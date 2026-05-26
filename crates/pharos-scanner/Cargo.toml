@@ -1,0 +1,32 @@
+[package]
+name = "pharos-scanner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+serde = { workspace = true }
+sonic-rs.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "process", "macros", "rt-multi-thread", "io-util"] }
+tracing.workspace = true
+walkdir.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
+name = "hash"
+harness = false
+
+[lints]
+workspace = true

@@ -11,6 +11,8 @@ Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better pe
 - CLI: clap derive (declarative) mode. No builder API.
 - DB: sqlx. All DB access behind `pharos-core` traits (e.g. `MediaStore`). Backend impls (sqlite default, postgres optional) live in adapter crate. Call sites depend on traits only — swap via wiring, not refactor.
 - Async traits: native `async fn` in traits (stable Rust 1.75+). No `async_trait` crate. Prefer generics over `dyn Trait` for swappable backends.
+- SIMD: use SIMD-accelerated crates where applicable. JSON parsing via `sonic-rs` (ByteDance; 1.5–2× faster than `simd-json` on common workloads, no intermediate tape). Hashing via `xxhash-rust` (xxh3) for stable IDs and `blake3` for content hashing. Image decode via `image` (default SIMD). Fall back gracefully on non-supported archs.
+- Benchmarks: every SIMD-accelerated or otherwise hot code path has a `criterion` benchmark under the owning crate's `benches/`. Bench gates regressions, not unit correctness.
 - Web UI: Dioxus (Rust → WASM). Single-lang stack.
 - API compat: existing Jellyfin clients (Finamp, Infuse, Jellyfin web/mobile/TV) work unmodified.
 - API compat: existing Plex clients (Plex web/mobile/TV, Plexamp) work unmodified.
@@ -67,7 +69,7 @@ Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better pe
 id|status|desc|cites
 T1|x|cargo workspace skeleton, actix-web app, config loader, tracing init, OTel+Prom exporters, test harness, trait scaffolding, clippy lints (V17), nix flake (devShell + package + OCI)|I.config,I.cli,I.obs,I.nix-flake,V11,V12,V13,V15,V17,V18
 T2|x|sqlx-backed `MediaStore` impl in `pharos-store-sqlx` crate (sqlite default, postgres feature-gated), migrations via `sqlx::migrate!`, wired through core trait — no call site knows backend|I.store,V10,V12
-T3|.|media-fs scanner: walk roots, extract metadata via ffprobe|I.media-fs,I.ffmpeg,V5
+T3|x|media-fs scanner: walk roots, extract metadata via ffprobe|I.media-fs,I.ffmpeg,V5,V12,V18
 T4|.|user/auth model + token issuance|V8
 T5|.|jellyfin-api: /System/Info, /Users/AuthenticateByName, /Users/Me|I.jellyfin-api,V1,V7
 T6|.|jellyfin-api: /Library/* + /Items/* (browse, search, details)|I.jellyfin-api,V1,V7

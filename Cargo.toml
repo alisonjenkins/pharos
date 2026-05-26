@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pharos-core",
+    "crates/pharos-scanner",
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
 ]
@@ -23,11 +24,15 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "html_reports"] }
 serde = { version = "1", features = ["derive"] }
+sonic-rs = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
 thiserror = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-actix-web = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+walkdir = "2"

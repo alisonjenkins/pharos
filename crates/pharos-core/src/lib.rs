@@ -13,10 +13,11 @@ pub struct MediaItem {
     pub kind: MediaKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum MediaKind {
     Movie,
     Episode,
+    #[default]
     Audio,
 }
 
@@ -73,12 +74,22 @@ pub trait Scanner: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 }
 
-pub trait Transcoder: Send + Sync {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeInfo {
+    pub kind: MediaKind,
+    pub duration_ms: Option<u64>,
+    pub container: Option<String>,
+}
+
+pub trait Prober: Send + Sync {
     fn probe(
         &self,
         path: &std::path::Path,
-    ) -> impl std::future::Future<Output = DomainResult<MediaKind>> + Send;
+    ) -> impl std::future::Future<Output = DomainResult<ProbeInfo>> + Send;
 }
+
+/// Future transcoding ops (T8, T9). Inherits `probe` from `Prober`.
+pub trait Transcoder: Prober {}
 
 pub trait Clock: Send + Sync {
     fn now_unix_ms(&self) -> u64;
