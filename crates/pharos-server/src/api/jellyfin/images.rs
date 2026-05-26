@@ -1,25 +1,38 @@
-//! Jellyfin /Items/{id}/Images/* stubs. T19 phase 1 ships 404 responses
-//! so clients gracefully fall back to default posters instead of hammering
-//! a 5xx loop. Real thumbnail generation (extract poster via ffmpeg + cache)
-//! lands with T19 phase 2.
+//! Jellyfin `/Items/{id}/Images/*` — Primary on demand (extracted via
+//! ffmpeg), Backdrop / Thumb extracted at a deeper / wider point;
+//! Logo / Banner / Art / Disc are upload-only.
 //!
-//! Endpoints are intentionally **unauthenticated** to match Jellyfin's
-//! reference behaviour — image URLs are passed around in `<img src=…>`
-//! tags where header auth isn't an option. The downstream concern (V9 —
-//! no media-path leak) is moot here: 404 carries no path.
+//! GET endpoints are intentionally **unauthenticated** to match
+//! Jellyfin's reference behaviour — image URLs are passed around in
+//! `<img src=…>` tags where header auth isn't an option. POST/DELETE
+//! (admin uploads) **do** require an admin bearer (V8/V9).
 
-use crate::state::AppState;
-use actix_web::{web, HttpResponse};
+use crate::{
+    api::jellyfin::auth_extractor::AuthUser,
+    image_cache::{ImageCacheError, ImageRole},
+    state::AppState,
+};
+use actix_web::{error, web, HttpResponse};
 use pharos_core::MediaStore;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths. The `image_type` path param is
-    // therefore also lowercased by `LowercasePath` — `is_known_image_type`
-    // + the Primary-only fast-path use case-insensitive comparison
-    // against Jellyfin's PascalCase ImageType enum.
+    // therefore also lowercased by `LowercasePath` — `ImageRole::from_str_ci`
+    // accepts both forms anyway.
     cfg.route("/items/{id}/images/{image_type}", web::get().to(get_image))
-        .route("/items/{id}/images/{image_type}", web::head().to(head_image))
+        .route(
+            "/items/{id}/images/{image_type}",
+            web::head().to(head_image),
+        )
+        .route(
+            "/items/{id}/images/{image_type}",
+            web::post().to(post_image),
+        )
+        .route(
+            "/items/{id}/images/{image_type}",
+            web::delete().to(delete_image),
+        )
         .route(
             "/items/{id}/images/{image_type}/{image_index}",
             web::get().to(get_image_indexed),
@@ -27,6 +40,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/items/{id}/images/{image_type}/{image_index}",
             web::head().to(head_image_indexed),
+        )
+        .route(
+            "/items/{id}/images/{image_type}/{image_index}",
+            web::post().to(post_image_indexed),
+        )
+        .route(
+            "/items/{id}/images/{image_type}/{image_index}",
+            web::delete().to(delete_image_indexed),
         );
 }
 
@@ -40,7 +61,6 @@ struct ImagePath {
 struct IndexedImagePath {
     id: String,
     image_type: String,
-    #[allow(dead_code)]
     image_index: u32,
 }
 
@@ -48,45 +68,89 @@ async fn get_image(
     state: web::Data<AppState>,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, false).await
+    serve_image(&state, &path.id, &path.image_type, 0, false).await
 }
 
 async fn head_image(
     state: web::Data<AppState>,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, true).await
+    serve_image(&state, &path.id, &path.image_type, 0, true).await
 }
 
 async fn get_image_indexed(
     state: web::Data<AppState>,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, false).await
+    serve_image(&state, &path.id, &path.image_type, path.image_index, false).await
 }
 
 async fn head_image_indexed(
     state: web::Data<AppState>,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, true).await
+    serve_image(&state, &path.id, &path.image_type, path.image_index, true).await
+}
+
+async fn post_image(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<ImagePath>,
+    body: web::Bytes,
+) -> Result<HttpResponse, actix_web::Error> {
+    upload_image(&state, &user, &path.id, &path.image_type, 0, &body).await
+}
+
+async fn post_image_indexed(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<IndexedImagePath>,
+    body: web::Bytes,
+) -> Result<HttpResponse, actix_web::Error> {
+    upload_image(
+        &state,
+        &user,
+        &path.id,
+        &path.image_type,
+        path.image_index,
+        &body,
+    )
+    .await
+}
+
+async fn delete_image(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<ImagePath>,
+) -> Result<HttpResponse, actix_web::Error> {
+    remove_image(&state, &user, &path.id, &path.image_type, 0).await
+}
+
+async fn delete_image_indexed(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<IndexedImagePath>,
+) -> Result<HttpResponse, actix_web::Error> {
+    remove_image(
+        &state,
+        &user,
+        &path.id,
+        &path.image_type,
+        path.image_index,
+    )
+    .await
 }
 
 async fn serve_image(
     state: &AppState,
     id_str: &str,
     image_type: &str,
+    index: u32,
     head_only: bool,
 ) -> Result<HttpResponse, actix_web::Error> {
-    if !is_known_image_type(image_type) {
+    let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
-    }
-    // Case-insensitive: the URI is folded to lowercase by
-    // `LowercasePath` before routing, so `image_type` arrives lowercased.
-    if !image_type.eq_ignore_ascii_case("Primary") {
-        // Backdrop / Thumb / etc. still phase 3.
-        return Ok(HttpResponse::NotFound().body(""));
-    }
+    };
     let Some(cache) = state.images.as_ref() else {
         return Ok(HttpResponse::NotFound().body(""));
     };
@@ -98,8 +162,12 @@ async fn serve_image(
         Ok(it) => it,
         Err(_) => return Ok(HttpResponse::NotFound().body("")),
     };
-    let path = match cache.primary(id, item.kind, &item.path).await {
+    let path = match cache.fetch(id, role, item.kind, &item.path, index).await {
         Ok(p) => p,
+        // Upload-only roles (Logo/Banner/Art/Disc) report
+        // `UploadOnly` when no upload has happened — surface as 404
+        // for the read endpoint, same as a missing file.
+        Err(ImageCacheError::UploadOnly) => return Ok(HttpResponse::NotFound().body("")),
         Err(e) => {
             tracing::warn!(error = %e, "image extraction failed");
             return Ok(HttpResponse::NotFound().body(""));
@@ -115,26 +183,70 @@ async fn serve_image(
     Ok(HttpResponse::Ok().content_type("image/jpeg").body(bytes))
 }
 
-/// Jellyfin's `ImageType` enum values. Match here so unknown types
-/// surface as 400 instead of generic 404 — eases client-side debugging.
-fn is_known_image_type(s: &str) -> bool {
-    [
-        "primary",
-        "backdrop",
-        "logo",
-        "thumb",
-        "art",
-        "banner",
-        "disc",
-        "box",
-        "screenshot",
-        "menu",
-        "chapter",
-        "boxrear",
-        "profile",
-    ]
-    .iter()
-    .any(|known| s.eq_ignore_ascii_case(known))
+async fn upload_image(
+    state: &AppState,
+    user: &AuthUser,
+    id_str: &str,
+    image_type: &str,
+    index: u32,
+    body: &[u8],
+) -> Result<HttpResponse, actix_web::Error> {
+    if !user.0.policy.admin {
+        return Err(error::ErrorForbidden("admin required"));
+    }
+    let Some(role) = ImageRole::from_str_ci(image_type) else {
+        return Err(error::ErrorBadRequest("unknown image type"));
+    };
+    let Some(cache) = state.images.as_ref() else {
+        return Err(error::ErrorInternalServerError("image cache not configured"));
+    };
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("item not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    if body.is_empty() {
+        return Err(error::ErrorBadRequest("empty image body"));
+    }
+    cache
+        .upload(id, role, item.kind, index, body)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    state.notify_library_changed();
+    Ok(HttpResponse::NoContent().finish())
+}
+
+async fn remove_image(
+    state: &AppState,
+    user: &AuthUser,
+    id_str: &str,
+    image_type: &str,
+    index: u32,
+) -> Result<HttpResponse, actix_web::Error> {
+    if !user.0.policy.admin {
+        return Err(error::ErrorForbidden("admin required"));
+    }
+    let Some(role) = ImageRole::from_str_ci(image_type) else {
+        return Err(error::ErrorBadRequest("unknown image type"));
+    };
+    let Some(cache) = state.images.as_ref() else {
+        return Ok(HttpResponse::NoContent().finish());
+    };
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("item not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    cache
+        .remove(id, role, item.kind, index)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    state.notify_library_changed();
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[cfg(test)]
@@ -155,7 +267,7 @@ mod tests {
         let state = seed_state().await;
         let app =
             test::init_service(App::new().app_data(state).configure(register)).await;
-        for t in ["primary", "backdrop", "thumb"] {
+        for t in ["primary", "backdrop", "thumb", "logo", "banner", "art"] {
             let req = test::TestRequest::get()
                 .uri(&format!("/items/abc/images/{t}"))
                 .to_request();
@@ -215,5 +327,18 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_ne!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn post_requires_auth_and_returns_401_without_token() {
+        let state = seed_state().await;
+        let app =
+            test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::post()
+            .uri("/items/1/images/primary")
+            .set_payload(vec![0xFFu8, 0xD8, 0xFF, 0xE0])
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
     }
 }
