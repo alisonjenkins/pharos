@@ -85,7 +85,7 @@ T17|.|group-sync client integration via existing Jellyfin/Plex session hooks|I.g
 T18|.|feature-parity audit vs Jellyfin: gap list, prioritize|V1
 T19|.|fill parity gaps from T18|V1
 T20|.|extensions past parity (TBD — defer scope to post-T19)|
-T21|.|Jellyfin architecture audit: extract patterns, map to idiomatic Rust traits, doc in `docs/jellyfin-mapping.md`. Lands before T5.|V12
+T21|x|Jellyfin architecture audit: extract patterns, map to idiomatic Rust traits, doc in `docs/jellyfin-mapping.md`. Lands before T5.|V12
 T22|.|health-api: `/healthz`, `/readyz`, `/info`, `/metrics`. Lands with T1.|I.health-api,V14
 T23|.|observability deepening: span attrs for media ops, RED metrics per route, log redaction|I.obs,V8,V13,V15
 T24|.|dioxus-ui crate: workspace member, WASM build pipeline, served via axum static + fallback|I.dioxus-ui,V16
