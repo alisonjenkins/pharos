@@ -1,7 +1,9 @@
 //! /Items and /Library item-browsing routes.
 //!
 //! Phase-1 scope: list, get-by-id, per-user list, virtual-folders summary.
-//! Filters/search land in later T6 follow-ups.
+//! Phase-2 scope (this file): SearchTerm + IncludeItemTypes filters,
+//! SortBy / SortOrder. Filtering is in-memory after `MediaStore::list()`
+//! today — moves to SQL-side once library sizes warrant it.
 
 use crate::{
     api::jellyfin::{
@@ -11,7 +13,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::MediaStore;
+use pharos_core::{MediaItem, MediaKind, MediaStore};
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -32,6 +34,18 @@ struct ListQuery {
     start_index: u32,
     #[serde(default = "default_limit")]
     limit: u32,
+    /// Substring of the item title; case-insensitive.
+    #[serde(default)]
+    search_term: Option<String>,
+    /// Comma-separated Jellyfin Type names: e.g. "Movie,Episode".
+    #[serde(default)]
+    include_item_types: Option<String>,
+    /// `SortName` (default), `Random`, `DateCreated` (currently same as SortName — no created-at column yet).
+    #[serde(default)]
+    sort_by: Option<String>,
+    /// `Ascending` (default) | `Descending`.
+    #[serde(default)]
+    sort_order: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -48,7 +62,8 @@ async fn list_items(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(paginate(all, &state.server_id, q.start_index, q.limit)))
+    let filtered = filter_and_sort(all, &q);
+    Ok(HttpResponse::Ok().json(paginate(filtered, &state.server_id, q.start_index, q.limit)))
 }
 
 async fn list_user_items(
@@ -68,7 +83,70 @@ async fn list_user_items(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(paginate(all, &state.server_id, q.start_index, q.limit)))
+    let filtered = filter_and_sort(all, &q);
+    Ok(HttpResponse::Ok().json(paginate(filtered, &state.server_id, q.start_index, q.limit)))
+}
+
+fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
+    if let Some(term) = q.search_term.as_ref() {
+        let needle = term.to_ascii_lowercase();
+        if !needle.is_empty() {
+            items.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
+        }
+    }
+    if let Some(types) = q.include_item_types.as_ref() {
+        let wanted: Vec<MediaKind> = types
+            .split(',')
+            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
+            .collect();
+        if !wanted.is_empty() {
+            items.retain(|i| wanted.contains(&i.kind));
+        }
+    }
+    let sort_by = q.sort_by.as_deref().unwrap_or("SortName");
+    let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
+    match sort_by {
+        "Random" => shuffle_in_place(&mut items),
+        _ => {
+            items.sort_by(|a, b| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            });
+            if descending {
+                items.reverse();
+            }
+        }
+    }
+    items
+}
+
+fn jellyfin_type_to_kind(s: &str) -> Option<MediaKind> {
+    match s {
+        "Movie" => Some(MediaKind::Movie),
+        "Episode" => Some(MediaKind::Episode),
+        "Audio" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+/// Deterministic-when-tested shuffle. Uses `getrandom` to seed a small
+/// xorshift so the random-sort doesn't pull in the rand crate.
+fn shuffle_in_place(items: &mut [MediaItem]) {
+    let mut seed = [0u8; 8];
+    if getrandom::getrandom(&mut seed).is_err() {
+        // Fall back to a fixed seed — caller already accepts non-determinism;
+        // a fixed seed is no worse than panicking under unprivileged sandbox.
+        seed = [1, 2, 3, 4, 5, 6, 7, 8];
+    }
+    let mut state = u64::from_le_bytes(seed) | 1;
+    for i in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state as usize) % (i + 1);
+        items.swap(i, j);
+    }
 }
 
 async fn get_item(

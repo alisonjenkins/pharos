@@ -185,6 +185,67 @@ async fn get_user_item_rejects_other_user_id_in_path() {
 }
 
 #[actix_web::test]
+async fn list_items_filters_by_search_term() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?SearchTerm=title-2")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1);
+    assert_eq!(v["Items"][0]["Name"], "title-2");
+}
+
+#[actix_web::test]
+async fn list_items_filters_by_include_item_types() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Audio")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1);
+    assert_eq!(v["Items"][0]["Type"], "Audio");
+}
+
+#[actix_web::test]
+async fn list_items_filters_with_two_types() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Movie,Episode")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // 2 movies + 1 episode in the seed.
+    assert_eq!(v["TotalRecordCount"], 3);
+}
+
+#[actix_web::test]
+async fn list_items_sorts_descending_when_requested() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?SortOrder=Descending")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v["Items"].as_array().unwrap();
+    let names: Vec<String> = arr
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap().to_string())
+        .collect();
+    // Default is title- prefix; descending lexicographic puts -3 first.
+    assert_eq!(names.first().map(|s| s.as_str()), Some("title-3"));
+}
+
+#[actix_web::test]
 async fn virtual_folders_returns_synth_library() {
     let (state, token, _u) = seed().await;
     let app = test::init_service(build_app(state)).await;
