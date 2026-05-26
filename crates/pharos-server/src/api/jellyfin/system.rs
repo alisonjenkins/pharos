@@ -2,25 +2,18 @@ use crate::{api::jellyfin::dto::SystemInfoDto, state::AppState};
 use actix_web::{web, HttpResponse, Responder};
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    for path in ["/System/Info", "/system/info"] {
-        cfg.route(path, web::get().to(system_info));
-    }
-    for path in ["/System/Info/Public", "/system/info/public"] {
-        cfg.route(path, web::get().to(system_info));
-    }
-    for path in ["/System/Configuration", "/system/configuration"] {
-        cfg.route(path, web::get().to(system_configuration));
-    }
-    for path in ["/System/Endpoint", "/system/endpoint"] {
-        cfg.route(path, web::get().to(system_endpoint));
-    }
-    for path in ["/DisplayPreferences/{id}", "/displaypreferences/{id}"] {
-        cfg.route(path, web::get().to(display_preferences))
-            .route(path, web::post().to(display_preferences_update));
-    }
-    for path in ["/Playback/BitrateTest", "/playback/bitratetest"] {
-        cfg.route(path, web::get().to(bitrate_test));
-    }
+    // T31: lowercase-only routes; `LowercasePath` middleware folds the
+    // PascalCase requests jellyfin-web sends onto these.
+    cfg.route("/system/info", web::get().to(system_info))
+        .route("/system/info/public", web::get().to(system_info))
+        .route("/system/configuration", web::get().to(system_configuration))
+        .route("/system/endpoint", web::get().to(system_endpoint))
+        .route("/displaypreferences/{id}", web::get().to(display_preferences))
+        .route(
+            "/displaypreferences/{id}",
+            web::post().to(display_preferences_update),
+        )
+        .route("/playback/bitratetest", web::get().to(bitrate_test));
 }
 
 #[derive(serde::Deserialize)]

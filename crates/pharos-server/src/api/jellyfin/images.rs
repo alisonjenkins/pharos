@@ -14,22 +14,20 @@ use pharos_core::MediaStore;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    cfg.route(
-        "/Items/{id}/Images/{image_type}",
-        web::get().to(get_image),
-    )
-    .route(
-        "/Items/{id}/Images/{image_type}",
-        web::head().to(head_image),
-    )
-    .route(
-        "/Items/{id}/Images/{image_type}/{image_index}",
-        web::get().to(get_image_indexed),
-    )
-    .route(
-        "/Items/{id}/Images/{image_type}/{image_index}",
-        web::head().to(head_image_indexed),
-    );
+    // T31: lowercase canonical paths. The `image_type` path param is
+    // therefore also lowercased by `LowercasePath` — `is_known_image_type`
+    // + the Primary-only fast-path use case-insensitive comparison
+    // against Jellyfin's PascalCase ImageType enum.
+    cfg.route("/items/{id}/images/{image_type}", web::get().to(get_image))
+        .route("/items/{id}/images/{image_type}", web::head().to(head_image))
+        .route(
+            "/items/{id}/images/{image_type}/{image_index}",
+            web::get().to(get_image_indexed),
+        )
+        .route(
+            "/items/{id}/images/{image_type}/{image_index}",
+            web::head().to(head_image_indexed),
+        );
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,7 +81,9 @@ async fn serve_image(
     if !is_known_image_type(image_type) {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
     }
-    if image_type != "Primary" {
+    // Case-insensitive: the URI is folded to lowercase by
+    // `LowercasePath` before routing, so `image_type` arrives lowercased.
+    if !image_type.eq_ignore_ascii_case("Primary") {
         // Backdrop / Thumb / etc. still phase 3.
         return Ok(HttpResponse::NotFound().body(""));
     }
@@ -118,22 +118,23 @@ async fn serve_image(
 /// Jellyfin's `ImageType` enum values. Match here so unknown types
 /// surface as 400 instead of generic 404 — eases client-side debugging.
 fn is_known_image_type(s: &str) -> bool {
-    matches!(
-        s,
-        "Primary"
-            | "Backdrop"
-            | "Logo"
-            | "Thumb"
-            | "Art"
-            | "Banner"
-            | "Disc"
-            | "Box"
-            | "Screenshot"
-            | "Menu"
-            | "Chapter"
-            | "BoxRear"
-            | "Profile"
-    )
+    [
+        "primary",
+        "backdrop",
+        "logo",
+        "thumb",
+        "art",
+        "banner",
+        "disc",
+        "box",
+        "screenshot",
+        "menu",
+        "chapter",
+        "boxrear",
+        "profile",
+    ]
+    .iter()
+    .any(|known| s.eq_ignore_ascii_case(known))
 }
 
 #[cfg(test)]
@@ -154,9 +155,9 @@ mod tests {
         let state = seed_state().await;
         let app =
             test::init_service(App::new().app_data(state).configure(register)).await;
-        for t in ["Primary", "Backdrop", "Thumb"] {
+        for t in ["primary", "backdrop", "thumb"] {
             let req = test::TestRequest::get()
-                .uri(&format!("/Items/abc/Images/{t}"))
+                .uri(&format!("/items/abc/images/{t}"))
                 .to_request();
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), 404, "type={t}");
@@ -169,7 +170,7 @@ mod tests {
         let app =
             test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
-            .uri("/Items/abc/Images/Backdrop/0")
+            .uri("/items/abc/images/backdrop/0")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 404);
@@ -181,7 +182,7 @@ mod tests {
         let app =
             test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
-            .uri("/Items/abc/Images/Bogus")
+            .uri("/items/abc/images/bogus")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400);
@@ -194,7 +195,7 @@ mod tests {
             test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::default()
             .method(actix_web::http::Method::HEAD)
-            .uri("/Items/abc/Images/Primary")
+            .uri("/items/abc/images/primary")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 404);
@@ -210,7 +211,7 @@ mod tests {
         let app =
             test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
-            .uri("/Items/abc/Images/Primary")
+            .uri("/items/abc/images/primary")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_ne!(resp.status(), 401);

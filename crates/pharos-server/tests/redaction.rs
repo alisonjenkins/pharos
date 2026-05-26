@@ -15,7 +15,8 @@ use pharos_core::{
 };
 use pharos_jellyfin_test_client::{DeviceInfo, JellyfinClient};
 use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, state::AppState, sync::GroupRegistry,
+    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
+    sync::GroupRegistry,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,7 @@ async fn boot() -> (TestServer, String) {
         App::new()
             .app_data(state.clone())
             .app_data(registry.clone())
+            .wrap(LowercasePath)
             .configure(jellyfin::configure)
     });
     let url = server.url("").trim_end_matches('/').to_string();

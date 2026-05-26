@@ -5,7 +5,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, state::AppState};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::io::Write;
 use tempfile::TempDir;
@@ -56,7 +56,10 @@ fn build_app(
         InitError = (),
     >,
 > {
-    App::new().app_data(state).configure(jellyfin::configure)
+    App::new()
+        .app_data(state)
+        .wrap(LowercasePath)
+        .configure(jellyfin::configure)
 }
 
 #[actix_web::test]

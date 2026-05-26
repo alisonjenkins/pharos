@@ -10,30 +10,20 @@ use pharos_core::{AuthBackend, AuthError, SecretString, TokenStore};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    // Jellyfin server matches paths case-insensitively. jellyfin-web in
-    // particular sends all-lowercase. Until pharos grows a real path-
-    // normalising middleware (tracked T29 phase 4), register both
-    // canonical and lowercase aliases on each route.
-    for path in ["/Users/AuthenticateByName", "/Users/authenticatebyname"] {
-        cfg.route(path, web::post().to(authenticate_by_name));
-    }
-    for path in ["/Users/Me", "/Users/me"] {
-        cfg.route(path, web::get().to(me));
-    }
-    // GET /Users/{userId} — clients fetch by id after login.
-    cfg.route("/Users/{user_id}", web::get().to(user_by_id));
-    for path in ["/Users/Public", "/users/public", "/Users/public"] {
-        cfg.route(path, web::get().to(public_users));
-    }
-    for path in ["/QuickConnect/Enabled", "/quickconnect/enabled"] {
-        cfg.route(path, web::get().to(quick_connect_enabled));
-    }
-    for path in ["/Branding/Configuration", "/branding/configuration"] {
-        cfg.route(path, web::get().to(branding_configuration));
-    }
-    for path in ["/Branding/Css", "/Branding/Css.css", "/branding/css"] {
-        cfg.route(path, web::get().to(branding_css));
-    }
+    // T31: paths registered in lowercase only — `LowercasePath`
+    // middleware normalises incoming requests, so jellyfin-web's
+    // mixed-case URIs (/Users/AuthenticateByName, /Branding/Css)
+    // resolve here too.
+    cfg.route("/users/authenticatebyname", web::post().to(authenticate_by_name))
+        .route("/users/me", web::get().to(me))
+        .route("/users/public", web::get().to(public_users))
+        .route("/users/{user_id}", web::get().to(user_by_id))
+        .route("/quickconnect/enabled", web::get().to(quick_connect_enabled))
+        .route("/branding/configuration", web::get().to(branding_configuration))
+        .route("/branding/css", web::get().to(branding_css))
+        // Some Jellyfin clients (jellyfin-web included) request the
+        // branding CSS with a `.css` suffix; same handler.
+        .route("/branding/css.css", web::get().to(branding_css));
 }
 
 /// Jellyfin's "tile picker" on the login page calls this. Return an

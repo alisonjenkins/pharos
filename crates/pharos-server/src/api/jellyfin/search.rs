@@ -17,18 +17,10 @@ use pharos_core::{MediaItem, MediaKind, MediaStore};
 use serde::{Deserialize, Serialize};
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    for path in ["/Search/Hints", "/search/hints"] {
-        cfg.route(path, web::get().to(search_hints));
-    }
-    for path in ["/Search/Suggestions", "/search/suggestions"] {
-        cfg.route(path, web::get().to(search_suggestions));
-    }
-    for path in [
-        "/Users/{user_id}/Suggestions",
-        "/Users/{user_id}/suggestions",
-    ] {
-        cfg.route(path, web::get().to(user_suggestions));
-    }
+    // T31: lowercase-only — `LowercasePath` middleware handles PascalCase.
+    cfg.route("/search/hints", web::get().to(search_hints))
+        .route("/search/suggestions", web::get().to(search_suggestions))
+        .route("/users/{user_id}/suggestions", web::get().to(user_suggestions));
 }
 
 #[derive(Debug, Deserialize)]

@@ -14,21 +14,14 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    cfg.route("/Sessions", web::get().to(list_sessions))
-        .route("/Sessions/Playing", web::post().to(playing_started))
-        .route(
-            "/Sessions/Playing/Progress",
-            web::post().to(playing_progress),
-        )
-        .route(
-            "/Sessions/Playing/Stopped",
-            web::post().to(playing_stopped),
-        )
-        .route("/Sessions/Capabilities", web::post().to(capabilities))
-        .route(
-            "/Sessions/Capabilities/Full",
-            web::post().to(capabilities),
-        );
+    // T31: lowercase canonical paths; `LowercasePath` middleware
+    // rewrites jellyfin-web's PascalCase before the router matches.
+    cfg.route("/sessions", web::get().to(list_sessions))
+        .route("/sessions/playing", web::post().to(playing_started))
+        .route("/sessions/playing/progress", web::post().to(playing_progress))
+        .route("/sessions/playing/stopped", web::post().to(playing_stopped))
+        .route("/sessions/capabilities", web::post().to(capabilities))
+        .route("/sessions/capabilities/full", web::post().to(capabilities));
 }
 
 #[derive(Debug, Deserialize)]

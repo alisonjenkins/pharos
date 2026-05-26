@@ -6,7 +6,7 @@ use pharos_server::{
     config::Config,
     health::{ReadinessError, ReadinessHandle},
     image_cache::ImageCache,
-    middleware::RedMetrics,
+    middleware::{LowercasePath, RedMetrics},
     obs, router,
     state::AppState,
     sync::GroupRegistry,
@@ -238,6 +238,13 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
             .wrap(cors)
+            // Lowercase the URI path before metrics + tracing capture
+            // it, so RedMetrics labels and TracingLogger spans use the
+            // canonical lowercase form (and label cardinality stays
+            // bounded). actix runs wraps in registration order, so
+            // this needs to sit between cors (outermost) and the
+            // observability layers below.
+            .wrap(LowercasePath)
             .wrap(RedMetrics)
             .wrap(TracingLogger::default())
             .configure(router::configure);

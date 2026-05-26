@@ -13,10 +13,12 @@ use actix_web::{error, web, HttpRequest};
 use pharos_core::MediaStore;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    cfg.route("/Videos/{id}/stream", web::get().to(stream_video))
-        .route("/Videos/{id}/stream.{ext}", web::get().to(stream_video))
-        .route("/Audio/{id}/stream", web::get().to(stream_audio))
-        .route("/Audio/{id}/universal", web::get().to(stream_audio));
+    // T31: lowercase canonical paths; `LowercasePath` middleware
+    // rewrites jellyfin-web's PascalCase before the router matches.
+    cfg.route("/videos/{id}/stream", web::get().to(stream_video))
+        .route("/videos/{id}/stream.{ext}", web::get().to(stream_video))
+        .route("/audio/{id}/stream", web::get().to(stream_audio))
+        .route("/audio/{id}/universal", web::get().to(stream_audio));
 }
 
 async fn stream_video(

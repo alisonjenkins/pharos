@@ -28,15 +28,11 @@ const SEGMENT_SECONDS: f64 = 6.0;
 const TICKS_PER_SECOND: u64 = 10_000_000;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    cfg.route(
-        "/Videos/{id}/master.m3u8",
-        web::get().to(master_playlist),
-    )
-    .route("/Videos/{id}/main.m3u8", web::get().to(variant_playlist))
-    .route(
-        "/Videos/{id}/hls1/main/{seg}.ts",
-        web::get().to(segment),
-    );
+    // T31: lowercase canonical paths; `LowercasePath` middleware
+    // rewrites the PascalCase URIs the streamer emits before routing.
+    cfg.route("/videos/{id}/master.m3u8", web::get().to(master_playlist))
+        .route("/videos/{id}/main.m3u8", web::get().to(variant_playlist))
+        .route("/videos/{id}/hls1/main/{seg}.ts", web::get().to(segment));
 }
 
 async fn duration_seconds(
@@ -107,7 +103,10 @@ async fn variant_playlist(
         let remaining = duration - (seg as f64 * SEGMENT_SECONDS);
         let len = remaining.clamp(0.01, SEGMENT_SECONDS);
         body.push_str(&format!("#EXTINF:{len:.3},\n"));
-        body.push_str(&format!("/Videos/{id}/hls1/main/{seg}.ts?{qs}\n"));
+        // Lowercase: T31 routes are registered lowercase; emit the
+        // canonical form so HLS players don't pay a middleware rewrite
+        // for every segment.
+        body.push_str(&format!("/videos/{id}/hls1/main/{seg}.ts?{qs}\n"));
     }
     body.push_str("#EXT-X-ENDLIST\n");
     Ok(HttpResponse::Ok()
@@ -208,7 +207,7 @@ mod tests {
         let (state, _t) = seed().await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
-            .uri("/Videos/7/master.m3u8")
+            .uri("/videos/7/master.m3u8")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);

@@ -17,71 +17,44 @@ use pharos_core::{MediaItem, MediaKind, MediaStore};
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    for path in ["/Items", "/items"] {
-        cfg.route(path, web::get().to(list_items));
-    }
-    for path in ["/Items/{id}", "/items/{id}"] {
-        cfg.route(path, web::get().to(get_item));
-    }
-    for path in ["/Users/{user_id}/Items", "/Users/{user_id}/items"] {
-        cfg.route(path, web::get().to(list_user_items));
-    }
+    // T31: paths registered in lowercase only — the `LowercasePath`
+    // middleware rewrites PascalCase requests before routing. Empty-
+    // list stubs cover the long-tail endpoints jellyfin-web fetches
+    // on the home + details pages so the client renders the empty
+    // state instead of throwing a Response exception.
+    cfg.route("/items", web::get().to(list_items))
+        .route("/items/{id}", web::get().to(get_item))
+        .route("/users/{user_id}/items", web::get().to(list_user_items))
+        .route(
+            "/users/{user_id}/items/latest",
+            web::get().to(list_user_items_latest),
+        )
+        .route(
+            "/users/{user_id}/items/{item_id}",
+            web::get().to(get_user_item),
+        )
+        .route("/users/{user_id}/views", web::get().to(user_views))
+        .route("/userviews", web::get().to(user_views_query))
+        .route("/library/virtualfolders", web::get().to(virtual_folders))
+        .route("/library/mediafolders", web::get().to(media_folders))
+        .route("/items/{id}/playbackinfo", web::get().to(playback_info))
+        .route("/items/{id}/playbackinfo", web::post().to(playback_info));
+
     for path in [
-        "/Users/{user_id}/Items/Latest",
-        "/Users/{user_id}/items/latest",
+        "/items/{id}/similar",
+        "/items/{id}/thememedia",
+        "/items/{id}/themesongs",
+        "/items/{id}/themevideos",
+        "/items/{id}/specialfeatures",
+        "/users/{user_id}/items/{item_id}/intros",
+        "/users/{user_id}/items/resume",
+        "/shows/nextup",
+        "/shows/upcoming",
+        "/genres",
+        "/studios",
+        "/persons",
     ] {
-        cfg.route(path, web::get().to(list_user_items_latest));
-    }
-    for path in [
-        "/Users/{user_id}/Items/{item_id}",
-        "/Users/{user_id}/items/{item_id}",
-    ] {
-        cfg.route(path, web::get().to(get_user_item));
-    }
-    for path in ["/Users/{user_id}/Views", "/Users/{user_id}/views"] {
-        cfg.route(path, web::get().to(user_views));
-    }
-    // Legacy alias jellyfin-web hits: GET /UserViews?userId=...
-    for path in ["/UserViews", "/userviews"] {
-        cfg.route(path, web::get().to(user_views_query));
-    }
-    for path in ["/Library/VirtualFolders", "/library/virtualfolders"] {
-        cfg.route(path, web::get().to(virtual_folders));
-    }
-    for path in ["/Library/MediaFolders", "/library/mediafolders"] {
-        cfg.route(path, web::get().to(media_folders));
-    }
-    for path in ["/Items/{id}/PlaybackInfo", "/items/{id}/playbackinfo"] {
-        cfg.route(path, web::get().to(playback_info))
-            .route(path, web::post().to(playback_info));
-    }
-    // Empty-list stubs for the long-tail endpoints jellyfin-web fetches
-    // on the home + details pages. Each returns an ItemsResult-shaped
-    // empty payload (or empty array where Jellyfin's contract differs)
-    // so the client renders the "Nothing here yet" state instead of
-    // a thrown Response exception.
-    for (canonical, lower) in [
-        ("/Items/{id}/Similar", "/items/{id}/similar"),
-        ("/Items/{id}/ThemeMedia", "/items/{id}/thememedia"),
-        ("/Items/{id}/ThemeSongs", "/items/{id}/themesongs"),
-        ("/Items/{id}/ThemeVideos", "/items/{id}/themevideos"),
-        ("/Items/{id}/SpecialFeatures", "/items/{id}/specialfeatures"),
-        (
-            "/Users/{user_id}/Items/{item_id}/Intros",
-            "/Users/{user_id}/items/{item_id}/intros",
-        ),
-        (
-            "/Users/{user_id}/Items/Resume",
-            "/Users/{user_id}/items/resume",
-        ),
-        ("/Shows/NextUp", "/shows/nextup"),
-        ("/Shows/Upcoming", "/shows/upcoming"),
-        ("/Genres", "/genres"),
-        ("/Studios", "/studios"),
-        ("/Persons", "/persons"),
-    ] {
-        cfg.route(canonical, web::get().to(empty_items_result))
-            .route(lower, web::get().to(empty_items_result));
+        cfg.route(path, web::get().to(empty_items_result));
     }
 }
 

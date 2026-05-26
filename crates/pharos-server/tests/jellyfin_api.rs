@@ -8,6 +8,7 @@ use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
     api::jellyfin,
     auth::BuiltinAuth,
+    middleware::LowercasePath,
     router,
     state::AppState,
 };
@@ -35,6 +36,7 @@ async fn system_info_returns_pascalcase_shape() {
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
+            .wrap(LowercasePath)
             .configure(jellyfin::configure),
     )
     .await;
@@ -53,6 +55,7 @@ async fn system_info_public_alias_works() {
     let app = test::init_service(
         App::new()
             .app_data(state)
+            .wrap(LowercasePath)
             .configure(jellyfin::configure),
     )
     .await;
@@ -69,6 +72,7 @@ async fn authenticate_by_name_returns_token_and_user() {
     let app = test::init_service(
         App::new()
             .app_data(state)
+            .wrap(LowercasePath)
             .configure(jellyfin::configure),
     )
     .await;
@@ -94,6 +98,7 @@ async fn authenticate_with_wrong_password_is_401() {
     let app = test::init_service(
         App::new()
             .app_data(state)
+            .wrap(LowercasePath)
             .configure(jellyfin::configure),
     )
     .await;
@@ -111,6 +116,7 @@ async fn me_without_token_is_401() {
     let app = test::init_service(
         App::new()
             .app_data(state)
+            .wrap(LowercasePath)
             .configure(jellyfin::configure),
     )
     .await;
@@ -125,6 +131,7 @@ async fn full_login_then_me_with_token_returns_user() {
     let app = test::init_service(
         App::new()
             .app_data(state)
+            .wrap(LowercasePath)
             .configure(jellyfin::configure),
     )
     .await;
@@ -163,6 +170,7 @@ async fn router_mounts_jellyfin_scope_alongside_metrics_and_health() {
         App::new()
             .app_data(web::Data::new(readiness))
             .app_data(state)
+            .wrap(LowercasePath)
             .configure(router::configure),
     )
     .await;
