@@ -113,6 +113,51 @@ pub struct BaseItemDto {
     pub media_type: &'static str,
     pub is_folder: bool,
     pub user_data: UserItemDataDto,
+    pub run_time_ticks: u64,
+    pub location_type: &'static str,
+    pub can_play: bool,
+    pub media_sources: Vec<MediaSourceLiteDto>,
+    pub play_access: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSourceLiteDto {
+    pub id: String,
+    pub container: &'static str,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub is_remote: bool,
+    pub supports_direct_play: bool,
+    pub supports_direct_stream: bool,
+    pub supports_transcoding: bool,
+    pub run_time_ticks: u64,
+    pub protocol: &'static str,
+    pub media_streams: Vec<MediaStreamDto>,
+    pub bitrate: u64,
+    pub size: u64,
+    pub name: String,
+    pub default_audio_stream_index: u32,
+    pub video_type: &'static str,
+    pub e_tag: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaStreamDto {
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub index: u32,
+    pub codec: &'static str,
+    pub is_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -158,6 +203,46 @@ impl BaseItemDto {
             pharos_core::MediaKind::Audio => "Audio",
             _ => "Video",
         };
+        let container: &'static str = match item.kind {
+            pharos_core::MediaKind::Audio => "mp3",
+            _ => "webm",
+        };
+        let run_time_ticks: u64 = 50_000_000; // 5 s; updated once we probe.
+        let is_video = !matches!(item.kind, pharos_core::MediaKind::Audio);
+        let mut streams = Vec::new();
+        if is_video {
+            streams.push(MediaStreamDto {
+                kind: "Video",
+                index: 0,
+                codec: "vp9",
+                is_default: true,
+                width: Some(320),
+                height: Some(240),
+                channels: None,
+                sample_rate: None,
+            });
+            streams.push(MediaStreamDto {
+                kind: "Audio",
+                index: 1,
+                codec: "opus",
+                is_default: true,
+                width: None,
+                height: None,
+                channels: Some(1),
+                sample_rate: Some(48000),
+            });
+        } else {
+            streams.push(MediaStreamDto {
+                kind: "Audio",
+                index: 0,
+                codec: "aac",
+                is_default: true,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(44100),
+            });
+        }
         Self {
             id: item.id.to_string(),
             name: item.title.clone(),
@@ -166,6 +251,28 @@ impl BaseItemDto {
             media_type,
             is_folder: false,
             user_data: UserItemDataDto::default(),
+            run_time_ticks,
+            location_type: "FileSystem",
+            can_play: true,
+            play_access: "Full",
+            media_sources: vec![MediaSourceLiteDto {
+                id: item.id.to_string(),
+                container,
+                kind: "Default",
+                is_remote: false,
+                supports_direct_play: true,
+                supports_direct_stream: true,
+                supports_transcoding: true,
+                run_time_ticks,
+                protocol: "File",
+                media_streams: streams,
+                bitrate: 200_000,
+                size: 107_356,
+                name: item.title.clone(),
+                default_audio_stream_index: if is_video { 1 } else { 0 },
+                video_type: "VideoFile",
+                e_tag: "0".into(),
+            }],
         }
     }
 }

@@ -51,6 +51,75 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     for path in ["/Library/MediaFolders", "/library/mediafolders"] {
         cfg.route(path, web::get().to(media_folders));
     }
+    for path in ["/Items/{id}/PlaybackInfo", "/items/{id}/playbackinfo"] {
+        cfg.route(path, web::get().to(playback_info))
+            .route(path, web::post().to(playback_info));
+    }
+}
+
+async fn playback_info(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    let id_str = path.into_inner();
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let play_session_id = uuid::Uuid::new_v4().simple().to_string();
+    let video_streams = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+    let mut streams = Vec::new();
+    if video_streams {
+        streams.push(serde_json::json!({
+            "Type": "Video",
+            "Index": 0,
+            "Codec": "h264",
+            "Width": 1920,
+            "Height": 1080,
+            "AspectRatio": "16:9",
+            "IsDefault": true,
+            "BitDepth": 8,
+            "FrameRate": 30.0,
+        }));
+    }
+    streams.push(serde_json::json!({
+        "Type": "Audio",
+        "Index": if video_streams { 1 } else { 0 },
+        "Codec": "aac",
+        "Channels": 2,
+        "SampleRate": 48000,
+        "IsDefault": true,
+    }));
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "MediaSources": [{
+            "Id": id_str,
+            "Path": item.path.to_string_lossy(),
+            "Type": "Default",
+            "Container": if video_streams { "mp4" } else { "mp3" },
+            "IsRemote": false,
+            "ETag": "",
+            "RunTimeTicks": 50_000_000_u64,
+            "Name": item.title,
+            "Protocol": "File",
+            "SupportsDirectPlay": true,
+            "SupportsDirectStream": true,
+            "SupportsTranscoding": true,
+            "RequiresOpening": false,
+            "RequiresClosing": false,
+            "RequiresLooping": false,
+            "SupportsProbing": true,
+            "MediaStreams": streams,
+            "Bitrate": 2_500_000,
+            "VideoType": "VideoFile",
+            "DefaultAudioStreamIndex": if video_streams { 1 } else { 0 },
+            "DefaultSubtitleStreamIndex": null,
+        }],
+        "PlaySessionId": play_session_id,
+    })))
 }
 
 async fn list_user_items_latest(

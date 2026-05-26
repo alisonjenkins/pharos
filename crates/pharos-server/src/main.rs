@@ -59,7 +59,6 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let stores = SqliteStore::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
-    // Idempotent: ignore Conflict.
     let hash = auth
         .hash_password(&SecretString::new("playwright-test-pw"))
         .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
@@ -74,15 +73,67 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
             return Err(AppError::Io(std::io::Error::other(e.to_string())));
         }
     }
-    for (i, kind) in [
-        (1u64, MediaKind::Movie),
-        (2, MediaKind::Movie),
-        (3, MediaKind::Episode),
-        (4, MediaKind::Audio),
+
+    // Generate a 5-second H.264/AAC MP4 fixture via ffmpeg so the
+    // playback Playwright test has real bytes to stream. Path is
+    // /tmp/pharos-playwright-media/fixture.mp4 — overwritten each run
+    // so a stale file from a code change doesn't shadow new ffmpeg
+    // args.
+    let fixture_dir = std::path::PathBuf::from("/tmp/pharos-playwright-media");
+    tokio::fs::create_dir_all(&fixture_dir)
+        .await
+        .map_err(AppError::Io)?;
+    // WebM + VP9 + Opus so the FOSS Chromium shipped with Playwright
+    // (no proprietary codec support) can actually decode it. H.264 fails
+    // with DEMUXER_ERROR_NO_SUPPORTED_STREAMS under headless chromium.
+    let fixture_path = fixture_dir.join("fixture.webm");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=320x240:rate=15",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=5",
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-row-mt",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-shortest",
+        ])
+        .arg(&fixture_path)
+        .status()
+        .await
+        .map_err(AppError::Io)?;
+    if !status.success() {
+        return Err(AppError::Io(std::io::Error::other(
+            "ffmpeg fixture generation failed",
+        )));
+    }
+
+    for (i, kind, path) in [
+        (1u64, MediaKind::Movie, fixture_path.clone()),
+        (2, MediaKind::Movie, fixture_path.clone()),
+        (3, MediaKind::Episode, fixture_path.clone()),
+        (4, MediaKind::Audio, fixture_path.clone()),
     ] {
         let item = MediaItem {
             id: i,
-            path: format!("/playwright-fixture/{i}.mkv").into(),
+            path,
             title: format!("Playwright Title {i}"),
             kind,
         };
@@ -92,7 +143,8 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let mut lock = stdout.lock();
     writeln!(
         lock,
-        "seeded: user='playwright' password='playwright-test-pw' (admin), 4 items",
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 4 items, fixture={}",
+        fixture_path.display()
     )?;
     Ok(())
 }
