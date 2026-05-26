@@ -1,5 +1,14 @@
-//! Top-level app shell. T25 grows this with router + library browse;
-//! T26 adds player; T27 adds group-session UI.
+//! Top-level app shell + sub-views.
+//! - [`login`] — T25 phase 1
+//! - [`library`] — T25 phase 1
+//! - player — T26 (pending)
+//! - group session — T27 (pending)
+
+pub mod library;
+pub mod login;
+
+pub use library::{ItemTile, LibraryView};
+pub use login::{LoginAttempt, LoginForm};
 
 use dioxus::prelude::*;
 

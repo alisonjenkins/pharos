@@ -96,7 +96,7 @@ T21|x|Jellyfin architecture audit: extract patterns, map to idiomatic Rust trait
 T22|x|health-api: `/healthz`, `/readyz`, `/info`, `/metrics`. Lands with T1.|I.health-api,V14,V18
 T23|x|observability deepening: span attrs for media ops, RED metrics per route, log redaction|I.obs,V8,V13,V15
 T24|x|dioxus-ui crate skeleton phase 1: workspace member, library with first component, builds on host. WASM build pipeline + actix static serving deferred to T24 phase 2.|I.dioxus-ui,V16
-T25|.|dioxus-ui: login + library browse views, talks Jellyfin-compat API|I.dioxus-ui,V16,V1
+T25|x|dioxus-ui: login + library browse views, talks Jellyfin-compat API. T25 phase 1: pure components (LoginForm, LibraryView, ItemTile) with props-driven state; runtime fetch wiring lands with T24 phase 2 (WASM pipeline).|I.dioxus-ui,V16,V1
 T26|.|dioxus-ui: player view (HLS + direct), session reporting|I.dioxus-ui,V16,V1
 T27|.|dioxus-ui: group session UI (join room, sync indicator, chat)|I.dioxus-ui,V3,V16
 T28|x|architecture doc + diagrams (mermaid) in `docs/architecture.md`: components, crate graph, request flow, concurrency model, data flow|V12,V18
