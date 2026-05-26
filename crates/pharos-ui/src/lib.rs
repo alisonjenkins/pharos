@@ -8,9 +8,11 @@
 #![allow(non_snake_case)]
 
 pub mod api_types;
+pub mod client;
 pub mod views;
 
 pub use api_types::{ItemKind, LibraryItem, LoggedInUser};
+pub use client::{parse_auth_response, parse_items_response, ClientError};
 pub use views::{
     App, GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot, ItemTile, LibraryView,
     LoginAttempt, LoginForm, PlaybackEvent, PlayerProps, PlayerView,

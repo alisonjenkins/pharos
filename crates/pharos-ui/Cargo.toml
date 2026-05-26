@@ -7,10 +7,10 @@ license.workspace = true
 
 [features]
 default = []
-# Enable the `[[bin]] web` target — adds the wasm renderer.
-# Build with `dx serve` or `cargo build --target wasm32-unknown-unknown
-# --bin pharos-ui-web --features web`.
-web = ["dep:dioxus-web"]
+# Enable the `[[bin]] web` target — adds the wasm renderer + gloo-net
+# HTTP client. Build with `dx serve` or
+# `cargo build --target wasm32-unknown-unknown --bin pharos-ui-web --features web`.
+web = ["dep:dioxus-web", "dep:gloo-net"]
 
 [[bin]]
 name = "pharos-ui-web"
@@ -20,6 +20,10 @@ required-features = ["web"]
 [dependencies]
 dioxus.workspace = true
 dioxus-web = { workspace = true, optional = true }
+gloo-net = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

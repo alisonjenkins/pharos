@@ -1,9 +1,11 @@
 //! Plain-data DTOs the UI consumes from the Jellyfin-compat API.
 //! Shapes match what the server emits (V16 — UI only talks public API).
-//! No serde here yet — these are pure component-prop types; T24 phase 2
-//! adds the fetch layer that deserialises wire JSON into these.
+//! Derives serde so the WASM-side `client` module can parse responses
+//! directly; tests cover the parsing.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoggedInUser {
     pub id: String,
     pub name: String,
@@ -12,14 +14,14 @@ pub struct LoggedInUser {
     pub is_admin: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryItem {
     pub id: String,
     pub name: String,
     pub kind: ItemKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemKind {
     Movie,
     Episode,

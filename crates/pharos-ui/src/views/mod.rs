@@ -1,14 +1,15 @@
 //! Top-level app shell + sub-views.
-//! - [`login`] — T25 phase 1
-//! - [`library`] — T25 phase 1
-//! - player — T26 (pending)
-//! - group session — T27 (pending)
+//! T25 phase 2 wires LoginForm → LibraryView → PlayerView via Dioxus
+//! signals + use_resource. The fetch client lives in `crate::client::web`
+//! (feature `web`); host builds skip it but the components compile.
 
+pub mod app_state;
 pub mod group;
 pub mod library;
 pub mod login;
 pub mod player;
 
+pub use app_state::{AppRoute, RootApp};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
 pub use library::{ItemTile, LibraryView};
 pub use login::{LoginAttempt, LoginForm};
@@ -16,44 +17,11 @@ pub use player::{PlaybackEvent, PlayerProps, PlayerView};
 
 use dioxus::prelude::*;
 
+/// Top-level mount point. Renders `RootApp` so the WASM entrypoint
+/// stays a one-liner.
 #[component]
 pub fn App() -> Element {
-    rsx! {
-        Layout {
-            Banner { title: "pharos" }
-            Placeholder {}
-        }
-    }
-}
-
-#[component]
-fn Layout(children: Element) -> Element {
-    rsx! {
-        div {
-            class: "pharos-app",
-            {children}
-        }
-    }
-}
-
-#[component]
-fn Banner(title: String) -> Element {
-    rsx! {
-        header {
-            class: "pharos-banner",
-            h1 { "{title}" }
-        }
-    }
-}
-
-#[component]
-fn Placeholder() -> Element {
-    rsx! {
-        main {
-            class: "pharos-main",
-            p { "Library view lands in T25. Player lands in T26. Group session UI lands in T27." }
-        }
-    }
+    rsx! { RootApp {} }
 }
 
 #[cfg(test)]
