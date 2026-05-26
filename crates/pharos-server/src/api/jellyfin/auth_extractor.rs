@@ -44,6 +44,10 @@ impl FromRequest for AuthUser {
 }
 
 /// Public for tests + handler-side use that need the raw token string.
+///
+/// Lookup order: `X-Emby-Token` → `X-MediaBrowser-Token` →
+/// MediaBrowser/Emby `Authorization` parse → `api_key` query param (used
+/// by media-element `src=` playback where headers can't be injected).
 pub fn extract_token(req: &HttpRequest) -> Option<String> {
     let h = req.headers();
 
@@ -67,6 +71,13 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             if let Some(tok) = parse_mediabrowser_token(v) {
                 return Some(tok);
             }
+        }
+    }
+    for (k, v) in req.query_string().split('&').filter_map(|kv| kv.split_once('=')) {
+        if (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey"))
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
         }
     }
     None
@@ -136,5 +147,22 @@ mod tests {
             .insert_header(("Authorization", r#"MediaBrowser Client="x""#))
             .to_http_request();
         assert!(extract_token(&req).is_none());
+    }
+
+    #[test]
+    fn parses_api_key_query_param() {
+        let req = TestRequest::default()
+            .uri("/Videos/123/stream?static=true&api_key=abc123&MediaSourceId=xyz")
+            .to_http_request();
+        assert_eq!(extract_token(&req).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn header_token_wins_over_query_api_key() {
+        let req = TestRequest::default()
+            .uri("/Videos/123/stream?api_key=query-token")
+            .insert_header(("X-Emby-Token", "header-token"))
+            .to_http_request();
+        assert_eq!(extract_token(&req).as_deref(), Some("header-token"));
     }
 }

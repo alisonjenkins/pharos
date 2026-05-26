@@ -4,6 +4,7 @@
 pub mod auth_extractor;
 pub mod dto;
 pub mod items;
+pub mod stream;
 pub mod system;
 pub mod users;
 
@@ -14,4 +15,5 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     system::register(cfg);
     users::register(cfg);
     items::register(cfg);
+    stream::register(cfg);
 }

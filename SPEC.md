@@ -74,7 +74,7 @@ T3|x|media-fs scanner: walk roots, extract metadata via ffprobe|I.media-fs,I.ffm
 T4|x|user/auth model + token issuance: User, UserPolicy, Argon2 password hash, TokenStore (sqlite) issuing opaque UUIDv4 tokens, AuthBackend trait, BuiltinAuth impl|V8,V12,V17
 T5|x|jellyfin-api: /System/Info, /Users/AuthenticateByName, /Users/Me + AppState wiring + auth extractor for Emby/MediaBrowser headers|I.jellyfin-api,V1,V7,V4
 T6|x|jellyfin-api: /Library/* + /Items/* (browse, search, details). T6 phase 1: GET /Items, GET /Items/{id}, GET /Users/{uid}/Items, GET /Library/VirtualFolders (search/filters/images deferred to T6 phase 2)|I.jellyfin-api,V1,V7,V9
-T7|.|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play)|I.jellyfin-api,V1,V9
+T7|x|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play) via actix-files NamedFile + Range support. Auth extractor accepts api_key query param.|I.jellyfin-api,V1,V9
 T8|.|transcode pipeline: ffmpeg wrapper, segment delivery, format negotiation|I.ffmpeg,V6
 T9|.|jellyfin-api: transcoded streaming + HLS|I.jellyfin-api,V1,V6
 T10|.|jellyfin-api: /Sessions, /PlayState (playback reporting)|I.jellyfin-api,V1
