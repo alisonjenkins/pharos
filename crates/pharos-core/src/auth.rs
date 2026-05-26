@@ -27,7 +27,7 @@ impl std::fmt::Display for UserId {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UserPolicy {
     pub admin: bool,
 }
@@ -98,6 +98,26 @@ pub trait UserStore: Send + Sync {
         &self,
         id: UserId,
     ) -> impl std::future::Future<Output = AuthResult<UserRecord>> + Send;
+
+    /// List every user. Ordered by name for stable admin-UI rendering.
+    /// T46 — admin endpoints need this for `/Users` (admin variant).
+    fn list(
+        &self,
+    ) -> impl std::future::Future<Output = AuthResult<Vec<UserRecord>>> + Send;
+
+    /// Drop a user + cascade their tokens + user_data rows. T46.
+    fn delete(
+        &self,
+        id: UserId,
+    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+
+    /// Overwrite the user's `UserPolicy`. T46 — admin endpoint
+    /// `POST /Users/{id}/Policy`.
+    fn set_policy(
+        &self,
+        id: UserId,
+        policy: UserPolicy,
+    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 }
 
 /// Persistence of session tokens.

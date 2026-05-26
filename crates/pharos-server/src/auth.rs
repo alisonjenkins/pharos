@@ -101,6 +101,30 @@ mod tests {
                 .cloned()
                 .ok_or(AuthError::UserNotFound)
         }
+        async fn list(&self) -> AuthResult<Vec<UserRecord>> {
+            let g = self.by_name.lock().await;
+            let mut v: Vec<UserRecord> = g.values().cloned().collect();
+            v.sort_by_key(|a| a.name.to_lowercase());
+            Ok(v)
+        }
+        async fn delete(&self, id: UserId) -> AuthResult<()> {
+            let mut g = self.by_name.lock().await;
+            let Some(key) = g.iter().find(|(_, r)| r.id == id).map(|(k, _)| k.clone()) else {
+                return Err(AuthError::UserNotFound);
+            };
+            g.remove(&key);
+            Ok(())
+        }
+        async fn set_policy(&self, id: UserId, policy: UserPolicy) -> AuthResult<()> {
+            let mut g = self.by_name.lock().await;
+            for rec in g.values_mut() {
+                if rec.id == id {
+                    rec.policy = policy;
+                    return Ok(());
+                }
+            }
+            Err(AuthError::UserNotFound)
+        }
     }
 
     async fn fresh() -> BuiltinAuth<MemUsers> {

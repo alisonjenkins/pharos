@@ -70,6 +70,50 @@ impl UserStore for SqliteStore {
             .transpose()?
             .ok_or(AuthError::UserNotFound)
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn list(&self) -> AuthResult<Vec<UserRecord>> {
+        let rows: Vec<(Vec<u8>, String, String, i64)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin FROM users ORDER BY name COLLATE NOCASE",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(record_from_row).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn delete(&self, id: UserId) -> AuthResult<()> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        // Cascades drop auth_tokens + user_data via FK; user_data
+        // has ON DELETE CASCADE (migration 0004), auth_tokens has it
+        // on the user_id column (migration 0002).
+        let res = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(id_bytes)
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn set_policy(&self, id: UserId, policy: UserPolicy) -> AuthResult<()> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        let admin: i64 = if policy.admin { 1 } else { 0 };
+        let res = sqlx::query("UPDATE users SET admin = ? WHERE id = ?")
+            .bind(admin)
+            .bind(id_bytes)
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
 }
 
 fn record_from_row(row: (Vec<u8>, String, String, i64)) -> AuthResult<UserRecord> {

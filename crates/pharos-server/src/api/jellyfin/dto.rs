@@ -123,8 +123,8 @@ impl UserDto {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct UserPolicyDto {
     pub is_administrator: bool,
     pub is_hidden: bool,
