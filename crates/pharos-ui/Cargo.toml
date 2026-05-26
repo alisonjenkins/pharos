@@ -5,8 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enable the `[[bin]] web` target — adds the wasm renderer.
+# Build with `dx serve` or `cargo build --target wasm32-unknown-unknown
+# --bin pharos-ui-web --features web`.
+web = ["dep:dioxus-web"]
+
+[[bin]]
+name = "pharos-ui-web"
+path = "src/bin/web.rs"
+required-features = ["web"]
+
 [dependencies]
 dioxus.workspace = true
+dioxus-web = { workspace = true, optional = true }
 
 [lints]
 workspace = true

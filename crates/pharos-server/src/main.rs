@@ -60,14 +60,26 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     readiness.mark("store").await?;
 
     let handle_for_app = readiness.clone();
+    let ui_dir = cfg.server.ui_dir.clone();
     HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
             .wrap(RedMetrics)
             .wrap(TracingLogger::default())
-            .configure(router::configure)
+            .configure(router::configure);
+        if let Some(path) = ui_dir.as_ref() {
+            // Dioxus default-routes the SPA in hash mode unless configured
+            // otherwise, so a single `Files::new` with `index_file` is
+            // enough — no history-mode fallback needed.
+            app = app.service(
+                actix_files::Files::new("/ui", path)
+                    .index_file("index.html")
+                    .use_last_modified(true),
+            );
+        }
+        app
     })
     .bind(&cfg.server.bind)?
     .run()

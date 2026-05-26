@@ -96,6 +96,8 @@
             pkgs.cargo-watch
             pkgs.cargo-deny
             pkgs.cargo-audit
+            pkgs.dioxus-cli
+            pkgs.wasm-bindgen-cli
             pkgs.ffmpeg-headless
             pkgs.pkg-config
             pkgs.git

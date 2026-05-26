@@ -23,6 +23,17 @@ Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) re
 
 If `Agent isolation: "worktree"` errors with "not in a git repository", restart Claude Code once — settings hot-reload is best-effort and the harness's git-repo check is cached at session start. Worktrees should work in subsequent sessions.
 
+## Web UI build
+
+Dioxus UI lives in `crates/pharos-ui` and compiles to WASM via the
+`dx` CLI shipped in the devShell.
+
+- Dev loop: `nix develop --command dx serve --package pharos-ui` (hot reload).
+- Release bundle: `nix develop --command dx build --package pharos-ui --release`.
+- Output lands under `target/dx/pharos-ui/release/web/public/`.
+- Point the server at it via `[server].ui_dir` in `config.toml`; pharos serves the bundle at `/ui/*`.
+- WASM target is pinned in `rust-toolchain.toml`; `cargo build --target wasm32-unknown-unknown` works without extra setup inside the devShell.
+
 ## Stack
 
-actix-web · clap derive · tokio · sqlx (planned T2) · Dioxus (planned T24) · tracing + metrics + Prometheus.
+actix-web · clap derive · tokio · sqlx · Dioxus + dx (WASM) · tracing + metrics + Prometheus.

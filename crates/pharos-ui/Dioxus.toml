@@ -1,0 +1,17 @@
+[application]
+name = "pharos-ui"
+
+[web.app]
+title = "pharos"
+default_platform = "web"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "index.html", "assets"]
+
+[web.resource]
+style = ["/assets/pharos.css"]
+script = []
+
+[bundle.web]
+out_dir = "target/dx/pharos-ui/release/web"

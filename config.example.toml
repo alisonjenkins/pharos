@@ -1,6 +1,11 @@
 [server]
 bind = "0.0.0.0:8096"
 name = "pharos"
+# Path to the built Dioxus UI bundle. Produce with:
+#   nix develop --command dx build --package pharos-ui --release
+# Then point this at the resulting `web/public/` directory and the
+# server will serve it at /ui/*.
+# ui_dir = "/srv/pharos/ui/public"
 
 [obs]
 log_level = "info"

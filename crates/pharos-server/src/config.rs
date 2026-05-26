@@ -15,6 +15,11 @@ pub struct ServerConfig {
     pub bind: String,
     #[serde(default = "default_server_name")]
     pub name: String,
+    /// Directory containing the built Dioxus UI bundle. When set, the
+    /// server serves index.html + assets at `/ui/*`. Run `dx build` in
+    /// `crates/pharos-ui` to produce one.
+    #[serde(default)]
+    pub ui_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

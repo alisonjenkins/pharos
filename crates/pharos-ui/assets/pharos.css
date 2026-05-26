@@ -1,0 +1,96 @@
+/* pharos minimum stylesheet. T26/T27 grow this. */
+
+:root {
+  color-scheme: dark light;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --bg: #0e1116;
+  --fg: #e6e8eb;
+  --muted: #8b95a5;
+  --accent: #4cb4ff;
+  --tile-bg: #1a2030;
+  --error: #ff6b6b;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.pharos-banner {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #1f2530;
+}
+.pharos-banner h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+.pharos-main {
+  padding: 1.5rem;
+}
+
+.pharos-login {
+  display: grid;
+  gap: 0.75rem;
+  max-width: 320px;
+  margin: 4rem auto;
+}
+.pharos-login label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+.pharos-login input {
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid #2a3142;
+  background: #11151c;
+  color: var(--fg);
+}
+.pharos-login button {
+  padding: 0.6rem;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #001e2e;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pharos-error {
+  color: var(--error);
+  font-size: 0.875rem;
+  margin: 0;
+}
+
+.pharos-library {
+  padding: 1rem 1.5rem;
+}
+.pharos-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 1rem;
+}
+.pharos-tile {
+  background: var(--tile-bg);
+  border-radius: 8px;
+  padding: 0.75rem;
+  cursor: pointer;
+  transition: transform 0.1s ease;
+}
+.pharos-tile:hover {
+  transform: translateY(-2px);
+}
+.pharos-tile-kind {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.pharos-tile-title {
+  margin: 0.25rem 0 0;
+  font-size: 1rem;
+}
+.pharos-empty {
+  color: var(--muted);
+}
