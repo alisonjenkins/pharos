@@ -142,6 +142,18 @@ async fn segment(
         duration_ticks: Some(duration_ticks),
     };
 
+    // T42: when an HLS cache is wired, route through it. Otherwise
+    // fall back to live transcoding (every request spawns ffmpeg).
+    if let Some(cache) = state.hls.as_ref() {
+        let bytes = cache
+            .segment_bytes(id_num, seg, &item.path, &opts)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
+        return Ok(HttpResponse::Ok()
+            .content_type(Container::Mpegts.content_type())
+            .body(bytes));
+    }
+
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
         .transcode(&item.path, &opts)

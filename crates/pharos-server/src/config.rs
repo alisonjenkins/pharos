@@ -24,6 +24,19 @@ pub struct ServerConfig {
     /// /Items/{id}/Images/Primary returns 404.
     #[serde(default)]
     pub image_cache_dir: Option<PathBuf>,
+    /// Directory used to cache transcoded HLS segments (T42). When
+    /// unset, segments stream live without persisting — every request
+    /// spawns ffmpeg.
+    #[serde(default)]
+    pub transcode_cache_dir: Option<PathBuf>,
+    /// Soft cap on the HLS segment cache, in bytes. Once exceeded,
+    /// least-recently-used segments are evicted. Default 1 GiB.
+    #[serde(default = "default_transcode_cache_bytes")]
+    pub transcode_cache_max_bytes: u64,
+}
+
+fn default_transcode_cache_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

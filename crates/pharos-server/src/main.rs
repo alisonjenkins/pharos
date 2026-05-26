@@ -5,6 +5,7 @@ use pharos_server::{
     cli::{AdminOp, Cli, Cmd},
     config::Config,
     health::{ReadinessError, ReadinessHandle},
+    hls_cache::HlsSegmentCache,
     image_cache::ImageCache,
     middleware::{LowercasePath, RedMetrics},
     obs, router,
@@ -212,6 +213,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let mut state = AppState::load(stores, cfg.server.name.clone()).await?;
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
         state = state.with_image_cache(ImageCache::new(cache_dir));
+    }
+    if let Some(cache_dir) = cfg.server.transcode_cache_dir.clone() {
+        state = state.with_hls_cache(HlsSegmentCache::new(
+            cache_dir,
+            cfg.server.transcode_cache_max_bytes,
+        ));
     }
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
