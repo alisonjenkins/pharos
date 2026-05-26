@@ -55,6 +55,42 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         cfg.route(path, web::get().to(playback_info))
             .route(path, web::post().to(playback_info));
     }
+    // Empty-list stubs for the long-tail endpoints jellyfin-web fetches
+    // on the home + details pages. Each returns an ItemsResult-shaped
+    // empty payload (or empty array where Jellyfin's contract differs)
+    // so the client renders the "Nothing here yet" state instead of
+    // a thrown Response exception.
+    for (canonical, lower) in [
+        ("/Items/{id}/Similar", "/items/{id}/similar"),
+        ("/Items/{id}/ThemeMedia", "/items/{id}/thememedia"),
+        ("/Items/{id}/ThemeSongs", "/items/{id}/themesongs"),
+        ("/Items/{id}/ThemeVideos", "/items/{id}/themevideos"),
+        ("/Items/{id}/SpecialFeatures", "/items/{id}/specialfeatures"),
+        (
+            "/Users/{user_id}/Items/{item_id}/Intros",
+            "/Users/{user_id}/items/{item_id}/intros",
+        ),
+        (
+            "/Users/{user_id}/Items/Resume",
+            "/Users/{user_id}/items/resume",
+        ),
+        ("/Shows/NextUp", "/shows/nextup"),
+        ("/Shows/Upcoming", "/shows/upcoming"),
+        ("/Genres", "/genres"),
+        ("/Studios", "/studios"),
+        ("/Persons", "/persons"),
+    ] {
+        cfg.route(canonical, web::get().to(empty_items_result))
+            .route(lower, web::get().to(empty_items_result));
+    }
+}
+
+async fn empty_items_result(_user: AuthUser) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0,
+    }))
 }
 
 async fn playback_info(
