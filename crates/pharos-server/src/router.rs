@@ -16,7 +16,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(root))
         .route("/metrics", web::get().to(metrics))
         .configure(crate::health::configure)
-        .configure(crate::api::jellyfin::configure);
+        .configure(crate::api::jellyfin::configure)
+        .configure(crate::sync::ws::register);
 }
 
 #[cfg(test)]

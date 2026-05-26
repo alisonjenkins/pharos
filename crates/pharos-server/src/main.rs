@@ -7,6 +7,7 @@ use pharos_server::{
     middleware::RedMetrics,
     obs, router,
     state::AppState,
+    sync::GroupRegistry,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::io::Write;
@@ -51,6 +52,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
     let app_state = web::Data::new(AppState::new(stores, cfg.server.name.clone()));
+    let group_registry = web::Data::new(GroupRegistry::spawn());
 
     // Probes whose readiness must flip true before /readyz returns 200.
     let readiness = ReadinessHandle::spawn(&["process", "store"]);
@@ -62,6 +64,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
+            .app_data(group_registry.clone())
             .wrap(RedMetrics)
             .wrap(TracingLogger::default())
             .configure(router::configure)

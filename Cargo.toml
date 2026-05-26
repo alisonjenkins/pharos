@@ -21,6 +21,7 @@ expect_used = "deny"
 [workspace.dependencies]
 actix-files = "0.6"
 actix-web = "4"
+actix-ws = "0.3"
 anyhow = "1"
 argon2 = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
