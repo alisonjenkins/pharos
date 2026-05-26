@@ -82,12 +82,30 @@ struct MemberRec {
     buffering: bool,
 }
 
+/// Last broadcast playback state. V19 — kept on the actor so a late
+/// joiner (or a network-blip reconnect) immediately syncs to the
+/// group's current position instead of staying frozen at its own
+/// startup time.
+#[derive(Debug, Clone, Copy)]
+enum PlaybackState {
+    Idle,
+    Playing {
+        position_ms: u64,
+        /// `server_ms_now()` at the moment of the last `Play`.
+        anchor_server_ms: u64,
+    },
+    Paused {
+        position_ms: u64,
+    },
+}
+
 struct GroupState {
     id: GroupId,
     started_at: Instant,
     members: HashMap<MemberId, MemberRec>,
     leader: Option<MemberId>,
     group_paused_due_to_buffering: bool,
+    playback: PlaybackState,
 }
 
 impl GroupState {
@@ -98,6 +116,7 @@ impl GroupState {
             members: HashMap::new(),
             leader: None,
             group_paused_due_to_buffering: false,
+            playback: PlaybackState::Idle,
         }
     }
 
@@ -120,15 +139,19 @@ impl GroupState {
         MIN_LEAD_MS + half_max_rtt
     }
 
-    async fn broadcast(&self, msg: ServerMsg) {
+    /// V19: one slow / wedged member must not block the actor or
+    /// delay broadcasts to everyone else. `try_send` returns
+    /// immediately; on a full sink the message is dropped (the
+    /// member will reconcile via the next state catch-up).
+    fn broadcast(&self, msg: ServerMsg) {
         for m in self.members.values() {
-            let _ = m.sink.send(msg.clone()).await;
+            let _ = m.sink.try_send(msg.clone());
         }
     }
 
-    async fn send_one(&self, to: MemberId, msg: ServerMsg) {
+    fn send_one(&self, to: MemberId, msg: ServerMsg) {
         if let Some(m) = self.members.get(&to) {
-            let _ = m.sink.send(msg).await;
+            let _ = m.sink.try_send(msg);
         }
     }
 
@@ -210,7 +233,45 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             };
             for (other_id, rec) in &state.members {
                 if *other_id != member_id {
-                    let _ = rec.sink.send(ServerMsg::MemberJoined { member: me.clone() }).await;
+                    let _ = rec
+                        .sink
+                        .try_send(ServerMsg::MemberJoined { member: me.clone() });
+                }
+            }
+            // V19: late joiner catch-up. If the group is in flight,
+            // send the most recent Play/Pause/Seek to just this member
+            // so its UI doesn't sit at position 0 until the next
+            // leader command.
+            let server_ms = state.server_ms_now();
+            match state.playback {
+                PlaybackState::Idle => {}
+                PlaybackState::Playing {
+                    position_ms,
+                    anchor_server_ms,
+                } => {
+                    let elapsed = server_ms.saturating_sub(anchor_server_ms);
+                    state.send_one(
+                        member_id,
+                        ServerMsg::Play {
+                            at_server_ms: server_ms + MIN_LEAD_MS,
+                            position_ms: position_ms + elapsed,
+                        },
+                    );
+                }
+                PlaybackState::Paused { position_ms } => {
+                    state.send_one(
+                        member_id,
+                        ServerMsg::Seek {
+                            at_server_ms: server_ms + MIN_LEAD_MS,
+                            position_ms,
+                        },
+                    );
+                    state.send_one(
+                        member_id,
+                        ServerMsg::Pause {
+                            at_server_ms: server_ms + MIN_LEAD_MS,
+                        },
+                    );
                 }
             }
         }
@@ -220,63 +281,83 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if was_leader {
                 state.elect_leader();
                 if let Some(new_leader) = state.leader {
-                    state.broadcast(ServerMsg::LeaderChange { leader: new_leader }).await;
+                    state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
                 }
             }
-            state.broadcast(ServerMsg::MemberLeft { member_id }).await;
+            state.broadcast(ServerMsg::MemberLeft { member_id });
         }
         GroupMsg::LeaderPlay { sender, position_ms } => {
             if state.leader != Some(sender) {
-                state
-                    .send_one(
-                        sender,
-                        ServerMsg::Error {
-                            code: ErrorCode::NotLeader,
-                            detail: "only leader may issue Play".into(),
-                        },
-                    )
-                    .await;
+                state.send_one(
+                    sender,
+                    ServerMsg::Error {
+                        code: ErrorCode::NotLeader,
+                        detail: "only leader may issue Play".into(),
+                    },
+                );
                 return;
             }
-            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
-            state.broadcast(ServerMsg::Play { at_server_ms, position_ms }).await;
+            let server_ms = state.server_ms_now();
+            let at_server_ms = server_ms + state.lead_time_ms();
+            state.playback = PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms: server_ms,
+            };
+            state.broadcast(ServerMsg::Play { at_server_ms, position_ms });
         }
         GroupMsg::LeaderPause { sender } => {
             if state.leader != Some(sender) {
-                state
-                    .send_one(
-                        sender,
-                        ServerMsg::Error {
-                            code: ErrorCode::NotLeader,
-                            detail: "only leader may issue Pause".into(),
-                        },
-                    )
-                    .await;
+                state.send_one(
+                    sender,
+                    ServerMsg::Error {
+                        code: ErrorCode::NotLeader,
+                        detail: "only leader may issue Pause".into(),
+                    },
+                );
                 return;
             }
-            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
-            state.broadcast(ServerMsg::Pause { at_server_ms }).await;
+            let server_ms = state.server_ms_now();
+            let at_server_ms = server_ms + state.lead_time_ms();
+            // Freeze position at the moment we paused so late joiners
+            // get the correct still-frame.
+            if let PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms,
+            } = state.playback
+            {
+                let elapsed = server_ms.saturating_sub(anchor_server_ms);
+                state.playback = PlaybackState::Paused {
+                    position_ms: position_ms + elapsed,
+                };
+            }
+            state.broadcast(ServerMsg::Pause { at_server_ms });
         }
         GroupMsg::LeaderSeek { sender, position_ms } => {
             if state.leader != Some(sender) {
-                state
-                    .send_one(
-                        sender,
-                        ServerMsg::Error {
-                            code: ErrorCode::NotLeader,
-                            detail: "only leader may issue Seek".into(),
-                        },
-                    )
-                    .await;
+                state.send_one(
+                    sender,
+                    ServerMsg::Error {
+                        code: ErrorCode::NotLeader,
+                        detail: "only leader may issue Seek".into(),
+                    },
+                );
                 return;
             }
-            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
-            state
-                .broadcast(ServerMsg::Seek {
-                    at_server_ms,
+            let server_ms = state.server_ms_now();
+            let at_server_ms = server_ms + state.lead_time_ms();
+            // Seek preserves play/pause; only mutates the position
+            // anchor. Idle treats Seek as "load this position paused".
+            state.playback = match state.playback {
+                PlaybackState::Playing { .. } => PlaybackState::Playing {
                     position_ms,
-                })
-                .await;
+                    anchor_server_ms: server_ms,
+                },
+                _ => PlaybackState::Paused { position_ms },
+            };
+            state.broadcast(ServerMsg::Seek {
+                at_server_ms,
+                position_ms,
+            });
         }
         GroupMsg::ObserveClock {
             member_id,
@@ -300,7 +381,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             {
                 state.group_paused_due_to_buffering = true;
                 let at_server_ms = state.server_ms_now() + MIN_LEAD_MS;
-                state.broadcast(ServerMsg::Pause { at_server_ms }).await;
+                state.broadcast(ServerMsg::Pause { at_server_ms });
             }
         }
         GroupMsg::BufferingEnd { member_id } => {
