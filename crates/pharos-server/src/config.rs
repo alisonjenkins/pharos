@@ -20,6 +20,10 @@ pub struct ServerConfig {
     /// `crates/pharos-ui` to produce one.
     #[serde(default)]
     pub ui_dir: Option<PathBuf>,
+    /// Directory pharos writes extracted poster images to. When unset,
+    /// /Items/{id}/Images/Primary returns 404.
+    #[serde(default)]
+    pub image_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

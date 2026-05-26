@@ -90,7 +90,7 @@ T15|x|group-sync protocol design doc + invariants for V3|I.group-sync,V3,V8,V18
 T16|x|group-sync impl phase 1: WS at /sync/v1/ws, ClientMsg/ServerMsg, Group actor + registry, clock-offset estimator with median over N=9 samples. Jellyfin /socket bridge deferred to T16 phase 2.|I.group-sync,V3,V18,V19,V20
 T17|x|group-sync client integration via Jellyfin /socket SyncPlay bridge. Phase 1: /socket WS endpoint, translates SyncPlayCreateGroup/JoinGroup/Play/Pause to GroupRegistry, emits SyncPlayGroupUpdate / SyncPlayCommand outbound. Plex SyncPlay (timeline) is Phase 2.|I.group-sync,V3,V1,V20
 T18|x|feature-parity audit vs Jellyfin: gap list, prioritize. See `docs/jellyfin-parity-audit.md`.|V1,V7
-T19|x|fill parity gaps from T18. Phase 1: /Items/{id}/Images/* stubs (GET+HEAD, returns 404 cleanly so clients fall back to placeholders), GET /Users/{uid}/Items/{itemId} per-user item view. Played-state + thumbnail generation deferred to T19 phase 2+.|V1,V7
+T19|x|fill parity gaps from T18. Phase 1: image stubs + per-user item. Phase 2: real Primary-image extraction via ffmpeg `-ss N -vframes 1 -f image2 -vcodec mjpeg`, disk cache under `[server].image_cache_dir`. Audio cover-art + backdrop/thumb/banner deferred to phase 3. Played-state still phase 4.|V1,V7
 T20|.|extensions past parity (TBD — defer scope to post-T19)|
 T21|x|Jellyfin architecture audit: extract patterns, map to idiomatic Rust traits, doc in `docs/jellyfin-mapping.md`. Lands before T5.|V12
 T22|x|health-api: `/healthz`, `/readyz`, `/info`, `/metrics`. Lands with T1.|I.health-api,V14,V18

@@ -3,7 +3,7 @@
 //! Concrete backend types are wired here so handlers stay free of generics.
 //! Swap point: change the type aliases below — handlers are untouched.
 
-use crate::{auth::BuiltinAuth, sessions::SessionRegistry};
+use crate::{auth::BuiltinAuth, image_cache::ImageCache, sessions::SessionRegistry};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use uuid::Uuid;
 
@@ -14,6 +14,7 @@ pub struct AppState {
     pub stores: Stores,
     pub auth: Auth,
     pub sessions: SessionRegistry,
+    pub images: Option<ImageCache>,
     pub server_id: String,
     pub server_name: String,
     pub version: &'static str,
@@ -27,9 +28,15 @@ impl AppState {
             stores,
             auth,
             sessions,
+            images: None,
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
             version: env!("CARGO_PKG_VERSION"),
         }
+    }
+
+    pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
+        self.images = Some(cache);
+        self
     }
 }

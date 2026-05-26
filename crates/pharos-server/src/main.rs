@@ -4,6 +4,7 @@ use pharos_server::{
     cli::{AdminOp, Cli, Cmd},
     config::Config,
     health::{ReadinessError, ReadinessHandle},
+    image_cache::ImageCache,
     middleware::RedMetrics,
     obs, router,
     state::AppState,
@@ -51,7 +52,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
-    let app_state = web::Data::new(AppState::new(stores, cfg.server.name.clone()));
+    let mut state = AppState::new(stores, cfg.server.name.clone());
+    if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
+        state = state.with_image_cache(ImageCache::new(cache_dir));
+    }
+    let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
 
     // Probes whose readiness must flip true before /readyz returns 200.
