@@ -126,7 +126,24 @@ async fn playback_info(
     };
 
     let streams = build_media_streams(probe, is_video);
-    let default_audio_stream_index = if is_video { 1 } else { 0 };
+    // Find the audio stream's actual index (or skip if there isn't one).
+    // Hard-coding `1` for silent-video files made jellyfin-web's player
+    // try to select a track that doesn't exist.
+    let default_audio_stream_index: Option<u32> = streams
+        .iter()
+        .find(|s| s.kind == "Audio")
+        .map(|s| s.index);
+
+    // TranscodingSubProtocol only makes sense alongside a real
+    // TranscodingUrl. Emitting `"hls"` unconditionally made
+    // jellyfin-web's htmlVideoPlayer route the direct-play webm URL
+    // through hls.js — which then errored with manifestParsingError
+    // when it tried to parse the webm bytes as an HLS manifest.
+    let transcoding_sub_protocol = if transcoding_url.is_some() {
+        Some("hls")
+    } else {
+        None
+    };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "MediaSources": [{
@@ -144,7 +161,7 @@ async fn playback_info(
             "SupportsDirectStream": supports_direct_stream,
             "SupportsTranscoding": true,
             "TranscodingUrl": transcoding_url,
-            "TranscodingSubProtocol": "hls",
+            "TranscodingSubProtocol": transcoding_sub_protocol,
             "RequiresOpening": false,
             "RequiresClosing": false,
             "RequiresLooping": false,

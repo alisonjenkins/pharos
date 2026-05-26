@@ -243,7 +243,11 @@ pub struct MediaSourceLiteDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     pub name: String,
-    pub default_audio_stream_index: u32,
+    /// `None` when the source has no audio track. Hard-coding an index
+    /// for silent-video fixtures made jellyfin-web's player attempt
+    /// to select a track that doesn't exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_audio_stream_index: Option<u32>,
     pub video_type: &'static str,
     pub e_tag: String,
 }
@@ -421,7 +425,10 @@ impl BaseItemDto {
         let run_time_ticks = probe.run_time_ticks().unwrap_or(0);
 
         let media_streams = build_media_streams(probe, is_video);
-        let default_audio_stream_index = if is_video { 1 } else { 0 };
+        let default_audio_stream_index: Option<u32> = media_streams
+            .iter()
+            .find(|s| s.kind == "Audio")
+            .map(|s| s.index);
 
         Self {
             id: item.id.to_string(),
