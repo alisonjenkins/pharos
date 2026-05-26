@@ -8,6 +8,12 @@ test:
 lint:
     nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
+# Supply-chain checks (T45). Runs cargo-audit (RustSec advisories) and
+# cargo-deny (licenses + bans + sources) under the policies in
+# deny.toml.
+audit:
+    nix develop --command bash -c 'cargo audit && cargo deny check'
+
 # Boot pharos with a known config, run schemathesis against the live
 # port, then shut down. Layer A of T29. Requires `pkgs.schemathesis` from
 # the devShell.

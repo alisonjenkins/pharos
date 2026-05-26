@@ -1,0 +1,11 @@
+# cargo-audit configuration.
+# Keep `ignore` in sync with the matching list in `/deny.toml`.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack on `rsa`. Pulled in transitively
+    # through sqlx-mysql (which sqlx-macros-core depends on regardless
+    # of features). Pharos never enables sqlx's mysql feature and never
+    # uses RSA, so the timing side-channel is unreachable in our binary.
+    "RUSTSEC-2023-0071",
+]

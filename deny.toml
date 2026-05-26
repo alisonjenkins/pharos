@@ -1,0 +1,69 @@
+# cargo-deny config — supply-chain guardrails for pharos.
+# Invoke via `just audit` or `nix develop --command cargo deny check`.
+#
+# Three checks live here: advisories (RustSec), bans (banned crates +
+# duplicate-version policy), and licenses (allowed set, with a small
+# exception list for transitive deps we can't avoid).
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack on the `rsa` crate. Pulled in
+    # transitively by sqlx-mysql via sqlx-macros-core (the proc-macro
+    # crate hard-deps every driver). Pharos never enables the mysql
+    # feature on sqlx and never uses RSA in any code path, so this is
+    # not reachable in our compiled binary. Re-evaluate when sqlx ships
+    # a fix or moves to a non-affected RSA impl.
+    "RUSTSEC-2023-0071",
+]
+
+[licenses]
+# cargo-deny ≥0.14 removed `unlicensed`/`copyleft`/`default` keys.
+# Behaviour now: anything not in `allow` is denied automatically.
+confidence-threshold = 0.92
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "AGPL-3.0-or-later",
+    "BSL-1.0",
+    # webpki-roots ships its bundled CA list under CDLA-Permissive-2.0;
+    # the upstream Mozilla CCADB data is the actual licensed payload.
+    "CDLA-Permissive-2.0",
+]
+
+[[licenses.exceptions]]
+# `ring` ships under a custom non-SPDX license that's a derivative of
+# ISC + BoringSSL + OpenSSL. cargo-deny matches it imperfectly.
+name = "ring"
+allow = ["ISC", "MIT", "OpenSSL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal workspace crates use `path = "..."` with implicit `*`
+# version; that's not a real wildcard on crates.io.
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # The whole point of T44 is that token bytes never leak — banning
+    # rand_chacha at workspace level forces a deliberate review if a
+    # contributor adds a non-CSPRNG to the auth path.
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

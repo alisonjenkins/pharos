@@ -16,6 +16,9 @@ edition = "2021"
 rust-version = "1.80"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/ali/pharos"
+# Internal crates — distribution is via the `pharos` binary, the
+# OCI image, and the nix flake, not crates.io.
+publish = false
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
