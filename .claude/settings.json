@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'set -e; INPUT=$(cat); WORKTREE_PATH=$(echo \"$INPUT\" | jq -r .worktree_path); BASE_BRANCH=$(echo \"$INPUT\" | jq -r .base_branch); BRANCH_NAME=\"agent/$(basename \"$WORKTREE_PATH\")\"; git -C \"/Users/ali/git/personal/pharos\" worktree add -B \"$BRANCH_NAME\" \"$WORKTREE_PATH\" \"$BASE_BRANCH\" >&2; echo \"$WORKTREE_PATH\"'"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'INPUT=$(cat); WORKTREE_PATH=$(echo \"$INPUT\" | jq -r .worktree_path); BRANCH_NAME=\"agent/$(basename \"$WORKTREE_PATH\")\"; git -C \"/Users/ali/git/personal/pharos\" worktree remove --force \"$WORKTREE_PATH\" 2>/dev/null || true; git -C \"/Users/ali/git/personal/pharos\" branch -D \"$BRANCH_NAME\" 2>/dev/null || true'"
+          }
+        ]
+      }
+    ]
+  }
+}

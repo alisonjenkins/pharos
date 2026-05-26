@@ -17,6 +17,12 @@ Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) re
 - Tasks numbered T1…T27 in §T. Pick next via `/ck:build --next` or `/ck:build T<n>`.
 - Bugs append to §B with cause + invariant link (`/ck:spec bug: …`).
 
+## Subagent worktree isolation
+
+`.claude/settings.json` configures `WorktreeCreate` / `WorktreeRemove` hooks so the `Agent` tool with `isolation: "worktree"` works. Each isolated agent gets its own `agent/<basename>` ephemeral branch off `main`; the hook cleans up the branch on remove.
+
+If `Agent isolation: "worktree"` errors with "not in a git repository", restart Claude Code once — settings hot-reload is best-effort and the harness's git-repo check is cached at session start. Worktrees should work in subsequent sessions.
+
 ## Stack
 
 actix-web · clap derive · tokio · sqlx (planned T2) · Dioxus (planned T24) · tracing + metrics + Prometheus.
