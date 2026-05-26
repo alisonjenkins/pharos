@@ -5,6 +5,7 @@ members = [
     "crates/pharos-scanner",
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
+    "crates/pharos-ui",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ getrandom = "0.2"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "html_reports"] }
+dioxus = { version = "0.6", default-features = false, features = ["macro", "html", "hooks", "signals"] }
 serde = { version = "1", features = ["derive"] }
 sonic-rs = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }

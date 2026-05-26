@@ -93,7 +93,7 @@ T20|.|extensions past parity (TBD — defer scope to post-T19)|
 T21|x|Jellyfin architecture audit: extract patterns, map to idiomatic Rust traits, doc in `docs/jellyfin-mapping.md`. Lands before T5.|V12
 T22|x|health-api: `/healthz`, `/readyz`, `/info`, `/metrics`. Lands with T1.|I.health-api,V14,V18
 T23|x|observability deepening: span attrs for media ops, RED metrics per route, log redaction|I.obs,V8,V13,V15
-T24|.|dioxus-ui crate: workspace member, WASM build pipeline, served via axum static + fallback|I.dioxus-ui,V16
+T24|x|dioxus-ui crate skeleton phase 1: workspace member, library with first component, builds on host. WASM build pipeline + actix static serving deferred to T24 phase 2.|I.dioxus-ui,V16
 T25|.|dioxus-ui: login + library browse views, talks Jellyfin-compat API|I.dioxus-ui,V16,V1
 T26|.|dioxus-ui: player view (HLS + direct), session reporting|I.dioxus-ui,V16,V1
 T27|.|dioxus-ui: group session UI (join room, sync indicator, chat)|I.dioxus-ui,V3,V16
