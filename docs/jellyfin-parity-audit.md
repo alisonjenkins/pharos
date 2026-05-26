@@ -491,17 +491,24 @@ Items 1–5 = the bulk of user-visible parity uplift. After item 8 a
 Finamp / Jellyfin-web session looks like real Jellyfin for direct play.
 Items 9–15 = polish + admin.
 
-## 6. Out of scope (✗)
+## 6. Scope notes (re-baselined 2026-05-26)
 
-Listed explicitly so reviewers push back on PRs sneaking them in.
+User reversed several previously won't-do items into planned. Items
+moved to **deferred (→ T<n>)** now have dedicated T-rows in SPEC.md.
 
-- **Live TV** — 41 `/LiveTv/*` endpoints. Tuner discovery (HDHomeRun, IPTV M3U), EPG (Schedules Direct, XMLTV), DVR, series timers, listing-provider config. No tuner abstraction in Phase 1. Finamp / Infuse don't surface it anyway.
-- **DLNA** — Removed upstream in 10.11 (zero `/Dlna/*` paths in snapshot). pharos follows; SSDP + content-directory XML not coming back. Cast / AirPlay (if ever wanted) are separate tasks post-parity.
+**Planned (deferred to named §T row)**
+
+- **Live TV** — 41 `/LiveTv/*` endpoints. Tuner discovery (HDHomeRun, IPTV M3U), EPG (Schedules Direct, XMLTV), DVR, series timers, listing-provider config. Tracked under **T47**.
+- **DLNA** — Removed upstream in 10.11 (zero `/Dlna/*` paths in snapshot) but pharos wants the discovery + UPnP control surface for non-Jellyfin DLNA clients. Tracked under **T48**.
+- **Admin web panel** — `/System/Configuration/*` POST, `/Dashboard/*`, `/Startup/*`, `/Environment/*`, plugin install, scheduled-task triggers, listing-provider config, `/Library/VirtualFolders` POST/DELETE, user create/delete, backup. Tracked under **T46** (server-side) + **T50** (Dioxus admin UI mirror).
+- **SyncPlay UI conformance** — multi-context Playwright proof of V19/V20 in a real browser pair. Tracked under **T49**.
+
+**Still out of scope (✗)**
+
 - **Runtime plugin DLLs** — No stable Rust ABI; plugins are cargo crates composed at build (jellyfin-mapping.md §4). WASM host could restore dynamic extension; past Phase 2.
 - **Broadcast / push channels** — `/Library/{Movies,Series,Media}/{Added,Updated}` inbound webhook for metadata agents. Scanner enumerates itself.
-- **Admin web panel** — `/System/Configuration/*`, `/Dashboard/*`, `/Startup/*`, `/Environment/*`, plugin install, scheduled-task triggers, listing-provider config, `/Library/VirtualFolders` POST/DELETE, user create/delete, backup. Admin = TOML + CLI. Read-only stubs for pre-auth GETs; rest `✗`.
-- **Per-item destructive ops** — `DELETE /Items`, `DELETE /Items/{itemId}`, `POST /Videos/MergeVersions`, `DELETE /Videos/{itemId}/AlternateSources`, metadata-editor POSTs, remote-search apply. Risk:reward bad — no client needs them.
-- **Provider chrome** — `/Items/RemoteSearch/*`, `/Items/{itemId}/RemoteSearch/*`, `/Providers/{Subtitles,Lyrics}/*`, `/Tmdb/ClientConfiguration`. Behind plugin system. Phase 2.
+- **Per-item destructive ops** — `DELETE /Items`, `DELETE /Items/{itemId}`, `POST /Videos/MergeVersions`, `DELETE /Videos/{itemId}/AlternateSources`. Risk:reward bad — no client needs them.
+- **Provider chrome** — `/Items/RemoteSearch/*`, `/Items/{itemId}/RemoteSearch/*`, `/Providers/{Subtitles,Lyrics}/*`, `/Tmdb/ClientConfiguration`. Behind plugin system. Phase 2 alongside T20.
 
 ## 7. Bookkeeping
 
@@ -510,8 +517,9 @@ Approximate bucket counts across the 315-path 10.11.10 surface:
 - Implemented (`✓`): ~20 paths (System × 2, Users × 2, Items × 4, Videos/Audio × 4, Sessions × 8).
 - Stub-priority (T19 §5 items 1–8): ~80 paths, mostly one-line empty / static.
 - Real-impl backlog (T19 §5 items 9–15): ~60 paths.
-- Won't-do (`✗`): ~140 paths — LiveTV, plugin/package, admin write, remote-search, dashboard, startup, backup, environment.
-- Reserved for sibling tasks: 22 SyncPlay (T16/T17), 13 HLS + MediaInfo (T8/T9).
+- Won't-do (`✗`): ~80 paths — runtime plugin DLLs, destructive ops, provider chrome, broadcast push. (Down from 140 after T46/T47/T48 reopen.)
+- Re-baselined to planned (→ T<n>): ~60 paths — Live TV (T47), DLNA (T48), Admin web panel (T46/T50).
+- Reserved for sibling tasks: 22 SyncPlay (T16/T17/T49), 13 HLS + MediaInfo (T8/T9/T41/T42).
 
 Re-derive via `curl https://api.jellyfin.org/openapi/jellyfin-openapi-stable.json | jq …`.
 
