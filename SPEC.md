@@ -2,7 +2,9 @@
 
 ## §G goal
 
-Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better perf/reliability than both. Group watch + group listen first-class, not bolt-on. Group-sync is a **primary motivation** — Jellyfin's SyncPlay is buggy in practice (late-joiner desync, poor-network member drags whole group, buffer storms on leader handoff). pharos must improve on those, not replicate them.
+Rust media server. Wire-compat with Jellyfin clients (Phase 1) and Plex clients (Phase 2). Better perf/reliability than both. Group watch + group listen first-class, not bolt-on. Group-sync is a **primary motivation** — Jellyfin's SyncPlay is buggy in practice (late-joiner desync, poor-network member drags whole group, buffer storms on leader handoff). pharos must improve on those, not replicate them.
+
+**Phase 1 priority order**: (1) Jellyfin client compat, (2) Dioxus web UI, (3) core (scan/store/group-sync). Plex (T11–T14) waits until Phase 1 is solid.
 
 ## §C constraints
 
@@ -15,10 +17,10 @@ Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better pe
 - Benchmarks: every SIMD-accelerated or otherwise hot code path has a `criterion` benchmark under the owning crate's `benches/`. Bench gates regressions, not unit correctness.
 - Test runner: `cargo nextest run --workspace`. Config in `.config/nextest.toml`. Doctests via `cargo test --doc` separately.
 - Web UI: Dioxus (Rust → WASM). Single-lang stack.
-- API compat: existing Jellyfin clients (Finamp, Infuse, Jellyfin web/mobile/TV) work unmodified.
-- API compat: existing Plex clients (Plex web/mobile/TV, Plexamp) work unmodified.
-- Phase 1: feature-parity with Jellyfin.
-- Phase 2: extensions past parity.
+- API compat: existing Jellyfin clients (Finamp, Infuse, Jellyfin web/mobile/TV) work unmodified — Phase 1 hard requirement.
+- API compat: existing Plex clients (Plex web/mobile/TV, Plexamp) work unmodified — **Phase 2; deprioritised**. T11–T14 hold but no Plex work blocks Jellyfin progress.
+- Phase 1: feature-parity with Jellyfin + pharos-native group-sync.
+- Phase 2: Plex client compat + extensions past Jellyfin parity.
 - Transcoding via ffmpeg (subprocess, no FFI initially).
 - Single binary deploy. Config file + env vars. No external runtime deps beyond ffmpeg.
 - TDD: failing test before impl change. No "test later".
