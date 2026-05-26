@@ -26,3 +26,38 @@ compat-openapi addr="127.0.0.1:18096":
 # Run the in-process Jellyfin client roundtrip test (Layer B).
 compat-client:
     nix develop --command cargo nextest run --workspace --test client_compat
+
+# Playwright driving headless jellyfin-web (Phase 3). Assumes pharos is
+# already running on PHAROS_URL (default http://127.0.0.1:8096) and that
+# `compat-playwright/scripts/setup.sh` has run at least once.
+compat-playwright:
+    nix develop --command bash -c 'cd compat-playwright && npx playwright test'
+
+# Convenience: spin up pharos with seeded data + run Playwright in one
+# shot. Uses a fresh tmp sqlite db so prior state doesn't leak.
+compat-playwright-full:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    cat > "$TMP/pharos.toml" <<EOF
+    [server]
+    bind = "127.0.0.1:8096"
+    name = "pharos-playwright"
+
+    [obs]
+    log_level = "warn"
+
+    [media]
+    roots = []
+
+    [database]
+    url = "sqlite://$TMP/pharos.db?mode=rwc"
+    EOF
+    PHAROS_CONFIG="$TMP/pharos.toml"
+    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    nix develop --command bash -c "cargo run -q --bin pharos -- --config '$PHAROS_CONFIG' serve" &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
+    sleep 2
+    nix develop --command bash -c 'cd compat-playwright && npx playwright test'

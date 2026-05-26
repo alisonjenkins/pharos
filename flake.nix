@@ -103,6 +103,11 @@
             pkgs.git
             pkgs.just
             pkgs.curl
+            # Node + Playwright drive T29 phase 3 (jellyfin-web headless).
+            # Browser binaries come from playwright-driver.browsers and
+            # are wired in via PLAYWRIGHT_BROWSERS_PATH below.
+            pkgs.nodejs_22
+            pkgs.playwright-driver.browsers
             # schemathesis (Layer A of T29) — install separately via:
             #   pipx install schemathesis
             # Not pinned in the flake because nixpkgs lacks a stable
@@ -111,6 +116,8 @@
           ];
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
+            export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+            export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
           '';
         };
 

@@ -43,8 +43,56 @@ async fn main() -> Result<(), AppError> {
                 let mut lock = stdout.lock();
                 writeln!(lock, "{cfg:#?}")?;
             }
+            AdminOp::SeedPlaywrightUser => seed_playwright_user(&cfg).await?,
         },
     }
+    Ok(())
+}
+
+async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
+    use pharos_core::{
+        MediaItem, MediaKind, MediaStore, SecretString, UserId, UserPolicy, UserRecord, UserStore,
+    };
+    use pharos_server::auth::BuiltinAuth;
+
+    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let auth = BuiltinAuth::new(stores.clone());
+
+    // Idempotent: ignore Conflict.
+    let hash = auth
+        .hash_password(&SecretString::new("playwright-test-pw"))
+        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+    let user = UserRecord {
+        id: UserId::new(),
+        name: "playwright".into(),
+        password_hash: hash,
+        policy: UserPolicy { admin: true },
+    };
+    if let Err(e) = stores.create(user).await {
+        if !matches!(e, pharos_core::AuthError::Conflict) {
+            return Err(AppError::Io(std::io::Error::other(e.to_string())));
+        }
+    }
+    for (i, kind) in [
+        (1u64, MediaKind::Movie),
+        (2, MediaKind::Movie),
+        (3, MediaKind::Episode),
+        (4, MediaKind::Audio),
+    ] {
+        let item = MediaItem {
+            id: i,
+            path: format!("/playwright-fixture/{i}.mkv").into(),
+            title: format!("Playwright Title {i}"),
+            kind,
+        };
+        let _ = stores.put(item).await;
+    }
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    writeln!(
+        lock,
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 4 items",
+    )?;
     Ok(())
 }
 

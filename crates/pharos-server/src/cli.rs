@@ -29,6 +29,10 @@ pub enum Cmd {
 pub enum AdminOp {
     /// Print resolved config.
     PrintConfig,
+    /// Seed the known Playwright compat user (`playwright` /
+    /// `playwright-test-pw`) plus a handful of placeholder items.
+    /// Idempotent — re-running is a no-op for existing rows.
+    SeedPlaywrightUser,
 }
 
 #[cfg(test)]
