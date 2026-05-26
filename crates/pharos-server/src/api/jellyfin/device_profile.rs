@@ -182,12 +182,18 @@ fn matches_csv(csv: &str, candidate: &str) -> bool {
         .any(|s| s.eq_ignore_ascii_case(candidate))
 }
 
+/// `candidate = None` means the source file has no stream of this kind
+/// (e.g. a silent video). Treat that as a match — direct play still
+/// works, the client just doesn't play any audio. Previously this
+/// returned `false`, which sent silent WebM video down the transcode
+/// path; with no TranscodingUrl populated the client surfaced "Playback
+/// Error" instead of just playing the video silently.
 fn matches_codec(csv: &str, candidate: Option<&str>) -> bool {
     if csv.is_empty() {
         return true;
     }
     let Some(c) = candidate else {
-        return false;
+        return true;
     };
     matches_csv(csv, c)
 }
@@ -347,6 +353,26 @@ mod tests {
                 dp("mp3", "", "mp3", "Audio"),
             ],
             ..Default::default()
+        };
+        assert_eq!(negotiate(&profile, &source), Decision::DirectPlay);
+    }
+
+    #[test]
+    fn silent_video_still_direct_plays() {
+        // Some test fixtures (BBB WebM corpus, no audio track). Profile
+        // demands an audio codec, but the file has none — direct play
+        // should still succeed (browser will play silently) rather than
+        // forcing a transcode whose TranscodingUrl is never wired up.
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![dp("webm", "vp9", "vorbis,opus", "Video")],
+            ..Default::default()
+        };
+        let source = SourceMedia {
+            container: "webm".into(),
+            video_codec: Some("vp9".into()),
+            audio_codec: None,
+            bitrate_bps: Some(2_000_000),
+            is_video: true,
         };
         assert_eq!(negotiate(&profile, &source), Decision::DirectPlay);
     }

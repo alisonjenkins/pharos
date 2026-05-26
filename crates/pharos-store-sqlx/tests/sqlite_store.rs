@@ -17,6 +17,7 @@ fn item(id: u64, path: &str, title: &str, kind: MediaKind) -> MediaItem {
         path: path.into(),
         title: title.into(),
         kind,
+        ..Default::default()
     }
 }
 

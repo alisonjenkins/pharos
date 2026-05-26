@@ -1,6 +1,9 @@
-//! `ffprobe` subprocess + SIMD JSON parsing via `sonic-rs`.
+//! `ffprobe` subprocess + SIMD JSON parsing via `sonic-rs`. Yields a full
+//! `ProbeInfo { kind, probe: MediaProbe }` so the API surface can render
+//! real Size / Bitrate / RunTimeTicks / Width / Height / FrameRate /
+//! codec / channels / sample rate without re-shelling on every request.
 
-use pharos_core::{DomainError, DomainResult, MediaKind, ProbeInfo, Prober};
+use pharos_core::{DomainError, DomainResult, MediaKind, MediaProbe, ProbeInfo, Prober};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +70,23 @@ struct FfprobeOutput {
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
     codec_type: String,
+    #[serde(default)]
+    codec_name: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    channels: Option<u32>,
+    /// ffprobe reports `sample_rate` as a string ("48000").
+    #[serde(default)]
+    sample_rate: Option<String>,
+    /// Rational frame rate, e.g. `"24000/1001"`. `avg_frame_rate`
+    /// preferred over `r_frame_rate` for VFR sources.
+    #[serde(default)]
+    avg_frame_rate: Option<String>,
+    #[serde(default)]
+    r_frame_rate: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -75,6 +95,10 @@ struct FfprobeFormat {
     format_name: Option<String>,
     #[serde(default)]
     duration: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    bit_rate: Option<String>,
 }
 
 /// Public so the criterion bench in `benches/parse.rs` can call directly
@@ -89,11 +113,67 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         .as_deref()
         .and_then(|s| s.parse::<f64>().ok())
         .map(|s| (s * 1000.0) as u64);
+    let size_bytes = parsed
+        .format
+        .size
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok());
+    let bitrate_bps = parsed
+        .format
+        .bit_rate
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let video_stream = parsed.streams.iter().find(|s| s.codec_type == "video");
+    let audio_stream = parsed.streams.iter().find(|s| s.codec_type == "audio");
+
+    let video_codec = video_stream.and_then(|s| s.codec_name.clone());
+    let audio_codec = audio_stream.and_then(|s| s.codec_name.clone());
+    let width = video_stream.and_then(|s| s.width);
+    let height = video_stream.and_then(|s| s.height);
+    let frame_rate_mille = video_stream.and_then(|s| {
+        s.avg_frame_rate
+            .as_deref()
+            .and_then(parse_rational_mille)
+            .or_else(|| s.r_frame_rate.as_deref().and_then(parse_rational_mille))
+    });
+    let audio_channels = audio_stream.and_then(|s| s.channels);
+    let sample_rate = audio_stream
+        .and_then(|s| s.sample_rate.as_deref())
+        .and_then(|s| s.parse::<u32>().ok());
+
     Ok(ProbeInfo {
         kind,
-        duration_ms,
-        container: parsed.format.format_name,
+        probe: MediaProbe {
+            size_bytes,
+            duration_ms,
+            container: parsed.format.format_name,
+            bitrate_bps,
+            video_codec,
+            audio_codec,
+            width,
+            height,
+            frame_rate_mille,
+            audio_channels,
+            sample_rate,
+        },
     })
+}
+
+/// ffprobe rationals look like `"24000/1001"`. `0/0` (no frames seen)
+/// and a 0 denominator both yield `None`.
+fn parse_rational_mille(s: &str) -> Option<u32> {
+    let (num, den) = s.split_once('/')?;
+    let num: f64 = num.parse().ok()?;
+    let den: f64 = den.parse().ok()?;
+    if den == 0.0 {
+        return None;
+    }
+    let fps = num / den;
+    if !fps.is_finite() || fps <= 0.0 {
+        return None;
+    }
+    Some((fps * 1000.0).round() as u32)
 }
 
 fn infer_kind(out: &FfprobeOutput) -> MediaKind {
@@ -113,37 +193,75 @@ mod tests {
 
     const VIDEO_JSON: &[u8] = br#"{
         "streams": [
-            {"codec_type": "video"},
-            {"codec_type": "audio"}
+            {"codec_type": "video", "codec_name": "vp9", "width": 1920, "height": 1080,
+             "avg_frame_rate": "24000/1001", "r_frame_rate": "24/1"},
+            {"codec_type": "audio", "codec_name": "opus", "channels": 2,
+             "sample_rate": "48000"}
         ],
-        "format": {"format_name": "matroska,webm", "duration": "3600.5"}
+        "format": {"format_name": "matroska,webm", "duration": "3600.5",
+                   "size": "5243523", "bit_rate": "4000000"}
     }"#;
 
     const AUDIO_JSON: &[u8] = br#"{
-        "streams": [{"codec_type": "audio"}],
-        "format": {"format_name": "flac", "duration": "245.123"}
+        "streams": [
+            {"codec_type": "audio", "codec_name": "mp3", "channels": 2,
+             "sample_rate": "44100"}
+        ],
+        "format": {"format_name": "mp3", "duration": "245.123",
+                   "size": "9876543", "bit_rate": "320000"}
     }"#;
 
     #[test]
-    fn parse_video_returns_movie() {
+    fn parse_video_extracts_full_metadata() {
         let info = parse_ffprobe_output(VIDEO_JSON).unwrap();
         assert_eq!(info.kind, MediaKind::Movie);
-        assert_eq!(info.duration_ms, Some(3_600_500));
-        assert_eq!(info.container.as_deref(), Some("matroska,webm"));
+        let p = &info.probe;
+        assert_eq!(p.duration_ms, Some(3_600_500));
+        assert_eq!(p.container.as_deref(), Some("matroska,webm"));
+        assert_eq!(p.size_bytes, Some(5_243_523));
+        assert_eq!(p.bitrate_bps, Some(4_000_000));
+        assert_eq!(p.video_codec.as_deref(), Some("vp9"));
+        assert_eq!(p.audio_codec.as_deref(), Some("opus"));
+        assert_eq!(p.width, Some(1920));
+        assert_eq!(p.height, Some(1080));
+        assert_eq!(p.audio_channels, Some(2));
+        assert_eq!(p.sample_rate, Some(48000));
+        // 24000/1001 ≈ 23.976 fps → 23_976 in mille.
+        assert_eq!(p.frame_rate_mille, Some(23_976));
     }
 
     #[test]
-    fn parse_audio_only_returns_audio() {
+    fn parse_audio_only_skips_video_fields() {
         let info = parse_ffprobe_output(AUDIO_JSON).unwrap();
         assert_eq!(info.kind, MediaKind::Audio);
-        assert_eq!(info.duration_ms, Some(245_123));
+        let p = &info.probe;
+        assert_eq!(p.duration_ms, Some(245_123));
+        assert_eq!(p.video_codec, None);
+        assert_eq!(p.width, None);
+        assert_eq!(p.height, None);
+        assert_eq!(p.frame_rate_mille, None);
+        assert_eq!(p.audio_codec.as_deref(), Some("mp3"));
+        assert_eq!(p.audio_channels, Some(2));
+        assert_eq!(p.sample_rate, Some(44100));
     }
 
     #[test]
     fn parse_missing_duration_is_none() {
         let json = br#"{"streams":[{"codec_type":"audio"}],"format":{}}"#;
         let info = parse_ffprobe_output(json).unwrap();
-        assert!(info.duration_ms.is_none());
+        assert!(info.probe.duration_ms.is_none());
+        assert!(info.probe.size_bytes.is_none());
+    }
+
+    #[test]
+    fn parse_zero_over_zero_frame_rate_is_none() {
+        let json = br#"{
+            "streams": [{"codec_type": "video", "avg_frame_rate": "0/0",
+                         "r_frame_rate": "0/0"}],
+            "format": {}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(info.probe.frame_rate_mille, None);
     }
 
     #[test]

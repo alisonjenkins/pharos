@@ -90,10 +90,16 @@ async fn content_directory_control(
     let action = soap_action_name(&req);
     match action.as_deref() {
         Some("Browse") => {
-            // Pull ObjectID + BrowseFlag for log/debug; current impl
-            // always returns the full library when ObjectID is "0" or
-            // "root" — folders aren't modeled yet.
+            // Pull ObjectID + StartingIndex + RequestedCount. Pharos
+            // doesn't model folders yet so any ObjectID resolves to
+            // the flat library — but pagination is honoured so control
+            // points that scroll a 50k library don't re-fetch the
+            // whole DIDL response on every page.
             let object_id = extract_xml_tag(body_str, "ObjectID").unwrap_or_default();
+            let starting_index =
+                parse_browse_u32(body_str, "StartingIndex").unwrap_or(0);
+            let requested_count =
+                parse_browse_u32(body_str, "RequestedCount").unwrap_or(0);
             let items = match state.stores.list().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -101,7 +107,14 @@ async fn content_directory_control(
                 }
             };
             let base = base_url_from_request(&req);
-            let xml = browse_response_xml(&items, &object_id, &base, &state.server_id);
+            let xml = browse_response_xml(
+                &items,
+                &object_id,
+                &base,
+                &state.server_id,
+                starting_index,
+                requested_count,
+            );
             HttpResponse::Ok()
                 .content_type("text/xml; charset=\"utf-8\"")
                 .body(xml)
@@ -215,17 +228,44 @@ pub fn device_description_xml(server_id: &str, server_name: &str, base: &str) ->
     )
 }
 
-/// Build a `Browse` SOAP response carrying every library item as a
-/// DIDL-Lite `<item>` under the root container.
+/// Parse an integer-typed UPnP Browse argument. Missing / unparseable
+/// fields yield None — caller decides the default (0 = "from start"
+/// for StartingIndex; 0 = "all" for RequestedCount).
+pub fn parse_browse_u32(body: &str, tag: &str) -> Option<u32> {
+    extract_xml_tag(body, tag).and_then(|s| s.trim().parse().ok())
+}
+
+/// Soft cap on a single Browse response so a control point that asks
+/// for "all" doesn't drag a 50k-item DIDL across the wire in one shot.
+/// Real clients paginate already; this is a safety belt.
+pub const DLNA_BROWSE_MAX_PAGE: u32 = 1_000;
+
+/// Build a `Browse` SOAP response carrying a paginated slice of the
+/// library as DIDL-Lite `<item>` entries under the root container.
+///
+/// `starting_index` is 0-based per UPnP. `requested_count = 0` means
+/// "all" — we cap at [`DLNA_BROWSE_MAX_PAGE`].
 pub fn browse_response_xml(
     items: &[MediaItem],
     object_id: &str,
     base: &str,
     _server_id: &str,
+    starting_index: u32,
+    requested_count: u32,
 ) -> String {
+    let total = items.len() as u32;
+    let start = starting_index.min(total);
+    let cap = if requested_count == 0 {
+        DLNA_BROWSE_MAX_PAGE
+    } else {
+        requested_count.min(DLNA_BROWSE_MAX_PAGE)
+    };
+    let end = (start.saturating_add(cap)).min(total);
+    let page = &items[start as usize..end as usize];
+
     let mut didl = String::with_capacity(512);
     didl.push_str(r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">"#);
-    for item in items {
+    for item in page {
         let id = item.id;
         let title = xml_escape(&item.title);
         let class = match item.kind {
@@ -246,7 +286,7 @@ pub fn browse_response_xml(
     }
     didl.push_str("</DIDL-Lite>");
     let didl_escaped = xml_escape(&didl);
-    let count = items.len();
+    let number_returned = page.len();
     let object_id_safe = xml_escape(object_id);
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -254,8 +294,8 @@ pub fn browse_response_xml(
   <s:Body>
     <u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
       <Result>{didl_escaped}</Result>
-      <NumberReturned>{count}</NumberReturned>
-      <TotalMatches>{count}</TotalMatches>
+      <NumberReturned>{number_returned}</NumberReturned>
+      <TotalMatches>{total}</TotalMatches>
       <UpdateID>1</UpdateID>
       <ObjectID>{object_id_safe}</ObjectID>
     </u:BrowseResponse>
@@ -338,12 +378,14 @@ mod tests {
                 path: PathBuf::from("/m/1.webm"),
                 title: "Movie 1 & friends".into(),
                 kind: MediaKind::Movie,
+                ..Default::default()
             },
             MediaItem {
                 id: 5,
                 path: PathBuf::from("/m/5.mp3"),
                 title: "Track".into(),
                 kind: MediaKind::Audio,
+                ..Default::default()
             },
         ]
     }
@@ -365,7 +407,7 @@ mod tests {
 
     #[test]
     fn browse_response_emits_one_didl_item_per_media_item() {
-        let xml = browse_response_xml(&fixture_items(), "0", "http://x", "srv");
+        let xml = browse_response_xml(&fixture_items(), "0", "http://x", "srv", 0, 0);
         assert!(xml.contains("<NumberReturned>2</NumberReturned>"));
         assert!(xml.contains("<TotalMatches>2</TotalMatches>"));
         // DIDL is double-escaped — `<item id="1"` becomes
@@ -381,9 +423,39 @@ mod tests {
     fn browse_response_xml_escapes_title() {
         // `Movie 1 & friends` must arrive as `&amp;` even after the
         // double-escape (the DIDL inner XML is itself entity-encoded).
-        let xml = browse_response_xml(&fixture_items(), "0", "http://x", "srv");
+        let xml = browse_response_xml(&fixture_items(), "0", "http://x", "srv", 0, 0);
         // After two passes, `&` → `&amp;` (first pass) → `&amp;amp;` (second).
         assert!(xml.contains("Movie 1 &amp;amp; friends"));
+    }
+
+    #[test]
+    fn browse_response_honours_starting_index_and_requested_count() {
+        // Build 5 fake items.
+        let items: Vec<MediaItem> = (0..5)
+            .map(|i| MediaItem {
+                id: i,
+                path: PathBuf::from(format!("/m/{i}.mkv")),
+                title: format!("Item {i}"),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            })
+            .collect();
+        let xml = browse_response_xml(&items, "0", "http://x", "srv", 1, 2);
+        // Window {1, 2} → 2 returned, total still 5.
+        assert!(xml.contains("<NumberReturned>2</NumberReturned>"), "{xml}");
+        assert!(xml.contains("<TotalMatches>5</TotalMatches>"));
+        // Item 1 and 2 present, 0/3/4 absent (DIDL doubly-escaped).
+        assert!(xml.contains("&lt;item id=&quot;1&quot;"));
+        assert!(xml.contains("&lt;item id=&quot;2&quot;"));
+        assert!(!xml.contains("&lt;item id=&quot;0&quot;"));
+        assert!(!xml.contains("&lt;item id=&quot;3&quot;"));
+    }
+
+    #[test]
+    fn parse_browse_u32_handles_present_and_missing_tags() {
+        let body = r#"<Browse><StartingIndex>7</StartingIndex></Browse>"#;
+        assert_eq!(parse_browse_u32(body, "StartingIndex"), Some(7));
+        assert_eq!(parse_browse_u32(body, "RequestedCount"), None);
     }
 
     #[test]

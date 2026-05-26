@@ -8,6 +8,7 @@ use crate::{
     live_tv::M3uXmltvBackend, sessions::SessionRegistry,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
+use std::path::PathBuf;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -42,6 +43,10 @@ pub struct AppState {
     pub server_id: String,
     pub server_name: String,
     pub version: &'static str,
+    /// Configured media roots — same list the CLI `pharos scan`
+    /// walks. Held here so admin endpoints (`/Library/Refresh`) can
+    /// spawn a real background scan without re-parsing config.
+    pub media_roots: Vec<PathBuf>,
     /// Broadcast bus used by `/socket`. Capacity 256 — bursts during
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
@@ -64,6 +69,7 @@ impl AppState {
             images: None,
             hls: None,
             live_tv: None,
+            media_roots: Vec::new(),
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -89,6 +95,7 @@ impl AppState {
             images: None,
             hls: None,
             live_tv: None,
+            media_roots: Vec::new(),
             server_id,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -108,6 +115,11 @@ impl AppState {
 
     pub fn with_live_tv(mut self, backend: M3uXmltvBackend) -> Self {
         self.live_tv = Some(backend);
+        self
+    }
+
+    pub fn with_media_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.media_roots = roots;
         self
     }
 

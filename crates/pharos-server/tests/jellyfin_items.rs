@@ -41,6 +41,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
                 path: format!("/m/{i}.x").into(),
                 title: format!("title-{i}"),
                 kind: *k,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -261,4 +262,266 @@ async fn virtual_folders_returns_synth_library() {
     let arr = v.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["Name"], "All Media");
+}
+
+/// Probe metadata round-trips into /Items/{id} MediaSources so the
+/// jellyfin-web htmlVideoPlayer sees real Size + RunTimeTicks + Bitrate
+/// instead of pre-T29-followup hardcoded stubs. Caught when the dev env
+/// hung on the BBB fixture: 5.2 MB delivered against an advertised
+/// 107 KB / 200 kbps stub stalled MSE.
+async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>, String) {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 999,
+            path: "/m/probed.webm".into(),
+            title: "Probed".into(),
+            kind: MediaKind::Movie,
+            probe,
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "test".into()));
+    (state, token.0.expose().to_string())
+}
+
+#[actix_web::test]
+async fn get_item_renders_real_probe_metadata_into_media_source() {
+    let probe = pharos_core::MediaProbe {
+        size_bytes: Some(5_243_523),
+        duration_ms: Some(10_000),
+        container: Some("matroska,webm".into()),
+        bitrate_bps: Some(4_194_018),
+        video_codec: Some("vp9".into()),
+        audio_codec: Some("opus".into()),
+        width: Some(1920),
+        height: Some(1080),
+        frame_rate_mille: Some(23_976),
+        audio_channels: Some(2),
+        sample_rate: Some(48000),
+    };
+    let (state, token) = seed_with_probe(probe).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items/999")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let src = &v["MediaSources"][0];
+    assert_eq!(src["Size"], 5_243_523_u64, "size from probe");
+    assert_eq!(src["Bitrate"], 4_194_018_u64, "bitrate from probe");
+    assert_eq!(
+        src["RunTimeTicks"], 100_000_000_u64,
+        "10 s × 10_000_000 ticks/s"
+    );
+    assert_eq!(src["Container"], "webm");
+    let streams = src["MediaStreams"].as_array().unwrap();
+    let video = &streams[0];
+    assert_eq!(video["Type"], "Video");
+    assert_eq!(video["Codec"], "vp9");
+    assert_eq!(video["Width"], 1920);
+    assert_eq!(video["Height"], 1080);
+    let audio = &streams[1];
+    assert_eq!(audio["Type"], "Audio");
+    assert_eq!(audio["Codec"], "opus");
+    assert_eq!(audio["Channels"], 2);
+    assert_eq!(audio["SampleRate"], 48000);
+}
+
+#[actix_web::test]
+async fn get_item_omits_size_when_probe_absent() {
+    // No probe data → no fabricated Size. Clients treat missing Size as
+    // unknown rather than the old 107356 stub that lied about the file.
+    let (state, token) = seed_with_probe(pharos_core::MediaProbe::default()).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items/999")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let src = &v["MediaSources"][0];
+    assert!(src.get("Size").is_none(), "Size omitted, got {src:?}");
+    assert!(
+        src.get("Bitrate").is_none(),
+        "Bitrate omitted, got {src:?}"
+    );
+}
+
+#[actix_web::test]
+async fn playback_info_pulls_real_codec_and_size_from_probe() {
+    let probe = pharos_core::MediaProbe {
+        size_bytes: Some(5_243_523),
+        duration_ms: Some(10_000),
+        container: Some("matroska,webm".into()),
+        bitrate_bps: Some(4_194_018),
+        video_codec: Some("vp9".into()),
+        audio_codec: Some("opus".into()),
+        width: Some(1920),
+        height: Some(1080),
+        frame_rate_mille: Some(23_976),
+        audio_channels: Some(2),
+        sample_rate: Some(48000),
+    };
+    let (state, token) = seed_with_probe(probe).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Items/999/PlaybackInfo")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload("{}")
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let src = &v["MediaSources"][0];
+    assert_eq!(src["Container"], "webm");
+    assert_eq!(src["Size"], 5_243_523_u64);
+    assert_eq!(src["Bitrate"], 4_194_018_u64);
+    assert_eq!(src["RunTimeTicks"], 100_000_000_u64);
+    let streams = src["MediaStreams"].as_array().unwrap();
+    assert_eq!(streams[0]["Codec"], "vp9");
+    assert_eq!(streams[1]["Codec"], "opus");
+}
+
+#[actix_web::test]
+async fn user_views_returns_one_collection_per_media_root() {
+    // Seed two roots; expect two CollectionFolder entries with stable
+    // ids derived from each root path (T-fix-7 per-root libraries).
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 1,
+            path: "/media/Movies/big.mkv".into(),
+            title: "big".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 2,
+            path: "/media/TV/show.mkv".into(),
+            title: "show".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(
+        AppState::new(stores, "srv".into())
+            .with_media_roots(vec!["/media/Movies".into(), "/media/TV".into()]),
+    );
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{}/Views", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let names: Vec<&str> = items.iter().map(|x| x["Name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"Movies"));
+    assert!(names.contains(&"TV"));
+    // Each id must be 32 hex chars (per UI assumptions).
+    for it in items {
+        let id = it["Id"].as_str().unwrap();
+        assert_eq!(id.len(), 32, "id {id} not 32 hex chars");
+    }
+}
+
+#[actix_web::test]
+async fn list_items_filters_by_parent_id_to_one_library() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 1,
+            path: "/media/Movies/big.mkv".into(),
+            title: "movie-one".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 2,
+            path: "/media/TV/show/s01e01.mkv".into(),
+            title: "ep-one".into(),
+            kind: MediaKind::Episode,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(
+        AppState::new(stores, "srv".into())
+            .with_media_roots(vec!["/media/Movies".into(), "/media/TV".into()]),
+    );
+    // Discover the Movies library id from /Views, then filter by it.
+    let app = test::init_service(build_app(state.clone())).await;
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{}/Views", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let v: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, req).await).unwrap();
+    let movies_id = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["Name"] == "Movies")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let req = test::TestRequest::get()
+        .uri(&format!("/Items?ParentId={movies_id}"))
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{v:?}");
+    assert_eq!(items[0]["Name"], "movie-one");
 }

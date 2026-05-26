@@ -59,6 +59,7 @@ async fn boot_server() -> (TestServer, String) {
                 path: format!("/m/{i}.x").into(),
                 title: format!("title-{i}"),
                 kind: *kind,
+                ..Default::default()
             })
             .await
             .unwrap();

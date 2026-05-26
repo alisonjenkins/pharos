@@ -9,7 +9,10 @@ use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
-        dto::{BaseItemDto, ItemsResultDto, VirtualFolderInfoDto, VirtualFolderOptionsDto},
+        dto::{
+            build_media_streams, container_for, BaseItemDto, ItemsResultDto, VirtualFolderInfoDto,
+            VirtualFolderOptionsDto,
+        },
     },
     state::AppState,
 };
@@ -92,27 +95,19 @@ async fn playback_info(
     })?;
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
     let is_video = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+    let probe = &item.probe;
 
-    // Source-media shape. Until pharos persists probed info on the
-    // MediaItem (tracked under T34's scanner enrichment), we feed the
-    // negotiator the same assumed-defaults the rest of the DTO surface
-    // uses — webm/vp9/opus for video, mp3/mp3 for audio.
-    let source = if is_video {
-        SourceMedia {
-            container: "webm".into(),
-            video_codec: Some("vp9".into()),
-            audio_codec: Some("opus".into()),
-            bitrate_bps: Some(200_000),
-            is_video: true,
-        }
-    } else {
-        SourceMedia {
-            container: "mp3".into(),
-            video_codec: None,
-            audio_codec: Some("mp3".into()),
-            bitrate_bps: Some(192_000),
-            is_video: false,
-        }
+    // Source-media shape pulled from the probe persisted by the scanner
+    // (T29 follow-up). Container falls back to a kind-derived default
+    // only when ffprobe never ran (mirrors `container_for` in dto.rs so
+    // negotiator + DTO see the same value).
+    let container = container_for(probe, is_video);
+    let source = SourceMedia {
+        container: container.clone(),
+        video_codec: probe.video_codec.clone(),
+        audio_codec: probe.audio_codec.clone(),
+        bitrate_bps: probe.bitrate_bps,
+        is_video,
     };
 
     let profile = body
@@ -130,38 +125,19 @@ async fn playback_info(
         _ => None,
     };
 
-    let mut streams = Vec::new();
-    if is_video {
-        streams.push(serde_json::json!({
-            "Type": "Video",
-            "Index": 0,
-            "Codec": source.video_codec.clone().unwrap_or_default(),
-            "Width": 320,
-            "Height": 240,
-            "AspectRatio": "4:3",
-            "IsDefault": true,
-            "BitDepth": 8,
-            "FrameRate": 10.0,
-        }));
-    }
-    streams.push(serde_json::json!({
-        "Type": "Audio",
-        "Index": if is_video { 1 } else { 0 },
-        "Codec": source.audio_codec.clone().unwrap_or_default(),
-        "Channels": 2,
-        "SampleRate": 48000,
-        "IsDefault": true,
-    }));
+    let streams = build_media_streams(probe, is_video);
+    let default_audio_stream_index = if is_video { 1 } else { 0 };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "MediaSources": [{
             "Id": id_str,
             "Path": item.path.to_string_lossy(),
             "Type": "Default",
-            "Container": source.container,
+            "Container": container,
             "IsRemote": false,
             "ETag": "",
-            "RunTimeTicks": 50_000_000_u64,
+            "RunTimeTicks": probe.run_time_ticks(),
+            "Size": probe.size_bytes,
             "Name": item.title,
             "Protocol": "File",
             "SupportsDirectPlay": direct_play,
@@ -174,9 +150,9 @@ async fn playback_info(
             "RequiresLooping": false,
             "SupportsProbing": true,
             "MediaStreams": streams,
-            "Bitrate": source.bitrate_bps.unwrap_or(2_500_000),
+            "Bitrate": probe.bitrate_bps,
             "VideoType": "VideoFile",
-            "DefaultAudioStreamIndex": if is_video { 1 } else { 0 },
+            "DefaultAudioStreamIndex": default_audio_stream_index,
             "DefaultSubtitleStreamIndex": null,
         }],
         "PlaySessionId": play_session_id,
@@ -224,7 +200,7 @@ async fn user_views(
     _user: AuthUser,
     _path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(HttpResponse::Ok().json(synth_views_body(&state.server_id)))
+    Ok(HttpResponse::Ok().json(synth_views_body(&state)))
 }
 
 #[derive(serde::Deserialize)]
@@ -239,14 +215,56 @@ async fn user_views_query(
     _user: AuthUser,
     _q: web::Query<UserViewsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(HttpResponse::Ok().json(synth_views_body(&state.server_id)))
+    Ok(HttpResponse::Ok().json(synth_views_body(&state)))
 }
 
-fn synth_views_body(server_id: &str) -> serde_json::Value {
-    // Phase 1: synthesize one "All Media" collection so the home page
-    // renders something. Real per-root libraries lands once
-    // [media].roots are wired into the scanner + store.
-    let view = serde_json::json!({
+/// Synthesise a `Folder`/`CollectionFolder` view per configured
+/// `[media].roots` entry. The library `Id` is the stable_id of the
+/// canonical root path so the same id survives restarts; jellyfin-web
+/// stores it in client-side state.
+///
+/// Zero roots → single "All Media" placeholder so the sidebar still
+/// renders (used in tests that hit `AppState::new` without roots).
+fn synth_views_body(state: &AppState) -> serde_json::Value {
+    let views = library_views(state);
+    let count = views.len() as u32;
+    serde_json::json!({
+        "Items": views,
+        "TotalRecordCount": count,
+        "StartIndex": 0,
+    })
+}
+
+fn library_views(state: &AppState) -> Vec<serde_json::Value> {
+    if state.media_roots.is_empty() {
+        return vec![all_media_placeholder(&state.server_id)];
+    }
+    state
+        .media_roots
+        .iter()
+        .map(|root| {
+            let id = library_id_for_root(root);
+            let name = root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Media")
+                .to_string();
+            serde_json::json!({
+                "Id": id,
+                "Name": name,
+                "ServerId": state.server_id,
+                "Type": "CollectionFolder",
+                "CollectionType": "mixed",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+                "UserData": { "Played": false, "PlayCount": 0 },
+            })
+        })
+        .collect()
+}
+
+fn all_media_placeholder(server_id: &str) -> serde_json::Value {
+    serde_json::json!({
         "Id": "00000000000000000000000000000000",
         "Name": "All Media",
         "ServerId": server_id,
@@ -255,31 +273,29 @@ fn synth_views_body(server_id: &str) -> serde_json::Value {
         "MediaType": "Unknown",
         "IsFolder": true,
         "UserData": { "Played": false, "PlayCount": 0 },
-    });
-    serde_json::json!({
-        "Items": [view],
-        "TotalRecordCount": 1,
-        "StartIndex": 0,
     })
+}
+
+/// 32-char hex id derived from the canonical root path — same input →
+/// same id across restarts. Two roots only collide if their xxh3 hashes
+/// collide (cryptographically unlikely for any realistic library
+/// count).
+pub(crate) fn library_id_for_root(path: &std::path::Path) -> String {
+    let h = pharos_scanner::stable_id(path);
+    // Pad to 32 hex chars so jellyfin-web's uuid-shaped id regex
+    // accepts it (some downstream code assumes 32-hex shapes).
+    format!("{h:016x}{h:016x}")
 }
 
 async fn media_folders(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    let view = serde_json::json!({
-        "Id": "00000000000000000000000000000000",
-        "Name": "All Media",
-        "ServerId": state.server_id,
-        "Type": "CollectionFolder",
-        "CollectionType": "mixed",
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "UserData": { "Played": false, "PlayCount": 0 },
-    });
+    let views = library_views(&state);
+    let count = views.len() as u32;
     Ok(HttpResponse::Ok().json(serde_json::json!({
-        "Items": [view],
-        "TotalRecordCount": 1,
+        "Items": views,
+        "TotalRecordCount": count,
         "StartIndex": 0,
     })))
 }
@@ -303,6 +319,12 @@ struct ListQuery {
     /// `Ascending` (default) | `Descending`.
     #[serde(default)]
     sort_order: Option<String>,
+    /// Library / collection id (one per `[media].roots` entry). When
+    /// present, restricts the result set to items whose stored path
+    /// lives under the matching root. `00000000…0000` (the
+    /// All-Media placeholder) means "no parent filter".
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -319,7 +341,7 @@ async fn list_items(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let filtered = filter_and_sort(all, &q);
+    let filtered = filter_and_sort(restrict_to_parent(&state, all, q.parent_id.as_deref()), &q);
     let dto = paginate(&state, user.0.id, filtered, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
@@ -341,9 +363,39 @@ async fn list_user_items(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let filtered = filter_and_sort(all, &q);
+    let filtered = filter_and_sort(restrict_to_parent(&state, all, q.parent_id.as_deref()), &q);
     let dto = paginate(&state, user.0.id, filtered, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
+}
+
+/// Drop items that don't live under the configured root mapped to
+/// `parent_id`. Unknown `parent_id` → empty list (client asked for a
+/// library that doesn't exist). The All-Media placeholder + `None`
+/// pass everything through unchanged.
+fn restrict_to_parent(
+    state: &AppState,
+    items: Vec<MediaItem>,
+    parent_id: Option<&str>,
+) -> Vec<MediaItem> {
+    let Some(pid) = parent_id else {
+        return items;
+    };
+    if pid.is_empty() || pid == "00000000000000000000000000000000" {
+        return items;
+    }
+    let Some(root) = state
+        .media_roots
+        .iter()
+        .find(|r| library_id_for_root(r) == pid)
+    else {
+        // Unknown id — render an empty library rather than the whole
+        // store; matches Jellyfin's "library with no items" surface.
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter(|i| i.path.starts_with(root))
+        .collect()
 }
 
 fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {

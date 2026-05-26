@@ -173,6 +173,7 @@ mod tests {
             path: "/m/x".into(),
             title: "x".into(),
             kind: MediaKind::Movie,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -233,6 +234,7 @@ mod tests {
             path: "/m/y".into(),
             title: "y".into(),
             kind: MediaKind::Movie,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -267,6 +269,7 @@ mod tests {
                 path: format!("/m/{id}").into(),
                 title: format!("t-{id}"),
                 kind: MediaKind::Movie,
+                ..Default::default()
             })
             .await
             .unwrap();

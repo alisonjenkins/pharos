@@ -80,7 +80,10 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
             Ok(items) => {
                 let n = items.len();
                 for item in items {
-                    if stores.put(item).await.is_err() {
+                    let id = item.id;
+                    let path = item.path.clone();
+                    if let Err(e) = stores.put(item).await {
+                        writeln!(lock, "  put id={id} path={} err={e}", path.display())?;
                         total_skipped += 1;
                     } else {
                         total_imported += 1;
@@ -205,6 +208,7 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
             path,
             title: format!("Playwright Title {i}"),
             kind,
+            ..Default::default()
         };
         let _ = stores.put(item).await;
     }
@@ -261,7 +265,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
-    let mut state = AppState::load(stores, cfg.server.name.clone()).await?;
+    let mut state = AppState::load(stores, cfg.server.name.clone())
+        .await?
+        .with_media_roots(cfg.media.roots.clone());
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
         state = state.with_image_cache(ImageCache::new(cache_dir));
     }

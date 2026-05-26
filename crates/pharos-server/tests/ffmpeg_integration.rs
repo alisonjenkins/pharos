@@ -109,9 +109,9 @@ async fn probe_real_video_classifies_as_movie() {
     let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
     assert_eq!(probe.kind, MediaKind::Movie);
     // 3 s ±200 ms tolerance — VP9 encoder pads slightly.
-    let d = probe.duration_ms.unwrap_or(0);
+    let d = probe.duration_ms().unwrap_or(0);
     assert!((2_800..=3_200).contains(&d), "duration_ms={d}");
-    let container = probe.container.unwrap_or_default();
+    let container = probe.container().unwrap_or_default().to_string();
     assert!(
         container.contains("matroska") || container.contains("webm"),
         "container={container}"

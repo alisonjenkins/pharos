@@ -14,6 +14,7 @@ async fn seed_state() -> (web::Data<AppState>, String) {
             path: "/m/1.webm".into(),
             title: "Movie One".into(),
             kind: MediaKind::Movie,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -23,6 +24,7 @@ async fn seed_state() -> (web::Data<AppState>, String) {
             path: "/m/2.mp3".into(),
             title: "Track Two".into(),
             kind: MediaKind::Audio,
+            ..Default::default()
         })
         .await
         .unwrap();

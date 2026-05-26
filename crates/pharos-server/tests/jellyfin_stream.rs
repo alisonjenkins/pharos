@@ -38,6 +38,7 @@ async fn seed_with_file() -> (web::Data<AppState>, String, TempDir) {
             path: path.clone(),
             title: "movie".into(),
             kind: MediaKind::Movie,
+            ..Default::default()
         })
         .await
         .unwrap();

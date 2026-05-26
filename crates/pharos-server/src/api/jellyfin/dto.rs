@@ -114,8 +114,8 @@ impl UserDto {
             name: user.name.clone(),
             server_id: server_id.to_string(),
             id: user.id.0.simple().to_string(),
-            has_password: true,
-            has_configured_password: true,
+            has_password: user.has_password,
+            has_configured_password: user.has_password,
             policy: UserPolicyDto::from_domain(&user.policy),
             configuration: UserConfigurationDto::default(),
             primary_image_aspect_ratio: 1.0,
@@ -227,18 +227,21 @@ pub struct PersonDto {
 #[serde(rename_all = "PascalCase")]
 pub struct MediaSourceLiteDto {
     pub id: String,
-    pub container: &'static str,
+    pub container: String,
     #[serde(rename = "Type")]
     pub kind: &'static str,
     pub is_remote: bool,
     pub supports_direct_play: bool,
     pub supports_direct_stream: bool,
     pub supports_transcoding: bool,
-    pub run_time_ticks: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_time_ticks: Option<u64>,
     pub protocol: &'static str,
     pub media_streams: Vec<MediaStreamDto>,
-    pub bitrate: u64,
-    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     pub name: String,
     pub default_audio_stream_index: u32,
     pub video_type: &'static str,
@@ -251,7 +254,8 @@ pub struct MediaStreamDto {
     #[serde(rename = "Type")]
     pub kind: &'static str,
     pub index: u32,
-    pub codec: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
     pub is_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
@@ -261,6 +265,14 @@ pub struct MediaStreamDto {
     pub channels: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_rate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_frame_rate: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_frame_rate: Option<f32>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -403,46 +415,14 @@ impl BaseItemDto {
             pharos_core::MediaKind::Audio => "Audio",
             _ => "Video",
         };
-        let container: &'static str = match item.kind {
-            pharos_core::MediaKind::Audio => "mp3",
-            _ => "webm",
-        };
-        let run_time_ticks: u64 = 50_000_000; // 5 s; updated once we probe.
         let is_video = !matches!(item.kind, pharos_core::MediaKind::Audio);
-        let mut streams = Vec::new();
-        if is_video {
-            streams.push(MediaStreamDto {
-                kind: "Video",
-                index: 0,
-                codec: "vp9",
-                is_default: true,
-                width: Some(320),
-                height: Some(240),
-                channels: None,
-                sample_rate: None,
-            });
-            streams.push(MediaStreamDto {
-                kind: "Audio",
-                index: 1,
-                codec: "opus",
-                is_default: true,
-                width: None,
-                height: None,
-                channels: Some(1),
-                sample_rate: Some(48000),
-            });
-        } else {
-            streams.push(MediaStreamDto {
-                kind: "Audio",
-                index: 0,
-                codec: "aac",
-                is_default: true,
-                width: None,
-                height: None,
-                channels: Some(2),
-                sample_rate: Some(44100),
-            });
-        }
+        let probe = &item.probe;
+        let container = container_for(probe, is_video);
+        let run_time_ticks = probe.run_time_ticks().unwrap_or(0);
+
+        let media_streams = build_media_streams(probe, is_video);
+        let default_audio_stream_index = if is_video { 1 } else { 0 };
+
         Self {
             id: item.id.to_string(),
             name: item.title.clone(),
@@ -463,13 +443,13 @@ impl BaseItemDto {
                 supports_direct_play: true,
                 supports_direct_stream: true,
                 supports_transcoding: true,
-                run_time_ticks,
+                run_time_ticks: probe.run_time_ticks(),
                 protocol: "File",
-                media_streams: streams,
-                bitrate: 200_000,
-                size: 107_356,
+                media_streams,
+                bitrate: probe.bitrate_bps,
+                size: probe.size_bytes,
                 name: item.title.clone(),
-                default_audio_stream_index: if is_video { 1 } else { 0 },
+                default_audio_stream_index,
                 video_type: "VideoFile",
                 e_tag: "0".into(),
             }],
@@ -505,4 +485,172 @@ pub struct SessionInfoDto {
     pub client: String,
     pub application_version: String,
     pub server_id: String,
+}
+
+/// Pick a container string for the wire response. ffprobe reports
+/// `format_name` as a comma-joined alias list (e.g. `"matroska,webm"`).
+/// Jellyfin's DirectPlayProfile matches single tokens, so we have to
+/// pick one. Prefer the more specific alias when it matches a profile
+/// pharos commonly emits (webm > matroska, m4v > mp4), since the file
+/// actually IS the more specific one — the `mkv` muxer accepts webm,
+/// but a `.webm` file's clients pick the webm profile, not matroska.
+/// Falls back to a kind-default when no probe ran, because an empty
+/// Container makes jellyfin-web pick Transcode with no TranscodingUrl
+/// → "Playback Error" dialog (caught in dev).
+pub(crate) fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> String {
+    const PREFERRED: &[&str] = &["webm", "m4v", "mp4", "mp3", "flac", "ogg", "opus", "aac"];
+    if let Some(c) = probe.container.as_deref() {
+        let aliases: Vec<&str> = c
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for pref in PREFERRED {
+            if aliases.iter().any(|a| a.eq_ignore_ascii_case(pref)) {
+                return (*pref).to_string();
+            }
+        }
+        if let Some(first) = aliases.first() {
+            return first.to_string();
+        }
+    }
+    if is_video {
+        "mp4".to_string()
+    } else {
+        "mp3".to_string()
+    }
+}
+
+pub(crate) fn build_media_streams(
+    probe: &pharos_core::MediaProbe,
+    is_video: bool,
+) -> Vec<MediaStreamDto> {
+    let mut streams = Vec::with_capacity(if is_video { 2 } else { 1 });
+    if is_video {
+        let aspect_ratio = match (probe.width, probe.height) {
+            (Some(w), Some(h)) if h != 0 => Some(format!("{w}:{h}")),
+            _ => None,
+        };
+        let fps = probe.frame_rate_f32();
+        streams.push(MediaStreamDto {
+            kind: "Video",
+            index: 0,
+            codec: probe.video_codec.clone(),
+            is_default: true,
+            width: probe.width,
+            height: probe.height,
+            channels: None,
+            sample_rate: None,
+            bit_rate: probe.bitrate_bps,
+            aspect_ratio,
+            real_frame_rate: fps,
+            average_frame_rate: fps,
+        });
+        // Only advertise an audio stream when probe actually found one.
+        // Some test fixtures (the BBB WebM corpus) are video-only;
+        // fabricating an `aac` stream there breaks DirectPlay because
+        // the file has no AAC bytes and the client's audio decoder
+        // errors out → "Playback Error".
+        if let Some(codec) = probe.audio_codec.clone() {
+            streams.push(MediaStreamDto {
+                kind: "Audio",
+                index: 1,
+                codec: Some(codec),
+                is_default: true,
+                width: None,
+                height: None,
+                channels: probe.audio_channels,
+                sample_rate: probe.sample_rate,
+                bit_rate: None,
+                aspect_ratio: None,
+                real_frame_rate: None,
+                average_frame_rate: None,
+            });
+        }
+    } else {
+        streams.push(MediaStreamDto {
+            kind: "Audio",
+            index: 0,
+            codec: probe.audio_codec.clone(),
+            is_default: true,
+            width: None,
+            height: None,
+            channels: probe.audio_channels,
+            sample_rate: probe.sample_rate,
+            bit_rate: probe.bitrate_bps,
+            aspect_ratio: None,
+            real_frame_rate: None,
+            average_frame_rate: None,
+        });
+    }
+    streams
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use pharos_core::MediaProbe;
+
+    #[test]
+    fn container_for_prefers_webm_alias_over_matroska() {
+        // ffprobe reports `format_name = "matroska,webm"` for both .mkv
+        // and .webm files; jellyfin-web's DirectPlayProfile expects
+        // `webm` for vp9 video. Picking "matroska" forces transcode →
+        // "Playback Error" because no TranscodingUrl is wired.
+        let probe = MediaProbe {
+            container: Some("matroska,webm".into()),
+            ..Default::default()
+        };
+        assert_eq!(container_for(&probe, true), "webm");
+    }
+
+    #[test]
+    fn container_for_falls_back_when_no_preferred_alias() {
+        let probe = MediaProbe {
+            container: Some("avi".into()),
+            ..Default::default()
+        };
+        assert_eq!(container_for(&probe, true), "avi");
+    }
+
+    #[test]
+    fn container_for_kind_default_when_probe_empty() {
+        let probe = MediaProbe::default();
+        assert_eq!(container_for(&probe, true), "mp4");
+        assert_eq!(container_for(&probe, false), "mp3");
+    }
+
+    #[test]
+    fn build_media_streams_omits_audio_for_silent_video() {
+        // BBB test corpus is video-only. Advertising a fabricated audio
+        // stream there breaks playback — the client tries to decode
+        // bytes that aren't AAC.
+        let probe = MediaProbe {
+            video_codec: Some("vp9".into()),
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        };
+        let streams = build_media_streams(&probe, true);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].kind, "Video");
+        assert_eq!(streams[0].codec.as_deref(), Some("vp9"));
+    }
+
+    #[test]
+    fn build_media_streams_emits_audio_when_probe_has_codec() {
+        let probe = MediaProbe {
+            video_codec: Some("vp9".into()),
+            audio_codec: Some("opus".into()),
+            audio_channels: Some(2),
+            sample_rate: Some(48_000),
+            ..Default::default()
+        };
+        let streams = build_media_streams(&probe, true);
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[1].kind, "Audio");
+        assert_eq!(streams[1].codec.as_deref(), Some("opus"));
+        assert_eq!(streams[1].channels, Some(2));
+    }
 }

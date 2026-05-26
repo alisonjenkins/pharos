@@ -70,11 +70,7 @@ async fn list_users(
         .iter()
         .map(|u| {
             UserDto::from_domain(
-                &pharos_core::User {
-                    id: u.id,
-                    name: u.name.clone(),
-                    policy: u.policy,
-                },
+                &u.clone().into_user(),
                 &state.server_id,
             )
         })
@@ -116,14 +112,7 @@ async fn create_user(
         Err(AuthError::Conflict) => return Err(error::ErrorConflict("name taken")),
         Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
     }
-    let dto = UserDto::from_domain(
-        &pharos_core::User {
-            id: record.id,
-            name: record.name,
-            policy: record.policy,
-        },
-        &state.server_id,
-    );
+    let dto = UserDto::from_domain(&record.into_user(), &state.server_id);
     state.notify_library_changed();
     Ok(HttpResponse::Ok().json(dto))
 }
@@ -226,11 +215,31 @@ async fn library_refresh(
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
-    // Real library re-scan is a separate background task (T36 CLI form
-    // doesn't run inside the server). For now the endpoint just fires
-    // the broadcast — useful when an admin manually drops a file in a
-    // shared mount and wants connected clients to refresh.
-    state.notify_library_changed();
+    // Spawn the scan on the runtime and return immediately — Jellyfin's
+    // admin UI expects 204 quickly, then polls /ScheduledTasks for
+    // progress (not implemented yet; the LibraryChanged broadcast on
+    // completion is enough for connected clients to invalidate caches).
+    let state = state.into_inner();
+    actix_web::rt::spawn(async move {
+        let scanner = pharos_scanner::FsScanner::new(
+            pharos_scanner::FfmpegProber::new(),
+        );
+        for root in &state.media_roots {
+            match scanner.scan_into(root, &state.stores).await {
+                Ok(n) => tracing::info!(
+                    root = %root.display(),
+                    imported = n,
+                    "library refresh: root scanned"
+                ),
+                Err(e) => tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "library refresh: scan failed"
+                ),
+            }
+        }
+        state.notify_library_changed();
+    });
     Ok(HttpResponse::NoContent().finish())
 }
 

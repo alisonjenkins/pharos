@@ -6,4 +6,4 @@ pub mod ffmpeg;
 pub mod fs;
 
 pub use ffmpeg::{parse_ffprobe_output, FfmpegProber};
-pub use fs::{FsScanner, DEFAULT_EXTENSIONS};
+pub use fs::{is_episode_path, stable_id, FsScanner, DEFAULT_EXTENSIONS};

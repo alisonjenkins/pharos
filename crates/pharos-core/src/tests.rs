@@ -51,7 +51,27 @@ fn sample() -> MediaItem {
         path: "/m/a.mkv".into(),
         title: "A".into(),
         kind: MediaKind::Movie,
+        ..Default::default()
     }
+}
+
+#[test]
+fn media_probe_run_time_ticks_converts_ms_to_jellyfin_ticks() {
+    let p = MediaProbe {
+        duration_ms: Some(2_500),
+        ..Default::default()
+    };
+    assert_eq!(p.run_time_ticks(), Some(25_000_000));
+}
+
+#[test]
+fn media_probe_frame_rate_round_trips_through_mille() {
+    let p = MediaProbe {
+        frame_rate_mille: Some(23_976),
+        ..Default::default()
+    };
+    let fps = p.frame_rate_f32().expect("set");
+    assert!((fps - 23.976).abs() < 0.001, "got {fps}");
 }
 
 #[tokio::test]

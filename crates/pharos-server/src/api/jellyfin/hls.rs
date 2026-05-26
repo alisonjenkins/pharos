@@ -35,10 +35,17 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/videos/{id}/hls1/main/{seg}.ts", web::get().to(segment));
 }
 
-async fn duration_seconds(
-    state: &AppState,
-    id_str: &str,
-) -> Result<(f64, std::path::PathBuf), actix_web::Error> {
+/// Snapshot of the probe-derived facts the HLS layer needs. Loaded
+/// once per request from `MediaStore` instead of re-deriving in each
+/// handler.
+struct HlsItem {
+    duration_seconds: f64,
+    width: Option<u32>,
+    height: Option<u32>,
+    source_bitrate_bps: Option<u64>,
+}
+
+async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_web::Error> {
     let id: u64 = id_str
         .parse()
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
@@ -46,16 +53,41 @@ async fn duration_seconds(
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
-    let prober = FfmpegProber::new();
-    let info = prober
-        .probe(&item.path)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(format!("probe: {e}")))?;
-    let secs = info
-        .duration_ms
-        .map(|ms| ms as f64 / 1000.0)
-        .unwrap_or(0.0);
-    Ok((secs, item.path))
+    // Prefer the probe persisted at scan time. Fall back to live
+    // ffprobe only when the row predates the probe-metadata migration
+    // so the hot path stays subprocess-free.
+    let duration_seconds = match item.probe.duration_ms {
+        Some(ms) => ms as f64 / 1000.0,
+        None => {
+            let prober = FfmpegProber::new();
+            let info = prober
+                .probe(&item.path)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(format!("probe: {e}")))?;
+            info.duration_ms()
+                .map(|ms| ms as f64 / 1000.0)
+                .unwrap_or(0.0)
+        }
+    };
+    Ok(HlsItem {
+        duration_seconds,
+        width: item.probe.width,
+        height: item.probe.height,
+        source_bitrate_bps: item.probe.bitrate_bps,
+    })
+}
+
+/// Pick the bitrate we cap the encoder at. Clamp source bitrate into a
+/// sane window — we never spend > 8 Mbps on a transcode (modest CPU
+/// budget) and never less than 500 kbps so low-bitrate sources still
+/// look watchable post-transcode.
+const HLS_MIN_BITRATE_BPS: u64 = 500_000;
+const HLS_MAX_BITRATE_BPS: u64 = 8_000_000;
+
+fn target_video_bitrate(source: Option<u64>) -> u64 {
+    source
+        .unwrap_or(HLS_MAX_BITRATE_BPS)
+        .clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS)
 }
 
 async fn master_playlist(
@@ -65,15 +97,20 @@ async fn master_playlist(
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id = path.into_inner();
-    let (duration, _) = duration_seconds(&state, &id).await?;
-    // Single variant for phase 1. Bitrate estimate just informs client.
+    let item = load_hls_item(&state, &id).await?;
+    // Bandwidth advertised in the master = encoder cap + a small
+    // overhead for audio (128 kbps fits AAC LC + segment framing).
+    let bandwidth = target_video_bitrate(item.source_bitrate_bps) + 128_000;
+    let resolution = match (item.width, item.height) {
+        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
+        _ => String::new(),
+    };
     let body = format!(
         "#EXTM3U\n#EXT-X-VERSION:3\n\
-         #EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS=\"avc1.640028,mp4a.40.2\",RESOLUTION=1920x1080\n\
+         #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"avc1.640028,mp4a.40.2\"{resolution}\n\
          /Videos/{id}/main.m3u8?{}\n",
         token_qs(&req)
     );
-    let _ = duration;
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .body(body))
@@ -86,7 +123,8 @@ async fn variant_playlist(
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id = path.into_inner();
-    let (duration, _) = duration_seconds(&state, &id).await?;
+    let item = load_hls_item(&state, &id).await?;
+    let duration = item.duration_seconds;
     let segment_count = (duration / SEGMENT_SECONDS).ceil() as u32;
     let segment_count = segment_count.max(1);
     let qs = token_qs(&req);
@@ -136,7 +174,7 @@ async fn segment(
         container: Container::Mpegts,
         video: Some(VideoCodec::H264),
         audio: Some(AudioCodec::Aac),
-        video_bitrate_bps: Some(2_500_000),
+        video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
         audio_bitrate_bps: Some(128_000),
         start_position_ticks: start_ticks,
         duration_ticks: Some(duration_ticks),
@@ -207,6 +245,7 @@ mod tests {
                 path: "/nonexistent.mkv".into(),
                 title: "m".into(),
                 kind: MediaKind::Movie,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -223,5 +262,65 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);
+    }
+
+    async fn seed_with_probe(
+        probe: pharos_core::MediaProbe,
+    ) -> (web::Data<AppState>, String) {
+        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let auth = BuiltinAuth::new(stores.clone());
+        let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+        let uid = UserId::new();
+        stores
+            .create(UserRecord {
+                id: uid,
+                name: "u".into(),
+                password_hash: hash,
+                policy: UserPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let token = stores.issue(uid, "t").await.unwrap();
+        stores
+            .put(MediaItem {
+                id: 9,
+                path: "/nonexistent.mkv".into(),
+                title: "m".into(),
+                kind: MediaKind::Movie,
+                probe,
+            })
+            .await
+            .unwrap();
+        let state = web::Data::new(AppState::new(stores, "t".into()));
+        (state, token.0.expose().to_string())
+    }
+
+    #[actix_web::test]
+    async fn master_playlist_uses_real_resolution_and_bitrate_from_probe() {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(10_000),
+            width: Some(1280),
+            height: Some(720),
+            bitrate_bps: Some(1_500_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri(&format!("/videos/9/master.m3u8?api_key={token}"))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("RESOLUTION=1280x720"), "{s}");
+        // 1.5 Mbps source + 128 kbps audio overhead = 1_628_000.
+        assert!(s.contains("BANDWIDTH=1628000"), "{s}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn target_video_bitrate_clamps_into_window() {
+        assert_eq!(target_video_bitrate(Some(100_000)), HLS_MIN_BITRATE_BPS);
+        assert_eq!(target_video_bitrate(Some(20_000_000)), HLS_MAX_BITRATE_BPS);
+        assert_eq!(target_video_bitrate(Some(2_500_000)), 2_500_000);
+        assert_eq!(target_video_bitrate(None), HLS_MAX_BITRATE_BPS);
     }
 }

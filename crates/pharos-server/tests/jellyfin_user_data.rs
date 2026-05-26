@@ -39,6 +39,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
                 path: format!("/m/{id}.x").into(),
                 title: title.into(),
                 kind,
+                ..Default::default()
             })
             .await
             .unwrap();

@@ -39,6 +39,9 @@ pub struct User {
     pub id: UserId,
     pub name: String,
     pub policy: UserPolicy,
+    /// Derived at projection time so the public surface knows whether
+    /// a hash was set without having to expose the hash itself.
+    pub has_password: bool,
 }
 
 /// Internal record carrying the password hash. Only `UserStore` callers
@@ -53,10 +56,12 @@ pub struct UserRecord {
 
 impl UserRecord {
     pub fn into_user(self) -> User {
+        let has_password = !self.password_hash.expose().is_empty();
         User {
             id: self.id,
             name: self.name,
             policy: self.policy,
+            has_password,
         }
     }
 }

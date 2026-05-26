@@ -315,8 +315,22 @@ fn translate_outbound(msg: ServerMsg, group_id: Option<GroupId>) -> Option<Outbo
             })
             .ok()?,
         )),
-        ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. }
-            | ServerMsg::LeaderChange { .. } => None,
+        ServerMsg::LeaderChange { leader } => Some(Outbound::new(
+            "SyncPlayGroupUpdate",
+            // Jellyfin's PlaybackAccessControl payload is `{ Type:
+            // "LeaderChanged", Data: { LeaderId } }`. We keep the same
+            // top-level kind ("LeaderChanged") jellyfin-web's
+            // playbackManager listens for. group_id flows through as
+            // GroupId so jellyfin-web's group store updates the right
+            // session card; the actual `Leader` rides in `LeaderId`
+            // — wire-level a string for the member uuid.
+            serde_json::json!({
+                "Type": "LeaderChanged",
+                "GroupId": group_id.map(|g| g.to_string()).unwrap_or_default(),
+                "LeaderId": leader.to_string(),
+            }),
+        )),
+        ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => None,
     }
 }
 

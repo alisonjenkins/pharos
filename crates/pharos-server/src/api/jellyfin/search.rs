@@ -52,7 +52,8 @@ struct SearchHint {
     #[serde(rename = "Type")]
     kind: &'static str,
     media_type: &'static str,
-    run_time_ticks: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_time_ticks: Option<u64>,
     matched_term: String,
     #[serde(rename = "IsFolder")]
     is_folder: bool,
@@ -107,7 +108,7 @@ async fn search_hints(
             name: i.title.clone(),
             kind: jellyfin_type(i.kind),
             media_type: media_type(i.kind),
-            run_time_ticks: 0,
+            run_time_ticks: i.probe.run_time_ticks(),
             matched_term: q.search_term.clone().unwrap_or_default(),
             is_folder: false,
         })

@@ -1,10 +1,16 @@
 use crate::StoreError;
-use pharos_core::{DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaStore};
+use pharos_core::{
+    DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore,
+};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     SqlitePool,
 };
 use std::str::FromStr;
+
+const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
+    bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
+    audio_channels, sample_rate";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -79,13 +85,12 @@ impl MediaStore for SqliteStore {
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
         let id_i64 = i64::try_from(id)
             .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
-        let row = sqlx::query_as::<_, MediaRow>(
-            "SELECT id, path, title, kind FROM media_items WHERE id = ?",
-        )
-        .bind(id_i64)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items WHERE id = ?");
+        let row = sqlx::query_as::<_, MediaRow>(&sql)
+            .bind(id_i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
         match row {
             Some(r) => r.into_domain(),
             None => Err(DomainError::NotFound(id)),
@@ -100,16 +105,43 @@ impl MediaStore for SqliteStore {
             .path
             .to_str()
             .ok_or_else(|| DomainError::Backend("non-utf8 path".into()))?;
+        let p = &item.probe;
         sqlx::query(
-            "INSERT INTO media_items (id, path, title, kind) VALUES (?, ?, ?, ?)
+            "INSERT INTO media_items (id, path, title, kind, \
+                size_bytes, duration_ms, container, bitrate_bps, \
+                video_codec, audio_codec, width, height, frame_rate_mille, \
+                audio_channels, sample_rate) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
-                                           kind = excluded.kind",
+                                           kind = excluded.kind,
+                                           size_bytes = excluded.size_bytes,
+                                           duration_ms = excluded.duration_ms,
+                                           container = excluded.container,
+                                           bitrate_bps = excluded.bitrate_bps,
+                                           video_codec = excluded.video_codec,
+                                           audio_codec = excluded.audio_codec,
+                                           width = excluded.width,
+                                           height = excluded.height,
+                                           frame_rate_mille = excluded.frame_rate_mille,
+                                           audio_channels = excluded.audio_channels,
+                                           sample_rate = excluded.sample_rate",
         )
         .bind(id_i64)
         .bind(path)
         .bind(&item.title)
         .bind(item.kind.as_str())
+        .bind(p.size_bytes.map(|v| v as i64))
+        .bind(p.duration_ms.map(|v| v as i64))
+        .bind(p.container.as_deref())
+        .bind(p.bitrate_bps.map(|v| v as i64))
+        .bind(p.video_codec.as_deref())
+        .bind(p.audio_codec.as_deref())
+        .bind(p.width.map(|v| v as i64))
+        .bind(p.height.map(|v| v as i64))
+        .bind(p.frame_rate_mille.map(|v| v as i64))
+        .bind(p.audio_channels.map(|v| v as i64))
+        .bind(p.sample_rate.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -118,12 +150,11 @@ impl MediaStore for SqliteStore {
 
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
-        let rows = sqlx::query_as::<_, MediaRow>(
-            "SELECT id, path, title, kind FROM media_items ORDER BY id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items ORDER BY id");
+        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
         rows.into_iter().map(MediaRow::into_domain).collect()
     }
 }
@@ -134,6 +165,17 @@ struct MediaRow {
     path: String,
     title: String,
     kind: String,
+    size_bytes: Option<i64>,
+    duration_ms: Option<i64>,
+    container: Option<String>,
+    bitrate_bps: Option<i64>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    frame_rate_mille: Option<i64>,
+    audio_channels: Option<i64>,
+    sample_rate: Option<i64>,
 }
 
 impl MediaRow {
@@ -141,11 +183,25 @@ impl MediaRow {
         let id = u64::try_from(self.id)
             .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?;
         let kind = MediaKind::from_str(&self.kind)?;
+        let probe = MediaProbe {
+            size_bytes: self.size_bytes.and_then(|v| u64::try_from(v).ok()),
+            duration_ms: self.duration_ms.and_then(|v| u64::try_from(v).ok()),
+            container: self.container,
+            bitrate_bps: self.bitrate_bps.and_then(|v| u64::try_from(v).ok()),
+            video_codec: self.video_codec,
+            audio_codec: self.audio_codec,
+            width: self.width.and_then(|v| u32::try_from(v).ok()),
+            height: self.height.and_then(|v| u32::try_from(v).ok()),
+            frame_rate_mille: self.frame_rate_mille.and_then(|v| u32::try_from(v).ok()),
+            audio_channels: self.audio_channels.and_then(|v| u32::try_from(v).ok()),
+            sample_rate: self.sample_rate.and_then(|v| u32::try_from(v).ok()),
+        };
         Ok(MediaItem {
             id,
             path: self.path.into(),
             title: self.title,
             kind,
+            probe,
         })
     }
 }

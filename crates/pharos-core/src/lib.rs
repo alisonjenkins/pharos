@@ -14,12 +14,53 @@ use std::path::PathBuf;
 
 pub type MediaId = u64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaItem {
     pub id: MediaId,
     pub path: PathBuf,
     pub title: String,
     pub kind: MediaKind,
+    /// Probed file/stream metadata persisted alongside the item.
+    /// All fields optional — a probe failure or pre-ffprobe scan still
+    /// yields a row, just with `MediaProbe::default()`. Jellyfin DTOs
+    /// omit fields whose value is `None` so clients negotiate against
+    /// reality, not a stub.
+    pub probe: MediaProbe,
+}
+
+/// Stream/format metadata pulled by `Prober::probe` (today: ffprobe).
+/// Persisted on `MediaItem` so the API surface (PlaybackInfo, BaseItemDto)
+/// reports real codec / container / size / runtime per file.
+///
+/// `frame_rate_mille` stores frames-per-second × 1000 to keep MediaProbe
+/// `Eq` without leaking floats into the domain layer. Conversion helpers
+/// (`frame_rate_f32`) live in the DTO boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaProbe {
+    pub size_bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub container: Option<String>,
+    pub bitrate_bps: Option<u64>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub frame_rate_mille: Option<u32>,
+    pub audio_channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+}
+
+impl MediaProbe {
+    /// Convenience accessor — fps as f32, rounded back from the
+    /// `× 1000` integer storage. Returns `None` if absent.
+    pub fn frame_rate_f32(&self) -> Option<f32> {
+        self.frame_rate_mille.map(|m| m as f32 / 1000.0)
+    }
+
+    /// Convert duration_ms → Jellyfin's 100-ns ticks (10_000 ticks / ms).
+    pub fn run_time_ticks(&self) -> Option<u64> {
+        self.duration_ms.map(|ms| ms.saturating_mul(10_000))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -132,11 +173,24 @@ pub trait Scanner: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 }
 
+/// Result of a single probe call. `kind` informs MediaItem classification;
+/// `probe` carries the full metadata block persisted on the item.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeInfo {
     pub kind: MediaKind,
-    pub duration_ms: Option<u64>,
-    pub container: Option<String>,
+    pub probe: MediaProbe,
+}
+
+impl ProbeInfo {
+    /// Backwards-compat shortcut for old callers that only checked
+    /// `duration_ms`. Reads through to the inner probe block.
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.probe.duration_ms
+    }
+
+    pub fn container(&self) -> Option<&str> {
+        self.probe.container.as_deref()
+    }
 }
 
 pub trait Prober: Send + Sync {

@@ -1,7 +1,7 @@
 //! Recursive media filesystem scan. Generic over `Prober` (V12).
 //! Walk lives in `spawn_blocking` — never parks async runtime (V5).
 
-use pharos_core::{DomainError, DomainResult, MediaItem, MediaStore, Prober, Scanner};
+use pharos_core::{DomainError, DomainResult, MediaItem, MediaKind, MediaStore, Prober, Scanner};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_64;
@@ -10,9 +10,15 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "mov", "avi", "webm", "m4v", "flac", "mp3", "opus", "m4a", "ogg", "wav",
 ];
 
-/// SIMD-accelerated stable ID for a path. xxh3_64 hashes UTF-8 bytes.
+/// SIMD-accelerated stable ID for a path. xxh3_64 hashes UTF-8 bytes,
+/// then masks to 63 bits so the value always survives the
+/// `u64 -> i64` conversion the sqlite store does on insert. (Half of
+/// real xxh3_64 outputs exceed i64::MAX; without the mask roughly
+/// half the library hits a silent "conflict" on import.) Keyspace
+/// stays 2^63, which still puts collisions out of reach for any
+/// realistic library size.
 pub fn stable_id(path: &Path) -> u64 {
-    xxh3_64(path.to_string_lossy().as_bytes())
+    xxh3_64(path.to_string_lossy().as_bytes()) & 0x7FFFFFFFFFFFFFFF
 }
 
 #[derive(Debug, Clone)]
@@ -62,11 +68,27 @@ impl<P: Prober> FsScanner<P> {
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
+                // Stat the file so MediaProbe.size_bytes is set even when
+                // ffprobe didn't report `format.size` (some containers).
+                let mut probe = info.probe;
+                if probe.size_bytes.is_none() {
+                    if let Ok(meta) = tokio::fs::metadata(&path).await {
+                        probe.size_bytes = Some(meta.len());
+                    }
+                }
+                // Promote video-kind items to Episode when the path
+                // looks like a TV layout. Audio stays as classified.
+                let kind = if matches!(info.kind, MediaKind::Movie) && is_episode_path(&path) {
+                    MediaKind::Episode
+                } else {
+                    info.kind
+                };
                 Some(MediaItem {
                     id: stable_id(&path),
                     path,
                     title,
-                    kind: info.kind,
+                    kind,
+                    probe,
                 })
             }
             Err(err) => {
@@ -89,6 +111,89 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
         }
         Ok(items)
     }
+}
+
+/// Heuristic: does `path` look like a TV episode?
+///
+/// We accept either signal:
+/// - filename contains an `SxxEyy` token (case-insensitive, with any
+///   non-letter separator before the `S` to avoid matching mid-word
+///   IDs like "GS9E2-clip"); or
+/// - any parent directory is named `Season N`, `Season NN`, `S<NN>`,
+///   `Specials`, or `Season 0` (the Plex/Jellyfin layout convention).
+///
+/// Path-only — no probe required. Files in a "Movies/" tree never hit
+/// either signal and stay Movie.
+pub fn is_episode_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if has_sxxeyy_token(name) {
+        return true;
+    }
+    for component in path.components() {
+        let comp = component.as_os_str().to_string_lossy();
+        if looks_like_season_dir(&comp) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_sxxeyy_token(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let lower: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let mut i = 0;
+    while i + 5 < lower.len() {
+        // boundary: start or non-letter before 's'
+        let at_boundary = i == 0 || !lower[i - 1].is_ascii_alphabetic();
+        if at_boundary
+            && lower[i] == b's'
+            && lower[i + 1].is_ascii_digit()
+        {
+            // optional second season digit
+            let mut j = i + 2;
+            if j < lower.len() && lower[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < lower.len() && lower[j] == b'e' {
+                let mut k = j + 1;
+                if k < lower.len() && lower[k].is_ascii_digit() {
+                    k += 1;
+                    if k < lower.len() && lower[k].is_ascii_digit() {
+                        return true;
+                    }
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn looks_like_season_dir(name: &str) -> bool {
+    let n = name.trim();
+    if n.eq_ignore_ascii_case("specials") {
+        return true;
+    }
+    let lower = n.to_ascii_lowercase();
+    // "Season 1", "Season 02", "Season 10"
+    if let Some(rest) = lower.strip_prefix("season ") {
+        return rest.trim().chars().all(|c| c.is_ascii_digit())
+            && !rest.trim().is_empty();
+    }
+    // Compact "S01", "S1" — only when whole component is that form so
+    // we don't grab a file named "S01E03.mkv" (handled by SxxEyy path).
+    if lower.starts_with('s')
+        && lower.len() >= 2
+        && lower.len() <= 4
+        && lower[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    false
 }
 
 /// Recursive walk inside `spawn_blocking`. Returns paths of files whose
@@ -149,8 +254,7 @@ mod tests {
             };
             Ok(ProbeInfo {
                 kind,
-                duration_ms: None,
-                container: None,
+                probe: Default::default(),
             })
         }
     }
@@ -211,6 +315,44 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn promotes_to_episode_when_path_matches_sxxeyy() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Show/Season 1/Show.S01E02.mkv").await;
+        let s = FsScanner::new(FakeProber::default());
+        let items = s.scan(td.path()).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].kind, MediaKind::Episode));
+    }
+
+    #[tokio::test]
+    async fn movies_path_stays_movie() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Movies/Big Buck Bunny (2008).mkv").await;
+        let s = FsScanner::new(FakeProber::default());
+        let items = s.scan(td.path()).await.unwrap();
+        assert!(matches!(items[0].kind, MediaKind::Movie));
+    }
+
+    #[test]
+    fn sxxeyy_token_recognises_common_patterns() {
+        assert!(has_sxxeyy_token("Show.S01E02.mkv"));
+        assert!(has_sxxeyy_token("show s1e1.mp4"));
+        assert!(has_sxxeyy_token("Series_S12E07_HDTV.mkv"));
+        assert!(!has_sxxeyy_token("classS5English.mp4")); // mid-word "S5" rejected
+        assert!(!has_sxxeyy_token("Movie 2024.mkv"));
+    }
+
+    #[test]
+    fn season_dir_patterns_recognised() {
+        assert!(looks_like_season_dir("Season 1"));
+        assert!(looks_like_season_dir("season 02"));
+        assert!(looks_like_season_dir("S01"));
+        assert!(looks_like_season_dir("Specials"));
+        assert!(!looks_like_season_dir("Movies"));
+        assert!(!looks_like_season_dir("Some Movie 2024"));
     }
 
     #[tokio::test]
