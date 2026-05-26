@@ -1,7 +1,9 @@
 //! Per-member rolling clock-offset estimator. NTP-style:
 //!
-//!     offset = ((T2 - T1) + (T3 - T4)) / 2
-//!     rtt    = (T4 - T1) - (T3 - T2)
+//! ```text
+//! offset = ((T2 - T1) + (T3 - T4)) / 2
+//! rtt    = (T4 - T1) - (T3 - T2)
+//! ```
 //!
 //! We keep the last N samples and publish the **median** so a single
 //! jitter spike does not pollute scheduling. Median > mean for the
