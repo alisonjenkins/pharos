@@ -67,69 +67,50 @@ test.describe("jellyfin-web compat", () => {
     await expect(err).toBeVisible();
   });
 
-  test("real media plays through pharos in a real browser", async ({ page }) => {
-    // End-to-end media-playback proof: a logged-in browser fetches the
-    // seeded MP4 from pharos's direct-play endpoint, decodes it, and
-    // advances currentTime past zero.
+  test("clicking jellyfin-web Play button plays media end-to-end", async ({ page }) => {
+    // Drive jellyfin-web's actual playback path:
+    //   login → details page for seeded fixture → click btnPlay →
+    //   jellyfin-web's playbackManager → htmlVideoPlayer → <video>
+    //   with currentTime > 0.
     //
-    // We synthesize the <video> element directly instead of driving
-    // jellyfin-web's Play button. The button now renders + clicks (see
-    // commit log — needed MediaSources + MediaStreams on the item DTO),
-    // but jellyfin-web's playbackManager has further endpoint expectations
-    // (PlaybackInfo POST with deviceProfile, intros endpoint, etc.) that
-    // are still open work. Pharos's *playback path* — auth via api_key
-    // query, /Videos/{id}/stream serving real H.264/AAC bytes with the
-    // right Content-Type and CORS — is what this test actually validates.
-    test.setTimeout(60_000);
+    // Requires User.Configuration.CastReceiverId (chromecastPlayer
+    // plugin reads it during init — without it a synchronous TypeError
+    // kills the playback chain). Fixture is VP9/Opus inside WebM so
+    // the FOSS chromium Playwright ships can decode without H.264
+    // licenses.
+    test.setTimeout(90_000);
     await connectToServer(page);
     await login(page, SEED_USER, SEED_PASS);
     await page.waitForURL(/#\/home/, { timeout: 25_000 });
-    const token = await page.evaluate(() => {
+    const serverId = await page.evaluate(() => {
       try {
-        const raw = window.localStorage.getItem("jellyfin_credentials");
-        if (!raw) return null;
-        const data = JSON.parse(raw);
-        return data?.Servers?.[0]?.AccessToken ?? null;
+        return JSON.parse(window.localStorage.getItem("jellyfin_credentials")!)
+          .Servers?.[0]?.Id ?? null;
       } catch (_e) {
         return null;
       }
     });
-    if (!token) {
-      throw new Error("could not read AccessToken from jellyfin-web localStorage");
+    if (!serverId) {
+      throw new Error("could not read serverId from jellyfin-web localStorage");
     }
-    // Mount a hidden <video> pointing at /Videos/1/stream. Browser will
-    // perform the GET (with CORS + Range), decode the fixture, and
-    // expose currentTime via the standard media element API.
-    await page.evaluate(
-      ({ pharosBase, token }) => {
-        const v = document.createElement("video");
-        v.id = "pharos-playback-probe";
-        v.crossOrigin = "anonymous";
-        v.muted = true; // autoplay policies require muted.
-        v.autoplay = true;
-        v.controls = false;
-        v.style.position = "fixed";
-        v.style.left = "-9999px"; // off-screen but rendered.
-        v.src = `${pharosBase}/Videos/1/stream?api_key=${token}&static=true`;
-        document.body.appendChild(v);
-        v.play().catch(() => {
-          // Even if play() rejects we still measure currentTime
-          // advancement via the timeupdate event.
-        });
-      },
-      { pharosBase: PHAROS_URL, token },
-    );
-    const video = page.locator("#pharos-playback-probe");
-    await video.waitFor({ state: "attached", timeout: 5_000 });
+    // Navigate straight to the item details page; click Play.
+    await page.goto(`/#/details?id=1&serverId=${serverId}`);
+    const playBtn = page.locator("button.btnPlay").first();
+    await playBtn.waitFor({ timeout: 20_000 });
+    await playBtn.click();
+    // jellyfin-web's htmlVideoPlayer mounts a <video> inside its
+    // own osd container once playbackManager resolves the source.
+    const video = page.locator("video").first();
+    await video.waitFor({ state: "attached", timeout: 30_000 });
     await page.waitForFunction(
       () => {
-        const v = document.getElementById("pharos-playback-probe") as
-          | HTMLVideoElement
-          | null;
+        const v = document.querySelector("video") as HTMLVideoElement | null;
         return !!v && v.currentTime > 0;
       },
       undefined,
       { timeout: 30_000 },
     );
+    // Sanity: page URL should have navigated to the player view.
+    await expect(page).toHaveURL(/#\/video/);
   });
 });

@@ -14,6 +14,25 @@ pub struct SystemInfoDto {
     pub operating_system: &'static str,
     pub local_address: String,
     pub startup_wizard_completed: bool,
+    pub cast_receiver_id: &'static str,
+    pub operating_system_display_name: &'static str,
+    pub has_pending_restart: bool,
+    pub is_shutting_down: bool,
+    pub supports_library_monitor: bool,
+    pub web_socket_port_number: u16,
+    pub completed_installations: Vec<serde_json::Value>,
+    pub can_self_restart: bool,
+    pub can_launch_web_browser: bool,
+    pub program_data_path: &'static str,
+    pub web_path: &'static str,
+    pub items_by_name_path: &'static str,
+    pub cache_path: &'static str,
+    pub log_path: &'static str,
+    pub internal_metadata_path: &'static str,
+    pub transcoding_temp_path: &'static str,
+    pub has_update_available: bool,
+    pub encoder_location: &'static str,
+    pub system_architecture: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,7 +60,52 @@ pub struct UserDto {
     pub has_password: bool,
     pub has_configured_password: bool,
     pub policy: UserPolicyDto,
+    pub configuration: UserConfigurationDto,
     pub primary_image_aspect_ratio: f32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserConfigurationDto {
+    pub audio_language_preference: &'static str,
+    pub play_default_audio_track: bool,
+    pub subtitle_language_preference: &'static str,
+    pub display_missing_episodes: bool,
+    pub grouped_folders: Vec<String>,
+    pub subtitle_mode: &'static str,
+    pub display_collections_view: bool,
+    pub enable_local_password: bool,
+    pub ordered_views: Vec<String>,
+    pub latest_items_excludes: Vec<String>,
+    pub my_media_excludes: Vec<String>,
+    pub hide_played_in_latest: bool,
+    pub remember_audio_selections: bool,
+    pub remember_subtitle_selections: bool,
+    pub enable_next_episode_auto_play: bool,
+    pub cast_receiver_id: &'static str,
+}
+
+impl Default for UserConfigurationDto {
+    fn default() -> Self {
+        Self {
+            audio_language_preference: "",
+            play_default_audio_track: true,
+            subtitle_language_preference: "",
+            display_missing_episodes: false,
+            grouped_folders: vec![],
+            subtitle_mode: "Default",
+            display_collections_view: false,
+            enable_local_password: false,
+            ordered_views: vec![],
+            latest_items_excludes: vec![],
+            my_media_excludes: vec![],
+            hide_played_in_latest: true,
+            remember_audio_selections: true,
+            remember_subtitle_selections: true,
+            enable_next_episode_auto_play: true,
+            cast_receiver_id: "F007D354",
+        }
+    }
 }
 
 impl UserDto {
@@ -53,6 +117,7 @@ impl UserDto {
             has_password: true,
             has_configured_password: true,
             policy: UserPolicyDto::from_domain(&user.policy),
+            configuration: UserConfigurationDto::default(),
             primary_image_aspect_ratio: 1.0,
         }
     }
