@@ -77,18 +77,25 @@ case "$HOST" in
     ;;
 esac
 
-# Build both OCI images via nix dockerTools. Identical inputs +
-# flake.lock → identical image bytes.
+# Build OCI images + compose manifest via nix dockerTools. Identical
+# inputs + flake.lock → identical image bytes. Three images:
+#   - pharos:latest                  (server)
+#   - pharos-jellyfin-web:latest     (UI bundle behind darkhttpd)
+#   - pharos-test-media:latest       (CC-licensed test corpus,
+#                                     populates the media volume)
 echo ">>> building pharos OCI image"
 PHAROS_OCI=$(nix build ".#packages.${LINUX_SYSTEM}.oci" --no-link --print-out-paths)
 echo ">>> building jellyfin-web OCI image"
 JELLYFIN_OCI=$(nix build ".#packages.${LINUX_SYSTEM}.jellyfinWebOci" --no-link --print-out-paths)
+echo ">>> building test-media OCI image"
+TESTMEDIA_OCI=$(nix build ".#packages.${LINUX_SYSTEM}.testMediaOci" --no-link --print-out-paths)
 echo ">>> resolving compose manifest"
 COMPOSE_SRC=$(nix build ".#packages.${LINUX_SYSTEM}.composeFile" --no-link --print-out-paths)
 
 echo ">>> loading images into $DOCKER"
-$DOCKER load < "$PHAROS_OCI"   >/dev/null
-$DOCKER load < "$JELLYFIN_OCI" >/dev/null
+$DOCKER load < "$PHAROS_OCI"     >/dev/null
+$DOCKER load < "$JELLYFIN_OCI"   >/dev/null
+$DOCKER load < "$TESTMEDIA_OCI"  >/dev/null
 
 # Materialise the compose file + pharos config under $STATE_DIR
 # (a host path the daemon shares unconditionally). The compose
@@ -120,15 +127,34 @@ if [ "${CLEAN:-0}" = "1" ]; then
   "${COMPOSE[@]}" -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
 fi
 
-# Seed playwright user + WebM fixture in a one-shot pharos container
-# sharing the same docker volumes the long-running serve container
-# will mount. The image's Entrypoint is the pharos binary; everything
-# after the service name overrides Cmd.
-echo ">>> seeding playwright user + fixture"
+# Populate the media volume with the Creative-Commons test corpus
+# baked into pharos-test-media:latest. One-shot container; mounts the
+# same volume the serve pharos will read from later.
+echo ">>> populating media volume with CC test corpus"
+MEDIA_VOL_NAME=$($DOCKER volume ls --format '{{.Name}}' | grep '_pharos_media$' | head -1)
+if [ -z "$MEDIA_VOL_NAME" ]; then
+  # Force compose to create the named volumes by spinning up briefly.
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" up --no-start >/dev/null 2>&1 || true
+  MEDIA_VOL_NAME=$($DOCKER volume ls --format '{{.Name}}' | grep '_pharos_media$' | head -1)
+fi
+if [ -n "$MEDIA_VOL_NAME" ]; then
+  $DOCKER run --rm -v "${MEDIA_VOL_NAME}:/media" pharos-test-media:latest
+fi
+
+# Register the populated files via `pharos scan`, then create the
+# playwright admin user. Both run as one-shot pharos containers
+# sharing the same volumes.
+echo ">>> scanning media volume into pharos store"
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm \
+    pharos \
+    --config /etc/pharos/config.toml scan \
+  || echo "    scan exited non-zero — see output above."
+
+echo ">>> creating playwright admin user"
 if ! "${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm \
     pharos \
-    --config /etc/pharos/config.toml admin seed-playwright-user; then
-  echo "    seed exited non-zero — check output above."
+    --config /etc/pharos/config.toml admin create-playwright-user; then
+  echo "    user creation exited non-zero — check output above."
 fi
 
 # Verify fixtures actually landed in the named volume. We discover

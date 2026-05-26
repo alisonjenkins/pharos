@@ -33,6 +33,11 @@ pub enum AdminOp {
     /// `playwright-test-pw`) plus a handful of placeholder items.
     /// Idempotent — re-running is a no-op for existing rows.
     SeedPlaywrightUser,
+    /// Just create the `playwright` admin user without generating
+    /// any media fixtures. Useful when media is pre-populated by
+    /// another process (e.g. the test-media OCI image dev-stack
+    /// ships) and `pharos scan` registers the items separately.
+    CreatePlaywrightUser,
 }
 
 #[cfg(test)]

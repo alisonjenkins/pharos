@@ -47,6 +47,7 @@ async fn main() -> Result<(), AppError> {
                 writeln!(lock, "{cfg:#?}")?;
             }
             AdminOp::SeedPlaywrightUser => seed_playwright_user(&cfg).await?,
+            AdminOp::CreatePlaywrightUser => create_playwright_user(&cfg).await?,
         },
     }
     Ok(())
@@ -214,6 +215,45 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         "seeded: user='playwright' password='playwright-test-pw' (admin), 4 items, fixture={}",
         fixture_path.display()
     )?;
+    Ok(())
+}
+
+/// Like `seed_playwright_user` but stops after creating the user.
+/// Used by dev-stack's CC-test-media flow where the media files are
+/// populated by a separate one-shot container + `pharos scan`
+/// registers them.
+async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
+    use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
+    use pharos_server::auth::BuiltinAuth;
+
+    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let auth = BuiltinAuth::new(stores.clone());
+
+    let hash = auth
+        .hash_password(&SecretString::new("playwright-test-pw"))
+        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+    let user = UserRecord {
+        id: UserId::new(),
+        name: "playwright".into(),
+        password_hash: hash,
+        policy: UserPolicy { admin: true },
+    };
+    match stores.create(user).await {
+        Ok(()) => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            writeln!(
+                lock,
+                "created user 'playwright' (admin) password='playwright-test-pw'"
+            )?;
+        }
+        Err(pharos_core::AuthError::Conflict) => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            writeln!(lock, "user 'playwright' already exists; leaving as-is")?;
+        }
+        Err(e) => return Err(AppError::Io(std::io::Error::other(e.to_string()))),
+    }
     Ok(())
 }
 

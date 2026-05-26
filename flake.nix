@@ -58,6 +58,78 @@
 
         pharos = cargoNix.workspaceMembers."pharos-server".build;
 
+        # ─── Creative-Commons test media ──────────────────────────
+        # Pinned URLs + sha256 so the corpus is bit-identical across
+        # hosts. Licenses recorded inline so the audit trail lives
+        # next to the fetcher.
+        bbb360 = pkgs.fetchurl {
+          url = "https://test-videos.co.uk/vids/bigbuckbunny/webm/vp9/360/Big_Buck_Bunny_360_10s_1MB.webm";
+          hash = "sha256:0n4wjcy95idw59biq105j1k6hcirkj86s7cybpzzshd0kzfzwakb";
+          # Big Buck Bunny © Blender Foundation, CC-BY 3.0
+          # https://peach.blender.org/about/
+          meta.license = pkgs.lib.licenses.cc-by-30;
+        };
+        bbb720 = pkgs.fetchurl {
+          url = "https://test-videos.co.uk/vids/bigbuckbunny/webm/vp9/720/Big_Buck_Bunny_720_10s_2MB.webm";
+          hash = "sha256:0dbjndi62f570hl1m29sirxsikaa5q93g08wmb77fcnraa6kfng0";
+          meta.license = pkgs.lib.licenses.cc-by-30;
+        };
+        bbb1080 = pkgs.fetchurl {
+          url = "https://test-videos.co.uk/vids/bigbuckbunny/webm/vp9/1080/Big_Buck_Bunny_1080_10s_5MB.webm";
+          hash = "sha256:0ljxfk30n57zhq9z3mb8ww7vj2bb7qkshjqr6w7nqbblvkbs649h";
+          meta.license = pkgs.lib.licenses.cc-by-30;
+        };
+        wikimediaExampleOgg = pkgs.fetchurl {
+          url = "https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg";
+          hash = "sha256:0ahq339irazfnlrdjhxczlf803b1jd9b8kr2077lgj74mbc5cyzm";
+          # Public domain (Wikimedia Commons).
+          meta.license = pkgs.lib.licenses.publicDomain;
+        };
+        kevinMacLeodCarefree = pkgs.fetchurl {
+          url = "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Carefree.mp3";
+          hash = "sha256:04g36gblzryj9jalkld4k7lfq1vrcwn4916l9xcv3n9hlrqbfcw4";
+          # Kevin MacLeod "Carefree", CC-BY 4.0.
+          # https://incompetech.com/wordpress/2013/06/carefree/
+          meta.license = pkgs.lib.licenses.cc-by-40;
+        };
+
+        # Test media tree assembled into one directory.
+        pharosTestMedia = pkgs.runCommand "pharos-test-media" { } ''
+          mkdir -p $out
+          cp ${bbb360}               $out/01-big-buck-bunny-360p.webm
+          cp ${bbb720}               $out/02-big-buck-bunny-720p.webm
+          cp ${bbb1080}              $out/03-big-buck-bunny-1080p.webm
+          cp ${wikimediaExampleOgg}  $out/04-wikimedia-example.ogg
+          cp ${kevinMacLeodCarefree} $out/05-carefree.mp3
+          cat > $out/LICENSES.txt <<EOF
+        01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/
+        02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/
+        03-big-buck-bunny-1080p.webm  CC-BY 3.0       https://peach.blender.org/about/
+        04-wikimedia-example.ogg      Public Domain   https://commons.wikimedia.org/wiki/File:Example.ogg
+        05-carefree.mp3               CC-BY 4.0       https://incompetech.com/wordpress/2013/06/carefree/
+        EOF
+        '';
+
+        # Sibling OCI image whose only job is to copy
+        # `pharosTestMedia` into the pharos_media docker volume on
+        # demand. dev-stack runs it as a one-shot during bring-up.
+        testMediaImage = pkgs.dockerTools.buildLayeredImage {
+          name = "pharos-test-media";
+          tag = "latest";
+          architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
+          contents = [
+            pkgs.busybox
+            pharosTestMedia
+          ];
+          config = {
+            Entrypoint = [
+              "/bin/sh"
+              "-c"
+              "cp -rL ${pharosTestMedia}/. /media/ && chmod -R a+r /media && echo '>>> test media populated:' && ls /media"
+            ];
+          };
+        };
+
         # Skeleton rootfs: passwd / group / writable /tmp + state
         # directories. Distroless containers usually skip this, but
         # ffmpeg + tokio's getrandom path are happier with a real
@@ -172,6 +244,8 @@
           # packages.<arch>-linux.* and the linux-builder picks up.
           oci = ociImage;
           jellyfinWebOci = jellyfinWebImage;
+          testMediaOci = testMediaImage;
+          testMediaTree = pharosTestMedia;
           composeFile = composeFile;
         };
 
