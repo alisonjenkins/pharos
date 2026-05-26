@@ -83,6 +83,42 @@ pub fn parse_items_response(bytes: &[u8]) -> Result<Vec<LibraryItem>, ClientErro
         .collect())
 }
 
+/// T50 — admin user-list parser. The Jellyfin `/Users` endpoint
+/// returns a bare array of `UserDto` (NOT wrapped in `ItemsResult`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminUser {
+    pub id: String,
+    pub name: String,
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AdminUserDto {
+    id: String,
+    name: String,
+    policy: AdminUserPolicyDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AdminUserPolicyDto {
+    is_administrator: bool,
+}
+
+pub fn parse_admin_users_response(bytes: &[u8]) -> Result<Vec<AdminUser>, ClientError> {
+    let parsed: Vec<AdminUserDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|u| AdminUser {
+            id: u.id,
+            name: u.name,
+            is_admin: u.policy.is_administrator,
+        })
+        .collect())
+}
+
 #[cfg(feature = "web")]
 pub mod web {
     //! gloo-net HTTP wrappers. Browser-only. Each call composes the
@@ -141,6 +177,84 @@ pub mod web {
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
         parse_items_response(&bytes)
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct CreateUserBody<'a> {
+        name: &'a str,
+        password: &'a str,
+    }
+
+    pub async fn admin_list_users(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<AdminUser>, ClientError> {
+        let resp = Request::get(&format!("{base}/Users"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_admin_users_response(&bytes)
+    }
+
+    pub async fn admin_create_user(
+        base: &str,
+        token: &str,
+        name: &str,
+        password: &str,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::to_string(&CreateUserBody { name, password })
+            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        let resp = Request::post(&format!("{base}/Users/New"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn admin_delete_user(
+        base: &str,
+        token: &str,
+        user_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::delete(&format!("{base}/Users/{user_id}"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn admin_library_refresh(base: &str, token: &str) -> Result<(), ClientError> {
+        let resp = Request::post(&format!("{base}/Library/Refresh"))
+            .header("X-Emby-Token", token)
+            .body("")
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
     }
 }
 

@@ -3,12 +3,14 @@
 //! signals + use_resource. The fetch client lives in `crate::client::web`
 //! (feature `web`); host builds skip it but the components compile.
 
+pub mod admin;
 pub mod app_state;
 pub mod group;
 pub mod library;
 pub mod login;
 pub mod player;
 
+pub use admin::{AdminAction, AdminView, AdminViewProps, CreateUserAttempt};
 pub use app_state::{AppRoute, RootApp};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
 pub use library::{ItemTile, LibraryView};
