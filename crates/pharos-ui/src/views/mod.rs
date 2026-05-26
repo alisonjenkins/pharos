@@ -6,9 +6,11 @@
 
 pub mod library;
 pub mod login;
+pub mod player;
 
 pub use library::{ItemTile, LibraryView};
 pub use login::{LoginAttempt, LoginForm};
+pub use player::{PlaybackEvent, PlayerProps, PlayerView};
 
 use dioxus::prelude::*;
 

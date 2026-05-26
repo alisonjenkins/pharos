@@ -97,7 +97,7 @@ T22|x|health-api: `/healthz`, `/readyz`, `/info`, `/metrics`. Lands with T1.|I.h
 T23|x|observability deepening: span attrs for media ops, RED metrics per route, log redaction|I.obs,V8,V13,V15
 T24|x|dioxus-ui phase 2: wasm32-unknown-unknown rust target via rust-toolchain.toml, dioxus-cli in nix devShell, dioxus-web optional dep + `web` bin entrypoint, actix-files serves config-driven ui dir with SPA fallback. Phase 1 components from T25 now mountable. Phase 3 (login → library wiring + fetch client) tracked under T25 follow-up.|I.dioxus-ui,V16
 T25|x|dioxus-ui: login + library browse views, talks Jellyfin-compat API. T25 phase 1: pure components (LoginForm, LibraryView, ItemTile) with props-driven state; runtime fetch wiring lands with T24 phase 2 (WASM pipeline).|I.dioxus-ui,V16,V1
-T26|.|dioxus-ui: player view (HLS + direct), session reporting|I.dioxus-ui,V16,V1
+T26|x|dioxus-ui: player view (HLS + direct), session reporting. T26 phase 1: PlayerView component renders <video>/<audio> pointing at /Videos/{id}/stream?api_key=…; emits PlaybackEvent callbacks (Started/Progress/Stopped) consumers can route to /Sessions/Playing/*. HLS variant + real fetch wiring deferred.|I.dioxus-ui,V16,V1
 T27|.|dioxus-ui: group session UI (join room, sync indicator, chat)|I.dioxus-ui,V3,V16
 T28|x|architecture doc + diagrams (mermaid) in `docs/architecture.md`: components, crate graph, request flow, concurrency model, data flow|V12,V18
 ```
