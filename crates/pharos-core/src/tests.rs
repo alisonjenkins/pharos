@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -11,7 +10,6 @@ struct MemStore {
     inner: Mutex<HashMap<MediaId, MediaItem>>,
 }
 
-#[async_trait]
 impl MediaStore for MemStore {
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
         self.inner
@@ -41,7 +39,6 @@ impl MediaStore for MemStore {
 
 struct NoopScanner;
 
-#[async_trait]
 impl Scanner for NoopScanner {
     async fn scan(&self, _root: &Path) -> DomainResult<Vec<MediaItem>> {
         Ok(vec![])
@@ -75,7 +72,9 @@ async fn store_get_missing_is_not_found() {
 }
 
 #[tokio::test]
-async fn scanner_trait_object_safe() {
-    let s: Box<dyn Scanner> = Box::new(NoopScanner);
-    assert!(s.scan(Path::new("/")).await.unwrap().is_empty());
+async fn scanner_callable_via_generic_bound() {
+    async fn drive<S: Scanner>(s: &S) -> Vec<MediaItem> {
+        s.scan(Path::new("/")).await.unwrap()
+    }
+    assert!(drive(&NoopScanner).await.is_empty());
 }

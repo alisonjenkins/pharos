@@ -1,7 +1,6 @@
 //! pharos-core: domain traits at IO boundary (V12).
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
-use async_trait::async_trait;
 use std::path::PathBuf;
 
 pub type MediaId = u64;
@@ -21,6 +20,28 @@ pub enum MediaKind {
     Audio,
 }
 
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Movie => "movie",
+            MediaKind::Episode => "episode",
+            MediaKind::Audio => "audio",
+        }
+    }
+}
+
+impl std::str::FromStr for MediaKind {
+    type Err = DomainError;
+    fn from_str(s: &str) -> DomainResult<Self> {
+        match s {
+            "movie" => Ok(MediaKind::Movie),
+            "episode" => Ok(MediaKind::Episode),
+            "audio" => Ok(MediaKind::Audio),
+            other => Err(DomainError::Backend(format!("unknown media kind: {other}"))),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DomainError {
     #[error("not found: {0}")]
@@ -33,21 +54,30 @@ pub enum DomainError {
 
 pub type DomainResult<T> = Result<T, DomainError>;
 
-#[async_trait]
 pub trait MediaStore: Send + Sync {
-    async fn get(&self, id: MediaId) -> DomainResult<MediaItem>;
-    async fn put(&self, item: MediaItem) -> DomainResult<()>;
-    async fn list(&self) -> DomainResult<Vec<MediaItem>>;
+    fn get(
+        &self,
+        id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
+    fn put(
+        &self,
+        item: MediaItem,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+    fn list(&self) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 }
 
-#[async_trait]
 pub trait Scanner: Send + Sync {
-    async fn scan(&self, root: &std::path::Path) -> DomainResult<Vec<MediaItem>>;
+    fn scan(
+        &self,
+        root: &std::path::Path,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 }
 
-#[async_trait]
 pub trait Transcoder: Send + Sync {
-    async fn probe(&self, path: &std::path::Path) -> DomainResult<MediaKind>;
+    fn probe(
+        &self,
+        path: &std::path::Path,
+    ) -> impl std::future::Future<Output = DomainResult<MediaKind>> + Send;
 }
 
 pub trait Clock: Send + Sync {

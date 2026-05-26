@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/pharos-core", "crates/pharos-server"]
+members = [
+    "crates/pharos-core",
+    "crates/pharos-server",
+    "crates/pharos-store-sqlx",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -16,11 +20,11 @@ expect_used = "deny"
 [workspace.dependencies]
 actix-web = "4"
 anyhow = "1"
-async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 toml = "0.8"
