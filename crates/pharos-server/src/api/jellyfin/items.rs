@@ -13,7 +13,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{MediaItem, MediaKind, MediaStore};
+use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -28,6 +28,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/users/{user_id}/items/latest",
             web::get().to(list_user_items_latest),
+        )
+        .route(
+            "/users/{user_id}/items/resume",
+            web::get().to(list_user_items_resume),
         )
         .route(
             "/users/{user_id}/items/{item_id}",
@@ -47,7 +51,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/items/{id}/themevideos",
         "/items/{id}/specialfeatures",
         "/users/{user_id}/items/{item_id}/intros",
-        "/users/{user_id}/items/resume",
         "/shows/nextup",
         "/shows/upcoming",
         "/genres",
@@ -148,10 +151,20 @@ async fn list_user_items_latest(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let limit = q.limit.min(100) as usize;
-    let dtos: Vec<BaseItemDto> = all
-        .into_iter()
-        .take(limit)
-        .map(|i| BaseItemDto::from_domain(&i, &state.server_id))
+    let page: Vec<MediaItem> = all.into_iter().take(limit).collect();
+    let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.0.id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let dtos: Vec<BaseItemDto> = page
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        })
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
     Ok(HttpResponse::Ok().json(dtos))
@@ -249,7 +262,7 @@ fn default_limit() -> u32 {
 
 async fn list_items(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: web::Query<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let all = state
@@ -258,7 +271,8 @@ async fn list_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let filtered = filter_and_sort(all, &q);
-    Ok(HttpResponse::Ok().json(paginate(filtered, &state.server_id, q.start_index, q.limit)))
+    let dto = paginate(&state, user.0.id, filtered, q.start_index, q.limit).await?;
+    Ok(HttpResponse::Ok().json(dto))
 }
 
 async fn list_user_items(
@@ -279,7 +293,8 @@ async fn list_user_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let filtered = filter_and_sort(all, &q);
-    Ok(HttpResponse::Ok().json(paginate(filtered, &state.server_id, q.start_index, q.limit)))
+    let dto = paginate(&state, user.0.id, filtered, q.start_index, q.limit).await?;
+    Ok(HttpResponse::Ok().json(dto))
 }
 
 fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
@@ -346,11 +361,11 @@ fn shuffle_in_place(items: &mut [MediaItem]) {
 
 async fn get_item(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
-    fetch_item_dto(&state, &id_str).await
+    fetch_item_dto(&state, &id_str, user.0.id).await
 }
 
 async fn get_user_item(
@@ -363,12 +378,13 @@ async fn get_user_item(
     if user_path != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
-    fetch_item_dto(&state, &item_id).await
+    fetch_item_dto(&state, &item_id, user.0.id).await
 }
 
 async fn fetch_item_dto(
     state: &AppState,
     id_str: &str,
+    user_id: UserId,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = id_str
         .parse()
@@ -377,7 +393,57 @@ async fn fetch_item_dto(
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
-    Ok(HttpResponse::Ok().json(BaseItemDto::from_domain(&item, &state.server_id)))
+    let user_data = state
+        .stores
+        .get_user_data(user_id, id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(BaseItemDto::from_domain_with_user_data(
+        &item,
+        &state.server_id,
+        user_data,
+    )))
+}
+
+async fn list_user_items_resume(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    let bearer_id = user.0.id.0.simple().to_string();
+    if path.into_inner() != bearer_id {
+        return Err(error::ErrorForbidden("user mismatch"));
+    }
+    let ids = state
+        .stores
+        .resumable_items(user.0.id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if let Ok(item) = state.stores.get(*id).await {
+            items.push(item);
+        }
+    }
+    let user_data = state
+        .stores
+        .user_data_bulk(user.0.id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let total = items.len() as u32;
+    let dtos: Vec<BaseItemDto> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(ItemsResultDto {
+        items: dtos,
+        total_record_count: total,
+        start_index: 0,
+    }))
 }
 
 async fn virtual_folders(
@@ -397,12 +463,13 @@ async fn virtual_folders(
     Ok(HttpResponse::Ok().json(vec![folder]))
 }
 
-fn paginate(
+async fn paginate(
+    state: &AppState,
+    user_id: UserId,
     all: Vec<pharos_core::MediaItem>,
-    server_id: &str,
     start_index: u32,
     limit: u32,
-) -> ItemsResultDto {
+) -> Result<ItemsResultDto, actix_web::Error> {
     let total = all.len() as u32;
     let start = start_index as usize;
     let end = (start + limit as usize).min(all.len());
@@ -411,13 +478,23 @@ fn paginate(
     } else {
         &all[start..end]
     };
+    let ids: Vec<u64> = slice.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user_id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let items: Vec<BaseItemDto> = slice
         .iter()
-        .map(|i| BaseItemDto::from_domain(i, server_id))
+        .enumerate()
+        .map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        })
         .collect();
-    ItemsResultDto {
+    Ok(ItemsResultDto {
         items,
         total_record_count: total,
         start_index,
-    }
+    })
 }

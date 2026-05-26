@@ -76,6 +76,55 @@ pub trait MediaStore: Send + Sync {
     fn list(&self) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 }
 
+/// Per-(user, item) state Jellyfin tracks: watched/unwatched, play
+/// count, resume position, favourite flag. T33 — drives the watched
+/// indicator + resume tiles in jellyfin-web.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserItemData {
+    pub played: bool,
+    pub play_count: u32,
+    /// Resume position in Jellyfin's 100ns ticks (10_000_000 per
+    /// second). Stays 0 once the item is fully played.
+    pub last_played_position_ticks: u64,
+    pub is_favorite: bool,
+    /// Unix-seconds timestamp of the last progress/playback event.
+    /// `0` means "never played" — kept separate from `played` so a
+    /// favourited-but-never-played item still reports last_played=0.
+    pub last_played_at: i64,
+}
+
+pub trait UserDataStore: Send + Sync {
+    fn get_user_data(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<UserItemData>> + Send;
+
+    fn set_user_data(
+        &self,
+        user: UserId,
+        item: MediaId,
+        data: UserItemData,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Bulk fetch keyed by `(user, item)`. Items not in the store
+    /// default to `UserItemData::default()` — callers do not need to
+    /// distinguish "row missing" from "all zeros". O(1) round trip
+    /// instead of N point-fetches when rendering a library list.
+    fn user_data_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<UserItemData>>> + Send;
+
+    /// Item ids that have a non-zero `last_played_position_ticks` and
+    /// are not flagged as played — drives Jellyfin's Resume row.
+    fn resumable_items(
+        &self,
+        user: UserId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+}
+
 pub trait Scanner: Send + Sync {
     fn scan(
         &self,

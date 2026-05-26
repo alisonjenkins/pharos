@@ -12,6 +12,7 @@ pub mod socket;
 pub mod socket_messages;
 pub mod stream;
 pub mod system;
+pub mod user_data;
 pub mod users;
 
 use actix_web::web;
@@ -22,6 +23,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     users::register(cfg);
     items::register(cfg);
     search::register(cfg);
+    user_data::register(cfg);
     images::register(cfg);
     stream::register(cfg);
     hls::register(cfg);

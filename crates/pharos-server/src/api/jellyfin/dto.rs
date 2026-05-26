@@ -268,6 +268,89 @@ pub struct MediaStreamDto {
 pub struct UserItemDataDto {
     pub played: bool,
     pub play_count: u32,
+    /// Resume position in Jellyfin's 100ns ticks.
+    pub playback_position_ticks: u64,
+    pub played_percentage: f32,
+    pub is_favorite: bool,
+    /// `IsFolder` field is unrelated to UserData but jellyfin-web's
+    /// item-data renderer reads `Likes` / `Rating` on this object —
+    /// `null` would crash the optional chain in older builds.
+    pub likes: Option<bool>,
+    pub rating: Option<f32>,
+    pub key: String,
+    pub last_played_date: Option<String>,
+}
+
+impl UserItemDataDto {
+    pub fn from_domain(item_id: pharos_core::MediaId, data: pharos_core::UserItemData) -> Self {
+        Self {
+            played: data.played,
+            play_count: data.play_count,
+            playback_position_ticks: data.last_played_position_ticks,
+            played_percentage: 0.0,
+            is_favorite: data.is_favorite,
+            likes: None,
+            rating: None,
+            key: item_id.to_string(),
+            last_played_date: if data.last_played_at > 0 {
+                Some(format_iso8601(data.last_played_at))
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// Minimal ISO-8601 (Z) formatter for the `LastPlayedDate` field —
+/// avoids pulling in `chrono` just for one render path.
+fn format_iso8601(unix_secs: i64) -> String {
+    // Constants: days/month etc. Use the same algorithm as
+    // chrono::NaiveDateTime::from_timestamp — straightforward Gregorian
+    // calendar arithmetic. Good enough for "last played" display.
+    let secs_per_day: i64 = 86_400;
+    let mut days = unix_secs.div_euclid(secs_per_day);
+    let mut secs_of_day = unix_secs.rem_euclid(secs_per_day);
+    let hh = secs_of_day / 3600;
+    secs_of_day %= 3600;
+    let mm = secs_of_day / 60;
+    let ss = secs_of_day % 60;
+    // Days since 1970-01-01 → Gregorian Y-M-D.
+    let mut year: i64 = 1970;
+    loop {
+        let dy: i64 = if is_leap(year) { 366 } else { 365 };
+        if days < dy {
+            break;
+        }
+        days -= dy;
+        year += 1;
+    }
+    let months: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 0;
+    while month < 12 {
+        let dm = if month == 1 && is_leap(year) {
+            29
+        } else {
+            months[month]
+        };
+        if days < dm {
+            break;
+        }
+        days -= dm;
+        month += 1;
+    }
+    let day = days + 1;
+    format!(
+        "{year:04}-{:02}-{:02}T{:02}:{:02}:{:02}.0000000Z",
+        month as i32 + 1,
+        day,
+        hh,
+        mm,
+        ss
+    )
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -297,6 +380,20 @@ pub struct VirtualFolderOptionsDto {
 
 impl BaseItemDto {
     pub fn from_domain(item: &pharos_core::MediaItem, server_id: &str) -> Self {
+        Self::from_domain_with_user_data(item, server_id, pharos_core::UserItemData::default())
+    }
+
+    pub fn from_domain_with_user_data(
+        item: &pharos_core::MediaItem,
+        server_id: &str,
+        user_data: pharos_core::UserItemData,
+    ) -> Self {
+        let mut dto = Self::build(item, server_id);
+        dto.user_data = UserItemDataDto::from_domain(item.id, user_data);
+        dto
+    }
+
+    fn build(item: &pharos_core::MediaItem, server_id: &str) -> Self {
         let kind = match item.kind {
             pharos_core::MediaKind::Movie => "Movie",
             pharos_core::MediaKind::Episode => "Episode",

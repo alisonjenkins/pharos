@@ -8,6 +8,9 @@ pub mod sqlite;
 #[cfg(feature = "sqlite")]
 mod auth_sqlite;
 
+#[cfg(feature = "sqlite")]
+mod user_data_sqlite;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 

@@ -10,6 +10,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
+use pharos_core::UserDataStore;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -107,24 +108,46 @@ async fn playing_started(
 
 async fn playing_progress(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     body: web::Json<ProgressBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
-    let Some(session_id) = body.play_session_id else {
-        return Ok(HttpResponse::NoContent().finish());
-    };
-    state
-        .sessions
-        .apply(SessionEvent::Progress {
-            session_id,
-            item_id: body.item_id,
-            position_ticks: body.position_ticks.unwrap_or(0),
-            is_paused: body.is_paused,
-        })
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let position_ticks = body.position_ticks.unwrap_or(0);
+    let item_id_str = body.item_id.clone();
+
+    if let Some(session_id) = body.play_session_id.clone() {
+        state
+            .sessions
+            .apply(SessionEvent::Progress {
+                session_id,
+                item_id: body.item_id,
+                position_ticks,
+                is_paused: body.is_paused,
+            })
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    }
+
+    // T33: persist the resume position so the Resume row picks the
+    // item up across sessions. The session-snapshot path above lives
+    // and dies with the in-process actor (V18) and won't survive
+    // restarts.
+    if let Ok(item_id) = item_id_str.parse::<pharos_core::MediaId>() {
+        if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
+            data.last_played_position_ticks = position_ticks;
+            data.last_played_at = now_unix();
+            let _ = state.stores.set_user_data(user.0.id, item_id, data).await;
+        }
+    }
     Ok(HttpResponse::NoContent().finish())
+}
+
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 async fn playing_stopped(
