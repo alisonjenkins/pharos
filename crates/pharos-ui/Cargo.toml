@@ -11,7 +11,7 @@ default = []
 # Enable the `[[bin]] web` target — adds the wasm renderer + gloo-net
 # HTTP client. Build with `dx serve` or
 # `cargo build --target wasm32-unknown-unknown --bin pharos-ui-web --features web`.
-web = ["dep:dioxus-web", "dep:gloo-net"]
+web = ["dep:dioxus-web", "dep:gloo-net", "dep:web-sys", "dep:wasm-bindgen"]
 
 [[bin]]
 name = "pharos-ui-web"
@@ -22,6 +22,11 @@ required-features = ["web"]
 dioxus.workspace = true
 dioxus-web = { workspace = true, optional = true }
 gloo-net = { workspace = true, optional = true }
+# Pulled in by the `web` feature so PlayerView's wasm path can read
+# `<video>.currentTime` from the underlying `web_sys::HtmlMediaElement`.
+# Host-side tests compile without them via cfg-gating in the source.
+web-sys = { version = "0.3", optional = true, features = ["HtmlMediaElement", "Event", "EventTarget"] }
+wasm-bindgen = { version = "0.2", optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true

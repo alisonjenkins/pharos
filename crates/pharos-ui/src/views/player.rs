@@ -87,10 +87,33 @@ pub fn PlayerView(
     }
 }
 
-/// Extract `currentTime` from a generic media event. Dioxus's web
-/// backend forwards the underlying DOM event; this is a stub for the
-/// component test compile. The WASM entrypoint replaces it with a
-/// real read from `event.target.currentTime` via web-sys.
+/// Read the underlying `<video>` / `<audio>` element's `currentTime`.
+///
+/// On the `web` feature (wasm + dioxus-web present): downcast the
+/// Dioxus `MediaData` to the `web_sys::Event` dioxus-web wraps it in,
+/// then walk `event.target() -> HtmlMediaElement::current_time()`.
+/// Returns `0.0` only when the event has no target or the target isn't
+/// a media element (defensive — never observed in practice).
+///
+/// On host (test) builds: no DOM exists, so return `0.0`. Tests cover
+/// the surrounding wire shape rather than runtime time values.
+#[cfg(feature = "web")]
+fn extract_current_time(ev: &Event<MediaData>) -> f64 {
+    use dioxus_web::WebEventExt;
+    use wasm_bindgen::JsCast;
+    let Some(web_event) = ev.try_as_web_event() else {
+        return 0.0;
+    };
+    let Some(target) = web_event.target() else {
+        return 0.0;
+    };
+    match target.dyn_into::<web_sys::HtmlMediaElement>() {
+        Ok(media) => media.current_time(),
+        Err(_) => 0.0,
+    }
+}
+
+#[cfg(not(feature = "web"))]
 fn extract_current_time(_ev: &Event<MediaData>) -> f64 {
     0.0
 }
