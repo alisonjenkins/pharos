@@ -14,7 +14,54 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/Users/AuthenticateByName",
         web::post().to(authenticate_by_name),
     )
-    .route("/Users/Me", web::get().to(me));
+    // Jellyfin server is case-insensitive on paths; jellyfin-web sends
+    // lowercase. Alias each hot route until we add a path-normalising
+    // middleware (tracked T19 phase 4).
+    .route(
+        "/Users/authenticatebyname",
+        web::post().to(authenticate_by_name),
+    )
+    .route("/Users/Me", web::get().to(me))
+    .route("/Users/me", web::get().to(me))
+    .route("/Users/Public", web::get().to(public_users))
+    .route("/users/public", web::get().to(public_users))
+    .route(
+        "/QuickConnect/Enabled",
+        web::get().to(quick_connect_enabled),
+    )
+    .route(
+        "/Branding/Configuration",
+        web::get().to(branding_configuration),
+    )
+    .route("/Branding/Css", web::get().to(branding_css))
+    .route("/Branding/Css.css", web::get().to(branding_css));
+}
+
+/// Jellyfin's "tile picker" on the login page calls this. Return an
+/// empty array — clients drop to the manual login form.
+async fn public_users() -> impl Responder {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    HttpResponse::Ok().json(empty)
+}
+
+/// We do not implement Quick Connect (would need a separate flow);
+/// reporting false ensures jellyfin-web hides the Quick Connect UI.
+async fn quick_connect_enabled() -> impl Responder {
+    HttpResponse::Ok().json(false)
+}
+
+async fn branding_configuration() -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "LoginDisclaimer": "",
+        "CustomCss": "",
+        "SplashscreenEnabled": false,
+    }))
+}
+
+async fn branding_css() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("text/css")
+        .body("")
 }
 
 async fn authenticate_by_name(

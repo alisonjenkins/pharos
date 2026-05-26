@@ -103,11 +103,15 @@
             pkgs.git
             pkgs.just
             pkgs.curl
-            # Node + Playwright drive T29 phase 3 (jellyfin-web headless).
-            # Browser binaries come from playwright-driver.browsers and
-            # are wired in via PLAYWRIGHT_BROWSERS_PATH below.
+            # Node + Playwright drive T29 phase 3. jellyfin-web is the
+            # upstream prebuilt static bundle, referenced via
+            # JELLYFIN_WEB_DIR at runtime. Playwright manages its own
+            # chromium under ~/.cache/ms-playwright; nix's
+            # playwright-driver.browsers had a directory-layout mismatch
+            # with the npm package on darwin, so we let Playwright drive
+            # the download (`npx playwright install chromium` once).
             pkgs.nodejs_22
-            pkgs.playwright-driver.browsers
+            pkgs.jellyfin-web
             # schemathesis (Layer A of T29) — install separately via:
             #   pipx install schemathesis
             # Not pinned in the flake because nixpkgs lacks a stable
@@ -116,8 +120,7 @@
           ];
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
-            export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
-            export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+            export JELLYFIN_WEB_DIR=${pkgs.jellyfin-web}/share/jellyfin-web
           '';
         };
 

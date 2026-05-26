@@ -1,3 +1,4 @@
+use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use clap::Parser;
 use pharos_server::{
@@ -115,10 +116,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let handle_for_app = readiness.clone();
     let ui_dir = cfg.server.ui_dir.clone();
     HttpServer::new(move || {
+        // Permissive CORS so browser-hosted Jellyfin clients (jellyfin-web,
+        // Dioxus UI served from a separate origin) can reach the API.
+        // Production should narrow this — tracked under §B if it bites.
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .expose_any_header()
+            .max_age(3600);
         let mut app = App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
+            .wrap(cors)
             .wrap(RedMetrics)
             .wrap(TracingLogger::default())
             .configure(router::configure);

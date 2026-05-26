@@ -1,46 +1,34 @@
 #!/usr/bin/env bash
 # T29 phase 3 — one-shot setup for the Playwright compat suite.
 #
-# Steps:
-#   1. npm install in compat-playwright/
-#   2. Clone + build jellyfin-web into compat-playwright/jellyfin-web
-#      (uses upstream master; pin to a tag for stability)
-#   3. Verify pharos binary is reachable
+# Just two things:
+#   1. npm install in compat-playwright/ (Playwright runtime + http-server).
+#   2. Verify the pharos binary is built.
+#
+# jellyfin-web is *not* cloned or built locally — the nix devShell pins
+# `pkgs.jellyfin-web` (the upstream prebuilt static bundle) and exports
+# JELLYFIN_WEB_DIR so playwright.config.ts can hand it to http-server.
+#
+# Browser binaries come from `pkgs.playwright-driver.browsers` via
+# PLAYWRIGHT_BROWSERS_PATH — `npx playwright install` is unnecessary.
 #
 # Run via:  nix develop --command bash compat-playwright/scripts/setup.sh
-#
-# Assumes nix devShell is active (provides nodejs + playwright browsers
-# via PLAYWRIGHT_BROWSERS_PATH).
 
 set -euo pipefail
 
 PHAROS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUITE_DIR="$PHAROS_DIR/compat-playwright"
-JF_WEB_DIR="$SUITE_DIR/jellyfin-web"
-JF_WEB_REPO="https://github.com/jellyfin/jellyfin-web.git"
-# Pin to a known-good tag. Bump deliberately and re-baseline tests when
-# upstream changes selectors.
-JF_WEB_REF="${JF_WEB_REF:-v10.10.7}"
 
 echo "==> npm install in $SUITE_DIR"
 cd "$SUITE_DIR"
-npm install
+npm install --no-audit --no-fund
 
-echo "==> Skipping Playwright browser install (using nix-pinned browsers via PLAYWRIGHT_BROWSERS_PATH)"
-
-if [ ! -d "$JF_WEB_DIR" ]; then
-    echo "==> Cloning jellyfin-web @ $JF_WEB_REF"
-    git clone --depth 1 --branch "$JF_WEB_REF" "$JF_WEB_REPO" "$JF_WEB_DIR.src"
-    cd "$JF_WEB_DIR.src"
-    echo "==> Building jellyfin-web (this can take a while)"
-    npm ci
-    npm run build:production
-    mv dist "$JF_WEB_DIR"
-    cd "$SUITE_DIR"
-    rm -rf "$JF_WEB_DIR.src"
-else
-    echo "==> jellyfin-web already built at $JF_WEB_DIR — skipping"
+if [ -z "${JELLYFIN_WEB_DIR:-}" ]; then
+    echo "ERROR: JELLYFIN_WEB_DIR is not set."
+    echo "Enter the nix devShell first (it exports JELLYFIN_WEB_DIR from pkgs.jellyfin-web)."
+    exit 1
 fi
+echo "==> jellyfin-web bundle: $JELLYFIN_WEB_DIR"
 
 echo "==> Verifying pharos binary"
 if ! "$PHAROS_DIR/target/debug/pharos" --version >/dev/null 2>&1; then
@@ -50,8 +38,5 @@ fi
 
 echo "==> Setup complete."
 echo
-echo "To run the suite:"
-echo "  1. Start pharos in another shell, seeded with the test user:"
-echo "       cargo run --bin pharos -- admin seed-playwright-user"
-echo "       cargo run --bin pharos -- serve"
-echo "  2. Run: just compat-playwright"
+echo "Run the suite:"
+echo "  just compat-playwright-full"
