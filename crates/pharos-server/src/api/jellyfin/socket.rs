@@ -1,0 +1,299 @@
+//! Jellyfin `/socket` WebSocket — multipurpose multiplex of `MessageType`
+//! payloads. Phase 1 covers the SyncPlay subset so existing Jellyfin phone
+//! and TV clients participate in pharos's improved group sync (V20).
+//!
+//! Non-SyncPlay messages (KeepAlive, Sessions, etc.) are accepted and
+//! ignored — phase 2 will fan them out to the relevant subsystems.
+
+use super::auth_extractor::AuthUser;
+use super::socket_messages::{
+    CommandData, GroupUpdateData, Inbound, Outbound, SyncPlayJoinData, SyncPlayPlayData,
+    SyncPlaySeekData,
+};
+use crate::state::AppState;
+use crate::sync::{
+    group::{GroupHandle, GroupMsg, Joined},
+    messages::{GroupId, MemberId, ServerMsg},
+    registry::GroupRegistry,
+};
+use actix_web::{web, HttpRequest, HttpResponse};
+use actix_ws::{AggregatedMessage, Session};
+use futures_util::StreamExt;
+use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
+
+const POSITION_TICKS_PER_MS: u64 = 10_000;
+
+pub fn register(cfg: &mut web::ServiceConfig) {
+    cfg.route("/socket", web::get().to(ws_entry));
+}
+
+async fn ws_entry(
+    req: HttpRequest,
+    body: web::Payload,
+    state: web::Data<AppState>,
+    registry: web::Data<GroupRegistry>,
+    user: AuthUser,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (response, session, stream) = actix_ws::handle(&req, body)?;
+    let stream = stream
+        .aggregate_continuations()
+        .max_continuation_size(64 * 1024);
+    let _ = state; // app data retained for future use (sessions etc.).
+    actix_web::rt::spawn(handle_connection(
+        session,
+        stream,
+        registry.get_ref().clone(),
+        user.0.name,
+    ));
+    Ok(response)
+}
+
+async fn handle_connection<S>(
+    mut session: Session,
+    mut stream: S,
+    registry: GroupRegistry,
+    member_name: String,
+) where
+    S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
+{
+    let started = Instant::now();
+    let member_id = MemberId::new();
+    let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
+    let mut current_group: Option<GroupHandle> = None;
+
+    'pump: loop {
+        tokio::select! {
+            biased;
+            Some(server_msg) = out_rx.recv() => {
+                if let Some(out) = translate_outbound(server_msg, current_group.as_ref().map(|h| h.group_id)) {
+                    if send_outbound(&mut session, &out).await.is_err() {
+                        break 'pump;
+                    }
+                }
+            }
+            frame = stream.next() => {
+                let Some(frame) = frame else { break 'pump };
+                match frame {
+                    Ok(AggregatedMessage::Text(txt)) => {
+                        let inbound: Inbound = match serde_json::from_str(&txt) {
+                            Ok(v) => v,
+                            Err(_) => continue 'pump,
+                        };
+                        handle_inbound(
+                            inbound,
+                            &mut current_group,
+                            member_id,
+                            &member_name,
+                            &out_tx,
+                            &registry,
+                            started,
+                        )
+                        .await;
+                    }
+                    Ok(AggregatedMessage::Ping(p)) => {
+                        let _ = session.pong(&p).await;
+                    }
+                    Ok(AggregatedMessage::Close(_)) | Err(_) => break 'pump,
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
+
+    if let Some(h) = current_group.take() {
+        let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
+    }
+    let _ = session.clone().close(None).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound(
+    inbound: Inbound,
+    current_group: &mut Option<GroupHandle>,
+    member_id: MemberId,
+    member_name: &str,
+    out_tx: &mpsc::Sender<ServerMsg>,
+    registry: &GroupRegistry,
+    started: Instant,
+) {
+    let _ = started;
+    match inbound.message_type.as_str() {
+        "SyncPlayCreateGroup" => {
+            if current_group.is_some() {
+                return;
+            }
+            let handle = match registry.create().await {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            join_via_handle(handle, current_group, member_id, member_name, out_tx).await;
+        }
+        "SyncPlayJoinGroup" => {
+            let Ok(data) = serde_json::from_value::<SyncPlayJoinData>(inbound.data) else {
+                return;
+            };
+            let group_id = GroupId(data.group_id);
+            let handle = match registry.get_or_create(group_id).await {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            join_via_handle(handle, current_group, member_id, member_name, out_tx).await;
+        }
+        "SyncPlayLeaveGroup" => {
+            if let Some(h) = current_group.take() {
+                let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
+            }
+        }
+        "SyncPlayPlay" => {
+            let Some(h) = current_group else { return };
+            let data: SyncPlayPlayData = serde_json::from_value(inbound.data).unwrap_or(
+                SyncPlayPlayData { playback_position_ticks: 0 },
+            );
+            let _ = h
+                .tx
+                .send(GroupMsg::LeaderPlay {
+                    sender: member_id,
+                    position_ms: data.playback_position_ticks / POSITION_TICKS_PER_MS,
+                })
+                .await;
+        }
+        "SyncPlayPause" | "SyncPlayUnpause" => {
+            let Some(h) = current_group else { return };
+            let _ = h
+                .tx
+                .send(GroupMsg::LeaderPause { sender: member_id })
+                .await;
+        }
+        "SyncPlaySeek" => {
+            let Some(h) = current_group else { return };
+            let Ok(data) = serde_json::from_value::<SyncPlaySeekData>(inbound.data) else {
+                return;
+            };
+            let _ = h
+                .tx
+                .send(GroupMsg::LeaderSeek {
+                    sender: member_id,
+                    position_ms: data.position_ticks / POSITION_TICKS_PER_MS,
+                })
+                .await;
+        }
+        "SyncPlayBuffering" => {
+            let Some(h) = current_group else { return };
+            let _ = h
+                .tx
+                .send(GroupMsg::BufferingStart {
+                    member_id,
+                    position_ms: 0,
+                })
+                .await;
+        }
+        "SyncPlayReady" => {
+            let Some(h) = current_group else { return };
+            let _ = h
+                .tx
+                .send(GroupMsg::BufferingEnd { member_id })
+                .await;
+        }
+        // KeepAlive, Sessions, etc. — phase 2.
+        _ => {}
+    }
+}
+
+async fn join_via_handle(
+    handle: GroupHandle,
+    current_group: &mut Option<GroupHandle>,
+    member_id: MemberId,
+    member_name: &str,
+    out_tx: &mpsc::Sender<ServerMsg>,
+) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if handle
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id,
+            name: member_name.to_string(),
+            sink: out_tx.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Ok(Joined { group_id, .. }) = reply_rx.await else {
+        return;
+    };
+    *current_group = Some(handle);
+    // Emit a Jellyfin-shaped GroupJoined notification to ourself.
+    let _ = out_tx
+        .send(ServerMsg::Joined {
+            group_id,
+            leader: member_id, // local, will be corrected by actor broadcasts
+            members: vec![],
+        })
+        .await;
+}
+
+fn translate_outbound(msg: ServerMsg, group_id: Option<GroupId>) -> Option<Outbound> {
+    match msg {
+        ServerMsg::Play { position_ms, .. } => Some(Outbound::new(
+            "SyncPlayCommand",
+            serde_json::to_value(CommandData {
+                command: "Unpause",
+                position_ticks: Some(position_ms * POSITION_TICKS_PER_MS),
+                when: None,
+            })
+            .ok()?,
+        )),
+        ServerMsg::Pause { .. } => Some(Outbound::new(
+            "SyncPlayCommand",
+            serde_json::to_value(CommandData {
+                command: "Pause",
+                position_ticks: None,
+                when: None,
+            })
+            .ok()?,
+        )),
+        ServerMsg::Seek { position_ms, .. } => Some(Outbound::new(
+            "SyncPlayCommand",
+            serde_json::to_value(CommandData {
+                command: "Seek",
+                position_ticks: Some(position_ms * POSITION_TICKS_PER_MS),
+                when: None,
+            })
+            .ok()?,
+        )),
+        ServerMsg::Joined { group_id: gid, .. } => Some(Outbound::new(
+            "SyncPlayGroupUpdate",
+            serde_json::to_value(GroupUpdateData {
+                kind: "GroupJoined",
+                group_id: gid.to_string(),
+            })
+            .ok()?,
+        )),
+        ServerMsg::MemberJoined { .. } => Some(Outbound::new(
+            "SyncPlayGroupUpdate",
+            serde_json::to_value(GroupUpdateData {
+                kind: "UserJoined",
+                group_id: group_id.map(|g| g.to_string()).unwrap_or_default(),
+            })
+            .ok()?,
+        )),
+        ServerMsg::MemberLeft { .. } => Some(Outbound::new(
+            "SyncPlayGroupUpdate",
+            serde_json::to_value(GroupUpdateData {
+                kind: "UserLeft",
+                group_id: group_id.map(|g| g.to_string()).unwrap_or_default(),
+            })
+            .ok()?,
+        )),
+        ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. }
+            | ServerMsg::LeaderChange { .. } => None,
+    }
+}
+
+async fn send_outbound(session: &mut Session, msg: &Outbound) -> Result<(), actix_ws::Closed> {
+    let s = serde_json::to_string(msg).map_err(|_| actix_ws::Closed)?;
+    session.text(s).await
+}
