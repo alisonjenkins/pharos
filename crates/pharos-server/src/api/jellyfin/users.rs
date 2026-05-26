@@ -1,6 +1,6 @@
 use crate::{
     api::jellyfin::{
-        auth_extractor::AuthUser,
+        auth_extractor::{auth_header_from_request, AuthUser},
         dto::{AuthenticateByNameRequest, AuthenticationResultDto, SessionInfoDto, UserDto},
     },
     state::AppState,
@@ -73,11 +73,11 @@ async fn authenticate_by_name(
         Err(e) => return Err(actix_web::error::ErrorInternalServerError(e.to_string())),
     };
 
-    let device_id = req
-        .headers()
-        .get("X-Emby-Authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_device_id)
+    let auth = auth_header_from_request(&req);
+    let device_id = auth
+        .device_id
+        .clone()
+        .or_else(|| auth.device.clone())
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
 
     let token = state
@@ -93,9 +93,9 @@ async fn authenticate_by_name(
             user_id: user_id_str.clone(),
             user_name: user.name.clone(),
             device_id,
-            device_name: "Unknown".into(),
-            client: "Unknown".into(),
-            application_version: "0".into(),
+            device_name: auth.device_label(),
+            client: auth.client_label(),
+            application_version: auth.version_label(),
             server_id: state.server_id.clone(),
         },
         user: UserDto::from_domain(&user, &state.server_id),
@@ -122,26 +122,3 @@ async fn user_by_id(
     Ok(HttpResponse::Ok().json(UserDto::from_domain(&user.0, &state.server_id)))
 }
 
-/// Parse `DeviceId=` (preferred) or `Device=` (fallback) from a
-/// MediaBrowser/Emby authorization header.
-fn parse_device_id(value: &str) -> Option<String> {
-    let after = value.strip_prefix("MediaBrowser").or_else(|| value.strip_prefix("Emby"))?;
-    let mut device_id: Option<String> = None;
-    let mut device: Option<String> = None;
-    for part in after.split(',') {
-        let part = part.trim();
-        let Some((k, raw)) = part.split_once('=') else {
-            continue;
-        };
-        let v = raw.trim().trim_matches('"').trim();
-        if v.is_empty() {
-            continue;
-        }
-        match k.trim().to_ascii_lowercase().as_str() {
-            "deviceid" => device_id = Some(v.to_string()),
-            "device" => device = Some(v.to_string()),
-            _ => {}
-        }
-    }
-    device_id.or(device)
-}

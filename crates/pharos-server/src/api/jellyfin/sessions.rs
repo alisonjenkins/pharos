@@ -5,11 +5,11 @@
 //! 204 No Content. GET /Sessions returns the actor's snapshot.
 
 use crate::{
-    api::jellyfin::auth_extractor::AuthUser,
+    api::jellyfin::auth_extractor::{auth_header_from_request, AuthUser},
     sessions::SessionEvent,
     state::AppState,
 };
-use actix_web::{error, web, HttpResponse, Responder};
+use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::UserDataStore;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -82,22 +82,28 @@ async fn list_sessions(
 async fn playing_started(
     state: web::Data<AppState>,
     user: AuthUser,
+    req: HttpRequest,
     body: web::Json<PlayingBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
     let session_id = body
         .play_session_id
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let auth = auth_header_from_request(&req);
     state
         .sessions
         .apply(SessionEvent::Started {
             session_id,
             user_id: user.0.id,
             user_name: user.0.name.clone(),
-            device_id: "unknown".into(),
-            device_name: "unknown".into(),
-            client: "unknown".into(),
-            version: "0".into(),
+            device_id: auth
+                .device_id
+                .clone()
+                .or_else(|| auth.device.clone())
+                .unwrap_or_else(|| "unknown".into()),
+            device_name: auth.device_label(),
+            client: auth.client_label(),
+            version: auth.version_label(),
             item_id: body.item_id,
             position_ticks: body.position_ticks.unwrap_or(0),
         })

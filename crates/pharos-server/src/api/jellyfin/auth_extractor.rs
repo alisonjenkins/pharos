@@ -85,20 +85,94 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
 
 /// Parse `MediaBrowser Token="abc", Client="x", …` style headers.
 fn parse_mediabrowser_token(value: &str) -> Option<String> {
+    parse_auth_header(value).and_then(|p| p.token)
+}
+
+/// All four fields jellyfin-web / mobile / TV clients drop into the
+/// Emby-Authorization header. Used by `/Users/AuthenticateByName` to
+/// label the resulting `SessionInfo`, by /Sessions to enrich the live
+/// session list, and by token issuance to bind tokens to a device.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuthHeader {
+    pub token: Option<String>,
+    pub device_id: Option<String>,
+    pub device: Option<String>,
+    pub client: Option<String>,
+    pub version: Option<String>,
+}
+
+impl AuthHeader {
+    /// What clients call themselves — falls back to "Unknown" only at
+    /// the wire boundary. Callers can still introspect `Option::None`.
+    pub fn device_label(&self) -> String {
+        self.device.clone().unwrap_or_else(|| "Unknown".into())
+    }
+    pub fn client_label(&self) -> String {
+        self.client.clone().unwrap_or_else(|| "Unknown".into())
+    }
+    pub fn version_label(&self) -> String {
+        self.version.clone().unwrap_or_else(|| "0".into())
+    }
+}
+
+/// Walk every recognised header and merge them. Header keys checked
+/// (in order): `X-Emby-Authorization`, `Authorization`.
+pub fn auth_header_from_request(req: &HttpRequest) -> AuthHeader {
+    let mut out = AuthHeader::default();
+    for name in ["X-Emby-Authorization", "Authorization"] {
+        if let Some(v) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
+            if let Some(parsed) = parse_auth_header(v) {
+                out = merge(out, parsed);
+            }
+        }
+    }
+    out
+}
+
+fn merge(mut a: AuthHeader, b: AuthHeader) -> AuthHeader {
+    if a.token.is_none() {
+        a.token = b.token;
+    }
+    if a.device_id.is_none() {
+        a.device_id = b.device_id;
+    }
+    if a.device.is_none() {
+        a.device = b.device;
+    }
+    if a.client.is_none() {
+        a.client = b.client;
+    }
+    if a.version.is_none() {
+        a.version = b.version;
+    }
+    a
+}
+
+/// `MediaBrowser Client="x", Device="iPhone", DeviceId="abc",
+/// Version="1.0", Token="…"` — parse every k=v pair the schemes
+/// recognised by Emby/Jellyfin use. Unknown keys are ignored.
+pub fn parse_auth_header(value: &str) -> Option<AuthHeader> {
     let after = value.strip_prefix("MediaBrowser").or_else(|| value.strip_prefix("Emby"))?;
+    let mut out = AuthHeader::default();
     for part in after.split(',') {
         let part = part.trim();
         let Some((k, raw)) = part.split_once('=') else {
             continue;
         };
-        if k.trim().eq_ignore_ascii_case("Token") {
-            let v = raw.trim().trim_matches('"').trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
+        let v = raw.trim().trim_matches('"').trim();
+        if v.is_empty() {
+            continue;
+        }
+        match k.trim().to_ascii_lowercase().as_str() {
+            "token" => out.token = Some(v.to_string()),
+            "deviceid" => out.device_id = Some(v.to_string()),
+            "device" => out.device = Some(v.to_string()),
+            "client" => out.client = Some(v.to_string()),
+            "version" => out.version = Some(v.to_string()),
+            _ => {}
         }
     }
-    None
+    Some(out)
 }
 
 #[cfg(test)]
@@ -155,6 +229,33 @@ mod tests {
             .uri("/Videos/123/stream?static=true&api_key=abc123&MediaSourceId=xyz")
             .to_http_request();
         assert_eq!(extract_token(&req).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_auth_header_extracts_all_four_fields() {
+        let p = parse_auth_header(
+            r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="abc-123", Version="10.11.0", Token="xyz""#,
+        )
+        .unwrap();
+        assert_eq!(p.client.as_deref(), Some("Jellyfin Web"));
+        assert_eq!(p.device.as_deref(), Some("Firefox"));
+        assert_eq!(p.device_id.as_deref(), Some("abc-123"));
+        assert_eq!(p.version.as_deref(), Some("10.11.0"));
+        assert_eq!(p.token.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn auth_header_from_request_merges_multiple_headers() {
+        // Some clients split Authorization vs X-Emby-Authorization;
+        // missing fields should fall through from one to the other.
+        let req = TestRequest::default()
+            .insert_header(("X-Emby-Authorization", r#"MediaBrowser DeviceId="a""#))
+            .insert_header(("Authorization", r#"MediaBrowser Client="c", Version="2""#))
+            .to_http_request();
+        let h = auth_header_from_request(&req);
+        assert_eq!(h.device_id.as_deref(), Some("a"));
+        assert_eq!(h.client.as_deref(), Some("c"));
+        assert_eq!(h.version.as_deref(), Some("2"));
     }
 
     #[test]
