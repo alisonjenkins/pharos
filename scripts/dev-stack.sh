@@ -128,7 +128,34 @@ echo ">>> seeding playwright user + fixture"
 if ! "${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm \
     pharos \
     --config /etc/pharos/config.toml admin seed-playwright-user; then
-  echo "    seed exited non-zero — likely already populated, continuing."
+  echo "    seed exited non-zero — check output above."
+fi
+
+# Verify fixtures actually landed in the named volume. We discover
+# the actual volume name via `docker compose config --volumes` (handles
+# the project-name prefix without us re-implementing compose's
+# munging rules), then spin a tmp alpine container with it mounted
+# read-only and list contents — the distroless pharos image has no
+# `ls`.
+echo ">>> verifying media volume contents"
+MEDIA_VOL=$($DOCKER volume ls --format '{{.Name}}' | grep '_pharos_media$' | head -1)
+if [ -n "$MEDIA_VOL" ] && $DOCKER volume inspect "$MEDIA_VOL" >/dev/null 2>&1; then
+  FILE_LIST=$($DOCKER run --rm -v "${MEDIA_VOL}:/media:ro" alpine \
+    sh -c 'ls /media 2>/dev/null' || true)
+  FOUND=$(printf "%s\n" "$FILE_LIST" | grep -c . || true)
+  echo "    files in $MEDIA_VOL: ${FOUND:-0}"
+  if [ -n "$FILE_LIST" ]; then
+    printf '%s\n' "$FILE_LIST" | sed 's/^/      /'
+  fi
+  if [ "${FOUND:-0}" -lt 4 ]; then
+    echo "    !! fewer than 4 fixtures in the media volume."
+    echo "    !! /Items + stream endpoints will 404."
+    echo "    !! Try: CLEAN=1 just dev-stack  (wipes + reseeds)"
+  fi
+else
+  echo "    !! could not locate the pharos_media docker volume."
+  $DOCKER volume ls | grep pharos || true
+  echo "    !! Try: CLEAN=1 just dev-stack"
 fi
 
 cleanup() {
