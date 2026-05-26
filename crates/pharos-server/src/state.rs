@@ -21,6 +21,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Construct with a fresh random `server_id`. Reserved for tests that
+    /// don't care about identity persistence — production callers should
+    /// use [`AppState::load`] so jellyfin clients don't re-pair across
+    /// restarts (T35).
     pub fn new(stores: Stores, server_name: String) -> Self {
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
@@ -33,6 +37,27 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
         }
+    }
+
+    /// Construct from a store, reading or initialising the persistent
+    /// `server_id` from `system_identity`. Same id returned across
+    /// restarts.
+    pub async fn load(
+        stores: Stores,
+        server_name: String,
+    ) -> Result<Self, pharos_store_sqlx::StoreError> {
+        let server_id = stores.load_or_create_server_id().await?;
+        let auth = BuiltinAuth::new(stores.clone());
+        let sessions = SessionRegistry::spawn();
+        Ok(Self {
+            stores,
+            auth,
+            sessions,
+            images: None,
+            server_id,
+            server_name,
+            version: env!("CARGO_PKG_VERSION"),
+        })
     }
 
     pub fn with_image_cache(mut self, cache: ImageCache) -> Self {

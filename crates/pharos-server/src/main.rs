@@ -37,7 +37,7 @@ async fn main() -> Result<(), AppError> {
 
     match cli.cmd {
         Cmd::Serve => serve(cfg).await?,
-        Cmd::Scan => tracing::info!("scan not yet implemented (T3)"),
+        Cmd::Scan => scan(&cfg).await?,
         Cmd::Admin { op } => match op {
             AdminOp::PrintConfig => {
                 let stdout = std::io::stdout();
@@ -47,6 +47,51 @@ async fn main() -> Result<(), AppError> {
             AdminOp::SeedPlaywrightUser => seed_playwright_user(&cfg).await?,
         },
     }
+    Ok(())
+}
+
+async fn scan(cfg: &Config) -> Result<(), AppError> {
+    use pharos_core::{MediaStore, Scanner};
+    use pharos_scanner::{FfmpegProber, FsScanner};
+
+    if cfg.media.roots.is_empty() {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        writeln!(
+            lock,
+            "no [media].roots configured — nothing to scan. Add roots = [\"…\"] to config.toml."
+        )?;
+        return Ok(());
+    }
+
+    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let scanner = FsScanner::new(FfmpegProber::new());
+
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let mut total_imported: u64 = 0;
+    let mut total_skipped: u64 = 0;
+    for root in &cfg.media.roots {
+        writeln!(lock, "scanning {}…", root.display())?;
+        match scanner.scan(root.as_path()).await {
+            Ok(items) => {
+                let n = items.len();
+                for item in items {
+                    if stores.put(item).await.is_err() {
+                        total_skipped += 1;
+                    } else {
+                        total_imported += 1;
+                    }
+                }
+                writeln!(lock, "  {n} items probed")?;
+            }
+            Err(e) => writeln!(lock, "  scan failed: {e}")?,
+        }
+    }
+    writeln!(
+        lock,
+        "scan complete: imported={total_imported} skipped(conflict)={total_skipped}",
+    )?;
     Ok(())
 }
 
@@ -164,7 +209,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
-    let mut state = AppState::new(stores, cfg.server.name.clone());
+    let mut state = AppState::load(stores, cfg.server.name.clone()).await?;
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
         state = state.with_image_cache(ImageCache::new(cache_dir));
     }

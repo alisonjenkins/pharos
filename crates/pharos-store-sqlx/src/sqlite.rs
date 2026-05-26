@@ -32,6 +32,46 @@ impl SqliteStore {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Read or initialise this server's stable identity UUID. First call
+    /// in a fresh install writes a new row; subsequent calls return the
+    /// same value. Clients see the same `server_id` across pharos
+    /// restarts so they don't have to re-pair (T35).
+    pub async fn load_or_create_server_id(&self) -> Result<String, StoreError> {
+        if let Some((id,)) =
+            sqlx::query_as::<_, (String,)>("SELECT server_id FROM system_identity WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?
+        {
+            return Ok(id);
+        }
+        let new_id = uuid::Uuid::new_v4().simple().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Race-safe insert: if another process beat us to it, fall back
+        // to its value.
+        match sqlx::query(
+            "INSERT INTO system_identity (id, server_id, created_at) VALUES (1, ?, ?)",
+        )
+        .bind(&new_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(_) => Ok(new_id),
+            Err(sqlx::Error::Database(_)) => {
+                let (id,) = sqlx::query_as::<_, (String,)>(
+                    "SELECT server_id FROM system_identity WHERE id = 1",
+                )
+                .fetch_one(&self.pool)
+                .await?;
+                Ok(id)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl MediaStore for SqliteStore {
