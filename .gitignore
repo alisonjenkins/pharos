@@ -12,6 +12,8 @@ Cargo.lock.bak
 .claude/cache/
 .claude/sessions/
 .claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/tasks/
 compat-playwright/node_modules/
 compat-playwright/test-results/
 compat-playwright/playwright-report/

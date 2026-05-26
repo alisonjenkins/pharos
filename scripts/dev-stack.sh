@@ -62,10 +62,21 @@ if [ ! -d "$JELLYFIN_WEB_DIR" ]; then
 fi
 echo "    jellyfin-web -> $JELLYFIN_WEB_DIR"
 
-# Build the distroless pharos OCI image via nix dockerTools. Output
-# is a tarball; docker load makes it available as pharos:latest.
-echo ">>> building pharos OCI image (.#oci)"
-OCI_TARBALL=$(nix build .#oci --no-link --print-out-paths)
+# Build the distroless pharos OCI image via nix dockerTools. Always
+# target a linux system attr — on darwin this dispatches to the
+# configured linux-builder so the binary inside is a real linux ELF;
+# on linux it's a no-op.
+HOST=$(uname -m)
+case "$HOST" in
+  arm64|aarch64) LINUX_SYSTEM="aarch64-linux" ;;
+  x86_64|amd64)  LINUX_SYSTEM="x86_64-linux" ;;
+  *)
+    echo "error: unsupported host arch $HOST" >&2
+    exit 1
+    ;;
+esac
+echo ">>> building pharos OCI image (.#packages.${LINUX_SYSTEM}.oci)"
+OCI_TARBALL=$(nix build ".#packages.${LINUX_SYSTEM}.oci" --no-link --print-out-paths)
 echo ">>> loading pharos:latest into $DOCKER"
 $DOCKER load < "$OCI_TARBALL" >/dev/null
 
@@ -100,14 +111,14 @@ else
   NGINX_NET=(-p 127.0.0.1:8097:8097)
 fi
 
-# Seed the playwright user + WebM fixture via a one-shot run.
+# Seed the playwright user + WebM fixture via a one-shot run. Drop
+# the image's default Cmd (`serve`) by passing replacement args.
 echo ">>> seeding playwright user + fixture"
 $DOCKER run --rm \
   -v "$STATE_DIR/db:/var/lib/pharos/db" \
   -v "$STATE_DIR/media:/var/lib/pharos/media" \
   -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
   -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-  --entrypoint /bin/pharos \
   pharos:latest \
   --config /etc/pharos/config.toml admin seed-playwright-user \
   || echo "    (seed may have already happened; continuing)"

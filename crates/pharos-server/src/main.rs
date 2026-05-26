@@ -121,77 +121,57 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         }
     }
 
+    // Generate a 5-second WebM fixture via ffmpeg so the playback
+    // Playwright test has real bytes to stream. Path is
+    // /tmp/pharos-playwright-media/fixture.webm — overwritten each
+    // run so a stale file from a code change doesn't shadow new
+    // ffmpeg args.
+    //
     // WebM + VP9 + Opus so the FOSS Chromium shipped with Playwright
     // (no proprietary codec support) can actually decode it. H.264 fails
     // with DEMUXER_ERROR_NO_SUPPORTED_STREAMS under headless chromium.
-    //
-    // Two sources, in order of preference:
-    //
-    // 1. `PHAROS_PLAYWRIGHT_FIXTURE` env var — points at an existing
-    //    file (typically baked into the OCI image at build time, so
-    //    the distroless runtime doesn't need ffmpeg).
-    // 2. Generate via host ffmpeg at /tmp/pharos-playwright-media —
-    //    devShell path.
-    let (fixture_dir, fixture_path) = match std::env::var("PHAROS_PLAYWRIGHT_FIXTURE") {
-        Ok(p) if !p.is_empty() => {
-            let p = std::path::PathBuf::from(p);
-            let parent = p
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("/tmp"))
-                .to_path_buf();
-            tokio::fs::create_dir_all(&parent).await.map_err(AppError::Io)?;
-            if !tokio::fs::try_exists(&p).await.unwrap_or(false) {
-                return Err(AppError::Io(std::io::Error::other(format!(
-                    "PHAROS_PLAYWRIGHT_FIXTURE='{}' but file is missing",
-                    p.display()
-                ))));
-            }
-            (parent, p)
-        }
-        _ => {
-            let dir = std::path::PathBuf::from("/tmp/pharos-playwright-media");
-            tokio::fs::create_dir_all(&dir).await.map_err(AppError::Io)?;
-            let path = dir.join("fixture.webm");
-            let status = tokio::process::Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "testsrc=duration=5:size=320x240:rate=15",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:duration=5",
-                    "-c:v",
-                    "libvpx-vp9",
-                    "-deadline",
-                    "realtime",
-                    "-cpu-used",
-                    "8",
-                    "-row-mt",
-                    "1",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "libopus",
-                    "-shortest",
-                ])
-                .arg(&path)
-                .status()
-                .await
-                .map_err(AppError::Io)?;
-            if !status.success() {
-                return Err(AppError::Io(std::io::Error::other(
-                    "ffmpeg fixture generation failed",
-                )));
-            }
-            (dir, path)
-        }
-    };
+    let fixture_dir = std::path::PathBuf::from("/tmp/pharos-playwright-media");
+    tokio::fs::create_dir_all(&fixture_dir)
+        .await
+        .map_err(AppError::Io)?;
+    let fixture_path = fixture_dir.join("fixture.webm");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=320x240:rate=15",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=5",
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-row-mt",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-shortest",
+        ])
+        .arg(&fixture_path)
+        .status()
+        .await
+        .map_err(AppError::Io)?;
+    if !status.success() {
+        return Err(AppError::Io(std::io::Error::other(
+            "ffmpeg fixture generation failed",
+        )));
+    }
 
     // Materialise four distinct paths so the store's UNIQUE(path)
     // constraint doesn't silently drop items 2/3/4. Each is a copy of
