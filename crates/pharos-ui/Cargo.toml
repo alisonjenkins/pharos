@@ -26,5 +26,12 @@ serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# T51 phase 1: dioxus-ssr renders components to HTML strings inside
+# `#[test]`s so we can assert structural landmarks (input #ids,
+# button text, expected error branches) without a browser. Lives at
+# the same major version as the main `dioxus` workspace dep.
+dioxus-ssr = "0.6"
+
 [lints]
 workspace = true
