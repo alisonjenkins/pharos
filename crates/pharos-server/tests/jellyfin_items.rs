@@ -459,6 +459,52 @@ async fn user_views_returns_one_collection_per_media_root() {
 }
 
 #[actix_web::test]
+async fn get_item_by_library_id_returns_collection_folder() {
+    // Clicking into a library in jellyfin-web fetches
+    // `/Users/{u}/Items/{libraryId}` first; the per-root library id
+    // is 32-hex so the old u64::parse path 400'd and the view hung.
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let state = web::Data::new(
+        AppState::new(stores, "srv".into())
+            .with_media_roots(vec!["/media/Movies".into()]),
+    );
+    let app = test::init_service(build_app(state.clone())).await;
+    // Discover library id from /Views.
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{}/Views", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let v: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, req).await).unwrap();
+    let lib_id = v["Items"][0]["Id"].as_str().unwrap().to_string();
+    // /Items/{lib_id} must return CollectionFolder, not 400.
+    let req = test::TestRequest::get()
+        .uri(&format!("/Items/{lib_id}"))
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body = test::read_body(resp).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Id"], lib_id);
+    assert_eq!(v["Type"], "CollectionFolder");
+    assert_eq!(v["IsFolder"], true);
+}
+
+#[actix_web::test]
 async fn list_items_filters_by_parent_id_to_one_library() {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());

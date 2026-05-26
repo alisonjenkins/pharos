@@ -487,6 +487,20 @@ async fn fetch_item_dto(
     id_str: &str,
     user_id: UserId,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // T-fix-7 follow-up: when the id is one of the synthesised
+    // library CollectionFolder ids (32-hex, derived from
+    // [media].roots), short-circuit with a CollectionFolder DTO.
+    // jellyfin-web GETs /Items/{libraryId} after clicking into a
+    // library; without this branch the id fails u64::parse → 400 →
+    // the library view hangs (caught via HAR: "all media hang").
+    if let Some(view) = library_view_for_id(state, id_str) {
+        return Ok(HttpResponse::Ok().json(view));
+    }
+    // The All-Media placeholder id used when no [media].roots are
+    // configured (still 32 hex chars; never resolves to a real item).
+    if id_str == "00000000000000000000000000000000" {
+        return Ok(HttpResponse::Ok().json(all_media_placeholder(&state.server_id)));
+    }
     let id: u64 = id_str
         .parse()
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
@@ -504,6 +518,14 @@ async fn fetch_item_dto(
         &state.server_id,
         user_data,
     )))
+}
+
+/// If `id_str` matches the library id of any configured root, return
+/// the same CollectionFolder JSON that `/Users/{u}/Views` emits.
+fn library_view_for_id(state: &AppState, id_str: &str) -> Option<serde_json::Value> {
+    library_views(state)
+        .into_iter()
+        .find(|v| v.get("Id").and_then(|i| i.as_str()) == Some(id_str))
 }
 
 async fn list_user_items_resume(
