@@ -79,7 +79,7 @@ T6|x|jellyfin-api: /Library/* + /Items/* (browse, search, details). T6 phase 1: 
 T7|x|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play) via actix-files NamedFile + Range support. Auth extractor accepts api_key query param.|I.jellyfin-api,V1,V9
 T8|.|transcode pipeline: ffmpeg wrapper, segment delivery, format negotiation|I.ffmpeg,V6
 T9|.|jellyfin-api: transcoded streaming + HLS|I.jellyfin-api,V1,V6
-T10|~|jellyfin-api: /Sessions, /PlayState (playback reporting). Actor-owned SessionRegistry; POST Playing/Progress/Stopped + Capabilities accept body and update state; GET /Sessions returns active list.|I.jellyfin-api,V1,V18
+T10|x|jellyfin-api: /Sessions, /PlayState (playback reporting). Actor-owned SessionRegistry; POST Playing/Progress/Stopped + Capabilities accept body and update state; GET /Sessions returns active list.|I.jellyfin-api,V1,V18
 T11|.|plex-api: identity, /myplex auth bridge, /library/sections|I.plex-api,V2,V7
 T12|.|plex-api: /library/metadata, hubs, search|I.plex-api,V2,V7
 T13|.|plex-api: streaming + transcode endpoints|I.plex-api,V2,V6,V9
