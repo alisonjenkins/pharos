@@ -10,31 +10,30 @@ use pharos_core::{AuthBackend, AuthError, SecretString, TokenStore};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    cfg.route(
-        "/Users/AuthenticateByName",
-        web::post().to(authenticate_by_name),
-    )
-    // Jellyfin server is case-insensitive on paths; jellyfin-web sends
-    // lowercase. Alias each hot route until we add a path-normalising
-    // middleware (tracked T19 phase 4).
-    .route(
-        "/Users/authenticatebyname",
-        web::post().to(authenticate_by_name),
-    )
-    .route("/Users/Me", web::get().to(me))
-    .route("/Users/me", web::get().to(me))
-    .route("/Users/Public", web::get().to(public_users))
-    .route("/users/public", web::get().to(public_users))
-    .route(
-        "/QuickConnect/Enabled",
-        web::get().to(quick_connect_enabled),
-    )
-    .route(
-        "/Branding/Configuration",
-        web::get().to(branding_configuration),
-    )
-    .route("/Branding/Css", web::get().to(branding_css))
-    .route("/Branding/Css.css", web::get().to(branding_css));
+    // Jellyfin server matches paths case-insensitively. jellyfin-web in
+    // particular sends all-lowercase. Until pharos grows a real path-
+    // normalising middleware (tracked T29 phase 4), register both
+    // canonical and lowercase aliases on each route.
+    for path in ["/Users/AuthenticateByName", "/Users/authenticatebyname"] {
+        cfg.route(path, web::post().to(authenticate_by_name));
+    }
+    for path in ["/Users/Me", "/Users/me"] {
+        cfg.route(path, web::get().to(me));
+    }
+    // GET /Users/{userId} — clients fetch by id after login.
+    cfg.route("/Users/{user_id}", web::get().to(user_by_id));
+    for path in ["/Users/Public", "/users/public", "/Users/public"] {
+        cfg.route(path, web::get().to(public_users));
+    }
+    for path in ["/QuickConnect/Enabled", "/quickconnect/enabled"] {
+        cfg.route(path, web::get().to(quick_connect_enabled));
+    }
+    for path in ["/Branding/Configuration", "/branding/configuration"] {
+        cfg.route(path, web::get().to(branding_configuration));
+    }
+    for path in ["/Branding/Css", "/Branding/Css.css", "/branding/css"] {
+        cfg.route(path, web::get().to(branding_css));
+    }
 }
 
 /// Jellyfin's "tile picker" on the login page calls this. Return an
@@ -118,6 +117,19 @@ async fn authenticate_by_name(
 
 async fn me(state: web::Data<AppState>, user: AuthUser) -> impl Responder {
     HttpResponse::Ok().json(UserDto::from_domain(&user.0, &state.server_id))
+}
+
+async fn user_by_id(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    let requested = path.into_inner();
+    let bearer_id = user.0.id.0.simple().to_string();
+    if requested != bearer_id {
+        return Err(actix_web::error::ErrorForbidden("user mismatch"));
+    }
+    Ok(HttpResponse::Ok().json(UserDto::from_domain(&user.0, &state.server_id)))
 }
 
 /// Parse `DeviceId=` (preferred) or `Device=` (fallback) from a

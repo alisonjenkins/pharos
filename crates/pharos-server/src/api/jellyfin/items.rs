@@ -17,14 +17,131 @@ use pharos_core::{MediaItem, MediaKind, MediaStore};
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
-    cfg.route("/Items", web::get().to(list_items))
-        .route("/Items/{id}", web::get().to(get_item))
-        .route("/Users/{user_id}/Items", web::get().to(list_user_items))
-        .route(
-            "/Users/{user_id}/Items/{item_id}",
-            web::get().to(get_user_item),
-        )
-        .route("/Library/VirtualFolders", web::get().to(virtual_folders));
+    for path in ["/Items", "/items"] {
+        cfg.route(path, web::get().to(list_items));
+    }
+    for path in ["/Items/{id}", "/items/{id}"] {
+        cfg.route(path, web::get().to(get_item));
+    }
+    for path in ["/Users/{user_id}/Items", "/Users/{user_id}/items"] {
+        cfg.route(path, web::get().to(list_user_items));
+    }
+    for path in [
+        "/Users/{user_id}/Items/Latest",
+        "/Users/{user_id}/items/latest",
+    ] {
+        cfg.route(path, web::get().to(list_user_items_latest));
+    }
+    for path in [
+        "/Users/{user_id}/Items/{item_id}",
+        "/Users/{user_id}/items/{item_id}",
+    ] {
+        cfg.route(path, web::get().to(get_user_item));
+    }
+    for path in ["/Users/{user_id}/Views", "/Users/{user_id}/views"] {
+        cfg.route(path, web::get().to(user_views));
+    }
+    // Legacy alias jellyfin-web hits: GET /UserViews?userId=...
+    for path in ["/UserViews", "/userviews"] {
+        cfg.route(path, web::get().to(user_views_query));
+    }
+    for path in ["/Library/VirtualFolders", "/library/virtualfolders"] {
+        cfg.route(path, web::get().to(virtual_folders));
+    }
+    for path in ["/Library/MediaFolders", "/library/mediafolders"] {
+        cfg.route(path, web::get().to(media_folders));
+    }
+}
+
+async fn list_user_items_latest(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<ListQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    let user_path = path.into_inner();
+    let bearer_id = user.0.id.0.simple().to_string();
+    if user_path != bearer_id {
+        return Err(error::ErrorForbidden("user mismatch"));
+    }
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let limit = q.limit.min(100) as usize;
+    let dtos: Vec<BaseItemDto> = all
+        .into_iter()
+        .take(limit)
+        .map(|i| BaseItemDto::from_domain(&i, &state.server_id))
+        .collect();
+    // /Items/Latest returns a raw array, not the ItemsResult envelope.
+    Ok(HttpResponse::Ok().json(dtos))
+}
+
+async fn user_views(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    _path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    Ok(HttpResponse::Ok().json(synth_views_body(&state.server_id)))
+}
+
+#[derive(serde::Deserialize)]
+struct UserViewsQuery {
+    #[serde(default, rename = "userId")]
+    #[allow(dead_code)]
+    user_id: Option<String>,
+}
+
+async fn user_views_query(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    _q: web::Query<UserViewsQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    Ok(HttpResponse::Ok().json(synth_views_body(&state.server_id)))
+}
+
+fn synth_views_body(server_id: &str) -> serde_json::Value {
+    // Phase 1: synthesize one "All Media" collection so the home page
+    // renders something. Real per-root libraries lands once
+    // [media].roots are wired into the scanner + store.
+    let view = serde_json::json!({
+        "Id": "00000000000000000000000000000000",
+        "Name": "All Media",
+        "ServerId": server_id,
+        "Type": "CollectionFolder",
+        "CollectionType": "mixed",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "UserData": { "Played": false, "PlayCount": 0 },
+    });
+    serde_json::json!({
+        "Items": [view],
+        "TotalRecordCount": 1,
+        "StartIndex": 0,
+    })
+}
+
+async fn media_folders(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    let view = serde_json::json!({
+        "Id": "00000000000000000000000000000000",
+        "Name": "All Media",
+        "ServerId": state.server_id,
+        "Type": "CollectionFolder",
+        "CollectionType": "mixed",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "UserData": { "Played": false, "PlayCount": 0 },
+    });
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": [view],
+        "TotalRecordCount": 1,
+        "StartIndex": 0,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
