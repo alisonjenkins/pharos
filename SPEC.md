@@ -79,7 +79,7 @@ T4|x|user/auth model + token issuance: User, UserPolicy, Argon2 password hash, T
 T5|x|jellyfin-api: /System/Info, /Users/AuthenticateByName, /Users/Me + AppState wiring + auth extractor for Emby/MediaBrowser headers|I.jellyfin-api,V1,V7,V4
 T6|x|jellyfin-api: /Library/* + /Items/* (browse, search, details). T6 phase 1: GET /Items, GET /Items/{id}, GET /Users/{uid}/Items, GET /Library/VirtualFolders (search/filters/images deferred to T6 phase 2)|I.jellyfin-api,V1,V7,V9
 T7|x|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play) via actix-files NamedFile + Range support. Auth extractor accepts api_key query param.|I.jellyfin-api,V1,V9
-T8|.|transcode pipeline: ffmpeg wrapper, segment delivery, format negotiation|I.ffmpeg,V6
+T8|x|transcode pipeline phase 1: `pharos-transcode` crate, FfmpegTranscoder spawns subprocess, exposes byte stream via tokio_util::io::ReaderStream over ChildStdout, Drop kills child (V6), TranscodeOptions covers container/video-codec/audio-codec/start-position. Format negotiation matrix + HLS segments are T8 phase 2 + T9.|I.ffmpeg,V6,V12,V18
 T9|.|jellyfin-api: transcoded streaming + HLS|I.jellyfin-api,V1,V6
 T10|x|jellyfin-api: /Sessions, /PlayState (playback reporting). Actor-owned SessionRegistry; POST Playing/Progress/Stopped + Capabilities accept body and update state; GET /Sessions returns active list.|I.jellyfin-api,V1,V18
 T11|.|plex-api: identity, /myplex auth bridge, /library/sections|I.plex-api,V2,V7

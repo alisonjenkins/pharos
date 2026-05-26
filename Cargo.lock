@@ -2248,6 +2248,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-transcode"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "pharos-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "pharos-ui"
 version = "0.0.0"
 dependencies = [

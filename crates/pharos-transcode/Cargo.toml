@@ -1,0 +1,21 @@
+[package]
+name = "pharos-transcode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+bytes.workspace = true
+futures-core = "0.3"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

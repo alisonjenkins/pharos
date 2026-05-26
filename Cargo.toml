@@ -5,6 +5,7 @@ members = [
     "crates/pharos-scanner",
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
+    "crates/pharos-transcode",
     "crates/pharos-ui",
 ]
 
@@ -38,6 +39,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 thiserror = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-actix-web = "0.7"
