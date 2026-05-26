@@ -12,9 +12,10 @@
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::AdminUser;
+use pharos_ui::client::SearchHint;
 use pharos_ui::views::{
     AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, LibraryView, LoginForm,
-    PlayerView,
+    PlayerView, SearchStatus, SearchView,
 };
 
 fn render_root(root: fn() -> Element) -> String {
@@ -242,4 +243,100 @@ fn admin_view_status_banner_renders_when_present() {
     let html = render_root(admin_with_status);
     assert!(html.contains("pharos-admin-status"), "{html}");
     assert!(html.contains("Created alice"), "{html}");
+}
+
+// ---- SearchView -------------------------------------------------
+
+fn search_idle_with_hits() -> Element {
+    let hits = vec![
+        SearchHint {
+            id: "1".into(),
+            name: "Blade Runner".into(),
+            kind: ItemKind::Movie,
+            matched_term: "blade".into(),
+        },
+        SearchHint {
+            id: "2".into(),
+            name: "Vangelis - Tales".into(),
+            kind: ItemKind::Audio,
+            matched_term: "vang".into(),
+        },
+    ];
+    rsx! {
+        SearchView {
+            query: "bl".to_string(),
+            hits: hits,
+            status: SearchStatus::Idle,
+            on_query: move |_| {},
+            on_play: move |_| {},
+        }
+    }
+}
+
+fn search_loading() -> Element {
+    rsx! {
+        SearchView {
+            query: "bl".to_string(),
+            hits: Vec::<SearchHint>::new(),
+            status: SearchStatus::Loading,
+            on_query: move |_| {},
+            on_play: move |_| {},
+        }
+    }
+}
+
+fn search_empty() -> Element {
+    rsx! {
+        SearchView {
+            query: "nope".to_string(),
+            hits: Vec::<SearchHint>::new(),
+            status: SearchStatus::Empty,
+            on_query: move |_| {},
+            on_play: move |_| {},
+        }
+    }
+}
+
+fn search_error() -> Element {
+    rsx! {
+        SearchView {
+            query: "x".to_string(),
+            hits: Vec::<SearchHint>::new(),
+            status: SearchStatus::Error("network down".into()),
+            on_query: move |_| {},
+            on_play: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn search_view_renders_input_and_grouped_hits() {
+    let html = render_root(search_idle_with_hits);
+    assert!(html.contains(r#"type="search""#), "{html}");
+    assert!(html.contains("Blade Runner"), "{html}");
+    assert!(html.contains("Vangelis - Tales"), "{html}");
+    // Group headings present for both kinds.
+    assert!(html.contains(">Video<"), "{html}");
+    assert!(html.contains(">Audio<"), "{html}");
+}
+
+#[test]
+fn search_view_loading_branch_renders_indicator() {
+    let html = render_root(search_loading);
+    assert!(html.contains("pharos-search-loading"), "{html}");
+    assert!(html.contains("Searching"), "{html}");
+}
+
+#[test]
+fn search_view_empty_branch_renders_empty_text() {
+    let html = render_root(search_empty);
+    assert!(html.contains("pharos-empty"), "{html}");
+    assert!(html.contains("No matches"), "{html}");
+}
+
+#[test]
+fn search_view_error_branch_renders_error_class() {
+    let html = render_root(search_error);
+    assert!(html.contains("pharos-error"), "{html}");
+    assert!(html.contains("network down"), "{html}");
 }

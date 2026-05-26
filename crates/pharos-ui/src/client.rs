@@ -106,6 +106,52 @@ struct AdminUserPolicyDto {
     is_administrator: bool,
 }
 
+/// T53 — `/Search/Hints` result shape. `MediaType` distinguishes
+/// `Audio` from `Video`; `Type` (the kind) tracks the
+/// Jellyfin-side discriminator (Movie / Episode / Audio / ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHint {
+    pub id: String,
+    pub name: String,
+    pub kind: ItemKind,
+    pub matched_term: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SearchHintDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "Type", default)]
+    kind: String,
+    #[serde(default)]
+    matched_term: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SearchHintsResultDto {
+    #[serde(default)]
+    search_hints: Vec<SearchHintDto>,
+}
+
+pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, ClientError> {
+    let parsed: SearchHintsResultDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .search_hints
+        .into_iter()
+        .map(|h| SearchHint {
+            id: h.id,
+            name: h.name,
+            kind: ItemKind::from_jellyfin_type(&h.kind),
+            matched_term: h.matched_term,
+        })
+        .collect())
+}
+
 pub fn parse_admin_users_response(bytes: &[u8]) -> Result<Vec<AdminUser>, ClientError> {
     let parsed: Vec<AdminUserDto> =
         serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
@@ -241,6 +287,49 @@ pub mod web {
             return Err(ClientError::Status(resp.status()));
         }
         Ok(())
+    }
+
+    pub async fn search_hints(
+        base: &str,
+        token: &str,
+        term: &str,
+    ) -> Result<Vec<SearchHint>, ClientError> {
+        let qs = if term.is_empty() {
+            String::new()
+        } else {
+            format!("?searchTerm={}", urlencode(term))
+        };
+        let resp = Request::get(&format!("{base}/Search/Hints{qs}"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_search_hints_response(&bytes)
+    }
+
+    /// Minimal urlencode for the search term — covers space + `&` +
+    /// `?` which is all jellyfin-web's search input emits. Pulls in
+    /// no extra crate.
+    fn urlencode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
+                _ => {
+                    for b in c.to_string().bytes() {
+                        out.push_str(&format!("%{b:02X}"));
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub async fn admin_library_refresh(base: &str, token: &str) -> Result<(), ClientError> {

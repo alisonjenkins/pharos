@@ -12,10 +12,10 @@
 //! nothing useful.
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
-use crate::client::AdminUser;
+use crate::client::{AdminUser, SearchHint};
 use crate::views::{
     AdminAction, AdminView, CreateUserAttempt, LibraryView, LoginAttempt, LoginForm,
-    PlayerView,
+    PlayerView, SearchStatus, SearchView,
 };
 use dioxus::prelude::*;
 
@@ -27,6 +27,7 @@ pub enum AppRoute {
         kind: ItemKind,
     },
     Admin,
+    Search,
 }
 
 #[component]
@@ -114,6 +115,11 @@ fn Authenticated(
                 onclick: move |_| route.set(AppRoute::Library),
                 "Library"
             }
+            button {
+                class: "pharos-nav-search",
+                onclick: move |_| route.set(AppRoute::Search),
+                "Search"
+            }
             if is_admin {
                 button {
                     class: "pharos-nav-admin",
@@ -146,7 +152,82 @@ fn Authenticated(
                     server_base: server_base_from_window(),
                     current_user_id: current_user_id.clone(),
                 }
+            },
+            AppRoute::Search => rsx! {
+                SearchPane {
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
+                    on_play: move |(id, kind): (String, ItemKind)| {
+                        route.set(AppRoute::Player { item_id: id, kind });
+                    }
+                }
             }
+        }
+    }
+}
+
+#[component]
+fn SearchPane(
+    access_token: String,
+    server_base: String,
+    on_play: EventHandler<(String, ItemKind)>,
+) -> Element {
+    let mut query = use_signal(String::new);
+    let hits = use_signal::<Vec<SearchHint>>(Vec::new);
+    let status = use_signal::<SearchStatus>(|| SearchStatus::Idle);
+
+    let do_search = {
+        let access_token = access_token.clone();
+        let server_base = server_base.clone();
+        let mut hits = hits;
+        let mut status = status;
+        move |term: String| {
+            let token = access_token.clone();
+            let base = server_base.clone();
+            if term.trim().is_empty() {
+                hits.set(Vec::new());
+                status.set(SearchStatus::Idle);
+                return;
+            }
+            status.set(SearchStatus::Loading);
+            spawn(async move {
+                match fetch_search_hints(&base, &token, &term).await {
+                    Ok(v) if v.is_empty() => {
+                        hits.set(Vec::new());
+                        status.set(SearchStatus::Empty);
+                    }
+                    Ok(v) => {
+                        hits.set(v);
+                        status.set(SearchStatus::Idle);
+                    }
+                    Err(e) => status.set(SearchStatus::Error(e)),
+                }
+            });
+        }
+    };
+
+    let q_for_render = query.read().clone();
+    let hits_now = hits.read().clone();
+    let status_now = status.read().clone();
+
+    rsx! {
+        SearchView {
+            query: q_for_render,
+            hits: hits_now,
+            status: status_now,
+            on_query: move |q: String| {
+                query.set(q.clone());
+                do_search.clone()(q);
+            },
+            on_play: move |id: String| {
+                let kind = hits
+                    .read()
+                    .iter()
+                    .find(|h| h.id == id)
+                    .map(|h| h.kind)
+                    .unwrap_or(ItemKind::Movie);
+                on_play.call((id, kind));
+            },
         }
     }
 }
@@ -372,6 +453,26 @@ async fn library_refresh(base: &str, token: &str) -> Result<(), String> {
 #[cfg(not(feature = "web"))]
 async fn library_refresh(_base: &str, _token: &str) -> Result<(), String> {
     Err("library_refresh is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_search_hints(
+    base: &str,
+    token: &str,
+    term: &str,
+) -> Result<Vec<SearchHint>, String> {
+    crate::client::web::search_hints(base, token, term)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_search_hints(
+    _base: &str,
+    _token: &str,
+    _term: &str,
+) -> Result<Vec<SearchHint>, String> {
+    Err("search_hints is only wired in the web build".into())
 }
 
 #[cfg(test)]
