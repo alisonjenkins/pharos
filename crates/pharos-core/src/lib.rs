@@ -1,6 +1,10 @@
 //! pharos-core: domain traits at IO boundary (V12).
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
+pub mod secret;
+
+pub use secret::SecretString;
+
 use std::path::PathBuf;
 
 pub type MediaId = u64;

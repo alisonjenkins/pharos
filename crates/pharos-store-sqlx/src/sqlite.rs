@@ -35,6 +35,7 @@ impl SqliteStore {
 }
 
 impl MediaStore for SqliteStore {
+    #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
         let id_i64 = i64::try_from(id)
             .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
@@ -51,6 +52,7 @@ impl MediaStore for SqliteStore {
         }
     }
 
+    #[tracing::instrument(skip(self, item), fields(media.id = %item.id, media.kind = item.kind.as_str()))]
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
         let id_i64 = i64::try_from(item.id)
             .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
@@ -74,6 +76,7 @@ impl MediaStore for SqliteStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
         let rows = sqlx::query_as::<_, MediaRow>(
             "SELECT id, path, title, kind FROM media_items ORDER BY id",

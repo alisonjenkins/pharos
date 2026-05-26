@@ -4,6 +4,7 @@ use pharos_server::{
     cli::{AdminOp, Cli, Cmd},
     config::Config,
     health::{ReadinessError, ReadinessHandle},
+    middleware::RedMetrics,
     obs, router,
 };
 use std::io::Write;
@@ -53,6 +54,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
+            .wrap(RedMetrics)
             .wrap(TracingLogger::default())
             .configure(router::configure)
     })

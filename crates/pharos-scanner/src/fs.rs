@@ -41,6 +41,7 @@ impl<P: Prober> FsScanner<P> {
 
     /// Scan and push items into the given store. Streaming variant — avoids
     /// holding the entire library in memory. V10 atomicity holds per `put`.
+    #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
     pub async fn scan_into<S: MediaStore>(&self, root: &Path, store: &S) -> DomainResult<usize> {
         let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
         let mut n = 0;
@@ -77,6 +78,7 @@ impl<P: Prober> FsScanner<P> {
 }
 
 impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
+    #[tracing::instrument(skip(self), fields(root = %root.display()))]
     async fn scan(&self, root: &Path) -> DomainResult<Vec<MediaItem>> {
         let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
         let mut items = Vec::with_capacity(paths.len());
