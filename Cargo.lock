@@ -1737,7 +1737,9 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "pharos-core",
+ "pharos-store-sqlx",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1745,6 +1747,7 @@ dependencies = [
  "tracing",
  "tracing-actix-web",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

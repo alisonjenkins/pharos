@@ -31,4 +31,6 @@ fn config_example_parses() {
         .join("../../config.example.toml");
     let cfg = Config::from_path(&path).unwrap();
     assert_eq!(cfg.server.bind, "0.0.0.0:8096");
+    assert_eq!(cfg.server.name, "pharos");
+    assert!(cfg.database.url.starts_with("sqlite:"));
 }

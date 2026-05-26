@@ -13,6 +13,7 @@ Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better pe
 - Async traits: native `async fn` in traits (stable Rust 1.75+). No `async_trait` crate. Prefer generics over `dyn Trait` for swappable backends.
 - SIMD: use SIMD-accelerated crates where applicable. JSON parsing via `sonic-rs` (ByteDance; 1.5–2× faster than `simd-json` on common workloads, no intermediate tape). Hashing via `xxhash-rust` (xxh3) for stable IDs and `blake3` for content hashing. Image decode via `image` (default SIMD). Fall back gracefully on non-supported archs.
 - Benchmarks: every SIMD-accelerated or otherwise hot code path has a `criterion` benchmark under the owning crate's `benches/`. Bench gates regressions, not unit correctness.
+- Test runner: `cargo nextest run --workspace`. Config in `.config/nextest.toml`. Doctests via `cargo test --doc` separately.
 - Web UI: Dioxus (Rust → WASM). Single-lang stack.
 - API compat: existing Jellyfin clients (Finamp, Infuse, Jellyfin web/mobile/TV) work unmodified.
 - API compat: existing Plex clients (Plex web/mobile/TV, Plexamp) work unmodified.
@@ -71,7 +72,7 @@ T1|x|cargo workspace skeleton, actix-web app, config loader, tracing init, OTel+
 T2|x|sqlx-backed `MediaStore` impl in `pharos-store-sqlx` crate (sqlite default, postgres feature-gated), migrations via `sqlx::migrate!`, wired through core trait — no call site knows backend|I.store,V10,V12
 T3|x|media-fs scanner: walk roots, extract metadata via ffprobe|I.media-fs,I.ffmpeg,V5,V12,V18
 T4|x|user/auth model + token issuance: User, UserPolicy, Argon2 password hash, TokenStore (sqlite) issuing opaque UUIDv4 tokens, AuthBackend trait, BuiltinAuth impl|V8,V12,V17
-T5|.|jellyfin-api: /System/Info, /Users/AuthenticateByName, /Users/Me|I.jellyfin-api,V1,V7
+T5|x|jellyfin-api: /System/Info, /Users/AuthenticateByName, /Users/Me + AppState wiring + auth extractor for Emby/MediaBrowser headers|I.jellyfin-api,V1,V7,V4
 T6|.|jellyfin-api: /Library/* + /Items/* (browse, search, details)|I.jellyfin-api,V1,V7
 T7|.|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play)|I.jellyfin-api,V1,V9
 T8|.|transcode pipeline: ffmpeg wrapper, segment delivery, format negotiation|I.ffmpeg,V6
@@ -101,4 +102,5 @@ T28|x|architecture doc + diagrams (mermaid) in `docs/architecture.md`: component
 
 ```
 id|date|cause|fix
+B1|2026-05-26|parse_device_id matched `Device=` before `DeviceId=` because the loop returned on first hit. Test caught via auth header containing both keys.|prefer DeviceId; fall back to Device only if absent. Caught by V11 test-first practice — no new invariant.
 ```

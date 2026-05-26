@@ -6,7 +6,9 @@ use pharos_server::{
     health::{ReadinessError, ReadinessHandle},
     middleware::RedMetrics,
     obs, router,
+    state::AppState,
 };
+use pharos_store_sqlx::sqlite::SqliteStore;
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
 
@@ -20,6 +22,8 @@ enum AppError {
     Io(#[from] std::io::Error),
     #[error("readiness: {0}")]
     Readiness(#[from] ReadinessError),
+    #[error("store: {0}")]
+    Store(#[from] pharos_store_sqlx::StoreError),
 }
 
 #[actix_web::main]
@@ -43,17 +47,21 @@ async fn main() -> Result<(), AppError> {
 }
 
 async fn serve(cfg: Config) -> Result<(), AppError> {
-    tracing::info!(bind = %cfg.server.bind, "starting pharos");
+    tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
+
+    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let app_state = web::Data::new(AppState::new(stores, cfg.server.name.clone()));
 
     // Probes whose readiness must flip true before /readyz returns 200.
-    // Subsystems registered here as they come online (T2 store wiring, T3 scanner, …).
-    let readiness = ReadinessHandle::spawn(&["process"]);
+    let readiness = ReadinessHandle::spawn(&["process", "store"]);
     readiness.mark("process").await?;
+    readiness.mark("store").await?;
 
     let handle_for_app = readiness.clone();
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
+            .app_data(app_state.clone())
             .wrap(RedMetrics)
             .wrap(TracingLogger::default())
             .configure(router::configure)

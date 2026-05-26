@@ -6,11 +6,37 @@ pub struct Config {
     pub server: ServerConfig,
     pub obs: ObsConfig,
     pub media: MediaConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind: String,
+    #[serde(default = "default_server_name")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_db_url")]
+    pub url: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: default_db_url(),
+        }
+    }
+}
+
+fn default_db_url() -> String {
+    "sqlite::memory:".into()
+}
+
+fn default_server_name() -> String {
+    "pharos".into()
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -81,12 +107,16 @@ mod tests {
     const SAMPLE: &str = r#"
         [server]
         bind = "0.0.0.0:8096"
+        name = "pharos-test"
 
         [obs]
         log_level = "debug"
 
         [media]
         roots = ["/srv/media"]
+
+        [database]
+        url = "sqlite::memory:"
     "#;
 
     #[test]
@@ -108,6 +138,8 @@ mod tests {
         "#;
         let c = Config::from_toml_str(s).unwrap();
         assert_eq!(c.obs.log_level, "info");
+        assert_eq!(c.server.name, "pharos");
+        assert_eq!(c.database.url, "sqlite::memory:");
     }
 
     #[test]
