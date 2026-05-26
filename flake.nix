@@ -94,17 +94,39 @@
         };
 
         # Test media tree assembled into one directory.
-        pharosTestMedia = pkgs.runCommand "pharos-test-media" { } ''
+        #
+        # Upstream test-videos.co.uk BBB samples are video-only. We mux a
+        # silent Opus track in at build time so the corpus exercises the
+        # full audio+video pipeline through jellyfin-web's htmlVideoPlayer
+        # — direct-play of a video-only WebM works but a user who clicks
+        # play sees no soundbar, which looks broken even though it isn't.
+        # The Opus track is generated via ffmpeg's `anullsrc` lavfi
+        # source; output is bit-identical across builds because nix sets
+        # `SOURCE_DATE_EPOCH` and ffmpeg uses it for the WebM creation_time.
+        pharosTestMedia = pkgs.runCommand "pharos-test-media"
+          { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
           mkdir -p $out
-          cp ${bbb360}               $out/01-big-buck-bunny-360p.webm
-          cp ${bbb720}               $out/02-big-buck-bunny-720p.webm
-          cp ${bbb1080}              $out/03-big-buck-bunny-1080p.webm
+          add_silence() {
+            in=$1
+            out=$2
+            dur=$(ffprobe -v error -show_entries format=duration \
+                          -of default=nw=1:nk=1 "$in")
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -i "$in" \
+                   -f lavfi -t "$dur" -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
+                   -c:v copy -c:a libopus -b:a 64k \
+                   -map 0:v:0 -map 1:a:0 \
+                   -shortest "$out"
+          }
+          add_silence ${bbb360}   $out/01-big-buck-bunny-360p.webm
+          add_silence ${bbb720}   $out/02-big-buck-bunny-720p.webm
+          add_silence ${bbb1080}  $out/03-big-buck-bunny-1080p.webm
           cp ${wikimediaExampleOgg}  $out/04-wikimedia-example.ogg
           cp ${kevinMacLeodCarefree} $out/05-carefree.mp3
           cat > $out/LICENSES.txt <<EOF
-        01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/
-        02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/
-        03-big-buck-bunny-1080p.webm  CC-BY 3.0       https://peach.blender.org/about/
+        01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
+        02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
+        03-big-buck-bunny-1080p.webm  CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         04-wikimedia-example.ogg      Public Domain   https://commons.wikimedia.org/wiki/File:Example.ogg
         05-carefree.mp3               CC-BY 4.0       https://incompetech.com/wordpress/2013/06/carefree/
         EOF
