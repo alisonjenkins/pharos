@@ -12,10 +12,10 @@
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::AdminUser;
-use pharos_ui::client::SearchHint;
+use pharos_ui::client::{ItemDetail, SearchHint};
 use pharos_ui::views::{
-    AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, LibraryView, LoginForm,
-    PlayerView, SearchStatus, SearchView,
+    AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView, LibraryView,
+    LoginForm, PlayerView, SearchStatus, SearchView,
 };
 
 fn render_root(root: fn() -> Element) -> String {
@@ -339,4 +339,70 @@ fn search_view_error_branch_renders_error_class() {
     let html = render_root(search_error);
     assert!(html.contains("pharos-error"), "{html}");
     assert!(html.contains("network down"), "{html}");
+}
+
+// ---- ItemDetailView ---------------------------------------------
+
+fn detail_unplayed_no_position() -> Element {
+    rsx! {
+        ItemDetailView {
+            detail: ItemDetail {
+                id: "1".into(),
+                name: "Blade Runner".into(),
+                kind: ItemKind::Movie,
+                run_time_ticks: 117 * 60 * 10_000_000,
+                played: false,
+                play_count: 0,
+                is_favorite: false,
+                playback_position_ticks: 0,
+            },
+            error: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn detail_resumable_played_favorite() -> Element {
+    rsx! {
+        ItemDetailView {
+            detail: ItemDetail {
+                id: "2".into(),
+                name: "The Expanse - S01E01".into(),
+                kind: ItemKind::Episode,
+                run_time_ticks: 45 * 60 * 10_000_000,
+                played: false,
+                play_count: 3,
+                is_favorite: true,
+                playback_position_ticks: 30 * 60 * 10_000_000,
+            },
+            error: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn detail_view_renders_title_runtime_and_play_button() {
+    let html = render_root(detail_unplayed_no_position);
+    assert!(html.contains("Blade Runner"), "{html}");
+    assert!(html.contains("1h 57m"), "runtime missing: {html}");
+    assert!(html.contains("pharos-detail-play"), "{html}");
+    // No resume — Play (not Resume).
+    assert!(html.contains(">Play<"), "{html}");
+    assert!(!html.contains("Resume from"), "{html}");
+    // Unplayed + non-favourite states.
+    assert!(html.contains("Mark played"), "{html}");
+    assert!(html.contains("☆ Favourite"), "{html}");
+}
+
+#[test]
+fn detail_view_resume_button_renders_when_positionticks_set() {
+    let html = render_root(detail_resumable_played_favorite);
+    assert!(html.contains(">Resume<"), "{html}");
+    assert!(html.contains("Resume from 30m"), "{html}");
+    // Favourite-on state.
+    assert!(html.contains("★ Favourite"), "{html}");
+    // play_count display.
+    assert!(html.contains("pharos-detail-playcount"), "{html}");
+    assert!(html.contains(">3<"), "{html}");
 }

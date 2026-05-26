@@ -122,13 +122,14 @@ fi
 
 # Seed playwright user + WebM fixture in a one-shot pharos container
 # sharing the same docker volumes the long-running serve container
-# will mount.
+# will mount. The image's Entrypoint is the pharos binary; everything
+# after the service name overrides Cmd.
 echo ">>> seeding playwright user + fixture"
-"${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm \
-  --entrypoint /bin/pharos \
-  pharos \
-  --config /etc/pharos/config.toml admin seed-playwright-user \
-  || echo "    (seed may have already happened; continuing)"
+if ! "${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm \
+    pharos \
+    --config /etc/pharos/config.toml admin seed-playwright-user; then
+  echo "    seed exited non-zero — likely already populated, continuing."
+fi
 
 cleanup() {
   echo

@@ -137,6 +137,58 @@ struct SearchHintsResultDto {
     search_hints: Vec<SearchHintDto>,
 }
 
+/// T54 — single-item detail (`GET /Items/{id}` shape, projection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDetail {
+    pub id: String,
+    pub name: String,
+    pub kind: ItemKind,
+    pub run_time_ticks: u64,
+    pub played: bool,
+    pub play_count: u32,
+    pub is_favorite: bool,
+    pub playback_position_ticks: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ItemDetailDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "Type", default)]
+    kind: String,
+    #[serde(default)]
+    run_time_ticks: u64,
+    #[serde(default)]
+    user_data: ItemDetailUserDataDto,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ItemDetailUserDataDto {
+    played: bool,
+    play_count: u32,
+    is_favorite: bool,
+    playback_position_ticks: u64,
+}
+
+pub fn parse_item_detail_response(bytes: &[u8]) -> Result<ItemDetail, ClientError> {
+    let parsed: ItemDetailDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(ItemDetail {
+        id: parsed.id,
+        name: parsed.name,
+        kind: ItemKind::from_jellyfin_type(&parsed.kind),
+        run_time_ticks: parsed.run_time_ticks,
+        played: parsed.user_data.played,
+        play_count: parsed.user_data.play_count,
+        is_favorite: parsed.user_data.is_favorite,
+        playback_position_ticks: parsed.user_data.playback_position_ticks,
+    })
+}
+
 pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, ClientError> {
     let parsed: SearchHintsResultDto =
         serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
@@ -279,6 +331,72 @@ pub mod web {
         user_id: &str,
     ) -> Result<(), ClientError> {
         let resp = Request::delete(&format!("{base}/Users/{user_id}"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_item_detail(
+        base: &str,
+        token: &str,
+        id: &str,
+    ) -> Result<ItemDetail, ClientError> {
+        let resp = Request::get(&format!("{base}/Items/{id}"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_item_detail_response(&bytes)
+    }
+
+    pub async fn mark_played(
+        base: &str,
+        token: &str,
+        user_id: &str,
+        item_id: &str,
+        played: bool,
+    ) -> Result<(), ClientError> {
+        let method = if played { "POST" } else { "DELETE" };
+        let req = match method {
+            "POST" => Request::post(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}")),
+            _ => Request::delete(&format!("{base}/Users/{user_id}/PlayedItems/{item_id}")),
+        };
+        let resp = req
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn mark_favorite(
+        base: &str,
+        token: &str,
+        user_id: &str,
+        item_id: &str,
+        favorite: bool,
+    ) -> Result<(), ClientError> {
+        let req = if favorite {
+            Request::post(&format!("{base}/Users/{user_id}/FavoriteItems/{item_id}"))
+        } else {
+            Request::delete(&format!("{base}/Users/{user_id}/FavoriteItems/{item_id}"))
+        };
+        let resp = req
             .header("X-Emby-Token", token)
             .send()
             .await

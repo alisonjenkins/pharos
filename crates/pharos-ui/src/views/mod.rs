@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod app_state;
+pub mod detail;
 pub mod group;
 pub mod library;
 pub mod login;
@@ -13,11 +14,12 @@ pub mod search;
 
 pub use admin::{AdminAction, AdminView, AdminViewProps, CreateUserAttempt};
 pub use app_state::{AppRoute, RootApp};
+pub use detail::{DetailAction, ItemDetailView};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
-pub use search::{SearchStatus, SearchView};
 pub use library::{ItemTile, LibraryView};
 pub use login::{LoginAttempt, LoginForm};
 pub use player::{PlaybackEvent, PlayerProps, PlayerView};
+pub use search::{SearchStatus, SearchView};
 
 use dioxus::prelude::*;
 
