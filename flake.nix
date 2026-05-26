@@ -107,16 +107,17 @@
           { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
           mkdir -p $out
           add_silence() {
-            in=$1
-            out=$2
+            local src=$1
+            local dst=$2
+            local dur
             dur=$(ffprobe -v error -show_entries format=duration \
-                          -of default=nw=1:nk=1 "$in")
+                          -of default=nw=1:nk=1 "$src")
             ffmpeg -hide_banner -loglevel error -nostdin \
-                   -i "$in" \
+                   -i "$src" \
                    -f lavfi -t "$dur" -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
                    -c:v copy -c:a libopus -b:a 64k \
                    -map 0:v:0 -map 1:a:0 \
-                   -shortest "$out"
+                   -shortest "$dst"
           }
           add_silence ${bbb360}   $out/01-big-buck-bunny-360p.webm
           add_silence ${bbb720}   $out/02-big-buck-bunny-720p.webm
@@ -138,6 +139,42 @@
                  -c:a libopus -b:a 64k \
                  -shortest \
                  $out/06-test-av-confirm.webm
+
+          # Subtitle-confirm fixture: same testsrc + tone, plus an
+          # external WebVTT sidecar (Jellyfin's SubtitleProfile.method
+          # = "External" → the client GETs the .vtt next to the video
+          # and renders it as a `<track>`). Jellyfin's web client
+          # picks up sidecar files via the /Items/{id}/Subtitle
+          # surface which we don't ship yet — but the file existing on
+          # disk lets the user smoke-test the subtitle UI as soon as
+          # that endpoint lands. Also embeds a WebVTT track inside
+          # the WebM so muxed-subtitle paths can be exercised against
+          # the same fixture.
+          cat > $out/07-test-subtitles.vtt <<VTT
+        WEBVTT
+
+        00:00:00.500 --> 00:00:03.000
+        Pharos subtitle smoke test
+
+        00:00:03.500 --> 00:00:06.000
+        If you see this, external VTT works
+
+        00:00:06.500 --> 00:00:09.500
+        End of test
+        VTT
+          ffmpeg -hide_banner -loglevel error -nostdin \
+                 -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
+                 -f lavfi -i "sine=frequency=523.25:duration=10:sample_rate=48000" \
+                 -i $out/07-test-subtitles.vtt \
+                 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                 -pix_fmt yuv420p \
+                 -c:a libopus -b:a 64k \
+                 -c:s webvtt \
+                 -map 0:v:0 -map 1:a:0 -map 2:s:0 \
+                 -metadata:s:s:0 language=eng \
+                 -metadata:s:s:0 title="English" \
+                 -shortest \
+                 $out/07-test-subtitles.webm
           cat > $out/LICENSES.txt <<EOF
         01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
@@ -145,6 +182,8 @@
         04-wikimedia-example.ogg      Public Domain   https://commons.wikimedia.org/wiki/File:Example.ogg
         05-carefree.mp3               CC-BY 4.0       https://incompetech.com/wordpress/2013/06/carefree/
         06-test-av-confirm.webm       Synthetic       ffmpeg lavfi testsrc + 440 Hz sine, generated at build time
+        07-test-subtitles.webm        Synthetic       testsrc + 523 Hz tone + embedded WebVTT track (English)
+        07-test-subtitles.vtt         Synthetic       sidecar VTT for 07-test-subtitles.webm
         EOF
         '';
 
