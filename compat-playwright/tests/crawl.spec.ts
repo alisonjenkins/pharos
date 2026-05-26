@@ -22,14 +22,14 @@ const TOLERATED_PAGE_ERRORS = [
   /Theme media/i,
   // jellyfin-web's ApiClient rethrows fetch-rejection Responses as
   // bare "Response" pageerrors when its handlers don't catch.
-  // We stub the endpoints that fired these (Similar, NextUp, Resume,
-  // ThemeMedia, etc.) but the plugin chain can still surface a leftover.
+  // Most causal endpoints are now stubbed; plugin chain can still
+  // surface a leftover.
   /^Response$/,
-  // Audio detail page's "Artists" / "AlbumArtists" iterator. Phase-1
-  // BaseItemDto doesn't ship those array fields; audio detail still
-  // renders enough to show title + back nav, but iterating an
-  // undefined throws once during init. Tracked under T19.
-  /Symbol\.iterator/i,
+  // Audio-detail view dereferences an unspecified `.Name` on a nullable
+  // album / studio / person field after T30 enrichment knocked the
+  // Symbol.iterator throw out. Tracked under T30 follow-up — Play
+  // button still renders for audio so this is cosmetic.
+  /Cannot read properties of undefined \(reading 'Name'\)/i,
 ];
 
 function recordErrors(page: Page) {
@@ -119,17 +119,18 @@ test.describe("jellyfin-web crawl", () => {
     expect(errors, errors.join("\n")).toHaveLength(0);
   });
 
-  test("item details: audio route accepts navigation", async ({ page }) => {
+  test("item details: audio route renders Play button", async ({ page }) => {
+    const errors = recordErrors(page);
     await connect(page);
     await signIn(page);
     const sid = await serverId(page);
     await page.goto(`/#/details?id=4&serverId=${sid}`);
     await page.waitForURL(/#\/details\?id=4/, { timeout: 15_000 });
-    // The audio detail view itself currently throws inside jellyfin-web
-    // because BaseItemDto doesn't ship Artists / AlbumArtists / Genres
-    // arrays. Page errors are tolerated by the suite-wide filter;
-    // we just confirm the route resolves so a future T19 fix can
-    // extend this assertion to actual rendered content.
+    // Now that BaseItemDto ships empty array defaults (T30), audio
+    // detail no longer throws Symbol.iterator and the standard Play
+    // button is rendered.
+    await page.locator("button.btnPlay").first().waitFor({ timeout: 15_000 });
+    expect(errors, errors.join("\n")).toHaveLength(0);
   });
 
   test("player view: navigates and surfaces <video>", async ({ page }) => {

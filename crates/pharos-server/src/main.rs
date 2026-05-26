@@ -125,12 +125,23 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         )));
     }
 
-    for (i, kind, path) in [
-        (1u64, MediaKind::Movie, fixture_path.clone()),
-        (2, MediaKind::Movie, fixture_path.clone()),
-        (3, MediaKind::Episode, fixture_path.clone()),
-        (4, MediaKind::Audio, fixture_path.clone()),
+    // Materialise four distinct paths so the store's UNIQUE(path)
+    // constraint doesn't silently drop items 2/3/4. Each is a copy of
+    // the same fixture bytes.
+    let mut per_id_paths: Vec<(u64, MediaKind, std::path::PathBuf)> = Vec::new();
+    for (i, kind) in [
+        (1u64, MediaKind::Movie),
+        (2, MediaKind::Movie),
+        (3, MediaKind::Episode),
+        (4, MediaKind::Audio),
     ] {
+        let per_path = fixture_dir.join(format!("fixture-{i}.webm"));
+        tokio::fs::copy(&fixture_path, &per_path)
+            .await
+            .map_err(AppError::Io)?;
+        per_id_paths.push((i, kind, per_path));
+    }
+    for (i, kind, path) in per_id_paths {
         let item = MediaItem {
             id: i,
             path,

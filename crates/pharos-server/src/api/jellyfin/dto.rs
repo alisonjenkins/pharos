@@ -183,6 +183,44 @@ pub struct BaseItemDto {
     pub can_play: bool,
     pub media_sources: Vec<MediaSourceLiteDto>,
     pub play_access: &'static str,
+    // Array-typed fields jellyfin-web iterates over without null
+    // guards (T30). Default-empty so for-of / spread / .map don't
+    // throw Symbol.iterator TypeErrors during view init.
+    pub artists: Vec<String>,
+    pub artist_items: Vec<NameGuidPairDto>,
+    pub album_artists: Vec<NameGuidPairDto>,
+    pub genres: Vec<String>,
+    pub genre_items: Vec<NameGuidPairDto>,
+    pub tags: Vec<String>,
+    pub studios: Vec<NameGuidPairDto>,
+    pub people: Vec<PersonDto>,
+    pub production_locations: Vec<String>,
+    pub provider_ids: serde_json::Map<String, serde_json::Value>,
+    pub remote_trailers: Vec<serde_json::Value>,
+    pub chapters: Vec<serde_json::Value>,
+    pub trickplay: serde_json::Map<String, serde_json::Value>,
+    pub external_urls: Vec<serde_json::Value>,
+    pub image_tags: serde_json::Map<String, serde_json::Value>,
+    pub backdrop_image_tags: Vec<String>,
+    pub screenshot_image_tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct NameGuidPairDto {
+    pub name: String,
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PersonDto {
+    pub name: String,
+    pub id: String,
+    pub role: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub primary_image_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -338,6 +376,23 @@ impl BaseItemDto {
                 video_type: "VideoFile",
                 e_tag: "0".into(),
             }],
+            artists: vec![],
+            artist_items: vec![],
+            album_artists: vec![],
+            genres: vec![],
+            genre_items: vec![],
+            tags: vec![],
+            studios: vec![],
+            people: vec![],
+            production_locations: vec![],
+            provider_ids: serde_json::Map::new(),
+            remote_trailers: vec![],
+            chapters: vec![],
+            trickplay: serde_json::Map::new(),
+            external_urls: vec![],
+            image_tags: serde_json::Map::new(),
+            backdrop_image_tags: vec![],
+            screenshot_image_tags: vec![],
         }
     }
 }
