@@ -1,6 +1,8 @@
 # group-sync protocol
 
-Concrete design for synchronized playback across clients in a group. Drives T16 (impl) and T17 (client wiring). Governing invariants: V3 (≤500 ms p95 sync drift), V18 (actor-owned mutable state), V8 (no token leak in handshake).
+Concrete design for synchronized playback across clients in a group. Drives T16 (impl) and T17 (client wiring). Governing invariants: V3 (≤500 ms p95 sync drift), V18 (actor-owned mutable state), V8 (no token leak in handshake), V19 (must improve on Jellyfin SyncPlay failure modes), V20 (Jellyfin wire-compat).
+
+> **Compatibility note (2026-05-26):** existing Jellyfin phone and TV clients are first-class targets. The Jellyfin-shaped socket described in §10 below is the canonical entry — those clients work unmodified. The richer protocol in §3–§7 is an *extended* path mounted at `/sync/v1/ws` for pharos-native (Dioxus) clients. Server actor is the same for both; only the framing differs.
 
 See [`jellyfin-mapping.md`](jellyfin-mapping.md) §5 for the C# SyncPlay → Rust translation rationale, and [`architecture.md`](architecture.md) §4 for the surrounding concurrency model.
 
@@ -159,7 +161,24 @@ Pinning rule (Phase 2 candidate): a client may request `pin_leader=true` in `Joi
 - **Server lead time**: hard-coded to 300 ms. Could adapt to observed RTT distribution. Adapt only if V3 fails on slow links.
 - **Cross-server federation**: explicitly out of scope.
 
-## 9. Where each invariant lives
+## 10. Jellyfin wire-compat path
+
+The Jellyfin reference client uses Jellyfin's SyncPlay protocol over the main `/socket` WebSocket (multiplexed with other messages). To keep unmodified clients working (V20):
+
+- Mount the Jellyfin-shaped messages on the existing `/socket` endpoint, multiplexed by the `MessageType` field already used by Jellyfin's socket protocol.
+- Recognized inbound types (subset relevant here): `SyncPlayJoinGroup`, `SyncPlayLeaveGroup`, `SyncPlayPlay`, `SyncPlayPause`, `SyncPlaySeek`, `SyncPlayBuffering`, `SyncPlayPing`.
+- Outbound types: `SyncPlayGroupUpdate`, `SyncPlayCommand`, `SyncPlayPong`.
+- The translation layer maps each Jellyfin message to/from the internal `ClientMsg`/`ServerMsg` enums used by the actor. The actor never sees Jellyfin shapes directly — keeps the algorithm reusable.
+- Pharos's improved behaviour (per-member offset, isolated buffering, deterministic handoff) is the **server algorithm**, which is shared by both wire formats. Jellyfin clients benefit even without code changes on their side.
+
+What pharos cannot do over the Jellyfin path:
+- Send richer member-state metadata (Jellyfin shape is fixed).
+- Negotiate alternative wire encodings (CBOR etc.) — Jellyfin is JSON-only.
+- Per-member arbitrary pause-vetoes — Jellyfin clients don't surface a UI for it.
+
+Those features land on the extended `/sync/v1/ws` path for Dioxus and other pharos-aware clients. Both paths route through the same group actor; the actor only sees `ClientMsg`/`ServerMsg`.
+
+## 11. Where each invariant lives
 
 | Invariant | Implementation hook |
 |---|---|
@@ -167,3 +186,5 @@ Pinning rule (Phase 2 candidate): a client may request `pin_leader=true` in `Joi
 | V8 (no token leak) | `SecretString` in `Hello`; consumed pre-actor |
 | V18 (actor-owned state) | One tokio task per group; mpsc inbox; member sinks owned by actor |
 | V4 (no panic from handler) | WS handler returns `Result<_, actix_ws::Error>`; surface via `Error` frame, not panic |
+| V19 (improve on Jellyfin failure modes) | Per-member offset; one corrective Pause cap on leader handoff; auto-reconverge after <2 s blip without rejoin |
+| V20 (Jellyfin wire-compat) | Translation layer on `/socket`; actor untouched (§10) |

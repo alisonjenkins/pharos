@@ -6,4 +6,5 @@ pub mod health;
 pub mod middleware;
 pub mod obs;
 pub mod router;
+pub mod sessions;
 pub mod state;

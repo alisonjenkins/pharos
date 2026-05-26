@@ -2,7 +2,7 @@
 
 ## §G goal
 
-Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better perf/reliability than both. Group watch + group listen first-class, not bolt-on.
+Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better perf/reliability than both. Group watch + group listen first-class, not bolt-on. Group-sync is a **primary motivation** — Jellyfin's SyncPlay is buggy in practice (late-joiner desync, poor-network member drags whole group, buffer storms on leader handoff). pharos must improve on those, not replicate them.
 
 ## §C constraints
 
@@ -63,6 +63,8 @@ Rust media server. Wire-compat with Jellyfin + Plex client ecosystems. Better pe
 - V16: Dioxus UI consumes only public Jellyfin-compat API. No backdoor endpoints. UI swappable for any Jellyfin client.
 - V17: no `unwrap()` / `expect()` in non-test code. Enforced via `clippy::unwrap_used` + `clippy::expect_used` = deny at workspace level. Tests may opt-out.
 - V18: mutable runtime state owned by exactly one task. Mutation via message-passing (tokio mpsc). No `Mutex<State>` on request path. Locks permitted only for one-shot init or immutable-after-init caches.
+- V19: group-sync must improve on Jellyfin SyncPlay failure modes. Specifically: (a) late joiner does not desync existing members; (b) one poor-network member does not stall the group (per-member buffering isolation); (c) leader handoff causes ≤1 corrective Pause, no buffer storm; (d) network blip <2 s reconverges automatically without member rejoin.
+- V20: group-sync wire protocol stays Jellyfin SyncPlay-compatible so unmodified phone/TV clients participate. Improvements live in server-side algorithm. A second WS path may carry an extended protocol for pharos-native clients, but the Jellyfin-shaped socket is the canonical entry point.
 
 ## §T tasks
 
@@ -77,7 +79,7 @@ T6|x|jellyfin-api: /Library/* + /Items/* (browse, search, details). T6 phase 1: 
 T7|x|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play) via actix-files NamedFile + Range support. Auth extractor accepts api_key query param.|I.jellyfin-api,V1,V9
 T8|.|transcode pipeline: ffmpeg wrapper, segment delivery, format negotiation|I.ffmpeg,V6
 T9|.|jellyfin-api: transcoded streaming + HLS|I.jellyfin-api,V1,V6
-T10|.|jellyfin-api: /Sessions, /PlayState (playback reporting)|I.jellyfin-api,V1
+T10|~|jellyfin-api: /Sessions, /PlayState (playback reporting). Actor-owned SessionRegistry; POST Playing/Progress/Stopped + Capabilities accept body and update state; GET /Sessions returns active list.|I.jellyfin-api,V1,V18
 T11|.|plex-api: identity, /myplex auth bridge, /library/sections|I.plex-api,V2,V7
 T12|.|plex-api: /library/metadata, hubs, search|I.plex-api,V2,V7
 T13|.|plex-api: streaming + transcode endpoints|I.plex-api,V2,V6,V9
