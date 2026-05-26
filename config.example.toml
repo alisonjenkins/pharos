@@ -1,0 +1,9 @@
+[server]
+bind = "0.0.0.0:8096"
+
+[obs]
+log_level = "info"
+# otlp_endpoint = "http://localhost:4317"
+
+[media]
+roots = ["/srv/media"]

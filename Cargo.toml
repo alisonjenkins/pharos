@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/pharos-core", "crates/pharos-server"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ali/pharos"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace.dependencies]
+actix-web = "4"
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-actix-web = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
