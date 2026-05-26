@@ -104,6 +104,74 @@ impl UserPolicyDto {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
+pub struct BaseItemDto {
+    pub id: String,
+    pub name: String,
+    pub server_id: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub media_type: &'static str,
+    pub is_folder: bool,
+    pub user_data: UserItemDataDto,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserItemDataDto {
+    pub played: bool,
+    pub play_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemsResultDto {
+    pub items: Vec<BaseItemDto>,
+    pub total_record_count: u32,
+    pub start_index: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VirtualFolderInfoDto {
+    pub name: String,
+    pub locations: Vec<String>,
+    pub collection_type: &'static str,
+    pub item_id: String,
+    pub library_options: VirtualFolderOptionsDto,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VirtualFolderOptionsDto {
+    pub enable_photos: bool,
+    pub enable_realtime_monitor: bool,
+}
+
+impl BaseItemDto {
+    pub fn from_domain(item: &pharos_core::MediaItem, server_id: &str) -> Self {
+        let kind = match item.kind {
+            pharos_core::MediaKind::Movie => "Movie",
+            pharos_core::MediaKind::Episode => "Episode",
+            pharos_core::MediaKind::Audio => "Audio",
+        };
+        let media_type = match item.kind {
+            pharos_core::MediaKind::Audio => "Audio",
+            _ => "Video",
+        };
+        Self {
+            id: item.id.to_string(),
+            name: item.title.clone(),
+            server_id: server_id.to_string(),
+            kind,
+            media_type,
+            is_folder: false,
+            user_data: UserItemDataDto::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct SessionInfoDto {
     pub id: String,
     pub user_id: String,

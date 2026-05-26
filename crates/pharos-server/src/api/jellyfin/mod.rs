@@ -3,6 +3,7 @@
 
 pub mod auth_extractor;
 pub mod dto;
+pub mod items;
 pub mod system;
 pub mod users;
 
@@ -12,4 +13,5 @@ use actix_web::web;
 pub fn configure(cfg: &mut web::ServiceConfig) {
     system::register(cfg);
     users::register(cfg);
+    items::register(cfg);
 }
