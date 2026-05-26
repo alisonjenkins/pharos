@@ -1,13 +1,52 @@
-//! Postgres backend — wiring stub. Real impl tracked separately.
-//! Compiles under `--features postgres` so the feature gate stays exercised.
+//! Postgres backend mirroring the sqlite store (T39).
+//!
+//! Schema lives under `migrations/postgres/`. The trait surface is
+//! identical to `SqliteStore` — handlers swap by changing the
+//! `state::Stores` type alias and the `[database].url` scheme. Phase 1
+//! does not run an integration suite here (real postgres + dockerized
+//! CI lands with T37 phase 2); the impl is exercised by `cargo build
+//! --features postgres` in CI.
+//!
+//! Differences from sqlite worth flagging:
+//! - Numeric primary keys are `BIGINT` (i64) instead of sqlite
+//!   `INTEGER`; `u64 → i64` conversion uses `try_from` (overflow
+//!   reported as `DomainError::Backend`).
+//! - `users.id` is `BYTEA` for the 16-byte UUID — same as sqlite's
+//!   `BLOB`.
+//! - `ON CONFLICT` upsert syntax matches sqlite's; postgres supports
+//!   both (`ON CONFLICT (col) DO UPDATE`).
 
 use crate::StoreError;
-use pharos_core::{DomainError, DomainResult, MediaId, MediaItem, MediaStore};
+use pharos_core::{
+    AuthError, AuthResult, AuthToken, DomainError, DomainResult, MediaId, MediaItem, MediaKind,
+    MediaStore, SecretString, TokenStore, UserDataStore, UserId, UserItemData, UserPolicy,
+    UserRecord, UserStore,
+};
 use sqlx::PgPool;
+use std::str::FromStr;
+use uuid::Uuid;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+}
+
+fn map_sqlx<E: std::fmt::Display>(e: E) -> AuthError {
+    AuthError::Backend(e.to_string())
+}
+
+fn media_id_i64(id: MediaId) -> DomainResult<i64> {
+    i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))
+}
+
+fn now_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl PostgresStore {
@@ -16,28 +55,397 @@ impl PostgresStore {
             .max_connections(8)
             .connect(url)
             .await?;
+        MIGRATOR.run(&pool).await?;
         Ok(Self { pool })
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Read or initialise this server's stable identity UUID. Mirrors
+    /// `SqliteStore::load_or_create_server_id` (T35).
+    pub async fn load_or_create_server_id(&self) -> Result<String, StoreError> {
+        if let Some((id,)) =
+            sqlx::query_as::<_, (String,)>("SELECT server_id FROM system_identity WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?
+        {
+            return Ok(id);
+        }
+        let new_id = Uuid::new_v4().simple().to_string();
+        let now = now_unix_secs();
+        match sqlx::query(
+            "INSERT INTO system_identity (id, server_id, created_at) VALUES (1, $1, $2)",
+        )
+        .bind(&new_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(_) => Ok(new_id),
+            Err(sqlx::Error::Database(_)) => {
+                let (id,) = sqlx::query_as::<_, (String,)>(
+                    "SELECT server_id FROM system_identity WHERE id = 1",
+                )
+                .fetch_one(&self.pool)
+                .await?;
+                Ok(id)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl MediaStore for PostgresStore {
-    async fn get(&self, _id: MediaId) -> DomainResult<MediaItem> {
-        Err(DomainError::Backend(
-            "postgres backend not yet implemented".into(),
-        ))
+    #[tracing::instrument(skip(self), fields(media.id = %id))]
+    async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
+        let id_i64 = media_id_i64(id)?;
+        let row = sqlx::query_as::<_, MediaRow>(
+            "SELECT id, path, title, kind FROM media_items WHERE id = $1",
+        )
+        .bind(id_i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        match row {
+            Some(r) => r.into_domain(),
+            None => Err(DomainError::NotFound(id)),
+        }
     }
-    async fn put(&self, _item: MediaItem) -> DomainResult<()> {
-        Err(DomainError::Backend(
-            "postgres backend not yet implemented".into(),
-        ))
+
+    #[tracing::instrument(skip(self, item), fields(media.id = %item.id, media.kind = item.kind.as_str()))]
+    async fn put(&self, item: MediaItem) -> DomainResult<()> {
+        let id_i64 = media_id_i64(item.id)?;
+        let path = item
+            .path
+            .to_str()
+            .ok_or_else(|| DomainError::Backend("non-utf8 path".into()))?;
+        sqlx::query(
+            "INSERT INTO media_items (id, path, title, kind) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
+                                            title = EXCLUDED.title,
+                                            kind = EXCLUDED.kind",
+        )
+        .bind(id_i64)
+        .bind(path)
+        .bind(&item.title)
+        .bind(item.kind.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
     }
+
+    #[tracing::instrument(skip(self))]
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
-        Err(DomainError::Backend(
-            "postgres backend not yet implemented".into(),
-        ))
+        let rows = sqlx::query_as::<_, MediaRow>(
+            "SELECT id, path, title, kind FROM media_items ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+}
+
+impl UserStore for PostgresStore {
+    #[tracing::instrument(skip(self, record), fields(user.name = %record.name))]
+    async fn create(&self, record: UserRecord) -> AuthResult<()> {
+        let id_bytes = record.id.0.as_bytes().to_vec();
+        let admin: i32 = if record.policy.admin { 1 } else { 0 };
+        let res = sqlx::query(
+            "INSERT INTO users (id, name, password_hash, admin) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id_bytes)
+        .bind(&record.name)
+        .bind(record.password_hash.expose())
+        .bind(admin)
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(e)) if e.constraint().is_some() => {
+                Err(AuthError::Conflict)
+            }
+            Err(e) => Err(map_sqlx(e)),
+        }
+    }
+
+    #[tracing::instrument(skip(self), fields(user.name = %name))]
+    async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
+        let row: Option<(Vec<u8>, String, String, i32)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin FROM users WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(record_from_row)
+            .transpose()?
+            .ok_or(AuthError::UserNotFound)
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        let row: Option<(Vec<u8>, String, String, i32)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin FROM users WHERE id = $1",
+        )
+        .bind(id_bytes)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(record_from_row)
+            .transpose()?
+            .ok_or(AuthError::UserNotFound)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list(&self) -> AuthResult<Vec<UserRecord>> {
+        let rows: Vec<(Vec<u8>, String, String, i32)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin FROM users ORDER BY LOWER(name)",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(record_from_row).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn delete(&self, id: UserId) -> AuthResult<()> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        let res = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id_bytes)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn set_policy(&self, id: UserId, policy: UserPolicy) -> AuthResult<()> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        let admin: i32 = if policy.admin { 1 } else { 0 };
+        let res = sqlx::query("UPDATE users SET admin = $1 WHERE id = $2")
+            .bind(admin)
+            .bind(id_bytes)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
+}
+
+impl TokenStore for PostgresStore {
+    #[tracing::instrument(skip(self), fields(user.id = %user_id, device = %device_id))]
+    async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
+        let token = Uuid::new_v4().simple().to_string();
+        let user_bytes = user_id.0.as_bytes().to_vec();
+        sqlx::query(
+            "INSERT INTO auth_tokens (token, user_id, device_id, created_at) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(user_bytes)
+        .bind(device_id)
+        .bind(now_unix_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(AuthToken(SecretString::new(token)))
+    }
+
+    #[tracing::instrument(skip(self, token))]
+    async fn resolve(&self, token: &str) -> AuthResult<UserId> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT user_id FROM auth_tokens WHERE token = $1")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        let (bytes,) = row.ok_or(AuthError::InvalidToken)?;
+        let uuid = Uuid::from_slice(&bytes)
+            .map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
+        Ok(UserId(uuid))
+    }
+
+    #[tracing::instrument(skip(self, token))]
+    async fn revoke(&self, token: &str) -> AuthResult<()> {
+        sqlx::query("DELETE FROM auth_tokens WHERE token = $1")
+            .bind(token)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+}
+
+impl UserDataStore for PostgresStore {
+    #[tracing::instrument(skip(self), fields(user.id = %user.0, media.id = %item))]
+    async fn get_user_data(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> DomainResult<UserItemData> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let item_i64 = media_id_i64(item)?;
+        let row: Option<(i32, i32, i64, i32, i64)> = sqlx::query_as(
+            "SELECT played, play_count, last_played_position_ticks, is_favorite, last_played_at
+             FROM user_data WHERE user_id = $1 AND item_id = $2",
+        )
+        .bind(id_bytes)
+        .bind(item_i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(row_to_user_data).unwrap_or_default())
+    }
+
+    #[tracing::instrument(skip(self, data), fields(user.id = %user.0, media.id = %item))]
+    async fn set_user_data(
+        &self,
+        user: UserId,
+        item: MediaId,
+        data: UserItemData,
+    ) -> DomainResult<()> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let item_i64 = media_id_i64(item)?;
+        let played: i32 = if data.played { 1 } else { 0 };
+        let fav: i32 = if data.is_favorite { 1 } else { 0 };
+        let pos_i64 = i64::try_from(data.last_played_position_ticks)
+            .map_err(|e| DomainError::Backend(format!("position overflow: {e}")))?;
+        let pc_i32 = i32::try_from(data.play_count)
+            .map_err(|e| DomainError::Backend(format!("play_count overflow: {e}")))?;
+        sqlx::query(
+            "INSERT INTO user_data
+               (user_id, item_id, played, play_count, last_played_position_ticks,
+                is_favorite, last_played_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (user_id, item_id) DO UPDATE SET
+               played = EXCLUDED.played,
+               play_count = EXCLUDED.play_count,
+               last_played_position_ticks = EXCLUDED.last_played_position_ticks,
+               is_favorite = EXCLUDED.is_favorite,
+               last_played_at = EXCLUDED.last_played_at",
+        )
+        .bind(id_bytes)
+        .bind(item_i64)
+        .bind(played)
+        .bind(pc_i32)
+        .bind(pos_i64)
+        .bind(fav)
+        .bind(data.last_played_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self, items), fields(user.id = %user.0, count = items.len()))]
+    async fn user_data_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<UserItemData>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_bytes = user.0.as_bytes().to_vec();
+        // Postgres supports `= ANY($2)` with an array binding —
+        // cleaner than the sqlite per-?-placeholder trick.
+        let ids_i64: Vec<i64> = items
+            .iter()
+            .map(|id| media_id_i64(*id))
+            .collect::<DomainResult<_>>()?;
+        let rows: Vec<(i64, i32, i32, i64, i32, i64)> = sqlx::query_as(
+            "SELECT item_id, played, play_count, last_played_position_ticks,
+                    is_favorite, last_played_at
+             FROM user_data
+             WHERE user_id = $1 AND item_id = ANY($2)",
+        )
+        .bind(id_bytes)
+        .bind(&ids_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut by_id: std::collections::HashMap<i64, UserItemData> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for (id, played, pc, pos, fav, lp) in rows {
+            by_id.insert(id, row_to_user_data((played, pc, pos, fav, lp)));
+        }
+        Ok(ids_i64
+            .iter()
+            .map(|id| by_id.get(id).copied().unwrap_or_default())
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0))]
+    async fn resumable_items(&self, user: UserId) -> DomainResult<Vec<MediaId>> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT item_id FROM user_data
+             WHERE user_id = $1 AND last_played_position_ticks > 0 AND played = 0
+             ORDER BY last_played_at DESC",
+        )
+        .bind(id_bytes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(id,)| {
+                u64::try_from(id)
+                    .map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+            })
+            .collect()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaRow {
+    id: i64,
+    path: String,
+    title: String,
+    kind: String,
+}
+
+impl MediaRow {
+    fn into_domain(self) -> DomainResult<MediaItem> {
+        let id = u64::try_from(self.id)
+            .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?;
+        let kind = MediaKind::from_str(&self.kind)?;
+        Ok(MediaItem {
+            id,
+            path: self.path.into(),
+            title: self.title,
+            kind,
+        })
+    }
+}
+
+fn record_from_row(row: (Vec<u8>, String, String, i32)) -> AuthResult<UserRecord> {
+    let uuid =
+        Uuid::from_slice(&row.0).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
+    Ok(UserRecord {
+        id: UserId(uuid),
+        name: row.1,
+        password_hash: SecretString::new(row.2),
+        policy: UserPolicy { admin: row.3 != 0 },
+    })
+}
+
+fn row_to_user_data(row: (i32, i32, i64, i32, i64)) -> UserItemData {
+    let (played, pc, pos, fav, lp) = row;
+    UserItemData {
+        played: played != 0,
+        play_count: u32::try_from(pc).unwrap_or(0),
+        last_played_position_ticks: u64::try_from(pos).unwrap_or(0),
+        is_favorite: fav != 0,
+        last_played_at: lp,
     }
 }
