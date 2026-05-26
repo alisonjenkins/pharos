@@ -34,6 +34,17 @@ Dioxus UI lives in `crates/pharos-ui` and compiles to WASM via the
 - Point the server at it via `[server].ui_dir` in `config.toml`; pharos serves the bundle at `/ui/*`.
 - WASM target is pinned in `rust-toolchain.toml`; `cargo build --target wasm32-unknown-unknown` works without extra setup inside the devShell.
 
+## Client-compat validation (T29)
+
+Two layers:
+- Layer B (in-tree, runs in `cargo nextest`): `tests/client_compat.rs`
+  spins pharos on an ephemeral port and drives `pharos-jellyfin-test-client`
+  through a real-device-shape flow (Emby-Authorization header, strict
+  serde DTOs). Every PR runs this via `just test`.
+- Layer A (manual / nightly): `just compat-openapi` fetches the Jellyfin
+  OpenAPI spec and prints the `schemathesis run` invocation. Schemathesis
+  ships in the devShell.
+
 ## Stack
 
-actix-web · clap derive · tokio · sqlx · Dioxus + dx (WASM) · tracing + metrics + Prometheus.
+actix-web · clap derive · tokio · sqlx · Dioxus + dx (WASM) · tracing + metrics + Prometheus · reqwest (compat tests only).

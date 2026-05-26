@@ -102,6 +102,12 @@
             pkgs.pkg-config
             pkgs.git
             pkgs.just
+            pkgs.curl
+            # schemathesis (Layer A of T29) — install separately via:
+            #   pipx install schemathesis
+            # Not pinned in the flake because nixpkgs lacks a stable
+            # top-level attr today. Layer B (`tests/client_compat.rs`)
+            # is the hard CI gate; Layer A is best-effort, manual.
           ];
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"

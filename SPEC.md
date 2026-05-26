@@ -100,6 +100,7 @@ T25|x|dioxus-ui: login + library browse views, talks Jellyfin-compat API. Phase 
 T26|x|dioxus-ui: player view (HLS + direct), session reporting. T26 phase 1: PlayerView component renders <video>/<audio> pointing at /Videos/{id}/stream?api_key=…; emits PlaybackEvent callbacks (Started/Progress/Stopped) consumers can route to /Sessions/Playing/*. HLS variant + real fetch wiring deferred.|I.dioxus-ui,V16,V1
 T27|x|dioxus-ui: group session UI (join room, sync indicator, chat). T27 phase 1: GroupSessionPanel component (member list + leader badge + buffering indicator + Join/Leave actions); WS subscription wiring lands with T25 fetch-client work. Chat deferred to T27 phase 2.|I.dioxus-ui,V3,V16
 T28|x|architecture doc + diagrams (mermaid) in `docs/architecture.md`: components, crate graph, request flow, concurrency model, data flow|V12,V18
+T29|x|client-compat validation suite. Phase 1A: pharos-jellyfin-test-client crate + integration test driving a real-client-style flow (auth headers, strict serde DTOs, full login→browse→stream-head roundtrip) against pharos spawned via actix-test. Phase 1B: justfile `compat-openapi` recipe documents schemathesis run; schemathesis lives outside the flake (no top-level nixpkgs attr). Phase 2 (deferred): docker reference-jellyfin byte diff. Phase 3 (deferred): Playwright + jellyfin-web headless.|V1,V7,V11
 ```
 
 ## §B bugs
