@@ -82,7 +82,7 @@ T11|.|plex-api: identity, /myplex auth bridge, /library/sections|I.plex-api,V2,V
 T12|.|plex-api: /library/metadata, hubs, search|I.plex-api,V2,V7
 T13|.|plex-api: streaming + transcode endpoints|I.plex-api,V2,V6,V9
 T14|.|plex-api: timeline + session reporting|I.plex-api,V2
-T15|.|group-sync protocol design doc + invariants for V3|I.group-sync,V3
+T15|x|group-sync protocol design doc + invariants for V3|I.group-sync,V3,V8,V18
 T16|.|group-sync impl: websocket hub, room model, drift correction|I.group-sync,V3
 T17|.|group-sync client integration via existing Jellyfin/Plex session hooks|I.group-sync,V3,V1,V2
 T18|.|feature-parity audit vs Jellyfin: gap list, prioritize|V1
