@@ -92,6 +92,7 @@ T24|.|dioxus-ui crate: workspace member, WASM build pipeline, served via axum st
 T25|.|dioxus-ui: login + library browse views, talks Jellyfin-compat API|I.dioxus-ui,V16,V1
 T26|.|dioxus-ui: player view (HLS + direct), session reporting|I.dioxus-ui,V16,V1
 T27|.|dioxus-ui: group session UI (join room, sync indicator, chat)|I.dioxus-ui,V3,V16
+T28|x|architecture doc + diagrams (mermaid) in `docs/architecture.md`: components, crate graph, request flow, concurrency model, data flow|V12,V18
 ```
 
 ## §B bugs
