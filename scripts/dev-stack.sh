@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
-# Reproducible local dev-stack: pharos + jellyfin-web for manual testing.
+# Reproducible local dev-stack: pharos + jellyfin-web, both as
+# containers, on every host.
 #
-# Both halves come from the flake — reproducible inputs, deterministic
-# outputs:
-#
-# * Linux host: pharos runs as an OCI container built from `.#oci`,
-#   jellyfin-web runs as nginx:alpine bind-mounting the pinned nixpkgs
-#   jellyfin-web bundle.
-# * macOS / non-Linux host: docker desktop runs linux containers, but
-#   the flake's pharos derivation produces a host-OS binary, so we run
-#   pharos as a host process (still via `nix build .#pharos`). jellyfin-web
-#   stays in a container. The reproducibility argument is the same —
-#   both binaries are pinned by flake.lock.
+# pharos is built from `./Dockerfile` (multi-stage rust → debian) so
+# the runtime is linux regardless of build host. Pinning lives in
+# `rust-toolchain.toml` + `Cargo.lock`. jellyfin-web is nginx:alpine
+# bind-mounting the pinned nixpkgs bundle.
 #
 # Usage:
 #   nix run .#dev-stack            # via flake app
@@ -20,15 +14,13 @@
 #
 # Ports (host):
 #   8096  -> pharos backend
-#   8097  -> jellyfin-web static bundle (configure to point at
-#            http://localhost:8096 via the connect-server flow)
+#   8097  -> jellyfin-web static bundle
 #
-# Persistent state lives under $XDG_DATA_HOME/pharos-dev-stack so the
-# seeded user + DB survive across runs. Set CLEAN=1 to wipe.
+# Persistent state: $XDG_DATA_HOME/pharos-dev-stack. CLEAN=1 wipes.
 
 set -euo pipefail
 
-# Pick docker / podman.
+# Pick docker / podman + verify the daemon answers.
 if command -v docker >/dev/null 2>&1; then
   DOCKER=docker
 elif command -v podman >/dev/null 2>&1; then
@@ -37,12 +29,13 @@ else
   echo "error: neither docker nor podman in PATH" >&2
   exit 1
 fi
-
-UNAME=$(uname -s)
-case "$UNAME" in
-  Linux) IS_LINUX=1 ;;
-  *)     IS_LINUX=0 ;;
-esac
+if ! $DOCKER info >/dev/null 2>&1; then
+  echo "error: $DOCKER CLI present but daemon is unreachable." >&2
+  echo "  - macOS:   start Docker Desktop, or 'colima start'." >&2
+  echo "  - Linux:   'systemctl --user start docker' / start dockerd." >&2
+  echo "  - podman:  'podman machine start'." >&2
+  exit 1
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -55,7 +48,7 @@ fi
 mkdir -p "$STATE_DIR/db" "$STATE_DIR/media" "$STATE_DIR/cache"
 
 # Resolve jellyfin-web from the pinned nixpkgs.
-echo ">>> resolving jellyfin-web bundle"
+echo ">>> resolving jellyfin-web bundle (nixpkgs#jellyfin-web)"
 JELLYFIN_WEB_OUT=$(nix build --no-link --print-out-paths "nixpkgs#jellyfin-web")
 JELLYFIN_WEB_DIR="$JELLYFIN_WEB_OUT/share/jellyfin-web"
 if [ ! -d "$JELLYFIN_WEB_DIR" ]; then
@@ -64,28 +57,15 @@ if [ ! -d "$JELLYFIN_WEB_DIR" ]; then
 fi
 echo "    jellyfin-web -> $JELLYFIN_WEB_DIR"
 
-# Resolve pharos. Linux: OCI; otherwise: host binary.
-if [ "$IS_LINUX" = "1" ]; then
-  echo ">>> building pharos OCI image"
-  OCI_TARBALL=$(nix build .#oci --no-link --print-out-paths)
-  echo ">>> loading pharos:latest into $DOCKER"
-  $DOCKER load < "$OCI_TARBALL" >/dev/null
-else
-  echo ">>> building pharos host binary (containers on $UNAME run linux only;"
-  echo "    pharos runs on the host so it's the right OS/arch)"
-  PHAROS_BIN_PATH=$(nix build .#pharos --no-link --print-out-paths)
-  PHAROS_BIN="$PHAROS_BIN_PATH/bin/pharos"
-  if [ ! -x "$PHAROS_BIN" ]; then
-    echo "error: pharos binary not found at $PHAROS_BIN" >&2
-    exit 1
-  fi
-fi
+# Build pharos image from the local Dockerfile. BuildKit cache mounts
+# inside the Dockerfile reuse the cargo registry + target dir across
+# rebuilds.
+echo ">>> building pharos image (docker build)"
+DOCKER_BUILDKIT=1 $DOCKER build -t pharos:dev -f Dockerfile .
 
-# Write a config.toml. Paths differ depending on whether pharos runs
-# in-container (Linux) or on the host (other).
-if [ "$IS_LINUX" = "1" ]; then
-  CONFIG_PATH="$STATE_DIR/config.toml"
-  cat > "$CONFIG_PATH" <<TOML
+# Write a config.toml the container reads from /etc/pharos.
+CONFIG_PATH="$STATE_DIR/config.toml"
+cat > "$CONFIG_PATH" <<TOML
 [server]
 bind = "0.0.0.0:8096"
 name = "pharos-dev"
@@ -100,73 +80,57 @@ roots = ["/var/lib/pharos/media"]
 [database]
 url = "sqlite:///var/lib/pharos/db/pharos.db?mode=rwc"
 TOML
+
+# Linux can use --network=host so localhost works inside both
+# containers + on the host. Other OSes get -p publish-port; the host
+# reaches the services at localhost:<port> but containers can't see
+# each other via localhost. jellyfin-web is static + connects from the
+# browser, so it doesn't need to call pharos directly anyway.
+UNAME=$(uname -s)
+if [ "$UNAME" = "Linux" ]; then
+  PHAROS_NET=(--network=host)
+  NGINX_NET=(--network=host)
 else
-  CONFIG_PATH="$STATE_DIR/config.toml"
-  cat > "$CONFIG_PATH" <<TOML
-[server]
-bind = "127.0.0.1:8096"
-name = "pharos-dev"
-transcode_cache_dir = "$STATE_DIR/cache"
-
-[obs]
-log_level = "info"
-
-[media]
-roots = ["$STATE_DIR/media"]
-
-[database]
-url = "sqlite://$STATE_DIR/db/pharos.db?mode=rwc"
-TOML
+  PHAROS_NET=(-p 127.0.0.1:8096:8096)
+  NGINX_NET=(-p 127.0.0.1:8097:8097)
 fi
 
-# Seed playwright user + fixture.
+# Seed the playwright user + fixture via a one-shot pharos container.
 echo ">>> seeding playwright user + fixture"
-if [ "$IS_LINUX" = "1" ]; then
-  $DOCKER run --rm \
-    -v "$STATE_DIR/db:/var/lib/pharos/db" \
-    -v "$STATE_DIR/media:/var/lib/pharos/media" \
-    -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
-    -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-    pharos:latest \
-    --config /etc/pharos/config.toml admin seed-playwright-user \
-    || echo "    (seed may have already happened; continuing)"
-else
-  "$PHAROS_BIN" --config "$CONFIG_PATH" admin seed-playwright-user \
-    || echo "    (seed may have already happened; continuing)"
-fi
+$DOCKER run --rm \
+  -v "$STATE_DIR/db:/var/lib/pharos/db" \
+  -v "$STATE_DIR/media:/var/lib/pharos/media" \
+  -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
+  -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
+  pharos:dev \
+  --config /etc/pharos/config.toml admin seed-playwright-user \
+  || echo "    (seed may have already happened; continuing)"
+
+cleanup() {
+  echo
+  echo ">>> stopping dev-stack"
+  $DOCKER rm -f pharos-jellyfin-web >/dev/null 2>&1 || true
+  $DOCKER rm -f pharos-dev-stack    >/dev/null 2>&1 || true
+}
+trap cleanup INT TERM EXIT
 
 # Start pharos.
-if [ "$IS_LINUX" = "1" ]; then
-  echo ">>> starting pharos container"
-  $DOCKER rm -f pharos-dev-stack >/dev/null 2>&1 || true
-  $DOCKER run -d \
-    --name pharos-dev-stack \
-    --network=host \
-    --restart=unless-stopped \
-    -v "$STATE_DIR/db:/var/lib/pharos/db" \
-    -v "$STATE_DIR/media:/var/lib/pharos/media" \
-    -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
-    -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-    pharos:latest \
-    --config /etc/pharos/config.toml serve >/dev/null
-else
-  echo ">>> starting pharos (host process)"
-  "$PHAROS_BIN" --config "$CONFIG_PATH" serve &
-  PHAROS_PID=$!
-fi
+echo ">>> starting pharos container"
+$DOCKER rm -f pharos-dev-stack >/dev/null 2>&1 || true
+$DOCKER run -d \
+  --name pharos-dev-stack \
+  "${PHAROS_NET[@]}" \
+  --restart=unless-stopped \
+  -v "$STATE_DIR/db:/var/lib/pharos/db" \
+  -v "$STATE_DIR/media:/var/lib/pharos/media" \
+  -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
+  -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
+  pharos:dev \
+  --config /etc/pharos/config.toml serve >/dev/null
 
-# Start jellyfin-web (always a container; static-only, host-OS-agnostic).
+# Start jellyfin-web.
 echo ">>> starting jellyfin-web container"
 $DOCKER rm -f pharos-jellyfin-web >/dev/null 2>&1 || true
-NGINX_PORT_FLAG=""
-if [ "$IS_LINUX" = "1" ]; then
-  NGINX_NET_FLAG="--network=host"
-else
-  # macOS / podman-machine etc. — host networking isn't transparent;
-  # publish the port instead.
-  NGINX_NET_FLAG=""
-  NGINX_PORT_FLAG="-p 127.0.0.1:8097:8097"
-fi
 NGINX_CONF=$(cat <<'NGINX'
 server {
   listen 8097 default_server;
@@ -176,13 +140,9 @@ server {
 }
 NGINX
 )
-# shellcheck disable=SC2086  # we intentionally want word-splitting on
-# $NGINX_NET_FLAG / $NGINX_PORT_FLAG so an empty value contributes
-# nothing.
 $DOCKER run -d \
   --name pharos-jellyfin-web \
-  $NGINX_NET_FLAG \
-  $NGINX_PORT_FLAG \
+  "${NGINX_NET[@]}" \
   --restart=unless-stopped \
   -v "$JELLYFIN_WEB_DIR:/usr/share/jellyfin-web:ro" \
   nginx:alpine \
@@ -195,27 +155,8 @@ echo "    jellyfin-web -> http://localhost:8097"
 echo "    seeded user  -> playwright / playwright-test-pw"
 echo "    state dir    -> $STATE_DIR"
 echo
-echo "Ctrl-C to stop. Containers + host process clean up on exit."
+echo "Ctrl-C to stop. Containers tear down via the trap."
 echo
 
-cleanup() {
-  echo
-  echo ">>> stopping containers"
-  $DOCKER rm -f pharos-jellyfin-web >/dev/null 2>&1 || true
-  if [ "$IS_LINUX" = "1" ]; then
-    $DOCKER rm -f pharos-dev-stack >/dev/null 2>&1 || true
-  else
-    if [ -n "${PHAROS_PID:-}" ]; then
-      kill "$PHAROS_PID" 2>/dev/null || true
-    fi
-  fi
-}
-trap cleanup INT TERM EXIT
-
-if [ "$IS_LINUX" = "1" ]; then
-  # Stream pharos container logs as the foreground process.
-  $DOCKER logs -f pharos-dev-stack
-else
-  # pharos host process is already foregrounded via `wait`.
-  wait "${PHAROS_PID}"
-fi
+# Stream pharos logs as the foreground process.
+$DOCKER logs -f pharos-dev-stack

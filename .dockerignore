@@ -1,0 +1,19 @@
+# Keep the build context small + cache-friendly. The Dockerfile only
+# needs the workspace sources + lock + .config; everything else is
+# noise (or worse — invalidates cache on every rebuild).
+target
+result
+result-*
+.git
+.direnv
+.devenv
+node_modules
+compat-playwright/node_modules
+compat-playwright/test-results
+compat-playwright/playwright-report
+crates/pharos-ui/dist
+crates/pharos-ui/target
+crates/pharos-ui/.dioxus
+/tmp
+*.log
+.DS_Store
