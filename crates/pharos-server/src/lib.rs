@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod dlna;
 pub mod health;
 pub mod hls_cache;
 pub mod image_cache;
