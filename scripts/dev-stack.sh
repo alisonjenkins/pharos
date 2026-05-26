@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Reproducible local dev-stack: pharos + jellyfin-web as Nix-built
-# distroless OCI containers, on every host.
+# distroless OCI containers, orchestrated via docker compose.
 #
-# pharos comes from `nix build .#oci` — `dockerTools.buildLayeredImage`
-# wrapping a linux-cross-compiled binary + ffmpeg + cacert + tzdata
-# straight out of the nix store. No debian / alpine base layer; no
-# shell; just store paths. On darwin the build cross-compiles pharos
-# to ${arch}-unknown-linux-gnu so the resulting image is a real linux
-# container that docker desktop's linux VM can run.
+# Both images come from `dockerTools.buildLayeredImage` in flake.nix —
+# only nix store paths inside, no debian/alpine base, no upstream
+# Docker Hub pulls.
 #
-# jellyfin-web is nginx:alpine bind-mounting the pinned nixpkgs
-# bundle (`nix build nixpkgs#jellyfin-web`).
+# * pharos:latest             — rust release binary + ffmpeg + cacert
+#                               + tzdata + rootfs skel.
+# * pharos-jellyfin-web:latest — darkhttpd serving the pinned
+#                               nixpkgs#jellyfin-web bundle.
+#
+# On darwin the builds dispatch to the configured linux-builder
+# (`/etc/nix/machines`) so the binaries inside the images are linux
+# ELF regardless of build host.
 #
 # Usage:
 #   nix run .#dev-stack            # via flake app
@@ -21,7 +24,10 @@
 #   8096  -> pharos backend
 #   8097  -> jellyfin-web static bundle
 #
-# Persistent state: $XDG_DATA_HOME/pharos-dev-stack. CLEAN=1 wipes.
+# Persistent state (sqlite db + media fixtures + transcode cache)
+# lives in docker volumes (`pharos_db`, `pharos_media`, `pharos_cache`)
+# so it survives across runs. Set `CLEAN=1` to wipe them before
+# starting.
 
 set -euo pipefail
 
@@ -42,46 +48,25 @@ if ! $DOCKER info >/dev/null 2>&1; then
   exit 1
 fi
 
+# docker compose v2 ships as a CLI plugin (`docker compose`); v1 is
+# the legacy standalone `docker-compose`. Prefer v2.
+if $DOCKER compose version >/dev/null 2>&1; then
+  COMPOSE=("$DOCKER" compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "error: docker compose (v2 plugin or v1 standalone) required." >&2
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pharos-dev-stack"
-if [ "${CLEAN:-0}" = "1" ]; then
-  echo ">>> wiping $STATE_DIR"
-  rm -rf "$STATE_DIR"
-fi
-mkdir -p "$STATE_DIR/db" "$STATE_DIR/media" "$STATE_DIR/cache"
+mkdir -p "$STATE_DIR"
 
-# Resolve jellyfin-web from the pinned nixpkgs.
-echo ">>> resolving jellyfin-web bundle (nixpkgs#jellyfin-web)"
-JELLYFIN_WEB_OUT=$(nix build --no-link --print-out-paths "nixpkgs#jellyfin-web")
-JELLYFIN_WEB_SRC="$JELLYFIN_WEB_OUT/share/jellyfin-web"
-if [ ! -d "$JELLYFIN_WEB_SRC" ]; then
-  echo "error: jellyfin-web bundle not found at $JELLYFIN_WEB_SRC" >&2
-  exit 1
-fi
-# Docker Desktop on macOS only shares paths from its File Sharing
-# list — by default /nix is not in it, so bind-mounting straight
-# from the nix store yields a 403 inside nginx. Materialise the
-# bundle under $STATE_DIR (a host path docker-desktop is happy to
-# share) and mount from there. `cp -rL` deferences any symlinks so
-# the copy is self-contained.
-JELLYFIN_WEB_DIR="$STATE_DIR/jellyfin-web"
-if [ ! -d "$JELLYFIN_WEB_DIR" ] \
-   || [ "$(readlink -f "$JELLYFIN_WEB_DIR/.nix-source" 2>/dev/null)" != "$JELLYFIN_WEB_SRC" ]; then
-  echo ">>> materialising bundle under $JELLYFIN_WEB_DIR"
-  rm -rf "$JELLYFIN_WEB_DIR"
-  cp -rL "$JELLYFIN_WEB_SRC" "$JELLYFIN_WEB_DIR"
-  chmod -R u+w "$JELLYFIN_WEB_DIR"
-  ln -sfn "$JELLYFIN_WEB_SRC" "$JELLYFIN_WEB_DIR/.nix-source"
-fi
-echo "    jellyfin-web -> $JELLYFIN_WEB_DIR"
-echo "      (sourced from $JELLYFIN_WEB_SRC)"
-
-# Build the distroless pharos OCI image via nix dockerTools. Always
-# target a linux system attr — on darwin this dispatches to the
-# configured linux-builder so the binary inside is a real linux ELF;
-# on linux it's a no-op.
+# Pick the linux system attr that matches the docker host. On linux
+# this is the local system; on darwin it dispatches to linux-builder.
 HOST=$(uname -m)
 case "$HOST" in
   arm64|aarch64) LINUX_SYSTEM="aarch64-linux" ;;
@@ -91,13 +76,24 @@ case "$HOST" in
     exit 1
     ;;
 esac
-echo ">>> building pharos OCI image (.#packages.${LINUX_SYSTEM}.oci)"
-OCI_TARBALL=$(nix build ".#packages.${LINUX_SYSTEM}.oci" --no-link --print-out-paths)
-echo ">>> loading pharos:latest into $DOCKER"
-$DOCKER load < "$OCI_TARBALL" >/dev/null
 
-# Write a config.toml the container reads from /etc/pharos. Bind-
-# mounted at runtime so changes don't require a rebuild.
+# Build both OCI images via nix dockerTools. Identical inputs +
+# flake.lock → identical image bytes.
+echo ">>> building pharos OCI image"
+PHAROS_OCI=$(nix build ".#packages.${LINUX_SYSTEM}.oci" --no-link --print-out-paths)
+echo ">>> building jellyfin-web OCI image"
+JELLYFIN_OCI=$(nix build ".#packages.${LINUX_SYSTEM}.jellyfinWebOci" --no-link --print-out-paths)
+echo ">>> resolving compose manifest"
+COMPOSE_SRC=$(nix build ".#packages.${LINUX_SYSTEM}.composeFile" --no-link --print-out-paths)
+
+echo ">>> loading images into $DOCKER"
+$DOCKER load < "$PHAROS_OCI"   >/dev/null
+$DOCKER load < "$JELLYFIN_OCI" >/dev/null
+
+# Materialise the compose file + pharos config under $STATE_DIR
+# (a host path the daemon shares unconditionally). The compose
+# manifest references a host bind-mount for the pharos config so
+# edits don't need a rebuild.
 CONFIG_PATH="$STATE_DIR/config.toml"
 cat > "$CONFIG_PATH" <<TOML
 [server]
@@ -114,81 +110,45 @@ roots = ["/var/lib/pharos/media"]
 [database]
 url = "sqlite:///var/lib/pharos/db/pharos.db?mode=rwc"
 TOML
+COMPOSE_FILE="$STATE_DIR/docker-compose.yml"
+cp -f "$COMPOSE_SRC" "$COMPOSE_FILE"
+chmod u+w "$COMPOSE_FILE"
+export PHAROS_CONFIG_HOST="$CONFIG_PATH"
 
-# Networking. Linux can use --network=host so localhost works inside
-# both containers + on the host. On macOS docker-desktop's host
-# networking is in beta and finicky; publish ports instead.
-UNAME=$(uname -s)
-if [ "$UNAME" = "Linux" ]; then
-  PHAROS_NET=(--network=host)
-  NGINX_NET=(--network=host)
-else
-  PHAROS_NET=(-p 127.0.0.1:8096:8096)
-  NGINX_NET=(-p 127.0.0.1:8097:8097)
+if [ "${CLEAN:-0}" = "1" ]; then
+  echo ">>> wiping volumes"
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
 fi
 
-# Seed the playwright user + WebM fixture via a one-shot run. Drop
-# the image's default Cmd (`serve`) by passing replacement args.
+# Seed playwright user + WebM fixture in a one-shot pharos container
+# sharing the same docker volumes the long-running serve container
+# will mount.
 echo ">>> seeding playwright user + fixture"
-$DOCKER run --rm \
-  -v "$STATE_DIR/db:/var/lib/pharos/db" \
-  -v "$STATE_DIR/media:/var/lib/pharos/media" \
-  -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
-  -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-  pharos:latest \
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" run --rm \
+  --entrypoint /bin/pharos \
+  pharos \
   --config /etc/pharos/config.toml admin seed-playwright-user \
   || echo "    (seed may have already happened; continuing)"
 
 cleanup() {
   echo
   echo ">>> stopping dev-stack"
-  $DOCKER rm -f pharos-jellyfin-web >/dev/null 2>&1 || true
-  $DOCKER rm -f pharos-dev-stack    >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" down >/dev/null 2>&1 || true
 }
 trap cleanup INT TERM EXIT
 
-# Start pharos.
-echo ">>> starting pharos container"
-$DOCKER rm -f pharos-dev-stack >/dev/null 2>&1 || true
-$DOCKER run -d \
-  --name pharos-dev-stack \
-  "${PHAROS_NET[@]}" \
-  --restart=unless-stopped \
-  -v "$STATE_DIR/db:/var/lib/pharos/db" \
-  -v "$STATE_DIR/media:/var/lib/pharos/media" \
-  -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
-  -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-  pharos:latest >/dev/null
-
-# Start jellyfin-web.
-echo ">>> starting jellyfin-web container"
-$DOCKER rm -f pharos-jellyfin-web >/dev/null 2>&1 || true
-NGINX_CONF=$(cat <<'NGINX'
-server {
-  listen 8097 default_server;
-  root /usr/share/jellyfin-web;
-  index index.html;
-  location / { try_files $uri $uri/ /index.html; }
-}
-NGINX
-)
-$DOCKER run -d \
-  --name pharos-jellyfin-web \
-  "${NGINX_NET[@]}" \
-  --restart=unless-stopped \
-  -v "$JELLYFIN_WEB_DIR:/usr/share/jellyfin-web:ro" \
-  nginx:alpine \
-  sh -c "echo '$NGINX_CONF' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'" \
-  >/dev/null
+echo ">>> starting stack"
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" up -d
 
 echo
 echo "    pharos       -> http://localhost:8096"
 echo "    jellyfin-web -> http://localhost:8097"
 echo "    seeded user  -> playwright / playwright-test-pw"
 echo "    state dir    -> $STATE_DIR"
+echo "    volumes      -> pharos_db, pharos_media, pharos_cache  (docker volume ls)"
 echo
 echo "Ctrl-C to stop. Containers tear down via the trap."
 echo
 
 # Stream pharos logs as the foreground process.
-$DOCKER logs -f pharos-dev-stack
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" logs -f pharos
