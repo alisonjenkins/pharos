@@ -8,6 +8,7 @@
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
+        device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{BaseItemDto, ItemsResultDto, VirtualFolderInfoDto, VirtualFolderOptionsDto},
     },
     state::AppState,
@@ -69,10 +70,17 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
     }))
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct PlaybackInfoBody {
+    device_profile: Option<DeviceProfile>,
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
+    body: Option<web::Json<PlaybackInfoBody>>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
     let id: u64 = id_str
@@ -83,51 +91,92 @@ async fn playback_info(
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-    let video_streams = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+    let is_video = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+
+    // Source-media shape. Until pharos persists probed info on the
+    // MediaItem (tracked under T34's scanner enrichment), we feed the
+    // negotiator the same assumed-defaults the rest of the DTO surface
+    // uses — webm/vp9/opus for video, mp3/mp3 for audio.
+    let source = if is_video {
+        SourceMedia {
+            container: "webm".into(),
+            video_codec: Some("vp9".into()),
+            audio_codec: Some("opus".into()),
+            bitrate_bps: Some(200_000),
+            is_video: true,
+        }
+    } else {
+        SourceMedia {
+            container: "mp3".into(),
+            video_codec: None,
+            audio_codec: Some("mp3".into()),
+            bitrate_bps: Some(192_000),
+            is_video: false,
+        }
+    };
+
+    let profile = body
+        .and_then(|b| b.into_inner().device_profile)
+        .unwrap_or_default();
+    let decision = negotiate(&profile, &source);
+
+    let direct_play = decision.is_direct();
+    let supports_direct_stream = direct_play
+        || matches!(decision, Decision::AudioRemux { .. });
+    let transcoding_url = match &decision {
+        Decision::Transcode { target_container, .. } if target_container == "ts" => {
+            Some(format!("/videos/{id_str}/master.m3u8"))
+        }
+        _ => None,
+    };
+
     let mut streams = Vec::new();
-    if video_streams {
+    if is_video {
         streams.push(serde_json::json!({
             "Type": "Video",
             "Index": 0,
-            "Codec": "h264",
-            "Width": 1920,
-            "Height": 1080,
-            "AspectRatio": "16:9",
+            "Codec": source.video_codec.clone().unwrap_or_default(),
+            "Width": 320,
+            "Height": 240,
+            "AspectRatio": "4:3",
             "IsDefault": true,
             "BitDepth": 8,
-            "FrameRate": 30.0,
+            "FrameRate": 10.0,
         }));
     }
     streams.push(serde_json::json!({
         "Type": "Audio",
-        "Index": if video_streams { 1 } else { 0 },
-        "Codec": "aac",
+        "Index": if is_video { 1 } else { 0 },
+        "Codec": source.audio_codec.clone().unwrap_or_default(),
         "Channels": 2,
         "SampleRate": 48000,
         "IsDefault": true,
     }));
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "MediaSources": [{
             "Id": id_str,
             "Path": item.path.to_string_lossy(),
             "Type": "Default",
-            "Container": if video_streams { "mp4" } else { "mp3" },
+            "Container": source.container,
             "IsRemote": false,
             "ETag": "",
             "RunTimeTicks": 50_000_000_u64,
             "Name": item.title,
             "Protocol": "File",
-            "SupportsDirectPlay": true,
-            "SupportsDirectStream": true,
+            "SupportsDirectPlay": direct_play,
+            "SupportsDirectStream": supports_direct_stream,
             "SupportsTranscoding": true,
+            "TranscodingUrl": transcoding_url,
+            "TranscodingSubProtocol": "hls",
             "RequiresOpening": false,
             "RequiresClosing": false,
             "RequiresLooping": false,
             "SupportsProbing": true,
             "MediaStreams": streams,
-            "Bitrate": 2_500_000,
+            "Bitrate": source.bitrate_bps.unwrap_or(2_500_000),
             "VideoType": "VideoFile",
-            "DefaultAudioStreamIndex": if video_streams { 1 } else { 0 },
+            "DefaultAudioStreamIndex": if is_video { 1 } else { 0 },
             "DefaultSubtitleStreamIndex": null,
         }],
         "PlaySessionId": play_session_id,

@@ -2,6 +2,7 @@
 //! controller's worth of routes (see `docs/jellyfin-mapping.md` §3).
 
 pub mod auth_extractor;
+pub mod device_profile;
 pub mod dto;
 pub mod hls;
 pub mod images;
