@@ -89,6 +89,25 @@
           program = "${pharos}/bin/pharos";
         };
 
+        # `nix run .#dev-stack` boots pharos + jellyfin-web as
+        # containers under docker/podman, both built reproducibly
+        # from the flake (pharos via `.#oci`; jellyfin-web bundle
+        # bind-mounted from the pinned nixpkgs derivation). Manual
+        # testing entry point — see scripts/dev-stack.sh for the
+        # full pipeline.
+        apps.dev-stack = {
+          type = "app";
+          program =
+            let
+              script = pkgs.writeShellApplication {
+                name = "pharos-dev-stack";
+                runtimeInputs = [ pkgs.bash pkgs.coreutils pkgs.nix ];
+                text = builtins.readFile ./scripts/dev-stack.sh;
+              };
+            in
+            "${script}/bin/pharos-dev-stack";
+        };
+
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain

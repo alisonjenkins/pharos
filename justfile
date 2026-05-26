@@ -14,6 +14,13 @@ lint:
 audit:
     nix develop --command bash -c 'cargo audit && cargo deny check'
 
+# Boot pharos + jellyfin-web as containers for manual testing. Uses
+# `nix build .#oci` (pharos) + nginx:alpine + the pinned nixpkgs
+# jellyfin-web bundle bind-mounted in. Requires docker or podman on
+# the host. See scripts/dev-stack.sh for state-dir / port / cleanup.
+dev-stack:
+    ./scripts/dev-stack.sh
+
 # Boot pharos with a known config, run schemathesis against the live
 # port, then shut down. Layer A of T29. Requires `pkgs.schemathesis` from
 # the devShell.
