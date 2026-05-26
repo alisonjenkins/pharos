@@ -3,6 +3,7 @@
 
 pub mod auth_extractor;
 pub mod dto;
+pub mod hls;
 pub mod images;
 pub mod items;
 pub mod sessions;
@@ -21,6 +22,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     items::register(cfg);
     images::register(cfg);
     stream::register(cfg);
+    hls::register(cfg);
     sessions::register(cfg);
     socket::register(cfg);
 }
