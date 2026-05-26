@@ -2494,6 +2494,7 @@ dependencies = [
  "pharos-scanner",
  "pharos-store-sqlx",
  "pharos-transcode",
+ "regex-lite",
  "serde",
  "serde_json",
  "sonic-rs",
