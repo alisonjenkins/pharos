@@ -18,6 +18,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/Items", web::get().to(list_items))
         .route("/Items/{id}", web::get().to(get_item))
         .route("/Users/{user_id}/Items", web::get().to(list_user_items))
+        .route(
+            "/Users/{user_id}/Items/{item_id}",
+            web::get().to(get_user_item),
+        )
         .route("/Library/VirtualFolders", web::get().to(virtual_folders));
 }
 
@@ -73,6 +77,26 @@ async fn get_item(
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
+    fetch_item_dto(&state, &id_str).await
+}
+
+async fn get_user_item(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<(String, String)>,
+) -> Result<impl Responder, actix_web::Error> {
+    let (user_path, item_id) = path.into_inner();
+    let bearer_id = user.0.id.0.simple().to_string();
+    if user_path != bearer_id {
+        return Err(error::ErrorForbidden("user mismatch"));
+    }
+    fetch_item_dto(&state, &item_id).await
+}
+
+async fn fetch_item_dto(
+    state: &AppState,
+    id_str: &str,
+) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = id_str
         .parse()
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;

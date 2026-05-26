@@ -159,6 +159,32 @@ async fn list_user_items_accepts_matching_user() {
 }
 
 #[actix_web::test]
+async fn get_user_item_matches_bearer_returns_dto() {
+    let (state, token, uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{}/Items/100", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Id"], "100");
+    assert_eq!(v["Name"], "title-0");
+}
+
+#[actix_web::test]
+async fn get_user_item_rejects_other_user_id_in_path() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Users/deadbeefdeadbeefdeadbeefdeadbeef/Items/100")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 403);
+}
+
+#[actix_web::test]
 async fn virtual_folders_returns_synth_library() {
     let (state, token, _u) = seed().await;
     let app = test::init_service(build_app(state)).await;
