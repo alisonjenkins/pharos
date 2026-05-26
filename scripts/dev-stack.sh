@@ -55,12 +55,28 @@ mkdir -p "$STATE_DIR/db" "$STATE_DIR/media" "$STATE_DIR/cache"
 # Resolve jellyfin-web from the pinned nixpkgs.
 echo ">>> resolving jellyfin-web bundle (nixpkgs#jellyfin-web)"
 JELLYFIN_WEB_OUT=$(nix build --no-link --print-out-paths "nixpkgs#jellyfin-web")
-JELLYFIN_WEB_DIR="$JELLYFIN_WEB_OUT/share/jellyfin-web"
-if [ ! -d "$JELLYFIN_WEB_DIR" ]; then
-  echo "error: jellyfin-web bundle not found at $JELLYFIN_WEB_DIR" >&2
+JELLYFIN_WEB_SRC="$JELLYFIN_WEB_OUT/share/jellyfin-web"
+if [ ! -d "$JELLYFIN_WEB_SRC" ]; then
+  echo "error: jellyfin-web bundle not found at $JELLYFIN_WEB_SRC" >&2
   exit 1
 fi
+# Docker Desktop on macOS only shares paths from its File Sharing
+# list — by default /nix is not in it, so bind-mounting straight
+# from the nix store yields a 403 inside nginx. Materialise the
+# bundle under $STATE_DIR (a host path docker-desktop is happy to
+# share) and mount from there. `cp -rL` deferences any symlinks so
+# the copy is self-contained.
+JELLYFIN_WEB_DIR="$STATE_DIR/jellyfin-web"
+if [ ! -d "$JELLYFIN_WEB_DIR" ] \
+   || [ "$(readlink -f "$JELLYFIN_WEB_DIR/.nix-source" 2>/dev/null)" != "$JELLYFIN_WEB_SRC" ]; then
+  echo ">>> materialising bundle under $JELLYFIN_WEB_DIR"
+  rm -rf "$JELLYFIN_WEB_DIR"
+  cp -rL "$JELLYFIN_WEB_SRC" "$JELLYFIN_WEB_DIR"
+  chmod -R u+w "$JELLYFIN_WEB_DIR"
+  ln -sfn "$JELLYFIN_WEB_SRC" "$JELLYFIN_WEB_DIR/.nix-source"
+fi
 echo "    jellyfin-web -> $JELLYFIN_WEB_DIR"
+echo "      (sourced from $JELLYFIN_WEB_SRC)"
 
 # Build the distroless pharos OCI image via nix dockerTools. Always
 # target a linux system attr — on darwin this dispatches to the
