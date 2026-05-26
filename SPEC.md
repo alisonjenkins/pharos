@@ -87,7 +87,7 @@ T14|.|plex-api: timeline + session reporting|I.plex-api,V2
 T15|x|group-sync protocol design doc + invariants for V3|I.group-sync,V3,V8,V18
 T16|x|group-sync impl phase 1: WS at /sync/v1/ws, ClientMsg/ServerMsg, Group actor + registry, clock-offset estimator with median over N=9 samples. Jellyfin /socket bridge deferred to T16 phase 2.|I.group-sync,V3,V18,V19,V20
 T17|.|group-sync client integration via existing Jellyfin/Plex session hooks|I.group-sync,V3,V1,V2
-T18|.|feature-parity audit vs Jellyfin: gap list, prioritize|V1
+T18|x|feature-parity audit vs Jellyfin: gap list, prioritize. See `docs/jellyfin-parity-audit.md`.|V1,V7
 T19|.|fill parity gaps from T18|V1
 T20|.|extensions past parity (TBD — defer scope to post-T19)|
 T21|x|Jellyfin architecture audit: extract patterns, map to idiomatic Rust traits, doc in `docs/jellyfin-mapping.md`. Lands before T5.|V12
