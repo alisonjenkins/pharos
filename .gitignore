@@ -11,3 +11,4 @@ Cargo.lock.bak
 .claude/settings.local.json
 .claude/cache/
 .claude/sessions/
+.claude/worktrees/
