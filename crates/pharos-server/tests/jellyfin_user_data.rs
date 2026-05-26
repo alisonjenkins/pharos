@@ -220,6 +220,31 @@ async fn played_items_endpoint_excludes_item_from_resume() {
 }
 
 #[actix_web::test]
+async fn mark_played_broadcasts_user_data_changed_on_bus() {
+    use pharos_server::state::SocketBroadcast;
+    let (state, token, uid) = seed().await;
+    let mut bus = state.bus.subscribe();
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri(&format!("/Users/{}/PlayedItems/300", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), bus.recv())
+        .await
+        .expect("broadcast timeout")
+        .expect("broadcast recv");
+    match msg {
+        SocketBroadcast::UserDataChanged { user_id, item_id } => {
+            assert_eq!(user_id, uid.0.simple().to_string());
+            assert_eq!(item_id, "300");
+        }
+        other => panic!("expected UserDataChanged, got {other:?}"),
+    }
+}
+
+#[actix_web::test]
 async fn requires_auth_on_played_items() {
     let (state, _token, uid) = seed().await;
     let app = test::init_service(build_app(state)).await;

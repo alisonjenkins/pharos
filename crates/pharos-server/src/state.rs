@@ -5,10 +5,29 @@
 
 use crate::{auth::BuiltinAuth, image_cache::ImageCache, sessions::SessionRegistry};
 use pharos_store_sqlx::sqlite::SqliteStore;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 pub type Stores = SqliteStore;
 pub type Auth = BuiltinAuth<Stores>;
+
+/// Server-originated notifications fanned out to every connected
+/// `/socket`. T40 phase 2 — keeps client UIs (jellyfin-web especially)
+/// in sync with library + per-user state without polling.
+#[derive(Debug, Clone)]
+pub enum SocketBroadcast {
+    /// Library content changed (item added/updated/removed).
+    /// jellyfin-web treats this as a hint to invalidate its item
+    /// cache and refresh visible views.
+    LibraryChanged,
+    /// Per-user item state changed (played, favourite, position).
+    /// Carries the originating user + item so receivers can ignore
+    /// updates that don't apply to them.
+    UserDataChanged {
+        user_id: String,
+        item_id: String,
+    },
+}
 
 pub struct AppState {
     pub stores: Stores,
@@ -18,6 +37,10 @@ pub struct AppState {
     pub server_id: String,
     pub server_name: String,
     pub version: &'static str,
+    /// Broadcast bus used by `/socket`. Capacity 256 — bursts during
+    /// a library refresh stay buffered; slow consumers see a Lagged
+    /// signal which `socket.rs` translates into "drop + re-subscribe".
+    pub bus: broadcast::Sender<SocketBroadcast>,
 }
 
 impl AppState {
@@ -28,6 +51,7 @@ impl AppState {
     pub fn new(stores: Stores, server_name: String) -> Self {
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
+        let (bus, _) = broadcast::channel(256);
         Self {
             stores,
             auth,
@@ -36,6 +60,7 @@ impl AppState {
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
             version: env!("CARGO_PKG_VERSION"),
+            bus,
         }
     }
 
@@ -49,6 +74,7 @@ impl AppState {
         let server_id = stores.load_or_create_server_id().await?;
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
+        let (bus, _) = broadcast::channel(256);
         Ok(Self {
             stores,
             auth,
@@ -57,11 +83,27 @@ impl AppState {
             server_id,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
+            bus,
         })
     }
 
     pub fn with_image_cache(mut self, cache: ImageCache) -> Self {
         self.images = Some(cache);
         self
+    }
+
+    /// Fire a `LibraryChanged` event to every connected `/socket`.
+    /// No-op when there are zero subscribers (broadcast::send returns
+    /// Err but we don't care).
+    pub fn notify_library_changed(&self) {
+        let _ = self.bus.send(SocketBroadcast::LibraryChanged);
+    }
+
+    /// Fire a `UserDataChanged` event scoped to one user + item.
+    pub fn notify_user_data_changed(&self, user_id: &str, item_id: &str) {
+        let _ = self.bus.send(SocketBroadcast::UserDataChanged {
+            user_id: user_id.to_string(),
+            item_id: item_id.to_string(),
+        });
     }
 }

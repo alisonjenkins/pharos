@@ -136,7 +136,12 @@ async fn playing_progress(
         if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
             data.last_played_position_ticks = position_ticks;
             data.last_played_at = now_unix();
-            let _ = state.stores.set_user_data(user.0.id, item_id, data).await;
+            if state.stores.set_user_data(user.0.id, item_id, data).await.is_ok() {
+                state.notify_user_data_changed(
+                    &user.0.id.0.simple().to_string(),
+                    &item_id.to_string(),
+                );
+            }
         }
     }
     Ok(HttpResponse::NoContent().finish())

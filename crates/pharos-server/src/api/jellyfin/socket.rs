@@ -10,7 +10,7 @@ use super::socket_messages::{
     CommandData, GroupUpdateData, Inbound, Outbound, SyncPlayJoinData, SyncPlayPlayData,
     SyncPlaySeekData,
 };
-use crate::state::AppState;
+use crate::state::{AppState, SocketBroadcast};
 use crate::sync::{
     group::{GroupHandle, GroupMsg, Joined},
     messages::{GroupId, MemberId, ServerMsg},
@@ -20,7 +20,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, Session};
 use futures_util::StreamExt;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 const POSITION_TICKS_PER_MS: u64 = 10_000;
 
@@ -39,11 +39,12 @@ async fn ws_entry(
     let stream = stream
         .aggregate_continuations()
         .max_continuation_size(64 * 1024);
-    let _ = state; // app data retained for future use (sessions etc.).
+    let bus_rx = state.bus.subscribe();
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
         registry.get_ref().clone(),
+        bus_rx,
         user.0.name,
     ));
     Ok(response)
@@ -53,6 +54,7 @@ async fn handle_connection<S>(
     mut session: Session,
     mut stream: S,
     registry: GroupRegistry,
+    mut bus_rx: broadcast::Receiver<SocketBroadcast>,
     member_name: String,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
@@ -72,6 +74,17 @@ async fn handle_connection<S>(
                     }
                 }
             }
+            broadcast_msg = bus_rx.recv() => {
+                // Lagged means the broadcast buffer overran this
+                // subscriber. Stay connected; the next library refresh
+                // will sync the client anyway.
+                let Ok(b) = broadcast_msg else { continue };
+                if let Some(out) = translate_broadcast(b) {
+                    if send_outbound(&mut session, &out).await.is_err() {
+                        break 'pump;
+                    }
+                }
+            }
             frame = stream.next() => {
                 let Some(frame) = frame else { break 'pump };
                 match frame {
@@ -80,6 +93,20 @@ async fn handle_connection<S>(
                             Ok(v) => v,
                             Err(_) => continue 'pump,
                         };
+                        // KeepAlive: reply in-line. The Jellyfin clients
+                        // close the socket after ~10 s of silence; this
+                        // pong keeps it open without involving the group
+                        // actor.
+                        if inbound.message_type == "KeepAlive" {
+                            let out = Outbound::new(
+                                "KeepAlive",
+                                serde_json::Value::Null,
+                            );
+                            if send_outbound(&mut session, &out).await.is_err() {
+                                break 'pump;
+                            }
+                            continue 'pump;
+                        }
                         handle_inbound(
                             inbound,
                             &mut current_group,
@@ -296,4 +323,61 @@ fn translate_outbound(msg: ServerMsg, group_id: Option<GroupId>) -> Option<Outbo
 async fn send_outbound(session: &mut Session, msg: &Outbound) -> Result<(), actix_ws::Closed> {
     let s = serde_json::to_string(msg).map_err(|_| actix_ws::Closed)?;
     session.text(s).await
+}
+
+/// Translate a server-side `SocketBroadcast` into a Jellyfin-shaped
+/// `Outbound`. T40 phase 2 — keeps the wire format identical to what
+/// jellyfin-web expects when it subscribes via Sessions/LibraryChanged.
+pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
+    match b {
+        SocketBroadcast::LibraryChanged => Some(Outbound::new(
+            "LibraryChanged",
+            serde_json::json!({
+                "FoldersAddedTo": [],
+                "FoldersRemovedFrom": [],
+                "ItemsAdded": [],
+                "ItemsRemoved": [],
+                "ItemsUpdated": [],
+                "CollectionFolders": [],
+                "IsEmpty": false,
+            }),
+        )),
+        SocketBroadcast::UserDataChanged { user_id, item_id } => Some(Outbound::new(
+            "UserDataChanged",
+            serde_json::json!({
+                "UserId": user_id,
+                "UserDataList": [{ "ItemId": item_id }],
+            }),
+        )),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_library_changed_emits_libchanged_outbound() {
+        let out = translate_broadcast(SocketBroadcast::LibraryChanged).unwrap();
+        assert_eq!(out.message_type, "LibraryChanged");
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["MessageType"], "LibraryChanged");
+        // Jellyfin's LibraryChanged payload exposes these arrays even when empty.
+        assert!(v["Data"]["ItemsUpdated"].is_array());
+        assert!(v["Data"]["ItemsAdded"].is_array());
+    }
+
+    #[test]
+    fn translate_userdata_changed_carries_user_and_item_ids() {
+        let out = translate_broadcast(SocketBroadcast::UserDataChanged {
+            user_id: "u-1".into(),
+            item_id: "42".into(),
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "UserDataChanged");
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["UserId"], "u-1");
+        assert_eq!(v["Data"]["UserDataList"][0]["ItemId"], "42");
+    }
 }

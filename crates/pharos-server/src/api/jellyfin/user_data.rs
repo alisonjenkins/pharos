@@ -132,6 +132,9 @@ where
         .set_user_data(user_id, item_id, data)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // T40 phase 2 — fan out to every connected /socket so jellyfin-web
+    // updates the watched indicator + favourite star without a refresh.
+    state.notify_user_data_changed(&user_id.0.simple().to_string(), &item_id.to_string());
     Ok(HttpResponse::Ok().json(UserItemDataDto::from_domain(item_id, data)))
 }
 
