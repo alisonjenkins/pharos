@@ -123,12 +123,28 @@
           add_silence ${bbb1080}  $out/03-big-buck-bunny-1080p.webm
           cp ${wikimediaExampleOgg}  $out/04-wikimedia-example.ogg
           cp ${kevinMacLeodCarefree} $out/05-carefree.mp3
+          # Synthetic AV-confirm fixture: 10 s of ffmpeg `testsrc`
+          # (colour bars + frame counter) muxed with a 440 Hz sine
+          # tone. The point is to confirm jellyfin-web's audio path
+          # end-to-end — a user clicks play and *hears something*.
+          # The BBB clips above are silent (their upstream encoding
+          # was video-only) so they wouldn't surface a broken audio
+          # decoder.
+          ffmpeg -hide_banner -loglevel error -nostdin \
+                 -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
+                 -f lavfi -i "sine=frequency=440:duration=10:sample_rate=48000" \
+                 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                 -pix_fmt yuv420p \
+                 -c:a libopus -b:a 64k \
+                 -shortest \
+                 $out/06-test-av-confirm.webm
           cat > $out/LICENSES.txt <<EOF
         01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         03-big-buck-bunny-1080p.webm  CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         04-wikimedia-example.ogg      Public Domain   https://commons.wikimedia.org/wiki/File:Example.ogg
         05-carefree.mp3               CC-BY 4.0       https://incompetech.com/wordpress/2013/06/carefree/
+        06-test-av-confirm.webm       Synthetic       ffmpeg lavfi testsrc + 440 Hz sine, generated at build time
         EOF
         '';
 
