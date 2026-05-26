@@ -4,10 +4,12 @@
 //! - player — T26 (pending)
 //! - group session — T27 (pending)
 
+pub mod group;
 pub mod library;
 pub mod login;
 pub mod player;
 
+pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
 pub use library::{ItemTile, LibraryView};
 pub use login::{LoginAttempt, LoginForm};
 pub use player::{PlaybackEvent, PlayerProps, PlayerView};

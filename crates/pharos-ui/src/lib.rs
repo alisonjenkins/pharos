@@ -12,5 +12,6 @@ pub mod views;
 
 pub use api_types::{ItemKind, LibraryItem, LoggedInUser};
 pub use views::{
-    App, ItemTile, LibraryView, LoginAttempt, LoginForm, PlaybackEvent, PlayerProps, PlayerView,
+    App, GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot, ItemTile, LibraryView,
+    LoginAttempt, LoginForm, PlaybackEvent, PlayerProps, PlayerView,
 };
