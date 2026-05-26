@@ -5,6 +5,7 @@ pub mod config;
 pub mod health;
 pub mod hls_cache;
 pub mod image_cache;
+pub mod live_tv;
 pub mod middleware;
 pub mod obs;
 pub mod router;

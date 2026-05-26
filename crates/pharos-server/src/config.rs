@@ -33,6 +33,13 @@ pub struct ServerConfig {
     /// least-recently-used segments are evicted. Default 1 GiB.
     #[serde(default = "default_transcode_cache_bytes")]
     pub transcode_cache_max_bytes: u64,
+    /// Live-TV M3U playlist path (T47). When set, /LiveTv/Channels
+    /// + /LiveTv/Programs serve channels + EPG from this backend.
+    #[serde(default)]
+    pub live_tv_m3u: Option<PathBuf>,
+    /// Optional XMLTV file for the EPG side of the live-TV backend.
+    #[serde(default)]
+    pub live_tv_xmltv: Option<PathBuf>,
 }
 
 fn default_transcode_cache_bytes() -> u64 {

@@ -7,6 +7,7 @@ use pharos_server::{
     health::{ReadinessError, ReadinessHandle},
     hls_cache::HlsSegmentCache,
     image_cache::ImageCache,
+    live_tv::build_backend as build_live_tv_backend,
     middleware::{LowercasePath, RedMetrics},
     obs, router,
     state::AppState,
@@ -219,6 +220,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             cache_dir,
             cfg.server.transcode_cache_max_bytes,
         ));
+    }
+    if let Some(backend) = build_live_tv_backend(
+        cfg.server.live_tv_m3u.clone(),
+        cfg.server.live_tv_xmltv.clone(),
+    )
+    .await
+    .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?
+    {
+        state = state.with_live_tv(backend);
     }
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());

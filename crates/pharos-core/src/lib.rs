@@ -153,5 +153,47 @@ pub trait Clock: Send + Sync {
     fn now_unix_ms(&self) -> u64;
 }
 
+/// Live-TV channel exposed to Jellyfin clients via the /LiveTv API
+/// surface (T47). `stream_url` is what the channel's video pulls
+/// from — pharos may either pass-through or transcode depending on
+/// the client's DeviceProfile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveChannel {
+    /// Stable id within the backend (e.g. `tvg-id` from M3U or
+    /// HDHomeRun's `GuideNumber`).
+    pub id: String,
+    pub number: String,
+    pub name: String,
+    pub logo_url: Option<String>,
+    pub stream_url: String,
+    pub group_title: Option<String>,
+}
+
+/// EPG entry — one upcoming program on a channel. `start_unix_ms`
+/// / `end_unix_ms` are absolute timestamps; consumers convert to
+/// Jellyfin's ISO-8601 wire shape at the DTO boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpgProgram {
+    pub channel_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
+}
+
+pub trait TunerBackend: Send + Sync {
+    fn channels(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<LiveChannel>>> + Send;
+
+    /// EPG programmes in `[start_unix_ms, end_unix_ms)`. Backends
+    /// without an EPG return an empty Vec.
+    fn programs(
+        &self,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<EpgProgram>>> + Send;
+}
+
 #[cfg(test)]
 mod tests;

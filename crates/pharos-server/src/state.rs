@@ -5,7 +5,7 @@
 
 use crate::{
     auth::BuiltinAuth, hls_cache::HlsSegmentCache, image_cache::ImageCache,
-    sessions::SessionRegistry,
+    live_tv::M3uXmltvBackend, sessions::SessionRegistry,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use tokio::sync::broadcast;
@@ -38,6 +38,7 @@ pub struct AppState {
     pub sessions: SessionRegistry,
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
+    pub live_tv: Option<M3uXmltvBackend>,
     pub server_id: String,
     pub server_name: String,
     pub version: &'static str,
@@ -62,6 +63,7 @@ impl AppState {
             sessions,
             images: None,
             hls: None,
+            live_tv: None,
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -86,6 +88,7 @@ impl AppState {
             sessions,
             images: None,
             hls: None,
+            live_tv: None,
             server_id,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -100,6 +103,11 @@ impl AppState {
 
     pub fn with_hls_cache(mut self, cache: HlsSegmentCache) -> Self {
         self.hls = Some(cache);
+        self
+    }
+
+    pub fn with_live_tv(mut self, backend: M3uXmltvBackend) -> Self {
+        self.live_tv = Some(backend);
         self
     }
 
