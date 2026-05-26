@@ -17,11 +17,43 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/livetv/channels", web::get().to(channels))
         .route("/livetv/channels/{id}", web::get().to(channel))
         .route("/livetv/channels/{id}/stream", web::get().to(stream))
+        .route(
+            "/livetv/channels/{id}/images/primary",
+            web::get().to(channel_image_primary),
+        )
         .route("/livetv/programs", web::get().to(programs))
         .route("/livetv/recordings", web::get().to(empty_items_result))
         .route("/livetv/timers", web::get().to(empty_items_result))
         .route("/livetv/seriestimers", web::get().to(empty_items_result))
         .route("/livetv/tunerhosts", web::get().to(empty_items_result));
+}
+
+/// 302 to the channel's M3U logo URL. Jellyfin clients render the
+/// channel grid by fetching `/Items/{ImageTag}/Images/Primary` (or the
+/// equivalent live-tv route) — without this redirect the grid shows a
+/// broken-image placeholder even though every parsed channel has a
+/// `tvg-logo` URL.
+async fn channel_image_primary(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let Some(backend) = state.live_tv.as_ref() else {
+        return HttpResponse::NotFound().body("");
+    };
+    let id = path.into_inner();
+    let chs = match backend.channels().await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    };
+    let Some(ch) = chs.into_iter().find(|c| c.id == id) else {
+        return HttpResponse::NotFound().body("");
+    };
+    let Some(logo) = ch.logo_url else {
+        return HttpResponse::NotFound().body("");
+    };
+    HttpResponse::Found()
+        .insert_header((header::LOCATION, logo))
+        .finish()
 }
 
 async fn info(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
