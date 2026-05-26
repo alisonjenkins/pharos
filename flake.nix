@@ -8,6 +8,16 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Per-crate-derivation rust build. cargo2nix (the obvious pick)
+    # fails to bootstrap on darwin — its own globwalk dep trips
+    # macOS linker semantics. crate2nix offers the same per-crate
+    # semantics (each Cargo.lock entry → its own derivation, dedup'd
+    # via /nix/store across projects), runs darwin-native (it's in
+    # nixpkgs as `pkgs.crate2nix`), and is what we actually use.
+    # Generates `Cargo.nix` from `Cargo.lock`; the flake imports it
+    # to build each crate.
+    #
+    # No new flake input: crate2nix comes from the pinned nixpkgs.
   };
 
   outputs =
@@ -25,34 +35,28 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        # Pinned toolchain from rust-toolchain.toml.
+        # Pinned toolchain (rust + clippy + rustfmt + wasm target).
+        # Used by the devShell + injected into crate2nix's generated
+        # workspace below so dep builds use the same compiler that
+        # `cargo nextest` does.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
-
-        commonNativeBuildInputs = with pkgs; [ pkg-config ];
-
-        pharos = rustPlatform.buildRustPackage {
-          pname = "pharos";
-          version = "0.0.0";
-          src = pkgs.lib.cleanSource ./.;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
-          nativeBuildInputs = commonNativeBuildInputs;
-          buildInputs = [ ];
-          # ffmpeg is a runtime dep, not build.
-          doCheck = true;
-          meta = with pkgs.lib; {
-            description = "Rust media server, Jellyfin/Plex-compatible";
-            license = licenses.agpl3Plus;
-            platforms = platforms.unix;
-            mainProgram = "pharos";
+        # crate2nix's per-crate package set. `Cargo.nix` is generated
+        # by running `crate2nix generate` at the workspace root (see
+        # the `just regen-cargo-nix` recipe). The generated file
+        # exposes a `buildRustCrateForPkgs` builder per workspace
+        # member + per dep in Cargo.lock — each dep is its own nix
+        # derivation, cached in /nix/store and shared across any
+        # project that resolves the same crate+version.
+        cargoNix = import ./Cargo.nix {
+          inherit pkgs;
+          buildRustCrateForPkgs = pkgs: pkgs.buildRustCrate.override {
+            rustc = rustToolchain;
+            cargo = rustToolchain;
           };
         };
+
+        pharos = cargoNix.workspaceMembers."pharos-server".build;
 
         # Skeleton rootfs: passwd / group / writable /tmp + state
         # directories. Distroless containers usually skip this, but
@@ -202,6 +206,9 @@
             pkgs.cargo-watch
             pkgs.cargo-deny
             pkgs.cargo-audit
+            # crate2nix regenerates Cargo.nix when Cargo.lock changes.
+            # Run `just regen-cargo-nix` after touching dependencies.
+            pkgs.crate2nix
             pkgs.dioxus-cli
             pkgs.wasm-bindgen-cli
             pkgs.ffmpeg-headless
