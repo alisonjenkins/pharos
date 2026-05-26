@@ -1,0 +1,185 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Real-ffmpeg integration smoke tests (T38).
+//!
+//! All tests are `#[ignore]` so the default `cargo nextest run` stays
+//! fast. Run on-demand with:
+//!
+//!   nix develop --command cargo nextest run --run-ignored only \
+//!     -p pharos-server --test ffmpeg_integration
+//!
+//! Fixtures are generated on-the-fly from `lavfi testsrc` so there's
+//! nothing checked in. Each test creates a `tempfile::TempDir`,
+//! synthesises a WebM via ffmpeg's testsrc, and tears the dir down at
+//! end of scope.
+
+use pharos_core::{MediaKind, Prober};
+use pharos_scanner::FfmpegProber;
+use pharos_server::image_cache::ImageCache;
+use pharos_transcode::{FfmpegTranscoder, TranscodeOptions};
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+use tokio::io::AsyncReadExt;
+
+/// True if both `ffmpeg` and `ffprobe` resolve on PATH. Lets the
+/// tests no-op gracefully on systems without ffmpeg (CI matrix
+/// without nix devShell, for instance).
+fn ffmpeg_available() -> bool {
+    fn ok(bin: &str) -> bool {
+        std::process::Command::new(bin)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    ok("ffmpeg") && ok("ffprobe")
+}
+
+/// Synthesise a tiny WebM (VP9 + Opus, 320x240 @ 3s) using lavfi.
+/// Returns the file path.
+async fn make_video_fixture(dir: &Path) -> PathBuf {
+    let out = dir.join("fixture.webm");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=3:size=320x240:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-c:v",
+            "libvpx-vp9",
+            "-b:v",
+            "200k",
+            "-c:a",
+            "libopus",
+            "-shortest",
+        ])
+        .arg(&out)
+        .status()
+        .await
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to build fixture");
+    out
+}
+
+/// Synthesise an audio-only Opus-in-WebM fixture for the
+/// audio-prober test.
+async fn make_audio_fixture(dir: &Path) -> PathBuf {
+    let out = dir.join("fixture-audio.webm");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:a",
+            "libopus",
+        ])
+        .arg(&out)
+        .status()
+        .await
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to build audio fixture");
+    out
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg/ffprobe on PATH"]
+async fn probe_real_video_classifies_as_movie() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg/ffprobe not found");
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_video_fixture(td.path()).await;
+    let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
+    assert_eq!(probe.kind, MediaKind::Movie);
+    // 3 s ±200 ms tolerance — VP9 encoder pads slightly.
+    let d = probe.duration_ms.unwrap_or(0);
+    assert!((2_800..=3_200).contains(&d), "duration_ms={d}");
+    let container = probe.container.unwrap_or_default();
+    assert!(
+        container.contains("matroska") || container.contains("webm"),
+        "container={container}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg/ffprobe on PATH"]
+async fn probe_real_audio_classifies_as_audio() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_audio_fixture(td.path()).await;
+    let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
+    assert_eq!(probe.kind, MediaKind::Audio);
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg on PATH"]
+async fn image_cache_extracts_primary_jpeg_from_real_video() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_video_fixture(td.path()).await;
+    let cache_dir = td.path().join("cache");
+    // Fixture is 3 s — seek to 1 s so ffmpeg can decode a frame.
+    let cache = ImageCache::new(&cache_dir).with_seek_seconds(1);
+    let p = cache.primary(1, MediaKind::Movie, &fixture).await.unwrap();
+    let bytes = tokio::fs::read(&p).await.unwrap();
+    // JPEG SOI marker.
+    assert_eq!(&bytes[..2], &[0xFF, 0xD8], "expected JPEG magic");
+    assert!(bytes.len() > 256, "tiny jpeg unexpected: {} bytes", bytes.len());
+    // Second call hits the cache — file mtime should not advance, but
+    // simpler check: it just resolves to the same path without
+    // erroring (which it would on a missing ffmpeg).
+    let p2 = cache
+        .primary(1, MediaKind::Movie, Path::new("/no/such/source"))
+        .await
+        .unwrap();
+    assert_eq!(p, p2);
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg on PATH"]
+async fn transcoder_streams_bytes_from_real_video() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_video_fixture(td.path()).await;
+    let opts = TranscodeOptions {
+        container: pharos_transcode::Container::Mkv,
+        video: Some(pharos_transcode::VideoCodec::Copy),
+        audio: Some(pharos_transcode::AudioCodec::Copy),
+        video_bitrate_bps: None,
+        audio_bitrate_bps: None,
+        start_position_ticks: 0,
+        duration_ticks: None,
+    };
+    let mut stream = FfmpegTranscoder::new()
+        .transcode(&fixture, &opts)
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).await.unwrap();
+    assert!(n > 0, "expected at least one byte from ffmpeg stdout");
+    // Matroska EBML header begins with 0x1A 0x45 0xDF 0xA3.
+    assert_eq!(&buf[..4], &[0x1A, 0x45, 0xDF, 0xA3], "expected EBML magic");
+}

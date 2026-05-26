@@ -18,6 +18,7 @@ use tracing::instrument;
 pub struct ImageCache {
     root: PathBuf,
     ffmpeg_bin: PathBuf,
+    seek_seconds: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,11 +48,21 @@ impl ImageCache {
         Self {
             root: root.into(),
             ffmpeg_bin: PathBuf::from("ffmpeg"),
+            seek_seconds: 30,
         }
     }
 
     pub fn with_ffmpeg(mut self, p: impl Into<PathBuf>) -> Self {
         self.ffmpeg_bin = p.into();
+        self
+    }
+
+    /// Override the decode-seek timestamp used when extracting a
+    /// poster from video / episode sources. Defaults to 30s, which
+    /// works for real movies; the integration tests synth 3s clips and
+    /// override to 0.
+    pub fn with_seek_seconds(mut self, seek: u32) -> Self {
+        self.seek_seconds = seek;
         self
     }
 
@@ -91,6 +102,10 @@ impl ImageCache {
     ) -> Result<(), ImageCacheError> {
         let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        // Explicit `-f mjpeg` because the cache writes to a `.tmp`
+        // suffix path — ffmpeg can't infer the muxer from the .jpg.tmp
+        // extension and dies with "Unable to choose an output format".
+        let seek = self.seek_seconds.to_string();
         let args: Vec<&str> = match kind {
             MediaKind::Movie | MediaKind::Episode => vec![
                 "-hide_banner",
@@ -99,7 +114,7 @@ impl ImageCache {
                 "-nostdin",
                 "-y",
                 "-ss",
-                "30",
+                &seek,
                 "-i",
                 source_str,
                 "-frames:v",
@@ -108,6 +123,8 @@ impl ImageCache {
                 "3",
                 "-vf",
                 "scale=480:-1",
+                "-f",
+                "mjpeg",
                 out_str,
             ],
             MediaKind::Audio => vec![
@@ -124,6 +141,8 @@ impl ImageCache {
                 "1",
                 "-q:v",
                 "3",
+                "-f",
+                "mjpeg",
                 out_str,
             ],
         };
