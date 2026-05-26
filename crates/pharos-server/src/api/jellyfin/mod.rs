@@ -12,6 +12,7 @@ pub mod live_tv;
 pub mod search;
 pub mod sessions;
 pub mod socket;
+pub mod syncplay;
 pub mod socket_messages;
 pub mod stream;
 pub mod system;
@@ -37,4 +38,5 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     hls::register(cfg);
     sessions::register(cfg);
     socket::register(cfg);
+    syncplay::register(cfg);
 }
