@@ -10,10 +10,12 @@ async fn metrics() -> impl Responder {
         .body(crate::obs::render())
 }
 
-/// Wire core routes. Health endpoints land in T22.
+/// Wire core routes. Health endpoints are wired separately via `health::configure`
+/// so they can be reused/mounted independently.
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(root))
-        .route("/metrics", web::get().to(metrics));
+        .route("/metrics", web::get().to(metrics))
+        .configure(crate::health::configure);
 }
 
 #[cfg(test)]
