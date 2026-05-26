@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Reproducible local dev-stack: pharos + jellyfin-web, both as
-# containers, on every host.
+# Reproducible local dev-stack: pharos + jellyfin-web as Nix-built
+# distroless OCI containers, on every host.
 #
-# pharos is built from `./Dockerfile` (multi-stage rust → debian) so
-# the runtime is linux regardless of build host. Pinning lives in
-# `rust-toolchain.toml` + `Cargo.lock`. jellyfin-web is nginx:alpine
-# bind-mounting the pinned nixpkgs bundle.
+# pharos comes from `nix build .#oci` — `dockerTools.buildLayeredImage`
+# wrapping a linux-cross-compiled binary + ffmpeg + cacert + tzdata
+# straight out of the nix store. No debian / alpine base layer; no
+# shell; just store paths. On darwin the build cross-compiles pharos
+# to ${arch}-unknown-linux-gnu so the resulting image is a real linux
+# container that docker desktop's linux VM can run.
+#
+# jellyfin-web is nginx:alpine bind-mounting the pinned nixpkgs
+# bundle (`nix build nixpkgs#jellyfin-web`).
 #
 # Usage:
 #   nix run .#dev-stack            # via flake app
@@ -57,13 +62,15 @@ if [ ! -d "$JELLYFIN_WEB_DIR" ]; then
 fi
 echo "    jellyfin-web -> $JELLYFIN_WEB_DIR"
 
-# Build pharos image from the local Dockerfile. BuildKit cache mounts
-# inside the Dockerfile reuse the cargo registry + target dir across
-# rebuilds.
-echo ">>> building pharos image (docker build)"
-DOCKER_BUILDKIT=1 $DOCKER build -t pharos:dev -f Dockerfile .
+# Build the distroless pharos OCI image via nix dockerTools. Output
+# is a tarball; docker load makes it available as pharos:latest.
+echo ">>> building pharos OCI image (.#oci)"
+OCI_TARBALL=$(nix build .#oci --no-link --print-out-paths)
+echo ">>> loading pharos:latest into $DOCKER"
+$DOCKER load < "$OCI_TARBALL" >/dev/null
 
-# Write a config.toml the container reads from /etc/pharos.
+# Write a config.toml the container reads from /etc/pharos. Bind-
+# mounted at runtime so changes don't require a rebuild.
 CONFIG_PATH="$STATE_DIR/config.toml"
 cat > "$CONFIG_PATH" <<TOML
 [server]
@@ -81,11 +88,9 @@ roots = ["/var/lib/pharos/media"]
 url = "sqlite:///var/lib/pharos/db/pharos.db?mode=rwc"
 TOML
 
-# Linux can use --network=host so localhost works inside both
-# containers + on the host. Other OSes get -p publish-port; the host
-# reaches the services at localhost:<port> but containers can't see
-# each other via localhost. jellyfin-web is static + connects from the
-# browser, so it doesn't need to call pharos directly anyway.
+# Networking. Linux can use --network=host so localhost works inside
+# both containers + on the host. On macOS docker-desktop's host
+# networking is in beta and finicky; publish ports instead.
 UNAME=$(uname -s)
 if [ "$UNAME" = "Linux" ]; then
   PHAROS_NET=(--network=host)
@@ -95,14 +100,15 @@ else
   NGINX_NET=(-p 127.0.0.1:8097:8097)
 fi
 
-# Seed the playwright user + fixture via a one-shot pharos container.
+# Seed the playwright user + WebM fixture via a one-shot run.
 echo ">>> seeding playwright user + fixture"
 $DOCKER run --rm \
   -v "$STATE_DIR/db:/var/lib/pharos/db" \
   -v "$STATE_DIR/media:/var/lib/pharos/media" \
   -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
   -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-  pharos:dev \
+  --entrypoint /bin/pharos \
+  pharos:latest \
   --config /etc/pharos/config.toml admin seed-playwright-user \
   || echo "    (seed may have already happened; continuing)"
 
@@ -125,8 +131,7 @@ $DOCKER run -d \
   -v "$STATE_DIR/media:/var/lib/pharos/media" \
   -v "$STATE_DIR/cache:/var/lib/pharos/cache" \
   -v "$CONFIG_PATH:/etc/pharos/config.toml:ro" \
-  pharos:dev \
-  --config /etc/pharos/config.toml serve >/dev/null
+  pharos:latest >/dev/null
 
 # Start jellyfin-web.
 echo ">>> starting jellyfin-web container"
