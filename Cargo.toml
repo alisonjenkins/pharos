@@ -21,7 +21,9 @@ expect_used = "deny"
 [workspace.dependencies]
 actix-web = "4"
 anyhow = "1"
+argon2 = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.2"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "html_reports"] }
@@ -35,4 +37,5 @@ toml = "0.8"
 tracing = "0.1"
 tracing-actix-web = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"

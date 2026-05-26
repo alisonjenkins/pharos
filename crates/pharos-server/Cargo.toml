@@ -13,7 +13,9 @@ path = "src/main.rs"
 pharos-core = { path = "../pharos-core" }
 actix-web.workspace = true
 anyhow.workspace = true
+argon2.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 serde.workspace = true

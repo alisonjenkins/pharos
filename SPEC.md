@@ -70,7 +70,7 @@ id|status|desc|cites
 T1|x|cargo workspace skeleton, actix-web app, config loader, tracing init, OTel+Prom exporters, test harness, trait scaffolding, clippy lints (V17), nix flake (devShell + package + OCI)|I.config,I.cli,I.obs,I.nix-flake,V11,V12,V13,V15,V17,V18
 T2|x|sqlx-backed `MediaStore` impl in `pharos-store-sqlx` crate (sqlite default, postgres feature-gated), migrations via `sqlx::migrate!`, wired through core trait — no call site knows backend|I.store,V10,V12
 T3|x|media-fs scanner: walk roots, extract metadata via ffprobe|I.media-fs,I.ffmpeg,V5,V12,V18
-T4|.|user/auth model + token issuance|V8
+T4|x|user/auth model + token issuance: User, UserPolicy, Argon2 password hash, TokenStore (sqlite) issuing opaque UUIDv4 tokens, AuthBackend trait, BuiltinAuth impl|V8,V12,V17
 T5|.|jellyfin-api: /System/Info, /Users/AuthenticateByName, /Users/Me|I.jellyfin-api,V1,V7
 T6|.|jellyfin-api: /Library/* + /Items/* (browse, search, details)|I.jellyfin-api,V1,V7
 T7|.|jellyfin-api: /Videos/{id}/stream, /Audio/{id}/universal (direct play)|I.jellyfin-api,V1,V9

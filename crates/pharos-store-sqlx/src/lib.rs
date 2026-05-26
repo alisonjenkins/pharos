@@ -5,6 +5,9 @@
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "sqlite")]
+mod auth_sqlite;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
