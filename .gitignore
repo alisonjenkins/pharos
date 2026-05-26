@@ -16,3 +16,5 @@ compat-playwright/node_modules/
 compat-playwright/test-results/
 compat-playwright/playwright-report/
 compat-playwright/.cache/
+/test-results/
+/playwright-report/
