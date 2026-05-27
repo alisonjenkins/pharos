@@ -8330,6 +8330,10 @@ rec {
         ];
         devDependencies = [
           {
+            name = "proptest";
+            packageId = "proptest";
+          }
+          {
             name = "tokio";
             packageId = "tokio";
             features = [ "macros" "rt-multi-thread" "signal" "sync" "macros" "rt-multi-thread" ];
