@@ -88,14 +88,23 @@ struct CapabilitiesBody {
 
 async fn list_sessions(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     let snap = state
         .sessions
         .snapshot()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(snap))
+    // Real Jellyfin: admins see every active session, non-admins only
+    // their own. Bare `_user: AuthUser` (no filter) was a V9 leak —
+    // user A could read user B's now-playing item via /Sessions.
+    let filtered: Vec<_> = if user.0.policy.admin {
+        snap
+    } else {
+        let bearer = user.0.id.0.simple().to_string();
+        snap.into_iter().filter(|s| s.user_id == bearer).collect()
+    };
+    Ok(HttpResponse::Ok().json(filtered))
 }
 
 async fn playing_started(
