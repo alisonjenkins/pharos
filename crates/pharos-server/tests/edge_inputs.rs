@@ -292,3 +292,36 @@ async fn fields_query_param_is_silently_accepted() {
     .await;
     assert!(resp.status().is_success(), "{resp:?}");
 }
+
+/// Items with non-ASCII / unicode paths + titles round-trip through
+/// the store + DTO without mangling. Caught when a vorbis-tagged
+/// Greek-name track surfaced as `???` in a previous Jellyfin
+/// fork's UI.
+#[actix_web::test]
+async fn unicode_paths_and_titles_round_trip_intact() {
+    let (state, reg, token, _) = seed().await;
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
+    let title = "日本語のタイトル — Ελληνικά";
+    state
+        .stores
+        .put(MediaItem {
+            id: 9,
+            path: "/m/日本語/Ελληνικά.mp3".into(),
+            title: title.into(),
+            kind: MediaKind::Audio,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(state, reg)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/9")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Name"], title);
+}
