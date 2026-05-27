@@ -298,3 +298,87 @@ async fn ffmpeg_extracts_webvtt_from_embedded_stream() {
     );
     assert!(body.contains("Hello pharos"), "cue line missing: {body}");
 }
+
+/// Build an MP3 with an embedded cover image (`attached_pic`) via
+/// `ffmpeg -attach`. The ImageCache audio path uses `-map 0:v?`
+/// which picks up the attached picture stream.
+async fn make_audio_fixture_with_cover(dir: &Path) -> PathBuf {
+    // Generate a 1×1 magenta JPEG via ffmpeg lavfi so the test stays
+    // hermetic (no checked-in binary fixture).
+    let cover = dir.join("cover.jpg");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=magenta:s=64x64:d=1",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2",
+        ])
+        .arg(&cover)
+        .status()
+        .await
+        .expect("spawn ffmpeg cover");
+    assert!(status.success(), "ffmpeg failed to build cover.jpg");
+
+    let out = dir.join("withcover.mp3");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-i",
+        ])
+        .arg(&cover)
+        .args([
+            "-map", "0:a:0", "-map", "1:v:0",
+            "-c:a", "libmp3lame", "-b:a", "64k",
+            "-c:v", "mjpeg",
+            // ID3v2 attached_pic disposition for embedded cover art.
+            "-disposition:v:0", "attached_pic",
+            "-id3v2_version", "3",
+            "-shortest",
+        ])
+        .arg(&out)
+        .status()
+        .await
+        .expect("spawn ffmpeg cover-mp3");
+    assert!(status.success(), "ffmpeg failed to build covered mp3");
+    out
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg on PATH"]
+async fn image_cache_extracts_audio_cover_art() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_audio_fixture_with_cover(td.path()).await;
+    let cache_dir = td.path().join("cache");
+    let cache = ImageCache::new(&cache_dir);
+    let p = cache
+        .primary(2, MediaKind::Audio, &fixture)
+        .await
+        .expect("audio cover extracts");
+    let bytes = tokio::fs::read(&p).await.unwrap();
+    assert_eq!(&bytes[..2], &[0xFF, 0xD8], "JPEG magic missing");
+    assert!(
+        bytes.len() > 64,
+        "extracted cover too small: {} bytes",
+        bytes.len()
+    );
+}
