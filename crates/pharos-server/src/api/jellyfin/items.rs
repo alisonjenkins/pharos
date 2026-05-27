@@ -964,6 +964,26 @@ struct ListQuery {
     /// without. Real Jellyfin honours both directions.
     #[serde(default)]
     has_subtitles: Option<bool>,
+    /// Resolution-category booleans jellyfin-web's "Quality" filter
+    /// chips send. We compare against `probe.width` since aspect
+    /// ratios vary and height alone undercounts widescreen content.
+    /// Items without width data drop when any of these are active.
+    /// The explicit `rename`s honour Jellyfin's case (Is4K with an
+    /// uppercase K, Is3D with an uppercase D) — serde's PascalCase
+    /// renamer alone produces `Is4k` / `Is3d` which the client never
+    /// sends.
+    #[serde(default, rename = "Is4K")]
+    is_4k: Option<bool>,
+    #[serde(default)]
+    is_hd: Option<bool>,
+    #[serde(default, rename = "Is3D")]
+    is_3d: Option<bool>,
+    /// Explicit min/max bounds on the source video width. Lets a
+    /// power user pick a 1440p cutoff that the canned chips miss.
+    #[serde(default)]
+    min_width: Option<u32>,
+    #[serde(default)]
+    max_width: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1295,6 +1315,31 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
     }
     if let Some(want) = q.has_subtitles {
         items.retain(|i| i.probe.subtitle_tracks.is_empty() != want);
+    }
+    // Resolution filters: "4K" ≥ 3840, "HD" 1280..3840, "SD" < 1280.
+    // Width-based — height alone undercounts widescreen content.
+    if let Some(want) = q.is_4k {
+        items.retain(|i| i.probe.width.map(|w| w >= 3840) == Some(want));
+    }
+    if let Some(want) = q.is_hd {
+        items.retain(|i| {
+            i.probe
+                .width
+                .map(|w| (1280..3840).contains(&w))
+                == Some(want)
+        });
+    }
+    if let Some(want) = q.is_3d {
+        // No 3D detection in the prober yet; report false for every
+        // item so `Is3D=false` returns everything and `Is3D=true`
+        // returns nothing. Lets clients tick the chip without 500'ing.
+        items.retain(|_| !want);
+    }
+    if let Some(min) = q.min_width {
+        items.retain(|i| i.probe.width.is_some_and(|w| w >= min));
+    }
+    if let Some(max) = q.max_width {
+        items.retain(|i| i.probe.width.is_some_and(|w| w <= max));
     }
     if let Some(min) = q.min_index_number {
         items.retain(|i| {
