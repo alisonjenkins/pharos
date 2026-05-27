@@ -900,6 +900,13 @@ struct ListQuery {
     /// numeric ids in the store match.
     #[serde(default)]
     ids: Option<String>,
+    /// Stable seed for `SortBy=Random`. Jellyfin clients pass this so
+    /// pagination across a randomised list returns a consistent order
+    /// (no duplicates, no holes). Absent → server derives a seed from
+    /// the bearer's user id so each user's "Random" view stays stable
+    /// within a browse session but differs across users.
+    #[serde(default)]
+    sort_seed: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -961,7 +968,12 @@ async fn list_items(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let filtered = filter_and_sort(restrict_to_parent(&state, all, q.parent_id.as_deref()), &q);
+    let seed = effective_sort_seed(&q, user.0.id);
+    let filtered = filter_and_sort(
+        restrict_to_parent(&state, all, q.parent_id.as_deref()),
+        &q,
+        seed,
+    );
     let after_ud = apply_userdata_filter(&state, user.0.id, filtered, q.filters.as_deref()).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
@@ -984,10 +996,31 @@ async fn list_user_items(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let filtered = filter_and_sort(restrict_to_parent(&state, all, q.parent_id.as_deref()), &q);
+    let seed = effective_sort_seed(&q, user.0.id);
+    let filtered = filter_and_sort(
+        restrict_to_parent(&state, all, q.parent_id.as_deref()),
+        &q,
+        seed,
+    );
     let after_ud = apply_userdata_filter(&state, user.0.id, filtered, q.filters.as_deref()).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
+}
+
+/// Returns the seed used for `SortBy=Random`. When the client passes
+/// `SortSeed`, honour it (clients use this to keep pagination stable
+/// across requests). Otherwise derive from the bearer's user id so
+/// the order is stable per-user within a session.
+fn effective_sort_seed(q: &ListQuery, user_id: UserId) -> u64 {
+    if let Some(s) = q.sort_seed {
+        return s | 1;
+    }
+    // Fold UUID bytes into a u64 — `as u64` slice is enough for a
+    // shuffle seed; cryptographic strength is not required.
+    let bytes = user_id.0.as_bytes();
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(buf) | 1
 }
 
 /// Filter the list by per-user UserData state (favorite / played /
@@ -1139,7 +1172,7 @@ fn restrict_to_parent(
     Vec::new()
 }
 
-fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
+fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> Vec<MediaItem> {
     if let Some(raw) = q.ids.as_ref() {
         // 32-char synth ids (library / series / season / artist /
         // album / genre) live in a different namespace from numeric
@@ -1184,7 +1217,7 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
         .find(|s| !s.is_empty())
         .unwrap_or("SortName");
     match primary {
-        "Random" => shuffle_in_place(&mut items),
+        "Random" => shuffle_in_place(&mut items, sort_seed),
         "DateCreated" | "DateAdded" => {
             // Newest-first by default. Items without a created_at
             // (pre-migration-0010 rows) sort to the end of the
@@ -1261,14 +1294,13 @@ fn jellyfin_type_to_kind(s: &str) -> Option<MediaKind> {
 
 /// Deterministic-when-tested shuffle. Uses `getrandom` to seed a small
 /// xorshift so the random-sort doesn't pull in the rand crate.
-fn shuffle_in_place(items: &mut [MediaItem]) {
-    let mut seed = [0u8; 8];
-    if getrandom::getrandom(&mut seed).is_err() {
-        // Fall back to a fixed seed — caller already accepts non-determinism;
-        // a fixed seed is no worse than panicking under unprivileged sandbox.
-        seed = [1, 2, 3, 4, 5, 6, 7, 8];
-    }
-    let mut state = u64::from_le_bytes(seed) | 1;
+/// xorshift64 Fisher–Yates. Deterministic for a given seed — same
+/// `(items, seed)` yields the same permutation. Caller threads a
+/// seed (from `?SortSeed=` or the bearer's user id) so /Items?
+/// SortBy=Random pagination doesn't reshuffle between page requests.
+fn shuffle_in_place(items: &mut [MediaItem], seed: u64) {
+    // xorshift64 reqs non-zero state; caller forces low bit.
+    let mut state = seed | 1;
     for i in (1..items.len()).rev() {
         state ^= state << 13;
         state ^= state >> 7;
