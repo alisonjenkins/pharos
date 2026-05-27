@@ -206,6 +206,13 @@ pub struct BaseItemDto {
     /// row predates migration 0010 (pre-T-fix-39 rescans).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_created: Option<String>,
+    /// jellyfin-web's breadcrumb back-nav requires every item to
+    /// reference its parent: Episode → SeasonId, Audio in album →
+    /// AlbumId, otherwise the containing library / root id. Set by
+    /// `BaseItemDto::with_parent_id(...)` after construction since
+    /// the library-root mapping lives in AppState.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     /// Audio metadata: album name (None for video/no-tag files).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub album: Option<String>,
@@ -548,6 +555,15 @@ impl BaseItemDto {
             backdrop_image_tags: vec![image_tag_for(item.id, "backdrop")],
             screenshot_image_tags: vec![],
             date_created: item.created_at.map(format_iso8601),
+            // ParentId default: SeasonId for episodes, AlbumId for
+            // audio with album tag, else None (handler fills with the
+            // library root id; we can't compute it without
+            // media_roots).
+            parent_id: item
+                .series
+                .as_ref()
+                .and_then(|s| s.season_number.map(|n| season_id_for(&s.series_name, n)))
+                .or_else(|| item.probe.album.as_deref().map(album_id_for)),
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
             series_name: item.series.as_ref().map(|s| s.series_name.clone()),

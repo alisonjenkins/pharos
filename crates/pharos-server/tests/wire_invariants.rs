@@ -413,7 +413,61 @@ async fn video_item_advertises_primary_backdrop_thumb_image_tags() {
     assert!(!tags.contains_key("Thumb"));
 }
 
-/// (8) — Episode promotion. A path that matches the TV-layout
+/// (9) — Every item DTO must carry a ParentId so jellyfin-web's
+/// breadcrumb back-nav works. Episode → SeasonId; audio with album
+/// → AlbumId; otherwise the library root id matching the path.
+#[actix_web::test]
+async fn every_item_has_a_parent_id() {
+    let (state_inner, token) = seed_with_items(vec![
+        MediaItem {
+            id: 1,
+            path: "/m/Movies/big.mkv".into(),
+            title: "movie".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        },
+        MediaItem {
+            id: 2,
+            path: "/m/TV/Show/Season 1/s01e01.mkv".into(),
+            title: "ep".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Show".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+            }),
+            ..Default::default()
+        },
+    ])
+    .await;
+    // Inject media_roots so the library_parent_id pass has something
+    // to match.
+    let state = web::Data::new(
+        std::sync::Arc::try_unwrap(state_inner.into_inner())
+            .unwrap_or_else(|_| panic!("state arc"))
+            .with_media_roots(vec!["/m/Movies".into(), "/m/TV".into()]),
+    );
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for it in v["Items"].as_array().unwrap() {
+        let pid = it["ParentId"].as_str();
+        assert!(
+            pid.is_some_and(|p| p.len() == 32),
+            "{} has no ParentId: {it:?}",
+            it["Name"]
+        );
+    }
+}
+
+/// (10) — Episode promotion. A path that matches the TV-layout
 /// heuristic must yield kind=Episode in the put → list → get
 /// round-trip (catches scanner classification regressions across
 /// the storage layer).

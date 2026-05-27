@@ -1043,6 +1043,27 @@ fn library_view_for_id(state: &AppState, id_str: &str) -> Option<serde_json::Val
         .find(|v| v.get("Id").and_then(|i| i.as_str()) == Some(id_str))
 }
 
+/// Library-root id whose path prefixes this item, if any. Used to
+/// post-fill `BaseItemDto.parent_id` for top-level items.
+fn library_parent_id(state: &AppState, item: &MediaItem) -> Option<String> {
+    state
+        .media_roots
+        .iter()
+        .find(|r| item.path.starts_with(r))
+        .map(|r| library_id_for_root(r))
+}
+
+/// Walk a Vec<BaseItemDto> + matching items, post-filling ParentId
+/// with the library root id when the DTO didn't already set
+/// SeasonId / AlbumId.
+fn fill_parent_ids(state: &AppState, dtos: &mut [BaseItemDto], items: &[&MediaItem]) {
+    for (dto, item) in dtos.iter_mut().zip(items.iter()) {
+        if dto.parent_id.is_none() {
+            dto.parent_id = library_parent_id(state, item);
+        }
+    }
+}
+
 /// Look up `id_str` against the synthesised Series + Season ids
 /// derived from every Episode in the store. Returns a Jellyfin-shaped
 /// Series / Season BaseItem DTO when matched. `None` otherwise.
@@ -1207,7 +1228,7 @@ async fn paginate(
         .user_data_bulk(user_id, &ids)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<BaseItemDto> = slice
+    let mut items: Vec<BaseItemDto> = slice
         .iter()
         .enumerate()
         .map(|(i, item)| {
@@ -1215,6 +1236,8 @@ async fn paginate(
             BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
         })
         .collect();
+    let refs: Vec<&pharos_core::MediaItem> = slice.iter().collect();
+    fill_parent_ids(state, &mut items, &refs);
     Ok(ItemsResultDto {
         items,
         total_record_count: total,
