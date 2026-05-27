@@ -183,3 +183,118 @@ async fn transcoder_streams_bytes_from_real_video() {
     // Matroska EBML header begins with 0x1A 0x45 0xDF 0xA3.
     assert_eq!(&buf[..4], &[0x1A, 0x45, 0xDF, 0xA3], "expected EBML magic");
 }
+
+/// Synthesise a WebM with an embedded WebVTT subtitle track so the
+/// extraction endpoint has something to extract from.
+async fn make_subtitled_video_fixture(dir: &Path) -> PathBuf {
+    let vtt = dir.join("subs.vtt");
+    tokio::fs::write(
+        &vtt,
+        "WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nHello pharos\n",
+    )
+    .await
+    .unwrap();
+    let out = dir.join("subbed.webm");
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=3:size=320x240:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-i",
+        ])
+        .arg(&vtt)
+        .args([
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-row-mt",
+            "1",
+            "-b:v",
+            "200k",
+            "-c:a",
+            "libopus",
+            "-c:s",
+            "webvtt",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "2:s:0",
+            "-metadata:s:s:0",
+            "language=eng",
+            "-shortest",
+        ])
+        .arg(&out)
+        .status()
+        .await
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to build subtitled fixture");
+    out
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg/ffprobe on PATH"]
+async fn probe_subtitle_tracks_extracts_embedded_webvtt() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_subtitled_video_fixture(td.path()).await;
+    let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
+    assert!(
+        !probe.probe.subtitle_tracks.is_empty(),
+        "expected at least one subtitle track in {fixture:?}, got {:?}",
+        probe.probe.subtitle_tracks
+    );
+    let st = &probe.probe.subtitle_tracks[0];
+    assert_eq!(st.codec.as_deref(), Some("webvtt"));
+    assert_eq!(st.language.as_deref(), Some("eng"));
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg on PATH"]
+async fn ffmpeg_extracts_webvtt_from_embedded_stream() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_subtitled_video_fixture(td.path()).await;
+    // Drive the same shell-out the subtitles handler does, asserting
+    // the stdout starts with `WEBVTT`.
+    let out = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+        ])
+        .arg(&fixture)
+        .args([
+            "-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", "pipe:1",
+        ])
+        .output()
+        .await
+        .expect("spawn ffmpeg");
+    assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.trim_start().starts_with("WEBVTT"),
+        "extraction didn't start with WEBVTT magic: {body:.200}"
+    );
+    assert!(body.contains("Hello pharos"), "cue line missing: {body}");
+}
