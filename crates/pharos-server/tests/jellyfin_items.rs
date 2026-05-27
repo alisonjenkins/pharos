@@ -1309,3 +1309,79 @@ async fn items_similar_scores_by_series_then_genre() {
     // Self never appears.
     assert!(!names.contains(&"S01E01"));
 }
+
+#[actix_web::test]
+async fn items_counts_aggregates_by_kind_and_distinct_names() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 1,
+            path: "/m/movie.mkv".into(),
+            title: "M".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 2,
+            path: "/m/Show/Season 1/s01e01.mkv".into(),
+            title: "E1".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Show".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 3,
+            path: "/m/song.mp3".into(),
+            title: "S".into(),
+            kind: MediaKind::Audio,
+            probe: pharos_core::MediaProbe {
+                artist: Some("Kevin MacLeod".into()),
+                album: Some("Carefree".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/Counts")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["MovieCount"], 1);
+    assert_eq!(v["EpisodeCount"], 1);
+    assert_eq!(v["SongCount"], 1);
+    assert_eq!(v["SeriesCount"], 1);
+    assert_eq!(v["ArtistCount"], 1);
+    assert_eq!(v["AlbumCount"], 1);
+    assert_eq!(v["ItemCount"], 3);
+}

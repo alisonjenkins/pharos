@@ -28,6 +28,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // on the home + details pages so the client renders the empty
     // state instead of throwing a Response exception.
     cfg.route("/items", web::get().to(list_items))
+        // /items/counts BEFORE /items/{id} so `Counts` doesn't match
+        // as an item id.
+        .route("/items/counts", web::get().to(items_counts))
         .route("/items/{id}", web::get().to(get_item))
         .route("/users/{user_id}/items", web::get().to(list_user_items))
         .route(
@@ -81,6 +84,69 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
         "TotalRecordCount": 0,
         "StartIndex": 0,
     }))
+}
+
+/// `GET /Items/Counts` — Jellyfin clients render a "library stats"
+/// strip on the home page from this. Returns counts by kind +
+/// aggregate name counts (Artist/Album/Genre) for the music view.
+async fn items_counts(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use std::collections::HashSet;
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut movies = 0u32;
+    let mut episodes = 0u32;
+    let mut audio = 0u32;
+    let mut series: HashSet<&str> = HashSet::new();
+    let mut artists: HashSet<&str> = HashSet::new();
+    let mut albums: HashSet<&str> = HashSet::new();
+    let mut genres: HashSet<&str> = HashSet::new();
+    for i in &all {
+        match i.kind {
+            MediaKind::Movie => movies += 1,
+            MediaKind::Episode => {
+                episodes += 1;
+                if let Some(s) = i.series.as_ref() {
+                    series.insert(s.series_name.as_str());
+                }
+            }
+            MediaKind::Audio => audio += 1,
+        }
+        if let Some(n) = i.probe.artist.as_deref() {
+            artists.insert(n);
+        }
+        if let Some(n) = i.probe.album_artist.as_deref() {
+            artists.insert(n);
+        }
+        if let Some(n) = i.probe.album.as_deref() {
+            albums.insert(n);
+        }
+        if let Some(n) = i.probe.genre.as_deref() {
+            genres.insert(n);
+        }
+    }
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "MovieCount": movies,
+        "SeriesCount": series.len() as u32,
+        "EpisodeCount": episodes,
+        "ArtistCount": artists.len() as u32,
+        "ProgramCount": 0,
+        "TrailerCount": 0,
+        "SongCount": audio,
+        "AlbumCount": albums.len() as u32,
+        "MusicVideoCount": 0,
+        "BoxSetCount": 0,
+        "BookCount": 0,
+        "ItemCount": all.len() as u32,
+        // GenreCount isn't part of jellyfin-web's stats row but
+        // clients sometimes read it; cheap to include.
+        "GenreCount": genres.len() as u32,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
