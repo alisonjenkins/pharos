@@ -1108,3 +1108,113 @@ async fn artists_albums_genres_route_into_filtered_tracks() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["TotalRecordCount"], 2);
 }
+
+#[actix_web::test]
+async fn sort_by_runtime_ticks_orders_by_duration() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, title, dur_ms) in [(1u64, "Long", 30_000u64), (2, "Mid", 10_000), (3, "Short", 3_000)]
+    {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}.mp4").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                probe: pharos_core::MediaProbe {
+                    duration_ms: Some(dur_ms),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?SortBy=RuntimeTicks&SortOrder=Ascending")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Short", "Mid", "Long"]);
+}
+
+#[actix_web::test]
+async fn sort_by_albumartist_groups_tracks() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, title, artist) in [
+        (1u64, "Z song", "Beta"),
+        (2, "A song", "Alpha"),
+        (3, "M song", "Alpha"),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}.mp3").into(),
+                title: title.into(),
+                kind: MediaKind::Audio,
+                probe: pharos_core::MediaProbe {
+                    album_artist: Some(artist.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?SortBy=AlbumArtist&SortOrder=Ascending")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    // Alpha tracks first (A song, M song), then Beta (Z song).
+    assert_eq!(names, vec!["A song", "M song", "Z song"]);
+}

@@ -869,8 +869,66 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
     }
     let sort_by = q.sort_by.as_deref().unwrap_or("SortName");
     let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
-    match sort_by {
+    // Jellyfin's SortBy accepts a comma-separated chain — clients use
+    // it for stable secondary keys (e.g. "AlbumArtist,Album,SortName").
+    // We honour the first token that maps to a known key, then fall
+    // through to SortName so identical-by-primary items stay stable.
+    let primary = sort_by
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("SortName");
+    match primary {
         "Random" => shuffle_in_place(&mut items),
+        "DateCreated" | "DateAdded" => {
+            // No created_at column yet — sort by stable id descending so
+            // the highest hash-id (= last-inserted on a fresh DB) bubbles
+            // up first. Real DateCreated lands when migration 0010 adds
+            // the column. Better than no-op + matches Jellyfin's "newest
+            // first" UX.
+            items.sort_by(|a, b| b.id.cmp(&a.id));
+            if descending {
+                // Already descending — flip when explicit asc requested.
+                items.reverse();
+            }
+        }
+        "RuntimeTicks" | "Runtime" => {
+            items.sort_by(|a, b| {
+                a.probe
+                    .duration_ms
+                    .unwrap_or(0)
+                    .cmp(&b.probe.duration_ms.unwrap_or(0))
+            });
+            if descending {
+                items.reverse();
+            }
+        }
+        "AlbumArtist" => {
+            items.sort_by(|a, b| {
+                let an = a.probe.album_artist.as_deref().unwrap_or("");
+                let bn = b.probe.album_artist.as_deref().unwrap_or("");
+                an.to_ascii_lowercase()
+                    .cmp(&bn.to_ascii_lowercase())
+                    // Tiebreak by title for stable per-artist track order.
+                    .then(a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+            });
+            if descending {
+                items.reverse();
+            }
+        }
+        "Album" => {
+            items.sort_by(|a, b| {
+                let an = a.probe.album.as_deref().unwrap_or("");
+                let bn = b.probe.album.as_deref().unwrap_or("");
+                an.to_ascii_lowercase()
+                    .cmp(&bn.to_ascii_lowercase())
+                    .then(a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+            });
+            if descending {
+                items.reverse();
+            }
+        }
+        // SortName (default) and anything unrecognised.
         _ => {
             items.sort_by(|a, b| {
                 a.title
