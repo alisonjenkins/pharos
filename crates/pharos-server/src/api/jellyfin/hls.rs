@@ -109,7 +109,7 @@ async fn master_playlist(
         "#EXTM3U\n#EXT-X-VERSION:3\n\
          #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"avc1.640028,mp4a.40.2\"{resolution}\n\
          /Videos/{id}/main.m3u8?{}\n",
-        token_qs(&req)
+        playback_qs(&req)
     );
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -127,7 +127,7 @@ async fn variant_playlist(
     let duration = item.duration_seconds;
     let segment_count = (duration / SEGMENT_SECONDS).ceil() as u32;
     let segment_count = segment_count.max(1);
-    let qs = token_qs(&req);
+    let qs = playback_qs(&req);
     let mut body = String::with_capacity(256 + segment_count as usize * 80);
     body.push_str("#EXTM3U\n");
     body.push_str("#EXT-X-VERSION:3\n");
@@ -152,10 +152,18 @@ async fn variant_playlist(
         .body(body))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SegmentQuery {
+    #[serde(default)]
+    play_session_id: Option<String>,
+}
+
 async fn segment(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<(String, u32)>,
+    q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, seg) = path.into_inner();
     let id_num: u64 = id
@@ -170,15 +178,8 @@ async fn segment(
         (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
     let duration_ticks = (SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64;
 
-    let opts = TranscodeOptions {
-        container: Container::Mpegts,
-        video: Some(VideoCodec::H264),
-        audio: Some(AudioCodec::Aac),
-        video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
-        audio_bitrate_bps: Some(128_000),
-        start_position_ticks: start_ticks,
-        duration_ticks: Some(duration_ticks),
-    };
+    let opts = build_segment_opts(&state, q.play_session_id.as_deref(), &item, start_ticks, duration_ticks)
+        .await;
 
     // T42: when an HLS cache is wired, route through it. Otherwise
     // fall back to live transcoding (every request spawns ffmpeg).
@@ -188,7 +189,7 @@ async fn segment(
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
         return Ok(HttpResponse::Ok()
-            .content_type(Container::Mpegts.content_type())
+            .content_type(opts.container.content_type())
             .body(bytes));
     }
 
@@ -198,17 +199,97 @@ async fn segment(
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok(HttpResponse::Ok()
-        .content_type(Container::Mpegts.content_type())
+        .content_type(opts.container.content_type())
         .streaming(stream.into_stream()))
 }
 
-/// Helper: produce `api_key=…` query string from the incoming request
-/// so the embedded segment URLs carry forward the bearer token.
-fn token_qs(req: &HttpRequest) -> String {
-    match extract_token(req) {
-        Some(t) => format!("api_key={t}"),
-        None => String::new(),
+/// Resolve the per-segment `TranscodeOptions` for this request.
+///
+/// When the play session was registered by `playback_info` (the
+/// common path — jellyfin-web POSTs PlaybackInfo before requesting
+/// segments and embeds `PlaySessionId` in every subsequent URL), we
+/// honour the negotiator's `Decision::Transcode` — target container,
+/// video codec, audio codec, and the negotiated max-video-bitrate
+/// cap. Falls back to H264 + AAC + TS with a probe-driven bitrate
+/// cap when the session is missing (jellyfin clients that go
+/// straight at /master.m3u8 without a PlaySessionId — rare but
+/// possible).
+async fn build_segment_opts(
+    state: &AppState,
+    play_session_id: Option<&str>,
+    item: &pharos_core::MediaItem,
+    start_ticks: u64,
+    duration_ticks: u64,
+) -> TranscodeOptions {
+    use crate::api::jellyfin::device_profile::Decision;
+
+    let cached = match play_session_id {
+        Some(id) => state.transcode_sessions.get(id).await.ok().flatten(),
+        None => None,
+    };
+
+    if let Some(session) = cached {
+        if let Decision::Transcode {
+            target_container,
+            target_video_codec,
+            target_audio_codec,
+            max_video_bitrate_bps,
+        } = session.decision
+        {
+            let container = Container::from_name(&target_container).unwrap_or(Container::Mpegts);
+            let video = target_video_codec
+                .as_deref()
+                .and_then(VideoCodec::from_name)
+                .or(Some(VideoCodec::H264));
+            let audio = target_audio_codec
+                .as_deref()
+                .and_then(AudioCodec::from_name)
+                .or(Some(AudioCodec::Aac));
+            return TranscodeOptions {
+                container,
+                video,
+                audio,
+                video_bitrate_bps: Some(
+                    max_video_bitrate_bps
+                        .map(|cap| cap.min(HLS_MAX_BITRATE_BPS))
+                        .unwrap_or_else(|| target_video_bitrate(item.probe.bitrate_bps)),
+                ),
+                audio_bitrate_bps: Some(128_000),
+                start_position_ticks: start_ticks,
+                duration_ticks: Some(duration_ticks),
+            };
+        }
     }
+
+    // Fallback path: no session registered → conservative defaults.
+    TranscodeOptions {
+        container: Container::Mpegts,
+        video: Some(VideoCodec::H264),
+        audio: Some(AudioCodec::Aac),
+        video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
+        audio_bitrate_bps: Some(128_000),
+        start_position_ticks: start_ticks,
+        duration_ticks: Some(duration_ticks),
+    }
+}
+
+/// Produce `api_key=…&PlaySessionId=…` query string from the incoming
+/// request so the embedded segment URLs carry forward the bearer
+/// token *and* the play-session id (segment handler needs both:
+/// auth + the cached transcode `Decision`).
+fn playback_qs(req: &HttpRequest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = extract_token(req) {
+        parts.push(format!("api_key={t}"));
+    }
+    for kv in req.query_string().split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("PlaySessionId") && !v.is_empty() {
+                parts.push(format!("PlaySessionId={v}"));
+            }
+        }
+    }
+    parts.join("&")
 }
 
 #[cfg(test)]
@@ -288,6 +369,7 @@ mod tests {
                 title: "m".into(),
                 kind: MediaKind::Movie,
                 probe,
+                series: None,
             })
             .await
             .unwrap();
