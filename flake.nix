@@ -207,6 +207,69 @@
           };
         };
 
+        # Per-test fixture corpus for `tests/ffmpeg_integration.rs`.
+        # Built once, cached in /nix/store, consumed via the
+        # `PHAROS_TEST_FIXTURES` env var the devShell exports. Keeps
+        # the slow VP9 encodes out of `cargo nextest`.
+        pharosIntegrationFixtures =
+          pkgs.runCommand "pharos-integration-fixtures"
+            { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
+              mkdir -p $out
+              # 1. Base VP9 + Opus (3s, 320x240) — make_video_fixture.
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "testsrc=duration=3:size=320x240:rate=10" \
+                     -f lavfi -i "sine=frequency=440:duration=3" \
+                     -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                     -b:v 200k \
+                     -c:a libopus \
+                     -shortest \
+                     $out/video.webm
+
+              # 2. Opus-only (2s) — make_audio_fixture.
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "sine=frequency=440:duration=2" \
+                     -c:a libopus \
+                     $out/audio.webm
+
+              # 3. VP9 + Opus + embedded WebVTT — make_subtitled_video_fixture.
+              cat > $out/subs.vtt <<VTT
+              WEBVTT
+
+              00:00:00.500 --> 00:00:02.000
+              Hello pharos
+              VTT
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "testsrc=duration=3:size=320x240:rate=10" \
+                     -f lavfi -i "sine=frequency=440:duration=3" \
+                     -i $out/subs.vtt \
+                     -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                     -b:v 200k \
+                     -c:a libopus \
+                     -c:s webvtt \
+                     -map 0:v:0 -map 1:a:0 -map 2:s:0 \
+                     -metadata:s:s:0 language=eng \
+                     -shortest \
+                     $out/subbed.webm
+
+              # 4. MP3 with embedded ID3v2 attached_pic JPEG cover —
+              # make_audio_fixture_with_cover. Two ffmpeg passes: one
+              # for the 64x64 magenta JPEG, one for the mux.
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "color=c=magenta:s=64x64:d=1" \
+                     -frames:v 1 -f image2 \
+                     $out/cover.jpg
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "sine=frequency=440:duration=1" \
+                     -i $out/cover.jpg \
+                     -map 0:a:0 -map 1:v:0 \
+                     -c:a libmp3lame -b:a 64k \
+                     -c:v mjpeg \
+                     -disposition:v:0 attached_pic \
+                     -id3v2_version 3 \
+                     -shortest \
+                     $out/withcover.mp3
+            '';
+
         # Skeleton rootfs: passwd / group / writable /tmp + state
         # directories. Distroless containers usually skip this, but
         # ffmpeg + tokio's getrandom path are happier with a real
@@ -315,6 +378,7 @@
         packages = {
           default = pharos;
           pharos = pharos;
+          integrationFixtures = pharosIntegrationFixtures;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # `oci` + `jellyfinWebOci` + compose only meaningful on
           # linux. On darwin the same attrs resolve under
@@ -385,6 +449,10 @@
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
             export JELLYFIN_WEB_DIR=${pkgs.jellyfin-web}/share/jellyfin-web
+            # Test fixtures for `cargo nextest run -- --ignored
+            # ffmpeg_integration`. Built once in /nix/store, cached
+            # across CI + dev. Tests skip when env unset.
+            export PHAROS_TEST_FIXTURES=${pharosIntegrationFixtures}
           '';
         };
 

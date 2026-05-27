@@ -7,10 +7,11 @@
 //!   nix develop --command cargo nextest run --run-ignored only \
 //!     -p pharos-server --test ffmpeg_integration
 //!
-//! Fixtures are generated on-the-fly from `lavfi testsrc` so there's
-//! nothing checked in. Each test creates a `tempfile::TempDir`,
-//! synthesises a WebM via ffmpeg's testsrc, and tears the dir down at
-//! end of scope.
+//! Fixtures come from the `pharosIntegrationFixtures` nix derivation
+//! (built once, cached in /nix/store, exported as
+//! `PHAROS_TEST_FIXTURES` by the devShell). Tests skip when the env
+//! var isn't set — keeps the suite hermetic against ffmpeg version
+//! drift on the host.
 
 use pharos_core::{MediaKind, Prober};
 use pharos_scanner::FfmpegProber;
@@ -20,9 +21,20 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 
-/// True if both `ffmpeg` and `ffprobe` resolve on PATH. Lets the
-/// tests no-op gracefully on systems without ffmpeg (CI matrix
-/// without nix devShell, for instance).
+/// Path to the static fixture corpus. `None` when running outside
+/// the devShell (or the package hasn't been built) — tests early-skip.
+fn fixtures_dir() -> Option<PathBuf> {
+    std::env::var_os("PHAROS_TEST_FIXTURES").map(PathBuf::from)
+}
+
+fn fixture(name: &str) -> Option<PathBuf> {
+    let dir = fixtures_dir()?;
+    let p = dir.join(name);
+    if p.exists() { Some(p) } else { None }
+}
+
+/// True if ffmpeg resolves on PATH AND the fixture corpus exists.
+/// Tests `early-return` on either missing.
 fn ffmpeg_available() -> bool {
     fn ok(bin: &str) -> bool {
         std::process::Command::new(bin)
@@ -33,68 +45,17 @@ fn ffmpeg_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    ok("ffmpeg") && ok("ffprobe")
+    ok("ffmpeg") && ok("ffprobe") && fixtures_dir().is_some()
 }
 
-/// Synthesise a tiny WebM (VP9 + Opus, 320x240 @ 3s) using lavfi.
-/// Returns the file path.
-async fn make_video_fixture(dir: &Path) -> PathBuf {
-    let out = dir.join("fixture.webm");
-    let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=duration=3:size=320x240:rate=10",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=3",
-            "-c:v",
-            "libvpx-vp9",
-            "-b:v",
-            "200k",
-            "-c:a",
-            "libopus",
-            "-shortest",
-        ])
-        .arg(&out)
-        .status()
-        .await
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg failed to build fixture");
-    out
+/// Static fixture from `pharosIntegrationFixtures`. Resolves to the
+/// /nix/store copy, encoded once at flake-build time.
+fn make_video_fixture(_dir: &Path) -> PathBuf {
+    fixture("video.webm").expect("PHAROS_TEST_FIXTURES/video.webm missing")
 }
 
-/// Synthesise an audio-only Opus-in-WebM fixture for the
-/// audio-prober test.
-async fn make_audio_fixture(dir: &Path) -> PathBuf {
-    let out = dir.join("fixture-audio.webm");
-    let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=2",
-            "-c:a",
-            "libopus",
-        ])
-        .arg(&out)
-        .status()
-        .await
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg failed to build audio fixture");
-    out
+fn make_audio_fixture(_dir: &Path) -> PathBuf {
+    fixture("audio.webm").expect("PHAROS_TEST_FIXTURES/audio.webm missing")
 }
 
 #[tokio::test]
@@ -105,7 +66,7 @@ async fn probe_real_video_classifies_as_movie() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_video_fixture(td.path()).await;
+    let fixture = make_video_fixture(td.path());
     let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
     assert_eq!(probe.kind, MediaKind::Movie);
     // 3 s ±200 ms tolerance — VP9 encoder pads slightly.
@@ -125,7 +86,7 @@ async fn probe_real_audio_classifies_as_audio() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_audio_fixture(td.path()).await;
+    let fixture = make_audio_fixture(td.path());
     let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
     assert_eq!(probe.kind, MediaKind::Audio);
 }
@@ -137,7 +98,7 @@ async fn image_cache_extracts_primary_jpeg_from_real_video() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_video_fixture(td.path()).await;
+    let fixture = make_video_fixture(td.path());
     let cache_dir = td.path().join("cache");
     // Fixture is 3 s — seek to 1 s so ffmpeg can decode a frame.
     let cache = ImageCache::new(&cache_dir).with_seek_seconds(1);
@@ -163,7 +124,7 @@ async fn transcoder_streams_bytes_from_real_video() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_video_fixture(td.path()).await;
+    let fixture = make_video_fixture(td.path());
     let opts = TranscodeOptions {
         container: pharos_transcode::Container::Mkv,
         video: Some(pharos_transcode::VideoCodec::Copy),
@@ -184,66 +145,9 @@ async fn transcoder_streams_bytes_from_real_video() {
     assert_eq!(&buf[..4], &[0x1A, 0x45, 0xDF, 0xA3], "expected EBML magic");
 }
 
-/// Synthesise a WebM with an embedded WebVTT subtitle track so the
-/// extraction endpoint has something to extract from.
-async fn make_subtitled_video_fixture(dir: &Path) -> PathBuf {
-    let vtt = dir.join("subs.vtt");
-    tokio::fs::write(
-        &vtt,
-        "WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nHello pharos\n",
-    )
-    .await
-    .unwrap();
-    let out = dir.join("subbed.webm");
-    let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=duration=3:size=320x240:rate=10",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=3",
-            "-i",
-        ])
-        .arg(&vtt)
-        .args([
-            "-c:v",
-            "libvpx-vp9",
-            "-deadline",
-            "realtime",
-            "-cpu-used",
-            "8",
-            "-row-mt",
-            "1",
-            "-b:v",
-            "200k",
-            "-c:a",
-            "libopus",
-            "-c:s",
-            "webvtt",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-map",
-            "2:s:0",
-            "-metadata:s:s:0",
-            "language=eng",
-            "-shortest",
-        ])
-        .arg(&out)
-        .status()
-        .await
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg failed to build subtitled fixture");
-    out
+/// Static `subbed.webm` from the nix fixtures derivation.
+fn make_subtitled_video_fixture(_dir: &Path) -> PathBuf {
+    fixture("subbed.webm").expect("PHAROS_TEST_FIXTURES/subbed.webm missing")
 }
 
 #[tokio::test]
@@ -253,7 +157,7 @@ async fn probe_subtitle_tracks_extracts_embedded_webvtt() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_subtitled_video_fixture(td.path()).await;
+    let fixture = make_subtitled_video_fixture(td.path());
     let probe = FfmpegProber::new().probe(&fixture).await.unwrap();
     assert!(
         !probe.probe.subtitle_tracks.is_empty(),
@@ -272,7 +176,7 @@ async fn ffmpeg_extracts_webvtt_from_embedded_stream() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_subtitled_video_fixture(td.path()).await;
+    let fixture = make_subtitled_video_fixture(td.path());
     // Drive the same shell-out the subtitles handler does, asserting
     // the stdout starts with `WEBVTT`.
     let out = tokio::process::Command::new("ffmpeg")
@@ -299,65 +203,10 @@ async fn ffmpeg_extracts_webvtt_from_embedded_stream() {
     assert!(body.contains("Hello pharos"), "cue line missing: {body}");
 }
 
-/// Build an MP3 with an embedded cover image (`attached_pic`) via
-/// `ffmpeg -attach`. The ImageCache audio path uses `-map 0:v?`
-/// which picks up the attached picture stream.
-async fn make_audio_fixture_with_cover(dir: &Path) -> PathBuf {
-    // Generate a 1×1 magenta JPEG via ffmpeg lavfi so the test stays
-    // hermetic (no checked-in binary fixture).
-    let cover = dir.join("cover.jpg");
-    let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=magenta:s=64x64:d=1",
-            "-frames:v",
-            "1",
-            "-f",
-            "image2",
-        ])
-        .arg(&cover)
-        .status()
-        .await
-        .expect("spawn ffmpeg cover");
-    assert!(status.success(), "ffmpeg failed to build cover.jpg");
-
-    let out = dir.join("withcover.mp3");
-    let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=1",
-            "-i",
-        ])
-        .arg(&cover)
-        .args([
-            "-map", "0:a:0", "-map", "1:v:0",
-            "-c:a", "libmp3lame", "-b:a", "64k",
-            "-c:v", "mjpeg",
-            // ID3v2 attached_pic disposition for embedded cover art.
-            "-disposition:v:0", "attached_pic",
-            "-id3v2_version", "3",
-            "-shortest",
-        ])
-        .arg(&out)
-        .status()
-        .await
-        .expect("spawn ffmpeg cover-mp3");
-    assert!(status.success(), "ffmpeg failed to build covered mp3");
-    out
+/// Static `withcover.mp3` from the nix fixtures derivation. MP3 with
+/// an ID3v2 attached_pic JPEG; the ImageCache audio path picks it up.
+fn make_audio_fixture_with_cover(_dir: &Path) -> PathBuf {
+    fixture("withcover.mp3").expect("PHAROS_TEST_FIXTURES/withcover.mp3 missing")
 }
 
 #[tokio::test]
@@ -367,7 +216,7 @@ async fn image_cache_extracts_audio_cover_art() {
         return;
     }
     let td = TempDir::new().unwrap();
-    let fixture = make_audio_fixture_with_cover(td.path()).await;
+    let fixture = make_audio_fixture_with_cover(td.path());
     let cache_dir = td.path().join("cache");
     let cache = ImageCache::new(&cache_dir);
     let p = cache
