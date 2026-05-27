@@ -64,15 +64,15 @@ pub struct UserDto {
     pub primary_image_aspect_ratio: f32,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct UserConfigurationDto {
-    pub audio_language_preference: &'static str,
+    pub audio_language_preference: String,
     pub play_default_audio_track: bool,
-    pub subtitle_language_preference: &'static str,
+    pub subtitle_language_preference: String,
     pub display_missing_episodes: bool,
     pub grouped_folders: Vec<String>,
-    pub subtitle_mode: &'static str,
+    pub subtitle_mode: String,
     pub display_collections_view: bool,
     pub enable_local_password: bool,
     pub ordered_views: Vec<String>,
@@ -82,18 +82,18 @@ pub struct UserConfigurationDto {
     pub remember_audio_selections: bool,
     pub remember_subtitle_selections: bool,
     pub enable_next_episode_auto_play: bool,
-    pub cast_receiver_id: &'static str,
+    pub cast_receiver_id: String,
 }
 
 impl Default for UserConfigurationDto {
     fn default() -> Self {
         Self {
-            audio_language_preference: "",
+            audio_language_preference: String::new(),
             play_default_audio_track: true,
-            subtitle_language_preference: "",
+            subtitle_language_preference: String::new(),
             display_missing_episodes: false,
             grouped_folders: vec![],
-            subtitle_mode: "Default",
+            subtitle_mode: "Default".into(),
             display_collections_view: false,
             enable_local_password: false,
             ordered_views: vec![],
@@ -103,7 +103,7 @@ impl Default for UserConfigurationDto {
             remember_audio_selections: true,
             remember_subtitle_selections: true,
             enable_next_episode_auto_play: true,
-            cast_receiver_id: "F007D354",
+            cast_receiver_id: "F007D354".into(),
         }
     }
 }
@@ -202,6 +202,21 @@ pub struct BaseItemDto {
     pub external_urls: Vec<serde_json::Value>,
     pub image_tags: serde_json::Map<String, serde_json::Value>,
     pub backdrop_image_tags: Vec<String>,
+    // Series-hierarchy fields populated when this item is an Episode.
+    // jellyfin-web's Shows view reads them to render the Series ▸
+    // Season ▸ Episode breadcrumb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_index_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_number: Option<u32>,
     pub screenshot_image_tags: Vec<String>,
 }
 
@@ -277,6 +292,22 @@ pub struct MediaStreamDto {
     pub real_frame_rate: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub average_frame_rate: Option<f32>,
+    /// ISO-639 language tag on Audio + Subtitle tracks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Human-readable title on Subtitle tracks (e.g. "English [SDH]").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Subtitle-only: jellyfin-web uses `IsExternal` to flag sidecar
+    /// vs embedded tracks in the picker UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_external: Option<bool>,
+    /// Subtitle-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_forced: Option<bool>,
+    /// Jellyfin's URL the player fetches the rendered .vtt from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_url: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -477,7 +508,46 @@ impl BaseItemDto {
             image_tags: serde_json::Map::new(),
             backdrop_image_tags: vec![],
             screenshot_image_tags: vec![],
+            series_name: item.series.as_ref().map(|s| s.series_name.clone()),
+            series_id: item
+                .series
+                .as_ref()
+                .map(|s| series_id_for(&s.series_name)),
+            season_id: item.series.as_ref().and_then(|s| {
+                s.season_number
+                    .map(|n| season_id_for(&s.series_name, n))
+            }),
+            season_name: item
+                .series
+                .as_ref()
+                .and_then(|s| s.season_number.map(season_display_name)),
+            parent_index_number: item.series.as_ref().and_then(|s| s.season_number),
+            index_number: item.series.as_ref().and_then(|s| s.episode_number),
         }
+    }
+}
+
+/// Stable 32-hex id for the synthesised Series item.
+pub fn series_id_for(name: &str) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let h = xxh3_64(format!("series:{name}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+    format!("{h:016x}{h:016x}")
+}
+
+/// Stable 32-hex id for the synthesised Season item.
+pub fn season_id_for(series_name: &str, season_number: u32) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let h = xxh3_64(format!("season:{series_name}:{season_number}").as_bytes())
+        & 0x7FFFFFFFFFFFFFFF;
+    format!("{h:016x}{h:016x}")
+}
+
+/// Human-readable season name. "Specials" for 0, "Season N" otherwise.
+pub fn season_display_name(n: u32) -> String {
+    if n == 0 {
+        "Specials".into()
+    } else {
+        format!("Season {n}")
     }
 }
 
@@ -528,9 +598,35 @@ pub(crate) fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> 
     }
 }
 
+/// Per-item subtitle source. `item_id` is the MediaItem the stream
+/// belongs to. `delivery_url` carries the URL the client fetches the
+/// rendered .vtt from — built per call so callers can override the
+/// host prefix (PlaybackInfo + Items use a relative URL).
+pub struct SubtitleStreamCtx {
+    pub item_id: pharos_core::MediaId,
+    pub sidecar_count: u32,
+}
+
+impl SubtitleStreamCtx {
+    pub fn new(item_id: pharos_core::MediaId) -> Self {
+        Self {
+            item_id,
+            sidecar_count: 0,
+        }
+    }
+}
+
 pub(crate) fn build_media_streams(
     probe: &pharos_core::MediaProbe,
     is_video: bool,
+) -> Vec<MediaStreamDto> {
+    build_media_streams_with_subtitles(probe, is_video, None)
+}
+
+pub(crate) fn build_media_streams_with_subtitles(
+    probe: &pharos_core::MediaProbe,
+    is_video: bool,
+    subtitle_ctx: Option<&SubtitleStreamCtx>,
 ) -> Vec<MediaStreamDto> {
     let mut streams = Vec::with_capacity(if is_video { 2 } else { 1 });
     if is_video {
@@ -552,6 +648,11 @@ pub(crate) fn build_media_streams(
             aspect_ratio,
             real_frame_rate: fps,
             average_frame_rate: fps,
+            language: None,
+            title: None,
+            is_external: None,
+            is_forced: None,
+            delivery_url: None,
         });
         // Only advertise an audio stream when probe actually found one.
         // Some test fixtures (the BBB WebM corpus) are video-only;
@@ -572,7 +673,67 @@ pub(crate) fn build_media_streams(
                 aspect_ratio: None,
                 real_frame_rate: None,
                 average_frame_rate: None,
+                language: None,
+                title: None,
+                is_external: None,
+                is_forced: None,
+                delivery_url: None,
             });
+        }
+        // Subtitle tracks — embedded first, then sidecars.
+        if let Some(ctx) = subtitle_ctx {
+            for t in &probe.subtitle_tracks {
+                let title = t.title.clone().or_else(|| t.language.clone());
+                streams.push(MediaStreamDto {
+                    kind: "Subtitle",
+                    index: t.stream_index,
+                    codec: t.codec.clone(),
+                    is_default: t.is_default,
+                    width: None,
+                    height: None,
+                    channels: None,
+                    sample_rate: None,
+                    bit_rate: None,
+                    aspect_ratio: None,
+                    real_frame_rate: None,
+                    average_frame_rate: None,
+                    language: t.language.clone(),
+                    title,
+                    is_external: Some(false),
+                    is_forced: Some(t.is_forced),
+                    delivery_url: Some(format!(
+                        "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
+                        id = ctx.item_id,
+                        idx = t.stream_index,
+                    )),
+                });
+            }
+            // Sidecars: stream_index = SIDECAR_BASE + offset.
+            for offset in 0..ctx.sidecar_count {
+                let idx = crate::api::jellyfin::subtitles::SIDECAR_BASE_INDEX + offset;
+                streams.push(MediaStreamDto {
+                    kind: "Subtitle",
+                    index: idx,
+                    codec: Some("webvtt".into()),
+                    is_default: false,
+                    width: None,
+                    height: None,
+                    channels: None,
+                    sample_rate: None,
+                    bit_rate: None,
+                    aspect_ratio: None,
+                    real_frame_rate: None,
+                    average_frame_rate: None,
+                    language: None,
+                    title: Some(format!("External {}", offset + 1)),
+                    is_external: Some(true),
+                    is_forced: Some(false),
+                    delivery_url: Some(format!(
+                        "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
+                        id = ctx.item_id,
+                    )),
+                });
+            }
         }
     } else {
         streams.push(MediaStreamDto {
@@ -588,6 +749,11 @@ pub(crate) fn build_media_streams(
             aspect_ratio: None,
             real_frame_rate: None,
             average_frame_rate: None,
+            language: None,
+            title: None,
+            is_external: None,
+            is_forced: None,
+            delivery_url: None,
         });
     }
     streams

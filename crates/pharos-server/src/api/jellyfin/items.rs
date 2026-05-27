@@ -10,9 +10,10 @@ use crate::{
         auth_extractor::AuthUser,
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{
-            build_media_streams, container_for, BaseItemDto, ItemsResultDto, VirtualFolderInfoDto,
-            VirtualFolderOptionsDto,
+            build_media_streams_with_subtitles, container_for, BaseItemDto, ItemsResultDto,
+            SubtitleStreamCtx, VirtualFolderInfoDto, VirtualFolderOptionsDto,
         },
+        subtitles::discover_sidecars,
     },
     state::AppState,
 };
@@ -120,12 +121,40 @@ async fn playback_info(
         || matches!(decision, Decision::AudioRemux { .. });
     let transcoding_url = match &decision {
         Decision::Transcode { target_container, .. } if target_container == "ts" => {
-            Some(format!("/videos/{id_str}/master.m3u8"))
+            // PlaySessionId rides on the URL so the HLS handlers can
+            // look up the cached Decision (T-fix-2 part 2) instead of
+            // re-running the negotiator per segment.
+            Some(format!(
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
+            ))
         }
         _ => None,
     };
 
-    let streams = build_media_streams(probe, is_video);
+    // Register the negotiated Decision so HLS segment generation
+    // honours the target codec / container / bitrate cap. Only
+    // matters when we actually emitted a TranscodingUrl; direct play
+    // skips this so the cache doesn't bloat with no-op entries.
+    if transcoding_url.is_some() {
+        let _ = state
+            .transcode_sessions
+            .insert(
+                play_session_id.clone(),
+                crate::transcode_sessions::TranscodeSession {
+                    media_id: id,
+                    decision: decision.clone(),
+                    source_probe: probe.clone(),
+                },
+            )
+            .await;
+    }
+
+    let sidecars = discover_sidecars(&item.path).await;
+    let ctx = SubtitleStreamCtx {
+        item_id: item.id,
+        sidecar_count: sidecars.len() as u32,
+    };
+    let streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
     // Find the audio stream's actual index (or skip if there isn't one).
     // Hard-coding `1` for silent-video files made jellyfin-web's player
     // try to select a track that doesn't exist.
@@ -385,34 +414,65 @@ async fn list_user_items(
     Ok(HttpResponse::Ok().json(dto))
 }
 
-/// Drop items that don't live under the configured root mapped to
-/// `parent_id`. Unknown `parent_id` → empty list (client asked for a
-/// library that doesn't exist). The All-Media placeholder + `None`
-/// pass everything through unchanged.
+/// Drop items that don't live under the configured root / series /
+/// season mapped to `parent_id`. Unknown `parent_id` → empty list.
+/// The All-Media placeholder + `None` pass everything through.
 fn restrict_to_parent(
     state: &AppState,
     items: Vec<MediaItem>,
     parent_id: Option<&str>,
 ) -> Vec<MediaItem> {
+    use crate::api::jellyfin::dto::{season_id_for, series_id_for};
     let Some(pid) = parent_id else {
         return items;
     };
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return items;
     }
-    let Some(root) = state
+    // 1) Library / root match (per-root collections).
+    if let Some(root) = state
         .media_roots
         .iter()
         .find(|r| library_id_for_root(r) == pid)
-    else {
-        // Unknown id — render an empty library rather than the whole
-        // store; matches Jellyfin's "library with no items" surface.
-        return Vec::new();
-    };
-    items
-        .into_iter()
-        .filter(|i| i.path.starts_with(root))
-        .collect()
+    {
+        return items
+            .into_iter()
+            .filter(|i| i.path.starts_with(root))
+            .collect();
+    }
+    // 2) Series id → every episode whose series_name hashes to pid.
+    if items
+        .iter()
+        .any(|i| i.series.as_ref().is_some_and(|s| series_id_for(&s.series_name) == pid))
+    {
+        return items
+            .into_iter()
+            .filter(|i| {
+                i.series
+                    .as_ref()
+                    .is_some_and(|s| series_id_for(&s.series_name) == pid)
+            })
+            .collect();
+    }
+    // 3) Season id → every episode in that (series, season) pair.
+    if items.iter().any(|i| {
+        i.series.as_ref().is_some_and(|s| {
+            s.season_number
+                .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
+        })
+    }) {
+        return items
+            .into_iter()
+            .filter(|i| {
+                i.series.as_ref().is_some_and(|s| {
+                    s.season_number
+                        .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
+                })
+            })
+            .collect();
+    }
+    // Unknown id — render an empty library.
+    Vec::new()
 }
 
 fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
@@ -507,16 +567,18 @@ async fn fetch_item_dto(
     // T-fix-7 follow-up: when the id is one of the synthesised
     // library CollectionFolder ids (32-hex, derived from
     // [media].roots), short-circuit with a CollectionFolder DTO.
-    // jellyfin-web GETs /Items/{libraryId} after clicking into a
-    // library; without this branch the id fails u64::parse → 400 →
-    // the library view hangs (caught via HAR: "all media hang").
     if let Some(view) = library_view_for_id(state, id_str) {
         return Ok(HttpResponse::Ok().json(view));
     }
-    // The All-Media placeholder id used when no [media].roots are
-    // configured (still 32 hex chars; never resolves to a real item).
     if id_str == "00000000000000000000000000000000" {
         return Ok(HttpResponse::Ok().json(all_media_placeholder(&state.server_id)));
+    }
+    // T-fix-18: synth Series + Season DTOs derived from any Episode
+    // item whose series_id / season_id matches. Each requires one
+    // store.list() — fine at phase-1 scale; once libraries grow
+    // a series_index lands.
+    if let Some(view) = synth_series_or_season(state, id_str).await? {
+        return Ok(HttpResponse::Ok().json(view));
     }
     let id: u64 = id_str
         .parse()
@@ -543,6 +605,91 @@ fn library_view_for_id(state: &AppState, id_str: &str) -> Option<serde_json::Val
     library_views(state)
         .into_iter()
         .find(|v| v.get("Id").and_then(|i| i.as_str()) == Some(id_str))
+}
+
+/// Look up `id_str` against the synthesised Series + Season ids
+/// derived from every Episode in the store. Returns a Jellyfin-shaped
+/// Series / Season BaseItem DTO when matched. `None` otherwise.
+async fn synth_series_or_season(
+    state: &AppState,
+    id_str: &str,
+) -> Result<Option<serde_json::Value>, actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_display_name, season_id_for, series_id_for};
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // First: series match.
+    for item in all.iter() {
+        let Some(series) = item.series.as_ref() else {
+            continue;
+        };
+        if series_id_for(&series.series_name) == id_str {
+            return Ok(Some(series_dto(&state.server_id, &series.series_name)));
+        }
+    }
+    // Then: season match. We need (series_name, season_number) so
+    // walk every Episode again.
+    for item in all.iter() {
+        let Some(series) = item.series.as_ref() else {
+            continue;
+        };
+        let Some(season_n) = series.season_number else {
+            continue;
+        };
+        if season_id_for(&series.series_name, season_n) == id_str {
+            return Ok(Some(season_dto(
+                &state.server_id,
+                &series.series_name,
+                season_n,
+                &season_display_name(season_n),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn series_dto(server_id: &str, series_name: &str) -> serde_json::Value {
+    use crate::api::jellyfin::dto::series_id_for;
+    serde_json::json!({
+        "Id": series_id_for(series_name),
+        "Name": series_name,
+        "ServerId": server_id,
+        "Type": "Series",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "CanPlay": false,
+        "UserData": { "Played": false, "PlayCount": 0 },
+        // Empty array fields jellyfin-web spreads over.
+        "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
+        "ProductionLocations": [], "RemoteTrailers": [], "Chapters": [],
+        "ImageTags": {}, "BackdropImageTags": [], "ProviderIds": {},
+    })
+}
+
+fn season_dto(
+    server_id: &str,
+    series_name: &str,
+    season_number: u32,
+    season_name: &str,
+) -> serde_json::Value {
+    use crate::api::jellyfin::dto::{season_id_for, series_id_for};
+    serde_json::json!({
+        "Id": season_id_for(series_name, season_number),
+        "Name": season_name,
+        "ServerId": server_id,
+        "Type": "Season",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "CanPlay": false,
+        "SeriesName": series_name,
+        "SeriesId": series_id_for(series_name),
+        "IndexNumber": season_number,
+        "UserData": { "Played": false, "PlayCount": 0 },
+        "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
+        "ImageTags": {}, "BackdropImageTags": [], "ProviderIds": {},
+    })
 }
 
 async fn list_user_items_resume(

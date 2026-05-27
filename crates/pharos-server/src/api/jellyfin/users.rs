@@ -6,7 +6,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error::ErrorUnauthorized, web, HttpRequest, HttpResponse, Responder};
-use pharos_core::{AuthBackend, AuthError, SecretString, TokenStore};
+use pharos_core::{AuthBackend, AuthError, PreferenceStore, SecretString, TokenStore};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -106,7 +106,7 @@ async fn authenticate_by_name(
 }
 
 async fn me(state: web::Data<AppState>, user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(UserDto::from_domain(&user.0, &state.server_id))
+    HttpResponse::Ok().json(user_dto_with_config(&state, &user.0).await)
 }
 
 async fn user_by_id(
@@ -119,6 +119,21 @@ async fn user_by_id(
     if requested != bearer_id {
         return Err(actix_web::error::ErrorForbidden("user mismatch"));
     }
-    Ok(HttpResponse::Ok().json(UserDto::from_domain(&user.0, &state.server_id)))
+    Ok(HttpResponse::Ok().json(user_dto_with_config(&state, &user.0).await))
+}
+
+/// Build a `UserDto` overriding the default `Configuration` block
+/// with whatever the user last POSTed to `/Users/{u}/Configuration`.
+async fn user_dto_with_config(
+    state: &AppState,
+    user: &pharos_core::User,
+) -> UserDto {
+    let mut dto = UserDto::from_domain(user, &state.server_id);
+    if let Ok(Some(json)) = state.stores.get_user_configuration(user.id).await {
+        if let Ok(cfg) = serde_json::from_str(&json) {
+            dto.configuration = cfg;
+        }
+    }
+    dto
 }
 
