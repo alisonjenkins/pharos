@@ -35,11 +35,23 @@ pub struct SystemInfoDto {
     pub system_architecture: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AuthenticateByNameRequest {
     pub username: String,
     pub pw: String,
+}
+
+// V8: manual `Debug` so an accidental `tracing::debug!(?body)` or
+// `error!(?body)` never logs the cleartext password. The username is
+// still visible — it isn't secret on its own.
+impl std::fmt::Debug for AuthenticateByNameRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticateByNameRequest")
+            .field("username", &self.username)
+            .field("pw", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]

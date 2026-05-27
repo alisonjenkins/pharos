@@ -78,12 +78,22 @@ async fn list_users(
     Ok(HttpResponse::Ok().json(dtos))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct CreateUserBody {
     name: String,
     #[serde(default)]
     password: Option<String>,
+}
+
+// V8: redact the password field in Debug output.
+impl std::fmt::Debug for CreateUserBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateUserBody")
+            .field("name", &self.name)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 async fn create_user(
@@ -154,7 +164,7 @@ async fn set_user_policy(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct SetPasswordBody {
     #[serde(default)]
@@ -165,6 +175,17 @@ struct SetPasswordBody {
     current_pw: String,
     #[serde(default)]
     reset_password: bool,
+}
+
+// V8: redact both password fields. Reset flag is fine to show.
+impl std::fmt::Debug for SetPasswordBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetPasswordBody")
+            .field("new_pw", &"<redacted>")
+            .field("current_pw", &"<redacted>")
+            .field("reset_password", &self.reset_password)
+            .finish()
+    }
 }
 
 async fn set_user_password(
