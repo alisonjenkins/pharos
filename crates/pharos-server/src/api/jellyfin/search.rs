@@ -42,7 +42,7 @@ fn default_limit() -> u32 {
     25
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct SearchHint {
     item_id: String,
@@ -71,6 +71,9 @@ async fn search_hints(
     _user: AuthUser,
     q: web::Query<SearchQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::{album_id_for, artist_id_for, genre_id_for};
+    use std::collections::HashSet;
+
     let needle = q
         .search_term
         .as_deref()
@@ -78,6 +81,18 @@ async fn search_hints(
         .trim()
         .to_ascii_lowercase();
     let kinds = parse_include_item_types(q.include_item_types.as_deref());
+    let include_aggregates = q
+        .include_item_types
+        .as_deref()
+        .map(|s| {
+            s.split(',').any(|t| {
+                let t = t.trim();
+                t.eq_ignore_ascii_case("MusicArtist")
+                    || t.eq_ignore_ascii_case("MusicAlbum")
+                    || t.eq_ignore_ascii_case("Genre")
+            })
+        })
+        .unwrap_or(true);
 
     let all = state
         .stores
@@ -85,24 +100,15 @@ async fn search_hints(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
 
-    let filtered: Vec<MediaItem> = all
-        .into_iter()
+    let mut hints: Vec<SearchHint> = Vec::new();
+    // 1. Title matches on real items.
+    let filtered: Vec<&MediaItem> = all
+        .iter()
         .filter(|i| kinds.as_ref().map_or(true, |k| k.contains(&i.kind)))
         .filter(|i| needle.is_empty() || i.title.to_ascii_lowercase().contains(&needle))
         .collect();
-
-    let total = filtered.len() as u32;
-    let start = q.start_index as usize;
-    let end = (start + q.limit as usize).min(filtered.len());
-    let page = if start >= filtered.len() {
-        &[][..]
-    } else {
-        &filtered[start..end]
-    };
-
-    let hints: Vec<SearchHint> = page
-        .iter()
-        .map(|i| SearchHint {
+    for i in &filtered {
+        hints.push(SearchHint {
             item_id: i.id.to_string(),
             id: i.id.to_string(),
             name: i.title.clone(),
@@ -111,11 +117,76 @@ async fn search_hints(
             run_time_ticks: i.probe.run_time_ticks(),
             matched_term: q.search_term.clone().unwrap_or_default(),
             is_folder: false,
-        })
-        .collect();
+        });
+    }
+
+    // 2. Aggregate name matches (Artist / Album / Genre) — emitted
+    // as synthetic IsFolder hints jellyfin-web routes to /Items?
+    // ParentId={id}. Skipped when IncludeItemTypes explicitly omits
+    // all three of MusicArtist / MusicAlbum / Genre.
+    if include_aggregates && !needle.is_empty() {
+        let mut seen_artist: HashSet<String> = HashSet::new();
+        let mut seen_album: HashSet<String> = HashSet::new();
+        let mut seen_genre: HashSet<String> = HashSet::new();
+        for i in &all {
+            for src in [i.probe.artist.as_deref(), i.probe.album_artist.as_deref()] {
+                if let Some(n) = src {
+                    if n.to_ascii_lowercase().contains(&needle) && seen_artist.insert(n.into()) {
+                        hints.push(SearchHint {
+                            item_id: artist_id_for(n),
+                            id: artist_id_for(n),
+                            name: n.to_string(),
+                            kind: "MusicArtist",
+                            media_type: "Unknown",
+                            run_time_ticks: None,
+                            matched_term: q.search_term.clone().unwrap_or_default(),
+                            is_folder: true,
+                        });
+                    }
+                }
+            }
+            if let Some(n) = i.probe.album.as_deref() {
+                if n.to_ascii_lowercase().contains(&needle) && seen_album.insert(n.into()) {
+                    hints.push(SearchHint {
+                        item_id: album_id_for(n),
+                        id: album_id_for(n),
+                        name: n.to_string(),
+                        kind: "MusicAlbum",
+                        media_type: "Unknown",
+                        run_time_ticks: None,
+                        matched_term: q.search_term.clone().unwrap_or_default(),
+                        is_folder: true,
+                    });
+                }
+            }
+            if let Some(n) = i.probe.genre.as_deref() {
+                if n.to_ascii_lowercase().contains(&needle) && seen_genre.insert(n.into()) {
+                    hints.push(SearchHint {
+                        item_id: genre_id_for(n),
+                        id: genre_id_for(n),
+                        name: n.to_string(),
+                        kind: "Genre",
+                        media_type: "Unknown",
+                        run_time_ticks: None,
+                        matched_term: q.search_term.clone().unwrap_or_default(),
+                        is_folder: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let total = hints.len() as u32;
+    let start = q.start_index as usize;
+    let end = (start + q.limit as usize).min(hints.len());
+    let page: Vec<SearchHint> = if start >= hints.len() {
+        vec![]
+    } else {
+        hints[start..end].to_vec()
+    };
 
     Ok(HttpResponse::Ok().json(SearchHintsResult {
-        search_hints: hints,
+        search_hints: page,
         total_record_count: total,
     }))
 }
