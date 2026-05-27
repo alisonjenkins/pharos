@@ -191,18 +191,18 @@ async fn search_hints(
     }))
 }
 
-async fn search_suggestions(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0,
-    }))
+async fn search_suggestions(
+    state: web::Data<crate::state::AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    Ok(HttpResponse::Ok().json(build_suggestions(&state, user.0.id, 12).await?))
 }
 
 /// `/Users/{user_id}/Suggestions` — jellyfin-web fetches this on the
 /// search page to show "What other people are watching" -style tiles.
-/// Empty list keeps the page rendering without a Response throw.
+/// Bearer-matches-path check applies (V9).
 async fn user_suggestions(
+    state: web::Data<crate::state::AppState>,
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -210,11 +210,86 @@ async fn user_suggestions(
     if path.into_inner() != bearer {
         return Err(error::ErrorForbidden("user mismatch"));
     }
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
+    Ok(HttpResponse::Ok().json(build_suggestions(&state, user.0.id, 12).await?))
+}
+
+/// Build a random-sample suggestion result balanced across kinds.
+/// Picks up to `limit/kinds` items per kind, shuffles, returns the
+/// flattened envelope jellyfin-web expects.
+async fn build_suggestions(
+    state: &crate::state::AppState,
+    user_id: pharos_core::UserId,
+    limit: usize,
+) -> Result<serde_json::Value, actix_web::Error> {
+    use crate::api::jellyfin::dto::BaseItemDto;
+    use pharos_core::{MediaStore, UserDataStore};
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user_id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // Bucket by kind. Drop already-played items so the suggestions
+    // surface things the user hasn't watched yet.
+    let mut by_kind: std::collections::HashMap<MediaKind, Vec<(usize, &pharos_core::MediaItem)>> =
+        std::collections::HashMap::new();
+    for (idx, item) in all.iter().enumerate() {
+        let ud = user_data.get(idx).copied().unwrap_or_default();
+        if ud.played {
+            continue;
+        }
+        by_kind.entry(item.kind).or_default().push((idx, item));
+    }
+    let per_kind = (limit / 3).max(1); // 3 kinds: Movie / Episode / Audio
+    let mut picks: Vec<(usize, &pharos_core::MediaItem)> = Vec::new();
+    let mut seed = pseudo_seed();
+    for items in by_kind.values_mut() {
+        // Cheap xorshift shuffle in place — deterministic enough for
+        // suggestions, no rand dep needed.
+        xorshift_shuffle(items, &mut seed);
+        for entry in items.iter().take(per_kind) {
+            picks.push(*entry);
+        }
+    }
+    // One more pass to mix kinds in the final list.
+    xorshift_shuffle(&mut picks, &mut seed);
+    picks.truncate(limit);
+    let dtos: Vec<BaseItemDto> = picks
+        .iter()
+        .map(|(idx, item)| {
+            let ud = user_data.get(*idx).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        })
+        .collect();
+    let total = dtos.len() as u32;
+    Ok(serde_json::json!({
+        "Items": dtos,
+        "TotalRecordCount": total,
         "StartIndex": 0,
-    })))
+    }))
+}
+
+fn pseudo_seed() -> u64 {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        buf = [1, 2, 3, 4, 5, 6, 7, 8];
+    }
+    u64::from_le_bytes(buf) | 1
+}
+
+fn xorshift_shuffle<T>(items: &mut [T], state: &mut u64) {
+    for i in (1..items.len()).rev() {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        let j = (*state as usize) % (i + 1);
+        items.swap(i, j);
+    }
 }
 
 fn parse_include_item_types(s: Option<&str>) -> Option<Vec<MediaKind>> {

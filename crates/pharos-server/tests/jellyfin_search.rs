@@ -146,7 +146,7 @@ async fn search_hints_pagination() {
 }
 
 #[actix_web::test]
-async fn search_suggestions_returns_empty_items_result() {
+async fn search_suggestions_returns_envelope_shape() {
     let (state, token, _u) = seed().await;
     let app = test::init_service(build_app(state)).await;
     let req = test::TestRequest::get()
@@ -155,8 +155,14 @@ async fn search_suggestions_returns_empty_items_result() {
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["TotalRecordCount"], 0);
-    assert!(v["Items"].as_array().unwrap().is_empty());
+    // Real impl since T-fix-41 — surfaces random unwatched items.
+    // Shape stays the same: Items array + TotalRecordCount + StartIndex.
+    assert!(v["Items"].is_array());
+    assert_eq!(v["StartIndex"], 0);
+    assert_eq!(
+        v["TotalRecordCount"].as_u64().unwrap() as usize,
+        v["Items"].as_array().unwrap().len()
+    );
 }
 
 #[actix_web::test]
