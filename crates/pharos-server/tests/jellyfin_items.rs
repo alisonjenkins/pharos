@@ -1005,3 +1005,106 @@ async fn genres_endpoint_aggregates_distinct_genre_tags() {
         assert_eq!(it["IsFolder"], true);
     }
 }
+
+#[actix_web::test]
+async fn artists_albums_genres_route_into_filtered_tracks() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, artist, album, genre) in [
+        (1u64, "Kevin MacLeod", "Carefree", "Royalty Free"),
+        (2, "Kevin MacLeod", "Carefree", "Royalty Free"),
+        (3, "Kevin MacLeod", "Other", "Royalty Free"),
+        (4, "Other Artist", "Stuff", "Rock"),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}.mp3").into(),
+                title: format!("Track {id}"),
+                kind: MediaKind::Audio,
+                probe: pharos_core::MediaProbe {
+                    artist: Some(artist.into()),
+                    album_artist: Some(artist.into()),
+                    album: Some(album.into()),
+                    genre: Some(genre.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+
+    // /Artists yields 2 distinct artists.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Artists")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 2);
+    // Pluck Kevin MacLeod's id, scope /Items by it.
+    let km = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Name"] == "Kevin MacLeod")
+        .unwrap();
+    let km_id = km["Id"].as_str().unwrap();
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Items?ParentId={km_id}"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 3, "{v:?}");
+
+    // /Albums yields 3 distinct albums.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Albums")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 3);
+    let carefree = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Name"] == "Carefree")
+        .unwrap();
+    let carefree_id = carefree["Id"].as_str().unwrap();
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Items?ParentId={carefree_id}"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 2);
+}

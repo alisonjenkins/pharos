@@ -64,7 +64,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // /Genres + /Studios aggregate over MediaItem.{genre, album_artist}
     // tags. Replace stub when those columns ship — T-fix-31.
     cfg.route("/genres", web::get().to(list_genres))
-        .route("/studios", web::get().to(list_studios));
+        .route("/studios", web::get().to(list_studios))
+        // /Artists + /Albums power jellyfin-web's music navigation.
+        .route("/artists", web::get().to(list_artists))
+        .route("/artists/albumartists", web::get().to(list_artists))
+        .route("/albums", web::get().to(list_albums));
     // /Shows/NextUp has a real impl now that episode hierarchy
     // exists. Keep it after the empty-stub loop so the route is
     // registered with our handler.
@@ -112,6 +116,124 @@ async fn list_genres(
                 "MediaType": "Unknown",
                 "IsFolder": true,
             })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// `GET /Artists` — aggregate artist + album_artist tags. Each
+/// entry's `Id` is stable per name; clicking through goes to
+/// /Items?ParentId={id} which restrict_to_parent resolves.
+async fn list_artists(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::artist_id_for;
+    use std::collections::HashSet;
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for i in &all {
+        for src in [i.probe.album_artist.as_deref(), i.probe.artist.as_deref()] {
+            if let Some(n) = src.filter(|s| !s.is_empty()) {
+                if seen.insert(n.to_string()) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    let items: Vec<serde_json::Value> = names
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "Id": artist_id_for(n),
+                "Name": n,
+                "ServerId": state.server_id,
+                "Type": "MusicArtist",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+                "ImageTags": {},
+                "BackdropImageTags": [],
+                "Genres": [], "Tags": [],
+            })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// `GET /Albums` — aggregate distinct album names. Each entry
+/// carries the album_artist so jellyfin-web's track tile renders the
+/// "Album • Artist" subtitle without a follow-up fetch.
+async fn list_albums(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
+    use std::collections::HashMap;
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // Map album_name → (album_artist, sample track id) so a click
+    // into the album renders with the right artist on the tile.
+    let mut albums: HashMap<String, Option<String>> = HashMap::new();
+    for i in &all {
+        let Some(name) = i.probe.album.as_deref() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let entry = albums.entry(name.to_string()).or_insert(None);
+        if entry.is_none() {
+            *entry = i
+                .probe
+                .album_artist
+                .clone()
+                .or_else(|| i.probe.artist.clone());
+        }
+    }
+    let mut names: Vec<&String> = albums.keys().collect();
+    names.sort();
+    let items: Vec<serde_json::Value> = names
+        .into_iter()
+        .map(|n| {
+            let artist = albums.get(n).and_then(|a| a.clone());
+            let mut v = serde_json::json!({
+                "Id": album_id_for(n),
+                "Name": n,
+                "ServerId": state.server_id,
+                "Type": "MusicAlbum",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+                "ImageTags": {},
+                "BackdropImageTags": [],
+                "Genres": [], "Tags": [],
+            });
+            if let Some(a) = artist {
+                v["AlbumArtist"] = serde_json::Value::String(a.clone());
+                v["AlbumArtists"] = serde_json::json!([{
+                    "Name": a,
+                    "Id": artist_id_for(&a),
+                }]);
+            }
+            v
         })
         .collect();
     let total = items.len() as u32;
@@ -625,7 +747,9 @@ fn restrict_to_parent(
     items: Vec<MediaItem>,
     parent_id: Option<&str>,
 ) -> Vec<MediaItem> {
-    use crate::api::jellyfin::dto::{season_id_for, series_id_for};
+    use crate::api::jellyfin::dto::{
+        album_id_for, artist_id_for, genre_id_for, season_id_for, series_id_for,
+    };
     let Some(pid) = parent_id else {
         return items;
     };
@@ -671,6 +795,55 @@ fn restrict_to_parent(
                     s.season_number
                         .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
                 })
+            })
+            .collect();
+    }
+    // 4) Artist id → every track whose artist or album_artist matches.
+    if items.iter().any(|i| {
+        i.probe
+            .artist
+            .as_deref()
+            .is_some_and(|a| artist_id_for(a) == pid)
+            || i.probe
+                .album_artist
+                .as_deref()
+                .is_some_and(|a| artist_id_for(a) == pid)
+    }) {
+        return items
+            .into_iter()
+            .filter(|i| {
+                i.probe
+                    .artist
+                    .as_deref()
+                    .is_some_and(|a| artist_id_for(a) == pid)
+                    || i.probe
+                        .album_artist
+                        .as_deref()
+                        .is_some_and(|a| artist_id_for(a) == pid)
+            })
+            .collect();
+    }
+    // 5) Album id → every track whose album hashes to pid.
+    if items
+        .iter()
+        .any(|i| i.probe.album.as_deref().is_some_and(|a| album_id_for(a) == pid))
+    {
+        return items
+            .into_iter()
+            .filter(|i| {
+                i.probe.album.as_deref().is_some_and(|a| album_id_for(a) == pid)
+            })
+            .collect();
+    }
+    // 6) Genre id → every item tagged with that genre.
+    if items
+        .iter()
+        .any(|i| i.probe.genre.as_deref().is_some_and(|g| genre_id_for(g) == pid))
+    {
+        return items
+            .into_iter()
+            .filter(|i| {
+                i.probe.genre.as_deref().is_some_and(|g| genre_id_for(g) == pid)
             })
             .collect();
     }
