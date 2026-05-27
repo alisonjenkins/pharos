@@ -929,6 +929,17 @@ struct ListQuery {
     /// when paired with NameStartsWith="0". Optional; rarely used.
     #[serde(default)]
     name_less_than: Option<String>,
+    /// Inverse of `IncludeItemTypes` — drop items of any listed kind.
+    /// Useful when jellyfin-web wants "everything but Episode" in a
+    /// movies-only view that happens to share a parent.
+    #[serde(default)]
+    exclude_item_types: Option<String>,
+    /// Comma-separated `Audio` / `Video`. Equivalent to filtering by
+    /// MediaKind's media_type — `Video` matches Movie + Episode,
+    /// `Audio` matches Audio. Real Jellyfin uses this for the
+    /// audio-only / video-only library splits.
+    #[serde(default)]
+    media_types: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1229,6 +1240,25 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
             .collect();
         if !wanted.is_empty() {
             items.retain(|i| wanted.contains(&i.kind));
+        }
+    }
+    if let Some(types) = q.exclude_item_types.as_ref() {
+        let blocked: Vec<MediaKind> = types
+            .split(',')
+            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
+            .collect();
+        if !blocked.is_empty() {
+            items.retain(|i| !blocked.contains(&i.kind));
+        }
+    }
+    if let Some(raw) = q.media_types.as_ref() {
+        let want_audio = raw.split(',').any(|s| s.trim().eq_ignore_ascii_case("Audio"));
+        let want_video = raw.split(',').any(|s| s.trim().eq_ignore_ascii_case("Video"));
+        if want_audio || want_video {
+            items.retain(|i| match i.kind {
+                MediaKind::Audio => want_audio,
+                MediaKind::Movie | MediaKind::Episode => want_video,
+            });
         }
     }
     if let Some(prefix) = q
