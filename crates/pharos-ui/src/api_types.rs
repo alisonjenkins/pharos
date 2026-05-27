@@ -46,3 +46,23 @@ impl ItemKind {
         }
     }
 }
+
+/// Subtitle / audio track entry the PlayerView's picker iterates
+/// over. Mirrors the subset of jellyfin-web's MediaStream shape pharos
+/// emits — pure data so the picker is host-renderable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MediaTrack {
+    pub index: u32,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
+    pub is_external: bool,
+    pub delivery_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlaybackTracks {
+    pub audio: Vec<MediaTrack>,
+    pub subtitle: Vec<MediaTrack>,
+}

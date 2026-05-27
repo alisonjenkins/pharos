@@ -147,6 +147,40 @@ fn player_view_renders_video_for_movie_kind() {
     assert!(html.contains("api_key=tok"), "{html}");
 }
 
+fn player_movie_with_tracks() -> Element {
+    use pharos_ui::api_types::{MediaTrack, PlaybackTracks};
+    rsx! {
+        PlayerView {
+            item_id: "3".to_string(),
+            kind: ItemKind::Movie,
+            access_token: "tok".to_string(),
+            server_base: "http://x".to_string(),
+            tracks: PlaybackTracks {
+                audio: vec![],
+                subtitle: vec![MediaTrack {
+                    index: 2,
+                    language: Some("eng".into()),
+                    title: Some("English".into()),
+                    delivery_url: Some("/Videos/3/3/Subtitles/2/Stream.vtt".into()),
+                    is_default: true,
+                    ..Default::default()
+                }],
+            },
+            on_event: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn player_view_renders_subtitle_track_when_tracks_supplied() {
+    let html = render_root(player_movie_with_tracks);
+    // Native <track> for the browser CC picker.
+    assert!(html.contains("<track"), "{html}");
+    assert!(html.contains("Subtitles/2/Stream.vtt"), "{html}");
+    // Pharos-side aside picker also renders.
+    assert!(html.contains("pharos-player-tracks"), "{html}");
+}
+
 #[test]
 fn player_view_renders_audio_for_audio_kind() {
     let html = render_root(player_audio);

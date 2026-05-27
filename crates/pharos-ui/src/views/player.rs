@@ -6,7 +6,7 @@
 //! lands once T9 ships server-side HLS. Until then this component is
 //! direct-play only.
 
-use crate::api_types::ItemKind;
+use crate::api_types::{ItemKind, MediaTrack, PlaybackTracks};
 use dioxus::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +15,22 @@ pub struct PlayerProps {
     pub kind: ItemKind,
     pub access_token: String,
     pub server_base: String,
+    pub tracks: Option<PlaybackTracks>,
+}
+
+fn track_label(t: &MediaTrack) -> String {
+    let lang = t.language.clone().unwrap_or_default();
+    let title = t.title.clone().unwrap_or_default();
+    if !title.is_empty() {
+        if !lang.is_empty() {
+            return format!("{title} ({lang})");
+        }
+        return title;
+    }
+    if !lang.is_empty() {
+        return lang;
+    }
+    format!("Track {}", t.index)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +46,7 @@ pub fn PlayerView(
     kind: ItemKind,
     access_token: String,
     server_base: String,
+    tracks: Option<PlaybackTracks>,
     on_event: EventHandler<PlaybackEvent>,
 ) -> Element {
     let src = match kind {
@@ -44,6 +61,9 @@ pub fn PlayerView(
     let id_for_play = item_id.clone();
     let id_for_time = item_id.clone();
     let id_for_end = item_id.clone();
+    let tracks = tracks.unwrap_or_default();
+    let subtitles = tracks.subtitle.clone();
+    let audios = tracks.audio.clone();
 
     rsx! {
         section {
@@ -81,6 +101,56 @@ pub fn PlayerView(
                         item_id: id_for_end.clone(),
                         position_seconds: extract_current_time(&ev),
                     }),
+                    // Subtitle `<track>` elements — the browser surfaces
+                    // them as the native CC picker. `src` is the
+                    // server-emitted DeliveryUrl rebased onto the
+                    // user's server + token.
+                    for sub in subtitles.iter() {
+                        if let Some(url) = sub.delivery_url.as_ref() {
+                            track {
+                                kind: "subtitles",
+                                src: "{server_base}{url}&api_key={access_token}",
+                                srclang: sub.language.clone().unwrap_or_default(),
+                                label: track_label(sub),
+                                default: sub.is_default,
+                            }
+                        }
+                    }
+                }
+            }
+            // Pharos-side picker — duplicates info already in the
+            // native control bar but lets us style + add quality /
+            // remote-track-switch later without fighting Chromium.
+            if !subtitles.is_empty() || !audios.is_empty() {
+                aside {
+                    class: "pharos-player-tracks",
+                    if !audios.is_empty() {
+                        details {
+                            summary { "Audio tracks ({audios.len()})" }
+                            ul {
+                                for t in audios.iter() {
+                                    li {
+                                        key: "{t.index}",
+                                        "{track_label(t)}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !subtitles.is_empty() {
+                        details {
+                            summary { "Subtitles ({subtitles.len()})" }
+                            ul {
+                                for t in subtitles.iter() {
+                                    li {
+                                        key: "{t.index}",
+                                        "{track_label(t)}"
+                                        if t.is_external { " (external)" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -151,6 +221,7 @@ mod tests {
             kind: ItemKind::Audio,
             access_token: "tok".into(),
             server_base: "https://pharos.test".into(),
+            tracks: None,
         };
         let expected =
             "https://pharos.test/Audio/42/universal?api_key=tok";
