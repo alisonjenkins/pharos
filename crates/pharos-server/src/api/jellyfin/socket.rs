@@ -40,12 +40,14 @@ async fn ws_entry(
         .aggregate_continuations()
         .max_continuation_size(64 * 1024);
     let bus_rx = state.bus.subscribe();
+    let user_id_str = user.0.id.0.simple().to_string();
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
         registry.get_ref().clone(),
         bus_rx,
         user.0.name,
+        user_id_str,
     ));
     Ok(response)
 }
@@ -56,6 +58,7 @@ async fn handle_connection<S>(
     registry: GroupRegistry,
     mut bus_rx: broadcast::Receiver<SocketBroadcast>,
     member_name: String,
+    bound_user_id: String,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
@@ -79,6 +82,15 @@ async fn handle_connection<S>(
                 // subscriber. Stay connected; the next library refresh
                 // will sync the client anyway.
                 let Ok(b) = broadcast_msg else { continue };
+                // V9: UserDataChanged is scoped to one user. Drop the
+                // broadcast on this socket unless the bound bearer
+                // matches — otherwise user A learns user B watched
+                // item 42 (info leak across tenants).
+                if let SocketBroadcast::UserDataChanged { user_id, .. } = &b {
+                    if user_id != &bound_user_id {
+                        continue;
+                    }
+                }
                 if let Some(out) = translate_broadcast(b) {
                     if send_outbound(&mut session, &out).await.is_err() {
                         break 'pump;
