@@ -913,6 +913,22 @@ struct ListQuery {
     /// a genre tag are dropped when this filter is active.
     #[serde(default)]
     genres: Option<String>,
+    /// Letter-jump nav: jellyfin-web's A-Z chip strip sends
+    /// `NameStartsWith=A`. Items whose `title` starts with the given
+    /// prefix (case-insensitive) pass.
+    #[serde(default)]
+    name_starts_with: Option<String>,
+    /// Same as `NameStartsWith` semantically, but Jellyfin's
+    /// "starts-with-or-greater" letter nav uses this for everything
+    /// past Z (numbers, symbols). Same handler — clients use
+    /// whichever name they remember.
+    #[serde(default)]
+    name_starts_with_or_greater: Option<String>,
+    /// Strict alphabetic upper bound — `NameLessThan=B` drops items
+    /// at or after "B". Used by jellyfin-web's "0-9" letter chip
+    /// when paired with NameStartsWith="0". Optional; rarely used.
+    #[serde(default)]
+    name_less_than: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1213,6 +1229,22 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
             .collect();
         if !wanted.is_empty() {
             items.retain(|i| wanted.contains(&i.kind));
+        }
+    }
+    if let Some(prefix) = q
+        .name_starts_with
+        .as_deref()
+        .or(q.name_starts_with_or_greater.as_deref())
+    {
+        let lower = prefix.to_lowercase();
+        if !lower.is_empty() {
+            items.retain(|i| i.title.to_lowercase().starts_with(&lower));
+        }
+    }
+    if let Some(bound) = q.name_less_than.as_deref() {
+        let lower = bound.to_lowercase();
+        if !lower.is_empty() {
+            items.retain(|i| i.title.to_lowercase().as_str() < lower.as_str());
         }
     }
     if let Some(raw) = q.genres.as_ref() {
