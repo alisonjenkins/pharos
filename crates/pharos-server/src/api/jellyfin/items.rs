@@ -56,7 +56,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/items/{id}/themevideos",
         "/items/{id}/specialfeatures",
         "/users/{user_id}/items/{item_id}/intros",
-        "/shows/nextup",
         "/shows/upcoming",
         "/genres",
         "/studios",
@@ -64,6 +63,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     ] {
         cfg.route(path, web::get().to(empty_items_result));
     }
+    // /Shows/NextUp has a real impl now that episode hierarchy
+    // exists. Keep it after the empty-stub loop so the route is
+    // registered with our handler.
+    cfg.route("/shows/nextup", web::get().to(shows_next_up));
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
@@ -72,6 +75,100 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
         "TotalRecordCount": 0,
         "StartIndex": 0,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct NextUpQuery {
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+/// `GET /Shows/NextUp` — per Series, return the lowest-numbered
+/// Episode the user hasn't played yet. Sorted by series name; capped
+/// by the client's `Limit`. Driven entirely by the persisted
+/// SeriesInfo + UserItemData — no extra columns needed.
+async fn shows_next_up(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<NextUpQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.0.id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // Group episodes by series; pick the lowest unwatched per series.
+    use std::collections::HashMap;
+    let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
+    for (idx, item) in all.iter().enumerate() {
+        if !matches!(item.kind, MediaKind::Episode) {
+            continue;
+        }
+        let Some(series) = item.series.as_ref() else {
+            continue;
+        };
+        // Skip already-played episodes.
+        if user_data.get(idx).copied().unwrap_or_default().played {
+            continue;
+        }
+        buckets
+            .entry(series.series_name.clone())
+            .or_default()
+            .push((idx, item));
+    }
+    // Sort each bucket by (season_number, episode_number) ascending,
+    // pick the head.
+    let mut picks: Vec<(usize, &MediaItem)> = buckets
+        .into_iter()
+        .filter_map(|(_name, mut eps)| {
+            eps.sort_by_key(|(_, e)| {
+                let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
+                let n = e.series.as_ref().and_then(|s| s.episode_number).unwrap_or(0);
+                (s, n)
+            });
+            eps.into_iter().next()
+        })
+        .collect();
+    // Stable series-name sort across the result set.
+    picks.sort_by(|a, b| {
+        let an = a
+            .1
+            .series
+            .as_ref()
+            .map(|s| s.series_name.as_str())
+            .unwrap_or("");
+        let bn = b
+            .1
+            .series
+            .as_ref()
+            .map(|s| s.series_name.as_str())
+            .unwrap_or("");
+        an.cmp(bn)
+    });
+    picks.truncate(q.limit.max(1) as usize);
+    let dtos: Vec<BaseItemDto> = picks
+        .iter()
+        .map(|(idx, item)| {
+            let ud = user_data.get(*idx).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        })
+        .collect();
+    let total = dtos.len() as u32;
+    let _ = q.user_id; // kept for future per-user scoping
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": dtos,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -221,8 +318,15 @@ async fn list_user_items_latest(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // Honour ParentId so home-page "Latest" rows match the library
+    // the user clicked into. Library / series / season ids all
+    // resolve via the shared restrict_to_parent helper.
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref());
+    // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
+    // row filters to Type=Movie.
+    let typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
     let limit = q.limit.min(100) as usize;
-    let page: Vec<MediaItem> = all.into_iter().take(limit).collect();
+    let page: Vec<MediaItem> = typed.into_iter().take(limit).collect();
     let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
@@ -239,6 +343,18 @@ async fn list_user_items_latest(
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
     Ok(HttpResponse::Ok().json(dtos))
+}
+
+fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
+    let Some(s) = include else { return items };
+    let wanted: Vec<MediaKind> = s
+        .split(',')
+        .filter_map(|t| jellyfin_type_to_kind(t.trim()))
+        .collect();
+    if wanted.is_empty() {
+        return items;
+    }
+    items.into_iter().filter(|i| wanted.contains(&i.kind)).collect()
 }
 
 async fn user_views(

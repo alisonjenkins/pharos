@@ -817,3 +817,78 @@ async fn playback_info_lists_sidecar_subtitle_when_present() {
     assert_eq!(sub["IsExternal"], true);
     assert!(sub["DeliveryUrl"].as_str().unwrap().contains("/Subtitles/"));
 }
+
+#[actix_web::test]
+async fn shows_next_up_returns_lowest_unwatched_per_series() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    // Show A: S01E01 (played), S01E02 (unwatched), S01E03 (unwatched)
+    // Show B: S01E01 (unwatched), S01E02 (unwatched)
+    for (id, show, season, ep) in [
+        (1u64, "Show A", 1u32, 1u32),
+        (2, "Show A", 1, 2),
+        (3, "Show A", 1, 3),
+        (4, "Show B", 1, 1),
+        (5, "Show B", 1, 2),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{show}/S01E0{ep}.mkv").into(),
+                title: format!("E{ep}"),
+                kind: MediaKind::Episode,
+                series: Some(pharos_core::SeriesInfo {
+                    series_name: show.into(),
+                    season_number: Some(season),
+                    episode_number: Some(ep),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    // Mark Show A E01 played.
+    use pharos_core::UserDataStore;
+    let mut data = pharos_core::UserItemData::default();
+    data.played = true;
+    stores.set_user_data(uid, 1, data).await.unwrap();
+
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Shows/NextUp")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{v:?}");
+    // Show A: next up is E2 (since E1 played).
+    // Show B: next up is E1 (nothing played).
+    let by_show: std::collections::HashMap<&str, u64> = items
+        .iter()
+        .map(|it| {
+            (
+                it["SeriesName"].as_str().unwrap(),
+                it["IndexNumber"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(by_show.get("Show A"), Some(&2));
+    assert_eq!(by_show.get("Show B"), Some(&1));
+}
