@@ -893,6 +893,13 @@ struct ListQuery {
     /// are ignored (Jellyfin parity).
     #[serde(default)]
     filters: Option<String>,
+    /// Comma-separated list of item ids. When present, restricts the
+    /// result set to those items only — clients use this to refresh
+    /// a batch of cached items by id. Synth ids (library / series /
+    /// season / artist / album / genre) are silently dropped; only
+    /// numeric ids in the store match.
+    #[serde(default)]
+    ids: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1133,6 +1140,23 @@ fn restrict_to_parent(
 }
 
 fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
+    if let Some(raw) = q.ids.as_ref() {
+        // 32-char synth ids (library / series / season / artist /
+        // album / genre) live in a different namespace from numeric
+        // store ids. Treat anything longer than u64::MAX's 20-digit
+        // bound as a non-match — `"00000…001".parse()` otherwise
+        // collides with id 1.
+        let wanted: std::collections::HashSet<u64> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| s.len() <= 20)
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        // Empty `Ids=` (or all-non-numeric, eg only synth ids) → no
+        // matches. Matches Jellyfin's "you asked for nothing, you
+        // get nothing" semantics.
+        items.retain(|i| wanted.contains(&i.id));
+    }
     if let Some(term) = q.search_term.as_ref() {
         let needle = term.to_ascii_lowercase();
         if !needle.is_empty() {

@@ -189,6 +189,50 @@ async fn combined_filters_intersect() {
 }
 
 #[actix_web::test]
+async fn ids_query_filters_to_listed_ids_only() {
+    let (state, token) = seed_with_user_data().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?Ids=2,4&Limit=100")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: std::collections::BTreeSet<String> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap_or("").to_string())
+        .collect();
+    let want: std::collections::BTreeSet<String> =
+        ["It2", "It4"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(names, want, "Ids filter should restrict to the listed ids");
+}
+
+#[actix_web::test]
+async fn ids_query_with_synth_ids_returns_empty() {
+    let (state, token) = seed_with_user_data().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            // 32-hex synth id (eg. library root) — no numeric match.
+            .uri("/Items?Ids=00000000000000000000000000000001&Limit=100")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v["Items"].as_array().unwrap().is_empty(),
+        "synth-only Ids must not collide with numeric store ids"
+    );
+}
+
+#[actix_web::test]
 async fn unknown_filter_tokens_ignored() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
