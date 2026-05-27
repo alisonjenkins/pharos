@@ -499,3 +499,72 @@ async fn episode_classification_survives_store_roundtrip() {
     assert_eq!(series.season_number, Some(1));
     assert_eq!(series.episode_number, Some(3));
 }
+
+/// (11) — /Library/MediaFolders and /Users/{u}/Views must emit
+/// identical Items (same Id + Name) so jellyfin-web's library nav
+/// resolves the same id from either entry point. The two endpoints
+/// share `library_views()` internally — this is the regression net.
+#[actix_web::test]
+async fn library_mediafolders_and_user_views_emit_identical_items() {
+    use pharos_core::UserId;
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let state = web::Data::new(
+        AppState::new(stores, "srv".into())
+            .with_media_roots(vec!["/m/Movies".into(), "/m/TV".into()]),
+    );
+    let app = test::init_service(build_app(state)).await;
+    let by_views: serde_json::Value = serde_json::from_slice(
+        &test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/Users/{}/Views", uid.0.simple()))
+                .insert_header(("X-Emby-Token", token.0.expose()))
+                .to_request(),
+        )
+        .await,
+    )
+    .unwrap();
+    let by_folders: serde_json::Value = serde_json::from_slice(
+        &test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri("/Library/MediaFolders")
+                .insert_header(("X-Emby-Token", token.0.expose()))
+                .to_request(),
+        )
+        .await,
+    )
+    .unwrap();
+    // Both should produce two items with stable hash ids.
+    let extract = |v: &serde_json::Value| -> Vec<(String, String)> {
+        v["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                (
+                    x["Id"].as_str().unwrap().to_string(),
+                    x["Name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let mut v_views = extract(&by_views);
+    let mut v_folders = extract(&by_folders);
+    v_views.sort();
+    v_folders.sort();
+    assert_eq!(v_views, v_folders, "Views vs MediaFolders mismatch");
+}

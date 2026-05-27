@@ -252,6 +252,94 @@ async fn baseline_views_envelope_keys() {
 }
 
 #[actix_web::test]
+async fn baseline_items_counts_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/Counts")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_keys_present(
+        &v,
+        &[
+            "MovieCount",
+            "SeriesCount",
+            "EpisodeCount",
+            "ArtistCount",
+            "SongCount",
+            "AlbumCount",
+            "ItemCount",
+        ],
+        "/Items/Counts",
+    );
+}
+
+#[actix_web::test]
+async fn baseline_genres_envelope_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Genres")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_keys_present(
+        &v,
+        &["Items", "TotalRecordCount", "StartIndex"],
+        "/Genres envelope",
+    );
+}
+
+#[actix_web::test]
+async fn baseline_artists_envelope_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Artists")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_keys_present(
+        &v,
+        &["Items", "TotalRecordCount", "StartIndex"],
+        "/Artists envelope",
+    );
+}
+
+#[actix_web::test]
+async fn baseline_shows_nextup_envelope_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Shows/NextUp")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_keys_present(
+        &v,
+        &["Items", "TotalRecordCount", "StartIndex"],
+        "/Shows/NextUp envelope",
+    );
+}
+
+#[actix_web::test]
 async fn baseline_authenticate_envelope_keys() {
     let (state, _, _) = seed().await;
     let app = test::init_service(build_app(state)).await;

@@ -325,3 +325,29 @@ async fn unicode_paths_and_titles_round_trip_intact() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["Name"], title);
 }
+
+/// `Recursive=true` + `EnableTotalRecordCount` and other ad-hoc
+/// pagination toggles silently accepted. Pharos doesn't model
+/// folders so always-recursive is correct.
+#[actix_web::test]
+async fn items_recursive_and_pagination_flags_silently_accepted() {
+    let (state, reg, token, _) = seed().await;
+    let app = test::init_service(build_app(state, reg)).await;
+    for q in &[
+        "Recursive=true",
+        "Recursive=false",
+        "EnableTotalRecordCount=false",
+        "EnableImages=true&ImageTypeLimit=1",
+        "Recursive=true&IncludeItemTypes=Movie,Episode&SortBy=DateCreated&SortOrder=Descending&Limit=24",
+    ] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/Items?{q}"))
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert!(resp.status().is_success(), "q={q} → {resp:?}");
+    }
+}
