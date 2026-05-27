@@ -11,7 +11,7 @@ use std::str::FromStr;
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json";
+    subtitle_tracks_json, artist, album, album_artist, genre";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -118,8 +118,9 @@ impl MediaStore for SqliteStore {
                 video_codec, audio_codec, width, height, frame_rate_mille, \
                 audio_channels, sample_rate, \
                 series_name, season_number, episode_number, \
-                subtitle_tracks_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                subtitle_tracks_json, \
+                artist, album, album_artist, genre) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            kind = excluded.kind,
@@ -137,7 +138,11 @@ impl MediaStore for SqliteStore {
                                            series_name = excluded.series_name,
                                            season_number = excluded.season_number,
                                            episode_number = excluded.episode_number,
-                                           subtitle_tracks_json = excluded.subtitle_tracks_json",
+                                           subtitle_tracks_json = excluded.subtitle_tracks_json,
+                                           artist = excluded.artist,
+                                           album = excluded.album,
+                                           album_artist = excluded.album_artist,
+                                           genre = excluded.genre",
         )
         .bind(id_i64)
         .bind(path)
@@ -158,6 +163,10 @@ impl MediaStore for SqliteStore {
         .bind(season_number.map(|v| v as i64))
         .bind(episode_number.map(|v| v as i64))
         .bind(subtitle_tracks_json)
+        .bind(p.artist.as_deref())
+        .bind(p.album.as_deref())
+        .bind(p.album_artist.as_deref())
+        .bind(p.genre.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -196,6 +205,10 @@ struct MediaRow {
     season_number: Option<i64>,
     episode_number: Option<i64>,
     subtitle_tracks_json: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    album_artist: Option<String>,
+    genre: Option<String>,
 }
 
 impl MediaRow {
@@ -218,6 +231,10 @@ impl MediaRow {
             subtitle_tracks: crate::subtitle_track_json::decode(
                 self.subtitle_tracks_json.as_deref(),
             ),
+            artist: self.artist,
+            album: self.album,
+            album_artist: self.album_artist,
+            genre: self.genre,
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

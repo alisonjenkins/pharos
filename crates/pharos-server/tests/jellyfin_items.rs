@@ -892,3 +892,58 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
     assert_eq!(by_show.get("Show A"), Some(&2));
     assert_eq!(by_show.get("Show B"), Some(&1));
 }
+
+#[actix_web::test]
+async fn audio_item_surfaces_artist_album_genre_from_probe() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let probe = pharos_core::MediaProbe {
+        audio_codec: Some("mp3".into()),
+        artist: Some("Kevin MacLeod".into()),
+        album: Some("Carefree".into()),
+        album_artist: Some("Kevin MacLeod".into()),
+        genre: Some("Royalty Free".into()),
+        ..Default::default()
+    };
+    stores
+        .put(MediaItem {
+            id: 88,
+            path: "/m/carefree.mp3".into(),
+            title: "Carefree".into(),
+            kind: MediaKind::Audio,
+            probe,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/88")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Artists"][0], "Kevin MacLeod");
+    assert_eq!(v["ArtistItems"][0]["Name"], "Kevin MacLeod");
+    assert_eq!(v["ArtistItems"][0]["Id"].as_str().unwrap().len(), 32);
+    assert_eq!(v["AlbumArtists"][0]["Name"], "Kevin MacLeod");
+    assert_eq!(v["Album"], "Carefree");
+    assert_eq!(v["AlbumId"].as_str().unwrap().len(), 32);
+    assert_eq!(v["Genres"][0], "Royalty Free");
+}

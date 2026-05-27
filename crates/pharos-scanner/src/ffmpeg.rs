@@ -123,6 +123,29 @@ struct FfprobeFormat {
     size: Option<String>,
     #[serde(default)]
     bit_rate: Option<String>,
+    #[serde(default)]
+    tags: FfprobeFormatTags,
+}
+
+/// `format.tags` from ffprobe. ID3v2 + Vorbis + MP4 metadata all
+/// normalise into the same JSON keys; we accept the lowercase
+/// canonical form (artist / album / album_artist / genre / title).
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeFormatTags {
+    #[serde(default, alias = "ARTIST", alias = "Artist")]
+    artist: Option<String>,
+    #[serde(default, alias = "ALBUM", alias = "Album")]
+    album: Option<String>,
+    #[serde(
+        default,
+        alias = "ALBUM_ARTIST",
+        alias = "ALBUMARTIST",
+        alias = "AlbumArtist",
+        alias = "album_artist"
+    )]
+    album_artist: Option<String>,
+    #[serde(default, alias = "GENRE", alias = "Genre")]
+    genre: Option<String>,
 }
 
 /// Public so the criterion bench in `benches/parse.rs` can call directly
@@ -197,6 +220,10 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             audio_channels,
             sample_rate,
             subtitle_tracks,
+            artist: parsed.format.tags.artist,
+            album: parsed.format.tags.album,
+            album_artist: parsed.format.tags.album_artist,
+            genre: parsed.format.tags.genre,
         },
     })
 }

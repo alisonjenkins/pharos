@@ -202,6 +202,11 @@ pub struct BaseItemDto {
     pub external_urls: Vec<serde_json::Value>,
     pub image_tags: serde_json::Map<String, serde_json::Value>,
     pub backdrop_image_tags: Vec<String>,
+    /// Audio metadata: album name (None for video/no-tag files).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<String>,
     // Series-hierarchy fields populated when this item is an Episode.
     // jellyfin-web's Shows view reads them to render the Series ▸
     // Season ▸ Episode breadcrumb.
@@ -491,11 +496,41 @@ impl BaseItemDto {
                 video_type: "VideoFile",
                 e_tag: "0".into(),
             }],
-            artists: vec![],
-            artist_items: vec![],
-            album_artists: vec![],
-            genres: vec![],
-            genre_items: vec![],
+            artists: item.probe.artist.iter().cloned().collect(),
+            artist_items: item
+                .probe
+                .artist
+                .as_ref()
+                .map(|name| {
+                    vec![NameGuidPairDto {
+                        name: name.clone(),
+                        id: artist_id_for(name),
+                    }]
+                })
+                .unwrap_or_default(),
+            album_artists: item
+                .probe
+                .album_artist
+                .as_ref()
+                .map(|name| {
+                    vec![NameGuidPairDto {
+                        name: name.clone(),
+                        id: artist_id_for(name),
+                    }]
+                })
+                .unwrap_or_default(),
+            genres: item.probe.genre.iter().cloned().collect(),
+            genre_items: item
+                .probe
+                .genre
+                .as_ref()
+                .map(|name| {
+                    vec![NameGuidPairDto {
+                        name: name.clone(),
+                        id: genre_id_for(name),
+                    }]
+                })
+                .unwrap_or_default(),
             tags: vec![],
             studios: vec![],
             people: vec![],
@@ -508,6 +543,8 @@ impl BaseItemDto {
             image_tags: image_tags_for(item),
             backdrop_image_tags: vec![image_tag_for(item.id, "backdrop")],
             screenshot_image_tags: vec![],
+            album: item.probe.album.clone(),
+            album_id: item.probe.album.as_deref().map(album_id_for),
             series_name: item.series.as_ref().map(|s| s.series_name.clone()),
             series_id: item
                 .series
@@ -560,6 +597,24 @@ pub fn image_tag_for(item_id: u64, role: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let h = xxh3_64(format!("img:{item_id}:{role}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}")
+}
+
+/// Stable per-name 32-hex ids for the synthesised Artist / Album /
+/// Genre / Studio aggregate items. Drives /Items?ParentId=… joins
+/// + the NameGuidPair links jellyfin-web renders in track tiles.
+pub fn artist_id_for(name: &str) -> String {
+    name_aggregate_id_for("artist", name)
+}
+pub fn album_id_for(name: &str) -> String {
+    name_aggregate_id_for("album", name)
+}
+pub fn genre_id_for(name: &str) -> String {
+    name_aggregate_id_for("genre", name)
+}
+fn name_aggregate_id_for(kind: &str, name: &str) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let h = xxh3_64(format!("{kind}:{name}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+    format!("{h:016x}{h:016x}")
 }
 
 /// Stable 32-hex id for the synthesised Series item.

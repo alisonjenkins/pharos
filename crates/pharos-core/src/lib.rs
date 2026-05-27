@@ -67,6 +67,13 @@ pub struct MediaProbe {
     /// Embedded subtitle tracks discovered by the prober. Stored
     /// JSON-serialised in the `subtitle_tracks` column.
     pub subtitle_tracks: Vec<SubtitleTrack>,
+    /// Common audio-file format tags (`title` / `artist` / `album` /
+    /// `album_artist` / `genre`). Populated by FfmpegProber from
+    /// ffprobe's `format.tags`. None when the file lacks the tag.
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
 }
 
 /// One embedded subtitle stream from the source file.
