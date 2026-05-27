@@ -947,3 +947,61 @@ async fn audio_item_surfaces_artist_album_genre_from_probe() {
     assert_eq!(v["AlbumId"].as_str().unwrap().len(), 32);
     assert_eq!(v["Genres"][0], "Royalty Free");
 }
+
+#[actix_web::test]
+async fn genres_endpoint_aggregates_distinct_genre_tags() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, g) in [(1u64, "Jazz"), (2, "Jazz"), (3, "Rock"), (4, "Classical")] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}.mp3").into(),
+                title: format!("Track {id}"),
+                kind: MediaKind::Audio,
+                probe: pharos_core::MediaProbe {
+                    genre: Some(g.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Genres")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 3, "{v:?}");
+    let names: Vec<&str> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    // Sorted ascending.
+    assert_eq!(names, vec!["Classical", "Jazz", "Rock"]);
+    for it in v["Items"].as_array().unwrap() {
+        assert_eq!(it["Type"], "Genre");
+        assert_eq!(it["IsFolder"], true);
+    }
+}

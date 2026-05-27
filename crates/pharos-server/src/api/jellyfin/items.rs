@@ -57,12 +57,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/items/{id}/specialfeatures",
         "/users/{user_id}/items/{item_id}/intros",
         "/shows/upcoming",
-        "/genres",
-        "/studios",
-        "/persons",
+        "/persons", // No people metadata yet — phase 3 of T34.
     ] {
         cfg.route(path, web::get().to(empty_items_result));
     }
+    // /Genres + /Studios aggregate over MediaItem.{genre, album_artist}
+    // tags. Replace stub when those columns ship — T-fix-31.
+    cfg.route("/genres", web::get().to(list_genres))
+        .route("/studios", web::get().to(list_studios));
     // /Shows/NextUp has a real impl now that episode hierarchy
     // exists. Keep it after the empty-stub loop so the route is
     // registered with our handler.
@@ -75,6 +77,91 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
         "TotalRecordCount": 0,
         "StartIndex": 0,
     }))
+}
+
+/// `GET /Genres` — aggregate every distinct `genre` tag across all
+/// items into a flat list. Each entry carries a stable id derived
+/// via dto::genre_id_for, so /Items?ParentId={id} pivots cleanly
+/// once that branch is wired (currently library/series/season only).
+async fn list_genres(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::genre_id_for;
+    use std::collections::HashSet;
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut genres: Vec<&str> = all
+        .iter()
+        .filter_map(|i| i.probe.genre.as_deref())
+        .filter(|g| !g.is_empty() && seen.insert(g.to_string()))
+        .collect();
+    genres.sort_unstable();
+    let items: Vec<serde_json::Value> = genres
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "Id": genre_id_for(g),
+                "Name": g,
+                "ServerId": state.server_id,
+                "Type": "Genre",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+            })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// `GET /Studios` — same shape as /Genres but pivoting on
+/// album_artist (closest field we persist to a "studio" — Jellyfin's
+/// schema overloads the term across music + film). Real studio
+/// metadata waits on a metadata-provider layer.
+async fn list_studios(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use std::collections::HashSet;
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut studios: Vec<&str> = all
+        .iter()
+        .filter_map(|i| i.probe.album_artist.as_deref())
+        .filter(|s| !s.is_empty() && seen.insert(s.to_string()))
+        .collect();
+    studios.sort_unstable();
+    let items: Vec<serde_json::Value> = studios
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "Id": crate::api::jellyfin::dto::artist_id_for(s),
+                "Name": s,
+                "ServerId": state.server_id,
+                "Type": "Studio",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+            })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
