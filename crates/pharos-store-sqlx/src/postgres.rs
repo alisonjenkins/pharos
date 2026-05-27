@@ -19,13 +19,14 @@
 use crate::StoreError;
 use pharos_core::{
     AuthError, AuthResult, AuthToken, DomainError, DomainResult, MediaId, MediaItem, MediaKind,
-    MediaProbe, MediaStore, SecretString, TokenStore, UserDataStore, UserId, UserItemData,
-    UserPolicy, UserRecord, UserStore,
+    MediaProbe, MediaStore, SecretString, SeriesInfo, TokenStore, UserDataStore, UserId,
+    UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
-    audio_channels, sample_rate";
+    audio_channels, sample_rate, series_name, season_number, episode_number, \
+    subtitle_tracks_json";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -125,12 +126,20 @@ impl MediaStore for PostgresStore {
             .to_str()
             .ok_or_else(|| DomainError::Backend("non-utf8 path".into()))?;
         let p = &item.probe;
+        let series_name = item.series.as_ref().map(|s| s.series_name.as_str());
+        let season_number = item.series.as_ref().and_then(|s| s.season_number);
+        let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
+        let subtitle_tracks_json =
+            crate::subtitle_track_json::encode(&p.subtitle_tracks);
         sqlx::query(
             "INSERT INTO media_items (id, path, title, kind, \
                 size_bytes, duration_ms, container, bitrate_bps, \
                 video_codec, audio_codec, width, height, frame_rate_mille, \
-                audio_channels, sample_rate) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                audio_channels, sample_rate, \
+                series_name, season_number, episode_number, \
+                subtitle_tracks_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     $16, $17, $18, $19)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             kind = EXCLUDED.kind,
@@ -144,7 +153,11 @@ impl MediaStore for PostgresStore {
                                             height = EXCLUDED.height,
                                             frame_rate_mille = EXCLUDED.frame_rate_mille,
                                             audio_channels = EXCLUDED.audio_channels,
-                                            sample_rate = EXCLUDED.sample_rate",
+                                            sample_rate = EXCLUDED.sample_rate,
+                                            series_name = EXCLUDED.series_name,
+                                            season_number = EXCLUDED.season_number,
+                                            episode_number = EXCLUDED.episode_number,
+                                            subtitle_tracks_json = EXCLUDED.subtitle_tracks_json",
         )
         .bind(id_i64)
         .bind(path)
@@ -161,6 +174,10 @@ impl MediaStore for PostgresStore {
         .bind(p.frame_rate_mille.map(|v| v as i32))
         .bind(p.audio_channels.map(|v| v as i32))
         .bind(p.sample_rate.map(|v| v as i32))
+        .bind(series_name)
+        .bind(season_number.map(|v| v as i32))
+        .bind(episode_number.map(|v| v as i32))
+        .bind(subtitle_tracks_json)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -452,6 +469,10 @@ struct MediaRow {
     frame_rate_mille: Option<i32>,
     audio_channels: Option<i32>,
     sample_rate: Option<i32>,
+    series_name: Option<String>,
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+    subtitle_tracks_json: Option<String>,
 }
 
 impl MediaRow {
@@ -471,13 +492,22 @@ impl MediaRow {
             frame_rate_mille: self.frame_rate_mille.and_then(|v| u32::try_from(v).ok()),
             audio_channels: self.audio_channels.and_then(|v| u32::try_from(v).ok()),
             sample_rate: self.sample_rate.and_then(|v| u32::try_from(v).ok()),
+            subtitle_tracks: crate::subtitle_track_json::decode(
+                self.subtitle_tracks_json.as_deref(),
+            ),
         };
+        let series = self.series_name.map(|name| SeriesInfo {
+            series_name: name,
+            season_number: self.season_number.and_then(|v| u32::try_from(v).ok()),
+            episode_number: self.episode_number.and_then(|v| u32::try_from(v).ok()),
+        });
         Ok(MediaItem {
             id,
             path: self.path.into(),
             title: self.title,
             kind,
             probe,
+            series,
         })
     }
 }

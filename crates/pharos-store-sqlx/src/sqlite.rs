@@ -1,6 +1,6 @@
 use crate::StoreError;
 use pharos_core::{
-    DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore,
+    DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore, SeriesInfo,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -10,7 +10,8 @@ use std::str::FromStr;
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
-    audio_channels, sample_rate";
+    audio_channels, sample_rate, series_name, season_number, episode_number, \
+    subtitle_tracks_json";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -106,12 +107,19 @@ impl MediaStore for SqliteStore {
             .to_str()
             .ok_or_else(|| DomainError::Backend("non-utf8 path".into()))?;
         let p = &item.probe;
+        let series_name = item.series.as_ref().map(|s| s.series_name.as_str());
+        let season_number = item.series.as_ref().and_then(|s| s.season_number);
+        let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
+        let subtitle_tracks_json =
+            crate::subtitle_track_json::encode(&p.subtitle_tracks);
         sqlx::query(
             "INSERT INTO media_items (id, path, title, kind, \
                 size_bytes, duration_ms, container, bitrate_bps, \
                 video_codec, audio_codec, width, height, frame_rate_mille, \
-                audio_channels, sample_rate) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                audio_channels, sample_rate, \
+                series_name, season_number, episode_number, \
+                subtitle_tracks_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            kind = excluded.kind,
@@ -125,7 +133,11 @@ impl MediaStore for SqliteStore {
                                            height = excluded.height,
                                            frame_rate_mille = excluded.frame_rate_mille,
                                            audio_channels = excluded.audio_channels,
-                                           sample_rate = excluded.sample_rate",
+                                           sample_rate = excluded.sample_rate,
+                                           series_name = excluded.series_name,
+                                           season_number = excluded.season_number,
+                                           episode_number = excluded.episode_number,
+                                           subtitle_tracks_json = excluded.subtitle_tracks_json",
         )
         .bind(id_i64)
         .bind(path)
@@ -142,6 +154,10 @@ impl MediaStore for SqliteStore {
         .bind(p.frame_rate_mille.map(|v| v as i64))
         .bind(p.audio_channels.map(|v| v as i64))
         .bind(p.sample_rate.map(|v| v as i64))
+        .bind(series_name)
+        .bind(season_number.map(|v| v as i64))
+        .bind(episode_number.map(|v| v as i64))
+        .bind(subtitle_tracks_json)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -176,6 +192,10 @@ struct MediaRow {
     frame_rate_mille: Option<i64>,
     audio_channels: Option<i64>,
     sample_rate: Option<i64>,
+    series_name: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    subtitle_tracks_json: Option<String>,
 }
 
 impl MediaRow {
@@ -195,13 +215,22 @@ impl MediaRow {
             frame_rate_mille: self.frame_rate_mille.and_then(|v| u32::try_from(v).ok()),
             audio_channels: self.audio_channels.and_then(|v| u32::try_from(v).ok()),
             sample_rate: self.sample_rate.and_then(|v| u32::try_from(v).ok()),
+            subtitle_tracks: crate::subtitle_track_json::decode(
+                self.subtitle_tracks_json.as_deref(),
+            ),
         };
+        let series = self.series_name.map(|name| SeriesInfo {
+            series_name: name,
+            season_number: self.season_number.and_then(|v| u32::try_from(v).ok()),
+            episode_number: self.episode_number.and_then(|v| u32::try_from(v).ok()),
+        });
         Ok(MediaItem {
             id,
             path: self.path.into(),
             title: self.title,
             kind,
             probe,
+            series,
         })
     }
 }

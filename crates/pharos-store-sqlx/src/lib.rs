@@ -11,8 +11,15 @@ mod auth_sqlite;
 #[cfg(feature = "sqlite")]
 mod user_data_sqlite;
 
+#[cfg(feature = "sqlite")]
+mod preferences_sqlite;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+// JSON adapter for MediaProbe.subtitle_tracks persistence — kept
+// outside the feature gates so both backends use it.
+pub mod subtitle_track_json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
