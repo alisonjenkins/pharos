@@ -137,6 +137,18 @@ async fn display_preferences_update(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Reconstruct the URL clients should advertise when telling other
+/// clients to connect here. Derived from the request's Host header
+/// + scheme — the canonical Jellyfin "use whatever URL the client
+/// just hit you on" pattern. Used by casting / SyncPlay clients
+/// to publish a reachable URL to peer sessions.
+fn derive_local_address(req: &actix_web::HttpRequest) -> String {
+    let conn = req.connection_info();
+    let scheme = conn.scheme();
+    let host = conn.host();
+    format!("{scheme}://{host}")
+}
+
 async fn user_configuration_update(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -164,7 +176,10 @@ async fn user_configuration_update(
 /// the real one. Bump this when targeting a newer jellyfin-web build.
 const ADVERTISED_JELLYFIN_VERSION: &str = "10.11.0";
 
-async fn system_info(state: web::Data<AppState>) -> impl Responder {
+async fn system_info(
+    state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
+) -> impl Responder {
     let _ = state.version;
     HttpResponse::Ok().json(SystemInfoDto {
         id: state.server_id.clone(),
@@ -172,7 +187,7 @@ async fn system_info(state: web::Data<AppState>) -> impl Responder {
         version: ADVERTISED_JELLYFIN_VERSION.to_string(),
         product_name: "Jellyfin Server",
         operating_system: std::env::consts::OS,
-        local_address: String::new(),
+        local_address: derive_local_address(&req),
         startup_wizard_completed: true,
         cast_receiver_id: "F007D354",
         operating_system_display_name: "pharos",
