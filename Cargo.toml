@@ -55,3 +55,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+
+# Dev/test profile: drop full DWARF, keep line tables. Backtraces +
+# assertion file:line still work; link step generates less. Note:
+# changing this triggers a one-time full dep recompile (the cost has
+# been paid; don't churn it). No measurable wall-time win on M-series
+# darwin for the workspace as it stands today, but the smaller debug
+# sections noticeably shrink target/ disk usage.
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
