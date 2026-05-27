@@ -887,6 +887,57 @@ struct ListQuery {
     /// All-Media placeholder) means "no parent filter".
     #[serde(default)]
     parent_id: Option<String>,
+    /// Comma-separated UserData filters. Recognised:
+    /// `IsFavorite`, `IsNotFavorite`, `IsPlayed`, `IsUnplayed`,
+    /// `IsResumable`. Multiple filters AND together. Unknown tokens
+    /// are ignored (Jellyfin parity).
+    #[serde(default)]
+    filters: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct UserDataFilter {
+    is_favorite: Option<bool>,
+    is_played: Option<bool>,
+    is_resumable: bool,
+}
+
+impl UserDataFilter {
+    fn parse(raw: &str) -> Self {
+        let mut f = Self::default();
+        for tok in raw.split(',').map(str::trim) {
+            match tok {
+                "IsFavorite" => f.is_favorite = Some(true),
+                "IsNotFavorite" => f.is_favorite = Some(false),
+                "IsPlayed" => f.is_played = Some(true),
+                "IsUnplayed" => f.is_played = Some(false),
+                "IsResumable" => f.is_resumable = true,
+                _ => {}
+            }
+        }
+        f
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_favorite.is_some() || self.is_played.is_some() || self.is_resumable
+    }
+
+    fn matches(&self, ud: pharos_core::UserItemData) -> bool {
+        if let Some(want) = self.is_favorite {
+            if ud.is_favorite != want {
+                return false;
+            }
+        }
+        if let Some(want) = self.is_played {
+            if ud.played != want {
+                return false;
+            }
+        }
+        if self.is_resumable && (ud.played || ud.last_played_position_ticks == 0) {
+            return false;
+        }
+        true
+    }
 }
 
 fn default_limit() -> u32 {
@@ -904,7 +955,8 @@ async fn list_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let filtered = filter_and_sort(restrict_to_parent(&state, all, q.parent_id.as_deref()), &q);
-    let dto = paginate(&state, user.0.id, filtered, q.start_index, q.limit).await?;
+    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, q.filters.as_deref()).await?;
+    let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
 
@@ -926,8 +978,46 @@ async fn list_user_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let filtered = filter_and_sort(restrict_to_parent(&state, all, q.parent_id.as_deref()), &q);
-    let dto = paginate(&state, user.0.id, filtered, q.start_index, q.limit).await?;
+    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, q.filters.as_deref()).await?;
+    let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
+}
+
+/// Filter the list by per-user UserData state (favorite / played /
+/// resumable). One bulk UserData lookup for the full set when active;
+/// no extra IO when the Filters parameter is empty.
+async fn apply_userdata_filter(
+    state: &AppState,
+    user_id: UserId,
+    items: Vec<MediaItem>,
+    filters: Option<&str>,
+) -> Result<Vec<MediaItem>, actix_web::Error> {
+    let Some(raw) = filters else {
+        return Ok(items);
+    };
+    let f = UserDataFilter::parse(raw);
+    if !f.is_active() {
+        return Ok(items);
+    }
+    let ids: Vec<u64> = items.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user_id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let kept: Vec<MediaItem> = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            if f.matches(ud) {
+                Some(item)
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(kept)
 }
 
 /// Drop items that don't live under the configured root / series /

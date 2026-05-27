@@ -27,7 +27,7 @@ fn json_object_strategy() -> impl Strategy<Value = serde_json::Value> {
         prop_oneof![
             Just(serde_json::Value::Null),
             any::<bool>().prop_map(serde_json::Value::Bool),
-            any::<i64>().prop_map(|n| serde_json::Value::from(n)),
+            any::<i64>().prop_map(serde_json::Value::from),
             // String values are kept short so the resulting JSON
             // stays bounded.
             proptest::string::string_regex("[\\x20-\\x7e]{0,16}")
