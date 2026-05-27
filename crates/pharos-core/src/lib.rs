@@ -26,6 +26,22 @@ pub struct MediaItem {
     /// omit fields whose value is `None` so clients negotiate against
     /// reality, not a stub.
     pub probe: MediaProbe,
+    /// Show-hierarchy metadata when kind == Episode. None for
+    /// Movie / Audio. Synthesised Series + Season DTOs derive their
+    /// stable ids from `series_name` + `(series_name, season_number)`
+    /// respectively (via `series_id_for` / `season_id_for`).
+    pub series: Option<SeriesInfo>,
+}
+
+/// Parent-show / season / episode metadata for items the scanner
+/// promoted to `MediaKind::Episode`. `season_number` + `episode_number`
+/// fall back to None when the path didn't yield them but the
+/// containing dir still flagged as a season layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesInfo {
+    pub series_name: String,
+    pub season_number: Option<u32>,
+    pub episode_number: Option<u32>,
 }
 
 /// Stream/format metadata pulled by `Prober::probe` (today: ffprobe).
@@ -48,6 +64,27 @@ pub struct MediaProbe {
     pub frame_rate_mille: Option<u32>,
     pub audio_channels: Option<u32>,
     pub sample_rate: Option<u32>,
+    /// Embedded subtitle tracks discovered by the prober. Stored
+    /// JSON-serialised in the `subtitle_tracks` column.
+    pub subtitle_tracks: Vec<SubtitleTrack>,
+}
+
+/// One embedded subtitle stream from the source file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubtitleTrack {
+    /// ffprobe stream index — what we pass `ffmpeg -map 0:s:<n>`.
+    pub stream_index: u32,
+    /// ISO-639 language tag when ffprobe emitted one.
+    pub language: Option<String>,
+    /// Codec name (`subrip`, `webvtt`, `ass`, ...) used to pick the
+    /// right extraction pipeline.
+    pub codec: Option<String>,
+    /// Optional human-readable title.
+    pub title: Option<String>,
+    /// `true` when the stream's `disposition.default` flag is set.
+    pub is_default: bool,
+    /// `true` when the stream's `disposition.forced` flag is set.
+    pub is_forced: bool,
 }
 
 impl MediaProbe {
@@ -164,6 +201,38 @@ pub trait UserDataStore: Send + Sync {
         &self,
         user: UserId,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+}
+
+/// Per-user free-form preferences (UserConfiguration + display
+/// preferences). Stored as JSON strings — the schema lives in
+/// jellyfin-web's UserConfigurationDto and varies by version, so
+/// the storage layer treats them as opaque payloads.
+pub trait PreferenceStore: Send + Sync {
+    fn get_user_configuration(
+        &self,
+        user: UserId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<String>>> + Send;
+
+    fn set_user_configuration(
+        &self,
+        user: UserId,
+        json: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    fn get_display_preferences(
+        &self,
+        user: UserId,
+        dp_id: &str,
+        client: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<String>>> + Send;
+
+    fn set_display_preferences(
+        &self,
+        user: UserId,
+        dp_id: &str,
+        client: &str,
+        json: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
 pub trait Scanner: Send + Sync {
