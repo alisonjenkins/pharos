@@ -6,6 +6,7 @@
 use crate::{
     auth::BuiltinAuth, hls_cache::HlsSegmentCache, image_cache::ImageCache,
     live_tv::M3uXmltvBackend, sessions::SessionRegistry,
+    transcode_sessions::TranscodeSessionRegistry,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::path::PathBuf;
@@ -31,12 +32,26 @@ pub enum SocketBroadcast {
         user_id: String,
         item_id: String,
     },
+    /// Remote-control command targeted at a single session.
+    /// T-fix-17 / T40 phase 2 — admin or another client tells session
+    /// `session_id` to pause / play / stop / seek / change volume.
+    /// `command` is the Jellyfin PlayState/Command name; `arg` is
+    /// freeform JSON the receiving client interprets per command.
+    SessionCommand {
+        session_id: String,
+        command: String,
+        arg: serde_json::Value,
+    },
 }
 
 pub struct AppState {
     pub stores: Stores,
     pub auth: Auth,
     pub sessions: SessionRegistry,
+    /// Per-play-session transcode negotiation cache (T-fix-2 part 2).
+    /// Populated by `playback_info`; read by HLS segment handler so
+    /// segments honour the negotiated codec/container/bitrate.
+    pub transcode_sessions: TranscodeSessionRegistry,
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
     pub live_tv: Option<M3uXmltvBackend>,
@@ -61,11 +76,13 @@ impl AppState {
     pub fn new(stores: Stores, server_name: String) -> Self {
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
+        let transcode_sessions = TranscodeSessionRegistry::spawn();
         let (bus, _) = broadcast::channel(256);
         Self {
             stores,
             auth,
             sessions,
+            transcode_sessions,
             images: None,
             hls: None,
             live_tv: None,
@@ -87,11 +104,13 @@ impl AppState {
         let server_id = stores.load_or_create_server_id().await?;
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
+        let transcode_sessions = TranscodeSessionRegistry::spawn();
         let (bus, _) = broadcast::channel(256);
         Ok(Self {
             stores,
             auth,
             sessions,
+            transcode_sessions,
             images: None,
             hls: None,
             live_tv: None,
@@ -135,6 +154,21 @@ impl AppState {
         let _ = self.bus.send(SocketBroadcast::UserDataChanged {
             user_id: user_id.to_string(),
             item_id: item_id.to_string(),
+        });
+    }
+
+    /// Fire a `SessionCommand` event for one target session.
+    /// Receivers ignore commands not addressed to them.
+    pub fn notify_session_command(
+        &self,
+        session_id: &str,
+        command: &str,
+        arg: serde_json::Value,
+    ) {
+        let _ = self.bus.send(SocketBroadcast::SessionCommand {
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            arg,
         });
     }
 }

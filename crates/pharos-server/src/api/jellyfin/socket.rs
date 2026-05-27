@@ -363,6 +363,23 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 "UserDataList": [{ "ItemId": item_id }],
             }),
         )),
+        SocketBroadcast::SessionCommand { session_id, command, arg } => Some(Outbound::new(
+            // Jellyfin uses different MessageTypes per command family.
+            // The `PlayState` family covers playback transport (Play
+            // /Pause/Stop/Seek/Volume) — that's what jellyfin-web's
+            // session card surfaces. General commands (DisplayContent,
+            // ToggleMute, ...) use `GeneralCommand`. For phase 2 we
+            // route every command via PlayState since the playback
+            // family is what unblocks the casting UI.
+            "PlayState",
+            serde_json::json!({
+                "ControllingUserId": "",
+                "SessionId": session_id,
+                "Command": command,
+                "SeekPositionTicks": arg.get("SeekPositionTicks").cloned(),
+                // The remote side filters on `SessionId == own`.
+            }),
+        )),
     }
 }
 
