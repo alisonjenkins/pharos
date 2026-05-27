@@ -39,6 +39,22 @@ impl Container {
             Self::Ogg => "audio/ogg",
         }
     }
+
+    /// Map a Jellyfin / ffprobe container token (lowercase) to the
+    /// enum. Returns `None` for unknown / unsupported targets so the
+    /// caller can fall back rather than 500.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mp4" | "m4v" => Some(Self::Mp4),
+            "mkv" | "matroska" => Some(Self::Mkv),
+            "webm" => Some(Self::WebM),
+            "ts" | "mpegts" => Some(Self::Mpegts),
+            "mp3" => Some(Self::Mp3),
+            "flac" => Some(Self::Flac),
+            "ogg" => Some(Self::Ogg),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +75,20 @@ impl VideoCodec {
             Self::Vp9 => "libvpx-vp9",
             Self::Av1 => "libaom-av1",
             Self::Copy => "copy",
+        }
+    }
+
+    /// Resolve a Jellyfin / probe codec name to the enum. Falls back
+    /// to `None` for codecs ffmpeg in our build can't encode (e.g.
+    /// proprietary HEVC variants without -enable-libx265).
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "h264" | "avc" | "avc1" => Some(Self::H264),
+            "h265" | "hevc" => Some(Self::H265),
+            "vp9" => Some(Self::Vp9),
+            "av1" => Some(Self::Av1),
+            "copy" => Some(Self::Copy),
+            _ => None,
         }
     }
 }
@@ -83,6 +113,18 @@ impl AudioCodec {
             Self::Flac => "flac",
             Self::Vorbis => "libvorbis",
             Self::Copy => "copy",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "aac" | "mp4a" => Some(Self::Aac),
+            "mp3" => Some(Self::Mp3),
+            "opus" => Some(Self::Opus),
+            "flac" => Some(Self::Flac),
+            "vorbis" => Some(Self::Vorbis),
+            "copy" => Some(Self::Copy),
+            _ => None,
         }
     }
 }
