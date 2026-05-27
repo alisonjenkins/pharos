@@ -157,6 +157,24 @@ async fn set_user_policy(
     let policy = UserPolicy {
         admin: body.is_administrator,
     };
+    // Symmetric to the self-delete guard: refuse a self-demotion if
+    // it would leave zero admins. Otherwise the dashboard is bricked.
+    if target == user.0.id && !policy.admin {
+        let users = state
+            .stores
+            .list()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let other_admins = users
+            .iter()
+            .filter(|u| u.id != user.0.id && u.policy.admin)
+            .count();
+        if other_admins == 0 {
+            return Err(error::ErrorBadRequest(
+                "cannot demote self — no other admins remain",
+            ));
+        }
+    }
     match state.stores.set_policy(target, policy).await {
         Ok(()) => Ok(HttpResponse::NoContent().finish()),
         Err(AuthError::UserNotFound) => Err(error::ErrorNotFound("user not found")),
