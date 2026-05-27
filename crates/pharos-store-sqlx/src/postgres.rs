@@ -347,6 +347,26 @@ impl TokenStore for PostgresStore {
             .map_err(map_sqlx)?;
         Ok(())
     }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn tokens_for(&self, user: UserId) -> AuthResult<Vec<pharos_core::TokenRecord>> {
+        let user_bytes = user.0.as_bytes().to_vec();
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT device_id, created_at FROM auth_tokens WHERE user_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(user_bytes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .map(|(device_id, issued_at_unix_secs)| pharos_core::TokenRecord {
+                device_id,
+                issued_at_unix_secs,
+            })
+            .collect())
+    }
 }
 
 impl UserDataStore for PostgresStore {

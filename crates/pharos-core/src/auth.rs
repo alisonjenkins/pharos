@@ -142,6 +142,22 @@ pub trait TokenStore: Send + Sync {
         &self,
         token: &str,
     ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+
+    /// Tokens issued to `user`. Drives admin "active devices" list. Each
+    /// entry carries the device_id (Emby-Authorization header) + issued_at
+    /// unix-seconds. Token strings deliberately not exposed.
+    fn tokens_for(
+        &self,
+        user: UserId,
+    ) -> impl std::future::Future<Output = AuthResult<Vec<TokenRecord>>> + Send;
+}
+
+/// Per-token metadata exposed to admin endpoints. The actual token
+/// string never leaves the auth backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecord {
+    pub device_id: String,
+    pub issued_at_unix_secs: i64,
 }
 
 /// High-level auth backend. Wraps a `UserStore` + password verifier.

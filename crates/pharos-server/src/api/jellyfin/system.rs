@@ -22,7 +22,28 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/users/{user_id}/configuration",
             web::post().to(user_configuration_update),
         )
-        .route("/playback/bitratetest", web::get().to(bitrate_test));
+        .route("/playback/bitratetest", web::get().to(bitrate_test))
+        // Localization endpoints — clients pull these once at
+        // startup to populate language / country dropdowns. Empty
+        // arrays keep the dropdown rendering ("no choices") without
+        // 404 cascade. Real localization data lands when pharos has
+        // a settings UI.
+        .route("/localization/cultures", web::get().to(localization_cultures))
+        .route("/localization/countries", web::get().to(localization_countries))
+        .route(
+            "/localization/parentalratings",
+            web::get().to(localization_parental_ratings),
+        )
+        .route("/localization/options", web::get().to(localization_options))
+        // Per-client device listing — admin dashboard reads this.
+        .route("/devices", web::get().to(devices_list))
+        .route("/devices/info", web::get().to(devices_list))
+        // MediaSegments (intro/outro skip) — empty stub keeps the
+        // client's pre-playback fetch from cascading 404s.
+        .route(
+            "/mediasegments/{item_id}",
+            web::get().to(media_segments_stub),
+        );
 }
 
 #[derive(serde::Deserialize)]
@@ -211,4 +232,97 @@ async fn system_info(
         encoder_location: "System",
         system_architecture: std::env::consts::ARCH,
     })
+}
+
+/// Single-locale stub — jellyfin-web's preferences dropdowns
+/// render fine with one option each. Real lists land when the
+/// settings UI surfaces a need.
+async fn localization_cultures(_user: AuthUser) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!([
+        {
+            "Name": "English",
+            "DisplayName": "English",
+            "TwoLetterISOLanguageName": "en",
+            "ThreeLetterISOLanguageName": "eng",
+            "ThreeLetterISOLanguageNames": ["eng"],
+        }
+    ]))
+}
+
+async fn localization_countries(_user: AuthUser) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!([
+        {
+            "Name": "US",
+            "DisplayName": "United States",
+            "TwoLetterISORegionName": "US",
+            "ThreeLetterISORegionName": "USA",
+        }
+    ]))
+}
+
+async fn localization_parental_ratings(_user: AuthUser) -> impl Responder {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    HttpResponse::Ok().json(empty)
+}
+
+async fn localization_options(_user: AuthUser) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!([
+        { "Name": "English (US)", "Value": "en-US" },
+    ]))
+}
+
+/// `GET /Devices` + `/Devices/Info` — admin dashboard's device list.
+/// Aggregated from the token store: each issued token is one device
+/// record. Currently exposes (device_id, user_id, last_user_name).
+async fn devices_list(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::{TokenStore, UserStore};
+    if !user.0.policy.admin {
+        return Err(error::ErrorForbidden("admin required"));
+    }
+    // We don't have a `list_all_tokens` API. Walk users, list tokens
+    // per user. Phase 1 small-N — admins live with the per-user scan.
+    let users = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for u in users {
+        let tokens = state
+            .stores
+            .tokens_for(u.id)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        for t in tokens {
+            items.push(serde_json::json!({
+                "Id": t.device_id,
+                "Name": t.device_id, // No DeviceName stored — phase 2.
+                "AppName": "Jellyfin",
+                "AppVersion": "0",
+                "LastUserId": u.id.0.simple().to_string(),
+                "LastUserName": u.name,
+                "DateLastActivity": "1970-01-01T00:00:00.0000000Z",
+            }));
+        }
+    }
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+async fn media_segments_stub(
+    _user: AuthUser,
+    _path: web::Path<String>,
+) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0,
+    }))
 }

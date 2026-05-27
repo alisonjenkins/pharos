@@ -377,3 +377,120 @@ async fn baseline_authenticate_envelope_keys() {
         "AuthenticateByName SessionInfo",
     );
 }
+
+#[actix_web::test]
+async fn baseline_localization_cultures_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Localization/Cultures")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v.as_array().expect("Cultures: top-level array");
+    assert!(!arr.is_empty(), "Cultures: at least one entry");
+    assert_keys_present(
+        &arr[0],
+        &[
+            "Name",
+            "DisplayName",
+            "TwoLetterISOLanguageName",
+            "ThreeLetterISOLanguageName",
+            "ThreeLetterISOLanguageNames",
+        ],
+        "/Localization/Cultures[0]",
+    );
+}
+
+#[actix_web::test]
+async fn baseline_localization_countries_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Localization/Countries")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v.as_array().expect("Countries: top-level array");
+    assert!(!arr.is_empty(), "Countries: at least one entry");
+    assert_keys_present(
+        &arr[0],
+        &[
+            "Name",
+            "DisplayName",
+            "TwoLetterISORegionName",
+            "ThreeLetterISORegionName",
+        ],
+        "/Localization/Countries[0]",
+    );
+}
+
+#[actix_web::test]
+async fn baseline_devices_envelope_keys() {
+    // /Devices is admin-gated; non-admin token returns 403.
+    // Promote our seeded user to admin first.
+    let (state, token, uid) = seed().await;
+    state
+        .stores
+        .set_policy(uid, UserPolicy { admin: true })
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Devices")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_keys_present(
+        &v,
+        &["Items", "TotalRecordCount", "StartIndex"],
+        "/Devices envelope",
+    );
+    let items = v["Items"].as_array().expect("Items array");
+    assert!(!items.is_empty(), "seeded token must surface as a device");
+    assert_keys_present(
+        &items[0],
+        &[
+            "Id",
+            "Name",
+            "AppName",
+            "AppVersion",
+            "LastUserId",
+            "LastUserName",
+            "DateLastActivity",
+        ],
+        "/Devices Items[0]",
+    );
+}
+
+#[actix_web::test]
+async fn baseline_mediasegments_envelope_keys() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/MediaSegments/1")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_keys_present(
+        &v,
+        &["Items", "TotalRecordCount", "StartIndex"],
+        "/MediaSegments envelope",
+    );
+}
