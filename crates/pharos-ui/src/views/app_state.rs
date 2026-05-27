@@ -12,16 +12,19 @@
 //! nothing useful.
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
-use crate::client::{AdminUser, SearchHint};
+use crate::client::{AdminUser, ItemDetail, SearchHint};
 use crate::views::{
-    AdminAction, AdminView, CreateUserAttempt, LibraryView, LoginAttempt, LoginForm,
-    PlayerView, SearchStatus, SearchView,
+    AdminAction, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
+    LoginAttempt, LoginForm, PlayerView, SearchStatus, SearchView,
 };
 use dioxus::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppRoute {
     Library,
+    Detail {
+        item_id: String,
+    },
     Player {
         item_id: String,
         kind: ItemKind,
@@ -132,9 +135,21 @@ fn Authenticated(
             AppRoute::Library => rsx! {
                 LibraryPane {
                     items_resource: items_resource,
+                    on_select: move |id: String| {
+                        route.set(AppRoute::Detail { item_id: id });
+                    }
+                }
+            },
+            AppRoute::Detail { item_id } => rsx! {
+                DetailPane {
+                    item_id: item_id.clone(),
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
+                    current_user_id: current_user_id.clone(),
                     on_play: move |(id, kind): (String, ItemKind)| {
                         route.set(AppRoute::Player { item_id: id, kind });
-                    }
+                    },
+                    on_back: move |_| { route.set(AppRoute::Library); },
                 }
             },
             AppRoute::Player { item_id, kind } => rsx! {
@@ -157,8 +172,8 @@ fn Authenticated(
                 SearchPane {
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
-                    on_play: move |(id, kind): (String, ItemKind)| {
-                        route.set(AppRoute::Player { item_id: id, kind });
+                    on_select: move |id: String| {
+                        route.set(AppRoute::Detail { item_id: id });
                     }
                 }
             }
@@ -170,7 +185,7 @@ fn Authenticated(
 fn SearchPane(
     access_token: String,
     server_base: String,
-    on_play: EventHandler<(String, ItemKind)>,
+    on_select: EventHandler<String>,
 ) -> Element {
     let mut query = use_signal(String::new);
     let hits = use_signal::<Vec<SearchHint>>(Vec::new);
@@ -220,15 +235,150 @@ fn SearchPane(
                 do_search.clone()(q);
             },
             on_play: move |id: String| {
-                let kind = hits
-                    .read()
-                    .iter()
-                    .find(|h| h.id == id)
-                    .map(|h| h.kind)
-                    .unwrap_or(ItemKind::Movie);
-                on_play.call((id, kind));
+                // Click on a search hit routes to detail; user
+                // hits Play from there. Matches jellyfin-web flow.
+                on_select.call(id);
             },
         }
+    }
+}
+
+#[component]
+fn DetailPane(
+    item_id: String,
+    access_token: String,
+    server_base: String,
+    current_user_id: String,
+    on_play: EventHandler<(String, ItemKind)>,
+    on_back: EventHandler<()>,
+) -> Element {
+    let reload = use_signal(|| 0u32);
+    let status = use_signal::<Option<String>>(|| None);
+    let detail_resource = {
+        let id = item_id.clone();
+        let token = access_token.clone();
+        let base = server_base.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let id = id.clone();
+            let token = token.clone();
+            let base = base.clone();
+            async move { fetch_item_detail_via_client(&base, &token, &id).await }
+        })
+    };
+
+    let action_handler = {
+        let access_token = access_token.clone();
+        let server_base = server_base.clone();
+        let item_id_for_handler = item_id.clone();
+        let mut reload_signal = reload;
+        let mut status_signal = status;
+        let on_back = on_back;
+        let on_play = on_play;
+        move |action: DetailAction| {
+            let token = access_token.clone();
+            let base = server_base.clone();
+            let id = item_id_for_handler.clone();
+            match action {
+                DetailAction::Back => on_back.call(()),
+                DetailAction::Play => {
+                    // Read the latest fetched detail to learn the kind.
+                    let kind = detail_resource
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|d| d.kind)
+                        .unwrap_or(ItemKind::Movie);
+                    on_play.call((id, kind));
+                }
+                DetailAction::TogglePlayed => {
+                    let played_now = detail_resource
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|d| d.played)
+                        .unwrap_or(false);
+                    let user_id = current_user_id.clone();
+                    spawn(async move {
+                        match toggle_played(&base, &token, &user_id, &id, !played_now).await {
+                            Ok(()) => {
+                                status_signal.set(None);
+                                let n = *reload_signal.read();
+                                reload_signal.set(n.wrapping_add(1));
+                            }
+                            Err(e) => {
+                                status_signal.set(Some(format!("Played toggle failed: {e}")));
+                            }
+                        }
+                    });
+                }
+                DetailAction::ToggleFavorite => {
+                    let fav_now = detail_resource
+                        .read()
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(|d| d.is_favorite)
+                        .unwrap_or(false);
+                    let user_id = current_user_id.clone();
+                    spawn(async move {
+                        match toggle_favorite(&base, &token, &user_id, &id, !fav_now).await {
+                            Ok(()) => {
+                                status_signal.set(None);
+                                let n = *reload_signal.read();
+                                reload_signal.set(n.wrapping_add(1));
+                            }
+                            Err(e) => {
+                                status_signal.set(Some(format!("Favourite toggle failed: {e}")));
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    };
+
+    let value = detail_resource.read_unchecked();
+    let (detail_opt, fetch_err) = match value.as_ref() {
+        None => (None, Some("loading…".to_string())),
+        Some(Ok(d)) => (Some(d.clone()), None),
+        Some(Err(e)) => (None, Some(e.clone())),
+    };
+    let combined_status = fetch_err.or_else(|| status.read().clone());
+
+    match detail_opt {
+        Some(detail) => {
+            let primary_image_url = if detail.has_primary_image {
+                Some(format!(
+                    "{server_base}/Items/{item_id}/Images/Primary?api_key={access_token}"
+                ))
+            } else {
+                None
+            };
+            rsx! {
+                ItemDetailView {
+                    detail: detail,
+                    error: combined_status,
+                    primary_image_url: primary_image_url,
+                    on_action: action_handler,
+                }
+            }
+        }
+        None => rsx! {
+            div {
+                class: "pharos-detail-loading",
+                button {
+                    class: "pharos-detail-back",
+                    onclick: move |_| on_back.call(()),
+                    "← Back"
+                }
+                if let Some(s) = combined_status.as_ref() {
+                    p { class: "pharos-error", "{s}" }
+                } else {
+                    p { "loading…" }
+                }
+            }
+        },
     }
 }
 
@@ -309,24 +459,17 @@ fn AdminPane(
 #[component]
 fn LibraryPane(
     items_resource: Resource<Result<Vec<LibraryItem>, String>>,
-    on_play: EventHandler<(String, ItemKind)>,
+    on_select: EventHandler<String>,
 ) -> Element {
     let value = items_resource.read_unchecked();
     match value.as_ref() {
         None => rsx! { p { class: "pharos-loading", "Loading library…" } },
         Some(Err(e)) => rsx! { p { class: "pharos-error", "Library error: {e}" } },
         Some(Ok(items)) => {
-            // Map from `LibraryItem` click (id only) to (id, kind) by walking
-            // the snapshot. Cheap for phase-1 library sizes.
-            let items_for_lookup = items.clone();
             rsx! {
                 LibraryView {
                     items: items.clone(),
-                    on_play: move |id: String| {
-                        if let Some(it) = items_for_lookup.iter().find(|i| i.id == id) {
-                            on_play.call((it.id.clone(), it.kind));
-                        }
-                    }
+                    on_play: move |id: String| on_select.call(id),
                 }
             }
         }
@@ -453,6 +596,74 @@ async fn library_refresh(base: &str, token: &str) -> Result<(), String> {
 #[cfg(not(feature = "web"))]
 async fn library_refresh(_base: &str, _token: &str) -> Result<(), String> {
     Err("library_refresh is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_item_detail_via_client(
+    base: &str,
+    token: &str,
+    id: &str,
+) -> Result<ItemDetail, String> {
+    crate::client::web::fetch_item_detail(base, token, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_item_detail_via_client(
+    _base: &str,
+    _token: &str,
+    _id: &str,
+) -> Result<ItemDetail, String> {
+    Err("item detail fetch is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn toggle_played(
+    base: &str,
+    token: &str,
+    user_id: &str,
+    item_id: &str,
+    played: bool,
+) -> Result<(), String> {
+    crate::client::web::mark_played(base, token, user_id, item_id, played)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn toggle_played(
+    _base: &str,
+    _token: &str,
+    _user_id: &str,
+    _item_id: &str,
+    _played: bool,
+) -> Result<(), String> {
+    Err("mark_played is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn toggle_favorite(
+    base: &str,
+    token: &str,
+    user_id: &str,
+    item_id: &str,
+    favorite: bool,
+) -> Result<(), String> {
+    crate::client::web::mark_favorite(base, token, user_id, item_id, favorite)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn toggle_favorite(
+    _base: &str,
+    _token: &str,
+    _user_id: &str,
+    _item_id: &str,
+    _favorite: bool,
+) -> Result<(), String> {
+    Err("mark_favorite is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

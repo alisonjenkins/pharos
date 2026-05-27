@@ -389,8 +389,10 @@ fn detail_unplayed_no_position() -> Element {
                 play_count: 0,
                 is_favorite: false,
                 playback_position_ticks: 0,
+                ..Default::default()
             },
             error: None,
+            primary_image_url: None,
             on_action: move |_| {},
         }
     }
@@ -408,8 +410,53 @@ fn detail_resumable_played_favorite() -> Element {
                 play_count: 3,
                 is_favorite: true,
                 playback_position_ticks: 30 * 60 * 10_000_000,
+                series_name: Some("The Expanse".into()),
+                season_index: Some(1),
+                episode_index: Some(1),
+                ..Default::default()
             },
             error: None,
+            primary_image_url: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn detail_audio() -> Element {
+    rsx! {
+        ItemDetailView {
+            detail: ItemDetail {
+                id: "5".into(),
+                name: "End Titles".into(),
+                kind: ItemKind::Audio,
+                run_time_ticks: 3 * 60 * 10_000_000,
+                artists: vec!["Vangelis".into()],
+                album: Some("Blade Runner OST".into()),
+                album_artists: vec!["Vangelis".into()],
+                ..Default::default()
+            },
+            error: None,
+            primary_image_url: Some("/Items/5/Images/Primary?api_key=tok".into()),
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn detail_episode_breadcrumb_series_only() -> Element {
+    rsx! {
+        ItemDetailView {
+            detail: ItemDetail {
+                id: "9".into(),
+                name: "Pilot".into(),
+                kind: ItemKind::Episode,
+                run_time_ticks: 60 * 60 * 10_000_000,
+                series_name: Some("Andor".into()),
+                season_index: None,
+                episode_index: None,
+                ..Default::default()
+            },
+            error: None,
+            primary_image_url: None,
             on_action: move |_| {},
         }
     }
@@ -439,4 +486,31 @@ fn detail_view_resume_button_renders_when_positionticks_set() {
     // play_count display.
     assert!(html.contains("pharos-detail-playcount"), "{html}");
     assert!(html.contains(">3<"), "{html}");
+    // T54 phase 2: series breadcrumb + S/E.
+    assert!(html.contains("pharos-detail-series"), "{html}");
+    assert!(html.contains("The Expanse"), "{html}");
+    assert!(html.contains("S01E01"), "{html}");
+}
+
+#[test]
+fn detail_view_audio_renders_artist_album_and_primary_image() {
+    let html = render_root(detail_audio);
+    assert!(html.contains("pharos-detail-audio-meta"), "{html}");
+    assert!(html.contains("Vangelis"), "{html}");
+    assert!(html.contains("Blade Runner OST"), "{html}");
+    // album_artists same as artists → no separate line.
+    assert!(!html.contains("Album artist:"), "duplicate album artist line: {html}");
+    // Image figure rendered when primary_image_url set.
+    assert!(html.contains("pharos-detail-primary"), "{html}");
+    assert!(html.contains("/Items/5/Images/Primary?api_key=tok"), "{html}");
+}
+
+#[test]
+fn detail_view_episode_with_only_series_name_omits_se_label() {
+    let html = render_root(detail_episode_breadcrumb_series_only);
+    assert!(html.contains("pharos-detail-series"), "{html}");
+    assert!(html.contains("Andor"), "{html}");
+    // No S/E label when both indices missing.
+    assert!(!html.contains("S00"), "{html}");
+    assert!(!html.contains("pharos-detail-episode-index"), "{html}");
 }

@@ -4,6 +4,7 @@
 //! playback_position_ticks > 0. Fetch + mutation live in the
 //! WASM-side client; this component is pure (props in / events out).
 
+use crate::api_types::ItemKind;
 use crate::client::ItemDetail;
 use dioxus::prelude::*;
 
@@ -34,16 +35,46 @@ fn format_runtime(ticks: u64) -> String {
     }
 }
 
+/// "S01E03" — both indices known. Falls back to whichever fragment
+/// is available, returning None when neither is set.
+fn format_episode_index(season: Option<u32>, episode: Option<u32>) -> Option<String> {
+    match (season, episode) {
+        (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02}")),
+        (Some(s), None) => Some(format!("S{s:02}")),
+        (None, Some(e)) => Some(format!("E{e:02}")),
+        (None, None) => None,
+    }
+}
+
 #[component]
 pub fn ItemDetailView(
     detail: ItemDetail,
     error: Option<String>,
+    /// When set, renders a `<img class="pharos-detail-primary">` tag
+    /// pointing at the resolved image URL. None hides the figure.
+    /// Caller composes the URL (`/Items/{id}/Images/Primary?api_key=…`).
+    primary_image_url: Option<String>,
     on_action: EventHandler<DetailAction>,
 ) -> Element {
     let kind_label = detail.kind.label();
     let runtime = format_runtime(detail.run_time_ticks);
     let resumable = detail.playback_position_ticks > 0 && !detail.played;
     let resume_text = format_runtime(detail.playback_position_ticks);
+    let episode_label = format_episode_index(detail.season_index, detail.episode_index);
+    let series_label = detail.series_name.clone();
+    let artists_line = if !detail.artists.is_empty() {
+        Some(detail.artists.join(", "))
+    } else {
+        None
+    };
+    let album_line = detail.album.clone();
+    let album_artists_line = if !detail.album_artists.is_empty()
+        && detail.album_artists != detail.artists
+    {
+        Some(detail.album_artists.join(", "))
+    } else {
+        None
+    };
 
     rsx! {
         article {
@@ -57,6 +88,50 @@ pub fn ItemDetailView(
                     "← Back"
                 }
                 h1 { class: "pharos-detail-title", "{detail.name}" }
+                // Series breadcrumb above the title for episodes — mirrors
+                // jellyfin-web's `series · S01E03` line. Only renders when
+                // we actually have something to show.
+                if detail.kind == ItemKind::Episode {
+                    p {
+                        class: "pharos-detail-series",
+                        if let Some(s) = series_label.as_ref() {
+                            span { class: "pharos-detail-series-name", "{s}" }
+                        }
+                        if let Some(ep) = episode_label.as_ref() {
+                            if series_label.is_some() { " · " }
+                            span { class: "pharos-detail-episode-index", "{ep}" }
+                        }
+                    }
+                }
+                if detail.kind == ItemKind::Audio {
+                    p {
+                        class: "pharos-detail-audio-meta",
+                        if let Some(a) = artists_line.as_ref() {
+                            span { class: "pharos-detail-artists", "{a}" }
+                        }
+                        if let Some(al) = album_line.as_ref() {
+                            if artists_line.is_some() { " — " }
+                            span { class: "pharos-detail-album", "{al}" }
+                        }
+                        if let Some(aa) = album_artists_line.as_ref() {
+                            br {}
+                            span {
+                                class: "pharos-detail-album-artists",
+                                "Album artist: {aa}"
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(url) = primary_image_url.as_ref() {
+                figure {
+                    class: "pharos-detail-primary",
+                    img {
+                        src: "{url}",
+                        alt: "{detail.name}",
+                    }
+                }
             }
 
             if let Some(err) = error.as_ref() {
@@ -116,5 +191,13 @@ mod tests {
         let a = DetailAction::Play;
         assert_eq!(a, DetailAction::Play);
         assert_ne!(DetailAction::Play, DetailAction::Back);
+    }
+
+    #[test]
+    fn format_episode_index_branches() {
+        assert_eq!(format_episode_index(Some(1), Some(3)).as_deref(), Some("S01E03"));
+        assert_eq!(format_episode_index(Some(2), None).as_deref(), Some("S02"));
+        assert_eq!(format_episode_index(None, Some(7)).as_deref(), Some("E07"));
+        assert_eq!(format_episode_index(None, None), None);
     }
 }

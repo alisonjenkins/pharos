@@ -138,7 +138,11 @@ struct SearchHintsResultDto {
 }
 
 /// T54 — single-item detail (`GET /Items/{id}` shape, projection).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Phase 2 adds episode + audio hierarchy + image-presence so the
+/// detail view can render S/E breadcrumbs, artist/album lines, and
+/// the Primary backdrop without re-fetching.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ItemDetail {
     pub id: String,
     pub name: String,
@@ -148,6 +152,23 @@ pub struct ItemDetail {
     pub play_count: u32,
     pub is_favorite: bool,
     pub playback_position_ticks: u64,
+    /// Episode-only: parent series display name.
+    pub series_name: Option<String>,
+    /// Episode-only: season number (jellyfin's ParentIndexNumber).
+    pub season_index: Option<u32>,
+    /// Episode-only: episode number within season (IndexNumber).
+    pub episode_index: Option<u32>,
+    /// Audio-only: track artists, in display order.
+    pub artists: Vec<String>,
+    /// Audio-only: album name.
+    pub album: Option<String>,
+    /// Audio-only: album-level artists (often == artists, sometimes "Various Artists").
+    pub album_artists: Vec<String>,
+    /// True when ImageTags contains a "Primary" entry — caller composes
+    /// the `/Items/{id}/Images/Primary` URL.
+    pub has_primary_image: bool,
+    /// True when BackdropImageTags is non-empty.
+    pub has_backdrop_image: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +184,22 @@ struct ItemDetailDto {
     run_time_ticks: u64,
     #[serde(default)]
     user_data: ItemDetailUserDataDto,
+    #[serde(default)]
+    series_name: Option<String>,
+    #[serde(default)]
+    parent_index_number: Option<u32>,
+    #[serde(default)]
+    index_number: Option<u32>,
+    #[serde(default)]
+    artists: Vec<String>,
+    #[serde(default)]
+    album: Option<String>,
+    #[serde(default)]
+    album_artists: Vec<NameGuidPairDto>,
+    #[serde(default)]
+    image_tags: serde_json::Value,
+    #[serde(default)]
+    backdrop_image_tags: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -174,9 +211,21 @@ struct ItemDetailUserDataDto {
     playback_position_ticks: u64,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct NameGuidPairDto {
+    name: String,
+}
+
 pub fn parse_item_detail_response(bytes: &[u8]) -> Result<ItemDetail, ClientError> {
     let parsed: ItemDetailDto =
         serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    let has_primary_image = parsed
+        .image_tags
+        .as_object()
+        .map(|m| m.contains_key("Primary"))
+        .unwrap_or(false);
+    let has_backdrop_image = !parsed.backdrop_image_tags.is_empty();
     Ok(ItemDetail {
         id: parsed.id,
         name: parsed.name,
@@ -186,6 +235,14 @@ pub fn parse_item_detail_response(bytes: &[u8]) -> Result<ItemDetail, ClientErro
         play_count: parsed.user_data.play_count,
         is_favorite: parsed.user_data.is_favorite,
         playback_position_ticks: parsed.user_data.playback_position_ticks,
+        series_name: parsed.series_name,
+        season_index: parsed.parent_index_number,
+        episode_index: parsed.index_number,
+        artists: parsed.artists,
+        album: parsed.album,
+        album_artists: parsed.album_artists.into_iter().map(|p| p.name).collect(),
+        has_primary_image,
+        has_backdrop_image,
     })
 }
 
@@ -539,5 +596,56 @@ mod tests {
             br#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#;
         let items = parse_items_response(body).unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_item_detail_episode_extracts_series_and_indices() {
+        let body = br#"{
+            "Id":"e1","Name":"Pilot","Type":"Episode","RunTimeTicks":24000000000,
+            "SeriesName":"Andor","ParentIndexNumber":1,"IndexNumber":3,
+            "ImageTags":{"Primary":"abc"},"BackdropImageTags":[],
+            "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
+        }"#;
+        let d = parse_item_detail_response(body).unwrap();
+        assert_eq!(d.series_name.as_deref(), Some("Andor"));
+        assert_eq!(d.season_index, Some(1));
+        assert_eq!(d.episode_index, Some(3));
+        assert!(d.has_primary_image);
+        assert!(!d.has_backdrop_image);
+    }
+
+    #[test]
+    fn parse_item_detail_audio_extracts_artists_album() {
+        let body = br#"{
+            "Id":"a1","Name":"Tears in Rain","Type":"Audio","RunTimeTicks":1800000000,
+            "Artists":["Vangelis"],"Album":"Blade Runner OST",
+            "AlbumArtists":[{"Name":"Vangelis","Id":"va"}],
+            "ImageTags":{},"BackdropImageTags":["bg1"],
+            "UserData":{"Played":true,"PlayCount":4,"IsFavorite":true,"PlaybackPositionTicks":0}
+        }"#;
+        let d = parse_item_detail_response(body).unwrap();
+        assert_eq!(d.artists, vec!["Vangelis"]);
+        assert_eq!(d.album.as_deref(), Some("Blade Runner OST"));
+        assert_eq!(d.album_artists, vec!["Vangelis"]);
+        assert!(!d.has_primary_image);
+        assert!(d.has_backdrop_image);
+        assert_eq!(d.play_count, 4);
+        assert!(d.is_favorite);
+    }
+
+    #[test]
+    fn parse_item_detail_movie_defaults_have_no_episode_fields() {
+        let body = br#"{
+            "Id":"m1","Name":"Blade Runner","Type":"Movie","RunTimeTicks":70200000000,
+            "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
+        }"#;
+        let d = parse_item_detail_response(body).unwrap();
+        assert!(d.series_name.is_none());
+        assert!(d.season_index.is_none());
+        assert!(d.episode_index.is_none());
+        assert!(d.artists.is_empty());
+        assert!(d.album.is_none());
+        assert!(!d.has_primary_image);
+        assert!(!d.has_backdrop_image);
     }
 }
