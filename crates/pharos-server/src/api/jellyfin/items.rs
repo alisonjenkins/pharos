@@ -958,6 +958,12 @@ struct ListQuery {
     min_index_number: Option<u32>,
     #[serde(default)]
     max_index_number: Option<u32>,
+    /// `HasSubtitles=true` returns only items with at least one
+    /// subtitle track (embedded or sidecar — pharos reads embedded
+    /// from `probe.subtitle_tracks`). `false` returns only items
+    /// without. Real Jellyfin honours both directions.
+    #[serde(default)]
+    has_subtitles: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1286,6 +1292,9 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
                 MediaKind::Movie | MediaKind::Episode => want_video,
             });
         }
+    }
+    if let Some(want) = q.has_subtitles {
+        items.retain(|i| i.probe.subtitle_tracks.is_empty() != want);
     }
     if let Some(min) = q.min_index_number {
         items.retain(|i| {
