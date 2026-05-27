@@ -258,3 +258,37 @@ fn url_encode(s: &str) -> String {
     }
     out
 }
+
+/// `Fields=…` is jellyfin-web's per-call DTO field selector. Pharos
+/// always emits the full DTO; the param must be ignored gracefully
+/// (no 4xx parse rejection, no 5xx).
+#[actix_web::test]
+async fn fields_query_param_is_silently_accepted() {
+    let (state, reg, token, _) = seed().await;
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
+    state
+        .stores
+        .put(MediaItem {
+            id: 7,
+            path: "/m/x.mkv".into(),
+            title: "x".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(state, reg)).await;
+    let fields = "PrimaryImageAspectRatio,DateCreated,Path,MediaSourceCount,Overview,People,Tags,SortName";
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!(
+                "/Items?Limit=5&Fields={}&EnableImageTypes=Primary%2CBackdrop",
+                fields
+            ))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{resp:?}");
+}

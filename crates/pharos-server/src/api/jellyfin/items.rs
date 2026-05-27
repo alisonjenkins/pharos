@@ -50,7 +50,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/items/{id}/playbackinfo", web::post().to(playback_info));
 
     for path in [
-        "/items/{id}/similar",
         "/items/{id}/thememedia",
         "/items/{id}/themesongs",
         "/items/{id}/themevideos",
@@ -61,6 +60,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     ] {
         cfg.route(path, web::get().to(empty_items_result));
     }
+    cfg.route("/items/{id}/similar", web::get().to(items_similar));
     // /Genres + /Studios aggregate over MediaItem.{genre, album_artist}
     // tags. Replace stub when those columns ship — T-fix-31.
     cfg.route("/genres", web::get().to(list_genres))
@@ -81,6 +81,128 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
         "TotalRecordCount": 0,
         "StartIndex": 0,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SimilarQuery {
+    #[serde(default = "default_similar_limit")]
+    limit: u32,
+    #[serde(default)]
+    #[allow(dead_code)]
+    user_id: Option<String>,
+}
+fn default_similar_limit() -> u32 {
+    12
+}
+
+/// `GET /Items/{id}/Similar` — "more like this" for the item-detail
+/// view. Heuristic, ordered by overlap score:
+///
+/// - Episode → other episodes in the same Series (excluding self),
+///   then other episodes period.
+/// - Audio → tracks sharing album → album_artist → genre.
+/// - Movie → other Movies tagged with the same genre, falling
+///   through to other Movies sorted by title.
+async fn items_similar(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<SimilarQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    let id_str = path.into_inner();
+    let id: u64 = match id_str.parse() {
+        Ok(v) => v,
+        // Synth ids (library / series / season / artist / album / genre)
+        // — no "similar" semantics, return empty rather than 4xx.
+        Err(_) => {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
+            })));
+        }
+    };
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let Some(target) = all.iter().find(|i| i.id == id) else {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
+        })));
+    };
+    // Score every other item by overlap with the target.
+    let mut scored: Vec<(u32, &MediaItem)> = all
+        .iter()
+        .filter(|i| i.id != target.id)
+        .map(|i| (similarity_score(target, i), i))
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
+    let picks: Vec<&MediaItem> = scored
+        .iter()
+        .map(|(_, i)| *i)
+        .take(q.limit as usize)
+        .collect();
+    let ids: Vec<u64> = picks.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.0.id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut dtos: Vec<BaseItemDto> = picks
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        })
+        .collect();
+    fill_parent_ids(&state, &mut dtos, &picks);
+    let total = dtos.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": dtos,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// Score `candidate` for similarity to `target`. Higher = more
+/// similar. Zero excludes.
+fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
+    let mut s = 0u32;
+    // Same Series (Episode) is the strongest signal.
+    if let (Some(t), Some(c)) = (target.series.as_ref(), candidate.series.as_ref()) {
+        if t.series_name.eq_ignore_ascii_case(&c.series_name) {
+            s += 100;
+        }
+    }
+    // Same album_artist (Audio) — same artist's catalogue.
+    if let (Some(t), Some(c)) =
+        (target.probe.album_artist.as_deref(), candidate.probe.album_artist.as_deref())
+    {
+        if t.eq_ignore_ascii_case(c) {
+            s += 50;
+        }
+    }
+    // Same album (Audio) — same album's tracks.
+    if let (Some(t), Some(c)) = (target.probe.album.as_deref(), candidate.probe.album.as_deref()) {
+        if t.eq_ignore_ascii_case(c) {
+            s += 40;
+        }
+    }
+    // Same genre — broadly works for every kind.
+    if let (Some(t), Some(c)) = (target.probe.genre.as_deref(), candidate.probe.genre.as_deref()) {
+        if t.eq_ignore_ascii_case(c) {
+            s += 20;
+        }
+    }
+    // Same kind — weak signal but stops Movies surfacing as similar
+    // to Audio tracks when no other field overlaps.
+    if target.kind == candidate.kind {
+        s = s.saturating_add(5);
+    }
+    s
 }
 
 /// `GET /Genres` — aggregate every distinct `genre` tag across all

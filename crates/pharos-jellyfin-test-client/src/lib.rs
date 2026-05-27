@@ -73,6 +73,10 @@ impl JellyfinClient {
         self.token.as_deref()
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     fn auth_header_value(&self, token: Option<&str>) -> String {
         let mut v = format!(
             r#"MediaBrowser Client="{}", Device="{}", DeviceId="{}", Version="{}""#,

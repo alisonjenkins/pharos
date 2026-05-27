@@ -1219,3 +1219,91 @@ async fn sort_by_albumartist_groups_tracks() {
     // Alpha tracks first (A song, M song), then Beta (Z song).
     assert_eq!(names, vec!["A song", "M song", "Z song"]);
 }
+
+#[actix_web::test]
+async fn items_similar_scores_by_series_then_genre() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    // Target: My Show S01E01
+    stores
+        .put(MediaItem {
+            id: 1,
+            path: "/m/My Show/Season 1/s01e01.mkv".into(),
+            title: "S01E01".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "My Show".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Same series, different episode — should score highest.
+    stores
+        .put(MediaItem {
+            id: 2,
+            path: "/m/My Show/Season 1/s01e02.mkv".into(),
+            title: "S01E02".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "My Show".into(),
+                season_number: Some(1),
+                episode_number: Some(2),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Different series — should be filtered out (score 5 only from
+    // same-kind; still > 0 so it ranks behind same-series).
+    stores
+        .put(MediaItem {
+            id: 3,
+            path: "/m/Other Show/Season 1/s01e01.mkv".into(),
+            title: "Other E01".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Other Show".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/1/Similar")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    // Same-series episode ranks first.
+    assert_eq!(names.first(), Some(&"S01E02"));
+    // Self never appears.
+    assert!(!names.contains(&"S01E01"));
+}

@@ -141,6 +141,70 @@ async fn full_jellyfin_client_flow() {
     //    — what matters here is that the endpoint deserializes to a list.
     let sessions = client.sessions().await.unwrap();
     assert!(sessions.is_empty());
+
+    // 9-15: extended endpoints added since this test was written
+    // (Genres / Artists / Albums / Suggestions / NextUp / SyncPlay
+    // / Sessions remote). Drive them via awc with the same bearer
+    // token; assert (status < 500, well-formed JSON envelope where
+    // applicable). Catches mid-roll wire-shape regressions.
+    let token = client.token().expect("authenticated").to_string();
+    let base = client.base_url().to_string();
+    let c = awc::Client::default();
+    for path in [
+        "/Genres",
+        "/Artists",
+        "/Albums",
+        "/Studios",
+        "/Search/Suggestions",
+        &format!("/Users/{}/Suggestions", auth.user.id),
+        "/Shows/NextUp?Limit=5",
+        "/SyncPlay/List",
+        &format!("/Items/{}/Similar", first.id),
+    ] {
+        let mut resp = c
+            .get(&format!("{base}{path}"))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "{path} → {}",
+            resp.status()
+        );
+        let body = resp.body().await.unwrap();
+        let _v: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("{path}: bad json {e}"));
+    }
+    // PlaybackInfo with a realistic device profile must return
+    // SupportsDirectPlay alongside Container/MediaStreams.
+    let mut pi = c
+        .post(&format!("{base}/Items/{}/PlaybackInfo", first.id))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("content-type", "application/json"))
+        .send_body(
+            r#"{"DeviceProfile":{
+              "DirectPlayProfiles":[{"Container":"webm","Type":"Video"}]
+            }}"#,
+        )
+        .await
+        .unwrap();
+    assert!(pi.status().is_success(), "PlaybackInfo: {}", pi.status());
+    let body = pi.body().await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["MediaSources"][0]["Container"].is_string());
+    assert!(v["PlaySessionId"].is_string());
+    // Sessions remote-control: Pause command should 204 even with
+    // no live session matching the id (the bus delivers; nobody
+    // listens).
+    let pause = c
+        .post(&format!("{base}/Sessions/no-such/Playing/Pause"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("content-type", "application/json"))
+        .send_body("{}")
+        .await
+        .unwrap();
+    assert_eq!(pause.status().as_u16(), 204);
 }
 
 #[actix_web::test]

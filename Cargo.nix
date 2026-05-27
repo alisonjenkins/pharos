@@ -1918,7 +1918,7 @@ rec {
           "tls-rustls-0_23" = [ "dep:tls-rustls-0_23" ];
           "trust-dns" = [ "hickory-dns" ];
         };
-        resolvedDefaultFeatures = [ "cookies" ];
+        resolvedDefaultFeatures = [ "__compress" "compress-brotli" "compress-gzip" "compress-zstd" "cookies" "default" ];
       };
       "base64" = rec {
         crateName = "base64";
@@ -8260,6 +8260,10 @@ rec {
           {
             name = "actix-test";
             packageId = "actix-test";
+          }
+          {
+            name = "awc";
+            packageId = "awc";
           }
           {
             name = "pharos-jellyfin-test-client";
