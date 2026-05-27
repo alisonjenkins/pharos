@@ -1248,13 +1248,15 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
             }
         }
         "AlbumArtist" => {
+            // Unicode-aware case-fold so accented artist names sort
+            // consistently against ASCII ones (Ärzte vs Adele).
             items.sort_by(|a, b| {
                 let an = a.probe.album_artist.as_deref().unwrap_or("");
                 let bn = b.probe.album_artist.as_deref().unwrap_or("");
-                an.to_ascii_lowercase()
-                    .cmp(&bn.to_ascii_lowercase())
+                an.to_lowercase()
+                    .cmp(&bn.to_lowercase())
                     // Tiebreak by title for stable per-artist track order.
-                    .then(a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+                    .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
             });
             if descending {
                 items.reverse();
@@ -1264,9 +1266,9 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
             items.sort_by(|a, b| {
                 let an = a.probe.album.as_deref().unwrap_or("");
                 let bn = b.probe.album.as_deref().unwrap_or("");
-                an.to_ascii_lowercase()
-                    .cmp(&bn.to_ascii_lowercase())
-                    .then(a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+                an.to_lowercase()
+                    .cmp(&bn.to_lowercase())
+                    .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
             });
             if descending {
                 items.reverse();
@@ -1276,8 +1278,8 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
         _ => {
             items.sort_by(|a, b| {
                 a.title
-                    .to_ascii_lowercase()
-                    .cmp(&b.title.to_ascii_lowercase())
+                    .to_lowercase()
+                    .cmp(&b.title.to_lowercase())
             });
             if descending {
                 items.reverse();
@@ -1288,16 +1290,17 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
 }
 
 fn jellyfin_type_to_kind(s: &str) -> Option<MediaKind> {
-    match s {
-        "Movie" => Some(MediaKind::Movie),
-        "Episode" => Some(MediaKind::Episode),
-        "Audio" => Some(MediaKind::Audio),
+    // Case-insensitive — some clients send lowercase (Finamp's
+    // `audio`), real Jellyfin accepts both. Server-side ascii-fold
+    // is fine: these are all ASCII identifiers.
+    match s.to_ascii_lowercase().as_str() {
+        "movie" => Some(MediaKind::Movie),
+        "episode" => Some(MediaKind::Episode),
+        "audio" => Some(MediaKind::Audio),
         _ => None,
     }
 }
 
-/// Deterministic-when-tested shuffle. Uses `getrandom` to seed a small
-/// xorshift so the random-sort doesn't pull in the rand crate.
 /// xorshift64 Fisher–Yates. Deterministic for a given seed — same
 /// `(items, seed)` yields the same permutation. Caller threads a
 /// seed (from `?SortSeed=` or the bearer's user id) so /Items?
