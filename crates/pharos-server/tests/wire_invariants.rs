@@ -352,7 +352,62 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
     assert!(url.contains("/Subtitles/2/Stream.vtt"), "{url}");
 }
 
-/// (7) — Episode promotion. A path that matches the TV-layout
+/// (7) — Video items advertise Primary + Backdrop + Thumb ImageTags
+/// so jellyfin-web's tile grid renders covers without 404-ing on
+/// /Items/{id}/Images/Primary?tag=…. Audio gets Primary only.
+#[actix_web::test]
+async fn video_item_advertises_primary_backdrop_thumb_image_tags() {
+    let (state, token) = seed_with_items(vec![
+        MediaItem {
+            id: 100,
+            path: "/m/movie.mkv".into(),
+            title: "Movie".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        },
+        MediaItem {
+            id: 101,
+            path: "/m/song.mp3".into(),
+            title: "Song".into(),
+            kind: MediaKind::Audio,
+            ..Default::default()
+        },
+    ])
+    .await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/100")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tags = v["ImageTags"].as_object().expect("ImageTags object");
+    assert!(tags.contains_key("Primary"), "{tags:?}");
+    assert!(tags.contains_key("Backdrop"), "{tags:?}");
+    assert!(tags.contains_key("Thumb"), "{tags:?}");
+    let backdrops = v["BackdropImageTags"].as_array().unwrap();
+    assert_eq!(backdrops.len(), 1);
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/101")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tags = v["ImageTags"].as_object().expect("ImageTags object");
+    assert!(tags.contains_key("Primary"));
+    // Audio doesn't get Backdrop / Thumb (no frame to grab).
+    assert!(!tags.contains_key("Backdrop"));
+    assert!(!tags.contains_key("Thumb"));
+}
+
+/// (8) — Episode promotion. A path that matches the TV-layout
 /// heuristic must yield kind=Episode in the put → list → get
 /// round-trip (catches scanner classification regressions across
 /// the storage layer).

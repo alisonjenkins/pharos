@@ -505,8 +505,8 @@ impl BaseItemDto {
             chapters: vec![],
             trickplay: serde_json::Map::new(),
             external_urls: vec![],
-            image_tags: serde_json::Map::new(),
-            backdrop_image_tags: vec![],
+            image_tags: image_tags_for(item),
+            backdrop_image_tags: vec![image_tag_for(item.id, "backdrop")],
             screenshot_image_tags: vec![],
             series_name: item.series.as_ref().map(|s| s.series_name.clone()),
             series_id: item
@@ -525,6 +525,41 @@ impl BaseItemDto {
             index_number: item.series.as_ref().and_then(|s| s.episode_number),
         }
     }
+}
+
+/// Advertise the image roles ImageCache can produce for this item.
+/// Tag value is a stable per-(item, role) hash — jellyfin-web uses
+/// it as the `?tag=` cache-buster on the image URL. We don't have
+/// real ETags yet (re-extraction is deterministic per item) so the
+/// hash IS the version.
+pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    // Every item gets a Primary tag — Audio uses cover-art if embedded,
+    // Video uses a frame extracted at seek_seconds. Backdrop/Thumb only
+    // make sense for video.
+    m.insert(
+        "Primary".into(),
+        serde_json::Value::String(image_tag_for(item.id, "primary")),
+    );
+    if !matches!(item.kind, pharos_core::MediaKind::Audio) {
+        m.insert(
+            "Backdrop".into(),
+            serde_json::Value::String(image_tag_for(item.id, "backdrop")),
+        );
+        m.insert(
+            "Thumb".into(),
+            serde_json::Value::String(image_tag_for(item.id, "thumb")),
+        );
+    }
+    m
+}
+
+/// Per-(item, role) stable hex tag (16 chars — Jellyfin's `?tag=` is
+/// usually a hex string and the length doesn't matter to the client).
+pub fn image_tag_for(item_id: u64, role: &str) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let h = xxh3_64(format!("img:{item_id}:{role}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+    format!("{h:016x}")
 }
 
 /// Stable 32-hex id for the synthesised Series item.
