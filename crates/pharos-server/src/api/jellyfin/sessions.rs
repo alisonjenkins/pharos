@@ -10,7 +10,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
-use pharos_core::UserDataStore;
+use pharos_core::{MediaStore, UserDataStore};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -69,6 +69,10 @@ struct ProgressBody {
 struct StoppedBody {
     #[serde(default)]
     play_session_id: Option<String>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    position_ticks: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +182,7 @@ fn now_unix() -> i64 {
 
 async fn playing_stopped(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     body: web::Json<StoppedBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
@@ -188,6 +192,43 @@ async fn playing_stopped(
             .apply(SessionEvent::Stopped { session_id })
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    }
+
+    // Persist final UserData. If the client stopped within the last
+    // ~10% of the runtime, treat as "finished" — mark played, reset
+    // resume position. Otherwise save the position so the Resume row
+    // picks the item up later. Without this the Resume row holds
+    // every finished item forever (jellyfin-web only sends an
+    // explicit /PlayedItems POST on manual mark-played).
+    if let Some(item_id_str) = body.item_id {
+        if let Ok(item_id) = item_id_str.parse::<pharos_core::MediaId>() {
+            let position = body.position_ticks.unwrap_or(0);
+            let runtime = state
+                .stores
+                .get(item_id)
+                .await
+                .ok()
+                .and_then(|it| it.probe.run_time_ticks())
+                .unwrap_or(0);
+            let finished =
+                runtime > 0 && position >= runtime.saturating_sub(runtime / 10);
+            if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
+                if finished {
+                    data.played = true;
+                    data.play_count = data.play_count.saturating_add(1);
+                    data.last_played_position_ticks = 0;
+                } else {
+                    data.last_played_position_ticks = position;
+                }
+                data.last_played_at = now_unix();
+                if state.stores.set_user_data(user.0.id, item_id, data).await.is_ok() {
+                    state.notify_user_data_changed(
+                        &user.0.id.0.simple().to_string(),
+                        &item_id.to_string(),
+                    );
+                }
+            }
+        }
     }
     Ok(HttpResponse::NoContent().finish())
 }
