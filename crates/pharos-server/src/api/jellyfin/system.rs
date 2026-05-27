@@ -138,10 +138,12 @@ async fn display_preferences_update(
 }
 
 /// Reconstruct the URL clients should advertise when telling other
-/// clients to connect here. Derived from the request's Host header
-/// + scheme — the canonical Jellyfin "use whatever URL the client
-/// just hit you on" pattern. Used by casting / SyncPlay clients
-/// to publish a reachable URL to peer sessions.
+/// clients to connect here.
+///
+/// Derived from the request's Host header + scheme — the canonical
+/// Jellyfin "use whatever URL the client just hit you on" pattern.
+/// Used by casting / SyncPlay clients to publish a reachable URL to
+/// peer sessions.
 fn derive_local_address(req: &actix_web::HttpRequest) -> String {
     let conn = req.connection_info();
     let scheme = conn.scheme();

@@ -459,8 +459,8 @@ async fn shows_next_up(
     // Sort each bucket by (season_number, episode_number) ascending,
     // pick the head.
     let mut picks: Vec<(usize, &MediaItem)> = buckets
-        .into_iter()
-        .filter_map(|(_name, mut eps)| {
+        .into_values()
+        .filter_map(|mut eps| {
             eps.sort_by_key(|(_, e)| {
                 let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
                 let n = e.series.as_ref().and_then(|s| s.episode_number).unwrap_or(0);

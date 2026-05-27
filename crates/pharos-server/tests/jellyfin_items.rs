@@ -862,8 +862,10 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
     }
     // Mark Show A E01 played.
     use pharos_core::UserDataStore;
-    let mut data = pharos_core::UserItemData::default();
-    data.played = true;
+    let data = pharos_core::UserItemData {
+        played: true,
+        ..Default::default()
+    };
     stores.set_user_data(uid, 1, data).await.unwrap();
 
     let state = web::Data::new(AppState::new(stores, "srv".into()));

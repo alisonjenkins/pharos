@@ -129,8 +129,11 @@ async fn search_hints(
         let mut seen_album: HashSet<String> = HashSet::new();
         let mut seen_genre: HashSet<String> = HashSet::new();
         for i in &all {
-            for src in [i.probe.artist.as_deref(), i.probe.album_artist.as_deref()] {
-                if let Some(n) = src {
+            for n in [i.probe.artist.as_deref(), i.probe.album_artist.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                {
                     if n.to_ascii_lowercase().contains(&needle) && seen_artist.insert(n.into()) {
                         hints.push(SearchHint {
                             item_id: artist_id_for(n),
