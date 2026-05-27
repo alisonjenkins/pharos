@@ -940,6 +940,24 @@ struct ListQuery {
     /// audio-only / video-only library splits.
     #[serde(default)]
     media_types: Option<String>,
+    /// Direct boolean shortcut. Jellyfin's "Favorites" sidebar item
+    /// sometimes sends `IsFavorite=true` instead of
+    /// `Filters=IsFavorite`. Behaviourally identical — folded into
+    /// the same UserData lookup.
+    #[serde(default)]
+    is_favorite: Option<bool>,
+    /// Direct boolean shortcut, sibling of `IsFavorite`. `IsPlayed=true`
+    /// returns only items the user has finished; `false` returns
+    /// unplayed.
+    #[serde(default)]
+    is_played: Option<bool>,
+    /// Episode-list filters jellyfin-web uses for the season detail
+    /// view. `MinIndexNumber=3` drops episodes 1-2; `MaxIndexNumber=5`
+    /// drops 6+.
+    #[serde(default)]
+    min_index_number: Option<u32>,
+    #[serde(default)]
+    max_index_number: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1007,7 +1025,7 @@ async fn list_items(
         &q,
         seed,
     );
-    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, q.filters.as_deref()).await?;
+    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
@@ -1035,7 +1053,7 @@ async fn list_user_items(
         &q,
         seed,
     );
-    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, q.filters.as_deref()).await?;
+    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
@@ -1063,12 +1081,20 @@ async fn apply_userdata_filter(
     state: &AppState,
     user_id: UserId,
     items: Vec<MediaItem>,
-    filters: Option<&str>,
+    q: &ListQuery,
 ) -> Result<Vec<MediaItem>, actix_web::Error> {
-    let Some(raw) = filters else {
-        return Ok(items);
+    let mut f = match q.filters.as_deref() {
+        Some(raw) => UserDataFilter::parse(raw),
+        None => UserDataFilter::default(),
     };
-    let f = UserDataFilter::parse(raw);
+    // Direct boolean shortcuts fold into the same filter so a single
+    // bulk-userdata lookup serves both wire conventions.
+    if let Some(v) = q.is_favorite {
+        f.is_favorite = Some(v);
+    }
+    if let Some(v) = q.is_played {
+        f.is_played = Some(v);
+    }
     if !f.is_active() {
         return Ok(items);
     }
@@ -1260,6 +1286,24 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
                 MediaKind::Movie | MediaKind::Episode => want_video,
             });
         }
+    }
+    if let Some(min) = q.min_index_number {
+        items.retain(|i| {
+            i.series
+                .as_ref()
+                .and_then(|s| s.episode_number)
+                .map(|n| n >= min)
+                .unwrap_or(false)
+        });
+    }
+    if let Some(max) = q.max_index_number {
+        items.retain(|i| {
+            i.series
+                .as_ref()
+                .and_then(|s| s.episode_number)
+                .map(|n| n <= max)
+                .unwrap_or(false)
+        });
     }
     if let Some(prefix) = q
         .name_starts_with
