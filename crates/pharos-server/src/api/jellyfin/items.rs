@@ -881,14 +881,16 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery) -> Vec<MediaItem> {
     match primary {
         "Random" => shuffle_in_place(&mut items),
         "DateCreated" | "DateAdded" => {
-            // No created_at column yet — sort by stable id descending so
-            // the highest hash-id (= last-inserted on a fresh DB) bubbles
-            // up first. Real DateCreated lands when migration 0010 adds
-            // the column. Better than no-op + matches Jellyfin's "newest
-            // first" UX.
-            items.sort_by(|a, b| b.id.cmp(&a.id));
+            // Newest-first by default. Items without a created_at
+            // (pre-migration-0010 rows) sort to the end of the
+            // descending order via `unwrap_or(0)`.
+            items.sort_by(|a, b| {
+                b.created_at
+                    .unwrap_or(0)
+                    .cmp(&a.created_at.unwrap_or(0))
+                    .then(b.id.cmp(&a.id))
+            });
             if descending {
-                // Already descending — flip when explicit asc requested.
                 items.reverse();
             }
         }

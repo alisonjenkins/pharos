@@ -31,6 +31,11 @@ pub struct MediaItem {
     /// stable ids from `series_name` + `(series_name, season_number)`
     /// respectively (via `series_id_for` / `season_id_for`).
     pub series: Option<SeriesInfo>,
+    /// Unix-seconds timestamp of the first time pharos saw this
+    /// item. Set on initial INSERT; preserved by `ON CONFLICT` so
+    /// rescans don't reset "added on" dates. `None` for rows
+    /// imported before migration 0010.
+    pub created_at: Option<i64>,
 }
 
 /// Parent-show / season / episode metadata for items the scanner

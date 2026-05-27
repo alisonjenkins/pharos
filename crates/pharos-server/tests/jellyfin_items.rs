@@ -292,6 +292,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
             kind: MediaKind::Movie,
             probe,
             series: None,
+            created_at: None,
         })
         .await
         .unwrap();

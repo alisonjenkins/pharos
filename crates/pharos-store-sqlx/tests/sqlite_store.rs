@@ -27,7 +27,14 @@ async fn put_then_get_roundtrip() {
     let it = item(1, "/m/a.mkv", "A", MediaKind::Movie);
     s.put(it.clone()).await.unwrap();
     let got = s.get(1).await.unwrap();
-    assert_eq!(got, it);
+    // `created_at` is server-stamped on first insert — strip both
+    // sides of that field before equality compare.
+    let mut got_no_ts = got.clone();
+    got_no_ts.created_at = None;
+    let mut it_no_ts = it.clone();
+    it_no_ts.created_at = None;
+    assert_eq!(got_no_ts, it_no_ts);
+    assert!(got.created_at.is_some(), "store should stamp created_at");
 }
 
 #[tokio::test]

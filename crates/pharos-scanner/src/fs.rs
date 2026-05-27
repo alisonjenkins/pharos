@@ -97,6 +97,10 @@ impl<P: Prober> FsScanner<P> {
                     kind,
                     probe,
                     series,
+                    // Let the store-side `now_secs` populate. Passing
+                    // None preserves the original `created_at` on
+                    // rescan via the COALESCE in put().
+                    created_at: None,
                 })
             }
             Err(err) => {

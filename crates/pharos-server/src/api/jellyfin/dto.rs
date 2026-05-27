@@ -202,6 +202,10 @@ pub struct BaseItemDto {
     pub external_urls: Vec<serde_json::Value>,
     pub image_tags: serde_json::Map<String, serde_json::Value>,
     pub backdrop_image_tags: Vec<String>,
+    /// Server-side first-seen timestamp as ISO-8601. None when the
+    /// row predates migration 0010 (pre-T-fix-39 rescans).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_created: Option<String>,
     /// Audio metadata: album name (None for video/no-tag files).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub album: Option<String>,
@@ -543,6 +547,7 @@ impl BaseItemDto {
             image_tags: image_tags_for(item),
             backdrop_image_tags: vec![image_tag_for(item.id, "backdrop")],
             screenshot_image_tags: vec![],
+            date_created: item.created_at.map(format_iso8601),
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
             series_name: item.series.as_ref().map(|s| s.series_name.clone()),

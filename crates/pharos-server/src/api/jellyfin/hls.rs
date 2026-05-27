@@ -370,6 +370,7 @@ mod tests {
                 kind: MediaKind::Movie,
                 probe,
                 series: None,
+                created_at: None,
             })
             .await
             .unwrap();

@@ -26,7 +26,7 @@ use pharos_core::{
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json, artist, album, album_artist, genre";
+    subtitle_tracks_json, artist, album, album_artist, genre, created_at";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -131,6 +131,12 @@ impl MediaStore for PostgresStore {
         let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
         let subtitle_tracks_json =
             crate::subtitle_track_json::encode(&p.subtitle_tracks);
+        let created_at = item.created_at.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
         sqlx::query(
             "INSERT INTO media_items (id, path, title, kind, \
                 size_bytes, duration_ms, container, bitrate_bps, \
@@ -138,9 +144,9 @@ impl MediaStore for PostgresStore {
                 audio_channels, sample_rate, \
                 series_name, season_number, episode_number, \
                 subtitle_tracks_json, \
-                artist, album, album_artist, genre) \
+                artist, album, album_artist, genre, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                     $16, $17, $18, $19, $20, $21, $22, $23)
+                     $16, $17, $18, $19, $20, $21, $22, $23, $24)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             kind = EXCLUDED.kind,
@@ -162,7 +168,8 @@ impl MediaStore for PostgresStore {
                                             artist = EXCLUDED.artist,
                                             album = EXCLUDED.album,
                                             album_artist = EXCLUDED.album_artist,
-                                            genre = EXCLUDED.genre",
+                                            genre = EXCLUDED.genre,
+                                            created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
         .bind(path)
@@ -187,6 +194,7 @@ impl MediaStore for PostgresStore {
         .bind(p.album.as_deref())
         .bind(p.album_artist.as_deref())
         .bind(p.genre.as_deref())
+        .bind(created_at)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -486,6 +494,7 @@ struct MediaRow {
     album: Option<String>,
     album_artist: Option<String>,
     genre: Option<String>,
+    created_at: Option<i64>,
 }
 
 impl MediaRow {
@@ -525,6 +534,7 @@ impl MediaRow {
             kind,
             probe,
             series,
+            created_at: self.created_at,
         })
     }
 }
