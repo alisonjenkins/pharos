@@ -169,9 +169,10 @@ async fn set_user_policy(
 struct SetPasswordBody {
     #[serde(default)]
     new_pw: String,
-    /// Jellyfin's UI sends `CurrentPw`; admin reset can leave it empty.
+    /// Jellyfin's UI sends `CurrentPw`. Required on a self
+    /// password change; admins changing someone else's password
+    /// can omit it.
     #[serde(default)]
-    #[allow(dead_code)]
     current_pw: String,
     #[serde(default)]
     reset_password: bool,
@@ -196,16 +197,30 @@ async fn set_user_password(
 ) -> Result<impl Responder, actix_web::Error> {
     // Either the bearer matches the path id, or the bearer is admin.
     let target = parse_user_id(&path.into_inner())?;
-    if target != user.0.id && !user.0.policy.admin {
+    let is_self = target == user.0.id;
+    if !is_self && !user.0.policy.admin {
         return Err(error::ErrorForbidden("admin required"));
     }
     let body = body.into_inner();
+    // V8: a stolen session token must NOT be enough to change a
+    // user's password. Self-change requires CurrentPw to match the
+    // existing hash. Admin changing someone else's password (or
+    // resetting their own with ResetPassword=true) skips this — it
+    // matches Jellyfin's admin-reset flow.
+    let auth = BuiltinAuth::new(state.stores.clone());
+    let must_verify_current = is_self && !(user.0.policy.admin && body.reset_password);
+    if must_verify_current {
+        let current = SecretString::new(body.current_pw.clone());
+        use pharos_core::AuthBackend;
+        AuthBackend::authenticate(&auth, &user.0.name, &current)
+            .await
+            .map_err(|_| error::ErrorUnauthorized("current password mismatch"))?;
+    }
     let new_password = if body.reset_password {
         SecretString::new(String::new())
     } else {
         SecretString::new(body.new_pw)
     };
-    let auth = BuiltinAuth::new(state.stores.clone());
     let hash = auth
         .hash_password(&new_password)
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
