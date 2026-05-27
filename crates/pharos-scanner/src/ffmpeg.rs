@@ -3,7 +3,9 @@
 //! real Size / Bitrate / RunTimeTicks / Width / Height / FrameRate /
 //! codec / channels / sample rate without re-shelling on every request.
 
-use pharos_core::{DomainError, DomainResult, MediaKind, MediaProbe, ProbeInfo, Prober};
+use pharos_core::{
+    DomainError, DomainResult, MediaKind, MediaProbe, ProbeInfo, Prober, SubtitleTrack,
+};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +73,8 @@ struct FfprobeOutput {
 struct FfprobeStream {
     codec_type: String,
     #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
     codec_name: Option<String>,
     #[serde(default)]
     width: Option<u32>,
@@ -87,6 +91,26 @@ struct FfprobeStream {
     avg_frame_rate: Option<String>,
     #[serde(default)]
     r_frame_rate: Option<String>,
+    #[serde(default)]
+    tags: FfprobeStreamTags,
+    #[serde(default)]
+    disposition: FfprobeDisposition,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeStreamTags {
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeDisposition {
+    #[serde(default)]
+    default: i32,
+    #[serde(default)]
+    forced: i32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -142,6 +166,22 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         .and_then(|s| s.sample_rate.as_deref())
         .and_then(|s| s.parse::<u32>().ok());
 
+    let subtitle_tracks: Vec<SubtitleTrack> = parsed
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "subtitle")
+        .filter_map(|s| {
+            Some(SubtitleTrack {
+                stream_index: s.index?,
+                language: s.tags.language.clone(),
+                codec: s.codec_name.clone(),
+                title: s.tags.title.clone(),
+                is_default: s.disposition.default != 0,
+                is_forced: s.disposition.forced != 0,
+            })
+        })
+        .collect();
+
     Ok(ProbeInfo {
         kind,
         probe: MediaProbe {
@@ -156,6 +196,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             frame_rate_mille,
             audio_channels,
             sample_rate,
+            subtitle_tracks,
         },
     })
 }

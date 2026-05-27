@@ -1,7 +1,9 @@
 //! Recursive media filesystem scan. Generic over `Prober` (V12).
 //! Walk lives in `spawn_blocking` — never parks async runtime (V5).
 
-use pharos_core::{DomainError, DomainResult, MediaItem, MediaKind, MediaStore, Prober, Scanner};
+use pharos_core::{
+    DomainError, DomainResult, MediaItem, MediaKind, MediaStore, Prober, Scanner, SeriesInfo,
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_64;
@@ -83,12 +85,18 @@ impl<P: Prober> FsScanner<P> {
                 } else {
                     info.kind
                 };
+                let series = if matches!(kind, MediaKind::Episode) {
+                    parse_series_info(&path)
+                } else {
+                    None
+                };
                 Some(MediaItem {
                     id: stable_id(&path),
                     path,
                     title,
                     kind,
                     probe,
+                    series,
                 })
             }
             Err(err) => {
@@ -171,6 +179,109 @@ fn has_sxxeyy_token(name: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Extract `SeriesInfo { series_name, season_number, episode_number }`
+/// from a TV-layout path. Heuristic:
+/// - series_name = the closest ancestor directory of `path` that is
+///   *not* a "Season N" / "S01" / "Specials" / a configured media
+///   root token. Falls back to the immediate parent directory name
+///   when nothing else fits.
+/// - season_number = parsed from a "Season N" / "S<NN>" parent dir
+///   if present, or from the `SxxEyy` token in the filename.
+/// - episode_number = parsed from the `SxxEyy` token in the filename.
+///
+/// Returns `None` when `path` has no parent — pathological case.
+pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let (filename_season, episode) = parse_sxxeyy(name);
+
+    // Walk parents from closest to farthest.
+    let mut parents: Vec<&str> = path
+        .ancestors()
+        .skip(1)
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
+        .collect();
+
+    let mut season_from_dir: Option<u32> = None;
+    let mut series_name: Option<String> = None;
+
+    for parent in parents.drain(..) {
+        if let Some(n) = parse_season_dir(parent) {
+            season_from_dir = season_from_dir.or(Some(n));
+            continue;
+        }
+        if parent.eq_ignore_ascii_case("specials") {
+            season_from_dir = season_from_dir.or(Some(0));
+            continue;
+        }
+        // First non-season ancestor wins as the series name.
+        if series_name.is_none() {
+            series_name = Some(parent.to_string());
+            break;
+        }
+    }
+
+    let series_name = series_name?;
+    let season_number = season_from_dir.or(filename_season);
+    Some(SeriesInfo {
+        series_name,
+        season_number,
+        episode_number: episode,
+    })
+}
+
+/// Return the (season, episode) numbers when `name` carries an
+/// `SxxEyy` token at any letter-boundary. `None` if absent.
+fn parse_sxxeyy(name: &str) -> (Option<u32>, Option<u32>) {
+    let lower: Vec<u8> = name.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    let mut i = 0;
+    while i + 5 < lower.len() {
+        let at_boundary = i == 0 || !lower[i - 1].is_ascii_alphabetic();
+        if at_boundary && lower[i] == b's' && lower[i + 1].is_ascii_digit() {
+            // collect season digits
+            let s_start = i + 1;
+            let mut s_end = s_start + 1;
+            while s_end < lower.len() && lower[s_end].is_ascii_digit() {
+                s_end += 1;
+            }
+            if s_end < lower.len() && lower[s_end] == b'e' {
+                let e_start = s_end + 1;
+                let mut e_end = e_start;
+                while e_end < lower.len() && lower[e_end].is_ascii_digit() {
+                    e_end += 1;
+                }
+                if e_end > e_start {
+                    let season = std::str::from_utf8(&lower[s_start..s_end])
+                        .ok()
+                        .and_then(|s| s.parse().ok());
+                    let episode = std::str::from_utf8(&lower[e_start..e_end])
+                        .ok()
+                        .and_then(|s| s.parse().ok());
+                    return (season, episode);
+                }
+            }
+        }
+        i += 1;
+    }
+    (None, None)
+}
+
+/// Parse a "Season N" / "Season NN" / "S01" / "S1" directory name → N.
+fn parse_season_dir(name: &str) -> Option<u32> {
+    let n = name.trim();
+    if let Some(rest) = n.to_ascii_lowercase().strip_prefix("season ") {
+        return rest.trim().parse().ok();
+    }
+    let lower = n.to_ascii_lowercase();
+    if lower.starts_with('s')
+        && lower.len() >= 2
+        && lower.len() <= 4
+        && lower[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return lower[1..].parse().ok();
+    }
+    None
 }
 
 fn looks_like_season_dir(name: &str) -> bool {
@@ -343,6 +454,42 @@ mod tests {
         assert!(has_sxxeyy_token("Series_S12E07_HDTV.mkv"));
         assert!(!has_sxxeyy_token("classS5English.mp4")); // mid-word "S5" rejected
         assert!(!has_sxxeyy_token("Movie 2024.mkv"));
+    }
+
+    #[test]
+    fn parses_series_info_from_canonical_layout() {
+        let p = Path::new("/srv/media/TV/My Show/Season 2/My.Show.S02E07.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "My Show");
+        assert_eq!(info.season_number, Some(2));
+        assert_eq!(info.episode_number, Some(7));
+    }
+
+    #[test]
+    fn parses_series_info_with_compact_season_dir() {
+        let p = Path::new("/m/Another Show/S03/file.s03e01.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Another Show");
+        assert_eq!(info.season_number, Some(3));
+        assert_eq!(info.episode_number, Some(1));
+    }
+
+    #[test]
+    fn parses_series_info_specials_is_season_zero() {
+        let p = Path::new("/m/Some Show/Specials/Some.Show.S00E04.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Some Show");
+        assert_eq!(info.season_number, Some(0));
+        assert_eq!(info.episode_number, Some(4));
+    }
+
+    #[test]
+    fn series_info_falls_back_to_filename_season_when_no_season_dir() {
+        let p = Path::new("/m/Show Without Season Dir/Show.S05E11.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Show Without Season Dir");
+        assert_eq!(info.season_number, Some(5));
+        assert_eq!(info.episode_number, Some(11));
     }
 
     #[test]
