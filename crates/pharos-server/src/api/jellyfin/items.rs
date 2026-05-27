@@ -1191,9 +1191,13 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
         items.retain(|i| wanted.contains(&i.id));
     }
     if let Some(term) = q.search_term.as_ref() {
-        let needle = term.to_ascii_lowercase();
+        // Unicode-aware lowercase so titles with accents ("Pokémon",
+        // "Café") match queries typed in different case. ASCII-only
+        // `to_ascii_lowercase` left the É / é alone and silently
+        // dropped the match.
+        let needle = term.to_lowercase();
         if !needle.is_empty() {
-            items.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
+            items.retain(|i| i.title.to_lowercase().contains(&needle));
         }
     }
     if let Some(types) = q.include_item_types.as_ref() {

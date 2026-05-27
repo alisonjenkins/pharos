@@ -74,12 +74,15 @@ async fn search_hints(
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for, genre_id_for};
     use std::collections::HashSet;
 
+    // Unicode-aware lowercase so accented titles match queries typed
+    // in different case (Pokémon / POKÉMON). ASCII-only
+    // to_ascii_lowercase silently dropped these matches.
     let needle = q
         .search_term
         .as_deref()
         .unwrap_or("")
         .trim()
-        .to_ascii_lowercase();
+        .to_lowercase();
     let kinds = parse_include_item_types(q.include_item_types.as_deref());
     let include_aggregates = q
         .include_item_types
@@ -105,7 +108,7 @@ async fn search_hints(
     let filtered: Vec<&MediaItem> = all
         .iter()
         .filter(|i| kinds.as_ref().map_or(true, |k| k.contains(&i.kind)))
-        .filter(|i| needle.is_empty() || i.title.to_ascii_lowercase().contains(&needle))
+        .filter(|i| needle.is_empty() || i.title.to_lowercase().contains(&needle))
         .collect();
     for i in &filtered {
         hints.push(SearchHint {
@@ -134,7 +137,7 @@ async fn search_hints(
                 .flatten()
             {
                 {
-                    if n.to_ascii_lowercase().contains(&needle) && seen_artist.insert(n.into()) {
+                    if n.to_lowercase().contains(&needle) && seen_artist.insert(n.into()) {
                         hints.push(SearchHint {
                             item_id: artist_id_for(n),
                             id: artist_id_for(n),
@@ -149,7 +152,7 @@ async fn search_hints(
                 }
             }
             if let Some(n) = i.probe.album.as_deref() {
-                if n.to_ascii_lowercase().contains(&needle) && seen_album.insert(n.into()) {
+                if n.to_lowercase().contains(&needle) && seen_album.insert(n.into()) {
                     hints.push(SearchHint {
                         item_id: album_id_for(n),
                         id: album_id_for(n),
@@ -163,7 +166,7 @@ async fn search_hints(
                 }
             }
             if let Some(n) = i.probe.genre.as_deref() {
-                if n.to_ascii_lowercase().contains(&needle) && seen_genre.insert(n.into()) {
+                if n.to_lowercase().contains(&needle) && seen_genre.insert(n.into()) {
                     hints.push(SearchHint {
                         item_id: genre_id_for(n),
                         id: genre_id_for(n),
