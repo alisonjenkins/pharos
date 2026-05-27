@@ -291,6 +291,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
             title: "Probed".into(),
             kind: MediaKind::Movie,
             probe,
+            series: None,
         })
         .await
         .unwrap();
@@ -312,6 +313,7 @@ async fn get_item_renders_real_probe_metadata_into_media_source() {
         frame_rate_mille: Some(23_976),
         audio_channels: Some(2),
         sample_rate: Some(48000),
+        ..Default::default()
     };
     let (state, token) = seed_with_probe(probe).await;
     let app = test::init_service(build_app(state)).await;
@@ -376,6 +378,7 @@ async fn playback_info_pulls_real_codec_and_size_from_probe() {
         frame_rate_mille: Some(23_976),
         audio_channels: Some(2),
         sample_rate: Some(48000),
+        ..Default::default()
     };
     let (state, token) = seed_with_probe(probe).await;
     let app = test::init_service(build_app(state)).await;
@@ -570,4 +573,247 @@ async fn list_items_filters_by_parent_id_to_one_library() {
     let items = v["Items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "{v:?}");
     assert_eq!(items[0]["Name"], "movie-one");
+}
+
+#[actix_web::test]
+async fn episode_dto_carries_series_id_and_season_id() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 500,
+            path: "/m/TV/My Show/Season 2/My.Show.S02E07.mkv".into(),
+            title: "Episode 7".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "My Show".into(),
+                season_number: Some(2),
+                episode_number: Some(7),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items/500")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Type"], "Episode");
+    assert_eq!(v["SeriesName"], "My Show");
+    assert_eq!(v["ParentIndexNumber"], 2);
+    assert_eq!(v["IndexNumber"], 7);
+    let series_id = v["SeriesId"].as_str().unwrap();
+    let season_id = v["SeasonId"].as_str().unwrap();
+    assert_eq!(series_id.len(), 32);
+    assert_eq!(season_id.len(), 32);
+    assert_ne!(series_id, season_id);
+}
+
+#[actix_web::test]
+async fn get_item_by_series_id_returns_series_dto() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 500,
+            path: "/m/TV/Other Show/Season 1/file.s01e01.mkv".into(),
+            title: "Ep".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Other Show".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    // Discover series id by reading the episode first.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/500")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let series_id = v["SeriesId"].as_str().unwrap().to_string();
+    let season_id = v["SeasonId"].as_str().unwrap().to_string();
+    // Now resolve the synth Series DTO.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Items/{series_id}"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Id"], series_id);
+    assert_eq!(v["Name"], "Other Show");
+    assert_eq!(v["Type"], "Series");
+    assert_eq!(v["IsFolder"], true);
+    // Resolve the synth Season DTO.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Items/{season_id}"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Id"], season_id);
+    assert_eq!(v["Type"], "Season");
+    assert_eq!(v["SeriesName"], "Other Show");
+    assert_eq!(v["IndexNumber"], 1);
+}
+
+#[actix_web::test]
+async fn list_items_filters_by_series_id() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, ep_num, show) in [(1u64, 1u32, "Show A"), (2, 2, "Show A"), (3, 1, "Show B")] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/TV/{show}/Season 1/s01e0{ep_num}.mkv").into(),
+                title: format!("{show} E{ep_num}"),
+                kind: MediaKind::Episode,
+                series: Some(pharos_core::SeriesInfo {
+                    series_name: show.to_string(),
+                    season_number: Some(1),
+                    episode_number: Some(ep_num),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    // Read one episode to fish out the SeriesId for "Show A".
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/1")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let show_a_id = v["SeriesId"].as_str().unwrap().to_string();
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Items?ParentId={show_a_id}"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "expected 2 Show A episodes, got {v:?}");
+    for it in items {
+        assert!(
+            it["Name"].as_str().unwrap().starts_with("Show A"),
+            "{it:?}"
+        );
+    }
+}
+
+#[actix_web::test]
+async fn playback_info_lists_sidecar_subtitle_when_present() {
+    use std::io::Write;
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let td = tempfile::TempDir::new().unwrap();
+    let video = td.path().join("show.mkv");
+    std::fs::write(&video, b"x").unwrap();
+    let mut sidecar = std::fs::File::create(td.path().join("show.eng.vtt")).unwrap();
+    sidecar
+        .write_all(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 4242,
+            path: video,
+            title: "show".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Items/4242/PlaybackInfo")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload("{}")
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let streams = v["MediaSources"][0]["MediaStreams"].as_array().unwrap();
+    let sub = streams
+        .iter()
+        .find(|s| s["Type"] == "Subtitle")
+        .expect("subtitle stream synthesised from sidecar");
+    assert_eq!(sub["IsExternal"], true);
+    assert!(sub["DeliveryUrl"].as_str().unwrap().contains("/Subtitles/"));
 }

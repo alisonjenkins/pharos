@@ -184,3 +184,103 @@ async fn router_mounts_jellyfin_scope_alongside_metrics_and_health() {
         );
     }
 }
+
+#[actix_web::test]
+async fn user_configuration_persists_across_request() {
+    use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+    use pharos_server::{auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
+    let stores = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let state = actix_web::web::Data::new(AppState::new(stores, "t".into()));
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(pharos_server::api::jellyfin::configure),
+    )
+    .await;
+
+    // POST a non-default config.
+    let req = actix_web::test::TestRequest::post()
+        .uri(&format!("/Users/{}/Configuration", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(r#"{"AudioLanguagePreference":"de","SubtitleMode":"Always"}"#)
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204);
+
+    // GET /Users/Me echoes it back via UserDto.Configuration.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/Users/Me")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let body = actix_web::test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Configuration"]["AudioLanguagePreference"], "de");
+    assert_eq!(v["Configuration"]["SubtitleMode"], "Always");
+}
+
+#[actix_web::test]
+async fn display_preferences_round_trip_per_user() {
+    use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+    use pharos_server::{auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
+    let stores = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let state = actix_web::web::Data::new(AppState::new(stores, "t".into()));
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(pharos_server::api::jellyfin::configure),
+    )
+    .await;
+
+    // POST a prefs payload.
+    let req = actix_web::test::TestRequest::post()
+        .uri("/DisplayPreferences/home?client=emby")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(r#"{"ViewType":"poster","SortBy":"DateAdded"}"#)
+        .to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204);
+
+    // GET returns the stored payload, not the default-stub.
+    let req = actix_web::test::TestRequest::get()
+        .uri("/DisplayPreferences/home?client=emby")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .to_request();
+    let body = actix_web::test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["ViewType"], "poster");
+    assert_eq!(v["SortBy"], "DateAdded");
+}

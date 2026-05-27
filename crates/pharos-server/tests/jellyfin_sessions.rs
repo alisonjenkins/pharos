@@ -191,3 +191,55 @@ async fn sessions_requires_auth() {
     .await;
     assert_eq!(resp.status(), 401);
 }
+
+#[actix_web::test]
+async fn playstate_command_broadcasts_session_command() {
+    let (state, token) = seed().await;
+    // Subscribe before firing so we observe the broadcast.
+    let mut rx = state.bus.subscribe();
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/Sessions/sess-42/Playing/Pause")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .set_json(serde_json::json!({}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204);
+
+    let evt = rx.recv().await.expect("bus delivered SessionCommand");
+    match evt {
+        pharos_server::state::SocketBroadcast::SessionCommand {
+            session_id,
+            command,
+            ..
+        } => {
+            assert_eq!(session_id, "sess-42");
+            assert_eq!(command, "Pause");
+        }
+        other => panic!("expected SessionCommand, got {other:?}"),
+    }
+}
+
+#[actix_web::test]
+async fn seek_command_carries_position_ticks_in_arg() {
+    let (state, token) = seed().await;
+    let mut rx = state.bus.subscribe();
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/Sessions/sess-42/Playing/Seek")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .set_json(serde_json::json!({ "SeekPositionTicks": 50_000_000u64 }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204);
+
+    let evt = rx.recv().await.unwrap();
+    if let pharos_server::state::SocketBroadcast::SessionCommand { arg, command, .. } = evt {
+        assert_eq!(command, "Seek");
+        assert_eq!(arg["SeekPositionTicks"], 50_000_000u64);
+    } else {
+        panic!("expected SessionCommand");
+    }
+}
