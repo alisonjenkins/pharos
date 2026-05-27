@@ -671,7 +671,10 @@ async fn playback_info(
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "MediaSources": [{
             "Id": id_str,
-            "Path": item.path.to_string_lossy(),
+            // V9: media file paths never leak to clients. Jellyfin's
+            // own server omits this for non-admins; pharos omits it
+            // wholesale — playback uses the StreamUrl / DirectStreamUrl
+            // the client already has, not the on-disk path.
             "Type": "Default",
             "Container": container,
             "IsRemote": false,

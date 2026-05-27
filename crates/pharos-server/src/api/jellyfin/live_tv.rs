@@ -33,6 +33,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 /// equivalent live-tv route) — without this redirect the grid shows a
 /// broken-image placeholder even though every parsed channel has a
 /// `tvg-logo` URL.
+/// Public on purpose — `<img src=…>` cannot inject auth headers and
+/// jellyfin-web does not append `api_key` to channel logo URLs. Matches
+/// the also-public `/items/{id}/images/{type}` route (Jellyfin parity).
 async fn channel_image_primary(
     state: web::Data<AppState>,
     path: web::Path<String>,
