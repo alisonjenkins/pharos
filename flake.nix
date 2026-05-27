@@ -93,88 +93,103 @@
           meta.license = pkgs.lib.licenses.cc-by-40;
         };
 
-        # Test media tree assembled into one directory.
+        # ─── Test media corpus ────────────────────────────────────
         #
-        # Upstream test-videos.co.uk BBB samples are video-only. We mux a
-        # silent Opus track in at build time so the corpus exercises the
-        # full audio+video pipeline through jellyfin-web's htmlVideoPlayer
-        # — direct-play of a video-only WebM works but a user who clicks
-        # play sees no soundbar, which looks broken even though it isn't.
-        # The Opus track is generated via ffmpeg's `anullsrc` lavfi
-        # source; output is bit-identical across builds because nix sets
-        # `SOURCE_DATE_EPOCH` and ffmpeg uses it for the WebM creation_time.
-        pharosTestMedia = pkgs.runCommand "pharos-test-media"
-          { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
-          mkdir -p $out
-          add_silence() {
-            local src=$1
-            local dst=$2
-            local dur
+        # Split per fixture so a change to ONE doesn't invalidate the
+        # whole tree. Each sub-derivation lands in /nix/store keyed by
+        # its own inputs; finer granularity = more cache reuse across
+        # nixpkgs bumps (a ffmpeg-headless rev change only invalidates
+        # the encodes that actually depend on it, not the cp-only
+        # fixtures).
+        #
+        # Upstream test-videos.co.uk BBB samples are video-only. We mux
+        # a silent Opus track in at build time so the corpus exercises
+        # the full audio+video pipeline through jellyfin-web's
+        # htmlVideoPlayer. The Opus track is generated via ffmpeg's
+        # `anullsrc` lavfi source; output is bit-identical across
+        # builds because nix sets SOURCE_DATE_EPOCH.
+
+        # Per-resolution silent-Opus mux for the BBB fixtures. `-c:v
+        # copy` keeps it fast — only the new audio track is encoded.
+        addSilence = name: src:
+          pkgs.runCommand name
+            { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
             dur=$(ffprobe -v error -show_entries format=duration \
-                          -of default=nw=1:nk=1 "$src")
+                          -of default=nw=1:nk=1 ${src})
             ffmpeg -hide_banner -loglevel error -nostdin \
-                   -i "$src" \
+                   -i ${src} \
                    -f lavfi -t "$dur" -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
                    -c:v copy -c:a libopus -b:a 64k \
                    -map 0:v:0 -map 1:a:0 \
-                   -shortest "$dst"
-          }
-          add_silence ${bbb360}   $out/01-big-buck-bunny-360p.webm
-          add_silence ${bbb720}   $out/02-big-buck-bunny-720p.webm
-          add_silence ${bbb1080}  $out/03-big-buck-bunny-1080p.webm
+                   -shortest $out
+          '';
+        bbb360Webm = addSilence "bbb-360p.webm" bbb360;
+        bbb720Webm = addSilence "bbb-720p.webm" bbb720;
+        bbb1080Webm = addSilence "bbb-1080p.webm" bbb1080;
+
+        # Synthetic AV-confirm fixture: 10 s of ffmpeg `testsrc`
+        # muxed with a 440 Hz sine tone. Confirms jellyfin-web's audio
+        # path end-to-end (BBB clips above are silent).
+        avConfirmWebm =
+          pkgs.runCommand "test-av-confirm.webm"
+            { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
+                   -f lavfi -i "sine=frequency=440:duration=10:sample_rate=48000" \
+                   -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                   -pix_fmt yuv420p \
+                   -c:a libopus -b:a 64k \
+                   -shortest \
+                   $out
+          '';
+
+        # Subtitle-confirm fixture: testsrc + tone + embedded WebVTT.
+        # Sidecar .vtt is built separately so a tweak to the cue text
+        # doesn't reshell the slow VP9 encode.
+        subtitlesVtt = pkgs.writeText "test-subtitles.vtt" ''
+          WEBVTT
+
+          00:00:00.500 --> 00:00:03.000
+          Pharos subtitle smoke test
+
+          00:00:03.500 --> 00:00:06.000
+          If you see this, external VTT works
+
+          00:00:06.500 --> 00:00:09.500
+          End of test
+        '';
+        subtitlesWebm =
+          pkgs.runCommand "test-subtitles.webm"
+            { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
+                   -f lavfi -i "sine=frequency=523.25:duration=10:sample_rate=48000" \
+                   -i ${subtitlesVtt} \
+                   -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                   -pix_fmt yuv420p \
+                   -c:a libopus -b:a 64k \
+                   -c:s webvtt \
+                   -map 0:v:0 -map 1:a:0 -map 2:s:0 \
+                   -metadata:s:s:0 language=eng \
+                   -metadata:s:s:0 title="English" \
+                   -shortest \
+                   $out
+          '';
+
+        # Assembly-only derivation. Pure cp + cat — no ffmpeg here.
+        # Each cp is from an already-cached store path; the assembly
+        # itself is cheap and re-runs trivially when any one sub-fixture
+        # changes (without re-encoding the others).
+        pharosTestMedia = pkgs.runCommand "pharos-test-media" { } ''
+          mkdir -p $out
+          cp ${bbb360Webm}  $out/01-big-buck-bunny-360p.webm
+          cp ${bbb720Webm}  $out/02-big-buck-bunny-720p.webm
+          cp ${bbb1080Webm} $out/03-big-buck-bunny-1080p.webm
           cp ${wikimediaExampleOgg}  $out/04-wikimedia-example.ogg
           cp ${kevinMacLeodCarefree} $out/05-carefree.mp3
-          # Synthetic AV-confirm fixture: 10 s of ffmpeg `testsrc`
-          # (colour bars + frame counter) muxed with a 440 Hz sine
-          # tone. The point is to confirm jellyfin-web's audio path
-          # end-to-end — a user clicks play and *hears something*.
-          # The BBB clips above are silent (their upstream encoding
-          # was video-only) so they wouldn't surface a broken audio
-          # decoder.
-          ffmpeg -hide_banner -loglevel error -nostdin \
-                 -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
-                 -f lavfi -i "sine=frequency=440:duration=10:sample_rate=48000" \
-                 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
-                 -pix_fmt yuv420p \
-                 -c:a libopus -b:a 64k \
-                 -shortest \
-                 $out/06-test-av-confirm.webm
-
-          # Subtitle-confirm fixture: same testsrc + tone, plus an
-          # external WebVTT sidecar (Jellyfin's SubtitleProfile.method
-          # = "External" → the client GETs the .vtt next to the video
-          # and renders it as a `<track>`). Jellyfin's web client
-          # picks up sidecar files via the /Items/{id}/Subtitle
-          # surface which we don't ship yet — but the file existing on
-          # disk lets the user smoke-test the subtitle UI as soon as
-          # that endpoint lands. Also embeds a WebVTT track inside
-          # the WebM so muxed-subtitle paths can be exercised against
-          # the same fixture.
-          cat > $out/07-test-subtitles.vtt <<VTT
-        WEBVTT
-
-        00:00:00.500 --> 00:00:03.000
-        Pharos subtitle smoke test
-
-        00:00:03.500 --> 00:00:06.000
-        If you see this, external VTT works
-
-        00:00:06.500 --> 00:00:09.500
-        End of test
-        VTT
-          ffmpeg -hide_banner -loglevel error -nostdin \
-                 -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
-                 -f lavfi -i "sine=frequency=523.25:duration=10:sample_rate=48000" \
-                 -i $out/07-test-subtitles.vtt \
-                 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
-                 -pix_fmt yuv420p \
-                 -c:a libopus -b:a 64k \
-                 -c:s webvtt \
-                 -map 0:v:0 -map 1:a:0 -map 2:s:0 \
-                 -metadata:s:s:0 language=eng \
-                 -metadata:s:s:0 title="English" \
-                 -shortest \
-                 $out/07-test-subtitles.webm
+          cp ${avConfirmWebm} $out/06-test-av-confirm.webm
+          cp ${subtitlesVtt}  $out/07-test-subtitles.vtt
+          cp ${subtitlesWebm} $out/07-test-subtitles.webm
           cat > $out/LICENSES.txt <<EOF
         01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
