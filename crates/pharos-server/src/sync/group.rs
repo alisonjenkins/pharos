@@ -193,6 +193,15 @@ impl GroupHandle {
         });
         Self { tx, group_id }
     }
+
+    /// Request a `GroupSnapshot` from the actor. Returns `None` when
+    /// the actor has terminated (every member left). Used by the HTTP
+    /// `/SyncPlay/List` surface.
+    pub async fn snapshot(&self) -> Option<GroupSnapshot> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(GroupMsg::Snapshot { reply: tx }).await.ok()?;
+        rx.await.ok()
+    }
 }
 
 async fn handle(state: &mut GroupState, msg: GroupMsg) {

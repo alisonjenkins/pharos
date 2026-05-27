@@ -27,6 +27,9 @@ enum Msg {
     Create {
         reply: oneshot::Sender<GroupHandle>,
     },
+    List {
+        reply: oneshot::Sender<Vec<GroupHandle>>,
+    },
 }
 
 #[derive(Clone)]
@@ -60,6 +63,10 @@ impl GroupRegistry {
                         groups.insert(id, h.clone());
                         let _ = reply.send(h);
                     }
+                    Msg::List { reply } => {
+                        let all: Vec<GroupHandle> = groups.values().cloned().collect();
+                        let _ = reply.send(all);
+                    }
                 }
             }
         });
@@ -88,6 +95,17 @@ impl GroupRegistry {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Msg::Create { reply: tx })
+            .await
+            .map_err(|_| RegistryError::ActorDown)?;
+        rx.await.map_err(|_| RegistryError::ReplyDropped)
+    }
+
+    /// Snapshot of every live group's `GroupHandle`. Caller can fan
+    /// out `snapshot()` calls to render the group-watch list endpoint.
+    pub async fn list(&self) -> Result<Vec<GroupHandle>, RegistryError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::List { reply: tx })
             .await
             .map_err(|_| RegistryError::ActorDown)?;
         rx.await.map_err(|_| RegistryError::ReplyDropped)
