@@ -907,6 +907,12 @@ struct ListQuery {
     /// within a browse session but differs across users.
     #[serde(default)]
     sort_seed: Option<u64>,
+    /// Comma- or pipe-separated genre names. Jellyfin's wire convention
+    /// uses `|` between genre names. Items whose `probe.genre` matches
+    /// any of the listed names (case-insensitive) pass. Items without
+    /// a genre tag are dropped when this filter is active.
+    #[serde(default)]
+    genres: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1207,6 +1213,25 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
             .collect();
         if !wanted.is_empty() {
             items.retain(|i| wanted.contains(&i.kind));
+        }
+    }
+    if let Some(raw) = q.genres.as_ref() {
+        // Jellyfin's wire convention splits genres on `|` but some
+        // clients use `,`. Accept both — empty tokens (trailing
+        // separator) are ignored.
+        let wanted: std::collections::HashSet<String> = raw
+            .split(['|', ','])
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !wanted.is_empty() {
+            items.retain(|i| {
+                i.probe
+                    .genre
+                    .as_deref()
+                    .map(|g| wanted.contains(&g.to_lowercase()))
+                    .unwrap_or(false)
+            });
         }
     }
     let sort_by = q.sort_by.as_deref().unwrap_or("SortName");
