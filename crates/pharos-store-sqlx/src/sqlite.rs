@@ -81,6 +81,54 @@ impl SqliteStore {
     }
 }
 
+impl SqliteStore {
+    /// Read the persisted runtime config snapshot (`runtime_config`
+    /// row id=1). Returns `Default` when the row has never been
+    /// written.
+    pub async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT server_name, login_disclaimer, custom_css \
+             FROM runtime_config WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((server_name, login_disclaimer, custom_css)) => crate::RuntimeConfig {
+                server_name,
+                login_disclaimer,
+                custom_css,
+            },
+            None => crate::RuntimeConfig::default(),
+        })
+    }
+
+    /// Upsert the runtime config snapshot. Callers pass a fully-formed
+    /// `RuntimeConfig`; previous values are replaced wholesale (the
+    /// dashboard always submits the full form).
+    pub async fn set_runtime_config(&self, cfg: &crate::RuntimeConfig) -> Result<(), StoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        sqlx::query(
+            "INSERT INTO runtime_config (id, server_name, login_disclaimer, custom_css, updated_at)
+             VALUES (1, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 server_name = excluded.server_name,
+                 login_disclaimer = excluded.login_disclaimer,
+                 custom_css = excluded.custom_css,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(&cfg.server_name)
+        .bind(&cfg.login_disclaimer)
+        .bind(&cfg.custom_css)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 impl MediaStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {

@@ -212,9 +212,13 @@ const ADVERTISED_JELLYFIN_VERSION: &str = "10.11.0";
 
 async fn system_info(state: web::Data<AppState>, req: actix_web::HttpRequest) -> impl Responder {
     let _ = state.version;
+    let branding = state.effective_branding().await;
+    let server_name = branding
+        .server_name
+        .unwrap_or_else(|| state.server_name.clone());
     HttpResponse::Ok().json(SystemInfoDto {
         id: state.server_id.clone(),
-        server_name: state.server_name.clone(),
+        server_name,
         version: ADVERTISED_JELLYFIN_VERSION.to_string(),
         product_name: "Jellyfin Server",
         operating_system: std::env::consts::OS,

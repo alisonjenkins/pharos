@@ -178,16 +178,20 @@ async fn quick_connect_connect(
     })))
 }
 
-async fn branding_configuration() -> impl Responder {
+async fn branding_configuration(state: web::Data<AppState>) -> impl Responder {
+    let cfg = state.effective_branding().await;
     HttpResponse::Ok().json(serde_json::json!({
-        "LoginDisclaimer": "",
-        "CustomCss": "",
+        "LoginDisclaimer": cfg.login_disclaimer.unwrap_or_default(),
+        "CustomCss": cfg.custom_css.clone().unwrap_or_default(),
         "SplashscreenEnabled": false,
     }))
 }
 
-async fn branding_css() -> impl Responder {
-    HttpResponse::Ok().content_type("text/css").body("")
+async fn branding_css(state: web::Data<AppState>) -> impl Responder {
+    let cfg = state.effective_branding().await;
+    HttpResponse::Ok()
+        .content_type("text/css")
+        .body(cfg.custom_css.unwrap_or_default())
 }
 
 async fn authenticate_by_name(

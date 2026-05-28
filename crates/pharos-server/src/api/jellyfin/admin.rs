@@ -415,14 +415,42 @@ async fn library_refresh(
     Ok(HttpResponse::NoContent().finish())
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct SystemConfigurationBody {
+    server_name: Option<String>,
+    login_disclaimer: Option<String>,
+    custom_css: Option<String>,
+}
+
 async fn post_system_configuration(
+    state: web::Data<AppState>,
     user: AuthUser,
-    _body: web::Bytes,
+    body: web::Bytes,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
-    // Pharos's runtime config lives in `config.toml`; the dashboard's
-    // System / Configuration form posts JSON we accept but don't yet
-    // mutate. Track follow-up under T46 phase 2.
+    // jellyfin-web's dashboard form POSTs a giant JSON blob — we only
+    // mutate the three branding-style fields. Everything else is
+    // accepted-and-ignored (pharos's other runtime config still lives
+    // in config.toml, re-read on restart).
+    let parsed: SystemConfigurationBody = if body.is_empty() {
+        SystemConfigurationBody::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let cfg = pharos_store_sqlx::RuntimeConfig {
+        server_name: parsed
+            .server_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        login_disclaimer: parsed.login_disclaimer,
+        custom_css: parsed.custom_css,
+    };
+    state
+        .stores
+        .set_runtime_config(&cfg)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
 }
 

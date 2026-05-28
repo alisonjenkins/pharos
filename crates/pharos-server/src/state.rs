@@ -106,6 +106,14 @@ impl AppState {
         self
     }
 
+    /// Resolve the active `(server_name, login_disclaimer, custom_css)`
+    /// triple. Reads `runtime_config` once per call; the override wins
+    /// over the toml-supplied defaults. Returns `None` for fields with
+    /// no override so callers can fall through to their own defaults.
+    pub async fn effective_branding(&self) -> pharos_store_sqlx::RuntimeConfig {
+        self.stores.load_runtime_config().await.unwrap_or_default()
+    }
+
     /// Construct from a store, reading or initialising the persistent
     /// `server_id` from `system_identity`. Same id returned across
     /// restarts.

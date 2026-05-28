@@ -292,6 +292,65 @@ async fn system_logs_returns_empty_when_log_dir_unset() {
 }
 
 #[actix_web::test]
+async fn system_configuration_post_persists_server_name_into_info() {
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+
+    // Baseline: /System/Info reports the seed name.
+    let req = test::TestRequest::get()
+        .uri("/System/Info")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["ServerName"], "t");
+
+    // POST /System/Configuration with new ServerName.
+    let req = test::TestRequest::post()
+        .uri("/System/Configuration")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("Content-Type", "application/json"))
+        .set_payload(
+            r#"{"ServerName":"My Pharos","LoginDisclaimer":"Hello","CustomCss":"body{}"}"#,
+        )
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204);
+
+    // /System/Info reflects the new name.
+    let req = test::TestRequest::get()
+        .uri("/System/Info")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["ServerName"], "My Pharos");
+
+    // /Branding/Configuration carries the disclaimer + css.
+    let req = test::TestRequest::get()
+        .uri("/Branding/Configuration")
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["LoginDisclaimer"], "Hello");
+    assert_eq!(v["CustomCss"], "body{}");
+}
+
+#[actix_web::test]
+async fn system_configuration_post_admin_only() {
+    let (state, non_admin_token, _) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/System/Configuration")
+        .insert_header(("X-Emby-Token", non_admin_token.as_str()))
+        .insert_header(("Content-Type", "application/json"))
+        .set_payload(r#"{"ServerName":"hax"}"#)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 403);
+}
+
+#[actix_web::test]
 async fn api_key_create_lists_then_revoke_drops_it() {
     let (state, token, _uid) = seed(true).await;
     let app = test::init_service(build_app(state)).await;

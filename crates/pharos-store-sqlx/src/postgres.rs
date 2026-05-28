@@ -102,6 +102,44 @@ impl PostgresStore {
     }
 }
 
+impl PostgresStore {
+    pub async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT server_name, login_disclaimer, custom_css FROM runtime_config WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((s, l, c)) => crate::RuntimeConfig {
+                server_name: s,
+                login_disclaimer: l,
+                custom_css: c,
+            },
+            None => crate::RuntimeConfig::default(),
+        })
+    }
+
+    pub async fn set_runtime_config(&self, cfg: &crate::RuntimeConfig) -> Result<(), StoreError> {
+        let now = now_unix_secs();
+        sqlx::query(
+            "INSERT INTO runtime_config (id, server_name, login_disclaimer, custom_css, updated_at)
+             VALUES (1, $1, $2, $3, $4)
+             ON CONFLICT (id) DO UPDATE SET
+                 server_name = EXCLUDED.server_name,
+                 login_disclaimer = EXCLUDED.login_disclaimer,
+                 custom_css = EXCLUDED.custom_css,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&cfg.server_name)
+        .bind(&cfg.login_disclaimer)
+        .bind(&cfg.custom_css)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 impl MediaStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
