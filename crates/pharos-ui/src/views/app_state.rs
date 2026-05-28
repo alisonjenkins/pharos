@@ -12,10 +12,11 @@
 //! nothing useful.
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
-use crate::client::{AdminUser, ItemDetail, SearchHint};
+use crate::client::{AdminUser, ItemDetail, LiveChannel, LiveProgram, SearchHint};
 use crate::views::{
     AdminAction, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
-    LoginAttempt, LoginForm, PlayerView, SearchStatus, SearchView,
+    LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, SearchStatus,
+    SearchView,
 };
 use dioxus::prelude::*;
 
@@ -29,8 +30,12 @@ pub enum AppRoute {
         item_id: String,
         kind: ItemKind,
     },
+    LivePlayer {
+        channel_id: String,
+    },
     Admin,
     Search,
+    LiveTv,
 }
 
 #[component]
@@ -123,6 +128,11 @@ fn Authenticated(
                 onclick: move |_| route.set(AppRoute::Search),
                 "Search"
             }
+            button {
+                class: "pharos-nav-livetv",
+                onclick: move |_| route.set(AppRoute::LiveTv),
+                "Live TV"
+            }
             if is_admin {
                 button {
                     class: "pharos-nav-admin",
@@ -175,6 +185,23 @@ fn Authenticated(
                     on_select: move |id: String| {
                         route.set(AppRoute::Detail { item_id: id });
                     }
+                }
+            },
+            AppRoute::LiveTv => rsx! {
+                LiveTvPane {
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
+                    on_tune: move |id: String| {
+                        route.set(AppRoute::LivePlayer { channel_id: id });
+                    }
+                }
+            },
+            AppRoute::LivePlayer { channel_id } => rsx! {
+                LivePlayerPane {
+                    channel_id: channel_id.clone(),
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
+                    on_back: move |_| { route.set(AppRoute::LiveTv); },
                 }
             }
         }
@@ -503,6 +530,109 @@ fn PlayerPane(
     }
 }
 
+#[component]
+fn LivePlayerPane(
+    channel_id: String,
+    access_token: String,
+    server_base: String,
+    on_back: EventHandler<()>,
+) -> Element {
+    let src = format!(
+        "{server_base}/LiveTv/Channels/{channel_id}/Stream?api_key={access_token}"
+    );
+    rsx! {
+        div {
+            class: "pharos-player-pane pharos-livetv-player",
+            button {
+                class: "pharos-back",
+                onclick: move |_| on_back.call(()),
+                "← Back"
+            }
+            PlayerView {
+                item_id: channel_id.clone(),
+                kind: ItemKind::Movie,
+                access_token: access_token,
+                server_base: server_base,
+                src_override: Some(src),
+                on_event: move |_| {},
+            }
+        }
+    }
+}
+
+#[component]
+fn LiveTvPane(
+    access_token: String,
+    server_base: String,
+    on_tune: EventHandler<String>,
+) -> Element {
+    let reload = use_signal(|| 0u32);
+    let channels_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_live_channels(&base, &token).await }
+        })
+    };
+    let programs_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_live_programs(&base, &token, 6).await }
+        })
+    };
+
+    // `/livetv/channels/{id}/images/primary` is a public 302 to the
+    // upstream M3U logo — no api_key needed (matches `<img>` semantics
+    // where headers cannot be injected).
+    let logo_url_template = Some(format!(
+        "{server_base}/LiveTv/Channels/{{id}}/Images/Primary"
+    ));
+
+    let action_handler = {
+        let mut reload_signal = reload;
+        let on_tune = on_tune;
+        move |action: LiveTvAction| match action {
+            LiveTvAction::Tune { channel_id } => on_tune.call(channel_id),
+            LiveTvAction::Refresh => {
+                let n = *reload_signal.read();
+                reload_signal.set(n.wrapping_add(1));
+            }
+        }
+    };
+
+    let ch_value = channels_resource.read_unchecked();
+    let prog_value = programs_resource.read_unchecked();
+    let (channels, ch_status) = match ch_value.as_ref() {
+        None => (Vec::<LiveChannel>::new(), LiveTvStatus::Loading),
+        Some(Err(e)) => (Vec::new(), LiveTvStatus::Error(e.clone())),
+        Some(Ok(v)) if v.is_empty() => (Vec::new(), LiveTvStatus::Empty),
+        Some(Ok(v)) => (v.clone(), LiveTvStatus::Idle),
+    };
+    let programs: Vec<LiveProgram> = match prog_value.as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+
+    rsx! {
+        LiveTvView {
+            channels: channels,
+            programs: programs,
+            status: ch_status,
+            logo_url_template: logo_url_template,
+            on_action: action_handler,
+        }
+    }
+}
+
 #[cfg(feature = "web")]
 fn server_base_from_window() -> String {
     web_sys::window()
@@ -664,6 +794,38 @@ async fn toggle_favorite(
     _favorite: bool,
 ) -> Result<(), String> {
     Err("mark_favorite is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_live_channels(base: &str, token: &str) -> Result<Vec<LiveChannel>, String> {
+    crate::client::web::live_channels(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_live_channels(_base: &str, _token: &str) -> Result<Vec<LiveChannel>, String> {
+    Err("live_channels is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_live_programs(
+    base: &str,
+    token: &str,
+    hours: u32,
+) -> Result<Vec<LiveProgram>, String> {
+    crate::client::web::live_programs(base, token, hours)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_live_programs(
+    _base: &str,
+    _token: &str,
+    _hours: u32,
+) -> Result<Vec<LiveProgram>, String> {
+    Err("live_programs is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

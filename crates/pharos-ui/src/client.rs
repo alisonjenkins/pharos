@@ -261,6 +261,115 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
         .collect())
 }
 
+/// T56 — Live TV channel projection. `id` is the upstream tvg-id.
+/// `logo_url` is the public `/livetv/channels/{id}/images/primary`
+/// redirect path so the UI can render `<img src=...>` without
+/// composing the upstream URL itself.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveChannel {
+    pub id: String,
+    pub name: String,
+    pub number: String,
+    pub group: Option<String>,
+    pub has_logo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveProgram {
+    pub id: String,
+    pub channel_id: String,
+    pub title: String,
+    pub overview: Option<String>,
+    pub start_iso: String,
+    pub end_iso: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveChannelDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    channel_number: String,
+    #[serde(default)]
+    channel_group_name: Option<String>,
+    #[serde(default)]
+    image_tags: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveChannelsResultDto {
+    #[serde(default)]
+    items: Vec<LiveChannelDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveProgramDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    channel_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    start_date: String,
+    #[serde(default)]
+    end_date: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveProgramsResultDto {
+    #[serde(default)]
+    items: Vec<LiveProgramDto>,
+}
+
+pub fn parse_live_channels_response(bytes: &[u8]) -> Result<Vec<LiveChannel>, ClientError> {
+    let parsed: LiveChannelsResultDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .items
+        .into_iter()
+        .map(|c| {
+            let has_logo = c
+                .image_tags
+                .as_object()
+                .map(|m| m.contains_key("Primary"))
+                .unwrap_or(false);
+            LiveChannel {
+                id: c.id,
+                name: c.name,
+                number: c.channel_number,
+                group: c.channel_group_name,
+                has_logo,
+            }
+        })
+        .collect())
+}
+
+pub fn parse_live_programs_response(bytes: &[u8]) -> Result<Vec<LiveProgram>, ClientError> {
+    let parsed: LiveProgramsResultDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .items
+        .into_iter()
+        .map(|p| LiveProgram {
+            id: p.id,
+            channel_id: p.channel_id,
+            title: p.name,
+            overview: p.overview,
+            start_iso: p.start_date,
+            end_iso: p.end_date,
+        })
+        .collect())
+}
+
 pub fn parse_admin_users_response(bytes: &[u8]) -> Result<Vec<AdminUser>, ClientError> {
     let parsed: Vec<AdminUserDto> =
         serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
@@ -507,6 +616,46 @@ pub mod web {
         out
     }
 
+    pub async fn live_channels(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<LiveChannel>, ClientError> {
+        let resp = Request::get(&format!("{base}/LiveTv/Channels"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_live_channels_response(&bytes)
+    }
+
+    pub async fn live_programs(
+        base: &str,
+        token: &str,
+        window_hours: u32,
+    ) -> Result<Vec<LiveProgram>, ClientError> {
+        let resp =
+            Request::get(&format!("{base}/LiveTv/Programs?windowHours={window_hours}"))
+                .header("X-Emby-Token", token)
+                .send()
+                .await
+                .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_live_programs_response(&bytes)
+    }
+
     pub async fn admin_library_refresh(base: &str, token: &str) -> Result<(), ClientError> {
         let resp = Request::post(&format!("{base}/Library/Refresh"))
             .header("X-Emby-Token", token)
@@ -631,6 +780,41 @@ mod tests {
         assert!(d.has_backdrop_image);
         assert_eq!(d.play_count, 4);
         assert!(d.is_favorite);
+    }
+
+    #[test]
+    fn parse_live_channels_extracts_id_name_number_logo() {
+        let body = br#"{
+            "Items":[
+                {"Id":"c1","Name":"BBC One","ChannelNumber":"1","ChannelGroupName":"UK","ImageTags":{"Primary":"c1"}},
+                {"Id":"c2","Name":"BBC Two","ChannelNumber":"2","ImageTags":{}}
+            ],
+            "TotalRecordCount":2,"StartIndex":0
+        }"#;
+        let v = parse_live_channels_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].id, "c1");
+        assert_eq!(v[0].number, "1");
+        assert_eq!(v[0].group.as_deref(), Some("UK"));
+        assert!(v[0].has_logo);
+        assert!(!v[1].has_logo);
+        assert!(v[1].group.is_none());
+    }
+
+    #[test]
+    fn parse_live_programs_extracts_window_entries() {
+        let body = br#"{
+            "Items":[
+                {"Id":"c1-1","ChannelId":"c1","Name":"News","Overview":"Daily news",
+                 "StartDate":"2026-05-28T10:00:00.000Z","EndDate":"2026-05-28T10:30:00.000Z"}
+            ],
+            "TotalRecordCount":1,"StartIndex":0
+        }"#;
+        let v = parse_live_programs_response(body).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].channel_id, "c1");
+        assert_eq!(v[0].title, "News");
+        assert!(v[0].start_iso.starts_with("2026-05-28T10:00"));
     }
 
     #[test]

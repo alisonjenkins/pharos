@@ -12,10 +12,10 @@
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::AdminUser;
-use pharos_ui::client::{ItemDetail, SearchHint};
+use pharos_ui::client::{ItemDetail, LiveChannel, LiveProgram, SearchHint};
 use pharos_ui::views::{
     AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView, LibraryView,
-    LoginForm, PlayerView, SearchStatus, SearchView,
+    LiveTvStatus, LiveTvView, LoginForm, PlayerView, SearchStatus, SearchView,
 };
 
 fn render_root(root: fn() -> Element) -> String {
@@ -513,4 +513,96 @@ fn detail_view_episode_with_only_series_name_omits_se_label() {
     // No S/E label when both indices missing.
     assert!(!html.contains("S00"), "{html}");
     assert!(!html.contains("pharos-detail-episode-index"), "{html}");
+}
+
+// ---- LiveTvView -------------------------------------------------
+
+fn live_tv_with_two_channels() -> Element {
+    let channels = vec![
+        LiveChannel {
+            id: "c1".into(),
+            name: "BBC One".into(),
+            number: "1".into(),
+            group: Some("UK".into()),
+            has_logo: true,
+        },
+        LiveChannel {
+            id: "c2".into(),
+            name: "BBC Two".into(),
+            number: "2".into(),
+            group: None,
+            has_logo: false,
+        },
+    ];
+    let programs = vec![LiveProgram {
+        id: "c1-1".into(),
+        channel_id: "c1".into(),
+        title: "Six O'Clock News".into(),
+        overview: None,
+        start_iso: "2026-05-28T18:00:00.000Z".into(),
+        end_iso: "2026-05-28T18:30:00.000Z".into(),
+    }];
+    rsx! {
+        LiveTvView {
+            channels: channels,
+            programs: programs,
+            status: LiveTvStatus::Idle,
+            logo_url_template: Some("/LiveTv/Channels/{id}/Images/Primary".to_string()),
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn live_tv_empty() -> Element {
+    rsx! {
+        LiveTvView {
+            channels: Vec::<LiveChannel>::new(),
+            programs: Vec::<LiveProgram>::new(),
+            status: LiveTvStatus::Empty,
+            logo_url_template: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn live_tv_loading() -> Element {
+    rsx! {
+        LiveTvView {
+            channels: Vec::<LiveChannel>::new(),
+            programs: Vec::<LiveProgram>::new(),
+            status: LiveTvStatus::Loading,
+            logo_url_template: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn live_tv_view_renders_channel_grid_with_epg_and_logo() {
+    let html = render_root(live_tv_with_two_channels);
+    assert!(html.contains("BBC One"), "{html}");
+    assert!(html.contains("BBC Two"), "{html}");
+    // EPG entry rendered + HH:MM time extracted.
+    assert!(html.contains("18:00"), "{html}");
+    assert!(html.contains("Six O&#x27;Clock News") || html.contains("Six O'Clock News"), "{html}");
+    // Logo substitution: c1 has logo → has rendered <img> with /Primary path,
+    // c2 has no logo → no <img>.
+    assert!(html.contains("/LiveTv/Channels/c1/Images/Primary"), "{html}");
+    assert!(!html.contains("/LiveTv/Channels/c2/Images/Primary"), "{html}");
+    // No-listing fallback for the second channel.
+    assert!(html.contains("no listings"), "{html}");
+}
+
+#[test]
+fn live_tv_view_renders_empty_state() {
+    let html = render_root(live_tv_empty);
+    assert!(html.contains("pharos-livetv-empty"), "{html}");
+    assert!(html.contains("No channels configured"), "{html}");
+}
+
+#[test]
+fn live_tv_view_renders_loading_state() {
+    let html = render_root(live_tv_loading);
+    assert!(html.contains("pharos-livetv-loading"), "{html}");
+    assert!(html.contains("Loading channels"), "{html}");
 }

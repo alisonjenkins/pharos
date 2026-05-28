@@ -16,6 +16,11 @@ pub struct PlayerProps {
     pub access_token: String,
     pub server_base: String,
     pub tracks: Option<PlaybackTracks>,
+    /// Optional source URL override. When set, replaces the
+    /// kind-derived `/Videos/.../stream` or `/Audio/.../universal`
+    /// URL. Live TV uses this to point at `/LiveTv/Channels/{id}/Stream`
+    /// without polluting ItemKind with a `LiveChannel` variant.
+    pub src_override: Option<String>,
 }
 
 fn track_label(t: &MediaTrack) -> String {
@@ -47,15 +52,19 @@ pub fn PlayerView(
     access_token: String,
     server_base: String,
     tracks: Option<PlaybackTracks>,
+    src_override: Option<String>,
     on_event: EventHandler<PlaybackEvent>,
 ) -> Element {
-    let src = match kind {
-        ItemKind::Audio => format!(
-            "{server_base}/Audio/{item_id}/universal?api_key={access_token}"
-        ),
-        ItemKind::Movie | ItemKind::Episode => format!(
-            "{server_base}/Videos/{item_id}/stream?api_key={access_token}"
-        ),
+    let src = match src_override.as_ref() {
+        Some(url) => url.clone(),
+        None => match kind {
+            ItemKind::Audio => {
+                format!("{server_base}/Audio/{item_id}/universal?api_key={access_token}")
+            }
+            ItemKind::Movie | ItemKind::Episode => {
+                format!("{server_base}/Videos/{item_id}/stream?api_key={access_token}")
+            }
+        },
     };
 
     let id_for_play = item_id.clone();
@@ -222,6 +231,7 @@ mod tests {
             access_token: "tok".into(),
             server_base: "https://pharos.test".into(),
             tracks: None,
+            src_override: None,
         };
         let expected =
             "https://pharos.test/Audio/42/universal?api_key=tok";
