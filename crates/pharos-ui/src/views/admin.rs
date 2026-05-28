@@ -23,6 +23,18 @@ pub struct CreateUserAttempt {
 pub enum AdminAction {
     DeleteUser(String),
     CreateUser(CreateUserAttempt),
+    /// T50 phase 2 — flip the admin bit. `is_admin = false` against
+    /// the only remaining admin is refused server-side.
+    SetUserPolicy {
+        user_id: String,
+        is_admin: bool,
+    },
+    /// T50 phase 2 — admin-reset another user's password. Empty
+    /// `new_password` is rejected on the parent.
+    ResetUserPassword {
+        user_id: String,
+        new_password: String,
+    },
     LibraryRefresh,
     Refresh,
     SelectTab(AdminTab),
@@ -164,12 +176,11 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                             class: "pharos-admin-user-list",
                             for user in props.users.iter().cloned() {
                                 AdminUserRow {
+                                    key: "{user.id}",
                                     disable_delete: user.id == props.current_user_id,
+                                    is_self: user.id == props.current_user_id,
                                     user: user.clone(),
-                                    on_delete: {
-                                        let on_action = props.on_action;
-                                        move |id: String| on_action.call(AdminAction::DeleteUser(id))
-                                    }
+                                    on_action: props.on_action,
                                 }
                             }
                         }
@@ -395,23 +406,85 @@ pub fn AdminView(props: AdminViewProps) -> Element {
 struct AdminUserRowProps {
     user: AdminUser,
     disable_delete: bool,
-    on_delete: EventHandler<String>,
+    /// True when the row represents the currently signed-in admin —
+    /// disables `Delete` + flips the password reset form into a
+    /// self-change shape (needs current pw — phase 3).
+    is_self: bool,
+    on_action: EventHandler<AdminAction>,
 }
 
 #[component]
 fn AdminUserRow(props: AdminUserRowProps) -> Element {
     let admin_marker = if props.user.is_admin { " (admin)" } else { "" };
-    let id_for_handler = props.user.id.clone();
+    let id_for_delete = props.user.id.clone();
+    let id_for_policy = props.user.id.clone();
+    let id_for_reset = props.user.id.clone();
+    let user_is_admin = props.user.is_admin;
+    let mut reset_pw = use_signal(String::new);
+    let mut reset_pw_for_submit = reset_pw;
     rsx! {
         li {
             class: "pharos-admin-user",
             span { class: "pharos-admin-user-name", "{props.user.name}{admin_marker}" }
+            label {
+                class: "pharos-admin-user-policy",
+                input {
+                    r#type: "checkbox",
+                    checked: user_is_admin,
+                    onchange: {
+                        let on_action = props.on_action;
+                        move |ev: FormEvent| {
+                            let new_admin = ev.value() == "true" || ev.value() == "on";
+                            on_action.call(AdminAction::SetUserPolicy {
+                                user_id: id_for_policy.clone(),
+                                is_admin: new_admin,
+                            });
+                        }
+                    },
+                }
+                " admin"
+            }
+            form {
+                class: "pharos-admin-user-reset",
+                onsubmit: {
+                    let on_action = props.on_action;
+                    move |ev: FormEvent| {
+                        ev.prevent_default();
+                        let pw = reset_pw_for_submit.read().clone();
+                        if pw.is_empty() {
+                            return;
+                        }
+                        on_action.call(AdminAction::ResetUserPassword {
+                            user_id: id_for_reset.clone(),
+                            new_password: pw,
+                        });
+                        reset_pw_for_submit.set(String::new());
+                    }
+                },
+                input {
+                    class: "pharos-admin-user-reset-input",
+                    r#type: "password",
+                    placeholder: if props.is_self { "Reset (current pw needed)" } else { "Reset password" },
+                    value: "{reset_pw.read()}",
+                    oninput: move |ev| reset_pw.set(ev.value()),
+                    // Self-reset still requires current pw — the bare
+                    // admin reset form skips it. Disable submit on the
+                    // self row to point users at the prefs view.
+                    disabled: props.is_self,
+                }
+                button {
+                    class: "pharos-admin-user-reset-submit",
+                    r#type: "submit",
+                    disabled: props.is_self,
+                    "Reset"
+                }
+            }
             button {
                 class: "pharos-admin-user-delete",
                 disabled: props.disable_delete,
                 onclick: {
-                    let on_delete = props.on_delete;
-                    move |_| on_delete.call(id_for_handler.clone())
+                    let on_action = props.on_action;
+                    move |_| on_action.call(AdminAction::DeleteUser(id_for_delete.clone()))
                 },
                 if props.disable_delete { "you" } else { "Delete" }
             }

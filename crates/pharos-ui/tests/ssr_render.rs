@@ -354,6 +354,13 @@ fn admin_view_renders_user_rows_with_self_delete_disabled() {
         "self-delete not rendered as 'you': {html}"
     );
     assert!(html.contains(">Delete<"), "{html}");
+    // T50 phase 2: admin-toggle checkbox + password reset form per row.
+    assert!(html.contains("pharos-admin-user-policy"), "{html}");
+    assert!(html.contains("pharos-admin-user-reset"), "{html}");
+    // Self-row's reset input is disabled (points user at prefs view).
+    // Non-self row carries the standard placeholder.
+    assert!(html.contains("Reset password"), "{html}");
+    assert!(html.contains("Reset (current pw needed)"), "{html}");
 }
 
 #[test]

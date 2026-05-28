@@ -638,6 +638,22 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                         Ok(()) => status_signal.set(Some(format!("Deleted {id}"))),
                         Err(e) => status_signal.set(Some(format!("Delete failed: {e}"))),
                     },
+                    AdminAction::SetUserPolicy { user_id, is_admin } => {
+                        match set_user_policy(&base, &token, &user_id, is_admin).await {
+                            Ok(()) => status_signal.set(Some(format!(
+                                "{user_id} is now {}",
+                                if is_admin { "admin" } else { "non-admin" }
+                            ))),
+                            Err(e) => status_signal.set(Some(format!("Policy update failed: {e}"))),
+                        }
+                    }
+                    AdminAction::ResetUserPassword {
+                        user_id,
+                        new_password,
+                    } => match reset_user_password(&base, &token, &user_id, &new_password).await {
+                        Ok(()) => status_signal.set(Some(format!("Password reset for {user_id}"))),
+                        Err(e) => status_signal.set(Some(format!("Password reset failed: {e}"))),
+                    },
                     AdminAction::SelectTab(_) => unreachable!("handled above"),
                 }
                 let n = *reload_signal.read();
@@ -1436,6 +1452,50 @@ async fn send_general(
     _arg: serde_json::Value,
 ) -> Result<(), String> {
     Err("send_session_general is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn set_user_policy(
+    base: &str,
+    token: &str,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(), String> {
+    crate::client::web::admin_set_user_policy(base, token, user_id, is_admin)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn set_user_policy(
+    _base: &str,
+    _token: &str,
+    _user_id: &str,
+    _is_admin: bool,
+) -> Result<(), String> {
+    Err("admin_set_user_policy is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn reset_user_password(
+    base: &str,
+    token: &str,
+    user_id: &str,
+    new_password: &str,
+) -> Result<(), String> {
+    crate::client::web::admin_reset_user_password(base, token, user_id, new_password)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn reset_user_password(
+    _base: &str,
+    _token: &str,
+    _user_id: &str,
+    _new_password: &str,
+) -> Result<(), String> {
+    Err("admin_reset_user_password is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

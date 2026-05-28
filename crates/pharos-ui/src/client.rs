@@ -971,6 +971,55 @@ pub mod web {
         Ok(())
     }
 
+    pub async fn admin_set_user_policy(
+        base: &str,
+        token: &str,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "IsAdministrator": is_admin }).to_string();
+        let resp = Request::post(&format!("{base}/Users/{user_id}/Policy"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    /// T50 phase 2 — admin password reset for another user. Self-reset
+    /// requires CurrentPw, so admins reset only other users this way;
+    /// the caller-side check sits in `AdminUserRow`.
+    pub async fn admin_reset_user_password(
+        base: &str,
+        token: &str,
+        user_id: &str,
+        new_password: &str,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::json!({
+            "NewPw": new_password,
+            "ResetPassword": false,
+        })
+        .to_string();
+        let resp = Request::post(&format!("{base}/Users/{user_id}/Password"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn admin_delete_user(
         base: &str,
         token: &str,
