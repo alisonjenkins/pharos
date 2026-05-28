@@ -242,19 +242,71 @@ async fn system_info(state: web::Data<AppState>, req: actix_web::HttpRequest) ->
     })
 }
 
-/// Single-locale stub — jellyfin-web's preferences dropdowns
-/// render fine with one option each. Real lists land when the
-/// settings UI surfaces a need.
+/// A curated list of the languages pharos clients are most likely to
+/// pick for audio + subtitle preferences. Pharos doesn't ship the
+/// full ICU locale catalogue — that would bloat the binary for a
+/// dropdown — but the slice covers ~95% of clients in practice. If a
+/// user needs an exotic locale they can type it into the prefs view's
+/// text field (which is the canonical source of truth).
 async fn localization_cultures(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!([
-        {
-            "Name": "English",
-            "DisplayName": "English",
-            "TwoLetterISOLanguageName": "en",
-            "ThreeLetterISOLanguageName": "eng",
-            "ThreeLetterISOLanguageNames": ["eng"],
+    HttpResponse::Ok().json(LOCALIZATION_CULTURES)
+}
+
+const LOCALIZATION_CULTURES: &[Culture] = &[
+    Culture::new("English", "en", "eng"),
+    Culture::new("Spanish", "es", "spa"),
+    Culture::new("French", "fr", "fre"),
+    Culture::new("German", "de", "ger"),
+    Culture::new("Italian", "it", "ita"),
+    Culture::new("Portuguese", "pt", "por"),
+    Culture::new("Dutch", "nl", "dut"),
+    Culture::new("Russian", "ru", "rus"),
+    Culture::new("Polish", "pl", "pol"),
+    Culture::new("Turkish", "tr", "tur"),
+    Culture::new("Czech", "cs", "cze"),
+    Culture::new("Swedish", "sv", "swe"),
+    Culture::new("Norwegian", "no", "nor"),
+    Culture::new("Danish", "da", "dan"),
+    Culture::new("Finnish", "fi", "fin"),
+    Culture::new("Greek", "el", "gre"),
+    Culture::new("Hungarian", "hu", "hun"),
+    Culture::new("Romanian", "ro", "rum"),
+    Culture::new("Arabic", "ar", "ara"),
+    Culture::new("Hebrew", "he", "heb"),
+    Culture::new("Hindi", "hi", "hin"),
+    Culture::new("Japanese", "ja", "jpn"),
+    Culture::new("Korean", "ko", "kor"),
+    Culture::new("Chinese", "zh", "chi"),
+    Culture::new("Vietnamese", "vi", "vie"),
+    Culture::new("Thai", "th", "tha"),
+    Culture::new("Ukrainian", "uk", "ukr"),
+    Culture::new("Indonesian", "id", "ind"),
+];
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Culture {
+    name: &'static str,
+    display_name: &'static str,
+    two_letter_iso_language_name: &'static str,
+    three_letter_iso_language_name: &'static str,
+    three_letter_iso_language_names: &'static [&'static str],
+}
+
+impl Culture {
+    const fn new(
+        name: &'static str,
+        two: &'static str,
+        three: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            display_name: name,
+            two_letter_iso_language_name: two,
+            three_letter_iso_language_name: three,
+            three_letter_iso_language_names: &[],
         }
-    ]))
+    }
 }
 
 async fn localization_countries(_user: AuthUser) -> impl Responder {

@@ -14,8 +14,8 @@
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
-    LiveChannel, LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
-    UserConfiguration,
+    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, RemoteSession,
+    ScheduledTask, SearchHint, UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -1190,6 +1190,15 @@ fn PrefsPane(
             async move { fetch_user_configuration(&base, &token).await }
         })
     };
+    let cultures_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        use_resource(move || {
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_cultures(&base, &token).await }
+        })
+    };
 
     let action_handler = {
         let access_token = access_token.clone();
@@ -1224,6 +1233,10 @@ fn PrefsPane(
         Some(Ok(c)) => (c.clone(), None),
         Some(Err(e)) => (UserConfiguration::default(), Some(e.clone())),
     };
+    let cultures: Vec<LocalizationCulture> = match cultures_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
     let combined_status = fetch_err.or_else(|| status.read().clone());
 
     rsx! {
@@ -1231,6 +1244,7 @@ fn PrefsPane(
             config: config,
             active_tab: active_tab,
             status: combined_status,
+            cultures: cultures,
             on_action: action_handler,
         }
     }
@@ -1872,6 +1886,18 @@ async fn fetch_activity_entries(base: &str, token: &str) -> Result<Vec<ActivityE
 #[cfg(not(feature = "web"))]
 async fn fetch_activity_entries(_base: &str, _token: &str) -> Result<Vec<ActivityEntry>, String> {
     Err("list_activity_entries is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_cultures(base: &str, token: &str) -> Result<Vec<LocalizationCulture>, String> {
+    crate::client::web::list_cultures(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_cultures(_base: &str, _token: &str) -> Result<Vec<LocalizationCulture>, String> {
+    Err("list_cultures is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

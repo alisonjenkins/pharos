@@ -13,8 +13,8 @@ use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::{
     ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
-    LiveChannel, LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
-    UserConfiguration,
+    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, RemoteSession,
+    ScheduledTask, SearchHint, UserConfiguration,
 };
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
@@ -1244,4 +1244,43 @@ fn prefs_view_home_tab_renders_auto_play_toggle() {
     let html = render_root(prefs_home);
     assert!(html.contains("pharos-prefs-pane-home"), "{html}");
     assert!(html.contains("Auto-play next episode"), "{html}");
+}
+
+fn prefs_languages() -> Element {
+    rsx! {
+        PrefsView {
+            config: UserConfiguration {
+                audio_language_preference: "jpn".into(),
+                subtitle_language_preference: "eng".into(),
+                ..Default::default()
+            },
+            active_tab: PrefsTab::Languages,
+            status: None,
+            cultures: vec![
+                LocalizationCulture {
+                    name: "English".into(),
+                    two_letter_iso: "en".into(),
+                    three_letter_iso: "eng".into(),
+                },
+                LocalizationCulture {
+                    name: "Japanese".into(),
+                    two_letter_iso: "ja".into(),
+                    three_letter_iso: "jpn".into(),
+                },
+            ],
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn prefs_view_languages_tab_renders_dropdowns() {
+    let html = render_root(prefs_languages);
+    assert!(html.contains("pharos-prefs-pane-languages"), "{html}");
+    assert!(html.contains("Preferred audio language"), "{html}");
+    assert!(html.contains("Preferred subtitle language"), "{html}");
+    assert!(html.contains("English"), "{html}");
+    assert!(html.contains("Japanese"), "{html}");
+    // Languages tab is wired into the tab strip.
+    assert!(html.contains(">Languages<"), "{html}");
 }

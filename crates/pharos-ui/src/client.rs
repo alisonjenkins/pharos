@@ -342,6 +342,40 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
         .collect())
 }
 
+/// T55 ph2 — `/Localization/Cultures` row (subset of the upstream
+/// Jellyfin DTO — pharos's prefs view only needs the picker label +
+/// the two-letter code).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LocalizationCulture {
+    pub name: String,
+    pub two_letter_iso: String,
+    pub three_letter_iso: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LocalizationCultureDto {
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "TwoLetterISOLanguageName")]
+    two_letter_iso: String,
+    #[serde(default, rename = "ThreeLetterISOLanguageName")]
+    three_letter_iso: String,
+}
+
+pub fn parse_cultures_response(bytes: &[u8]) -> Result<Vec<LocalizationCulture>, ClientError> {
+    let parsed: Vec<LocalizationCultureDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|c| LocalizationCulture {
+            name: c.name,
+            two_letter_iso: c.two_letter_iso,
+            three_letter_iso: c.three_letter_iso,
+        })
+        .collect())
+}
+
 /// T55 — UserConfiguration projection. Subset of jellyfin-web's
 /// `Configuration` block — fields the preferences UI flips. Strings
 /// kept as `String` so the form can round-trip arbitrary values.
@@ -1570,6 +1604,25 @@ pub mod web {
         parse_activity_entries_response(&bytes)
     }
 
+    pub async fn list_cultures(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<LocalizationCulture>, ClientError> {
+        let resp = Request::get(&format!("{base}/Localization/Cultures"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_cultures_response(&bytes)
+    }
+
     pub async fn fetch_user_configuration(
         base: &str,
         token: &str,
@@ -1852,6 +1905,19 @@ mod tests {
         let v = parse_activity_entries_response(body).unwrap();
         assert_eq!(v[0].id, "abc");
         assert_eq!(v[1].id, "42");
+    }
+
+    #[test]
+    fn parse_cultures_extracts_name_and_iso_codes() {
+        let body = br#"[
+            {"Name":"English","TwoLetterISOLanguageName":"en","ThreeLetterISOLanguageName":"eng"},
+            {"Name":"French","TwoLetterISOLanguageName":"fr","ThreeLetterISOLanguageName":"fre"}
+        ]"#;
+        let v = parse_cultures_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "English");
+        assert_eq!(v[0].two_letter_iso, "en");
+        assert_eq!(v[1].three_letter_iso, "fre");
     }
 
     #[test]
