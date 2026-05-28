@@ -141,6 +141,8 @@ async fn transcoder_streams_bytes_from_real_video() {
         audio_bitrate_bps: None,
         start_position_ticks: 0,
         duration_ticks: None,
+        audio_source_stream_index: None,
+        burn_subtitle_stream_index: None,
     };
     let mut stream = FfmpegTranscoder::new()
         .transcode(&fixture, &opts)
@@ -233,5 +235,135 @@ async fn image_cache_extracts_audio_cover_art() {
         bytes.len() > 64,
         "extracted cover too small: {} bytes",
         bytes.len()
+    );
+}
+
+/// Static `dualaudio.mkv` from the nix fixtures derivation. Two
+/// audio tracks (440 Hz / 880 Hz) over a VP9 video. Drives W1.
+fn make_dual_audio_fixture(_dir: &Path) -> PathBuf {
+    fixture("dualaudio.mkv").expect("PHAROS_TEST_FIXTURES/dualaudio.mkv missing")
+}
+
+/// Static `dualsubs.mkv` from the nix fixtures derivation. Two
+/// embedded WebVTT subtitle tracks. Drives W2.
+fn make_dual_subtitle_fixture(_dir: &Path) -> PathBuf {
+    fixture("dualsubs.mkv").expect("PHAROS_TEST_FIXTURES/dualsubs.mkv missing")
+}
+
+/// Read the entire transcode stream into a Vec<u8> (bounded by
+/// fixture length, so always small).
+async fn drain_transcode_stream(
+    mut stream: pharos_transcode::TranscodeStream,
+) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+/// W1 — switching `AudioStreamIndex` produces different output bytes
+/// because ffmpeg muxes the chosen track. We don't decode the audio
+/// (that would require a separate analyser); the byte-diff is enough
+/// to prove the `-map 0:a:N` knob landed.
+#[tokio::test]
+#[ignore = "requires ffmpeg on PATH"]
+async fn transcoder_honours_audio_stream_index() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_dual_audio_fixture(td.path());
+
+    let common = TranscodeOptions {
+        container: pharos_transcode::Container::Mpegts,
+        video: Some(pharos_transcode::VideoCodec::H264),
+        audio: Some(pharos_transcode::AudioCodec::Aac),
+        video_bitrate_bps: Some(500_000),
+        audio_bitrate_bps: Some(128_000),
+        start_position_ticks: 0,
+        duration_ticks: Some(20_000_000), // 2 seconds
+        audio_source_stream_index: Some(0),
+        burn_subtitle_stream_index: None,
+    };
+    let track0_stream = FfmpegTranscoder::new()
+        .transcode(&fixture, &common)
+        .await
+        .unwrap();
+    let track0 = drain_transcode_stream(track0_stream).await.unwrap();
+
+    let mut alt = common.clone();
+    alt.audio_source_stream_index = Some(1);
+    let track1_stream = FfmpegTranscoder::new()
+        .transcode(&fixture, &alt)
+        .await
+        .unwrap();
+    let track1 = drain_transcode_stream(track1_stream).await.unwrap();
+
+    assert!(!track0.is_empty(), "track 0 produced no bytes");
+    assert!(!track1.is_empty(), "track 1 produced no bytes");
+    assert_ne!(
+        track0, track1,
+        "AudioStreamIndex switch produced identical output bytes"
+    );
+}
+
+/// W2 — burning a subtitle into the video changes the encoded
+/// stream. With + without burn-in must differ; track 0 vs track 1
+/// burn-in must also differ.
+#[tokio::test]
+#[ignore = "requires ffmpeg on PATH"]
+async fn transcoder_honours_burn_subtitle_index() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fixture = make_dual_subtitle_fixture(td.path());
+
+    let base = TranscodeOptions {
+        container: pharos_transcode::Container::Mpegts,
+        video: Some(pharos_transcode::VideoCodec::H264),
+        audio: Some(pharos_transcode::AudioCodec::Aac),
+        video_bitrate_bps: Some(500_000),
+        audio_bitrate_bps: Some(128_000),
+        start_position_ticks: 0,
+        duration_ticks: Some(20_000_000),
+        audio_source_stream_index: None,
+        burn_subtitle_stream_index: None,
+    };
+    let no_burn_stream = FfmpegTranscoder::new()
+        .transcode(&fixture, &base)
+        .await
+        .unwrap();
+    let no_burn = drain_transcode_stream(no_burn_stream).await.unwrap();
+
+    let mut with_sub_a = base.clone();
+    with_sub_a.burn_subtitle_stream_index = Some(0);
+    let sub_a_stream = FfmpegTranscoder::new()
+        .transcode(&fixture, &with_sub_a)
+        .await
+        .unwrap();
+    let sub_a = drain_transcode_stream(sub_a_stream).await.unwrap();
+
+    let mut with_sub_b = base.clone();
+    with_sub_b.burn_subtitle_stream_index = Some(1);
+    let sub_b_stream = FfmpegTranscoder::new()
+        .transcode(&fixture, &with_sub_b)
+        .await
+        .unwrap();
+    let sub_b = drain_transcode_stream(sub_b_stream).await.unwrap();
+
+    assert!(!no_burn.is_empty(), "no-burn produced no bytes");
+    assert!(!sub_a.is_empty(), "subtitle 0 burn produced no bytes");
+    assert!(!sub_b.is_empty(), "subtitle 1 burn produced no bytes");
+    assert_ne!(no_burn, sub_a, "burning subtitle 0 didn't change output");
+    assert_ne!(
+        sub_a, sub_b,
+        "subtitle 0 vs 1 burn produced identical output"
     );
 }

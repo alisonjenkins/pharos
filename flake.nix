@@ -266,7 +266,52 @@
                      -shortest \
                      $out/subbed.webm
 
-              # 4. MP3 with embedded ID3v2 attached_pic JPEG cover —
+              # 4. VP9 + two distinct audio tracks (440 Hz vs 880 Hz)
+              # — drives W1 audio-track-switching integration tests.
+              # Track 0 (eng) = 440 Hz tone, track 1 (jpn) = 880 Hz tone.
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "testsrc=duration=3:size=320x240:rate=10" \
+                     -f lavfi -i "sine=frequency=440:duration=3" \
+                     -f lavfi -i "sine=frequency=880:duration=3" \
+                     -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                     -b:v 200k \
+                     -c:a libopus \
+                     -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+                     -metadata:s:a:0 language=eng \
+                     -metadata:s:a:1 language=jpn \
+                     -shortest \
+                     $out/dualaudio.mkv
+
+              # 5. VP9 + opus + two embedded subtitle tracks (eng + jpn)
+              # — drives W2 burn-in integration tests.
+              cat > $out/subs_eng.vtt <<VTT
+              WEBVTT
+
+              00:00:00.500 --> 00:00:02.000
+              English subtitle
+              VTT
+              cat > $out/subs_jpn.vtt <<VTT
+              WEBVTT
+
+              00:00:00.500 --> 00:00:02.000
+              日本語字幕
+              VTT
+              ffmpeg -hide_banner -loglevel error -nostdin \
+                     -f lavfi -i "testsrc=duration=3:size=320x240:rate=10" \
+                     -f lavfi -i "sine=frequency=440:duration=3" \
+                     -i $out/subs_eng.vtt \
+                     -i $out/subs_jpn.vtt \
+                     -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                     -b:v 200k \
+                     -c:a libopus \
+                     -c:s webvtt \
+                     -map 0:v:0 -map 1:a:0 -map 2:s:0 -map 3:s:0 \
+                     -metadata:s:s:0 language=eng \
+                     -metadata:s:s:1 language=jpn \
+                     -shortest \
+                     $out/dualsubs.mkv
+
+              # 6. MP3 with embedded ID3v2 attached_pic JPEG cover —
               # make_audio_fixture_with_cover. Two ffmpeg passes: one
               # for the 64x64 magenta JPEG, one for the mux.
               ffmpeg -hide_banner -loglevel error -nostdin \

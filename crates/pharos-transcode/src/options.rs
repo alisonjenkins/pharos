@@ -140,6 +140,17 @@ pub struct TranscodeOptions {
     pub start_position_ticks: u64,
     /// Optional clip duration in Jellyfin ticks.
     pub duration_ticks: Option<u64>,
+    /// Source-relative audio-stream index (`AudioStreamIndex` query
+    /// param). When set, ffmpeg gets `-map 0:a:{N}` so multi-track
+    /// sources transcode the chosen track instead of the default.
+    /// None defers to ffmpeg's default selection.
+    pub audio_source_stream_index: Option<u32>,
+    /// Source-relative subtitle-stream index for burn-in. When set,
+    /// ffmpeg gets `-vf subtitles='{path}:si={N}'` and the chosen
+    /// subtitle stream is rendered into the video frames. None
+    /// leaves subtitles as a separate track (or absent on transcode
+    /// output containers that don't carry them).
+    pub burn_subtitle_stream_index: Option<u32>,
 }
 
 impl TranscodeOptions {
@@ -173,6 +184,8 @@ mod tests {
             audio_bitrate_bps: None,
             start_position_ticks: 30_000_000,
             duration_ticks: Some(50_000_000),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -188,6 +201,8 @@ mod tests {
             audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }

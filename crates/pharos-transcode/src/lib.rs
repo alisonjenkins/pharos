@@ -153,6 +153,24 @@ where
     }
 }
 
+/// Escape a path for the ffmpeg `subtitles=` filter graph. Filter args
+/// are colon-separated key/value pairs, so the path must escape `\`,
+/// `'`, `:` and `,` to keep ffmpeg's parser from misreading the rest
+/// of the filter chain.
+fn escape_subtitles_path(p: &str) -> String {
+    let mut out = String::with_capacity(p.len() + 8);
+    for c in p.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            ':' => out.push_str("\\:"),
+            ',' => out.push_str("\\,"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
@@ -170,6 +188,17 @@ fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
         a.push("-t".into());
         a.push(format!("{dur:.3}"));
     }
+    // W1 — when the caller specifies an audio stream, route the
+    // video + the chosen audio track explicitly. `0:v?` keeps video
+    // optional (no error on audio-only sources). Default selection
+    // falls through to ffmpeg's "pick the most appropriate stream"
+    // heuristic which mirrors the prior behaviour.
+    if let Some(audio_idx) = opts.audio_source_stream_index {
+        a.push("-map".into());
+        a.push("0:v?".into());
+        a.push("-map".into());
+        a.push(format!("0:a:{audio_idx}"));
+    }
     match opts.video {
         Some(VideoCodec::Copy) => {
             a.push("-c:v".into());
@@ -181,6 +210,16 @@ fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
             if let Some(b) = opts.video_bitrate_bps {
                 a.push("-b:v".into());
                 a.push(format!("{b}"));
+            }
+            // W2 — burn the chosen subtitle stream into the video
+            // frames via the `subtitles` filter. Skipped on `Copy`
+            // (filtering requires re-encode) and on `None` (no video).
+            if let Some(sub_idx) = opts.burn_subtitle_stream_index {
+                a.push("-vf".into());
+                a.push(format!(
+                    "subtitles={}:si={sub_idx}",
+                    escape_subtitles_path(input)
+                ));
             }
         }
         None => {
@@ -227,6 +266,8 @@ mod tests {
             audio_bitrate_bps: Some(128_000),
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         }
     }
 
@@ -256,6 +297,8 @@ mod tests {
             audio_bitrate_bps: Some(128_000),
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -275,11 +318,62 @@ mod tests {
             audio_bitrate_bps: Some(192_000),
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
         assert!(joined.contains("-vn"));
         assert!(joined.contains("-c:a libmp3lame"));
+    }
+
+    #[test]
+    fn audio_stream_index_emits_explicit_map() {
+        let mut o = opts();
+        o.audio_source_stream_index = Some(2);
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(joined.contains("-map 0:v?"), "{joined}");
+        assert!(joined.contains("-map 0:a:2"), "{joined}");
+    }
+
+    #[test]
+    fn audio_stream_index_default_skips_map_clause() {
+        let o = opts();
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(!joined.contains("-map"), "{joined}");
+    }
+
+    #[test]
+    fn burn_subtitle_appends_subtitles_filter() {
+        let mut o = opts();
+        o.burn_subtitle_stream_index = Some(3);
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(joined.contains("-vf subtitles=/m/x.mkv:si=3"), "{joined}");
+    }
+
+    #[test]
+    fn escape_subtitles_path_protects_filter_metachars() {
+        assert_eq!(escape_subtitles_path("/m/a.mkv"), "/m/a.mkv");
+        assert_eq!(escape_subtitles_path("/m/it's.mkv"), "/m/it\\'s.mkv");
+        assert_eq!(escape_subtitles_path("/m/a:b.mkv"), "/m/a\\:b.mkv");
+        assert_eq!(escape_subtitles_path("a\\b"), "a\\\\b");
+        assert_eq!(escape_subtitles_path("a,b"), "a\\,b");
+    }
+
+    #[test]
+    fn burn_subtitle_skipped_when_video_is_copy() {
+        // Filtering needs re-encode; -vf with -c:v copy is a no-op
+        // ffmpeg would error on. We deliberately don't add the filter
+        // when video is in copy mode.
+        let mut o = opts();
+        o.video = Some(VideoCodec::Copy);
+        o.burn_subtitle_stream_index = Some(0);
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(!joined.contains("-vf"), "{joined}");
     }
 
     #[test]

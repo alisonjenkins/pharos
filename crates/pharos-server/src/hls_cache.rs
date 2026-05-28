@@ -43,12 +43,42 @@ struct EntryMeta {
     last_used: u64,
 }
 
+/// Compound cache key:
+/// `(media_id, segment_index, audio_stream_index, subtitle_stream_index,
+///   video_bitrate_thousands)`.
+/// Audio + subtitle default to a 0 / off sentinel so the cache layout
+/// collapses for the common (no client override) case. Video bitrate
+/// is rounded to nearest kbps so floating-point negotiation jitter
+/// doesn't produce phantom variant files. `0` means "no override"
+/// (negotiator-supplied default).
+type CacheKey = (u64, u32, u32, i32, u32);
+
+const NO_SUBTITLE: i32 = -1;
+
+fn make_key(
+    media_id: u64,
+    seg_index: u32,
+    audio_index: Option<u32>,
+    subtitle_index: Option<u32>,
+    video_bitrate_bps: Option<u64>,
+) -> CacheKey {
+    (
+        media_id,
+        seg_index,
+        audio_index.unwrap_or(0),
+        subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
+        video_bitrate_bps
+            .map(|b| (b / 1000).min(u32::MAX as u64) as u32)
+            .unwrap_or(0),
+    )
+}
+
 #[derive(Debug, Default)]
 struct CacheState {
     /// Per-key locks. Held while a fetch is in flight so concurrent
     /// requests for the same segment don't race.
-    fetch_locks: HashMap<(u64, u32), Arc<Mutex<()>>>,
-    entries: HashMap<(u64, u32), EntryMeta>,
+    fetch_locks: HashMap<CacheKey, Arc<Mutex<()>>>,
+    entries: HashMap<CacheKey, EntryMeta>,
     total_bytes: u64,
     access_counter: u64,
 }
@@ -92,10 +122,10 @@ impl HlsSegmentCache {
         &self.root
     }
 
-    /// Fetch the bytes for `(media_id, seg_index)`. On cache hit returns
-    /// directly from disk; on miss, transcodes the segment, atomically
-    /// renames into place, updates LRU + total-bytes, and triggers
-    /// eviction if over cap.
+    /// Fetch the bytes for `(media_id, seg_index)` with no per-track
+    /// override. Equivalent to `segment_bytes_keyed(.., None, None,
+    /// ..)`. Retained for callers that don't know about per-stream
+    /// indices yet.
     pub async fn segment_bytes(
         &self,
         media_id: u64,
@@ -103,8 +133,32 @@ impl HlsSegmentCache {
         source: &Path,
         opts: &TranscodeOptions,
     ) -> Result<Vec<u8>, HlsCacheError> {
-        let key = (media_id, seg_index);
-        let path = self.segment_path(media_id, seg_index);
+        self.segment_bytes_keyed(media_id, seg_index, None, None, source, opts)
+            .await
+    }
+
+    /// W1/W2 — per-stream cache lookup. `audio_index` + `subtitle_index`
+    /// land in the cache key + the on-disk path so a client switching
+    /// audio track doesn't trample the previous track's cached
+    /// segments. None values fall through to the default-track sentinel
+    /// (audio=0, subtitle=-1).
+    pub async fn segment_bytes_keyed(
+        &self,
+        media_id: u64,
+        seg_index: u32,
+        audio_index: Option<u32>,
+        subtitle_index: Option<u32>,
+        source: &Path,
+        opts: &TranscodeOptions,
+    ) -> Result<Vec<u8>, HlsCacheError> {
+        let key = make_key(
+            media_id,
+            seg_index,
+            audio_index,
+            subtitle_index,
+            opts.video_bitrate_bps,
+        );
+        let path = self.segment_path_keyed(key);
 
         // Fast hit path: file present, just bump LRU.
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -148,10 +202,34 @@ impl HlsSegmentCache {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     fn segment_path(&self, media_id: u64, seg_index: u32) -> PathBuf {
-        self.root
-            .join(media_id.to_string())
-            .join(format!("{seg_index}.ts"))
+        self.segment_path_keyed((media_id, seg_index, 0, NO_SUBTITLE, 0))
+    }
+
+    /// Compose `{root}/{media_id}/{seg}.ts` for the default case
+    /// (audio=0, subtitle=-1, bitrate=auto) and a longer-form
+    /// `{root}/{media_id}/{seg}-a{A}-s{S}-b{Bkbps}.ts` when any
+    /// dimension diverges. Keeps the existing on-disk layout intact
+    /// for warm caches that pre-date per-track + per-variant keys.
+    fn segment_path_keyed(&self, key: CacheKey) -> PathBuf {
+        let (media_id, seg_index, audio_index, subtitle_index, bitrate_k) = key;
+        let filename = if audio_index == 0 && subtitle_index == NO_SUBTITLE && bitrate_k == 0 {
+            format!("{seg_index}.ts")
+        } else {
+            let sub_part = if subtitle_index == NO_SUBTITLE {
+                "off".to_string()
+            } else {
+                subtitle_index.to_string()
+            };
+            let bitrate_part = if bitrate_k == 0 {
+                "auto".to_string()
+            } else {
+                format!("{bitrate_k}")
+            };
+            format!("{seg_index}-a{audio_index}-s{sub_part}-b{bitrate_part}.ts")
+        };
+        self.root.join(media_id.to_string()).join(filename)
     }
 
     async fn write_segment(
@@ -179,7 +257,7 @@ impl HlsSegmentCache {
         Ok(())
     }
 
-    async fn touch(&self, key: (u64, u32)) {
+    async fn touch(&self, key: CacheKey) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -188,7 +266,7 @@ impl HlsSegmentCache {
         }
     }
 
-    async fn record(&self, key: (u64, u32), bytes: u64) {
+    async fn record(&self, key: CacheKey, bytes: u64) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -209,7 +287,7 @@ impl HlsSegmentCache {
     async fn maybe_evict(&self) {
         // Snapshot the (key, last_used) candidates outside the lock so
         // the disk delete doesn't hold the cache state.
-        let mut to_remove: Vec<((u64, u32), PathBuf)> = Vec::new();
+        let mut to_remove: Vec<(CacheKey, PathBuf)> = Vec::new();
         {
             let mut state = self.state.lock().await;
             while state.total_bytes > self.max_bytes {
@@ -232,7 +310,7 @@ impl HlsSegmentCache {
                 };
                 state.entries.remove(&key);
                 state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
-                to_remove.push((key, self.segment_path(key.0, key.1)));
+                to_remove.push((key, self.segment_path_keyed(key)));
             }
         }
         for (_, path) in to_remove {
@@ -267,7 +345,9 @@ mod tests {
             tokio::fs::create_dir_all(p).await.unwrap();
         }
         tokio::fs::write(&path, body).await.unwrap();
-        cache.record((media_id, seg), body.len() as u64).await;
+        cache
+            .record((media_id, seg, 0, NO_SUBTITLE, 0), body.len() as u64)
+            .await;
         cache.maybe_evict().await;
     }
 
@@ -284,6 +364,8 @@ mod tests {
             audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -304,6 +386,8 @@ mod tests {
             audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts)
@@ -327,6 +411,8 @@ mod tests {
             audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -363,6 +449,8 @@ mod tests {
                 audio_bitrate_bps: None,
                 start_position_ticks: 0,
                 duration_ticks: None,
+                audio_source_stream_index: None,
+                burn_subtitle_stream_index: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)
@@ -379,6 +467,8 @@ mod tests {
                 audio_bitrate_bps: None,
                 start_position_ticks: 0,
                 duration_ticks: None,
+                audio_source_stream_index: None,
+                burn_subtitle_stream_index: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)
