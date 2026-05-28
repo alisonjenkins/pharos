@@ -435,7 +435,7 @@ async fn post_system_configuration_key(
     Ok(HttpResponse::NoContent().finish())
 }
 
-fn require_admin(user: &AuthUser) -> Result<(), actix_web::Error> {
+pub(super) fn require_admin(user: &AuthUser) -> Result<(), actix_web::Error> {
     if !user.0.policy.admin {
         return Err(error::ErrorForbidden("admin required"));
     }

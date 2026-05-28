@@ -356,6 +356,29 @@ async fn api_key_create_lists_then_revoke_drops_it() {
 }
 
 #[actix_web::test]
+async fn auth_providers_admin_only() {
+    let (state, admin_token, _) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Auth/Providers")
+        .insert_header(("X-Emby-Token", admin_token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["Name"], "Default");
+
+    let (state2, non_admin_token, _) = seed(false).await;
+    let app2 = test::init_service(build_app(state2)).await;
+    let req = test::TestRequest::get()
+        .uri("/Auth/Providers")
+        .insert_header(("X-Emby-Token", non_admin_token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app2, req).await;
+    assert_eq!(resp.status(), 403);
+}
+
+#[actix_web::test]
 async fn api_key_create_requires_admin() {
     let (state, token, _uid) = seed(false).await;
     let app = test::init_service(build_app(state)).await;

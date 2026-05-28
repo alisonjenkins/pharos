@@ -90,16 +90,20 @@ async fn notifications_user(_user: AuthUser) -> impl Responder {
     }))
 }
 
-async fn auth_providers(_user: AuthUser) -> impl Responder {
+async fn auth_providers(
+    user: AuthUser,
+) -> Result<actix_web::HttpResponse, actix_web::Error> {
+    // jellyfin contract — admin-only.
+    crate::api::jellyfin::admin::require_admin(&user)?;
     // Single built-in provider so the dashboard's auth-provider
     // dropdown isn't empty. Matches jellyfin-web's expected shape
     // (`Name` + `Id`).
-    HttpResponse::Ok().json(serde_json::json!([
+    Ok(HttpResponse::Ok().json(serde_json::json!([
         {
             "Name": "Default",
             "Id": "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
         }
-    ]))
+    ])))
 }
 
 async fn theme_media(_user: AuthUser) -> impl Responder {
