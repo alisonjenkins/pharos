@@ -50,6 +50,15 @@ pub struct ServerConfig {
     /// `trickplay_cache_dir` is set. Default `[320]`.
     #[serde(default = "default_trickplay_widths")]
     pub trickplay_widths: Vec<u32>,
+    /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
+    /// extraction results so subsequent fetches skip the ffmpeg
+    /// spawn. Default 64 MiB.
+    #[serde(default = "default_subtitle_cache_bytes")]
+    pub subtitle_cache_max_bytes: u64,
+    /// Maximum subtitle cache entry count. Default 1024 — generous
+    /// for the largest realistic library; pairs with byte cap.
+    #[serde(default = "default_subtitle_cache_entries")]
+    pub subtitle_cache_max_entries: usize,
     /// Live-TV M3U playlist path (T47). When set, /LiveTv/Channels
     /// + /LiveTv/Programs serve channels + EPG from this backend.
     #[serde(default)]
@@ -86,6 +95,14 @@ fn default_trickplay_interval_ms() -> u32 {
 
 fn default_trickplay_widths() -> Vec<u32> {
     vec![320]
+}
+
+fn default_subtitle_cache_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_subtitle_cache_entries() -> usize {
+    1024
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

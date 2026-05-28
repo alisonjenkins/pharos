@@ -593,7 +593,7 @@ struct PlaybackInfoBody {
 
 async fn playback_info(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     body: Option<web::Json<PlaybackInfoBody>>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -605,6 +605,15 @@ async fn playback_info(
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
+    // P4 — defensive resume offset. Clients that drive playback
+    // purely from PlaybackInfo (Finamp, Jellyfin-Android-TV) never
+    // see UserData.PlaybackPositionTicks via /Items/{id}; emit it
+    // here too. `played=true` → no resume (Jellyfin convention:
+    // already-watched items restart from 0).
+    let resume_ticks = match state.stores.get_user_data(user.0.id, id).await {
+        Ok(ud) if !ud.played => ud.last_played_position_ticks,
+        _ => 0,
+    };
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
     let is_video = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
     let probe = &item.probe;
@@ -713,8 +722,14 @@ async fn playback_info(
             "VideoType": "VideoFile",
             "DefaultAudioStreamIndex": default_audio_stream_index,
             "DefaultSubtitleStreamIndex": null,
+            // P4 — resume offset. Mirrors the top-level field for
+            // clients that read the MediaSource directly.
+            "StartPositionTicks": resume_ticks,
         }],
         "PlaySessionId": play_session_id,
+        // P4 — top-level resume offset. jellyfin-web reads this when
+        // it didn't keep a local copy of UserData.PlaybackPositionTicks.
+        "StartPositionTicks": resume_ticks,
     })))
 }
 

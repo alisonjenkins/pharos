@@ -5,7 +5,7 @@
 
 use crate::{
     auth::BuiltinAuth, hls_cache::HlsSegmentCache, image_cache::ImageCache,
-    live_tv::M3uXmltvBackend, sessions::SessionRegistry,
+    live_tv::M3uXmltvBackend, sessions::SessionRegistry, subtitle_cache::SubtitleCache,
     transcode_sessions::TranscodeSessionRegistry, trickplay_cache::TrickplayCache,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
@@ -52,6 +52,7 @@ pub struct AppState {
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
     pub trickplay: Option<TrickplayCache>,
+    pub subtitles: Option<SubtitleCache>,
     /// Trickplay layout knobs surfaced to handlers + DTO emitter so
     /// the wire shape matches what was actually generated.
     pub trickplay_widths: Vec<u32>,
@@ -94,6 +95,7 @@ impl AppState {
             images: None,
             hls: None,
             trickplay: None,
+            subtitles: None,
             trickplay_widths: Vec::new(),
             trickplay_interval_ms: 10_000,
             live_tv: None,
@@ -142,6 +144,7 @@ impl AppState {
             images: None,
             hls: None,
             trickplay: None,
+            subtitles: None,
             trickplay_widths: Vec::new(),
             trickplay_interval_ms: 10_000,
             live_tv: None,
@@ -167,6 +170,11 @@ impl AppState {
 
     pub fn with_trickplay_cache(mut self, cache: TrickplayCache) -> Self {
         self.trickplay = Some(cache);
+        self
+    }
+
+    pub fn with_subtitle_cache(mut self, cache: SubtitleCache) -> Self {
+        self.subtitles = Some(cache);
         self
     }
 

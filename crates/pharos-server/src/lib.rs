@@ -14,6 +14,7 @@ pub mod router;
 pub mod sessions;
 pub mod ssdp;
 pub mod state;
+pub mod subtitle_cache;
 pub mod sync;
 pub mod transcode_sessions;
 pub mod trickplay_cache;

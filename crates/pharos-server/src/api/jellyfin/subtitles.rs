@@ -18,7 +18,11 @@
 //! starting at `1_000_000` so their numeric IDs never collide with
 //! real ffprobe stream indices.
 
-use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use crate::{
+    api::jellyfin::auth_extractor::AuthUser,
+    state::AppState,
+    subtitle_cache::{mtime_secs, SubtitleKind},
+};
 use actix_web::{error, http::header, web, HttpResponse};
 use pharos_core::MediaStore;
 use tokio::process::Command;
@@ -79,7 +83,7 @@ async fn deliver_vtt(
         let Some((sidecar_path, kind)) = sidecars.into_iter().nth(offset) else {
             return Err(error::ErrorNotFound("no sidecar at that index"));
         };
-        return serve_sidecar(&sidecar_path, kind).await;
+        return serve_sidecar(state, &sidecar_path, kind, stream_index).await;
     }
 
     // Embedded stream: ffmpeg -map 0:<idx> -f webvtt.
@@ -87,6 +91,57 @@ async fn deliver_vtt(
         .path
         .to_str()
         .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+
+    // P5 — cache lookup before ffmpeg. Key includes mtime so a
+    // mid-flight source edit invalidates the cached bytes.
+    let mtime = mtime_secs(&item.path).await;
+    if let Some(cache) = state.subtitles.as_ref() {
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+            .await
+        {
+            return Ok(HttpResponse::Ok()
+                .content_type("text/vtt; charset=utf-8")
+                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .body((*bytes).clone()));
+        }
+        // Per-key fetch lock dedupes concurrent first-fetchers so
+        // they share one ffmpeg spawn.
+        let lock = cache
+            .lock(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+            .await;
+        let _guard = lock.lock().await;
+        // Re-check — peer may have stored while we waited.
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+            .await
+        {
+            return Ok(HttpResponse::Ok()
+                .content_type("text/vtt; charset=utf-8")
+                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .body((*bytes).clone()));
+        }
+        let out = run_ffmpeg_embedded(input, stream_index).await?;
+        let stored = cache
+            .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
+            .await;
+        return Ok(HttpResponse::Ok()
+            .content_type("text/vtt; charset=utf-8")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .body((*stored).clone()));
+    }
+
+    // No cache configured — fall back to the original spawn-per-fetch
+    // path. (Default config keeps the cache on; this branch only
+    // fires for tests / minimal deployments.)
+    let out = run_ffmpeg_embedded(input, stream_index).await?;
+    Ok(HttpResponse::Ok()
+        .content_type("text/vtt; charset=utf-8")
+        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+        .body(out))
+}
+
+async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, actix_web::Error> {
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -112,10 +167,7 @@ async fn deliver_vtt(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(HttpResponse::Ok()
-        .content_type("text/vtt; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-        .body(out.stdout))
+    Ok(out.stdout)
 }
 
 /// Sidecar kind — `.vtt` ships as-is, `.srt` runs through ffmpeg to
@@ -175,11 +227,15 @@ pub async fn discover_sidecars(
 }
 
 async fn serve_sidecar(
+    state: &AppState,
     path: &std::path::Path,
     kind: SidecarKind,
+    stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
     match kind {
         SidecarKind::Vtt => {
+            // VTT is already in the target format — disk-read is the
+            // hot path. No cache (would just shadow the page cache).
             let bytes = tokio::fs::read(path)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
@@ -192,35 +248,74 @@ async fn serve_sidecar(
             let input = path
                 .to_str()
                 .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
-            let out = Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-nostdin",
-                    "-i",
-                    input,
-                    "-c:s",
-                    "webvtt",
-                    "-f",
-                    "webvtt",
-                    "pipe:1",
-                ])
-                .output()
-                .await
-                .map_err(|e| error::ErrorInternalServerError(format!("ffmpeg spawn: {e}")))?;
-            if !out.status.success() {
-                return Err(error::ErrorInternalServerError(format!(
-                    "ffmpeg srt→vtt: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
+            // P5 — SRT → WebVTT cache.
+            let mtime = mtime_secs(path).await;
+            if let Some(cache) = state.subtitles.as_ref() {
+                if let Some(bytes) = cache
+                    .get(path, mtime, stream_index, SubtitleKind::Sidecar)
+                    .await
+                {
+                    return Ok(HttpResponse::Ok()
+                        .content_type("text/vtt; charset=utf-8")
+                        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                        .body((*bytes).clone()));
+                }
+                let lock = cache
+                    .lock(path, mtime, stream_index, SubtitleKind::Sidecar)
+                    .await;
+                let _guard = lock.lock().await;
+                if let Some(bytes) = cache
+                    .get(path, mtime, stream_index, SubtitleKind::Sidecar)
+                    .await
+                {
+                    return Ok(HttpResponse::Ok()
+                        .content_type("text/vtt; charset=utf-8")
+                        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                        .body((*bytes).clone()));
+                }
+                let out = run_ffmpeg_srt_to_vtt(input).await?;
+                let stored = cache
+                    .store(path, mtime, stream_index, SubtitleKind::Sidecar, out)
+                    .await;
+                return Ok(HttpResponse::Ok()
+                    .content_type("text/vtt; charset=utf-8")
+                    .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                    .body((*stored).clone()));
             }
+            let out = run_ffmpeg_srt_to_vtt(input).await?;
             Ok(HttpResponse::Ok()
                 .content_type("text/vtt; charset=utf-8")
                 .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-                .body(out.stdout))
+                .body(out))
         }
     }
+}
+
+async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            input,
+            "-c:s",
+            "webvtt",
+            "-f",
+            "webvtt",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("ffmpeg spawn: {e}")))?;
+    if !out.status.success() {
+        return Err(error::ErrorInternalServerError(format!(
+            "ffmpeg srt→vtt: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
 }
 
 #[cfg(test)]

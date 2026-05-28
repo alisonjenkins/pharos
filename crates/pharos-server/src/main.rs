@@ -279,6 +279,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             cfg.server.transcode_cache_max_bytes,
         ));
     }
+    // P5 — subtitle cache, always on. Pure in-process; the only
+    // tunables are bytes + entry cap. Disabled by setting both to 0.
+    if cfg.server.subtitle_cache_max_bytes > 0 && cfg.server.subtitle_cache_max_entries > 0 {
+        state = state.with_subtitle_cache(pharos_server::subtitle_cache::SubtitleCache::new(
+            cfg.server.subtitle_cache_max_bytes,
+            cfg.server.subtitle_cache_max_entries,
+        ));
+    }
     if !cfg.server.trickplay_widths.is_empty() {
         if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
             state =
