@@ -11,7 +11,8 @@ use std::str::FromStr;
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json";
+    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
+    video_profile, video_level";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -174,8 +175,9 @@ impl MediaStore for SqliteStore {
                 audio_channels, sample_rate, \
                 series_name, season_number, episode_number, \
                 subtitle_tracks_json, \
-                artist, album, album_artist, genre, created_at, chapters_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                artist, album, album_artist, genre, created_at, chapters_json, \
+                video_profile, video_level) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            kind = excluded.kind,
@@ -199,6 +201,8 @@ impl MediaStore for SqliteStore {
                                            album_artist = excluded.album_artist,
                                            genre = excluded.genre,
                                            chapters_json = excluded.chapters_json,
+                                           video_profile = excluded.video_profile,
+                                           video_level = excluded.video_level,
                                            -- Preserve original
                                            -- created_at on rescans;
                                            -- COALESCE keeps existing
@@ -231,6 +235,8 @@ impl MediaStore for SqliteStore {
         .bind(p.genre.as_deref())
         .bind(created_at)
         .bind(chapters_json)
+        .bind(p.video_profile.as_deref())
+        .bind(p.video_level.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -275,6 +281,8 @@ struct MediaRow {
     genre: Option<String>,
     created_at: Option<i64>,
     chapters_json: Option<String>,
+    video_profile: Option<String>,
+    video_level: Option<i64>,
 }
 
 impl MediaRow {
@@ -288,6 +296,8 @@ impl MediaRow {
             container: self.container,
             bitrate_bps: self.bitrate_bps.and_then(|v| u64::try_from(v).ok()),
             video_codec: self.video_codec,
+            video_profile: self.video_profile,
+            video_level: self.video_level.and_then(|v| u32::try_from(v).ok()),
             audio_codec: self.audio_codec,
             width: self.width.and_then(|v| u32::try_from(v).ok()),
             height: self.height.and_then(|v| u32::try_from(v).ok()),

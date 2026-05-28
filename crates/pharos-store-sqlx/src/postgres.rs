@@ -26,7 +26,8 @@ use pharos_core::{
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json";
+    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
+    video_profile, video_level";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -182,9 +183,10 @@ impl MediaStore for PostgresStore {
                 audio_channels, sample_rate, \
                 series_name, season_number, episode_number, \
                 subtitle_tracks_json, \
-                artist, album, album_artist, genre, created_at, chapters_json) \
+                artist, album, album_artist, genre, created_at, chapters_json, \
+                video_profile, video_level) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+                     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             kind = EXCLUDED.kind,
@@ -208,6 +210,8 @@ impl MediaStore for PostgresStore {
                                             album_artist = EXCLUDED.album_artist,
                                             genre = EXCLUDED.genre,
                                             chapters_json = EXCLUDED.chapters_json,
+                                            video_profile = EXCLUDED.video_profile,
+                                            video_level = EXCLUDED.video_level,
                                             created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
@@ -235,6 +239,8 @@ impl MediaStore for PostgresStore {
         .bind(p.genre.as_deref())
         .bind(created_at)
         .bind(chapters_json)
+        .bind(p.video_profile.as_deref())
+        .bind(p.video_level.map(|v| v as i32))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -548,6 +554,8 @@ struct MediaRow {
     genre: Option<String>,
     created_at: Option<i64>,
     chapters_json: Option<String>,
+    video_profile: Option<String>,
+    video_level: Option<i32>,
 }
 
 impl MediaRow {
@@ -561,6 +569,8 @@ impl MediaRow {
             container: self.container,
             bitrate_bps: self.bitrate_bps.and_then(|v| u64::try_from(v).ok()),
             video_codec: self.video_codec,
+            video_profile: self.video_profile,
+            video_level: self.video_level.and_then(|v| u32::try_from(v).ok()),
             audio_codec: self.audio_codec,
             width: self.width.and_then(|v| u32::try_from(v).ok()),
             height: self.height.and_then(|v| u32::try_from(v).ok()),

@@ -87,6 +87,8 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 container,
                 bitrate_bps: br,
                 video_codec: vc,
+                video_profile: None,
+                video_level: None,
                 audio_codec: ac,
                 width: w,
                 height: h,

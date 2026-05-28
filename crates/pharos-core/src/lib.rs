@@ -63,6 +63,14 @@ pub struct MediaProbe {
     pub container: Option<String>,
     pub bitrate_bps: Option<u64>,
     pub video_codec: Option<String>,
+    /// Canonical H.264/HEVC/VP9 profile name as ffprobe reports
+    /// (`"High"`, `"Main"`, `"Main 10"`, `"Profile 0"`). Used to
+    /// build RFC 6381 CODECS strings for HLS playlists.
+    pub video_profile: Option<String>,
+    /// Codec level × 10 (e.g. 40 = level 4.0, 51 = level 5.1). Wire
+    /// format for the trailing two hex digits of `avc1.…` /
+    /// `hvc1.…L<level>` codec tokens.
+    pub video_level: Option<u32>,
     pub audio_codec: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,

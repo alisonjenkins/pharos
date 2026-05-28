@@ -99,6 +99,14 @@ struct FfprobeStream {
     index: Option<u32>,
     #[serde(default)]
     codec_name: Option<String>,
+    /// Codec profile string ("High", "Main 10", "Profile 0"). Used to
+    /// emit RFC 6381 codec tokens for HLS CODECS attribute.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Codec level × 10 reported by ffprobe for AVC/HEVC. None for
+    /// VP9/AV1/Opus etc.
+    #[serde(default)]
+    level: Option<i32>,
     #[serde(default)]
     width: Option<u32>,
     #[serde(default)]
@@ -198,6 +206,13 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
     let audio_stream = parsed.streams.iter().find(|s| s.codec_type == "audio");
 
     let video_codec = video_stream.and_then(|s| s.codec_name.clone());
+    let video_profile = video_stream.and_then(|s| s.profile.clone());
+    // ffprobe sometimes reports level=-99 for unknown / inapplicable
+    // streams (VP9 / AV1 / Opus). Drop negative values.
+    let video_level = video_stream
+        .and_then(|s| s.level)
+        .filter(|&l| l > 0)
+        .map(|l| l as u32);
     let audio_codec = audio_stream.and_then(|s| s.codec_name.clone());
     let width = video_stream.and_then(|s| s.width);
     let height = video_stream.and_then(|s| s.height);
@@ -267,6 +282,8 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             container: parsed.format.format_name,
             bitrate_bps,
             video_codec,
+            video_profile,
+            video_level,
             audio_codec,
             width,
             height,
@@ -351,6 +368,44 @@ mod tests {
         assert_eq!(p.sample_rate, Some(48000));
         // 24000/1001 ≈ 23.976 fps → 23_976 in mille.
         assert_eq!(p.frame_rate_mille, Some(23_976));
+    }
+
+    #[test]
+    fn parse_h264_extracts_profile_and_level() {
+        let json = br#"{
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264",
+                 "profile": "High", "level": 40,
+                 "width": 1920, "height": 1080},
+                {"codec_type": "audio", "codec_name": "aac", "channels": 2,
+                 "sample_rate": "48000"}
+            ],
+            "format": {"format_name": "mov,mp4", "duration": "120"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        let p = &info.probe;
+        assert_eq!(p.video_codec.as_deref(), Some("h264"));
+        assert_eq!(p.video_profile.as_deref(), Some("High"));
+        assert_eq!(p.video_level, Some(40));
+    }
+
+    #[test]
+    fn parse_drops_negative_level_sentinel() {
+        // ffprobe reports level=-99 for VP9 / AV1 / formats without
+        // discrete levels. Must come through as None, not Some(-99 as u32).
+        let json = br#"{
+            "streams": [
+                {"codec_type": "video", "codec_name": "vp9",
+                 "profile": "Profile 0", "level": -99,
+                 "width": 1280, "height": 720}
+            ],
+            "format": {"format_name": "matroska"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        let p = &info.probe;
+        assert_eq!(p.video_codec.as_deref(), Some("vp9"));
+        assert_eq!(p.video_profile.as_deref(), Some("Profile 0"));
+        assert_eq!(p.video_level, None);
     }
 
     #[test]
