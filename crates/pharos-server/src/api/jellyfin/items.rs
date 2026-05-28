@@ -637,7 +637,12 @@ async fn playback_info(
     let decision = negotiate(&profile, &source);
 
     let direct_play = decision.is_direct();
-    let supports_direct_stream = direct_play || matches!(decision, Decision::AudioRemux { .. });
+    // P9 — VideoRemux supports DirectStream too: video copies + audio
+    // remuxes, so the client gets a fast-mux container without a full
+    // re-encode.
+    let supports_direct_stream = direct_play
+        || matches!(decision, Decision::AudioRemux { .. })
+        || matches!(decision, Decision::VideoRemux { .. });
     let transcoding_url = match &decision {
         Decision::Transcode {
             target_container, ..
@@ -649,7 +654,20 @@ async fn playback_info(
                 "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
             ))
         }
+        // P9 — VideoRemux drives the same HLS surface as Transcode;
+        // the segment handler reads `Decision::VideoRemux` from the
+        // registered session and emits `-c:v copy`.
+        Decision::VideoRemux { .. } => Some(format!(
+            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
+        )),
         _ => None,
+    };
+    // P9 — emitted container reflects the negotiated target when remuxing.
+    let advertised_container = match &decision {
+        Decision::VideoRemux {
+            target_container, ..
+        } => target_container.clone(),
+        _ => container.clone(),
     };
 
     // Register the negotiated Decision so HLS segment generation
@@ -701,7 +719,7 @@ async fn playback_info(
             // wholesale — playback uses the StreamUrl / DirectStreamUrl
             // the client already has, not the on-disk path.
             "Type": "Default",
-            "Container": container,
+            "Container": advertised_container,
             "IsRemote": false,
             "ETag": "",
             "RunTimeTicks": probe.run_time_ticks(),

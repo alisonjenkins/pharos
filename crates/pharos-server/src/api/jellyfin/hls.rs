@@ -48,7 +48,44 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/videos/{id}/hls1/{variant}/{seg}.ts",
             web::get().to(segment_named),
+        )
+        // P8 — per-subtitle-track HLS playlist (referenced by the
+        // master playlist's `EXT-X-MEDIA` URI). Returns a single-
+        // segment VOD m3u8 pointing at the existing VTT extractor.
+        .route(
+            "/videos/{id}/subtitles/{idx}.m3u8",
+            web::get().to(subtitle_playlist),
         );
+}
+
+async fn subtitle_playlist(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, idx) = path.into_inner();
+    let item = load_hls_item(&state, &id).await?;
+    let qs = playback_qs(&req);
+    let duration_secs = item.duration_seconds.max(0.0);
+    // VTT served by the existing subtitle handler. `0` stands in for
+    // the mediaSourceId (subtitle endpoint accepts the short form
+    // too, but the canonical wire shape keeps the segment count = 1).
+    let mut body = String::with_capacity(256);
+    body.push_str("#EXTM3U\n");
+    body.push_str("#EXT-X-VERSION:3\n");
+    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    body.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        duration_secs.ceil() as u64
+    ));
+    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    body.push_str(&format!("#EXTINF:{duration_secs:.3},\n"));
+    body.push_str(&format!("/videos/{id}/0/subtitles/{idx}/stream.vtt?{qs}\n"));
+    body.push_str("#EXT-X-ENDLIST\n");
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .body(body))
 }
 
 /// W3 — quality ladder. Each variant maps to a `(name, height,
@@ -298,6 +335,9 @@ struct HlsItem {
     video_level: Option<u32>,
     audio_codec: Option<String>,
     kind: pharos_core::MediaKind,
+    /// P8 — embedded subtitle tracks surfaced as `EXT-X-MEDIA` lines
+    /// on the master playlist so HLS clients render a track selector.
+    subtitle_tracks: Vec<pharos_core::SubtitleTrack>,
 }
 
 async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_web::Error> {
@@ -334,6 +374,7 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
         video_level: item.probe.video_level,
         audio_codec: item.probe.audio_codec.clone(),
         kind: item.kind,
+        subtitle_tracks: item.probe.subtitle_tracks.clone(),
     })
 }
 
@@ -372,6 +413,25 @@ async fn master_playlist(
 
     let mut body = String::new();
     body.push_str("#EXTM3U\n#EXT-X-VERSION:3\n");
+
+    // P8 — softsub. Emit EXT-X-MEDIA per subtitle track so HLS
+    // clients render a subtitle selector instead of forcing burn-in.
+    let has_subs =
+        !item.subtitle_tracks.is_empty() && !matches!(item.kind, pharos_core::MediaKind::Audio);
+    if has_subs {
+        for (i, track) in item.subtitle_tracks.iter().enumerate() {
+            let name = subtitle_display_name(track, i);
+            let lang = track.language.as_deref().unwrap_or("und");
+            let default = if track.is_default { "YES" } else { "NO" };
+            let forced = if track.is_forced { "YES" } else { "NO" };
+            body.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",\
+                 LANGUAGE=\"{lang}\",DEFAULT={default},FORCED={forced},AUTOSELECT=YES,\
+                 URI=\"/videos/{id}/subtitles/{idx}.m3u8?{qs}\"\n",
+                idx = track.stream_index,
+            ));
+        }
+    }
 
     if matches!(item.kind, pharos_core::MediaKind::Audio) {
         // P3 — audio-only HLS: no RESOLUTION token, audio CODECS only.
@@ -416,8 +476,9 @@ async fn master_playlist(
         (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
         _ => String::new(),
     };
+    let sub_attr = if has_subs { ",SUBTITLES=\"subs\"" } else { "" };
     body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}{sub_attr}\n\
          /Videos/{id}/main.m3u8?{qs}\n"
     ));
 
@@ -432,7 +493,7 @@ async fn master_playlist(
             None => String::new(),
         };
         body.push_str(&format!(
-            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\"{resolution}\n\
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\"{resolution}{sub_attr}\n\
              /Videos/{id}/variants/{name}.m3u8?{qs}\n",
             bw = v.advertised_bandwidth(),
             name = v.name(),
@@ -441,6 +502,18 @@ async fn master_playlist(
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .body(body))
+}
+
+/// Render a human-readable label for a subtitle track. Falls back to
+/// `Track {idx}` when neither title nor language is present.
+fn subtitle_display_name(track: &pharos_core::SubtitleTrack, idx: usize) -> String {
+    if let Some(title) = track.title.as_ref().filter(|s| !s.is_empty()) {
+        return title.clone();
+    }
+    if let Some(lang) = track.language.as_ref().filter(|s| !s.is_empty()) {
+        return lang.to_ascii_uppercase();
+    }
+    format!("Track {}", idx + 1)
 }
 
 /// Pull the negotiated `max_video_bitrate_bps` from the transcode
@@ -711,37 +784,66 @@ fn build_segment_opts(
     use crate::api::jellyfin::device_profile::Decision;
 
     if let Some(session) = session {
-        if let Decision::Transcode {
-            target_container,
-            target_video_codec,
-            target_audio_codec,
-            max_video_bitrate_bps,
-        } = session.decision
-        {
-            let container = Container::from_name(&target_container).unwrap_or(Container::Mpegts);
-            let video = target_video_codec
-                .as_deref()
-                .and_then(VideoCodec::from_name)
-                .or(Some(VideoCodec::H264));
-            let audio = target_audio_codec
-                .as_deref()
-                .and_then(AudioCodec::from_name)
-                .or(Some(AudioCodec::Aac));
-            return TranscodeOptions {
-                container,
-                video,
-                audio,
-                video_bitrate_bps: Some(
-                    max_video_bitrate_bps
-                        .map(|cap| cap.min(HLS_MAX_BITRATE_BPS))
-                        .unwrap_or_else(|| target_video_bitrate(item.probe.bitrate_bps)),
-                ),
-                audio_bitrate_bps: Some(128_000),
-                start_position_ticks: start_ticks,
-                duration_ticks: Some(duration_ticks),
-                audio_source_stream_index: audio_stream_index,
-                burn_subtitle_stream_index: subtitle_stream_index,
-            };
+        match session.decision {
+            Decision::Transcode {
+                target_container,
+                target_video_codec,
+                target_audio_codec,
+                max_video_bitrate_bps,
+            } => {
+                let container =
+                    Container::from_name(&target_container).unwrap_or(Container::Mpegts);
+                let video = target_video_codec
+                    .as_deref()
+                    .and_then(VideoCodec::from_name)
+                    .or(Some(VideoCodec::H264));
+                let audio = target_audio_codec
+                    .as_deref()
+                    .and_then(AudioCodec::from_name)
+                    .or(Some(AudioCodec::Aac));
+                return TranscodeOptions {
+                    container,
+                    video,
+                    audio,
+                    video_bitrate_bps: Some(
+                        max_video_bitrate_bps
+                            .map(|cap| cap.min(HLS_MAX_BITRATE_BPS))
+                            .unwrap_or_else(|| target_video_bitrate(item.probe.bitrate_bps)),
+                    ),
+                    audio_bitrate_bps: Some(128_000),
+                    start_position_ticks: start_ticks,
+                    duration_ticks: Some(duration_ticks),
+                    audio_source_stream_index: audio_stream_index,
+                    burn_subtitle_stream_index: subtitle_stream_index,
+                };
+            }
+            // P9 — VideoRemux: copy video, transcode audio (or copy
+            // if codec already matches). Container always swaps to
+            // the profile target. Burn-in stripped (copy path can't
+            // filter).
+            Decision::VideoRemux {
+                target_container,
+                target_audio_codec,
+            } => {
+                let container =
+                    Container::from_name(&target_container).unwrap_or(Container::Mpegts);
+                let audio = target_audio_codec
+                    .as_deref()
+                    .and_then(AudioCodec::from_name)
+                    .or(Some(AudioCodec::Aac));
+                return TranscodeOptions {
+                    container,
+                    video: Some(VideoCodec::Copy),
+                    audio,
+                    video_bitrate_bps: None,
+                    audio_bitrate_bps: Some(128_000),
+                    start_position_ticks: start_ticks,
+                    duration_ticks: Some(duration_ticks),
+                    audio_source_stream_index: audio_stream_index,
+                    burn_subtitle_stream_index: None,
+                };
+            }
+            _ => {}
         }
     }
 

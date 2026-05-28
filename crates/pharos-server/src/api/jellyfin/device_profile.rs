@@ -76,6 +76,17 @@ pub enum Decision {
     AudioRemux {
         target_audio_codec: String,
     },
+    /// P9 — Video remux: video + audio codecs match a DirectPlayProfile
+    /// but the container doesn't (e.g. MKV source against an MP4
+    /// profile). Video bitstream copies; audio also copies when its
+    /// codec matches AND the client accepts it, otherwise re-encodes
+    /// to `target_audio_codec`. Container always swaps to the profile
+    /// the client asked for.
+    VideoRemux {
+        target_container: String,
+        /// `None` = audio codec matches profile and copies as well.
+        target_audio_codec: Option<String>,
+    },
     /// Full transcode: container, video, or video bitrate exceeds the
     /// profile cap. All three fields populated from the matched
     /// TranscodingProfile (or sensible defaults if the client supplied
@@ -132,6 +143,35 @@ pub fn negotiate(profile: &DeviceProfile, source: &SourceMedia) -> Decision {
         return Decision::AudioRemux {
             target_audio_codec: "aac".into(),
         };
+    }
+
+    // P9 — Video remux: relax the container check. When the source's
+    // video codec matches a DirectPlayProfile AND the profile's
+    // container differs from the source's, remux container only.
+    // Skip when video bitrate exceeds the cap — full transcode is
+    // forced in that case.
+    if !over_bitrate && source.is_video {
+        for p in &profile.direct_play_profiles {
+            if !p.kind.is_empty() && !p.kind.eq_ignore_ascii_case(want_kind) {
+                continue;
+            }
+            // Container MUST differ here, otherwise the earlier loop
+            // already returned DirectPlay / AudioRemux.
+            if matches_csv(&p.container, &source.container) {
+                continue;
+            }
+            let video_ok = matches_codec(&p.video_codec, source.video_codec.as_deref());
+            if !video_ok {
+                continue;
+            }
+            let target_container = pick_first_csv(&p.container)
+                .unwrap_or_else(|| default_container(source.is_video).into());
+            let audio_ok = matches_codec(&p.audio_codec, source.audio_codec.as_deref());
+            return Decision::VideoRemux {
+                target_container,
+                target_audio_codec: if audio_ok { None } else { Some("aac".into()) },
+            };
+        }
     }
 
     // Fall through to TranscodingProfile.
