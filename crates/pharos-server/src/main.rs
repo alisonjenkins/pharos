@@ -288,6 +288,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     {
         state = state.with_live_tv(backend);
     }
+    state = state.with_log_dir(cfg.obs.log_dir.clone());
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
 

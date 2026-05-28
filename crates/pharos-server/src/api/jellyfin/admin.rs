@@ -35,7 +35,8 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(empty_array))
         .route("/plugins", web::get().to(empty_array))
-        .route("/system/logs", web::get().to(empty_array))
+        .route("/system/logs", web::get().to(system_logs))
+        .route("/system/logs/log", web::get().to(system_logs_file))
         .route(
             "/system/activitylog/entries",
             web::get().to(empty_items_result),
@@ -445,4 +446,84 @@ fn parse_user_id(s: &str) -> Result<UserId, actix_web::Error> {
     Uuid::parse_str(s)
         .map(UserId)
         .map_err(|_| error::ErrorBadRequest("invalid user id"))
+}
+
+/// `/System/Logs` — list regular files in `[obs].log_dir`. Returns
+/// `[]` when log_dir is unset. Admin-only.
+async fn system_logs(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(dir) = state.log_dir.as_ref() else {
+        return Ok(HttpResponse::Ok().json(Vec::<serde_json::Value>::new()));
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return Ok(HttpResponse::Ok().json(Vec::<serde_json::Value>::new())),
+    };
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let size = meta.len();
+        let mtime_secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mtime_iso = crate::api::jellyfin::dto::format_iso8601(mtime_secs);
+        out.push(serde_json::json!({
+            "Name": name,
+            "Size": size,
+            "DateModified": mtime_iso,
+        }));
+    }
+    out.sort_by(|a, b| {
+        b["DateModified"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["DateModified"].as_str().unwrap_or(""))
+    });
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LogFileQuery {
+    name: String,
+}
+
+/// `/System/Logs/Log?name=…` — stream a single log file's body.
+/// Path traversal blocked: the resolved file's parent must equal
+/// `state.log_dir` exactly.
+async fn system_logs_file(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<LogFileQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(dir) = state.log_dir.as_ref() else {
+        return Err(error::ErrorNotFound("no log dir configured"));
+    };
+    let candidate = dir.join(&q.name);
+    let canon_parent = candidate
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .ok_or_else(|| error::ErrorBadRequest("invalid log path"))?;
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|_| error::ErrorInternalServerError("log_dir missing"))?;
+    if canon_parent != canon_dir {
+        return Err(error::ErrorBadRequest("log path escapes log_dir"));
+    }
+    let body = std::fs::read(&candidate)
+        .map_err(|_| error::ErrorNotFound("log file not found"))?;
+    Ok(HttpResponse::Ok()
+        .content_type("text/plain; charset=utf-8")
+        .body(body))
 }

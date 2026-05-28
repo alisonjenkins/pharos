@@ -87,6 +87,13 @@ pub struct ObsConfig {
     pub otlp_endpoint: Option<String>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Directory pharos writes / surfaces log files from. When set,
+    /// `/System/Logs` lists every regular file in it with size + mtime
+    /// and `/System/Logs/Log?name=…` serves the file body. Pharos does
+    /// not write to it itself today — operators point this at the dir
+    /// their log shipper (journald-to-file, supervisor, etc.) populates.
+    #[serde(default)]
+    pub log_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

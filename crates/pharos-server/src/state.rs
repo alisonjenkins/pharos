@@ -59,6 +59,9 @@ pub struct AppState {
     /// walks. Held here so admin endpoints (`/Library/Refresh`) can
     /// spawn a real background scan without re-parsing config.
     pub media_roots: Vec<PathBuf>,
+    /// Directory pharos surfaces log files from for the
+    /// `/System/Logs` admin endpoint. None disables the surface.
+    pub log_dir: Option<PathBuf>,
     /// Broadcast bus used by `/socket`. Capacity 256 — bursts during
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
@@ -84,11 +87,19 @@ impl AppState {
             hls: None,
             live_tv: None,
             media_roots: Vec::new(),
+            log_dir: None,
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
         }
+    }
+
+    /// Builder: attach the log-files directory the
+    /// `/System/Logs` admin endpoint surfaces.
+    pub fn with_log_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.log_dir = dir;
+        self
     }
 
     /// Construct from a store, reading or initialising the persistent
@@ -112,6 +123,7 @@ impl AppState {
             hls: None,
             live_tv: None,
             media_roots: Vec::new(),
+            log_dir: None,
             server_id,
             server_name,
             version: env!("CARGO_PKG_VERSION"),

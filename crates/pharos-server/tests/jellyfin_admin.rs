@@ -216,6 +216,82 @@ async fn scheduled_tasks_and_plugins_return_empty_arrays() {
 }
 
 #[actix_web::test]
+async fn system_logs_lists_files_in_log_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("pharos.log"), b"hello\n").unwrap();
+    std::fs::write(tmp.path().join("scan.log"), b"line\n").unwrap();
+    let stores = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let auth = pharos_server::auth::BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "boss".into(),
+            password_hash: hash,
+            policy: UserPolicy { admin: true },
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    let token = token.0.expose().to_string();
+    let state =
+        pharos_server::state::AppState::new(stores, "t".into()).with_log_dir(Some(tmp.path().into()));
+    let state = web::Data::new(state);
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/System/Logs")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    let names: Vec<String> = arr
+        .iter()
+        .map(|e| e["Name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"pharos.log".to_string()));
+    assert!(names.contains(&"scan.log".to_string()));
+    for entry in arr {
+        let size = entry["Size"].as_u64().unwrap();
+        assert!(size > 0, "{entry}");
+    }
+
+    // Fetch a specific file.
+    let req = test::TestRequest::get()
+        .uri("/System/Logs/Log?Name=pharos.log")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    assert_eq!(body.as_ref(), b"hello\n");
+
+    // Path traversal blocked.
+    let req = test::TestRequest::get()
+        .uri("/System/Logs/Log?Name=..%2Fetc%2Fpasswd")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
+#[actix_web::test]
+async fn system_logs_returns_empty_when_log_dir_unset() {
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/System/Logs")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v.as_array().unwrap().is_empty());
+}
+
+#[actix_web::test]
 async fn api_key_create_lists_then_revoke_drops_it() {
     let (state, token, _uid) = seed(true).await;
     let app = test::init_service(build_app(state)).await;
