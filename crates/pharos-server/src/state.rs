@@ -62,6 +62,9 @@ pub struct AppState {
     /// Directory pharos surfaces log files from for the
     /// `/System/Logs` admin endpoint. None disables the surface.
     pub log_dir: Option<PathBuf>,
+    /// T-fix-Q1 — QuickConnect pending-request registry. Always
+    /// available; the `/QuickConnect/Enabled` flag advertises true.
+    pub quick_connect: crate::quick_connect::QuickConnectRegistry,
     /// Broadcast bus used by `/socket`. Capacity 256 — bursts during
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
@@ -88,6 +91,7 @@ impl AppState {
             live_tv: None,
             media_roots: Vec::new(),
             log_dir: None,
+            quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -124,6 +128,7 @@ impl AppState {
             live_tv: None,
             media_roots: Vec::new(),
             log_dir: None,
+            quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
             server_name,
             version: env!("CARGO_PKG_VERSION"),

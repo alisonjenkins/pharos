@@ -9,6 +9,7 @@ pub mod image_cache;
 pub mod live_tv;
 pub mod middleware;
 pub mod obs;
+pub mod quick_connect;
 pub mod router;
 pub mod sessions;
 pub mod ssdp;

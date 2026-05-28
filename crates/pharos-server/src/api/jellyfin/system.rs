@@ -86,7 +86,7 @@ async fn system_configuration() -> impl Responder {
         "UICulture": "en-US",
         "PreferredMetadataLanguage": "en",
         "MetadataCountryCode": "US",
-        "QuickConnectAvailable": false,
+        "QuickConnectAvailable": true,
         "StartupWizardCompleted": true,
     }))
 }

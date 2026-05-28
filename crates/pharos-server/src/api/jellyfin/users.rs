@@ -25,6 +25,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/quickconnect/enabled",
         web::get().to(quick_connect_enabled),
     )
+    .route("/quickconnect/initiate", web::post().to(quick_connect_initiate))
+    .route("/quickconnect/initiate", web::get().to(quick_connect_initiate))
+    .route("/quickconnect/authorize", web::post().to(quick_connect_authorize))
+    .route("/quickconnect/connect", web::get().to(quick_connect_connect))
     .route(
         "/branding/configuration",
         web::get().to(branding_configuration),
@@ -42,10 +46,136 @@ async fn public_users() -> impl Responder {
     HttpResponse::Ok().json(empty)
 }
 
-/// We do not implement Quick Connect (would need a separate flow);
-/// reporting false ensures jellyfin-web hides the Quick Connect UI.
 async fn quick_connect_enabled() -> impl Responder {
-    HttpResponse::Ok().json(false)
+    HttpResponse::Ok().json(true)
+}
+
+/// `/QuickConnect/Initiate` — unauthenticated. Returns a fresh
+/// `(Code, Secret, DeviceId)` triple. Client polls Connect with the
+/// Secret while showing the Code on screen for the user to read out.
+async fn quick_connect_initiate(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+) -> Result<impl Responder, actix_web::Error> {
+    let auth = auth_header_from_request(&req);
+    let device_id = auth
+        .device_id
+        .clone()
+        .or_else(|| auth.device.clone())
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    state
+        .quick_connect
+        .tx
+        .send(crate::quick_connect::QcMsg::Initiate {
+            device_id: device_id.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let entry = reply_rx
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Code": entry.code,
+        "Secret": entry.secret,
+        "DeviceId": entry.device_id,
+        "Authenticated": false,
+        "DateAdded": "",
+    })))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AuthorizeQuery {
+    #[serde(default)]
+    code: String,
+}
+
+/// `/QuickConnect/Authorize?Code=…` — signed-in user vouches for the
+/// pending request. Pharos gates on any authenticated bearer (the
+/// user effectively authorizes themselves); admin-only flow is a
+/// future tightening if it bites.
+async fn quick_connect_authorize(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<AuthorizeQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    if q.code.trim().is_empty() {
+        return Err(actix_web::error::ErrorBadRequest("Code query param required"));
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    state
+        .quick_connect
+        .tx
+        .send(crate::quick_connect::QcMsg::Authorize {
+            code: q.code.clone(),
+            by: user.0.id,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let ok = reply_rx
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    if !ok {
+        return Err(actix_web::error::ErrorNotFound("unknown code"));
+    }
+    Ok(HttpResponse::Ok().json(true))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ConnectQuery {
+    #[serde(default)]
+    secret: String,
+}
+
+/// `/QuickConnect/Connect?Secret=…` — poll endpoint. Returns the
+/// pending request's current state. Once `Authenticated:true`, the
+/// response carries an `AccessToken` and the pending record is
+/// consumed (one-shot).
+async fn quick_connect_connect(
+    state: web::Data<AppState>,
+    q: web::Query<ConnectQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    if q.secret.trim().is_empty() {
+        return Err(actix_web::error::ErrorBadRequest("Secret query param required"));
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    state
+        .quick_connect
+        .tx
+        .send(crate::quick_connect::QcMsg::Connect {
+            secret: q.secret.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let entry = reply_rx
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let Some(entry) = entry else {
+        return Err(actix_web::error::ErrorNotFound("unknown or expired secret"));
+    };
+    let Some(by) = entry.authorized_by else {
+        // Not yet authorized — client keeps polling.
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "Code": entry.code,
+            "DeviceId": entry.device_id,
+            "Authenticated": false,
+        })));
+    };
+    // Authorized — mint an AccessToken against the authorizing user.
+    let token = crate::quick_connect::issue_token(&state.stores, by, &entry.device_id)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Code": entry.code,
+        "DeviceId": entry.device_id,
+        "Authenticated": true,
+        "AccessToken": token,
+    })))
 }
 
 async fn branding_configuration() -> impl Responder {
