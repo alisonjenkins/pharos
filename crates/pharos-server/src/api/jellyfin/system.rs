@@ -324,10 +324,106 @@ async fn devices_list(
     })))
 }
 
-async fn media_segments_stub(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
+async fn media_segments_stub(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> impl Responder {
+    let item_id = path.into_inner();
+    let items = build_media_segments(&state, &item_id).await;
+    let total = items.len() as u32;
     HttpResponse::Ok().json(serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
+        "Items": items,
+        "TotalRecordCount": total,
         "StartIndex": 0,
     }))
+}
+
+/// Walk the item's chapter list and project intro / outro / recap
+/// chapters into Jellyfin's MediaSegment shape so jellyfin-web's
+/// "Skip Intro" overlay fires.
+///
+/// Heuristic-only: titles matching common patterns are classified;
+/// everything else is ignored.
+async fn build_media_segments(
+    state: &AppState,
+    item_id: &str,
+) -> Vec<serde_json::Value> {
+    use pharos_core::MediaStore;
+    let Ok(id) = item_id.parse::<u64>() else {
+        return Vec::new();
+    };
+    let Ok(item) = state.stores.get(id).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let chapters = &item.probe.chapters;
+    for (idx, c) in chapters.iter().enumerate() {
+        let Some(seg_type) = classify_chapter_title(&c.title) else {
+            continue;
+        };
+        let start_ticks = c.start_ms.saturating_mul(10_000);
+        // The chapter's `end_ms` is the *next* chapter's start —
+        // ffprobe carries it explicitly so we trust it.
+        let end_ticks = if c.end_ms > c.start_ms {
+            c.end_ms.saturating_mul(10_000)
+        } else {
+            start_ticks.saturating_add(30_000_000_000) // 30s fallback
+        };
+        out.push(serde_json::json!({
+            "Id": format!("{item_id}:{idx}"),
+            "ItemId": item_id,
+            "StartTicks": start_ticks,
+            "EndTicks": end_ticks,
+            "Type": seg_type,
+        }));
+    }
+    out
+}
+
+/// Map a free-text chapter title to a Jellyfin MediaSegmentType.
+/// Returns None when the title doesn't look like an actionable
+/// segment.
+pub(crate) fn classify_chapter_title(title: &str) -> Option<&'static str> {
+    let lc = title.to_ascii_lowercase();
+    if lc.contains("intro") || lc.contains("opening") {
+        return Some("Intro");
+    }
+    if lc.contains("outro")
+        || lc.contains("end credits")
+        || lc.contains("closing")
+        || lc.starts_with("credits")
+    {
+        return Some("Outro");
+    }
+    if lc.contains("recap") || lc.contains("previously on") {
+        return Some("Recap");
+    }
+    if lc.contains("preview") || lc.contains("next on") {
+        return Some("Preview");
+    }
+    if lc.contains("commercial") {
+        return Some("Commercial");
+    }
+    None
+}
+
+#[cfg(test)]
+mod media_segments_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn classify_chapter_title_branches() {
+        assert_eq!(classify_chapter_title("Opening"), Some("Intro"));
+        assert_eq!(classify_chapter_title("Intro 1"), Some("Intro"));
+        assert_eq!(classify_chapter_title("End credits"), Some("Outro"));
+        assert_eq!(classify_chapter_title("Credits"), Some("Outro"));
+        assert_eq!(classify_chapter_title("Previously on"), Some("Recap"));
+        assert_eq!(classify_chapter_title("Recap"), Some("Recap"));
+        assert_eq!(classify_chapter_title("Next on"), Some("Preview"));
+        assert_eq!(classify_chapter_title("Commercial break"), Some("Commercial"));
+        assert_eq!(classify_chapter_title("Chapter 4"), None);
+        assert_eq!(classify_chapter_title("The Beach"), None);
+    }
 }
