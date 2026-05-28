@@ -33,6 +33,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "Window",
     "Document",
     "Storage",
+    "Location",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 serde = { workspace = true }

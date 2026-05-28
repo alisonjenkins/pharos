@@ -16,10 +16,12 @@ use crate::client::{
     ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
     RemoteSession, SearchHint, UserConfiguration,
 };
+use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
     AdminAction, AdminTab, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
     LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, PrefsAction,
-    PrefsTab, PrefsView, RemoteAction, RemoteControlView, SearchStatus, SearchView,
+    PrefsTab, PrefsView, RemoteAction, RemoteControlView, SavedServer, SearchStatus, SearchView,
+    ServerPickerAction, ServerPickerView,
 };
 use dioxus::prelude::*;
 
@@ -34,6 +36,7 @@ pub enum AppRoute {
     LiveTv,
     Prefs(PrefsTab),
     Remote,
+    SelectServer,
 }
 
 #[component]
@@ -41,6 +44,10 @@ pub fn RootApp() -> Element {
     let user = use_signal::<Option<LoggedInUser>>(|| None);
     let route = use_signal::<AppRoute>(|| AppRoute::Library);
     let error = use_signal::<Option<String>>(|| None);
+    // Pre-login server-picker toggle. None: show LoginForm. Some: show
+    // ServerPickerPane. Post-login the same flow is reachable via
+    // `AppRoute::SelectServer`.
+    let mut pre_login_picker = use_signal(|| false);
 
     rsx! {
         div {
@@ -49,7 +56,29 @@ pub fn RootApp() -> Element {
             main {
                 class: "pharos-main",
                 match user.read().as_ref() {
-                    None => rsx! { LoginGate { user: user, error: error } },
+                    None => if *pre_login_picker.read() {
+                        rsx! {
+                            ServerPickerPane {
+                                on_done: move |_| pre_login_picker.set(false),
+                            }
+                        }
+                    } else {
+                        rsx! {
+                            div {
+                                class: "pharos-pre-login",
+                                LoginGate { user: user, error: error }
+                                button {
+                                    class: "pharos-switch-server",
+                                    onclick: move |_| pre_login_picker.set(true),
+                                    "Switch server"
+                                }
+                                p {
+                                    class: "pharos-active-server",
+                                    "Connected to: {active_server_label()}"
+                                }
+                            }
+                        }
+                    },
                     Some(_) => rsx! {
                         Authenticated {
                             user: user,
@@ -82,6 +111,15 @@ fn LoginGate(user: Signal<Option<LoggedInUser>>, error: Signal<Option<String>>) 
             }
         }
     }
+}
+
+/// Visible label for the current active server. Strips
+/// `https?://` prefix so the chrome stays compact.
+fn active_server_label() -> String {
+    let url = server_base_from_window();
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
 }
 
 #[component]
@@ -141,6 +179,11 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
                 class: "pharos-nav-remote",
                 onclick: move |_| route.set(AppRoute::Remote),
                 "Remote"
+            }
+            button {
+                class: "pharos-nav-server",
+                onclick: move |_| route.set(AppRoute::SelectServer),
+                "Server"
             }
             if is_admin {
                 button {
@@ -226,6 +269,11 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
                 RemotePane {
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
+                }
+            },
+            AppRoute::SelectServer => rsx! {
+                ServerPickerPane {
+                    on_done: move |_| { route.set(AppRoute::Library); },
                 }
             }
         }
@@ -884,8 +932,140 @@ fn LiveTvPane(access_token: String, server_base: String, on_tune: EventHandler<S
     }
 }
 
+/// Manages the localStorage-backed server list + Select/Add/Forget
+/// actions. T59 phase 2. On Add we fire `/System/Info/Public` against
+/// the typed URL to mint a `SavedServer` entry (server_id, name).
+/// Switching servers updates `pharos.active_server_url` then reloads
+/// the page so every cached fetch / `use_resource` drops cleanly.
+#[component]
+fn ServerPickerPane(on_done: EventHandler<()>) -> Element {
+    let saved = use_signal::<Vec<SavedServer>>(load_saved_servers);
+    let status = use_signal::<Option<String>>(|| None);
+
+    let action_handler = {
+        let mut saved_sig = saved;
+        let mut status_sig = status;
+        let on_done = on_done;
+        move |action: ServerPickerAction| match action {
+            ServerPickerAction::Select(entry) => {
+                set_active_server_url(&entry.base_url);
+                // Persist last-used ordering: move picked entry to front.
+                let mut list = saved_sig.read().clone();
+                list.retain(|s| s.server_id != entry.server_id);
+                list.insert(0, entry.clone());
+                save_servers(&list);
+                saved_sig.set(list);
+                on_done.call(());
+                reload_app();
+            }
+            ServerPickerAction::Forget(server_id) => {
+                let mut list = saved_sig.read().clone();
+                let forgetting_active = list
+                    .iter()
+                    .any(|s| s.server_id == server_id && s.base_url == server_base_from_window());
+                list.retain(|s| s.server_id != server_id);
+                save_servers(&list);
+                saved_sig.set(list);
+                if forgetting_active {
+                    clear_active_server_url();
+                }
+                status_sig.set(Some(format!("Forgot {server_id}")));
+            }
+            ServerPickerAction::Add(url) => {
+                let trimmed = url.trim().trim_end_matches('/').to_string();
+                if trimmed.is_empty() {
+                    status_sig.set(Some("URL must not be empty".into()));
+                    return;
+                }
+                spawn(async move {
+                    match fetch_server_identity(&trimmed).await {
+                        Ok(entry) => {
+                            let mut list = saved_sig.read().clone();
+                            // Dedup by server_id; replace existing.
+                            list.retain(|s| s.server_id != entry.server_id);
+                            list.insert(0, entry.clone());
+                            save_servers(&list);
+                            saved_sig.set(list);
+                            status_sig.set(Some(format!("Added {}", entry.name)));
+                        }
+                        Err(e) => {
+                            status_sig.set(Some(format!("Couldn't reach {trimmed}: {e}")));
+                        }
+                    }
+                });
+            }
+        }
+    };
+
+    let default_url = active_server_label();
+    let saved_now = saved.read().clone();
+    let status_now = status.read().clone();
+    rsx! {
+        ServerPickerView {
+            saved: saved_now,
+            default_url: default_url,
+            status: status_now,
+            on_action: action_handler,
+        }
+    }
+}
+
+/// Fetch `/System/Info/Public` for a candidate base URL. Returns a
+/// `SavedServer` populated with the upstream server's `Id` + `ServerName`.
+/// Used by `ServerPickerPane::Add` to validate the URL before saving.
+#[cfg(feature = "web")]
+async fn fetch_server_identity(base_url: &str) -> Result<SavedServer, String> {
+    use gloo_net::http::Request;
+    let resp = Request::get(&format!("{base_url}/System/Info/Public"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("status {}", resp.status()));
+    }
+    let bytes = resp.binary().await.map_err(|e| e.to_string())?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct PublicSystemInfo {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        server_name: String,
+    }
+    let parsed: PublicSystemInfo =
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let name = if parsed.server_name.is_empty() {
+        base_url.to_string()
+    } else {
+        parsed.server_name
+    };
+    Ok(SavedServer {
+        server_id: parsed.id,
+        base_url: base_url.to_string(),
+        name,
+        last_user_name: String::new(),
+    })
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_server_identity(_base_url: &str) -> Result<SavedServer, String> {
+    Err("fetch_server_identity is only wired in the web build".into())
+}
+
+/// Resolve the active server's base URL. Reads the
+/// `pharos.active_server_url` localStorage key first (set by
+/// `ServerPickerPane::Select` / `Add`); falls back to the page's
+/// origin so the single-server bootstrap flow keeps working. Host
+/// builds (no browser) always resolve to empty.
 #[cfg(feature = "web")]
 fn server_base_from_window() -> String {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        if let Ok(Some(saved)) = storage.get_item("pharos.active_server_url") {
+            if !saved.is_empty() {
+                return saved;
+            }
+        }
+    }
     web_sys::window()
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_else(|| String::from(""))
@@ -895,6 +1075,41 @@ fn server_base_from_window() -> String {
 fn server_base_from_window() -> String {
     String::new()
 }
+
+#[cfg(feature = "web")]
+fn set_active_server_url(url: &str) {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return;
+    };
+    let _ = storage.set_item("pharos.active_server_url", url);
+}
+
+#[cfg(not(feature = "web"))]
+fn set_active_server_url(_url: &str) {}
+
+#[cfg(feature = "web")]
+fn clear_active_server_url() {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return;
+    };
+    let _ = storage.remove_item("pharos.active_server_url");
+}
+
+#[cfg(not(feature = "web"))]
+fn clear_active_server_url() {}
+
+/// Force a full page reload — the simplest way to drop every cached
+/// fetch / `use_resource` after the active server changes. WASM-only;
+/// host build is a no-op.
+#[cfg(feature = "web")]
+fn reload_app() {
+    if let Some(loc) = web_sys::window().map(|w| w.location()) {
+        let _ = loc.reload();
+    }
+}
+
+#[cfg(not(feature = "web"))]
+fn reload_app() {}
 
 #[cfg(feature = "web")]
 async fn login_via_client(attempt: &LoginAttempt) -> Result<LoggedInUser, String> {
