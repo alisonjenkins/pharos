@@ -14,6 +14,7 @@ pub mod sessions;
 pub mod socket;
 pub mod socket_messages;
 pub mod stream;
+pub mod stubs;
 pub mod subtitles;
 pub mod syncplay;
 pub mod system;
@@ -41,4 +42,5 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     socket::register(cfg);
     subtitles::register(cfg);
     syncplay::register(cfg);
+    stubs::register(cfg);
 }

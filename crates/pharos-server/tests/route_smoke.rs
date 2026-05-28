@@ -170,6 +170,28 @@ fn probes(user_id: &str) -> Vec<Probe> {
         p("/Library/Refresh", r#"{}"#),
         // Playback
         g("/Playback/BitrateTest?Size=1000"),
+        // T-fix-31 stubs — jellyfin-web fetches these at boot.
+        g("/Packages"),
+        g("/Repositories"),
+        g("/Notifications/Services"),
+        g("/Notifications/Types"),
+        g("/Notifications"),
+        g(&format!("/Notifications/{u}")),
+        g("/Auth/Providers"),
+        g("/Auth/PasswordResetProviders"),
+        g("/Web/ConfigurationPages"),
+        g("/Items/1/Intros"),
+        g("/Items/1/LocalTrailers"),
+        g("/Items/1/SpecialFeatures"),
+        g("/Items/1/ThemeMedia"),
+        g("/Items/1/ThemeSongs"),
+        g("/Items/1/ThemeVideos"),
+        g("/Items/1/CriticReviews"),
+        g("/GetUtcTime"),
+        p("/ClientLog/Document", r#"{}"#),
+        p("/Sessions/Playing/Ping", r#"{}"#),
+        // T58 phase 3 — API keys surface.
+        g("/Auth/Keys"),
     ]
 }
 
