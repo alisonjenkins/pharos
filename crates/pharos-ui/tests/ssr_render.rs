@@ -206,7 +206,20 @@ fn player_movie_with_tracks() -> Element {
             access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             tracks: PlaybackTracks {
-                audio: vec![],
+                audio: vec![
+                    MediaTrack {
+                        index: 1,
+                        language: Some("eng".into()),
+                        title: Some("English".into()),
+                        ..Default::default()
+                    },
+                    MediaTrack {
+                        index: 2,
+                        language: Some("jpn".into()),
+                        title: Some("Japanese".into()),
+                        ..Default::default()
+                    },
+                ],
                 subtitle: vec![MediaTrack {
                     index: 2,
                     language: Some("eng".into()),
@@ -230,6 +243,14 @@ fn player_view_renders_subtitle_track_when_tracks_supplied() {
     // Pharos-side OSD picker also renders.
     assert!(html.contains("pharos-player-osd"), "{html}");
     assert!(html.contains("pharos-player-subtitles"), "{html}");
+    // T57 phase 3 — subtitle picker is interactive (Off + per-track).
+    assert!(html.contains("pharos-player-subtitle-pick"), "{html}");
+    assert!(html.contains("pharos-player-subtitle-off"), "{html}");
+    assert!(html.contains(">Off<"), "{html}");
+    // Audio picker now renders one button per track.
+    assert!(html.contains("pharos-player-audio-pick"), "{html}");
+    assert!(html.contains("English (eng)"), "{html}");
+    assert!(html.contains("Japanese (jpn)"), "{html}");
 }
 
 #[test]

@@ -87,6 +87,18 @@ pub enum PlaybackEvent {
     ChapterSelected {
         position_seconds: f64,
     },
+    /// T57 phase 3 — user picked an audio track. Parent rebuilds
+    /// `src_override` with `&AudioStreamIndex={index}`.
+    AudioTrackSelected {
+        index: u32,
+    },
+    /// T57 phase 3 — user picked a subtitle track. `None` clears the
+    /// burn-in selection (browser-native `<track>` still wins for
+    /// direct play); parent rebuilds with `&SubtitleStreamIndex={index}`
+    /// when transcoding.
+    SubtitleTrackSelected {
+        index: Option<u32>,
+    },
 }
 
 #[component]
@@ -201,10 +213,16 @@ pub fn PlayerView(
                         class: "pharos-player-audio",
                         summary { "Audio tracks ({audios.len()})" }
                         ul {
-                            for t in audios.iter() {
+                            for t in audios.iter().cloned() {
                                 li {
                                     key: "{t.index}",
-                                    "{track_label(t)}"
+                                    button {
+                                        class: "pharos-player-audio-pick",
+                                        onclick: move |_| on_event.call(
+                                            PlaybackEvent::AudioTrackSelected { index: t.index },
+                                        ),
+                                        "{track_label(&t)}"
+                                    }
                                 }
                             }
                         }
@@ -215,11 +233,28 @@ pub fn PlayerView(
                         class: "pharos-player-subtitles",
                         summary { "Subtitles ({subtitles.len()})" }
                         ul {
-                            for t in subtitles.iter() {
+                            li {
+                                button {
+                                    class: "pharos-player-subtitle-pick pharos-player-subtitle-off",
+                                    onclick: move |_| on_event.call(
+                                        PlaybackEvent::SubtitleTrackSelected { index: None },
+                                    ),
+                                    "Off"
+                                }
+                            }
+                            for t in subtitles.iter().cloned() {
                                 li {
                                     key: "{t.index}",
-                                    "{track_label(t)}"
-                                    if t.is_external { " (external)" }
+                                    button {
+                                        class: "pharos-player-subtitle-pick",
+                                        onclick: move |_| on_event.call(
+                                            PlaybackEvent::SubtitleTrackSelected {
+                                                index: Some(t.index),
+                                            },
+                                        ),
+                                        "{track_label(&t)}"
+                                        if t.is_external { " (external)" }
+                                    }
                                 }
                             }
                         }

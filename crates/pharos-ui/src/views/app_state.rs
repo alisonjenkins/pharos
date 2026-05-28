@@ -786,6 +786,8 @@ fn PlayerPane(
 ) -> Element {
     use crate::views::QualityOption;
     let mut max_bitrate = use_signal::<Option<u32>>(|| None);
+    let mut audio_index = use_signal::<Option<u32>>(|| None);
+    let mut subtitle_index = use_signal::<Option<i32>>(|| None);
     let media_dom_id = format!("pharos-media-{item_id}");
 
     let item_for_url = item_id.clone();
@@ -793,14 +795,34 @@ fn PlayerPane(
     let token_for_url = access_token.clone();
     let kind_for_url = kind;
     let current_bitrate = *max_bitrate.read();
-    let src_override: Option<String> = current_bitrate.map(|b| match kind_for_url {
-        ItemKind::Audio => format!(
-            "{server_for_url}/Audio/{item_for_url}/universal?api_key={token_for_url}&MaxStreamingBitrate={b}"
-        ),
-        ItemKind::Movie | ItemKind::Episode => format!(
-            "{server_for_url}/Videos/{item_for_url}/stream?api_key={token_for_url}&MaxStreamingBitrate={b}"
-        ),
-    });
+    let current_audio = *audio_index.read();
+    let current_subtitle = *subtitle_index.read();
+    let needs_override = current_bitrate.is_some()
+        || current_audio.is_some()
+        || current_subtitle.is_some();
+    let src_override: Option<String> = if needs_override {
+        let mut qs = format!("?api_key={token_for_url}");
+        if let Some(b) = current_bitrate {
+            qs.push_str(&format!("&MaxStreamingBitrate={b}"));
+        }
+        if let Some(a) = current_audio {
+            qs.push_str(&format!("&AudioStreamIndex={a}"));
+        }
+        if let Some(s) = current_subtitle {
+            // i32 lets us encode -1 = off (Jellyfin convention).
+            qs.push_str(&format!("&SubtitleStreamIndex={s}"));
+        }
+        Some(match kind_for_url {
+            ItemKind::Audio => {
+                format!("{server_for_url}/Audio/{item_for_url}/universal{qs}")
+            }
+            ItemKind::Movie | ItemKind::Episode => {
+                format!("{server_for_url}/Videos/{item_for_url}/stream{qs}")
+            }
+        })
+    } else {
+        None
+    };
 
     let quality_options = vec![
         QualityOption {
@@ -850,6 +872,19 @@ fn PlayerPane(
                     }
                     crate::views::PlaybackEvent::ChapterSelected { position_seconds } => {
                         seek_media(&media_dom_id, position_seconds);
+                    }
+                    crate::views::PlaybackEvent::AudioTrackSelected { index } => {
+                        audio_index.set(Some(index));
+                    }
+                    crate::views::PlaybackEvent::SubtitleTrackSelected { index } => {
+                        subtitle_index.set(match index {
+                            Some(i) => Some(i as i32),
+                            // Jellyfin's SubtitleStreamIndex=-1 disables
+                            // burn-in. -1 keeps the override active so
+                            // jellyfin-web's "Off" pick is preserved
+                            // through the next quality switch.
+                            None => Some(-1),
+                        });
                     }
                     _ => {}
                 },
