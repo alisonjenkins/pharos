@@ -27,24 +27,15 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Auth provider picker (admin dashboard). Pharos ships one
         // built-in provider; surface it so the dropdown isn't empty.
         .route("/auth/providers", web::get().to(auth_providers))
-        .route(
-            "/auth/passwordresetproviders",
-            web::get().to(empty_array),
-        )
+        .route("/auth/passwordresetproviders", web::get().to(empty_array))
         // Web configuration pages — plugin pages, empty.
         .route("/web/configurationpages", web::get().to(empty_array))
         // Items-tree empty endpoints jellyfin-web's player-pre-roll path
         // queries before playback. None of these have a Phase 1 source
         // of data; the empty shape stops the client from cascading 404s.
         .route("/items/{id}/intros", web::get().to(empty_items_result))
-        .route(
-            "/items/{id}/localtrailers",
-            web::get().to(empty_array),
-        )
-        .route(
-            "/items/{id}/specialfeatures",
-            web::get().to(empty_array),
-        )
+        .route("/items/{id}/localtrailers", web::get().to(empty_array))
+        .route("/items/{id}/specialfeatures", web::get().to(empty_array))
         .route("/items/{id}/thememedia", web::get().to(theme_media))
         .route("/items/{id}/themesongs", web::get().to(empty_array))
         .route("/items/{id}/themevideos", web::get().to(empty_array))
@@ -90,9 +81,7 @@ async fn notifications_user(_user: AuthUser) -> impl Responder {
     }))
 }
 
-async fn auth_providers(
-    user: AuthUser,
-) -> Result<actix_web::HttpResponse, actix_web::Error> {
+async fn auth_providers(user: AuthUser) -> Result<actix_web::HttpResponse, actix_web::Error> {
     // jellyfin contract — admin-only.
     crate::api::jellyfin::admin::require_admin(&user)?;
     // Single built-in provider so the dashboard's auth-provider

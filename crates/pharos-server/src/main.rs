@@ -302,10 +302,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // handle so the runtime tears it down on shutdown.
     let _ssdp_guard = if cfg.server.ssdp_enabled {
         let advertise = cfg.server.ssdp_advertise_url.clone().unwrap_or_else(|| {
-            format!(
-                "http://{}",
-                cfg.server.bind.replace("0.0.0.0", "127.0.0.1")
-            )
+            format!("http://{}", cfg.server.bind.replace("0.0.0.0", "127.0.0.1"))
         });
         match pharos_server::ssdp::SsdpResponder::spawn(
             app_state.server_id.clone(),

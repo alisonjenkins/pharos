@@ -237,8 +237,8 @@ async fn system_logs_lists_files_in_log_dir() {
         .unwrap();
     let token = stores.issue(uid, "test").await.unwrap();
     let token = token.0.expose().to_string();
-    let state =
-        pharos_server::state::AppState::new(stores, "t".into()).with_log_dir(Some(tmp.path().into()));
+    let state = pharos_server::state::AppState::new(stores, "t".into())
+        .with_log_dir(Some(tmp.path().into()));
     let state = web::Data::new(state);
     let app = test::init_service(build_app(state)).await;
 
@@ -310,9 +310,7 @@ async fn system_configuration_post_persists_server_name_into_info() {
         .uri("/System/Configuration")
         .insert_header(("X-Emby-Token", token.as_str()))
         .insert_header(("Content-Type", "application/json"))
-        .set_payload(
-            r#"{"ServerName":"My Pharos","LoginDisclaimer":"Hello","CustomCss":"body{}"}"#,
-        )
+        .set_payload(r#"{"ServerName":"My Pharos","LoginDisclaimer":"Hello","CustomCss":"body{}"}"#)
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 204);

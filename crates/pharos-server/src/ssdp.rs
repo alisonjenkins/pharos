@@ -194,12 +194,7 @@ fn usn_for(server_id: &str, target: &str) -> String {
     format!("uuid:{server_id}::{target}")
 }
 
-async fn send_alives(
-    sock: &UdpSocket,
-    server_id: &str,
-    advertise_url: &str,
-    server_header: &str,
-) {
+async fn send_alives(sock: &UdpSocket, server_id: &str, advertise_url: &str, server_header: &str) {
     let mcast: SocketAddr = SocketAddr::new(MCAST_GROUP.into(), MCAST_PORT);
     let uuid_target = format!("uuid:{server_id}");
     let targets: Vec<String> = ANSWERABLE_TARGETS
@@ -264,10 +259,7 @@ mod tests {
     fn parse_header_case_insensitive_and_strips_quotes() {
         let req = "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
         assert_eq!(parse_header(req, "man").as_deref(), Some("ssdp:discover"));
-        assert_eq!(
-            parse_header(req, "ST").as_deref(),
-            Some("upnp:rootdevice"),
-        );
+        assert_eq!(parse_header(req, "ST").as_deref(), Some("upnp:rootdevice"),);
         assert_eq!(parse_header(req, "MX"), None);
     }
 
@@ -300,7 +292,10 @@ mod tests {
             "upnp:rootdevice",
         );
         assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
-        assert!(r.contains("LOCATION: http://192.168.1.10:8096/Dlna/abc123/description.xml"), "{r}");
+        assert!(
+            r.contains("LOCATION: http://192.168.1.10:8096/Dlna/abc123/description.xml"),
+            "{r}"
+        );
         assert!(r.contains("ST: upnp:rootdevice"), "{r}");
         assert!(r.contains("USN: uuid:abc123::upnp:rootdevice"), "{r}");
         assert!(r.contains("CACHE-CONTROL: max-age=1800"), "{r}");
@@ -316,16 +311,14 @@ mod tests {
 
     #[test]
     fn notify_alive_carries_nt_and_nts() {
-        let n = build_notify_alive(
-            "abc",
-            "http://h:8096",
-            "pharos/0.0.0",
-            "upnp:rootdevice",
-        );
+        let n = build_notify_alive("abc", "http://h:8096", "pharos/0.0.0", "upnp:rootdevice");
         assert!(n.starts_with("NOTIFY * HTTP/1.1\r\n"), "{n}");
         assert!(n.contains("NT: upnp:rootdevice"), "{n}");
         assert!(n.contains("NTS: ssdp:alive"), "{n}");
-        assert!(n.contains("LOCATION: http://h:8096/Dlna/abc/description.xml"), "{n}");
+        assert!(
+            n.contains("LOCATION: http://h:8096/Dlna/abc/description.xml"),
+            "{n}"
+        );
         assert!(n.contains("HOST: 239.255.255.250:1900"), "{n}");
     }
 }

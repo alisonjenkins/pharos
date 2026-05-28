@@ -298,11 +298,7 @@ struct Culture {
 }
 
 impl Culture {
-    const fn new(
-        name: &'static str,
-        two: &'static str,
-        three: &'static str,
-    ) -> Self {
+    const fn new(name: &'static str, two: &'static str, three: &'static str) -> Self {
         Self {
             name,
             display_name: name,
@@ -401,10 +397,7 @@ async fn media_segments_stub(
 ///
 /// Heuristic-only: titles matching common patterns are classified;
 /// everything else is ignored.
-async fn build_media_segments(
-    state: &AppState,
-    item_id: &str,
-) -> Vec<serde_json::Value> {
+async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json::Value> {
     use pharos_core::MediaStore;
     let Ok(id) = item_id.parse::<u64>() else {
         return Vec::new();
@@ -478,7 +471,10 @@ mod media_segments_tests {
         assert_eq!(classify_chapter_title("Previously on"), Some("Recap"));
         assert_eq!(classify_chapter_title("Recap"), Some("Recap"));
         assert_eq!(classify_chapter_title("Next on"), Some("Preview"));
-        assert_eq!(classify_chapter_title("Commercial break"), Some("Commercial"));
+        assert_eq!(
+            classify_chapter_title("Commercial break"),
+            Some("Commercial")
+        );
         assert_eq!(classify_chapter_title("Chapter 4"), None);
         assert_eq!(classify_chapter_title("The Beach"), None);
     }

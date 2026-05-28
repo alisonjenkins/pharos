@@ -30,14 +30,18 @@ use dioxus::prelude::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppRoute {
     Library,
-    Detail { item_id: String },
+    Detail {
+        item_id: String,
+    },
     Player {
         item_id: String,
         kind: ItemKind,
         chapters: Vec<ItemChapter>,
         run_time_ticks: u64,
     },
-    LivePlayer { channel_id: String },
+    LivePlayer {
+        channel_id: String,
+    },
     Admin,
     Search,
     LiveTv,
@@ -447,8 +451,10 @@ fn DetailPane(
                         .as_ref()
                         .map(|d| d.chapters.clone())
                         .unwrap_or_default();
-                    let run_time_ticks =
-                        detail_snapshot.as_ref().map(|d| d.run_time_ticks).unwrap_or(0);
+                    let run_time_ticks = detail_snapshot
+                        .as_ref()
+                        .map(|d| d.run_time_ticks)
+                        .unwrap_or(0);
                     on_play.call((id, kind, chapters, run_time_ticks));
                 }
                 DetailAction::TogglePlayed => {
@@ -523,9 +529,8 @@ fn DetailPane(
             };
             // Cast portraits use the public `<img>` route; no api_key
             // needed (matches the Items/Images/Primary contract).
-            let person_image_url_template = Some(format!(
-                "{server_base}/Items/{{person_id}}/Images/Primary"
-            ));
+            let person_image_url_template =
+                Some(format!("{server_base}/Items/{{person_id}}/Images/Primary"));
             rsx! {
                 ItemDetailView {
                     detail: detail,
@@ -714,8 +719,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                                 new_secret_signal.set(Some(secret));
                                 status_signal.set(Some(format!("Issued API key '{app_name}'")));
                             }
-                            Err(e) => status_signal
-                                .set(Some(format!("API-key creation failed: {e}"))),
+                            Err(e) => {
+                                status_signal.set(Some(format!("API-key creation failed: {e}")))
+                            }
                         }
                     }
                     AdminAction::RevokeApiKey { key_id } => {
@@ -858,9 +864,8 @@ fn PlayerPane(
     let current_bitrate = *max_bitrate.read();
     let current_audio = *audio_index.read();
     let current_subtitle = *subtitle_index.read();
-    let needs_override = current_bitrate.is_some()
-        || current_audio.is_some()
-        || current_subtitle.is_some();
+    let needs_override =
+        current_bitrate.is_some() || current_audio.is_some() || current_subtitle.is_some();
     let src_override: Option<String> = if needs_override {
         let mut qs = format!("?api_key={token_for_url}");
         if let Some(b) = current_bitrate {
@@ -1405,10 +1410,7 @@ fn LiveTvPane(access_token: String, server_base: String, on_tune: EventHandler<S
 /// Switching servers updates `pharos.active_server_url` then reloads
 /// the page so every cached fetch / `use_resource` drops cleanly.
 #[component]
-fn QuickConnectGuestPane(
-    user: Signal<Option<LoggedInUser>>,
-    on_done: EventHandler<()>,
-) -> Element {
+fn QuickConnectGuestPane(user: Signal<Option<LoggedInUser>>, on_done: EventHandler<()>) -> Element {
     let pending = use_signal::<Option<QuickConnectInitiate>>(|| None);
     let status = use_signal::<QuickConnectGuestStatus>(|| QuickConnectGuestStatus::Idle);
     let cancel_signal = use_signal(|| false);
@@ -1630,8 +1632,7 @@ async fn fetch_server_identity(base_url: &str) -> Result<SavedServer, String> {
         #[serde(default)]
         server_name: String,
     }
-    let parsed: PublicSystemInfo =
-        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let parsed: PublicSystemInfo = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let name = if parsed.server_name.is_empty() {
         base_url.to_string()
     } else {
@@ -2004,10 +2005,7 @@ async fn fetch_scheduled_tasks(base: &str, token: &str) -> Result<Vec<ScheduledT
 }
 
 #[cfg(not(feature = "web"))]
-async fn fetch_scheduled_tasks(
-    _base: &str,
-    _token: &str,
-) -> Result<Vec<ScheduledTask>, String> {
+async fn fetch_scheduled_tasks(_base: &str, _token: &str) -> Result<Vec<ScheduledTask>, String> {
     Err("list_scheduled_tasks is only wired in the web build".into())
 }
 
@@ -2132,22 +2130,14 @@ async fn poll_quick_connect(
 }
 
 #[cfg(feature = "web")]
-async fn authorize_quick_connect(
-    base: &str,
-    token: &str,
-    code: &str,
-) -> Result<(), String> {
+async fn authorize_quick_connect(base: &str, token: &str, code: &str) -> Result<(), String> {
     crate::client::web::quick_connect_authorize(base, token, code)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[cfg(not(feature = "web"))]
-async fn authorize_quick_connect(
-    _base: &str,
-    _token: &str,
-    _code: &str,
-) -> Result<(), String> {
+async fn authorize_quick_connect(_base: &str, _token: &str, _code: &str) -> Result<(), String> {
     Err("quick_connect_authorize is only wired in the web build".into())
 }
 
@@ -2198,10 +2188,7 @@ async fn sleep_ms(ms: u32) {
     let win = web_sys::window();
     let Some(win) = win else { return };
     let promise = js_sys::Promise::new(&mut |resolve, _| {
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
-            &resolve,
-            ms as i32,
-        );
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32);
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }

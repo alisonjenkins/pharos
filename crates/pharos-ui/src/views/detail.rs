@@ -236,7 +236,9 @@ pub fn ItemDetailView(
 #[component]
 fn CastRow(person: ItemPerson, template: Option<String>) -> Element {
     let img_url = if person.has_image {
-        template.as_ref().map(|t| t.replace("{person_id}", &person.id))
+        template
+            .as_ref()
+            .map(|t| t.replace("{person_id}", &person.id))
     } else {
         None
     };

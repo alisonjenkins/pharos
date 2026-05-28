@@ -115,10 +115,12 @@ pub fn PlayerView(
     /// entry's `start_position_ticks` (Jellyfin 100-ns) over the total
     /// `run_time_ticks` drives the marker's `left: {pct}%`. Empty
     /// hides the strip.
-    #[props(default)] chapters: Vec<ItemChapter>,
+    #[props(default)]
+    chapters: Vec<ItemChapter>,
     /// Total duration in Jellyfin ticks. Drives the chapter strip's
     /// marker positions; pass the item's RunTimeTicks.
-    #[props(default)] run_time_ticks: u64,
+    #[props(default)]
+    run_time_ticks: u64,
     on_event: EventHandler<PlaybackEvent>,
 ) -> Element {
     let src = match src_override.as_ref() {

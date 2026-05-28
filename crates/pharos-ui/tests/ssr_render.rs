@@ -531,7 +531,10 @@ fn admin_logs_tab() -> Element {
 fn admin_view_scheduled_tasks_tab_renders_table() {
     let html = render_root(admin_scheduled_tasks_tab);
     assert!(html.contains(r#"data-tab="scheduledtasks""#), "{html}");
-    assert!(html.contains("pharos-admin-section-scheduledtasks"), "{html}");
+    assert!(
+        html.contains("pharos-admin-section-scheduledtasks"),
+        "{html}"
+    );
     assert!(html.contains("Library scan"), "{html}");
     assert!(html.contains("pharos-admin-task-state"), "{html}");
     assert!(html.contains(">Idle<"), "{html}");
@@ -1066,10 +1069,7 @@ fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
     );
     // Overview text
     assert!(html.contains("pharos-detail-overview"), "{html}");
-    assert!(
-        html.contains("A blade runner hunts replicants."),
-        "{html}"
-    );
+    assert!(html.contains("A blade runner hunts replicants."), "{html}");
     // Genres
     assert!(html.contains("pharos-detail-genres"), "{html}");
     assert!(html.contains("Sci-Fi, Drama"), "{html}");
@@ -1078,18 +1078,12 @@ fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
     assert!(html.contains("Harrison Ford"), "{html}");
     assert!(html.contains("Rick Deckard"), "{html}");
     // Actor with image renders an img with substituted person id.
-    assert!(
-        html.contains("/Items/p1/Images/Primary"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/p1/Images/Primary"), "{html}");
     // Director without image renders kind label `(Director)` instead.
     assert!(html.contains("Ridley Scott"), "{html}");
     assert!(html.contains("(Director)"), "{html}");
     // Director's portrait is suppressed (no has_image).
-    assert!(
-        !html.contains("/Items/p2/Images/Primary"),
-        "{html}"
-    );
+    assert!(!html.contains("/Items/p2/Images/Primary"), "{html}");
 }
 
 // ---- LiveTvView -------------------------------------------------

@@ -549,8 +549,7 @@ async fn system_logs_file(
     if canon_parent != canon_dir {
         return Err(error::ErrorBadRequest("log path escapes log_dir"));
     }
-    let body = std::fs::read(&candidate)
-        .map_err(|_| error::ErrorNotFound("log file not found"))?;
+    let body = std::fs::read(&candidate).map_err(|_| error::ErrorNotFound("log file not found"))?;
     Ok(HttpResponse::Ok()
         .content_type("text/plain; charset=utf-8")
         .body(body))

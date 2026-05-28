@@ -25,10 +25,22 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/quickconnect/enabled",
         web::get().to(quick_connect_enabled),
     )
-    .route("/quickconnect/initiate", web::post().to(quick_connect_initiate))
-    .route("/quickconnect/initiate", web::get().to(quick_connect_initiate))
-    .route("/quickconnect/authorize", web::post().to(quick_connect_authorize))
-    .route("/quickconnect/connect", web::get().to(quick_connect_connect))
+    .route(
+        "/quickconnect/initiate",
+        web::post().to(quick_connect_initiate),
+    )
+    .route(
+        "/quickconnect/initiate",
+        web::get().to(quick_connect_initiate),
+    )
+    .route(
+        "/quickconnect/authorize",
+        web::post().to(quick_connect_authorize),
+    )
+    .route(
+        "/quickconnect/connect",
+        web::get().to(quick_connect_connect),
+    )
     .route(
         "/branding/configuration",
         web::get().to(branding_configuration),
@@ -102,7 +114,9 @@ async fn quick_connect_authorize(
     q: web::Query<AuthorizeQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     if q.code.trim().is_empty() {
-        return Err(actix_web::error::ErrorBadRequest("Code query param required"));
+        return Err(actix_web::error::ErrorBadRequest(
+            "Code query param required",
+        ));
     }
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     state
@@ -140,7 +154,9 @@ async fn quick_connect_connect(
     q: web::Query<ConnectQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     if q.secret.trim().is_empty() {
-        return Err(actix_web::error::ErrorBadRequest("Secret query param required"));
+        return Err(actix_web::error::ErrorBadRequest(
+            "Secret query param required",
+        ));
     }
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     state

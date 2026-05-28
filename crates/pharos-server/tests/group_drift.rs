@@ -39,9 +39,7 @@ async fn add_member(h: &GroupHandle, name: &str) -> (MemberId, mpsc::Receiver<Se
     (mid, rx)
 }
 
-async fn drain_until_play(
-    rx: &mut mpsc::Receiver<ServerMsg>,
-) -> Option<(u64, u64)> {
+async fn drain_until_play(rx: &mut mpsc::Receiver<ServerMsg>) -> Option<(u64, u64)> {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -103,16 +101,13 @@ async fn play_anchor_propagates_with_zero_drift_across_five_members() {
     for delta in samples {
         let t = anchor + delta;
         let expected = pos + (t - anchor);
-        let cohort: Vec<u64> = [m2, m3, m4, m5]
-            .iter()
-            .map(|(a, p)| p + (t - a))
-            .collect();
+        let cohort: Vec<u64> = [m2, m3, m4, m5].iter().map(|(a, p)| p + (t - a)).collect();
         for c in &cohort {
             assert_eq!(*c, expected, "drift > 0 at t={t}");
         }
         // p95 across the cohort is the max — assert under V3's 500ms.
-        let drift_ms = cohort.iter().copied().max().unwrap_or(0)
-            - cohort.iter().copied().min().unwrap_or(0);
+        let drift_ms =
+            cohort.iter().copied().max().unwrap_or(0) - cohort.iter().copied().min().unwrap_or(0);
         assert!(drift_ms < 500, "p95 drift {drift_ms}ms exceeds V3 budget");
     }
 }
@@ -152,9 +147,7 @@ async fn seek_anchor_propagates_with_zero_drift() {
     assert_eq!(m2.1, seek_position_ms);
 }
 
-async fn drain_until_seek(
-    rx: &mut mpsc::Receiver<ServerMsg>,
-) -> Option<(u64, u64)> {
+async fn drain_until_seek(rx: &mut mpsc::Receiver<ServerMsg>) -> Option<(u64, u64)> {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

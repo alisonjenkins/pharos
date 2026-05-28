@@ -746,9 +746,7 @@ struct ScheduledTaskDto {
     last_execution_result: serde_json::Value,
 }
 
-pub fn parse_scheduled_tasks_response(
-    bytes: &[u8],
-) -> Result<Vec<ScheduledTask>, ClientError> {
+pub fn parse_scheduled_tasks_response(bytes: &[u8]) -> Result<Vec<ScheduledTask>, ClientError> {
     let parsed: Vec<ScheduledTaskDto> =
         serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
     Ok(parsed
@@ -1527,10 +1525,7 @@ pub mod web {
         Ok(())
     }
 
-    pub async fn list_api_keys(
-        base: &str,
-        token: &str,
-    ) -> Result<Vec<ApiKey>, ClientError> {
+    pub async fn list_api_keys(base: &str, token: &str) -> Result<Vec<ApiKey>, ClientError> {
         let resp = Request::get(&format!("{base}/Auth/Keys"))
             .header("X-Emby-Token", token)
             .send()
@@ -1569,11 +1564,7 @@ pub mod web {
         parse_new_api_key_response(&bytes)
     }
 
-    pub async fn revoke_api_key(
-        base: &str,
-        token: &str,
-        key_id: &str,
-    ) -> Result<(), ClientError> {
+    pub async fn revoke_api_key(base: &str, token: &str, key_id: &str) -> Result<(), ClientError> {
         let resp = Request::delete(&format!("{base}/Auth/Keys/{}", urlencode(key_id)))
             .header("X-Emby-Token", token)
             .send()
@@ -1604,10 +1595,7 @@ pub mod web {
         parse_scheduled_tasks_response(&bytes)
     }
 
-    pub async fn list_plugins(
-        base: &str,
-        token: &str,
-    ) -> Result<Vec<PluginEntry>, ClientError> {
+    pub async fn list_plugins(base: &str, token: &str) -> Result<Vec<PluginEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/Plugins"))
             .header("X-Emby-Token", token)
             .send()
@@ -1623,10 +1611,7 @@ pub mod web {
         parse_plugins_response(&bytes)
     }
 
-    pub async fn list_logs(
-        base: &str,
-        token: &str,
-    ) -> Result<Vec<LogEntry>, ClientError> {
+    pub async fn list_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/System/Logs"))
             .header("X-Emby-Token", token)
             .send()
@@ -2281,7 +2266,10 @@ mod tests {
             "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();
-        assert_eq!(d.overview.as_deref(), Some("A blade runner hunts replicants."));
+        assert_eq!(
+            d.overview.as_deref(),
+            Some("A blade runner hunts replicants.")
+        );
         assert_eq!(d.genres, vec!["Sci-Fi", "Drama", "Mystery"]);
         assert_eq!(d.people.len(), 2);
         assert_eq!(d.people[0].name, "Harrison Ford");
