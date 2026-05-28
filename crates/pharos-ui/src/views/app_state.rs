@@ -788,11 +788,20 @@ fn PlayerPane(
     let mut max_bitrate = use_signal::<Option<u32>>(|| None);
     let mut audio_index = use_signal::<Option<u32>>(|| None);
     let mut subtitle_index = use_signal::<Option<i32>>(|| None);
+    // Stable per-instance PlaySessionId — server uses it as the key
+    // for `/Sessions/Playing/Progress` updates so multiple players
+    // (eg. swap-quality reload) don't trample one another. Generated
+    // once when the pane mounts; cleared automatically on unmount.
+    let play_session_id = use_signal(generate_play_session_id);
+    // Throttle progress POSTs: only fire once per 5 s wall-clock.
+    let last_progress_ts = use_signal::<f64>(|| 0.0);
     let media_dom_id = format!("pharos-media-{item_id}");
 
     let item_for_url = item_id.clone();
     let server_for_url = server_base.clone();
     let token_for_url = access_token.clone();
+    let access_token_for_progress = access_token.clone();
+    let server_base_for_progress = server_base.clone();
     let kind_for_url = kind;
     let current_bitrate = *max_bitrate.read();
     let current_audio = *audio_index.read();
@@ -865,32 +874,211 @@ fn PlayerPane(
                 current_max_bitrate: current_bitrate,
                 chapters: chapters,
                 run_time_ticks: run_time_ticks,
-                on_event: move |ev: crate::views::PlaybackEvent| match ev {
-                    crate::views::PlaybackEvent::QualityChanged { max_bitrate: b } => {
-                        // 0 = Auto = drop the override.
-                        max_bitrate.set(if b == 0 { None } else { Some(b) });
+                on_event: {
+                    let access_token = access_token_for_progress.clone();
+                    let server_base = server_base_for_progress.clone();
+                    let mut last_progress_ts = last_progress_ts;
+                    move |ev: crate::views::PlaybackEvent| match ev {
+                        crate::views::PlaybackEvent::QualityChanged { max_bitrate: b } => {
+                            // 0 = Auto = drop the override.
+                            max_bitrate.set(if b == 0 { None } else { Some(b) });
+                        }
+                        crate::views::PlaybackEvent::ChapterSelected { position_seconds } => {
+                            seek_media(&media_dom_id, position_seconds);
+                        }
+                        crate::views::PlaybackEvent::AudioTrackSelected { index } => {
+                            audio_index.set(Some(index));
+                        }
+                        crate::views::PlaybackEvent::SubtitleTrackSelected { index } => {
+                            subtitle_index.set(match index {
+                                Some(i) => Some(i as i32),
+                                None => Some(-1),
+                            });
+                        }
+                        crate::views::PlaybackEvent::Started { item_id } => {
+                            let base = server_base.clone();
+                            let token = access_token.clone();
+                            let ps_id = play_session_id.read().clone();
+                            spawn(async move {
+                                let _ = post_playing(&base, &token, &item_id, &ps_id, 0).await;
+                            });
+                        }
+                        crate::views::PlaybackEvent::Progress {
+                            item_id,
+                            position_seconds,
+                            paused,
+                        } => {
+                            let now = now_perf_ms();
+                            let last = *last_progress_ts.read();
+                            if now - last < 5_000.0 {
+                                return;
+                            }
+                            last_progress_ts.set(now);
+                            let base = server_base.clone();
+                            let token = access_token.clone();
+                            let ps_id = play_session_id.read().clone();
+                            let ticks =
+                                (position_seconds * 10_000_000.0).max(0.0) as u64;
+                            spawn(async move {
+                                let _ = post_playing_progress(
+                                    &base, &token, &item_id, &ps_id, ticks, paused,
+                                )
+                                .await;
+                            });
+                        }
+                        crate::views::PlaybackEvent::Stopped {
+                            item_id,
+                            position_seconds,
+                        } => {
+                            let base = server_base.clone();
+                            let token = access_token.clone();
+                            let ps_id = play_session_id.read().clone();
+                            let ticks =
+                                (position_seconds * 10_000_000.0).max(0.0) as u64;
+                            spawn(async move {
+                                let _ = post_playing_stopped(
+                                    &base, &token, &item_id, &ps_id, ticks,
+                                )
+                                .await;
+                            });
+                        }
+                        _ => {}
                     }
-                    crate::views::PlaybackEvent::ChapterSelected { position_seconds } => {
-                        seek_media(&media_dom_id, position_seconds);
-                    }
-                    crate::views::PlaybackEvent::AudioTrackSelected { index } => {
-                        audio_index.set(Some(index));
-                    }
-                    crate::views::PlaybackEvent::SubtitleTrackSelected { index } => {
-                        subtitle_index.set(match index {
-                            Some(i) => Some(i as i32),
-                            // Jellyfin's SubtitleStreamIndex=-1 disables
-                            // burn-in. -1 keeps the override active so
-                            // jellyfin-web's "Off" pick is preserved
-                            // through the next quality switch.
-                            None => Some(-1),
-                        });
-                    }
-                    _ => {}
                 },
             }
         }
     }
+}
+
+/// Per-PlayerPane PlaySessionId — server uses it to key
+/// `/Sessions/Playing/Progress` updates. UUID v4 via the `web_sys`
+/// crypto API on web; on host (tests) a sequential nonce.
+#[cfg(feature = "web")]
+fn generate_play_session_id() -> String {
+    let mut buf = [0u8; 16];
+    if let Some(crypto) = web_sys::window().and_then(|w| w.crypto().ok()) {
+        let _ = crypto.get_random_values_with_u8_array(&mut buf);
+    }
+    // Format as 32-char hex without dashes — matches `Uuid::simple`.
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+#[cfg(not(feature = "web"))]
+fn generate_play_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    format!("play-{n:032x}")
+}
+
+/// Monotonic ms-resolution clock for throttling. `performance.now()`
+/// on web; `Instant::now` on host.
+#[cfg(feature = "web")]
+fn now_perf_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+#[cfg(not(feature = "web"))]
+fn now_perf_ms() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(feature = "web")]
+async fn post_playing(
+    base: &str,
+    token: &str,
+    item_id: &str,
+    play_session_id: &str,
+    position_ticks: u64,
+) -> Result<(), String> {
+    crate::client::web::post_session_playing(base, token, item_id, play_session_id, position_ticks)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn post_playing(
+    _base: &str,
+    _token: &str,
+    _item_id: &str,
+    _play_session_id: &str,
+    _position_ticks: u64,
+) -> Result<(), String> {
+    Err("post_session_playing is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn post_playing_progress(
+    base: &str,
+    token: &str,
+    item_id: &str,
+    play_session_id: &str,
+    position_ticks: u64,
+    is_paused: bool,
+) -> Result<(), String> {
+    crate::client::web::post_session_playing_progress(
+        base,
+        token,
+        item_id,
+        play_session_id,
+        position_ticks,
+        is_paused,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn post_playing_progress(
+    _base: &str,
+    _token: &str,
+    _item_id: &str,
+    _play_session_id: &str,
+    _position_ticks: u64,
+    _is_paused: bool,
+) -> Result<(), String> {
+    Err("post_session_playing_progress is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn post_playing_stopped(
+    base: &str,
+    token: &str,
+    item_id: &str,
+    play_session_id: &str,
+    position_ticks: u64,
+) -> Result<(), String> {
+    crate::client::web::post_session_playing_stopped(
+        base,
+        token,
+        item_id,
+        play_session_id,
+        position_ticks,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn post_playing_stopped(
+    _base: &str,
+    _token: &str,
+    _item_id: &str,
+    _play_session_id: &str,
+    _position_ticks: u64,
+) -> Result<(), String> {
+    Err("post_session_playing_stopped is only wired in the web build".into())
 }
 
 /// Seek the `<video>` / `<audio>` whose DOM id matches `media_dom_id`.

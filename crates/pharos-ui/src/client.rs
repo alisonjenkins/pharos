@@ -1253,6 +1253,94 @@ pub mod web {
         parse_live_programs_response(&bytes)
     }
 
+    /// POST `/Sessions/Playing` — playback start reporting.
+    pub async fn post_session_playing(
+        base: &str,
+        token: &str,
+        item_id: &str,
+        play_session_id: &str,
+        position_ticks: u64,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::json!({
+            "ItemId": item_id,
+            "PlaySessionId": play_session_id,
+            "PositionTicks": position_ticks,
+        })
+        .to_string();
+        let resp = Request::post(&format!("{base}/Sessions/Playing"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    /// POST `/Sessions/Playing/Progress` — periodic progress ping. The
+    /// UI throttles these to ~5 s wall-time intervals so the server isn't
+    /// hammered on every ontimeupdate.
+    pub async fn post_session_playing_progress(
+        base: &str,
+        token: &str,
+        item_id: &str,
+        play_session_id: &str,
+        position_ticks: u64,
+        is_paused: bool,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::json!({
+            "ItemId": item_id,
+            "PlaySessionId": play_session_id,
+            "PositionTicks": position_ticks,
+            "IsPaused": is_paused,
+        })
+        .to_string();
+        let resp = Request::post(&format!("{base}/Sessions/Playing/Progress"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    /// POST `/Sessions/Playing/Stopped` — final position + cleanup.
+    pub async fn post_session_playing_stopped(
+        base: &str,
+        token: &str,
+        item_id: &str,
+        play_session_id: &str,
+        position_ticks: u64,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::json!({
+            "ItemId": item_id,
+            "PlaySessionId": play_session_id,
+            "PositionTicks": position_ticks,
+        })
+        .to_string();
+        let resp = Request::post(&format!("{base}/Sessions/Playing/Stopped"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn list_sessions(base: &str, token: &str) -> Result<Vec<RemoteSession>, ClientError> {
         let resp = Request::get(&format!("{base}/Sessions"))
             .header("X-Emby-Token", token)
