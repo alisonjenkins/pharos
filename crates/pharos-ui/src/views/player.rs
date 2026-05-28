@@ -1,13 +1,30 @@
-//! Player view. Renders a native `<video>` or `<audio>` element
-//! pointing at the Jellyfin direct-play endpoint with the user's token
-//! as an `api_key` query param (matches the T7 server contract).
+//! Player view + on-screen-display (OSD) controls (T57).
+//!
+//! Renders a native `<video>` or `<audio>` element pointing at the
+//! Jellyfin direct-play endpoint with the user's token as an `api_key`
+//! query param (matches the T7 server contract).
+//!
+//! T57 adds:
+//! - quality picker (`<select>` over `QualityOption`s; parent rebuilds
+//!   the `src` with `MaxStreamingBitrate=`),
+//! - fullscreen button (`HtmlElement::request_fullscreen()` via wasm),
+//! - audio-only minimised toggle (collapses the chrome).
 //!
 //! HLS variant (master.m3u8 served from `/Videos/{id}/master.m3u8`)
-//! lands once T9 ships server-side HLS. Until then this component is
-//! direct-play only.
+//! is wired via the `src_override` prop — the parent passes the
+//! master.m3u8 URL when an HLS transcode is required (T9).
 
 use crate::api_types::{ItemKind, MediaTrack, PlaybackTracks};
 use dioxus::prelude::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QualityOption {
+    /// Human-readable label, e.g. "1080p · 8 Mbps".
+    pub label: String,
+    /// `MaxStreamingBitrate` value sent to /Items/{id}/PlaybackInfo.
+    /// `0` reserved for "Auto" (no cap).
+    pub max_bitrate: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerProps {
@@ -21,6 +38,10 @@ pub struct PlayerProps {
     /// URL. Live TV uses this to point at `/LiveTv/Channels/{id}/Stream`
     /// without polluting ItemKind with a `LiveChannel` variant.
     pub src_override: Option<String>,
+    /// Quality picker entries. Empty → picker hidden.
+    pub quality_options: Vec<QualityOption>,
+    /// Currently selected `max_bitrate` for the quality picker.
+    pub current_max_bitrate: Option<u32>,
 }
 
 fn track_label(t: &MediaTrack) -> String {
@@ -40,9 +61,22 @@ fn track_label(t: &MediaTrack) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackEvent {
-    Started { item_id: String },
-    Progress { item_id: String, position_seconds: f64, paused: bool },
-    Stopped { item_id: String, position_seconds: f64 },
+    Started {
+        item_id: String,
+    },
+    Progress {
+        item_id: String,
+        position_seconds: f64,
+        paused: bool,
+    },
+    Stopped {
+        item_id: String,
+        position_seconds: f64,
+    },
+    QualityChanged {
+        max_bitrate: u32,
+    },
+    FullscreenRequested,
 }
 
 #[component]
@@ -53,6 +87,8 @@ pub fn PlayerView(
     server_base: String,
     tracks: Option<PlaybackTracks>,
     src_override: Option<String>,
+    #[props(default)] quality_options: Vec<QualityOption>,
+    #[props(default)] current_max_bitrate: Option<u32>,
     on_event: EventHandler<PlaybackEvent>,
 ) -> Element {
     let src = match src_override.as_ref() {
@@ -73,13 +109,24 @@ pub fn PlayerView(
     let tracks = tracks.unwrap_or_default();
     let subtitles = tracks.subtitle.clone();
     let audios = tracks.audio.clone();
+    // Stable id on the media element so Fullscreen can target it.
+    let media_dom_id = format!("pharos-media-{item_id}");
+    let mut minimised = use_signal(|| false);
+    let current_max_label = current_max_bitrate
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "0".to_string());
 
     rsx! {
         section {
-            class: "pharos-player",
+            class: if *minimised.read() {
+                "pharos-player pharos-player-minimised"
+            } else {
+                "pharos-player"
+            },
             "data-kind": "{kind.label()}",
             if matches!(kind, ItemKind::Audio) {
                 audio {
+                    id: "{media_dom_id}",
                     controls: true,
                     autoplay: true,
                     src: "{src}",
@@ -96,6 +143,7 @@ pub fn PlayerView(
                 }
             } else {
                 video {
+                    id: "{media_dom_id}",
                     controls: true,
                     autoplay: true,
                     playsinline: true,
@@ -127,38 +175,78 @@ pub fn PlayerView(
                     }
                 }
             }
-            // Pharos-side picker — duplicates info already in the
-            // native control bar but lets us style + add quality /
-            // remote-track-switch later without fighting Chromium.
-            if !subtitles.is_empty() || !audios.is_empty() {
-                aside {
-                    class: "pharos-player-tracks",
-                    if !audios.is_empty() {
-                        details {
-                            summary { "Audio tracks ({audios.len()})" }
-                            ul {
-                                for t in audios.iter() {
-                                    li {
-                                        key: "{t.index}",
-                                        "{track_label(t)}"
-                                    }
+            // OSD: tracks + quality + fullscreen + minimise toggle.
+            aside {
+                class: "pharos-player-osd",
+                if !audios.is_empty() {
+                    details {
+                        class: "pharos-player-audio",
+                        summary { "Audio tracks ({audios.len()})" }
+                        ul {
+                            for t in audios.iter() {
+                                li {
+                                    key: "{t.index}",
+                                    "{track_label(t)}"
                                 }
                             }
                         }
                     }
-                    if !subtitles.is_empty() {
-                        details {
-                            summary { "Subtitles ({subtitles.len()})" }
-                            ul {
-                                for t in subtitles.iter() {
-                                    li {
-                                        key: "{t.index}",
-                                        "{track_label(t)}"
-                                        if t.is_external { " (external)" }
-                                    }
+                }
+                if !subtitles.is_empty() {
+                    details {
+                        class: "pharos-player-subtitles",
+                        summary { "Subtitles ({subtitles.len()})" }
+                        ul {
+                            for t in subtitles.iter() {
+                                li {
+                                    key: "{t.index}",
+                                    "{track_label(t)}"
+                                    if t.is_external { " (external)" }
                                 }
                             }
                         }
+                    }
+                }
+                if !quality_options.is_empty() {
+                    label {
+                        class: "pharos-player-quality",
+                        "Quality: "
+                        select {
+                            value: "{current_max_label}",
+                            onchange: move |ev| {
+                                let v: u32 = ev.value().parse().unwrap_or(0);
+                                on_event.call(PlaybackEvent::QualityChanged { max_bitrate: v });
+                            },
+                            for q in quality_options.iter() {
+                                option {
+                                    key: "{q.max_bitrate}",
+                                    value: "{q.max_bitrate}",
+                                    "{q.label}"
+                                }
+                            }
+                        }
+                    }
+                }
+                button {
+                    class: "pharos-player-fullscreen",
+                    onclick: move |_| {
+                        request_fullscreen(&media_dom_id);
+                        on_event.call(PlaybackEvent::FullscreenRequested);
+                    },
+                    "Fullscreen"
+                }
+                if matches!(kind, ItemKind::Audio) {
+                    button {
+                        class: if *minimised.read() {
+                            "pharos-player-minimise on"
+                        } else {
+                            "pharos-player-minimise off"
+                        },
+                        onclick: move |_| {
+                            let was = *minimised.read();
+                            minimised.set(!was);
+                        },
+                        if *minimised.read() { "Expand" } else { "Minimise" }
                     }
                 }
             }
@@ -197,6 +285,20 @@ fn extract_current_time(_ev: &Event<MediaData>) -> f64 {
     0.0
 }
 
+#[cfg(feature = "web")]
+fn request_fullscreen(media_id: &str) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(el) = doc.get_element_by_id(media_id) else {
+        return;
+    };
+    let _ = el.request_fullscreen();
+}
+
+#[cfg(not(feature = "web"))]
+fn request_fullscreen(_media_id: &str) {}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -219,12 +321,15 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+        let q = PlaybackEvent::QualityChanged {
+            max_bitrate: 4_000_000,
+        };
+        assert_eq!(q.clone(), q);
+        assert_ne!(q, PlaybackEvent::FullscreenRequested);
     }
 
     #[test]
     fn audio_src_uses_universal_endpoint() {
-        // Indirect check: building props for audio + sanity-format the
-        // expected src.
         let p = PlayerProps {
             item_id: "42".into(),
             kind: ItemKind::Audio,
@@ -232,9 +337,10 @@ mod tests {
             server_base: "https://pharos.test".into(),
             tracks: None,
             src_override: None,
+            quality_options: Vec::new(),
+            current_max_bitrate: None,
         };
-        let expected =
-            "https://pharos.test/Audio/42/universal?api_key=tok";
+        let expected = "https://pharos.test/Audio/42/universal?api_key=tok";
         let src = format!(
             "{}/Audio/{}/universal?api_key={}",
             p.server_base, p.item_id, p.access_token

@@ -11,11 +11,14 @@
 
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
-use pharos_ui::client::AdminUser;
-use pharos_ui::client::{ItemDetail, LiveChannel, LiveProgram, SearchHint};
+use pharos_ui::client::{
+    ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
+    RemoteSession, SearchHint, UserConfiguration,
+};
 use pharos_ui::views::{
-    AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView, LibraryView,
-    LiveTvStatus, LiveTvView, LoginForm, PlayerView, SearchStatus, SearchView,
+    AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
+    LibraryView, LiveTvStatus, LiveTvView, LoginForm, PlayerView, PrefsTab, PrefsView,
+    RemoteControlView, SavedServer, SearchStatus, SearchView, ServerPickerView,
 };
 
 fn render_root(root: fn() -> Element) -> String {
@@ -48,13 +51,19 @@ fn login_form_with_error() -> Element {
 fn login_form_renders_username_password_inputs_and_submit() {
     let html = render_root(login_form_no_error);
     assert!(html.contains("Sign in to pharos"), "{html}");
-    assert!(html.contains(r#"type="text""#), "missing username input: {html}");
+    assert!(
+        html.contains(r#"type="text""#),
+        "missing username input: {html}"
+    );
     assert!(
         html.contains(r#"type="password""#),
         "missing password input: {html}"
     );
     assert!(html.contains(r#"autocomplete="username""#), "{html}");
-    assert!(html.contains(r#"autocomplete="current-password""#), "{html}");
+    assert!(
+        html.contains(r#"autocomplete="current-password""#),
+        "{html}"
+    );
     assert!(html.contains("Sign in</button>"), "{html}");
     assert!(!html.contains("pharos-error"), "error class leaked: {html}");
 }
@@ -138,6 +147,25 @@ fn player_audio() -> Element {
     }
 }
 
+fn player_movie_with_quality() -> Element {
+    use pharos_ui::views::QualityOption;
+    rsx! {
+        PlayerView {
+            item_id: "10".to_string(),
+            kind: ItemKind::Movie,
+            access_token: "tok".to_string(),
+            server_base: "http://x".to_string(),
+            quality_options: vec![
+                QualityOption { label: "Auto".into(), max_bitrate: 0 },
+                QualityOption { label: "1080p · 8 Mbps".into(), max_bitrate: 8_000_000 },
+                QualityOption { label: "720p · 4 Mbps".into(), max_bitrate: 4_000_000 },
+            ],
+            current_max_bitrate: Some(4_000_000),
+            on_event: move |_| {},
+        }
+    }
+}
+
 #[test]
 fn player_view_renders_video_for_movie_kind() {
     let html = render_root(player_movie);
@@ -177,8 +205,9 @@ fn player_view_renders_subtitle_track_when_tracks_supplied() {
     // Native <track> for the browser CC picker.
     assert!(html.contains("<track"), "{html}");
     assert!(html.contains("Subtitles/2/Stream.vtt"), "{html}");
-    // Pharos-side aside picker also renders.
-    assert!(html.contains("pharos-player-tracks"), "{html}");
+    // Pharos-side OSD picker also renders.
+    assert!(html.contains("pharos-player-osd"), "{html}");
+    assert!(html.contains("pharos-player-subtitles"), "{html}");
 }
 
 #[test]
@@ -186,6 +215,22 @@ fn player_view_renders_audio_for_audio_kind() {
     let html = render_root(player_audio);
     assert!(html.contains("<audio"), "audio element missing: {html}");
     assert!(html.contains("/Audio/2/universal"), "{html}");
+    // Audio kind exposes the minimise toggle.
+    assert!(html.contains("pharos-player-minimise"), "{html}");
+}
+
+#[test]
+fn player_view_renders_quality_picker_and_fullscreen() {
+    let html = render_root(player_movie_with_quality);
+    assert!(html.contains("pharos-player-quality"), "{html}");
+    assert!(html.contains("<select"), "{html}");
+    assert!(html.contains(r#"value="4000000""#), "{html}");
+    // All three options rendered.
+    assert!(html.contains("Auto"), "{html}");
+    assert!(html.contains("1080p · 8 Mbps"), "{html}");
+    assert!(html.contains("720p · 4 Mbps"), "{html}");
+    // Fullscreen button.
+    assert!(html.contains("pharos-player-fullscreen"), "{html}");
 }
 
 // ---- GroupSessionPanel ------------------------------------------
@@ -268,7 +313,10 @@ fn admin_view_renders_user_rows_with_self_delete_disabled() {
     assert!(html.contains("(admin)"), "{html}");
     // The current user (id=1) renders a `you` button (disabled),
     // the other renders a `Delete` button (enabled).
-    assert!(html.contains(">you<"), "self-delete not rendered as 'you': {html}");
+    assert!(
+        html.contains(">you<"),
+        "self-delete not rendered as 'you': {html}"
+    );
     assert!(html.contains(">Delete<"), "{html}");
 }
 
@@ -277,6 +325,232 @@ fn admin_view_status_banner_renders_when_present() {
     let html = render_root(admin_with_status);
     assert!(html.contains("pharos-admin-status"), "{html}");
     assert!(html.contains("Created alice"), "{html}");
+}
+
+fn admin_libraries_tab() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Libraries,
+            libraries: vec![
+                LibraryFolder {
+                    item_id: "lib-1".into(),
+                    name: "Movies".into(),
+                    collection_type: "movies".into(),
+                    locations: vec!["/data/movies".into()],
+                },
+                LibraryFolder {
+                    item_id: "lib-2".into(),
+                    name: "Shows".into(),
+                    collection_type: "tvshows".into(),
+                    locations: vec!["/data/tv".into(), "/mnt/tv".into()],
+                },
+            ],
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_devices_tab() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Devices,
+            devices: vec![DeviceEntry {
+                id: "d1".into(),
+                name: "Pixel 9".into(),
+                app_name: "Finamp".into(),
+                last_user_name: "ali".into(),
+            }],
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_activity_tab_empty() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Activity,
+            activity: Vec::<ActivityEntry>::new(),
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn admin_view_libraries_tab_renders_library_list() {
+    let html = render_root(admin_libraries_tab);
+    assert!(html.contains(r#"data-tab="libraries""#), "{html}");
+    assert!(html.contains("pharos-admin-section-libraries"), "{html}");
+    assert!(html.contains("Movies"), "{html}");
+    assert!(html.contains("Shows"), "{html}");
+    assert!(html.contains("/data/tv"), "{html}");
+    assert!(html.contains("tvshows"), "{html}");
+}
+
+#[test]
+fn admin_view_devices_tab_renders_table_rows() {
+    let html = render_root(admin_devices_tab);
+    assert!(html.contains(r#"data-tab="devices""#), "{html}");
+    assert!(html.contains("pharos-admin-section-devices"), "{html}");
+    assert!(html.contains("<table"), "{html}");
+    assert!(html.contains("Pixel 9"), "{html}");
+    assert!(html.contains("Finamp"), "{html}");
+}
+
+#[test]
+fn admin_view_activity_tab_renders_empty_state() {
+    let html = render_root(admin_activity_tab_empty);
+    assert!(html.contains(r#"data-tab="activity""#), "{html}");
+    assert!(html.contains("pharos-admin-section-activity"), "{html}");
+    assert!(html.contains("No activity recorded"), "{html}");
+}
+
+// ---- ServerPickerView ------------------------------------------
+
+fn server_picker_with_two_servers() -> Element {
+    rsx! {
+        ServerPickerView {
+            saved: vec![
+                SavedServer {
+                    server_id: "srv-1".into(),
+                    base_url: "https://home.example.com".into(),
+                    name: "Home".into(),
+                    last_user_name: "ali".into(),
+                },
+                SavedServer {
+                    server_id: "srv-2".into(),
+                    base_url: "https://work.example.com".into(),
+                    name: "Work".into(),
+                    last_user_name: "".into(),
+                },
+            ],
+            default_url: "https://home.example.com".to_string(),
+            status: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn server_picker_empty() -> Element {
+    rsx! {
+        ServerPickerView {
+            saved: Vec::<SavedServer>::new(),
+            default_url: "https://pharos.local".to_string(),
+            status: Some("Couldn't reach https://broken.example".to_string()),
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn server_picker_renders_saved_servers_and_default_url() {
+    let html = render_root(server_picker_with_two_servers);
+    assert!(html.contains("Select server"), "{html}");
+    assert!(html.contains("Home"), "{html}");
+    assert!(html.contains("Work"), "{html}");
+    assert!(html.contains("home.example.com"), "{html}");
+    assert!(html.contains("Last: ali"), "{html}");
+    // "Forget" buttons render per row.
+    assert!(html.contains(">Forget<"), "{html}");
+    // Default URL pre-fills the add input.
+    assert!(
+        html.contains(r#"value="https://home.example.com""#),
+        "{html}"
+    );
+}
+
+fn remote_with_sessions() -> Element {
+    let sessions = vec![
+        RemoteSession {
+            id: "s1".into(),
+            user_id: "u1".into(),
+            user_name: "ali".into(),
+            device_name: "Pixel 9".into(),
+            client: "Finamp".into(),
+            now_playing_item_id: Some("item-9".into()),
+            position_ticks: 0,
+            is_paused: false,
+        },
+        RemoteSession {
+            id: "s2".into(),
+            user_id: "u1".into(),
+            user_name: "ali".into(),
+            device_name: "this browser".into(),
+            client: "pharos-ui".into(),
+            now_playing_item_id: None,
+            position_ticks: 0,
+            is_paused: false,
+        },
+    ];
+    rsx! {
+        RemoteControlView {
+            sessions: sessions,
+            self_session_id: Some("s2".to_string()),
+            status: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn remote_empty() -> Element {
+    rsx! {
+        RemoteControlView {
+            sessions: Vec::<RemoteSession>::new(),
+            self_session_id: None,
+            status: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn remote_view_renders_sessions_and_hides_actions_on_self() {
+    let html = render_root(remote_with_sessions);
+    assert!(html.contains("pharos-remote-sessions"), "{html}");
+    assert!(html.contains("Pixel 9"), "{html}");
+    assert!(html.contains("Finamp"), "{html}");
+    assert!(html.contains("playing item-9"), "{html}");
+    // s1 (remote) has Pause/Play/Stop buttons.
+    assert!(html.contains("pharos-remote-action-pause"), "{html}");
+    assert!(html.contains("pharos-remote-action-stop"), "{html}");
+    // s2 (self) renders with the self marker + no actions section.
+    assert!(html.contains("pharos-remote-session-self"), "{html}");
+    assert!(html.contains("this device"), "{html}");
+    // Volume + seek controls render for remote sessions only.
+    assert!(html.contains("pharos-remote-volume"), "{html}");
+    assert!(html.contains("pharos-remote-seek"), "{html}");
+    assert!(
+        html.contains(r#"type="range""#),
+        "volume slider missing: {html}"
+    );
+}
+
+#[test]
+fn remote_view_renders_empty_state() {
+    let html = render_root(remote_empty);
+    assert!(html.contains("pharos-remote-empty"), "{html}");
+    assert!(html.contains("No active sessions"), "{html}");
+}
+
+#[test]
+fn server_picker_renders_empty_state_with_status() {
+    let html = render_root(server_picker_empty);
+    assert!(html.contains("pharos-server-picker-empty"), "{html}");
+    assert!(html.contains("No saved servers"), "{html}");
+    assert!(html.contains("pharos-server-picker-status"), "{html}");
+    assert!(
+        html.contains("Couldn&#x27;t reach") || html.contains("Couldn't reach"),
+        "{html}"
+    );
+    assert!(html.contains(r#"value="https://pharos.local""#), "{html}");
 }
 
 // ---- SearchView -------------------------------------------------
@@ -499,10 +773,16 @@ fn detail_view_audio_renders_artist_album_and_primary_image() {
     assert!(html.contains("Vangelis"), "{html}");
     assert!(html.contains("Blade Runner OST"), "{html}");
     // album_artists same as artists → no separate line.
-    assert!(!html.contains("Album artist:"), "duplicate album artist line: {html}");
+    assert!(
+        !html.contains("Album artist:"),
+        "duplicate album artist line: {html}"
+    );
     // Image figure rendered when primary_image_url set.
     assert!(html.contains("pharos-detail-primary"), "{html}");
-    assert!(html.contains("/Items/5/Images/Primary?api_key=tok"), "{html}");
+    assert!(
+        html.contains("/Items/5/Images/Primary?api_key=tok"),
+        "{html}"
+    );
 }
 
 #[test]
@@ -584,11 +864,20 @@ fn live_tv_view_renders_channel_grid_with_epg_and_logo() {
     assert!(html.contains("BBC Two"), "{html}");
     // EPG entry rendered + HH:MM time extracted.
     assert!(html.contains("18:00"), "{html}");
-    assert!(html.contains("Six O&#x27;Clock News") || html.contains("Six O'Clock News"), "{html}");
+    assert!(
+        html.contains("Six O&#x27;Clock News") || html.contains("Six O'Clock News"),
+        "{html}"
+    );
     // Logo substitution: c1 has logo → has rendered <img> with /Primary path,
     // c2 has no logo → no <img>.
-    assert!(html.contains("/LiveTv/Channels/c1/Images/Primary"), "{html}");
-    assert!(!html.contains("/LiveTv/Channels/c2/Images/Primary"), "{html}");
+    assert!(
+        html.contains("/LiveTv/Channels/c1/Images/Primary"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("/LiveTv/Channels/c2/Images/Primary"),
+        "{html}"
+    );
     // No-listing fallback for the second channel.
     assert!(html.contains("no listings"), "{html}");
 }
@@ -605,4 +894,85 @@ fn live_tv_view_renders_loading_state() {
     let html = render_root(live_tv_loading);
     assert!(html.contains("pharos-livetv-loading"), "{html}");
     assert!(html.contains("Loading channels"), "{html}");
+}
+
+// ---- PrefsView --------------------------------------------------
+
+fn prefs_display() -> Element {
+    rsx! {
+        PrefsView {
+            config: UserConfiguration {
+                hide_played_in_latest: true,
+                display_missing_episodes: false,
+                ..Default::default()
+            },
+            active_tab: PrefsTab::Display,
+            status: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn prefs_playback_with_status() -> Element {
+    rsx! {
+        PrefsView {
+            config: UserConfiguration {
+                audio_language_preference: "jpn".into(),
+                subtitle_language_preference: "eng".into(),
+                subtitle_mode: "Smart".into(),
+                ..Default::default()
+            },
+            active_tab: PrefsTab::Playback,
+            status: Some("Saved.".to_string()),
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn prefs_home() -> Element {
+    rsx! {
+        PrefsView {
+            config: UserConfiguration {
+                enable_next_episode_auto_play: true,
+                ..Default::default()
+            },
+            active_tab: PrefsTab::Home,
+            status: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn prefs_view_display_tab_renders_display_pane_and_tabs() {
+    let html = render_root(prefs_display);
+    assert!(html.contains(r#"data-tab="display""#), "{html}");
+    assert!(html.contains("pharos-prefs-pane-display"), "{html}");
+    assert!(html.contains("Show missing episodes"), "{html}");
+    assert!(html.contains("Hide played items"), "{html}");
+    // Tab nav contains all three tabs.
+    assert!(html.contains(">Display<"), "{html}");
+    assert!(html.contains(">Playback<"), "{html}");
+    assert!(html.contains(">Home<"), "{html}");
+    // Save button always renders.
+    assert!(html.contains("pharos-prefs-save"), "{html}");
+}
+
+#[test]
+fn prefs_view_playback_tab_renders_inputs_and_status() {
+    let html = render_root(prefs_playback_with_status);
+    assert!(html.contains("pharos-prefs-pane-playback"), "{html}");
+    assert!(html.contains(r#"value="jpn""#), "{html}");
+    assert!(html.contains(r#"value="eng""#), "{html}");
+    // Subtitle-mode select rendered with `Smart` selected.
+    assert!(html.contains("<select"), "{html}");
+    assert!(html.contains("pharos-prefs-status"), "{html}");
+    assert!(html.contains("Saved."), "{html}");
+}
+
+#[test]
+fn prefs_view_home_tab_renders_auto_play_toggle() {
+    let html = render_root(prefs_home);
+    assert!(html.contains("pharos-prefs-pane-home"), "{html}");
+    assert!(html.contains("Auto-play next episode"), "{html}");
 }

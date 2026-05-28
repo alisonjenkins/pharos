@@ -186,12 +186,12 @@ async fn handle_inbound(
         }
         "SyncPlayPlay" => {
             let Some(h) = current_group else { return };
-            let data: SyncPlayPlayData = serde_json::from_value(inbound.data).unwrap_or(
-                SyncPlayPlayData { playback_position_ticks: 0 },
-            );
-            let _ = h
-                .tx
-                .send(GroupMsg::LeaderPlay {
+            let data: SyncPlayPlayData =
+                serde_json::from_value(inbound.data).unwrap_or(SyncPlayPlayData {
+                    playback_position_ticks: 0,
+                });
+            let _ =
+                h.tx.send(GroupMsg::LeaderPlay {
                     sender: member_id,
                     position_ms: data.playback_position_ticks / POSITION_TICKS_PER_MS,
                 })
@@ -199,19 +199,15 @@ async fn handle_inbound(
         }
         "SyncPlayPause" | "SyncPlayUnpause" => {
             let Some(h) = current_group else { return };
-            let _ = h
-                .tx
-                .send(GroupMsg::LeaderPause { sender: member_id })
-                .await;
+            let _ = h.tx.send(GroupMsg::LeaderPause { sender: member_id }).await;
         }
         "SyncPlaySeek" => {
             let Some(h) = current_group else { return };
             let Ok(data) = serde_json::from_value::<SyncPlaySeekData>(inbound.data) else {
                 return;
             };
-            let _ = h
-                .tx
-                .send(GroupMsg::LeaderSeek {
+            let _ =
+                h.tx.send(GroupMsg::LeaderSeek {
                     sender: member_id,
                     position_ms: data.position_ticks / POSITION_TICKS_PER_MS,
                 })
@@ -219,9 +215,8 @@ async fn handle_inbound(
         }
         "SyncPlayBuffering" => {
             let Some(h) = current_group else { return };
-            let _ = h
-                .tx
-                .send(GroupMsg::BufferingStart {
+            let _ =
+                h.tx.send(GroupMsg::BufferingStart {
                     member_id,
                     position_ms: 0,
                 })
@@ -229,10 +224,7 @@ async fn handle_inbound(
         }
         "SyncPlayReady" => {
             let Some(h) = current_group else { return };
-            let _ = h
-                .tx
-                .send(GroupMsg::BufferingEnd { member_id })
-                .await;
+            let _ = h.tx.send(GroupMsg::BufferingEnd { member_id }).await;
         }
         // KeepAlive, Sessions, etc. — phase 2.
         _ => {}
@@ -375,24 +367,58 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 "UserDataList": [{ "ItemId": item_id }],
             }),
         )),
-        SocketBroadcast::SessionCommand { session_id, command, arg } => Some(Outbound::new(
-            // Jellyfin uses different MessageTypes per command family.
-            // The `PlayState` family covers playback transport (Play
-            // /Pause/Stop/Seek/Volume) — that's what jellyfin-web's
-            // session card surfaces. General commands (DisplayContent,
-            // ToggleMute, ...) use `GeneralCommand`. For phase 2 we
-            // route every command via PlayState since the playback
-            // family is what unblocks the casting UI.
-            "PlayState",
-            serde_json::json!({
-                "ControllingUserId": "",
-                "SessionId": session_id,
-                "Command": command,
-                "SeekPositionTicks": arg.get("SeekPositionTicks").cloned(),
-                // The remote side filters on `SessionId == own`.
-            }),
-        )),
+        SocketBroadcast::SessionCommand {
+            session_id,
+            command,
+            arg,
+        } => Some(if is_playstate_command(&command) {
+            // PlayState family — playback transport
+            // (Play/Pause/Unpause/Stop/Seek/NextTrack/PreviousTrack/
+            // Rewind/FastForward/PlayPause).
+            // jellyfin-web's playback engine listens for this MessageType.
+            Outbound::new(
+                "PlayState",
+                serde_json::json!({
+                    "ControllingUserId": "",
+                    "SessionId": session_id,
+                    "Command": command,
+                    "SeekPositionTicks": arg.get("SeekPositionTicks").cloned(),
+                }),
+            )
+        } else {
+            // GeneralCommand family — display, volume, mute, fullscreen.
+            // Jellyfin's wire shape nests `Arguments` for string args
+            // (DisplayMessage, DisplayContent) and surfaces well-known
+            // numeric args (`Volume`) at the top of the Arguments map.
+            // We pass the full `arg` value through so clients that
+            // expect specific keys can still find them.
+            Outbound::new(
+                "GeneralCommand",
+                serde_json::json!({
+                    "ControllingUserId": "",
+                    "SessionId": session_id,
+                    "Name": command,
+                    "Arguments": arg,
+                }),
+            )
+        }),
     }
+}
+
+fn is_playstate_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "Play"
+            | "Pause"
+            | "Unpause"
+            | "PlayPause"
+            | "Stop"
+            | "Seek"
+            | "NextTrack"
+            | "PreviousTrack"
+            | "Rewind"
+            | "FastForward"
+    )
 }
 
 #[cfg(test)]
@@ -404,7 +430,8 @@ mod tests {
     fn translate_library_changed_emits_libchanged_outbound() {
         let out = translate_broadcast(SocketBroadcast::LibraryChanged).unwrap();
         assert_eq!(out.message_type, "LibraryChanged");
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["MessageType"], "LibraryChanged");
         // Jellyfin's LibraryChanged payload exposes these arrays even when empty.
         assert!(v["Data"]["ItemsUpdated"].is_array());
@@ -419,8 +446,65 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out.message_type, "UserDataChanged");
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["UserId"], "u-1");
         assert_eq!(v["Data"]["UserDataList"][0]["ItemId"], "42");
+    }
+
+    #[test]
+    fn translate_session_command_emits_playstate_outbound() {
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-1".into(),
+            command: "Pause".into(),
+            arg: serde_json::json!({}),
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "PlayState");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["SessionId"], "s-1");
+        assert_eq!(v["Data"]["Command"], "Pause");
+        // Empty ControllingUserId for server-originated commands.
+        assert_eq!(v["Data"]["ControllingUserId"], "");
+    }
+
+    #[test]
+    fn translate_session_command_passes_seek_position_ticks_through() {
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-1".into(),
+            command: "Seek".into(),
+            arg: serde_json::json!({ "SeekPositionTicks": 9876543 }),
+        })
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["SeekPositionTicks"], 9876543);
+    }
+
+    #[test]
+    fn translate_session_command_routes_general_commands_as_general_command() {
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-1".into(),
+            command: "SetVolume".into(),
+            arg: serde_json::json!({ "Volume": 60 }),
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "GeneralCommand");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["Name"], "SetVolume");
+        assert_eq!(v["Data"]["Arguments"]["Volume"], 60);
+    }
+
+    #[test]
+    fn translate_session_command_togglemute_is_general_not_playstate() {
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-2".into(),
+            command: "ToggleMute".into(),
+            arg: serde_json::json!({}),
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "GeneralCommand");
     }
 }

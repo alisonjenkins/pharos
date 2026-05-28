@@ -68,13 +68,12 @@ pub fn ItemDetailView(
         None
     };
     let album_line = detail.album.clone();
-    let album_artists_line = if !detail.album_artists.is_empty()
-        && detail.album_artists != detail.artists
-    {
-        Some(detail.album_artists.join(", "))
-    } else {
-        None
-    };
+    let album_artists_line =
+        if !detail.album_artists.is_empty() && detail.album_artists != detail.artists {
+            Some(detail.album_artists.join(", "))
+        } else {
+            None
+        };
 
     rsx! {
         article {
@@ -195,7 +194,10 @@ mod tests {
 
     #[test]
     fn format_episode_index_branches() {
-        assert_eq!(format_episode_index(Some(1), Some(3)).as_deref(), Some("S01E03"));
+        assert_eq!(
+            format_episode_index(Some(1), Some(3)).as_deref(),
+            Some("S01E03")
+        );
         assert_eq!(format_episode_index(Some(2), None).as_deref(), Some("S02"));
         assert_eq!(format_episode_index(None, Some(7)).as_deref(), Some("E07"));
         assert_eq!(format_episode_index(None, None), None);

@@ -12,30 +12,28 @@
 //! nothing useful.
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
-use crate::client::{AdminUser, ItemDetail, LiveChannel, LiveProgram, SearchHint};
+use crate::client::{
+    ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
+    RemoteSession, SearchHint, UserConfiguration,
+};
 use crate::views::{
-    AdminAction, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
-    LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, SearchStatus,
-    SearchView,
+    AdminAction, AdminTab, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
+    LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, PrefsAction,
+    PrefsTab, PrefsView, RemoteAction, RemoteControlView, SearchStatus, SearchView,
 };
 use dioxus::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppRoute {
     Library,
-    Detail {
-        item_id: String,
-    },
-    Player {
-        item_id: String,
-        kind: ItemKind,
-    },
-    LivePlayer {
-        channel_id: String,
-    },
+    Detail { item_id: String },
+    Player { item_id: String, kind: ItemKind },
+    LivePlayer { channel_id: String },
     Admin,
     Search,
     LiveTv,
+    Prefs(PrefsTab),
+    Remote,
 }
 
 #[component]
@@ -87,10 +85,7 @@ fn LoginGate(user: Signal<Option<LoggedInUser>>, error: Signal<Option<String>>) 
 }
 
 #[component]
-fn Authenticated(
-    user: Signal<Option<LoggedInUser>>,
-    route: Signal<AppRoute>,
-) -> Element {
+fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) -> Element {
     let server_base = server_base_from_window();
     let items_resource = {
         let user_for_resource = user;
@@ -109,7 +104,11 @@ fn Authenticated(
 
     let current_route = route.read().clone();
     let is_admin = user.read().as_ref().map(|u| u.is_admin).unwrap_or(false);
-    let current_user_id = user.read().as_ref().map(|u| u.id.clone()).unwrap_or_default();
+    let current_user_id = user
+        .read()
+        .as_ref()
+        .map(|u| u.id.clone())
+        .unwrap_or_default();
     let access_token = user
         .read()
         .as_ref()
@@ -132,6 +131,16 @@ fn Authenticated(
                 class: "pharos-nav-livetv",
                 onclick: move |_| route.set(AppRoute::LiveTv),
                 "Live TV"
+            }
+            button {
+                class: "pharos-nav-prefs",
+                onclick: move |_| route.set(AppRoute::Prefs(PrefsTab::Display)),
+                "Preferences"
+            }
+            button {
+                class: "pharos-nav-remote",
+                onclick: move |_| route.set(AppRoute::Remote),
+                "Remote"
             }
             if is_admin {
                 button {
@@ -202,6 +211,21 @@ fn Authenticated(
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
                     on_back: move |_| { route.set(AppRoute::LiveTv); },
+                }
+            },
+            AppRoute::Prefs(tab) => rsx! {
+                PrefsPane {
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
+                    current_user_id: current_user_id.clone(),
+                    active_tab: tab,
+                    on_select_tab: move |t: PrefsTab| { route.set(AppRoute::Prefs(t)); },
+                }
+            },
+            AppRoute::Remote => rsx! {
+                RemotePane {
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
                 }
             }
         }
@@ -410,13 +434,10 @@ fn DetailPane(
 }
 
 #[component]
-fn AdminPane(
-    access_token: String,
-    server_base: String,
-    current_user_id: String,
-) -> Element {
+fn AdminPane(access_token: String, server_base: String, current_user_id: String) -> Element {
     let reload = use_signal(|| 0u32);
     let status = use_signal::<Option<String>>(|| None);
+    let active_tab = use_signal::<AdminTab>(AdminTab::default);
     let users_resource = {
         let base = server_base.clone();
         let token = access_token.clone();
@@ -428,36 +449,71 @@ fn AdminPane(
             async move { fetch_admin_users(&base, &token).await }
         })
     };
+    let libraries_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_virtual_folders(&base, &token).await }
+        })
+    };
+    let devices_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_devices(&base, &token).await }
+        })
+    };
+    let activity_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_activity_entries(&base, &token).await }
+        })
+    };
 
     let action_handler = {
         let access_token = access_token.clone();
         let server_base = server_base.clone();
         let mut reload_signal = reload;
         let mut status_signal = status;
+        let mut active_tab_signal = active_tab;
         move |action: AdminAction| {
             let token = access_token.clone();
             let base = server_base.clone();
+            if let AdminAction::SelectTab(t) = action {
+                active_tab_signal.set(t);
+                return;
+            }
             spawn(async move {
                 match action {
                     AdminAction::Refresh => {}
-                    AdminAction::LibraryRefresh => {
-                        match library_refresh(&base, &token).await {
-                            Ok(()) => status_signal.set(Some("Library refresh broadcast".into())),
-                            Err(e) => status_signal.set(Some(format!("Refresh failed: {e}"))),
-                        }
-                    }
+                    AdminAction::LibraryRefresh => match library_refresh(&base, &token).await {
+                        Ok(()) => status_signal.set(Some("Library refresh broadcast".into())),
+                        Err(e) => status_signal.set(Some(format!("Refresh failed: {e}"))),
+                    },
                     AdminAction::CreateUser(CreateUserAttempt { name, password }) => {
                         match create_user(&base, &token, &name, &password).await {
                             Ok(()) => status_signal.set(Some(format!("Created {name}"))),
                             Err(e) => status_signal.set(Some(format!("Create failed: {e}"))),
                         }
                     }
-                    AdminAction::DeleteUser(id) => {
-                        match delete_user(&base, &token, &id).await {
-                            Ok(()) => status_signal.set(Some(format!("Deleted {id}"))),
-                            Err(e) => status_signal.set(Some(format!("Delete failed: {e}"))),
-                        }
-                    }
+                    AdminAction::DeleteUser(id) => match delete_user(&base, &token, &id).await {
+                        Ok(()) => status_signal.set(Some(format!("Deleted {id}"))),
+                        Err(e) => status_signal.set(Some(format!("Delete failed: {e}"))),
+                    },
+                    AdminAction::SelectTab(_) => unreachable!("handled above"),
                 }
                 let n = *reload_signal.read();
                 reload_signal.set(n.wrapping_add(1));
@@ -471,7 +527,20 @@ fn AdminPane(
         Some(Ok(v)) => (v.clone(), None),
         Some(Err(e)) => (Vec::new(), Some(e.clone())),
     };
+    let libraries: Vec<LibraryFolder> = match libraries_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+    let devices: Vec<DeviceEntry> = match devices_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+    let activity: Vec<ActivityEntry> = match activity_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
     let combined_status = fetch_err.or_else(|| status.read().clone());
+    let tab_now = *active_tab.read();
 
     rsx! {
         AdminView {
@@ -479,6 +548,10 @@ fn AdminPane(
             current_user_id: current_user_id,
             status: combined_status,
             on_action: action_handler,
+            active_tab: tab_now,
+            libraries: libraries,
+            devices: devices,
+            activity: activity,
         }
     }
 }
@@ -511,6 +584,46 @@ fn PlayerPane(
     server_base: String,
     on_back: EventHandler<()>,
 ) -> Element {
+    use crate::views::QualityOption;
+    let mut max_bitrate = use_signal::<Option<u32>>(|| None);
+
+    let item_for_url = item_id.clone();
+    let server_for_url = server_base.clone();
+    let token_for_url = access_token.clone();
+    let kind_for_url = kind;
+    let current_bitrate = *max_bitrate.read();
+    let src_override: Option<String> = current_bitrate.map(|b| match kind_for_url {
+        ItemKind::Audio => format!(
+            "{server_for_url}/Audio/{item_for_url}/universal?api_key={token_for_url}&MaxStreamingBitrate={b}"
+        ),
+        ItemKind::Movie | ItemKind::Episode => format!(
+            "{server_for_url}/Videos/{item_for_url}/stream?api_key={token_for_url}&MaxStreamingBitrate={b}"
+        ),
+    });
+
+    let quality_options = vec![
+        QualityOption {
+            label: "Auto".into(),
+            max_bitrate: 0,
+        },
+        QualityOption {
+            label: "1080p · 8 Mbps".into(),
+            max_bitrate: 8_000_000,
+        },
+        QualityOption {
+            label: "720p · 4 Mbps".into(),
+            max_bitrate: 4_000_000,
+        },
+        QualityOption {
+            label: "480p · 2 Mbps".into(),
+            max_bitrate: 2_000_000,
+        },
+        QualityOption {
+            label: "Audio-only · 320 Kbps".into(),
+            max_bitrate: 320_000,
+        },
+    ];
+
     rsx! {
         div {
             class: "pharos-player-pane",
@@ -524,8 +637,152 @@ fn PlayerPane(
                 kind: kind,
                 access_token: access_token,
                 server_base: server_base,
-                on_event: move |_| {},
+                src_override: src_override,
+                quality_options: quality_options,
+                current_max_bitrate: current_bitrate,
+                on_event: move |ev: crate::views::PlaybackEvent| {
+                    if let crate::views::PlaybackEvent::QualityChanged { max_bitrate: b } = ev {
+                        // 0 = Auto = drop the override.
+                        max_bitrate.set(if b == 0 { None } else { Some(b) });
+                    }
+                },
             }
+        }
+    }
+}
+
+#[component]
+fn RemotePane(access_token: String, server_base: String) -> Element {
+    let reload = use_signal(|| 0u32);
+    let status = use_signal::<Option<String>>(|| None);
+    let sessions_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_sessions(&base, &token).await }
+        })
+    };
+
+    let action_handler = {
+        let access_token = access_token.clone();
+        let server_base = server_base.clone();
+        let mut reload_signal = reload;
+        let mut status_signal = status;
+        move |action: RemoteAction| {
+            let token = access_token.clone();
+            let base = server_base.clone();
+            if matches!(action, RemoteAction::Refresh) {
+                let n = *reload_signal.read();
+                reload_signal.set(n.wrapping_add(1));
+                return;
+            }
+            spawn(async move {
+                let result = match action {
+                    RemoteAction::PlayState {
+                        session_id,
+                        command,
+                        arg,
+                    } => send_playstate(&base, &token, &session_id, &command, arg).await,
+                    RemoteAction::General {
+                        session_id,
+                        command,
+                        arg,
+                    } => send_general(&base, &token, &session_id, &command, arg).await,
+                    RemoteAction::Refresh => unreachable!("handled above"),
+                };
+                match result {
+                    Ok(()) => status_signal.set(None),
+                    Err(e) => status_signal.set(Some(format!("Command failed: {e}"))),
+                }
+            });
+        }
+    };
+
+    let value = sessions_resource.read_unchecked();
+    let (sessions, fetch_err) = match value.as_ref() {
+        None => (Vec::<RemoteSession>::new(), Some("loading…".to_string())),
+        Some(Ok(v)) => (v.clone(), None),
+        Some(Err(e)) => (Vec::new(), Some(e.clone())),
+    };
+    let combined_status = fetch_err.or_else(|| status.read().clone());
+
+    rsx! {
+        RemoteControlView {
+            sessions: sessions,
+            self_session_id: None,
+            status: combined_status,
+            on_action: action_handler,
+        }
+    }
+}
+
+#[component]
+fn PrefsPane(
+    access_token: String,
+    server_base: String,
+    current_user_id: String,
+    active_tab: PrefsTab,
+    on_select_tab: EventHandler<PrefsTab>,
+) -> Element {
+    let reload = use_signal(|| 0u32);
+    let status = use_signal::<Option<String>>(|| None);
+    let config_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_user_configuration(&base, &token).await }
+        })
+    };
+
+    let action_handler = {
+        let access_token = access_token.clone();
+        let server_base = server_base.clone();
+        let user_id_for_handler = current_user_id.clone();
+        let mut reload_signal = reload;
+        let mut status_signal = status;
+        let on_select_tab = on_select_tab;
+        move |action: PrefsAction| match action {
+            PrefsAction::SelectTab(t) => on_select_tab.call(t),
+            PrefsAction::Save(cfg) => {
+                let token = access_token.clone();
+                let base = server_base.clone();
+                let user_id = user_id_for_handler.clone();
+                spawn(async move {
+                    match save_user_configuration(&base, &token, &user_id, &cfg).await {
+                        Ok(()) => {
+                            status_signal.set(Some("Saved.".into()));
+                            let n = *reload_signal.read();
+                            reload_signal.set(n.wrapping_add(1));
+                        }
+                        Err(e) => status_signal.set(Some(format!("Save failed: {e}"))),
+                    }
+                });
+            }
+        }
+    };
+
+    let value = config_resource.read_unchecked();
+    let (config, fetch_err) = match value.as_ref() {
+        None => (UserConfiguration::default(), Some("loading…".to_string())),
+        Some(Ok(c)) => (c.clone(), None),
+        Some(Err(e)) => (UserConfiguration::default(), Some(e.clone())),
+    };
+    let combined_status = fetch_err.or_else(|| status.read().clone());
+
+    rsx! {
+        PrefsView {
+            config: config,
+            active_tab: active_tab,
+            status: combined_status,
+            on_action: action_handler,
         }
     }
 }
@@ -537,9 +794,7 @@ fn LivePlayerPane(
     server_base: String,
     on_back: EventHandler<()>,
 ) -> Element {
-    let src = format!(
-        "{server_base}/LiveTv/Channels/{channel_id}/Stream?api_key={access_token}"
-    );
+    let src = format!("{server_base}/LiveTv/Channels/{channel_id}/Stream?api_key={access_token}");
     rsx! {
         div {
             class: "pharos-player-pane pharos-livetv-player",
@@ -561,11 +816,7 @@ fn LivePlayerPane(
 }
 
 #[component]
-fn LiveTvPane(
-    access_token: String,
-    server_base: String,
-    on_tune: EventHandler<String>,
-) -> Element {
+fn LiveTvPane(access_token: String, server_base: String, on_tune: EventHandler<String>) -> Element {
     let reload = use_signal(|| 0u32);
     let channels_resource = {
         let base = server_base.clone();
@@ -683,12 +934,7 @@ async fn fetch_admin_users(_base: &str, _token: &str) -> Result<Vec<AdminUser>, 
 }
 
 #[cfg(feature = "web")]
-async fn create_user(
-    base: &str,
-    token: &str,
-    name: &str,
-    password: &str,
-) -> Result<(), String> {
+async fn create_user(base: &str, token: &str, name: &str, password: &str) -> Result<(), String> {
     crate::client::web::admin_create_user(base, token, name, password)
         .await
         .map_err(|e| e.to_string())
@@ -794,6 +1040,136 @@ async fn toggle_favorite(
     _favorite: bool,
 ) -> Result<(), String> {
     Err("mark_favorite is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_sessions(base: &str, token: &str) -> Result<Vec<RemoteSession>, String> {
+    crate::client::web::list_sessions(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_sessions(_base: &str, _token: &str) -> Result<Vec<RemoteSession>, String> {
+    Err("list_sessions is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn send_playstate(
+    base: &str,
+    token: &str,
+    session_id: &str,
+    command: &str,
+    arg: serde_json::Value,
+) -> Result<(), String> {
+    crate::client::web::send_session_playstate(base, token, session_id, command, arg)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn send_playstate(
+    _base: &str,
+    _token: &str,
+    _session_id: &str,
+    _command: &str,
+    _arg: serde_json::Value,
+) -> Result<(), String> {
+    Err("send_session_playstate is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn send_general(
+    base: &str,
+    token: &str,
+    session_id: &str,
+    command: &str,
+    arg: serde_json::Value,
+) -> Result<(), String> {
+    crate::client::web::send_session_general(base, token, session_id, command, arg)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn send_general(
+    _base: &str,
+    _token: &str,
+    _session_id: &str,
+    _command: &str,
+    _arg: serde_json::Value,
+) -> Result<(), String> {
+    Err("send_session_general is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_virtual_folders(base: &str, token: &str) -> Result<Vec<LibraryFolder>, String> {
+    crate::client::web::list_virtual_folders(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_virtual_folders(_base: &str, _token: &str) -> Result<Vec<LibraryFolder>, String> {
+    Err("list_virtual_folders is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_devices(base: &str, token: &str) -> Result<Vec<DeviceEntry>, String> {
+    crate::client::web::list_devices(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_devices(_base: &str, _token: &str) -> Result<Vec<DeviceEntry>, String> {
+    Err("list_devices is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_activity_entries(base: &str, token: &str) -> Result<Vec<ActivityEntry>, String> {
+    crate::client::web::list_activity_entries(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_activity_entries(_base: &str, _token: &str) -> Result<Vec<ActivityEntry>, String> {
+    Err("list_activity_entries is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_user_configuration(base: &str, token: &str) -> Result<UserConfiguration, String> {
+    crate::client::web::fetch_user_configuration(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_user_configuration(_base: &str, _token: &str) -> Result<UserConfiguration, String> {
+    Err("user_configuration fetch is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn save_user_configuration(
+    base: &str,
+    token: &str,
+    user_id: &str,
+    cfg: &UserConfiguration,
+) -> Result<(), String> {
+    crate::client::web::save_user_configuration(base, token, user_id, cfg)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn save_user_configuration(
+    _base: &str,
+    _token: &str,
+    _user_id: &str,
+    _cfg: &UserConfiguration,
+) -> Result<(), String> {
+    Err("save_user_configuration is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

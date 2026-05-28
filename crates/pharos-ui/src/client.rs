@@ -8,7 +8,7 @@
 //! V16: only the public Jellyfin-compat surface is consumed. No backdoor.
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -261,6 +261,95 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
         .collect())
 }
 
+/// T55 — UserConfiguration projection. Subset of jellyfin-web's
+/// `Configuration` block — fields the preferences UI flips. Strings
+/// kept as `String` so the form can round-trip arbitrary values.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserConfiguration {
+    pub audio_language_preference: String,
+    pub subtitle_language_preference: String,
+    pub subtitle_mode: String,
+    pub play_default_audio_track: bool,
+    pub display_missing_episodes: bool,
+    pub display_collections_view: bool,
+    pub hide_played_in_latest: bool,
+    pub remember_audio_selections: bool,
+    pub remember_subtitle_selections: bool,
+    pub enable_next_episode_auto_play: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct UserConfigurationDto {
+    audio_language_preference: String,
+    subtitle_language_preference: String,
+    subtitle_mode: String,
+    play_default_audio_track: bool,
+    display_missing_episodes: bool,
+    display_collections_view: bool,
+    hide_played_in_latest: bool,
+    remember_audio_selections: bool,
+    remember_subtitle_selections: bool,
+    enable_next_episode_auto_play: bool,
+}
+
+impl Default for UserConfigurationDto {
+    fn default() -> Self {
+        Self {
+            audio_language_preference: String::new(),
+            subtitle_language_preference: String::new(),
+            subtitle_mode: "Default".into(),
+            play_default_audio_track: true,
+            display_missing_episodes: false,
+            display_collections_view: false,
+            hide_played_in_latest: true,
+            remember_audio_selections: true,
+            remember_subtitle_selections: true,
+            enable_next_episode_auto_play: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UserMeDto {
+    #[serde(default)]
+    configuration: UserConfigurationDto,
+}
+
+pub fn parse_user_configuration_response(bytes: &[u8]) -> Result<UserConfiguration, ClientError> {
+    let parsed: UserMeDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    let c = parsed.configuration;
+    Ok(UserConfiguration {
+        audio_language_preference: c.audio_language_preference,
+        subtitle_language_preference: c.subtitle_language_preference,
+        subtitle_mode: c.subtitle_mode,
+        play_default_audio_track: c.play_default_audio_track,
+        display_missing_episodes: c.display_missing_episodes,
+        display_collections_view: c.display_collections_view,
+        hide_played_in_latest: c.hide_played_in_latest,
+        remember_audio_selections: c.remember_audio_selections,
+        remember_subtitle_selections: c.remember_subtitle_selections,
+        enable_next_episode_auto_play: c.enable_next_episode_auto_play,
+    })
+}
+
+pub fn user_configuration_to_dto_json(c: &UserConfiguration) -> serde_json::Value {
+    serde_json::json!({
+        "AudioLanguagePreference": c.audio_language_preference,
+        "SubtitleLanguagePreference": c.subtitle_language_preference,
+        "SubtitleMode": c.subtitle_mode,
+        "PlayDefaultAudioTrack": c.play_default_audio_track,
+        "DisplayMissingEpisodes": c.display_missing_episodes,
+        "DisplayCollectionsView": c.display_collections_view,
+        "HidePlayedInLatest": c.hide_played_in_latest,
+        "RememberAudioSelections": c.remember_audio_selections,
+        "RememberSubtitleSelections": c.remember_subtitle_selections,
+        "EnableNextEpisodeAutoPlay": c.enable_next_episode_auto_play,
+    })
+}
+
 /// T56 — Live TV channel projection. `id` is the upstream tvg-id.
 /// `logo_url` is the public `/livetv/channels/{id}/images/primary`
 /// redirect path so the UI can render `<img src=...>` without
@@ -370,6 +459,200 @@ pub fn parse_live_programs_response(bytes: &[u8]) -> Result<Vec<LiveProgram>, Cl
         .collect())
 }
 
+/// T60 — `SessionInfo` projection from `/Sessions` (snapshot of the
+/// SessionRegistry actor). Includes the now-playing fields the remote-
+/// control UI needs to show a per-session status line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteSession {
+    pub id: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub device_name: String,
+    pub client: String,
+    pub now_playing_item_id: Option<String>,
+    pub position_ticks: u64,
+    pub is_paused: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoteSessionDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    user_name: String,
+    #[serde(default)]
+    device_name: String,
+    #[serde(default)]
+    client: String,
+    #[serde(default)]
+    now_playing_item_id: Option<String>,
+    #[serde(default)]
+    position_ticks: u64,
+    #[serde(default)]
+    is_paused: bool,
+}
+
+pub fn parse_sessions_response(bytes: &[u8]) -> Result<Vec<RemoteSession>, ClientError> {
+    let parsed: Vec<RemoteSessionDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|s| RemoteSession {
+            id: s.id,
+            user_id: s.user_id,
+            user_name: s.user_name,
+            device_name: s.device_name,
+            client: s.client,
+            now_playing_item_id: s.now_playing_item_id,
+            position_ticks: s.position_ticks,
+            is_paused: s.is_paused,
+        })
+        .collect())
+}
+
+/// T58 — VirtualFolder ("library") entry from `/Library/VirtualFolders`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LibraryFolder {
+    pub item_id: String,
+    pub name: String,
+    pub collection_type: String,
+    pub locations: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct VirtualFolderDto {
+    #[serde(default)]
+    item_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    collection_type: String,
+    #[serde(default)]
+    locations: Vec<String>,
+}
+
+pub fn parse_virtual_folders_response(bytes: &[u8]) -> Result<Vec<LibraryFolder>, ClientError> {
+    let parsed: Vec<VirtualFolderDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|d| LibraryFolder {
+            item_id: d.item_id,
+            name: d.name,
+            collection_type: d.collection_type,
+            locations: d.locations,
+        })
+        .collect())
+}
+
+/// T58 — `/Devices` entry. jellyfin-web's dashboard reads this to render
+/// the connected-clients list.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeviceEntry {
+    pub id: String,
+    pub name: String,
+    pub app_name: String,
+    pub last_user_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeviceDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    app_name: String,
+    #[serde(default)]
+    last_user_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DevicesResultDto {
+    #[serde(default)]
+    items: Vec<DeviceDto>,
+}
+
+pub fn parse_devices_response(bytes: &[u8]) -> Result<Vec<DeviceEntry>, ClientError> {
+    // /Devices returns the same wrapper jellyfin uses for most lists.
+    let parsed: DevicesResultDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .items
+        .into_iter()
+        .map(|d| DeviceEntry {
+            id: d.id,
+            name: d.name,
+            app_name: d.app_name,
+            last_user_name: d.last_user_name,
+        })
+        .collect())
+}
+
+/// T58 — `/System/ActivityLog/Entries` row (jellyfin-web's Activity Log
+/// dashboard). Pharos returns an empty list today; the projection
+/// types so the UI is in place when entries land.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActivityEntry {
+    pub id: String,
+    pub name: String,
+    pub short_overview: String,
+    pub date_iso: String,
+    pub severity: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ActivityEntryDto {
+    #[serde(default)]
+    id: serde_json::Value,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    short_overview: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    severity: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ActivityEntriesResultDto {
+    #[serde(default)]
+    items: Vec<ActivityEntryDto>,
+}
+
+pub fn parse_activity_entries_response(bytes: &[u8]) -> Result<Vec<ActivityEntry>, ClientError> {
+    let parsed: ActivityEntriesResultDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .items
+        .into_iter()
+        .map(|d| ActivityEntry {
+            id: id_to_string(&d.id),
+            name: d.name,
+            short_overview: d.short_overview,
+            date_iso: d.date,
+            severity: d.severity,
+        })
+        .collect())
+}
+
+fn id_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
 pub fn parse_admin_users_response(bytes: &[u8]) -> Result<Vec<AdminUser>, ClientError> {
     let parsed: Vec<AdminUserDto> =
         serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
@@ -391,7 +674,6 @@ pub mod web {
 
     use super::*;
     use gloo_net::http::Request;
-    use serde::Serialize;
 
     #[derive(Serialize)]
     #[serde(rename_all = "PascalCase")]
@@ -450,10 +732,7 @@ pub mod web {
         password: &'a str,
     }
 
-    pub async fn admin_list_users(
-        base: &str,
-        token: &str,
-    ) -> Result<Vec<AdminUser>, ClientError> {
+    pub async fn admin_list_users(base: &str, token: &str) -> Result<Vec<AdminUser>, ClientError> {
         let resp = Request::get(&format!("{base}/Users"))
             .header("X-Emby-Token", token)
             .send()
@@ -616,10 +895,7 @@ pub mod web {
         out
     }
 
-    pub async fn live_channels(
-        base: &str,
-        token: &str,
-    ) -> Result<Vec<LiveChannel>, ClientError> {
+    pub async fn live_channels(base: &str, token: &str) -> Result<Vec<LiveChannel>, ClientError> {
         let resp = Request::get(&format!("{base}/LiveTv/Channels"))
             .header("X-Emby-Token", token)
             .send()
@@ -640,12 +916,13 @@ pub mod web {
         token: &str,
         window_hours: u32,
     ) -> Result<Vec<LiveProgram>, ClientError> {
-        let resp =
-            Request::get(&format!("{base}/LiveTv/Programs?windowHours={window_hours}"))
-                .header("X-Emby-Token", token)
-                .send()
-                .await
-                .map_err(|e| ClientError::Http(e.to_string()))?;
+        let resp = Request::get(&format!(
+            "{base}/LiveTv/Programs?windowHours={window_hours}"
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
         if !resp.ok() {
             return Err(ClientError::Status(resp.status()));
         }
@@ -654,6 +931,160 @@ pub mod web {
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
         parse_live_programs_response(&bytes)
+    }
+
+    pub async fn list_sessions(base: &str, token: &str) -> Result<Vec<RemoteSession>, ClientError> {
+        let resp = Request::get(&format!("{base}/Sessions"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_sessions_response(&bytes)
+    }
+
+    pub async fn send_session_playstate(
+        base: &str,
+        token: &str,
+        session_id: &str,
+        command: &str,
+        arg: serde_json::Value,
+    ) -> Result<(), ClientError> {
+        let body = arg.to_string();
+        let resp = Request::post(&format!("{base}/Sessions/{session_id}/Playing/{command}"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn send_session_general(
+        base: &str,
+        token: &str,
+        session_id: &str,
+        command: &str,
+        arg: serde_json::Value,
+    ) -> Result<(), ClientError> {
+        let body = arg.to_string();
+        let resp = Request::post(&format!("{base}/Sessions/{session_id}/Command/{command}"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn list_virtual_folders(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<LibraryFolder>, ClientError> {
+        let resp = Request::get(&format!("{base}/Library/VirtualFolders"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_virtual_folders_response(&bytes)
+    }
+
+    pub async fn list_devices(base: &str, token: &str) -> Result<Vec<DeviceEntry>, ClientError> {
+        let resp = Request::get(&format!("{base}/Devices"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_devices_response(&bytes)
+    }
+
+    pub async fn list_activity_entries(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<ActivityEntry>, ClientError> {
+        let resp = Request::get(&format!("{base}/System/ActivityLog/Entries"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_activity_entries_response(&bytes)
+    }
+
+    pub async fn fetch_user_configuration(
+        base: &str,
+        token: &str,
+    ) -> Result<UserConfiguration, ClientError> {
+        let resp = Request::get(&format!("{base}/Users/Me"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_user_configuration_response(&bytes)
+    }
+
+    pub async fn save_user_configuration(
+        base: &str,
+        token: &str,
+        user_id: &str,
+        cfg: &UserConfiguration,
+    ) -> Result<(), ClientError> {
+        let body = user_configuration_to_dto_json(cfg).to_string();
+        let resp = Request::post(&format!("{base}/Users/{user_id}/Configuration"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
     }
 
     pub async fn admin_library_refresh(base: &str, token: &str) -> Result<(), ClientError> {
@@ -741,8 +1172,7 @@ mod tests {
 
     #[test]
     fn parse_items_empty_array_returns_empty_vec() {
-        let body =
-            br#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#;
+        let body = br#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#;
         let items = parse_items_response(body).unwrap();
         assert!(items.is_empty());
     }
@@ -780,6 +1210,102 @@ mod tests {
         assert!(d.has_backdrop_image);
         assert_eq!(d.play_count, 4);
         assert!(d.is_favorite);
+    }
+
+    #[test]
+    fn parse_sessions_extracts_user_device_client_and_playback() {
+        let body = br#"[
+            {"Id":"s1","UserId":"u1","UserName":"ali","DeviceName":"Pixel 9","Client":"Finamp",
+             "NowPlayingItemId":"item-9","PositionTicks":1234567890,"IsPaused":false},
+            {"Id":"s2","UserId":"u2","UserName":"ben","DeviceName":"AppleTV","Client":"Infuse",
+             "PositionTicks":0,"IsPaused":false}
+        ]"#;
+        let v = parse_sessions_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].id, "s1");
+        assert_eq!(v[0].now_playing_item_id.as_deref(), Some("item-9"));
+        assert_eq!(v[0].position_ticks, 1234567890);
+        assert!(v[1].now_playing_item_id.is_none());
+    }
+
+    #[test]
+    fn parse_virtual_folders_extracts_fields() {
+        let body = br#"[
+            {"Name":"Movies","ItemId":"a","CollectionType":"movies","Locations":["/data/movies"]},
+            {"Name":"Shows","ItemId":"b","CollectionType":"tvshows","Locations":["/data/tv","/mnt/tv"]}
+        ]"#;
+        let v = parse_virtual_folders_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "Movies");
+        assert_eq!(v[0].collection_type, "movies");
+        assert_eq!(v[1].locations.len(), 2);
+    }
+
+    #[test]
+    fn parse_devices_extracts_id_name_app_user() {
+        let body = br#"{"Items":[
+            {"Id":"d1","Name":"Pixel 9","AppName":"Finamp","LastUserName":"ali"},
+            {"Id":"d2","Name":"AppleTV","AppName":"Infuse","LastUserName":"ben"}
+        ],"TotalRecordCount":2,"StartIndex":0}"#;
+        let v = parse_devices_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].app_name, "Infuse");
+    }
+
+    #[test]
+    fn parse_activity_entries_empty_returns_empty_vec() {
+        let body = br#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#;
+        let v = parse_activity_entries_response(body).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_activity_entries_accepts_string_or_int_id() {
+        let body = br#"{"Items":[
+            {"Id":"abc","Name":"login","ShortOverview":"","Date":"2026-05-28T10:00:00Z","Severity":"Info"},
+            {"Id":42,"Name":"scan","ShortOverview":"x","Date":"2026-05-28T10:01:00Z","Severity":"Trace"}
+        ],"TotalRecordCount":2,"StartIndex":0}"#;
+        let v = parse_activity_entries_response(body).unwrap();
+        assert_eq!(v[0].id, "abc");
+        assert_eq!(v[1].id, "42");
+    }
+
+    #[test]
+    fn parse_user_configuration_uses_defaults_on_partial_payload() {
+        let body = br#"{
+            "Configuration":{
+                "AudioLanguagePreference":"jpn",
+                "SubtitleMode":"None",
+                "DisplayMissingEpisodes":true
+            }
+        }"#;
+        let c = parse_user_configuration_response(body).unwrap();
+        assert_eq!(c.audio_language_preference, "jpn");
+        assert_eq!(c.subtitle_mode, "None");
+        assert!(c.display_missing_episodes);
+        // serde defaults apply to fields the payload omits.
+        assert!(c.play_default_audio_track);
+        assert!(c.enable_next_episode_auto_play);
+    }
+
+    #[test]
+    fn user_configuration_to_dto_json_roundtrips_through_parser() {
+        let cfg = UserConfiguration {
+            audio_language_preference: "eng".into(),
+            subtitle_language_preference: "eng".into(),
+            subtitle_mode: "Smart".into(),
+            play_default_audio_track: false,
+            display_missing_episodes: true,
+            display_collections_view: true,
+            hide_played_in_latest: false,
+            remember_audio_selections: false,
+            remember_subtitle_selections: false,
+            enable_next_episode_auto_play: false,
+        };
+        let body = serde_json::json!({ "Configuration": user_configuration_to_dto_json(&cfg) });
+        let bytes = body.to_string();
+        let parsed = parse_user_configuration_response(bytes.as_bytes()).unwrap();
+        assert_eq!(parsed, cfg);
     }
 
     #[test]

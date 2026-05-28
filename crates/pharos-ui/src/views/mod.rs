@@ -11,17 +11,23 @@ pub mod library;
 pub mod live_tv;
 pub mod login;
 pub mod player;
+pub mod prefs;
+pub mod remote;
 pub mod search;
+pub mod server_picker;
 
-pub use admin::{AdminAction, AdminView, AdminViewProps, CreateUserAttempt};
+pub use admin::{AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt};
 pub use app_state::{AppRoute, RootApp};
 pub use detail::{DetailAction, ItemDetailView};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
 pub use library::{ItemTile, LibraryView};
 pub use live_tv::{LiveTvAction, LiveTvStatus, LiveTvView};
 pub use login::{LoginAttempt, LoginForm};
-pub use player::{PlaybackEvent, PlayerProps, PlayerView};
+pub use player::{PlaybackEvent, PlayerProps, PlayerView, QualityOption};
+pub use prefs::{PrefsAction, PrefsTab, PrefsView};
+pub use remote::{RemoteAction, RemoteControlView};
 pub use search::{SearchStatus, SearchView};
+pub use server_picker::{SavedServer, ServerPickerAction, ServerPickerView};
 
 use dioxus::prelude::*;
 

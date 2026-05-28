@@ -25,7 +25,15 @@ gloo-net = { workspace = true, optional = true }
 # Pulled in by the `web` feature so PlayerView's wasm path can read
 # `<video>.currentTime` from the underlying `web_sys::HtmlMediaElement`.
 # Host-side tests compile without them via cfg-gating in the source.
-web-sys = { version = "0.3", optional = true, features = ["HtmlMediaElement", "Event", "EventTarget"] }
+web-sys = { version = "0.3", optional = true, features = [
+    "HtmlMediaElement",
+    "Event",
+    "EventTarget",
+    "Element",
+    "Window",
+    "Document",
+    "Storage",
+] }
 wasm-bindgen = { version = "0.2", optional = true }
 serde = { workspace = true }
 serde_json.workspace = true

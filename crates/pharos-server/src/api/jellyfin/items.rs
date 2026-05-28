@@ -244,21 +244,28 @@ fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
         }
     }
     // Same album_artist (Audio) — same artist's catalogue.
-    if let (Some(t), Some(c)) =
-        (target.probe.album_artist.as_deref(), candidate.probe.album_artist.as_deref())
-    {
+    if let (Some(t), Some(c)) = (
+        target.probe.album_artist.as_deref(),
+        candidate.probe.album_artist.as_deref(),
+    ) {
         if t.eq_ignore_ascii_case(c) {
             s += 50;
         }
     }
     // Same album (Audio) — same album's tracks.
-    if let (Some(t), Some(c)) = (target.probe.album.as_deref(), candidate.probe.album.as_deref()) {
+    if let (Some(t), Some(c)) = (
+        target.probe.album.as_deref(),
+        candidate.probe.album.as_deref(),
+    ) {
         if t.eq_ignore_ascii_case(c) {
             s += 40;
         }
     }
     // Same genre — broadly works for every kind.
-    if let (Some(t), Some(c)) = (target.probe.genre.as_deref(), candidate.probe.genre.as_deref()) {
+    if let (Some(t), Some(c)) = (
+        target.probe.genre.as_deref(),
+        candidate.probe.genre.as_deref(),
+    ) {
         if t.eq_ignore_ascii_case(c) {
             s += 20;
         }
@@ -529,7 +536,11 @@ async fn shows_next_up(
         .filter_map(|mut eps| {
             eps.sort_by_key(|(_, e)| {
                 let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
-                let n = e.series.as_ref().and_then(|s| s.episode_number).unwrap_or(0);
+                let n = e
+                    .series
+                    .as_ref()
+                    .and_then(|s| s.episode_number)
+                    .unwrap_or(0);
                 (s, n)
             });
             eps.into_iter().next()
@@ -537,18 +548,16 @@ async fn shows_next_up(
         .collect();
     // Stable series-name sort across the result set.
     picks.sort_by(|a, b| {
-        let an = a
-            .1
-            .series
-            .as_ref()
-            .map(|s| s.series_name.as_str())
-            .unwrap_or("");
-        let bn = b
-            .1
-            .series
-            .as_ref()
-            .map(|s| s.series_name.as_str())
-            .unwrap_or("");
+        let an =
+            a.1.series
+                .as_ref()
+                .map(|s| s.series_name.as_str())
+                .unwrap_or("");
+        let bn =
+            b.1.series
+                .as_ref()
+                .map(|s| s.series_name.as_str())
+                .unwrap_or("");
         an.cmp(bn)
     });
     picks.truncate(q.limit.max(1) as usize);
@@ -611,10 +620,11 @@ async fn playback_info(
     let decision = negotiate(&profile, &source);
 
     let direct_play = decision.is_direct();
-    let supports_direct_stream = direct_play
-        || matches!(decision, Decision::AudioRemux { .. });
+    let supports_direct_stream = direct_play || matches!(decision, Decision::AudioRemux { .. });
     let transcoding_url = match &decision {
-        Decision::Transcode { target_container, .. } if target_container == "ts" => {
+        Decision::Transcode {
+            target_container, ..
+        } if target_container == "ts" => {
             // PlaySessionId rides on the URL so the HLS handlers can
             // look up the cached Decision (T-fix-2 part 2) instead of
             // re-running the negotiator per segment.
@@ -652,10 +662,8 @@ async fn playback_info(
     // Find the audio stream's actual index (or skip if there isn't one).
     // Hard-coding `1` for silent-video files made jellyfin-web's player
     // try to select a track that doesn't exist.
-    let default_audio_stream_index: Option<u32> = streams
-        .iter()
-        .find(|s| s.kind == "Audio")
-        .map(|s| s.index);
+    let default_audio_stream_index: Option<u32> =
+        streams.iter().find(|s| s.kind == "Audio").map(|s| s.index);
 
     // TranscodingSubProtocol only makes sense alongside a real
     // TranscodingUrl. Emitting `"hls"` unconditionally made
@@ -754,7 +762,10 @@ fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaIte
     if wanted.is_empty() {
         return items;
     }
-    items.into_iter().filter(|i| wanted.contains(&i.kind)).collect()
+    items
+        .into_iter()
+        .filter(|i| wanted.contains(&i.kind))
+        .collect()
 }
 
 async fn user_views(
@@ -1174,10 +1185,11 @@ fn restrict_to_parent(
             .collect();
     }
     // 2) Series id → every episode whose series_name hashes to pid.
-    if items
-        .iter()
-        .any(|i| i.series.as_ref().is_some_and(|s| series_id_for(&s.series_name) == pid))
-    {
+    if items.iter().any(|i| {
+        i.series
+            .as_ref()
+            .is_some_and(|s| series_id_for(&s.series_name) == pid)
+    }) {
         return items
             .into_iter()
             .filter(|i| {
@@ -1230,26 +1242,36 @@ fn restrict_to_parent(
             .collect();
     }
     // 5) Album id → every track whose album hashes to pid.
-    if items
-        .iter()
-        .any(|i| i.probe.album.as_deref().is_some_and(|a| album_id_for(a) == pid))
-    {
+    if items.iter().any(|i| {
+        i.probe
+            .album
+            .as_deref()
+            .is_some_and(|a| album_id_for(a) == pid)
+    }) {
         return items
             .into_iter()
             .filter(|i| {
-                i.probe.album.as_deref().is_some_and(|a| album_id_for(a) == pid)
+                i.probe
+                    .album
+                    .as_deref()
+                    .is_some_and(|a| album_id_for(a) == pid)
             })
             .collect();
     }
     // 6) Genre id → every item tagged with that genre.
-    if items
-        .iter()
-        .any(|i| i.probe.genre.as_deref().is_some_and(|g| genre_id_for(g) == pid))
-    {
+    if items.iter().any(|i| {
+        i.probe
+            .genre
+            .as_deref()
+            .is_some_and(|g| genre_id_for(g) == pid)
+    }) {
         return items
             .into_iter()
             .filter(|i| {
-                i.probe.genre.as_deref().is_some_and(|g| genre_id_for(g) == pid)
+                i.probe
+                    .genre
+                    .as_deref()
+                    .is_some_and(|g| genre_id_for(g) == pid)
             })
             .collect();
     }
@@ -1304,8 +1326,12 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
         }
     }
     if let Some(raw) = q.media_types.as_ref() {
-        let want_audio = raw.split(',').any(|s| s.trim().eq_ignore_ascii_case("Audio"));
-        let want_video = raw.split(',').any(|s| s.trim().eq_ignore_ascii_case("Video"));
+        let want_audio = raw
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("Audio"));
+        let want_video = raw
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("Video"));
         if want_audio || want_video {
             items.retain(|i| match i.kind {
                 MediaKind::Audio => want_audio,
@@ -1322,12 +1348,7 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
         items.retain(|i| i.probe.width.map(|w| w >= 3840) == Some(want));
     }
     if let Some(want) = q.is_hd {
-        items.retain(|i| {
-            i.probe
-                .width
-                .map(|w| (1280..3840).contains(&w))
-                == Some(want)
-        });
+        items.retain(|i| i.probe.width.map(|w| (1280..3840).contains(&w)) == Some(want));
     }
     if let Some(want) = q.is_3d {
         // No 3D detection in the prober yet; report false for every
@@ -1461,11 +1482,7 @@ fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> 
         }
         // SortName (default) and anything unrecognised.
         _ => {
-            items.sort_by(|a, b| {
-                a.title
-                    .to_lowercase()
-                    .cmp(&b.title.to_lowercase())
-            });
+            items.sort_by_key(|a| a.title.to_lowercase());
             if descending {
                 items.reverse();
             }
@@ -1557,11 +1574,13 @@ async fn fetch_item_dto(
         .get_user_data(user_id, id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(BaseItemDto::from_domain_with_user_data(
-        &item,
-        &state.server_id,
-        user_data,
-    )))
+    Ok(
+        HttpResponse::Ok().json(BaseItemDto::from_domain_with_user_data(
+            &item,
+            &state.server_id,
+            user_data,
+        )),
+    )
 }
 
 /// If `id_str` matches the library id of any configured root, return
