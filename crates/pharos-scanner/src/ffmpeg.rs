@@ -4,7 +4,8 @@
 //! codec / channels / sample rate without re-shelling on every request.
 
 use pharos_core::{
-    DomainError, DomainResult, MediaKind, MediaProbe, ProbeInfo, Prober, SubtitleTrack,
+    DomainError, DomainResult, MediaChapter, MediaKind, MediaProbe, ProbeInfo, Prober,
+    SubtitleTrack,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ impl Prober for FfmpegProber {
                 "json",
                 "-show_format",
                 "-show_streams",
+                "-show_chapters",
             ])
             .arg(path)
             .output()
@@ -67,6 +69,27 @@ struct FfprobeOutput {
     streams: Vec<FfprobeStream>,
     #[serde(default)]
     format: FfprobeFormat,
+    #[serde(default)]
+    chapters: Vec<FfprobeChapter>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeChapter {
+    #[serde(default)]
+    id: i64,
+    /// ffprobe reports seconds as a string (`"12.345"`).
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    end_time: Option<String>,
+    #[serde(default)]
+    tags: FfprobeChapterTags,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FfprobeChapterTags {
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +228,37 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         })
         .collect();
 
+    let chapters: Vec<MediaChapter> = parsed
+        .chapters
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, c)| {
+            let start = c
+                .start_time
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|s| (s * 1000.0) as u64)?;
+            let end = c
+                .end_time
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|s| (s * 1000.0) as u64)
+                .unwrap_or(start);
+            let title = c
+                .tags
+                .title
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("Chapter {}", idx + 1));
+            let _ = c.id;
+            Some(MediaChapter {
+                start_ms: start,
+                end_ms: end,
+                title,
+            })
+        })
+        .collect();
+
     Ok(ProbeInfo {
         kind,
         probe: MediaProbe {
@@ -224,6 +278,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             album: parsed.format.tags.album,
             album_artist: parsed.format.tags.album_artist,
             genre: parsed.format.tags.genre,
+            chapters,
         },
     })
 }
@@ -336,5 +391,38 @@ mod tests {
     fn parse_garbage_returns_err() {
         let res = parse_ffprobe_output(b"not json");
         assert!(res.is_err());
+    }
+
+    const VIDEO_WITH_CHAPTERS: &[u8] = br#"{
+        "streams": [{"codec_type":"video","codec_name":"h264"}],
+        "format": {"duration": "1800.0"},
+        "chapters": [
+            {"id": 0, "start_time": "0.000", "end_time": "300.000",
+             "tags": {"title": "Opening"}},
+            {"id": 1, "start_time": "300.000", "end_time": "900.000",
+             "tags": {"title": ""}},
+            {"id": 2, "start_time": "900.000", "end_time": "1800.000"}
+        ]
+    }"#;
+
+    #[test]
+    fn parse_chapters_extracts_with_fallback_titles() {
+        let info = parse_ffprobe_output(VIDEO_WITH_CHAPTERS).unwrap();
+        let chs = &info.probe.chapters;
+        assert_eq!(chs.len(), 3);
+        assert_eq!(chs[0].title, "Opening");
+        assert_eq!(chs[0].start_ms, 0);
+        assert_eq!(chs[0].end_ms, 300_000);
+        // Empty title falls back to "Chapter {idx+1}".
+        assert_eq!(chs[1].title, "Chapter 2");
+        // Missing title also falls back.
+        assert_eq!(chs[2].title, "Chapter 3");
+        assert_eq!(chs[2].start_ms, 900_000);
+    }
+
+    #[test]
+    fn parse_no_chapters_section_returns_empty_vec() {
+        let info = parse_ffprobe_output(VIDEO_JSON).unwrap();
+        assert!(info.probe.chapters.is_empty());
     }
 }

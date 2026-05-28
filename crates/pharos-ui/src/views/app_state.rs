@@ -13,8 +13,9 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
-    LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder, LiveChannel,
+    LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
+    UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -29,7 +30,12 @@ use dioxus::prelude::*;
 pub enum AppRoute {
     Library,
     Detail { item_id: String },
-    Player { item_id: String, kind: ItemKind },
+    Player {
+        item_id: String,
+        kind: ItemKind,
+        chapters: Vec<ItemChapter>,
+        run_time_ticks: u64,
+    },
     LivePlayer { channel_id: String },
     Admin,
     Search,
@@ -208,18 +214,31 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
                     current_user_id: current_user_id.clone(),
-                    on_play: move |(id, kind): (String, ItemKind)| {
-                        route.set(AppRoute::Player { item_id: id, kind });
+                    on_play: move |args: (String, ItemKind, Vec<ItemChapter>, u64)| {
+                        let (id, kind, chapters, run_time_ticks) = args;
+                        route.set(AppRoute::Player {
+                            item_id: id,
+                            kind,
+                            chapters,
+                            run_time_ticks,
+                        });
                     },
                     on_back: move |_| { route.set(AppRoute::Library); },
                 }
             },
-            AppRoute::Player { item_id, kind } => rsx! {
+            AppRoute::Player {
+                item_id,
+                kind,
+                chapters,
+                run_time_ticks,
+            } => rsx! {
                 PlayerPane {
                     item_id: item_id.clone(),
                     kind: kind,
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
+                    chapters: chapters.clone(),
+                    run_time_ticks: run_time_ticks,
                     on_back: move |_| { route.set(AppRoute::Library); },
                 }
             },
@@ -348,7 +367,7 @@ fn DetailPane(
     access_token: String,
     server_base: String,
     current_user_id: String,
-    on_play: EventHandler<(String, ItemKind)>,
+    on_play: EventHandler<(String, ItemKind, Vec<ItemChapter>, u64)>,
     on_back: EventHandler<()>,
 ) -> Element {
     let reload = use_signal(|| 0u32);
@@ -382,14 +401,25 @@ fn DetailPane(
             match action {
                 DetailAction::Back => on_back.call(()),
                 DetailAction::Play => {
-                    // Read the latest fetched detail to learn the kind.
-                    let kind = detail_resource
+                    // Read the latest fetched detail to learn the kind +
+                    // pass chapters / total runtime through to the
+                    // PlayerView so it can render the chapter strip.
+                    let detail_snapshot = detail_resource
                         .read()
                         .as_ref()
                         .and_then(|r| r.as_ref().ok())
+                        .cloned();
+                    let kind = detail_snapshot
+                        .as_ref()
                         .map(|d| d.kind)
                         .unwrap_or(ItemKind::Movie);
-                    on_play.call((id, kind));
+                    let chapters = detail_snapshot
+                        .as_ref()
+                        .map(|d| d.chapters.clone())
+                        .unwrap_or_default();
+                    let run_time_ticks =
+                        detail_snapshot.as_ref().map(|d| d.run_time_ticks).unwrap_or(0);
+                    on_play.call((id, kind, chapters, run_time_ticks));
                 }
                 DetailAction::TogglePlayed => {
                     let played_now = detail_resource
@@ -693,10 +723,13 @@ fn PlayerPane(
     kind: ItemKind,
     access_token: String,
     server_base: String,
+    chapters: Vec<ItemChapter>,
+    run_time_ticks: u64,
     on_back: EventHandler<()>,
 ) -> Element {
     use crate::views::QualityOption;
     let mut max_bitrate = use_signal::<Option<u32>>(|| None);
+    let media_dom_id = format!("pharos-media-{item_id}");
 
     let item_for_url = item_id.clone();
     let server_for_url = server_base.clone();
@@ -751,16 +784,41 @@ fn PlayerPane(
                 src_override: src_override,
                 quality_options: quality_options,
                 current_max_bitrate: current_bitrate,
-                on_event: move |ev: crate::views::PlaybackEvent| {
-                    if let crate::views::PlaybackEvent::QualityChanged { max_bitrate: b } = ev {
+                chapters: chapters,
+                run_time_ticks: run_time_ticks,
+                on_event: move |ev: crate::views::PlaybackEvent| match ev {
+                    crate::views::PlaybackEvent::QualityChanged { max_bitrate: b } => {
                         // 0 = Auto = drop the override.
                         max_bitrate.set(if b == 0 { None } else { Some(b) });
                     }
+                    crate::views::PlaybackEvent::ChapterSelected { position_seconds } => {
+                        seek_media(&media_dom_id, position_seconds);
+                    }
+                    _ => {}
                 },
             }
         }
     }
 }
+
+/// Seek the `<video>` / `<audio>` whose DOM id matches `media_dom_id`.
+/// Web-only — host build no-ops.
+#[cfg(feature = "web")]
+fn seek_media(media_dom_id: &str, position_seconds: f64) {
+    use wasm_bindgen::JsCast;
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(el) = doc.get_element_by_id(media_dom_id) else {
+        return;
+    };
+    if let Ok(media) = el.dyn_into::<web_sys::HtmlMediaElement>() {
+        media.set_current_time(position_seconds);
+    }
+}
+
+#[cfg(not(feature = "web"))]
+fn seek_media(_media_dom_id: &str, _position_seconds: f64) {}
 
 #[component]
 fn RemotePane(access_token: String, server_base: String) -> Element {
@@ -1552,6 +1610,8 @@ mod tests {
         let a = AppRoute::Player {
             item_id: "1".into(),
             kind: ItemKind::Movie,
+            chapters: Vec::new(),
+            run_time_ticks: 0,
         };
         let b = a.clone();
         assert_eq!(a, b);

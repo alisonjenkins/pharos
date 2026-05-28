@@ -79,6 +79,18 @@ pub struct MediaProbe {
     pub album: Option<String>,
     pub album_artist: Option<String>,
     pub genre: Option<String>,
+    /// Embedded chapter markers extracted by ffprobe `-show_chapters`.
+    /// Each entry's `start_ms` lands on Jellyfin's `Chapters[].StartPositionTicks`.
+    pub chapters: Vec<MediaChapter>,
+}
+
+/// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
+/// reports no name (most BluRay rips).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaChapter {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub title: String,
 }
 
 /// One embedded subtitle stream from the source file.

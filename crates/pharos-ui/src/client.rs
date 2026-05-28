@@ -177,6 +177,9 @@ pub struct ItemDetail {
     pub overview: Option<String>,
     /// T54 phase 3: genre tags. Server emits as a flat string array.
     pub genres: Vec<String>,
+    /// T54 phase 4 / T57 phase 2: chapter markers parsed from
+    /// `BaseItemDto.Chapters[].{Name,StartPositionTicks}`.
+    pub chapters: Vec<ItemChapter>,
 }
 
 /// T54 phase 3 — cast / crew display projection.
@@ -191,6 +194,14 @@ pub struct ItemPerson {
     /// True when ImageTag is non-null — caller composes
     /// `/Items/{person_id}/Images/Primary`.
     pub has_image: bool,
+}
+
+/// T54 phase 4 / T57 phase 2 — chapter marker projection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemChapter {
+    pub name: String,
+    /// Jellyfin's 100-ns ticks (10_000 ticks / ms).
+    pub start_position_ticks: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +239,15 @@ struct ItemDetailDto {
     overview: Option<String>,
     #[serde(default)]
     genres: Vec<String>,
+    #[serde(default)]
+    chapters: Vec<ItemChapterDto>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ItemChapterDto {
+    name: String,
+    start_position_ticks: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -296,6 +316,14 @@ pub fn parse_item_detail_response(bytes: &[u8]) -> Result<ItemDetail, ClientErro
         people,
         overview: parsed.overview,
         genres: parsed.genres,
+        chapters: parsed
+            .chapters
+            .into_iter()
+            .map(|c| ItemChapter {
+                name: c.name,
+                start_position_ticks: c.start_position_ticks,
+            })
+            .collect(),
     })
 }
 
@@ -1611,6 +1639,23 @@ mod tests {
         assert_eq!(v[0].channel_id, "c1");
         assert_eq!(v[0].title, "News");
         assert!(v[0].start_iso.starts_with("2026-05-28T10:00"));
+    }
+
+    #[test]
+    fn parse_item_detail_extracts_chapters() {
+        let body = br#"{
+            "Id":"m1","Name":"Movie","Type":"Movie","RunTimeTicks":36000000000,
+            "Chapters":[
+                {"Name":"Opening","StartPositionTicks":0},
+                {"Name":"Chapter 2","StartPositionTicks":3000000000}
+            ],
+            "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
+        }"#;
+        let d = parse_item_detail_response(body).unwrap();
+        assert_eq!(d.chapters.len(), 2);
+        assert_eq!(d.chapters[0].name, "Opening");
+        assert_eq!(d.chapters[0].start_position_ticks, 0);
+        assert_eq!(d.chapters[1].start_position_ticks, 3_000_000_000);
     }
 
     #[test]

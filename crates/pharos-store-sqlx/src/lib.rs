@@ -21,6 +21,10 @@ pub mod postgres;
 // outside the feature gates so both backends use it.
 pub mod subtitle_track_json;
 
+// JSON adapter for MediaProbe.chapters persistence (T54 phase 4
+// / T57 phase 2). Same pattern as subtitle_tracks.
+pub mod chapter_json;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlx: {0}")]

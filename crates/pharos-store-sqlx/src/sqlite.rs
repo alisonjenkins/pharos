@@ -11,7 +11,7 @@ use std::str::FromStr;
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json, artist, album, album_artist, genre, created_at";
+    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -111,6 +111,7 @@ impl MediaStore for SqliteStore {
         let season_number = item.series.as_ref().and_then(|s| s.season_number);
         let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
         let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
+        let chapters_json = crate::chapter_json::encode(&p.chapters);
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -125,8 +126,8 @@ impl MediaStore for SqliteStore {
                 audio_channels, sample_rate, \
                 series_name, season_number, episode_number, \
                 subtitle_tracks_json, \
-                artist, album, album_artist, genre, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                artist, album, album_artist, genre, created_at, chapters_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            kind = excluded.kind,
@@ -149,6 +150,7 @@ impl MediaStore for SqliteStore {
                                            album = excluded.album,
                                            album_artist = excluded.album_artist,
                                            genre = excluded.genre,
+                                           chapters_json = excluded.chapters_json,
                                            -- Preserve original
                                            -- created_at on rescans;
                                            -- COALESCE keeps existing
@@ -180,6 +182,7 @@ impl MediaStore for SqliteStore {
         .bind(p.album_artist.as_deref())
         .bind(p.genre.as_deref())
         .bind(created_at)
+        .bind(chapters_json)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -223,6 +226,7 @@ struct MediaRow {
     album_artist: Option<String>,
     genre: Option<String>,
     created_at: Option<i64>,
+    chapters_json: Option<String>,
 }
 
 impl MediaRow {
@@ -249,6 +253,7 @@ impl MediaRow {
             album: self.album,
             album_artist: self.album_artist,
             genre: self.genre,
+            chapters: crate::chapter_json::decode(self.chapters_json.as_deref()),
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

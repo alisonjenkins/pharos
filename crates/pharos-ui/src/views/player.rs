@@ -15,6 +15,7 @@
 //! master.m3u8 URL when an HLS transcode is required (T9).
 
 use crate::api_types::{ItemKind, MediaTrack, PlaybackTracks};
+use crate::client::ItemChapter;
 use dioxus::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -42,6 +43,10 @@ pub struct PlayerProps {
     pub quality_options: Vec<QualityOption>,
     /// Currently selected `max_bitrate` for the quality picker.
     pub current_max_bitrate: Option<u32>,
+    /// T57 phase 2: chapter markers (see component-level prop doc).
+    pub chapters: Vec<ItemChapter>,
+    /// T57 phase 2: total runtime in Jellyfin 100-ns ticks.
+    pub run_time_ticks: u64,
 }
 
 fn track_label(t: &MediaTrack) -> String {
@@ -77,6 +82,11 @@ pub enum PlaybackEvent {
         max_bitrate: u32,
     },
     FullscreenRequested,
+    /// User clicked a chapter marker — parent seeks the media element
+    /// to `position_seconds` (e.g. via `HtmlMediaElement::set_current_time`).
+    ChapterSelected {
+        position_seconds: f64,
+    },
 }
 
 #[component]
@@ -89,6 +99,14 @@ pub fn PlayerView(
     src_override: Option<String>,
     #[props(default)] quality_options: Vec<QualityOption>,
     #[props(default)] current_max_bitrate: Option<u32>,
+    /// T57 phase 2: chapter markers rendered over the scrub bar. Each
+    /// entry's `start_position_ticks` (Jellyfin 100-ns) over the total
+    /// `run_time_ticks` drives the marker's `left: {pct}%`. Empty
+    /// hides the strip.
+    #[props(default)] chapters: Vec<ItemChapter>,
+    /// Total duration in Jellyfin ticks. Drives the chapter strip's
+    /// marker positions; pass the item's RunTimeTicks.
+    #[props(default)] run_time_ticks: u64,
     on_event: EventHandler<PlaybackEvent>,
 ) -> Element {
     let src = match src_override.as_ref() {
@@ -250,6 +268,60 @@ pub fn PlayerView(
                     }
                 }
             }
+            if !chapters.is_empty() && run_time_ticks > 0 {
+                ChapterStrip {
+                    chapters: chapters.clone(),
+                    run_time_ticks: run_time_ticks,
+                    on_event: on_event,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ChapterStrip(
+    chapters: Vec<ItemChapter>,
+    run_time_ticks: u64,
+    on_event: EventHandler<PlaybackEvent>,
+) -> Element {
+    rsx! {
+        nav {
+            class: "pharos-player-chapters",
+            for c in chapters.iter().cloned() {
+                ChapterMarker {
+                    key: "{c.start_position_ticks}",
+                    chapter: c,
+                    run_time_ticks: run_time_ticks,
+                    on_event: on_event,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ChapterMarker(
+    chapter: ItemChapter,
+    run_time_ticks: u64,
+    on_event: EventHandler<PlaybackEvent>,
+) -> Element {
+    let pct = if run_time_ticks == 0 {
+        0.0
+    } else {
+        // Clamp so over-long chapter positions don't push off-screen.
+        let raw = chapter.start_position_ticks as f64 / run_time_ticks as f64 * 100.0;
+        raw.clamp(0.0, 100.0)
+    };
+    let style = format!("left: {pct:.2}%");
+    let position_seconds = chapter.start_position_ticks as f64 / 10_000_000.0;
+    rsx! {
+        button {
+            class: "pharos-player-chapter",
+            style: "{style}",
+            title: "{chapter.name}",
+            onclick: move |_| on_event.call(PlaybackEvent::ChapterSelected { position_seconds }),
+            "{chapter.name}"
         }
     }
 }
@@ -339,6 +411,8 @@ mod tests {
             src_override: None,
             quality_options: Vec::new(),
             current_max_bitrate: None,
+            chapters: Vec::new(),
+            run_time_ticks: 0,
         };
         let expected = "https://pharos.test/Audio/42/universal?api_key=tok";
         let src = format!(

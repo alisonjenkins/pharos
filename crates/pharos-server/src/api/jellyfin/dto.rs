@@ -560,7 +560,20 @@ impl BaseItemDto {
             production_locations: vec![],
             provider_ids: serde_json::Map::new(),
             remote_trailers: vec![],
-            chapters: vec![],
+            chapters: item
+                .probe
+                .chapters
+                .iter()
+                .map(|c| {
+                    // `StartPositionTicks` is Jellyfin's 100-ns unit
+                    // (10_000 ticks / ms).
+                    let ticks = c.start_ms.saturating_mul(10_000);
+                    serde_json::json!({
+                        "Name": c.title,
+                        "StartPositionTicks": ticks,
+                    })
+                })
+                .collect(),
             trickplay: serde_json::Map::new(),
             external_urls: vec![],
             image_tags: image_tags_for(item),

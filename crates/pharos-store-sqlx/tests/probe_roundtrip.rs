@@ -98,6 +98,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 album,
                 album_artist,
                 genre,
+                chapters: Vec::new(),
             },
         )
 }

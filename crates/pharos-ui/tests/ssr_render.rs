@@ -12,8 +12,9 @@
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::{
-    ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
-    LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder, LiveChannel,
+    LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
+    UserConfiguration,
 };
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
@@ -166,6 +167,27 @@ fn player_movie_with_quality() -> Element {
     }
 }
 
+fn player_movie_with_chapters() -> Element {
+    // 100-minute movie (60_000_000_000 ticks). Three chapter markers
+    // — at start, halfway, and 75%.
+    let run_time_ticks: u64 = 60_000_000_000;
+    rsx! {
+        PlayerView {
+            item_id: "42".to_string(),
+            kind: ItemKind::Movie,
+            access_token: "tok".to_string(),
+            server_base: "http://x".to_string(),
+            run_time_ticks: run_time_ticks,
+            chapters: vec![
+                ItemChapter { name: "Opening".into(), start_position_ticks: 0 },
+                ItemChapter { name: "Twist".into(), start_position_ticks: run_time_ticks / 2 },
+                ItemChapter { name: "Climax".into(), start_position_ticks: run_time_ticks * 3 / 4 },
+            ],
+            on_event: move |_| {},
+        }
+    }
+}
+
 #[test]
 fn player_view_renders_video_for_movie_kind() {
     let html = render_root(player_movie);
@@ -217,6 +239,20 @@ fn player_view_renders_audio_for_audio_kind() {
     assert!(html.contains("/Audio/2/universal"), "{html}");
     // Audio kind exposes the minimise toggle.
     assert!(html.contains("pharos-player-minimise"), "{html}");
+}
+
+#[test]
+fn player_view_renders_chapter_strip_with_pct_positions() {
+    let html = render_root(player_movie_with_chapters);
+    assert!(html.contains("pharos-player-chapters"), "{html}");
+    assert!(html.contains("pharos-player-chapter"), "{html}");
+    assert!(html.contains("Opening"), "{html}");
+    assert!(html.contains("Twist"), "{html}");
+    assert!(html.contains("Climax"), "{html}");
+    // Marker positions: 0%, 50%, 75%.
+    assert!(html.contains("left: 0.00%"), "{html}");
+    assert!(html.contains("left: 50.00%"), "{html}");
+    assert!(html.contains("left: 75.00%"), "{html}");
 }
 
 #[test]
