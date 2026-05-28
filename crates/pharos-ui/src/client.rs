@@ -141,7 +141,8 @@ struct SearchHintsResultDto {
 ///
 /// Phase 2 adds episode + audio hierarchy + image-presence so the
 /// detail view can render S/E breadcrumbs, artist/album lines, and
-/// the Primary backdrop without re-fetching.
+/// the Primary backdrop without re-fetching. Phase 3 picks up
+/// `Overview`, `People`, and chapter scaffolding.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ItemDetail {
     pub id: String,
@@ -169,6 +170,27 @@ pub struct ItemDetail {
     pub has_primary_image: bool,
     /// True when BackdropImageTags is non-empty.
     pub has_backdrop_image: bool,
+    /// T54 phase 3: cast + crew. Server emits `People` as an array of
+    /// PersonDto; the UI flattens to a stable display projection.
+    pub people: Vec<ItemPerson>,
+    /// T54 phase 3: long-form description.
+    pub overview: Option<String>,
+    /// T54 phase 3: genre tags. Server emits as a flat string array.
+    pub genres: Vec<String>,
+}
+
+/// T54 phase 3 — cast / crew display projection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemPerson {
+    pub id: String,
+    pub name: String,
+    /// e.g. "Director", "Actor", "Writer".
+    pub kind: String,
+    /// Role label (Actor's character name); empty for crew.
+    pub role: String,
+    /// True when ImageTag is non-null — caller composes
+    /// `/Items/{person_id}/Images/Primary`.
+    pub has_image: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +222,23 @@ struct ItemDetailDto {
     image_tags: serde_json::Value,
     #[serde(default)]
     backdrop_image_tags: Vec<serde_json::Value>,
+    #[serde(default)]
+    people: Vec<ItemPersonDto>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    genres: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ItemPersonDto {
+    id: String,
+    name: String,
+    role: String,
+    #[serde(rename = "Type")]
+    kind: String,
+    primary_image_tag: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -226,6 +265,17 @@ pub fn parse_item_detail_response(bytes: &[u8]) -> Result<ItemDetail, ClientErro
         .map(|m| m.contains_key("Primary"))
         .unwrap_or(false);
     let has_backdrop_image = !parsed.backdrop_image_tags.is_empty();
+    let people = parsed
+        .people
+        .into_iter()
+        .map(|p| ItemPerson {
+            id: p.id,
+            name: p.name,
+            kind: p.kind,
+            role: p.role,
+            has_image: p.primary_image_tag.is_some(),
+        })
+        .collect();
     Ok(ItemDetail {
         id: parsed.id,
         name: parsed.name,
@@ -243,6 +293,9 @@ pub fn parse_item_detail_response(bytes: &[u8]) -> Result<ItemDetail, ClientErro
         album_artists: parsed.album_artists.into_iter().map(|p| p.name).collect(),
         has_primary_image,
         has_backdrop_image,
+        people,
+        overview: parsed.overview,
+        genres: parsed.genres,
     })
 }
 
@@ -1341,6 +1394,31 @@ mod tests {
         assert_eq!(v[0].channel_id, "c1");
         assert_eq!(v[0].title, "News");
         assert!(v[0].start_iso.starts_with("2026-05-28T10:00"));
+    }
+
+    #[test]
+    fn parse_item_detail_phase3_extracts_people_overview_genres() {
+        let body = br#"{
+            "Id":"m1","Name":"Blade Runner","Type":"Movie","RunTimeTicks":70200000000,
+            "Overview":"A blade runner hunts replicants.",
+            "Genres":["Sci-Fi","Drama","Mystery"],
+            "People":[
+                {"Id":"p1","Name":"Harrison Ford","Role":"Rick Deckard","Type":"Actor","PrimaryImageTag":"tag1"},
+                {"Id":"p2","Name":"Ridley Scott","Role":"","Type":"Director","PrimaryImageTag":null}
+            ],
+            "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
+        }"#;
+        let d = parse_item_detail_response(body).unwrap();
+        assert_eq!(d.overview.as_deref(), Some("A blade runner hunts replicants."));
+        assert_eq!(d.genres, vec!["Sci-Fi", "Drama", "Mystery"]);
+        assert_eq!(d.people.len(), 2);
+        assert_eq!(d.people[0].name, "Harrison Ford");
+        assert_eq!(d.people[0].role, "Rick Deckard");
+        assert_eq!(d.people[0].kind, "Actor");
+        assert!(d.people[0].has_image);
+        assert_eq!(d.people[1].name, "Ridley Scott");
+        assert_eq!(d.people[1].kind, "Director");
+        assert!(!d.people[1].has_image);
     }
 
     #[test]

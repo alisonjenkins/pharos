@@ -454,11 +454,25 @@ fn DetailPane(
             } else {
                 None
             };
+            let backdrop_image_url = if detail.has_backdrop_image {
+                Some(format!(
+                    "{server_base}/Items/{item_id}/Images/Backdrop?api_key={access_token}"
+                ))
+            } else {
+                None
+            };
+            // Cast portraits use the public `<img>` route; no api_key
+            // needed (matches the Items/Images/Primary contract).
+            let person_image_url_template = Some(format!(
+                "{server_base}/Items/{{person_id}}/Images/Primary"
+            ));
             rsx! {
                 ItemDetailView {
                     detail: detail,
                     error: combined_status,
                     primary_image_url: primary_image_url,
+                    backdrop_image_url: backdrop_image_url,
+                    person_image_url_template: person_image_url_template,
                     on_action: action_handler,
                 }
             }

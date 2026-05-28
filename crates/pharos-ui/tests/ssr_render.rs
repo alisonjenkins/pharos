@@ -736,6 +736,45 @@ fn detail_episode_breadcrumb_series_only() -> Element {
     }
 }
 
+fn detail_with_cast_overview_genres_backdrop() -> Element {
+    use pharos_ui::client::ItemPerson;
+    rsx! {
+        ItemDetailView {
+            detail: ItemDetail {
+                id: "33".into(),
+                name: "Blade Runner".into(),
+                kind: ItemKind::Movie,
+                run_time_ticks: 117 * 60 * 10_000_000,
+                overview: Some("A blade runner hunts replicants.".into()),
+                genres: vec!["Sci-Fi".into(), "Drama".into()],
+                has_backdrop_image: true,
+                people: vec![
+                    ItemPerson {
+                        id: "p1".into(),
+                        name: "Harrison Ford".into(),
+                        kind: "Actor".into(),
+                        role: "Rick Deckard".into(),
+                        has_image: true,
+                    },
+                    ItemPerson {
+                        id: "p2".into(),
+                        name: "Ridley Scott".into(),
+                        kind: "Director".into(),
+                        role: String::new(),
+                        has_image: false,
+                    },
+                ],
+                ..Default::default()
+            },
+            error: None,
+            primary_image_url: None,
+            backdrop_image_url: Some("/Items/33/Images/Backdrop?api_key=tok".to_string()),
+            person_image_url_template: Some("/Items/{person_id}/Images/Primary".to_string()),
+            on_action: move |_| {},
+        }
+    }
+}
+
 #[test]
 fn detail_view_renders_title_runtime_and_play_button() {
     let html = render_root(detail_unplayed_no_position);
@@ -793,6 +832,43 @@ fn detail_view_episode_with_only_series_name_omits_se_label() {
     // No S/E label when both indices missing.
     assert!(!html.contains("S00"), "{html}");
     assert!(!html.contains("pharos-detail-episode-index"), "{html}");
+}
+
+#[test]
+fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
+    let html = render_root(detail_with_cast_overview_genres_backdrop);
+    // Backdrop image
+    assert!(html.contains("pharos-detail-backdrop"), "{html}");
+    assert!(
+        html.contains("/Items/33/Images/Backdrop?api_key=tok"),
+        "{html}"
+    );
+    // Overview text
+    assert!(html.contains("pharos-detail-overview"), "{html}");
+    assert!(
+        html.contains("A blade runner hunts replicants."),
+        "{html}"
+    );
+    // Genres
+    assert!(html.contains("pharos-detail-genres"), "{html}");
+    assert!(html.contains("Sci-Fi, Drama"), "{html}");
+    // Cast section
+    assert!(html.contains("pharos-detail-cast"), "{html}");
+    assert!(html.contains("Harrison Ford"), "{html}");
+    assert!(html.contains("Rick Deckard"), "{html}");
+    // Actor with image renders an img with substituted person id.
+    assert!(
+        html.contains("/Items/p1/Images/Primary"),
+        "{html}"
+    );
+    // Director without image renders kind label `(Director)` instead.
+    assert!(html.contains("Ridley Scott"), "{html}");
+    assert!(html.contains("(Director)"), "{html}");
+    // Director's portrait is suppressed (no has_image).
+    assert!(
+        !html.contains("/Items/p2/Images/Primary"),
+        "{html}"
+    );
 }
 
 // ---- LiveTvView -------------------------------------------------

@@ -5,7 +5,7 @@
 //! WASM-side client; this component is pure (props in / events out).
 
 use crate::api_types::ItemKind;
-use crate::client::ItemDetail;
+use crate::client::{ItemDetail, ItemPerson};
 use dioxus::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,15 @@ pub fn ItemDetailView(
     /// pointing at the resolved image URL. None hides the figure.
     /// Caller composes the URL (`/Items/{id}/Images/Primary?api_key=…`).
     primary_image_url: Option<String>,
+    /// T54 phase 3: when set, renders a `<img class="pharos-detail-backdrop">`
+    /// banner above the title. None hides it.
+    #[props(default)]
+    backdrop_image_url: Option<String>,
+    /// T54 phase 3: URL template (`{person_id}` placeholder) for cast
+    /// portraits. None hides every person image; the row still renders
+    /// with name + role. Caller controls token/base composition.
+    #[props(default)]
+    person_image_url_template: Option<String>,
     on_action: EventHandler<DetailAction>,
 ) -> Element {
     let kind_label = detail.kind.label();
@@ -75,10 +84,31 @@ pub fn ItemDetailView(
             None
         };
 
+    let overview = detail.overview.clone();
+    let genres_line = if detail.genres.is_empty() {
+        None
+    } else {
+        Some(detail.genres.join(", "))
+    };
+    let people = detail.people.clone();
+    let backdrop_url = backdrop_image_url.clone();
+    let person_template = person_image_url_template.clone();
+
     rsx! {
         article {
             class: "pharos-detail",
             "data-kind": "{kind_label}",
+
+            if let Some(url) = backdrop_url.as_ref() {
+                figure {
+                    class: "pharos-detail-backdrop",
+                    img {
+                        src: "{url}",
+                        alt: "{detail.name} backdrop",
+                    }
+                }
+            }
+
             header {
                 class: "pharos-detail-header",
                 button {
@@ -142,6 +172,20 @@ pub fn ItemDetailView(
                 dt { "Kind" } dd { "{kind_label}" }
                 dt { "Runtime" } dd { class: "pharos-detail-runtime", "{runtime}" }
                 dt { "Play count" } dd { class: "pharos-detail-playcount", "{detail.play_count}" }
+                if let Some(g) = genres_line.as_ref() {
+                    dt { "Genres" }
+                    dd {
+                        class: "pharos-detail-genres",
+                        "{g}"
+                    }
+                }
+            }
+
+            if let Some(text) = overview.as_ref() {
+                p {
+                    class: "pharos-detail-overview",
+                    "{text}"
+                }
             }
 
             div {
@@ -167,6 +211,51 @@ pub fn ItemDetailView(
                     onclick: move |_| on_action.call(DetailAction::ToggleFavorite),
                     if detail.is_favorite { "★ Favourite" } else { "☆ Favourite" }
                 }
+            }
+
+            if !people.is_empty() {
+                section {
+                    class: "pharos-detail-cast",
+                    h2 { class: "pharos-detail-cast-heading", "Cast & crew" }
+                    ul {
+                        class: "pharos-detail-cast-list",
+                        for p in people.iter().cloned() {
+                            CastRow {
+                                key: "{p.id}",
+                                person: p,
+                                template: person_template.clone(),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CastRow(person: ItemPerson, template: Option<String>) -> Element {
+    let img_url = if person.has_image {
+        template.as_ref().map(|t| t.replace("{person_id}", &person.id))
+    } else {
+        None
+    };
+    rsx! {
+        li {
+            class: "pharos-detail-cast-row",
+            "data-person-kind": "{person.kind}",
+            if let Some(url) = img_url.as_ref() {
+                img {
+                    class: "pharos-detail-cast-photo",
+                    src: "{url}",
+                    alt: "{person.name}",
+                }
+            }
+            span { class: "pharos-detail-cast-name", "{person.name}" }
+            if !person.role.is_empty() {
+                span { class: "pharos-detail-cast-role", " as {person.role}" }
+            } else if !person.kind.is_empty() {
+                span { class: "pharos-detail-cast-kind", " ({person.kind})" }
             }
         }
     }
