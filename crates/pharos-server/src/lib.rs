@@ -11,6 +11,7 @@ pub mod middleware;
 pub mod obs;
 pub mod router;
 pub mod sessions;
+pub mod ssdp;
 pub mod state;
 pub mod sync;
 pub mod transcode_sessions;

@@ -2532,6 +2532,7 @@ dependencies = [
  "regex-lite",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "sonic-rs",
  "tempfile",
  "thiserror 1.0.69",

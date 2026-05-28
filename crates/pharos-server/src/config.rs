@@ -40,6 +40,19 @@ pub struct ServerConfig {
     /// Optional XMLTV file for the EPG side of the live-TV backend.
     #[serde(default)]
     pub live_tv_xmltv: Option<PathBuf>,
+    /// T48 phase 2 — enable SSDP UDP-multicast responder on
+    /// 239.255.255.250:1900 so DLNA / UPnP control points discover
+    /// pharos without manual configuration. Default false; flip on
+    /// per-deployment when you actually want LAN discovery.
+    #[serde(default)]
+    pub ssdp_enabled: bool,
+    /// Externally-reachable origin pharos publishes in SSDP NOTIFY +
+    /// M-SEARCH replies (`LOCATION:` field points at
+    /// `{advertise_url}/Dlna/{server_id}/description.xml`). Falls
+    /// back to a synthesised `http://{first_lan_ip}:{port}` when
+    /// unset.
+    #[serde(default)]
+    pub ssdp_advertise_url: Option<String>,
 }
 
 fn default_transcode_cache_bytes() -> u64 {

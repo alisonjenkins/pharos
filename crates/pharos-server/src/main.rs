@@ -296,6 +296,33 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     readiness.mark("process").await?;
     readiness.mark("store").await?;
 
+    // T48 phase 2 — opt-in SSDP responder so LAN DLNA / UPnP control
+    // points discover us. The task owns its own UDP socket; we keep a
+    // handle so the runtime tears it down on shutdown.
+    let _ssdp_guard = if cfg.server.ssdp_enabled {
+        let advertise = cfg.server.ssdp_advertise_url.clone().unwrap_or_else(|| {
+            format!(
+                "http://{}",
+                cfg.server.bind.replace("0.0.0.0", "127.0.0.1")
+            )
+        });
+        match pharos_server::ssdp::SsdpResponder::spawn(
+            app_state.server_id.clone(),
+            app_state.server_name.clone(),
+            advertise,
+        )
+        .await
+        {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!(error = %e, "ssdp responder failed to bind; LAN discovery disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let handle_for_app = readiness.clone();
     let ui_dir = cfg.server.ui_dir.clone();
     HttpServer::new(move || {
