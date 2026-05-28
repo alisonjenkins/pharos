@@ -13,9 +13,9 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
-    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, QuickConnectInitiate,
-    RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, ItemChapter, ItemDetail,
+    LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry,
+    QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -648,6 +648,17 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             async move { fetch_api_keys(&base, &token).await }
         })
     };
+    let branding_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_branding(&base, &token).await }
+        })
+    };
     let new_api_key_secret = use_signal::<Option<String>>(|| None);
 
     let action_handler = {
@@ -718,6 +729,12 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                             }
                         }
                     }
+                    AdminAction::SaveBranding(cfg) => {
+                        match save_branding(&base, &token, &cfg).await {
+                            Ok(()) => status_signal.set(Some("Branding saved".into())),
+                            Err(e) => status_signal.set(Some(format!("Branding save failed: {e}"))),
+                        }
+                    }
                     AdminAction::SelectTab(_) => unreachable!("handled above"),
                 }
                 let n = *reload_signal.read();
@@ -761,6 +778,10 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
     };
+    let branding: BrandingConfig = match branding_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => BrandingConfig::default(),
+    };
     let combined_status = fetch_err.or_else(|| status.read().clone());
     let tab_now = *active_tab.read();
     let new_secret_now = new_api_key_secret.read().clone();
@@ -780,6 +801,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             logs: logs,
             api_keys: api_keys,
             new_api_key_secret: new_secret_now,
+            branding: branding,
         }
     }
 }
@@ -2047,6 +2069,30 @@ async fn fetch_activity_entries(base: &str, token: &str) -> Result<Vec<ActivityE
 #[cfg(not(feature = "web"))]
 async fn fetch_activity_entries(_base: &str, _token: &str) -> Result<Vec<ActivityEntry>, String> {
     Err("list_activity_entries is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_branding(base: &str, token: &str) -> Result<BrandingConfig, String> {
+    crate::client::web::fetch_branding_config(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_branding(_base: &str, _token: &str) -> Result<BrandingConfig, String> {
+    Err("fetch_branding_config is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn save_branding(base: &str, token: &str, cfg: &BrandingConfig) -> Result<(), String> {
+    crate::client::web::save_branding_config(base, token, cfg)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn save_branding(_base: &str, _token: &str, _cfg: &BrandingConfig) -> Result<(), String> {
+    Err("save_branding_config is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

@@ -6,8 +6,8 @@
 //! render so the UI is in place when entries land.
 
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, DeviceEntry, LibraryFolder, LogEntry, PluginEntry,
-    ScheduledTask,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, LibraryFolder, LogEntry,
+    PluginEntry, ScheduledTask,
 };
 use dioxus::prelude::*;
 
@@ -44,6 +44,9 @@ pub enum AdminAction {
     RevokeApiKey {
         key_id: String,
     },
+    /// T65 / UI — save the branding form (ServerName + LoginDisclaimer
+    /// + CustomCss) via POST /System/Configuration.
+    SaveBranding(BrandingConfig),
     LibraryRefresh,
     Refresh,
     SelectTab(AdminTab),
@@ -60,6 +63,7 @@ pub enum AdminTab {
     Plugins,
     Logs,
     ApiKeys,
+    Branding,
 }
 
 impl AdminTab {
@@ -73,6 +77,7 @@ impl AdminTab {
             Self::Plugins => "Plugins",
             Self::Logs => "Logs",
             Self::ApiKeys => "API keys",
+            Self::Branding => "Branding",
         }
     }
     fn class_suffix(self) -> &'static str {
@@ -85,9 +90,10 @@ impl AdminTab {
             Self::Plugins => "plugins",
             Self::Logs => "logs",
             Self::ApiKeys => "apikeys",
+            Self::Branding => "branding",
         }
     }
-    fn all() -> [AdminTab; 8] {
+    fn all() -> [AdminTab; 9] {
         [
             Self::Users,
             Self::Libraries,
@@ -97,6 +103,7 @@ impl AdminTab {
             Self::Plugins,
             Self::Logs,
             Self::ApiKeys,
+            Self::Branding,
         ]
     }
 }
@@ -128,6 +135,9 @@ pub struct AdminViewProps {
     /// it after the user dismisses the banner. None hides the banner.
     #[props(default)]
     pub new_api_key_secret: Option<String>,
+    /// T65 — current branding snapshot for the Branding tab.
+    #[props(default)]
+    pub branding: BrandingConfig,
 }
 
 #[component]
@@ -424,6 +434,12 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         on_action: props.on_action,
                     }
                 },
+                AdminTab::Branding => rsx! {
+                    BrandingPane {
+                        branding: props.branding.clone(),
+                        on_action: props.on_action,
+                    }
+                },
             }
         }
     }
@@ -488,6 +504,76 @@ fn ApiKeysPane(
                             on_action: on_action,
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BrandingPane(branding: BrandingConfig, on_action: EventHandler<AdminAction>) -> Element {
+    let mut draft = use_signal(|| branding.clone());
+    use_effect({
+        let branding = branding.clone();
+        move || {
+            draft.set(branding.clone());
+        }
+    });
+    let d = draft.read().clone();
+    rsx! {
+        section {
+            class: "pharos-admin-section pharos-admin-section-branding",
+            h3 { "Branding" }
+            form {
+                class: "pharos-admin-branding-form",
+                onsubmit: move |ev: FormEvent| {
+                    ev.prevent_default();
+                    on_action.call(AdminAction::SaveBranding(draft.read().clone()));
+                },
+                label {
+                    class: "pharos-admin-branding-row",
+                    "Server name: "
+                    input {
+                        class: "pharos-admin-branding-name",
+                        r#type: "text",
+                        value: "{d.server_name}",
+                        oninput: move |ev| {
+                            let mut c = draft.read().clone();
+                            c.server_name = ev.value();
+                            draft.set(c);
+                        },
+                    }
+                }
+                label {
+                    class: "pharos-admin-branding-row",
+                    "Login disclaimer: "
+                    textarea {
+                        class: "pharos-admin-branding-disclaimer",
+                        value: "{d.login_disclaimer}",
+                        oninput: move |ev| {
+                            let mut c = draft.read().clone();
+                            c.login_disclaimer = ev.value();
+                            draft.set(c);
+                        },
+                    }
+                }
+                label {
+                    class: "pharos-admin-branding-row",
+                    "Custom CSS: "
+                    textarea {
+                        class: "pharos-admin-branding-css",
+                        value: "{d.custom_css}",
+                        oninput: move |ev| {
+                            let mut c = draft.read().clone();
+                            c.custom_css = ev.value();
+                            draft.set(c);
+                        },
+                    }
+                }
+                button {
+                    class: "pharos-admin-branding-save",
+                    r#type: "submit",
+                    "Save"
                 }
             }
         }
@@ -658,6 +744,8 @@ mod tests {
         assert_eq!(AdminTab::Logs.label(), "Logs");
         assert_eq!(AdminTab::ApiKeys.label(), "API keys");
         assert_eq!(AdminTab::ApiKeys.class_suffix(), "apikeys");
-        assert_eq!(AdminTab::all().len(), 8);
+        assert_eq!(AdminTab::Branding.label(), "Branding");
+        assert_eq!(AdminTab::Branding.class_suffix(), "branding");
+        assert_eq!(AdminTab::all().len(), 9);
     }
 }

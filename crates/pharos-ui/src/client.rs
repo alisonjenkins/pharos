@@ -342,6 +342,44 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
         .collect())
 }
 
+/// T65 / UI — runtime-mutable branding snapshot the dashboard's
+/// Branding pane reads + writes. ServerName comes from /System/Info;
+/// LoginDisclaimer + CustomCss come from /Branding/Configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrandingConfig {
+    pub server_name: String,
+    pub login_disclaimer: String,
+    pub custom_css: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct BrandingConfigurationDto {
+    #[serde(default)]
+    login_disclaimer: String,
+    #[serde(default)]
+    custom_css: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SystemInfoNameDto {
+    #[serde(default)]
+    server_name: String,
+}
+
+pub fn parse_branding_configuration(bytes: &[u8]) -> Result<(String, String), ClientError> {
+    let dto: BrandingConfigurationDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok((dto.login_disclaimer, dto.custom_css))
+}
+
+pub fn parse_system_info_server_name(bytes: &[u8]) -> Result<String, ClientError> {
+    let dto: SystemInfoNameDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(dto.server_name)
+}
+
 /// T63 / UI — `/QuickConnect/Initiate` response.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuickConnectInitiate {
@@ -1718,6 +1756,68 @@ pub mod web {
         parse_quick_connect_poll(&bytes)
     }
 
+    pub async fn fetch_branding_config(
+        base: &str,
+        token: &str,
+    ) -> Result<BrandingConfig, ClientError> {
+        let info_resp = Request::get(&format!("{base}/System/Info"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !info_resp.ok() {
+            return Err(ClientError::Status(info_resp.status()));
+        }
+        let info_bytes = info_resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let server_name = parse_system_info_server_name(&info_bytes)?;
+
+        let brand_resp = Request::get(&format!("{base}/Branding/Configuration"))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !brand_resp.ok() {
+            return Err(ClientError::Status(brand_resp.status()));
+        }
+        let brand_bytes = brand_resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let (login_disclaimer, custom_css) = parse_branding_configuration(&brand_bytes)?;
+        Ok(BrandingConfig {
+            server_name,
+            login_disclaimer,
+            custom_css,
+        })
+    }
+
+    pub async fn save_branding_config(
+        base: &str,
+        token: &str,
+        cfg: &BrandingConfig,
+    ) -> Result<(), ClientError> {
+        let body = serde_json::json!({
+            "ServerName": cfg.server_name,
+            "LoginDisclaimer": cfg.login_disclaimer,
+            "CustomCss": cfg.custom_css,
+        })
+        .to_string();
+        let resp = Request::post(&format!("{base}/System/Configuration"))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn list_cultures(
         base: &str,
         token: &str,
@@ -2019,6 +2119,21 @@ mod tests {
         let v = parse_activity_entries_response(body).unwrap();
         assert_eq!(v[0].id, "abc");
         assert_eq!(v[1].id, "42");
+    }
+
+    #[test]
+    fn parse_branding_configuration_extracts_disclaimer_and_css() {
+        let body = br#"{"LoginDisclaimer":"Hello","CustomCss":"body { color: red }"}"#;
+        let (disc, css) = parse_branding_configuration(body).unwrap();
+        assert_eq!(disc, "Hello");
+        assert_eq!(css, "body { color: red }");
+    }
+
+    #[test]
+    fn parse_system_info_server_name_extracts_name() {
+        let body = br#"{"ServerName":"My Pharos","Id":"abc","Version":"10.11.0"}"#;
+        let name = parse_system_info_server_name(body).unwrap();
+        assert_eq!(name, "My Pharos");
     }
 
     #[test]

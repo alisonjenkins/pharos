@@ -12,9 +12,9 @@
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::{
-    ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
-    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, QuickConnectInitiate,
-    RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, ItemChapter, ItemDetail,
+    LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry,
+    QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
@@ -596,6 +596,33 @@ fn admin_view_apikeys_tab_surfaces_new_secret_and_revoke_button() {
     assert!(html.contains("pharos-admin-apikey-revoke"), "{html}");
     assert!(html.contains("cli"), "{html}");
     assert!(html.contains("2026-05-28T08:00:00Z"), "{html}");
+}
+
+fn admin_branding_tab() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Branding,
+            branding: BrandingConfig {
+                server_name: "My Pharos".into(),
+                login_disclaimer: "Welcome aboard".into(),
+                custom_css: "body{}".into(),
+            },
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn admin_view_branding_tab_renders_populated_form() {
+    let html = render_root(admin_branding_tab);
+    assert!(html.contains(r#"data-tab="branding""#), "{html}");
+    assert!(html.contains("pharos-admin-section-branding"), "{html}");
+    assert!(html.contains(r#"value="My Pharos""#), "{html}");
+    assert!(html.contains("Welcome aboard"), "{html}");
+    assert!(html.contains("pharos-admin-branding-save"), "{html}");
 }
 
 #[test]
