@@ -214,3 +214,91 @@ async fn scheduled_tasks_and_plugins_return_empty_arrays() {
         assert!(v.as_array().unwrap().is_empty(), "{path}");
     }
 }
+
+#[actix_web::test]
+async fn api_key_create_lists_then_revoke_drops_it() {
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+
+    // List starts empty.
+    let req = test::TestRequest::get()
+        .uri("/Auth/Keys")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 0);
+
+    // Create a new key.
+    let req = test::TestRequest::post()
+        .uri("/Auth/Keys?App=cli")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(created["AppName"], "cli");
+    assert_eq!(created["Id"], "apikey:cli");
+    let new_token = created["AccessToken"].as_str().unwrap().to_string();
+    assert!(!new_token.is_empty());
+
+    // List now reports it.
+    let req = test::TestRequest::get()
+        .uri("/Auth/Keys")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1);
+    assert_eq!(v["Items"][0]["AppName"], "cli");
+    // Token string never surfaces via list.
+    assert_eq!(v["Items"][0]["AccessToken"], "");
+
+    // Revoke.
+    let req = test::TestRequest::delete()
+        .uri("/Auth/Keys/apikey%3Acli")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204);
+
+    // List empty again.
+    let req = test::TestRequest::get()
+        .uri("/Auth/Keys")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 0);
+
+    // Revoking unknown id 404s.
+    let req = test::TestRequest::delete()
+        .uri("/Auth/Keys/apikey%3Anope")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[actix_web::test]
+async fn api_key_create_requires_admin() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Auth/Keys?App=cli")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 403);
+}
+
+#[actix_web::test]
+async fn api_key_create_rejects_empty_app() {
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Auth/Keys?App=")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400);
+}

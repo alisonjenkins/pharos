@@ -6,7 +6,8 @@
 //! render so the UI is in place when entries land.
 
 use crate::client::{
-    ActivityEntry, AdminUser, DeviceEntry, LibraryFolder, LogEntry, PluginEntry, ScheduledTask,
+    ActivityEntry, AdminUser, ApiKey, DeviceEntry, LibraryFolder, LogEntry, PluginEntry,
+    ScheduledTask,
 };
 use dioxus::prelude::*;
 
@@ -35,6 +36,14 @@ pub enum AdminAction {
         user_id: String,
         new_password: String,
     },
+    /// T58 phase 3 — issue a new API key (`/Auth/Keys?App=name`).
+    CreateApiKey {
+        app_name: String,
+    },
+    /// T58 phase 3 — revoke an API key by its server-assigned id.
+    RevokeApiKey {
+        key_id: String,
+    },
     LibraryRefresh,
     Refresh,
     SelectTab(AdminTab),
@@ -50,6 +59,7 @@ pub enum AdminTab {
     ScheduledTasks,
     Plugins,
     Logs,
+    ApiKeys,
 }
 
 impl AdminTab {
@@ -62,6 +72,7 @@ impl AdminTab {
             Self::ScheduledTasks => "Tasks",
             Self::Plugins => "Plugins",
             Self::Logs => "Logs",
+            Self::ApiKeys => "API keys",
         }
     }
     fn class_suffix(self) -> &'static str {
@@ -73,9 +84,10 @@ impl AdminTab {
             Self::ScheduledTasks => "scheduledtasks",
             Self::Plugins => "plugins",
             Self::Logs => "logs",
+            Self::ApiKeys => "apikeys",
         }
     }
-    fn all() -> [AdminTab; 7] {
+    fn all() -> [AdminTab; 8] {
         [
             Self::Users,
             Self::Libraries,
@@ -84,6 +96,7 @@ impl AdminTab {
             Self::ScheduledTasks,
             Self::Plugins,
             Self::Logs,
+            Self::ApiKeys,
         ]
     }
 }
@@ -108,6 +121,13 @@ pub struct AdminViewProps {
     pub plugins: Vec<PluginEntry>,
     #[props(default)]
     pub logs: Vec<LogEntry>,
+    #[props(default)]
+    pub api_keys: Vec<ApiKey>,
+    /// T58 phase 3 — most-recently-created key's secret string. Surfaces
+    /// the AccessToken once after the POST round-trip; the parent clears
+    /// it after the user dismisses the banner. None hides the banner.
+    #[props(default)]
+    pub new_api_key_secret: Option<String>,
 }
 
 #[component]
@@ -397,6 +417,103 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         }
                     }
                 },
+                AdminTab::ApiKeys => rsx! {
+                    ApiKeysPane {
+                        keys: props.api_keys.clone(),
+                        new_secret: props.new_api_key_secret.clone(),
+                        on_action: props.on_action,
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn ApiKeysPane(
+    keys: Vec<ApiKey>,
+    new_secret: Option<String>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let mut new_name = use_signal(String::new);
+    let mut name_for_submit = new_name;
+    rsx! {
+        section {
+            class: "pharos-admin-section pharos-admin-section-apikeys",
+            h3 { "API keys" }
+            if let Some(secret) = new_secret.as_ref() {
+                p {
+                    class: "pharos-admin-apikey-new",
+                    "New key (copy now — won't be shown again): "
+                    code { class: "pharos-admin-apikey-value", "{secret}" }
+                }
+            }
+            form {
+                class: "pharos-admin-apikey-create",
+                onsubmit: {
+                    let on_action = on_action;
+                    move |ev: FormEvent| {
+                        ev.prevent_default();
+                        let name = name_for_submit.read().clone();
+                        let trimmed = name.trim().to_string();
+                        if trimmed.is_empty() {
+                            return;
+                        }
+                        on_action.call(AdminAction::CreateApiKey { app_name: trimmed });
+                        name_for_submit.set(String::new());
+                    }
+                },
+                input {
+                    class: "pharos-admin-apikey-name",
+                    r#type: "text",
+                    placeholder: "App name",
+                    value: "{new_name.read()}",
+                    oninput: move |ev| new_name.set(ev.value()),
+                }
+                button {
+                    class: "pharos-admin-apikey-create-submit",
+                    r#type: "submit",
+                    "Issue key"
+                }
+            }
+            if keys.is_empty() {
+                p { class: "pharos-empty", "No API keys issued" }
+            } else {
+                ul {
+                    class: "pharos-admin-apikey-list",
+                    for k in keys.iter().cloned() {
+                        ApiKeyRow {
+                            key: "{k.id}",
+                            entry: k,
+                            on_action: on_action,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ApiKeyRow(entry: ApiKey, on_action: EventHandler<AdminAction>) -> Element {
+    let id_for_revoke = entry.id.clone();
+    rsx! {
+        li {
+            class: "pharos-admin-apikey",
+            "data-apikey-id": "{entry.id}",
+            span { class: "pharos-admin-apikey-app", "{entry.app_name}" }
+            if !entry.date_created_iso.is_empty() {
+                span {
+                    class: "pharos-admin-apikey-date",
+                    " · issued {entry.date_created_iso}"
+                }
+            }
+            button {
+                class: "pharos-admin-apikey-revoke",
+                onclick: move |_| on_action.call(AdminAction::RevokeApiKey {
+                    key_id: id_for_revoke.clone(),
+                }),
+                "Revoke"
             }
         }
     }
@@ -539,6 +656,8 @@ mod tests {
         assert_eq!(AdminTab::ScheduledTasks.label(), "Tasks");
         assert_eq!(AdminTab::Plugins.class_suffix(), "plugins");
         assert_eq!(AdminTab::Logs.label(), "Logs");
-        assert_eq!(AdminTab::all().len(), 7);
+        assert_eq!(AdminTab::ApiKeys.label(), "API keys");
+        assert_eq!(AdminTab::ApiKeys.class_suffix(), "apikeys");
+        assert_eq!(AdminTab::all().len(), 8);
     }
 }

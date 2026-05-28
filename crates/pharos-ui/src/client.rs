@@ -682,6 +682,76 @@ pub fn parse_plugins_response(bytes: &[u8]) -> Result<Vec<PluginEntry>, ClientEr
         .collect())
 }
 
+/// T58 phase 3 — `/Auth/Keys` row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApiKey {
+    pub id: String,
+    pub app_name: String,
+    pub date_created_iso: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ApiKeyDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    app_name: String,
+    #[serde(default)]
+    date_created: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ApiKeysResultDto {
+    #[serde(default)]
+    items: Vec<ApiKeyDto>,
+}
+
+pub fn parse_api_keys_response(bytes: &[u8]) -> Result<Vec<ApiKey>, ClientError> {
+    let parsed: ApiKeysResultDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .items
+        .into_iter()
+        .map(|k| ApiKey {
+            id: k.id,
+            app_name: k.app_name,
+            date_created_iso: k.date_created,
+        })
+        .collect())
+}
+
+/// T58 phase 3 — `/Auth/Keys` POST result. The raw `access_token` is
+/// returned ONCE; the UI surfaces it then drops it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NewApiKey {
+    pub id: String,
+    pub app_name: String,
+    pub access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct NewApiKeyDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    app_name: String,
+    #[serde(default)]
+    access_token: String,
+}
+
+pub fn parse_new_api_key_response(bytes: &[u8]) -> Result<NewApiKey, ClientError> {
+    let parsed: NewApiKeyDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(NewApiKey {
+        id: parsed.id,
+        app_name: parsed.app_name,
+        access_token: parsed.access_token,
+    })
+}
+
 /// T58 phase 2 — `/System/Logs` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogEntry {
@@ -1243,6 +1313,64 @@ pub mod web {
         Ok(())
     }
 
+    pub async fn list_api_keys(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<ApiKey>, ClientError> {
+        let resp = Request::get(&format!("{base}/Auth/Keys"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_api_keys_response(&bytes)
+    }
+
+    pub async fn create_api_key(
+        base: &str,
+        token: &str,
+        app_name: &str,
+    ) -> Result<NewApiKey, ClientError> {
+        let url = format!("{base}/Auth/Keys?App={}", urlencode(app_name));
+        let resp = Request::post(&url)
+            .header("X-Emby-Token", token)
+            .body("")
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_new_api_key_response(&bytes)
+    }
+
+    pub async fn revoke_api_key(
+        base: &str,
+        token: &str,
+        key_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::delete(&format!("{base}/Auth/Keys/{}", urlencode(key_id)))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn list_scheduled_tasks(
         base: &str,
         token: &str,
@@ -1533,6 +1661,27 @@ mod tests {
         assert_eq!(v[0].now_playing_item_id.as_deref(), Some("item-9"));
         assert_eq!(v[0].position_ticks, 1234567890);
         assert!(v[1].now_playing_item_id.is_none());
+    }
+
+    #[test]
+    fn parse_api_keys_extracts_app_name_and_date() {
+        let body = br#"{"Items":[
+            {"Id":"apikey:cli","AppName":"cli","DateCreated":"2026-05-28T08:00:00Z"}
+        ],"TotalRecordCount":1,"StartIndex":0}"#;
+        let v = parse_api_keys_response(body).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].app_name, "cli");
+        assert_eq!(v[0].id, "apikey:cli");
+    }
+
+    #[test]
+    fn parse_new_api_key_extracts_access_token_once() {
+        let body = br#"{
+            "Id":"apikey:cli","AppName":"cli","AccessToken":"abc123","DateCreated":"2026-05-28T08:00:00Z"
+        }"#;
+        let v = parse_new_api_key_response(body).unwrap();
+        assert_eq!(v.access_token, "abc123");
+        assert_eq!(v.app_name, "cli");
     }
 
     #[test]

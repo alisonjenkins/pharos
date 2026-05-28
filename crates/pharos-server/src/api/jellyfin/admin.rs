@@ -14,7 +14,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{AuthError, SecretString, UserId, UserPolicy, UserRecord, UserStore};
+use pharos_core::{AuthError, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -49,7 +49,122 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/system/configuration/{key}",
             web::post().to(post_system_configuration_key),
-        );
+        )
+        // T58 phase 3 — API keys. `device_id` doubles as the key id; the
+        // raw token string is returned ONCE on creation and never
+        // surfaced via list afterwards.
+        .route("/auth/keys", web::get().to(list_api_keys))
+        .route("/auth/keys", web::post().to(create_api_key))
+        .route("/auth/keys/{device_id}", web::delete().to(revoke_api_key));
+}
+
+const API_KEY_PREFIX: &str = "apikey:";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CreateApiKeyQuery {
+    /// `App` matches jellyfin-web's `/Auth/Keys` form param. Tucks into
+    /// the token's `device_id` as `apikey:{app}` so the key shows up
+    /// in /Sessions with the app name and is revokable via DELETE
+    /// `/Auth/Keys/{device_id}`.
+    #[serde(default)]
+    app: String,
+}
+
+async fn list_api_keys(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let tokens = state
+        .stores
+        .tokens_for(user.0.id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let items: Vec<serde_json::Value> = tokens
+        .into_iter()
+        .filter(|t| t.device_id.starts_with(API_KEY_PREFIX))
+        .map(|t| {
+            let app_name = t
+                .device_id
+                .strip_prefix(API_KEY_PREFIX)
+                .unwrap_or(&t.device_id)
+                .to_string();
+            serde_json::json!({
+                "AppName": app_name,
+                // Jellyfin clients display DateCreated only — they
+                // never see the raw token after issuance.
+                "DateCreated": iso8601_from_unix(t.issued_at_unix_secs),
+                // `device_id` doubles as the stable id for DELETE.
+                "AccessToken": "",
+                "Id": t.device_id,
+            })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+async fn create_api_key(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<CreateApiKeyQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let app_name = q.app.trim();
+    if app_name.is_empty() {
+        return Err(error::ErrorBadRequest("App query param required"));
+    }
+    let device_id = format!("{API_KEY_PREFIX}{app_name}");
+    let token = state
+        .stores
+        .issue(user.0.id, &device_id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "AppName": app_name,
+        "AccessToken": token.0.expose(),
+        "Id": device_id,
+        "DateCreated": iso8601_from_unix(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        ),
+    })))
+}
+
+async fn revoke_api_key(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let device_id = path.into_inner();
+    if !device_id.starts_with(API_KEY_PREFIX) {
+        return Err(error::ErrorBadRequest("not an API key id"));
+    }
+    let dropped = state
+        .stores
+        .revoke_tokens_by_device(user.0.id, &device_id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if dropped == 0 {
+        return Err(error::ErrorNotFound("api key not found"));
+    }
+    Ok(HttpResponse::NoContent().finish())
+}
+
+fn iso8601_from_unix(secs: i64) -> String {
+    // Reuse the same simple formatter the user_data layer uses — keep
+    // chrono out of the binary. Pull in from dto if it's already
+    // exposed, else implement inline.
+    use crate::api::jellyfin::dto::format_iso8601;
+    format_iso8601(secs)
 }
 
 async fn empty_array(_user: AuthUser) -> impl Responder {

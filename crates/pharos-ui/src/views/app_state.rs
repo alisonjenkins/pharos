@@ -13,8 +13,8 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder, LiveChannel,
-    LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
+    ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
+    LiveChannel, LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
     UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
@@ -607,6 +607,18 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             async move { fetch_logs(&base, &token).await }
         })
     };
+    let api_keys_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_api_keys(&base, &token).await }
+        })
+    };
+    let new_api_key_secret = use_signal::<Option<String>>(|| None);
 
     let action_handler = {
         let access_token = access_token.clone();
@@ -614,6 +626,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let mut reload_signal = reload;
         let mut status_signal = status;
         let mut active_tab_signal = active_tab;
+        let mut new_secret_signal = new_api_key_secret;
         move |action: AdminAction| {
             let token = access_token.clone();
             let base = server_base.clone();
@@ -654,6 +667,27 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                         Ok(()) => status_signal.set(Some(format!("Password reset for {user_id}"))),
                         Err(e) => status_signal.set(Some(format!("Password reset failed: {e}"))),
                     },
+                    AdminAction::CreateApiKey { app_name } => {
+                        match create_api_key(&base, &token, &app_name).await {
+                            Ok(secret) => {
+                                new_secret_signal.set(Some(secret));
+                                status_signal.set(Some(format!("Issued API key '{app_name}'")));
+                            }
+                            Err(e) => status_signal
+                                .set(Some(format!("API-key creation failed: {e}"))),
+                        }
+                    }
+                    AdminAction::RevokeApiKey { key_id } => {
+                        match revoke_api_key(&base, &token, &key_id).await {
+                            Ok(()) => {
+                                new_secret_signal.set(None);
+                                status_signal.set(Some(format!("Revoked {key_id}")));
+                            }
+                            Err(e) => {
+                                status_signal.set(Some(format!("API-key revoke failed: {e}")))
+                            }
+                        }
+                    }
                     AdminAction::SelectTab(_) => unreachable!("handled above"),
                 }
                 let n = *reload_signal.read();
@@ -693,8 +727,13 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
     };
+    let api_keys: Vec<ApiKey> = match api_keys_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
     let combined_status = fetch_err.or_else(|| status.read().clone());
     let tab_now = *active_tab.read();
+    let new_secret_now = new_api_key_secret.read().clone();
 
     rsx! {
         AdminView {
@@ -709,6 +748,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             scheduled_tasks: scheduled_tasks,
             plugins: plugins,
             logs: logs,
+            api_keys: api_keys,
+            new_api_key_secret: new_secret_now,
         }
     }
 }
@@ -1452,6 +1493,43 @@ async fn send_general(
     _arg: serde_json::Value,
 ) -> Result<(), String> {
     Err("send_session_general is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_api_keys(base: &str, token: &str) -> Result<Vec<ApiKey>, String> {
+    crate::client::web::list_api_keys(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_api_keys(_base: &str, _token: &str) -> Result<Vec<ApiKey>, String> {
+    Err("list_api_keys is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn create_api_key(base: &str, token: &str, app_name: &str) -> Result<String, String> {
+    crate::client::web::create_api_key(base, token, app_name)
+        .await
+        .map(|k| k.access_token)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn create_api_key(_base: &str, _token: &str, _app_name: &str) -> Result<String, String> {
+    Err("create_api_key is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn revoke_api_key(base: &str, token: &str, key_id: &str) -> Result<(), String> {
+    crate::client::web::revoke_api_key(base, token, key_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn revoke_api_key(_base: &str, _token: &str, _key_id: &str) -> Result<(), String> {
+    Err("revoke_api_key is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

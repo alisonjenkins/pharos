@@ -12,8 +12,8 @@
 use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::{
-    ActivityEntry, AdminUser, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder, LiveChannel,
-    LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
+    ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
+    LiveChannel, LiveProgram, LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint,
     UserConfiguration,
 };
 use pharos_ui::views::{
@@ -531,6 +531,58 @@ fn admin_view_logs_tab_renders_log_list() {
     assert!(html.contains("pharos-admin-section-logs"), "{html}");
     assert!(html.contains("pharos.log"), "{html}");
     assert!(html.contains("12345"), "{html}");
+}
+
+fn admin_apikeys_with_new_secret() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::ApiKeys,
+            api_keys: vec![ApiKey {
+                id: "apikey:cli".into(),
+                app_name: "cli".into(),
+                date_created_iso: "2026-05-28T08:00:00Z".into(),
+            }],
+            new_api_key_secret: Some("secret-token-xyz".to_string()),
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_apikeys_empty() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::ApiKeys,
+            api_keys: Vec::<ApiKey>::new(),
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn admin_view_apikeys_tab_surfaces_new_secret_and_revoke_button() {
+    let html = render_root(admin_apikeys_with_new_secret);
+    assert!(html.contains(r#"data-tab="apikeys""#), "{html}");
+    assert!(html.contains("pharos-admin-section-apikeys"), "{html}");
+    assert!(html.contains("pharos-admin-apikey-new"), "{html}");
+    assert!(html.contains("secret-token-xyz"), "{html}");
+    assert!(html.contains("pharos-admin-apikey-revoke"), "{html}");
+    assert!(html.contains("cli"), "{html}");
+    assert!(html.contains("2026-05-28T08:00:00Z"), "{html}");
+}
+
+#[test]
+fn admin_view_apikeys_tab_renders_empty_state_and_create_form() {
+    let html = render_root(admin_apikeys_empty);
+    assert!(html.contains("No API keys issued"), "{html}");
+    assert!(html.contains("pharos-admin-apikey-create"), "{html}");
+    // No new-secret banner when none queued.
+    assert!(!html.contains("pharos-admin-apikey-new"), "{html}");
 }
 
 // ---- ServerPickerView ------------------------------------------

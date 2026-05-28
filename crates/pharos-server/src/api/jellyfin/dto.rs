@@ -377,8 +377,9 @@ impl UserItemDataDto {
 }
 
 /// Minimal ISO-8601 (Z) formatter for the `LastPlayedDate` field —
-/// avoids pulling in `chrono` just for one render path.
-fn format_iso8601(unix_secs: i64) -> String {
+/// avoids pulling in `chrono` just for one render path. T58 phase 3
+/// reuses it from the admin module for `/Auth/Keys` DateCreated.
+pub(crate) fn format_iso8601(unix_secs: i64) -> String {
     // Constants: days/month etc. Use the same algorithm as
     // chrono::NaiveDateTime::from_timestamp — straightforward Gregorian
     // calendar arithmetic. Good enough for "last played" display.
