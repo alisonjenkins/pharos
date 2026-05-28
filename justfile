@@ -53,6 +53,15 @@ compat-client:
 compat-playwright:
     nix develop --command bash -c 'cd compat-playwright && npx playwright test'
 
+# T51 phase 3 — drive the pharos Dioxus UI under headless chromium.
+# Assumes pharos is running with `[server].ui_dir` pointed at a
+# `dx build` output. Skips cleanly when `/ui/` is not served.
+# Build the bundle once via:
+#   nix develop --command dx build --package pharos-ui --release
+# then point `[server].ui_dir` at `target/dx/pharos-ui/release/web/public`.
+compat-dioxus:
+    nix develop --command bash -c 'cd compat-playwright && npx playwright test --config playwright.dioxus.config.ts'
+
 # Convenience: spin up pharos with seeded data + run Playwright in one
 # shot. Uses a fresh tmp sqlite db so prior state doesn't leak.
 compat-playwright-full:
