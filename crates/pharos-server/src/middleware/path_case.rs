@@ -135,15 +135,13 @@ mod tests {
 
     #[actix_web::test]
     async fn middleware_routes_pascalcase_to_lowercase_handler() {
-        let app = at::init_service(
-            App::new().wrap(LowercasePath).route(
-                "/items/{id}",
-                web::get().to(|p: web::Path<String>| {
-                    let id = p.into_inner();
-                    async move { HttpResponse::Ok().body(id) }
-                }),
-            ),
-        )
+        let app = at::init_service(App::new().wrap(LowercasePath).route(
+            "/items/{id}",
+            web::get().to(|p: web::Path<String>| {
+                let id = p.into_inner();
+                async move { HttpResponse::Ok().body(id) }
+            }),
+        ))
         .await;
 
         // PascalCase request — handler is only registered as lowercase.
@@ -170,7 +168,9 @@ mod tests {
             "/items",
             web::get().to(|q: web::Query<std::collections::HashMap<String, String>>| {
                 let map = q.into_inner();
-                async move { HttpResponse::Ok().body(map.get("SearchTerm").cloned().unwrap_or_default()) }
+                async move {
+                    HttpResponse::Ok().body(map.get("SearchTerm").cloned().unwrap_or_default())
+                }
             }),
         ))
         .await;

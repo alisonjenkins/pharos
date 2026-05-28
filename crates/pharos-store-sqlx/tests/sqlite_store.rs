@@ -86,8 +86,13 @@ async fn concurrent_puts_do_not_lose_data() {
     for i in 1..=n {
         let s = s.clone();
         handles.push(tokio::spawn(async move {
-            s.put(item(i, &format!("/m/{i}.mkv"), &format!("t{i}"), MediaKind::Movie))
-                .await
+            s.put(item(
+                i,
+                &format!("/m/{i}.mkv"),
+                &format!("t{i}"),
+                MediaKind::Movie,
+            ))
+            .await
         }));
     }
     for h in handles {

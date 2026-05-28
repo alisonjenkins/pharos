@@ -10,9 +10,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_mixed_kinds() -> (web::Data<AppState>, String) {
@@ -67,7 +65,6 @@ fn build_app(
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
 }
-
 
 #[actix_web::test]
 async fn include_item_types_accepts_lowercase() {

@@ -53,18 +53,15 @@ fn direct_play_profile_strat() -> impl Strategy<Value = DirectPlayProfile> {
 }
 
 fn transcoding_profile_strat() -> impl Strategy<Value = TranscodingProfile> {
-    (
-        container_strat(),
-        video_codec_strat(),
-        audio_codec_strat(),
-    )
-        .prop_map(|(c, v, a)| TranscodingProfile {
+    (container_strat(), video_codec_strat(), audio_codec_strat()).prop_map(|(c, v, a)| {
+        TranscodingProfile {
             container: c,
             video_codec: v,
             audio_codec: a,
             protocol: "hls".into(),
             kind: "Video".into(),
-        })
+        }
+    })
 }
 
 fn profile_strat() -> impl Strategy<Value = DeviceProfile> {

@@ -129,8 +129,7 @@ impl MediaStore for PostgresStore {
         let series_name = item.series.as_ref().map(|s| s.series_name.as_str());
         let season_number = item.series.as_ref().and_then(|s| s.season_number);
         let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
-        let subtitle_tracks_json =
-            crate::subtitle_track_json::encode(&p.subtitle_tracks);
+        let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
         let created_at = item.created_at.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -228,22 +227,19 @@ impl UserStore for PostgresStore {
         .await;
         match res {
             Ok(_) => Ok(()),
-            Err(sqlx::Error::Database(e)) if e.constraint().is_some() => {
-                Err(AuthError::Conflict)
-            }
+            Err(sqlx::Error::Database(e)) if e.constraint().is_some() => Err(AuthError::Conflict),
             Err(e) => Err(map_sqlx(e)),
         }
     }
 
     #[tracing::instrument(skip(self), fields(user.name = %name))]
     async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
-        let row: Option<(Vec<u8>, String, String, i32)> = sqlx::query_as(
-            "SELECT id, name, password_hash, admin FROM users WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i32)> =
+            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -252,13 +248,12 @@ impl UserStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
-        let row: Option<(Vec<u8>, String, String, i32)> = sqlx::query_as(
-            "SELECT id, name, password_hash, admin FROM users WHERE id = $1",
-        )
-        .bind(id_bytes)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i32)> =
+            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE id = $1")
+                .bind(id_bytes)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -266,12 +261,11 @@ impl UserStore for PostgresStore {
 
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> AuthResult<Vec<UserRecord>> {
-        let rows: Vec<(Vec<u8>, String, String, i32)> = sqlx::query_as(
-            "SELECT id, name, password_hash, admin FROM users ORDER BY LOWER(name)",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        let rows: Vec<(Vec<u8>, String, String, i32)> =
+            sqlx::query_as("SELECT id, name, password_hash, admin FROM users ORDER BY LOWER(name)")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
         rows.into_iter().map(record_from_row).collect()
     }
 
@@ -333,8 +327,8 @@ impl TokenStore for PostgresStore {
                 .await
                 .map_err(map_sqlx)?;
         let (bytes,) = row.ok_or(AuthError::InvalidToken)?;
-        let uuid = Uuid::from_slice(&bytes)
-            .map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
+        let uuid =
+            Uuid::from_slice(&bytes).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
         Ok(UserId(uuid))
     }
 
@@ -361,21 +355,19 @@ impl TokenStore for PostgresStore {
         .map_err(map_sqlx)?;
         Ok(rows
             .into_iter()
-            .map(|(device_id, issued_at_unix_secs)| pharos_core::TokenRecord {
-                device_id,
-                issued_at_unix_secs,
-            })
+            .map(
+                |(device_id, issued_at_unix_secs)| pharos_core::TokenRecord {
+                    device_id,
+                    issued_at_unix_secs,
+                },
+            )
             .collect())
     }
 }
 
 impl UserDataStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(user.id = %user.0, media.id = %item))]
-    async fn get_user_data(
-        &self,
-        user: UserId,
-        item: MediaId,
-    ) -> DomainResult<UserItemData> {
+    async fn get_user_data(&self, user: UserId, item: MediaId) -> DomainResult<UserItemData> {
         let id_bytes = user.0.as_bytes().to_vec();
         let item_i64 = media_id_i64(item)?;
         let row: Option<(i32, i32, i64, i32, i64)> = sqlx::query_as(
@@ -482,8 +474,7 @@ impl UserDataStore for PostgresStore {
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         rows.into_iter()
             .map(|(id,)| {
-                u64::try_from(id)
-                    .map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+                u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
             })
             .collect()
     }

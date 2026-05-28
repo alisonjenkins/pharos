@@ -84,8 +84,8 @@ impl SqliteStore {
 impl MediaStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
-        let id_i64 = i64::try_from(id)
-            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
         let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items WHERE id = ?");
         let row = sqlx::query_as::<_, MediaRow>(&sql)
             .bind(id_i64)
@@ -110,8 +110,7 @@ impl MediaStore for SqliteStore {
         let series_name = item.series.as_ref().map(|s| s.series_name.as_str());
         let season_number = item.series.as_ref().and_then(|s| s.season_number);
         let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
-        let subtitle_tracks_json =
-            crate::subtitle_track_json::encode(&p.subtitle_tracks);
+        let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)

@@ -19,7 +19,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // rewrites jellyfin-web's PascalCase before the router matches.
     cfg.route("/sessions", web::get().to(list_sessions))
         .route("/sessions/playing", web::post().to(playing_started))
-        .route("/sessions/playing/progress", web::post().to(playing_progress))
+        .route(
+            "/sessions/playing/progress",
+            web::post().to(playing_progress),
+        )
         .route("/sessions/playing/stopped", web::post().to(playing_stopped))
         .route("/sessions/capabilities", web::post().to(capabilities))
         .route("/sessions/capabilities/full", web::post().to(capabilities))
@@ -170,7 +173,12 @@ async fn playing_progress(
         if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
             data.last_played_position_ticks = position_ticks;
             data.last_played_at = now_unix();
-            if state.stores.set_user_data(user.0.id, item_id, data).await.is_ok() {
+            if state
+                .stores
+                .set_user_data(user.0.id, item_id, data)
+                .await
+                .is_ok()
+            {
                 state.notify_user_data_changed(
                     &user.0.id.0.simple().to_string(),
                     &item_id.to_string(),
@@ -219,8 +227,7 @@ async fn playing_stopped(
                 .ok()
                 .and_then(|it| it.probe.run_time_ticks())
                 .unwrap_or(0);
-            let finished =
-                runtime > 0 && position >= runtime.saturating_sub(runtime / 10);
+            let finished = runtime > 0 && position >= runtime.saturating_sub(runtime / 10);
             if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
                 if finished {
                     data.played = true;
@@ -230,7 +237,12 @@ async fn playing_stopped(
                     data.last_played_position_ticks = position;
                 }
                 data.last_played_at = now_unix();
-                if state.stores.set_user_data(user.0.id, item_id, data).await.is_ok() {
+                if state
+                    .stores
+                    .set_user_data(user.0.id, item_id, data)
+                    .await
+                    .is_ok()
+                {
                     state.notify_user_data_changed(
                         &user.0.id.0.simple().to_string(),
                         &item_id.to_string(),
@@ -266,7 +278,9 @@ async fn session_playstate_command(
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
     let (session_id, command) = path.into_inner();
-    let arg = body.map(|b| b.into_inner()).unwrap_or(serde_json::json!({}));
+    let arg = body
+        .map(|b| b.into_inner())
+        .unwrap_or(serde_json::json!({}));
     state.notify_session_command(&session_id, &canonical_command(&command), arg);
     HttpResponse::NoContent().finish()
 }
@@ -281,7 +295,9 @@ async fn session_general_command(
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
     let (session_id, command) = path.into_inner();
-    let arg = body.map(|b| b.into_inner()).unwrap_or(serde_json::json!({}));
+    let arg = body
+        .map(|b| b.into_inner())
+        .unwrap_or(serde_json::json!({}));
     state.notify_session_command(&session_id, &canonical_command(&command), arg);
     HttpResponse::NoContent().finish()
 }
@@ -338,7 +354,9 @@ async fn session_play_request(
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
     let session_id = path.into_inner();
-    let arg = body.map(|b| b.into_inner()).unwrap_or(serde_json::json!({}));
+    let arg = body
+        .map(|b| b.into_inner())
+        .unwrap_or(serde_json::json!({}));
     state.notify_session_command(&session_id, "Play", arg);
     HttpResponse::NoContent().finish()
 }

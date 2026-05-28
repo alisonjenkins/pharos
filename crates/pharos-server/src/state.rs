@@ -28,10 +28,7 @@ pub enum SocketBroadcast {
     /// Per-user item state changed (played, favourite, position).
     /// Carries the originating user + item so receivers can ignore
     /// updates that don't apply to them.
-    UserDataChanged {
-        user_id: String,
-        item_id: String,
-    },
+    UserDataChanged { user_id: String, item_id: String },
     /// Remote-control command targeted at a single session.
     /// T-fix-17 / T40 phase 2 — admin or another client tells session
     /// `session_id` to pause / play / stop / seek / change volume.
@@ -159,12 +156,7 @@ impl AppState {
 
     /// Fire a `SessionCommand` event for one target session.
     /// Receivers ignore commands not addressed to them.
-    pub fn notify_session_command(
-        &self,
-        session_id: &str,
-        command: &str,
-        arg: serde_json::Value,
-    ) {
+    pub fn notify_session_command(&self, session_id: &str, command: &str, arg: serde_json::Value) {
         let _ = self.bus.send(SocketBroadcast::SessionCommand {
             session_id: session_id.to_string(),
             command: command.to_string(),

@@ -23,9 +23,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserDataStore, UserId,
     UserItemData, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 struct Fixture {
@@ -174,7 +172,9 @@ async fn item_endpoint_returns_per_bearer_user_data_not_other_users() {
         "Alice must still see Alice's favorite flag; got {ud_alice}"
     );
     assert_eq!(
-        ud_alice.get("PlaybackPositionTicks").and_then(|v| v.as_u64()),
+        ud_alice
+            .get("PlaybackPositionTicks")
+            .and_then(|v| v.as_u64()),
         Some(300_000_000),
         "Alice must still see Alice's resume position; got {ud_alice}"
     );

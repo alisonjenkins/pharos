@@ -12,9 +12,7 @@ use pharos_store_sqlx::sqlite::SqliteStore;
 async fn seed() -> (web::Data<AppState>, String, UserId) {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
-    let hash = auth
-        .hash_password(&SecretString::new("hunter2"))
-        .unwrap();
+    let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     let uid = UserId::new();
     stores
         .create(UserRecord {
@@ -90,7 +88,9 @@ async fn search_hints_matches_title_substring_case_insensitive() {
     let hints = v["SearchHints"].as_array().unwrap();
     assert_eq!(hints.len(), 2);
     let names: Vec<&str> = hints.iter().map(|h| h["Name"].as_str().unwrap()).collect();
-    assert!(names.iter().all(|n| n.to_ascii_lowercase().contains("blade")));
+    assert!(names
+        .iter()
+        .all(|n| n.to_ascii_lowercase().contains("blade")));
     // Hint shape: ItemId + Id duplicated, Type + MediaType present.
     let first = &hints[0];
     assert!(first["ItemId"].is_string());

@@ -29,9 +29,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, SeriesInfo, SubtitleTrack,
     TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_with_items(items: Vec<MediaItem>) -> (web::Data<AppState>, String) {
@@ -190,7 +188,8 @@ async fn direct_play_omits_transcoding_sub_protocol() {
     let src = &v["MediaSources"][0];
     assert_eq!(src["SupportsDirectPlay"], true, "{src:?}");
     assert!(
-        src.get("TranscodingSubProtocol").map_or(true, |t| t.is_null()),
+        src.get("TranscodingSubProtocol")
+            .map_or(true, |t| t.is_null()),
         "DirectPlay must not advertise a sub-protocol (would route via hls.js): {src:?}"
     );
     assert!(
@@ -296,7 +295,10 @@ async fn item_dto_keys_are_pascal_case() {
         );
     }
     // Also recurse one layer into MediaSources[0].
-    let src = obj.get("MediaSources").and_then(|v| v[0].as_object()).unwrap();
+    let src = obj
+        .get("MediaSources")
+        .and_then(|v| v[0].as_object())
+        .unwrap();
     for key in src.keys() {
         let first = key.chars().next().unwrap();
         assert!(

@@ -93,13 +93,7 @@ pub fn primary_path(root: &Path, kind: MediaKind, id: u64) -> PathBuf {
 /// Per-role + per-index cache path. Index-0 forms the canonical "no
 /// index" filename for any non-list role; jellyfin-web indexes
 /// Backdrops at 0…N.
-pub fn image_path(
-    root: &Path,
-    role: ImageRole,
-    kind: MediaKind,
-    id: u64,
-    index: u32,
-) -> PathBuf {
+pub fn image_path(root: &Path, role: ImageRole, kind: MediaKind, id: u64, index: u32) -> PathBuf {
     let media = match kind {
         MediaKind::Movie => "movie",
         MediaKind::Episode => "episode",
@@ -291,10 +285,7 @@ impl ImageCache {
                 out_str,
             ],
         };
-        let output = Command::new(&self.ffmpeg_bin)
-            .args(&args)
-            .output()
-            .await?;
+        let output = Command::new(&self.ffmpeg_bin).args(&args).output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             return Err(ImageCacheError::Ffmpeg(output.status.code(), stderr));
@@ -346,7 +337,10 @@ mod tests {
     #[test]
     fn image_role_parses_case_insensitive() {
         assert_eq!(ImageRole::from_str_ci("Primary"), Some(ImageRole::Primary));
-        assert_eq!(ImageRole::from_str_ci("backdrop"), Some(ImageRole::Backdrop));
+        assert_eq!(
+            ImageRole::from_str_ci("backdrop"),
+            Some(ImageRole::Backdrop)
+        );
         assert_eq!(ImageRole::from_str_ci("LOGO"), Some(ImageRole::Logo));
         assert_eq!(ImageRole::from_str_ci("nope"), None);
     }
@@ -397,7 +391,9 @@ mod tests {
         let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
         // Pre-seed cache so primary() short-circuits.
         let p = primary_path(td.path(), MediaKind::Movie, 42);
-        tokio::fs::create_dir_all(p.parent().unwrap()).await.unwrap();
+        tokio::fs::create_dir_all(p.parent().unwrap())
+            .await
+            .unwrap();
         tokio::fs::write(&p, b"fake-jpeg").await.unwrap();
         let got = cache
             .primary(42, MediaKind::Movie, Path::new("/no/source"))

@@ -13,7 +13,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/system/info/public", web::get().to(system_info))
         .route("/system/configuration", web::get().to(system_configuration))
         .route("/system/endpoint", web::get().to(system_endpoint))
-        .route("/displaypreferences/{id}", web::get().to(display_preferences))
+        .route(
+            "/displaypreferences/{id}",
+            web::get().to(display_preferences),
+        )
         .route(
             "/displaypreferences/{id}",
             web::post().to(display_preferences_update),
@@ -28,8 +31,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // arrays keep the dropdown rendering ("no choices") without
         // 404 cascade. Real localization data lands when pharos has
         // a settings UI.
-        .route("/localization/cultures", web::get().to(localization_cultures))
-        .route("/localization/countries", web::get().to(localization_countries))
+        .route(
+            "/localization/cultures",
+            web::get().to(localization_cultures),
+        )
+        .route(
+            "/localization/countries",
+            web::get().to(localization_countries),
+        )
         .route(
             "/localization/parentalratings",
             web::get().to(localization_parental_ratings),
@@ -116,7 +125,9 @@ async fn display_preferences(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let body = match stored {
-        Some(json) => serde_json::from_str(&json).unwrap_or_else(|_| default_prefs(&dp_id, &q.client)),
+        Some(json) => {
+            serde_json::from_str(&json).unwrap_or_else(|_| default_prefs(&dp_id, &q.client))
+        }
         None => default_prefs(&dp_id, &q.client),
     };
     Ok(HttpResponse::Ok().json(body))
@@ -199,10 +210,7 @@ async fn user_configuration_update(
 /// the real one. Bump this when targeting a newer jellyfin-web build.
 const ADVERTISED_JELLYFIN_VERSION: &str = "10.11.0";
 
-async fn system_info(
-    state: web::Data<AppState>,
-    req: actix_web::HttpRequest,
-) -> impl Responder {
+async fn system_info(state: web::Data<AppState>, req: actix_web::HttpRequest) -> impl Responder {
     let _ = state.version;
     HttpResponse::Ok().json(SystemInfoDto {
         id: state.server_id.clone(),
@@ -316,10 +324,7 @@ async fn devices_list(
     })))
 }
 
-async fn media_segments_stub(
-    _user: AuthUser,
-    _path: web::Path<String>,
-) -> impl Responder {
+async fn media_segments_stub(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({
         "Items": [],
         "TotalRecordCount": 0,

@@ -213,11 +213,20 @@ impl HlsSegmentCache {
         {
             let mut state = self.state.lock().await;
             while state.total_bytes > self.max_bytes {
-                let Some((key, meta)) = state
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, m)| m.last_used)
-                    .map(|(k, m)| (*k, EntryMeta { bytes: m.bytes, last_used: m.last_used }))
+                let Some((key, meta)) =
+                    state
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, m)| m.last_used)
+                        .map(|(k, m)| {
+                            (
+                                *k,
+                                EntryMeta {
+                                    bytes: m.bytes,
+                                    last_used: m.last_used,
+                                },
+                            )
+                        })
                 else {
                     break;
                 };
@@ -252,12 +261,7 @@ mod tests {
     /// Seed a cache file directly (no ffmpeg) and update LRU state to
     /// match. Used by unit tests so they don't need a real ffmpeg
     /// invocation per byte.
-    async fn force_insert(
-        cache: &HlsSegmentCache,
-        media_id: u64,
-        seg: u32,
-        body: &[u8],
-    ) {
+    async fn force_insert(cache: &HlsSegmentCache, media_id: u64, seg: u32, body: &[u8]) {
         let path = cache.segment_path(media_id, seg);
         if let Some(p) = path.parent() {
             tokio::fs::create_dir_all(p).await.unwrap();

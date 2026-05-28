@@ -99,11 +99,10 @@ mod tests {
     #[actix_web::test]
     async fn middleware_records_counter_and_histogram() {
         let _ = crate::obs::init("info");
-        let app = test::init_service(
-            App::new()
-                .wrap(RedMetrics)
-                .route("/ping", web::get().to(|| async { HttpResponse::Ok().body("pong") })),
-        )
+        let app = test::init_service(App::new().wrap(RedMetrics).route(
+            "/ping",
+            web::get().to(|| async { HttpResponse::Ok().body("pong") }),
+        ))
         .await;
         let req = test::TestRequest::get().uri("/ping").to_request();
         let resp = test::call_service(&app, req).await;
@@ -118,18 +117,23 @@ mod tests {
             body.contains("http_request_duration_seconds"),
             "missing histogram; rendered:\n{body}"
         );
-        assert!(body.contains("path=\"/ping\""), "missing path label; rendered:\n{body}");
-        assert!(body.contains("status=\"200\""), "missing status label; rendered:\n{body}");
+        assert!(
+            body.contains("path=\"/ping\""),
+            "missing path label; rendered:\n{body}"
+        );
+        assert!(
+            body.contains("status=\"200\""),
+            "missing status label; rendered:\n{body}"
+        );
     }
 
     #[actix_web::test]
     async fn middleware_labels_use_route_pattern_not_concrete_uri() {
         let _ = crate::obs::init("info");
-        let app = test::init_service(
-            App::new()
-                .wrap(RedMetrics)
-                .route("/Items/{id}", web::get().to(|| async { HttpResponse::Ok().finish() })),
-        )
+        let app = test::init_service(App::new().wrap(RedMetrics).route(
+            "/Items/{id}",
+            web::get().to(|| async { HttpResponse::Ok().finish() }),
+        ))
         .await;
         let req = test::TestRequest::get().uri("/Items/12345").to_request();
         let resp = test::call_service(&app, req).await;

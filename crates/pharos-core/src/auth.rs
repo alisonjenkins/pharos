@@ -99,22 +99,14 @@ pub trait UserStore: Send + Sync {
         name: &str,
     ) -> impl std::future::Future<Output = AuthResult<UserRecord>> + Send;
 
-    fn get(
-        &self,
-        id: UserId,
-    ) -> impl std::future::Future<Output = AuthResult<UserRecord>> + Send;
+    fn get(&self, id: UserId) -> impl std::future::Future<Output = AuthResult<UserRecord>> + Send;
 
     /// List every user. Ordered by name for stable admin-UI rendering.
     /// T46 — admin endpoints need this for `/Users` (admin variant).
-    fn list(
-        &self,
-    ) -> impl std::future::Future<Output = AuthResult<Vec<UserRecord>>> + Send;
+    fn list(&self) -> impl std::future::Future<Output = AuthResult<Vec<UserRecord>>> + Send;
 
     /// Drop a user + cascade their tokens + user_data rows. T46.
-    fn delete(
-        &self,
-        id: UserId,
-    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+    fn delete(&self, id: UserId) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 
     /// Overwrite the user's `UserPolicy`. T46 — admin endpoint
     /// `POST /Users/{id}/Policy`.
@@ -133,15 +125,9 @@ pub trait TokenStore: Send + Sync {
         device_id: &str,
     ) -> impl std::future::Future<Output = AuthResult<AuthToken>> + Send;
 
-    fn resolve(
-        &self,
-        token: &str,
-    ) -> impl std::future::Future<Output = AuthResult<UserId>> + Send;
+    fn resolve(&self, token: &str) -> impl std::future::Future<Output = AuthResult<UserId>> + Send;
 
-    fn revoke(
-        &self,
-        token: &str,
-    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+    fn revoke(&self, token: &str) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 
     /// Tokens issued to `user`. Drives admin "active devices" list. Each
     /// entry carries the device_id (Emby-Authorization header) + issued_at
@@ -185,7 +171,10 @@ mod tests {
 
     #[test]
     fn auth_error_display() {
-        assert_eq!(AuthError::InvalidCredentials.to_string(), "invalid credentials");
+        assert_eq!(
+            AuthError::InvalidCredentials.to_string(),
+            "invalid credentials"
+        );
         assert_eq!(AuthError::InvalidToken.to_string(), "invalid token");
     }
 

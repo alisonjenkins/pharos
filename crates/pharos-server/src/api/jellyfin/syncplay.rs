@@ -54,10 +54,7 @@ struct GroupInfoDto {
     last_updated_at: String,
 }
 
-async fn list_groups(
-    _user: AuthUser,
-    registry: web::Data<GroupRegistry>,
-) -> impl Responder {
+async fn list_groups(_user: AuthUser, registry: web::Data<GroupRegistry>) -> impl Responder {
     let Ok(handles) = registry.list().await else {
         // Actor unreachable: return empty rather than 500 so the UI
         // renders an "no active groups" pane instead of an error.
@@ -136,13 +133,8 @@ mod tests {
     async fn syncplay_list_empty_when_no_groups() {
         let (state, token) = seed_auth().await;
         let reg = web::Data::new(GroupRegistry::spawn());
-        let app = test::init_service(
-            App::new()
-                .app_data(state)
-                .app_data(reg)
-                .configure(register),
-        )
-        .await;
+        let app =
+            test::init_service(App::new().app_data(state).app_data(reg).configure(register)).await;
         let req = test::TestRequest::get()
             .uri("/syncplay/list")
             .insert_header(("X-Emby-Token", token.as_str()))

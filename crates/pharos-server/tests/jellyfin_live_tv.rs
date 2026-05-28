@@ -3,9 +3,7 @@
 //! Programs EPG (T47).
 
 use actix_web::{test, web, App};
-use pharos_core::{
-    SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
-};
+use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
     api::jellyfin, auth::BuiltinAuth, live_tv::M3uXmltvBackend, middleware::LowercasePath,
     state::AppState,
@@ -55,9 +53,7 @@ async fn seed_state_with_live_tv() -> (web::Data<AppState>, String, TempDir) {
     backend.load_m3u(&m3u_path).await.unwrap();
     backend.load_xmltv(&xml_path).await.unwrap();
 
-    let state = web::Data::new(
-        AppState::new(stores, "t".into()).with_live_tv(backend),
-    );
+    let state = web::Data::new(AppState::new(stores, "t".into()).with_live_tv(backend));
     (state, token.0.expose().to_string(), td)
 }
 
@@ -153,9 +149,7 @@ async fn programs_in_window_returns_epg() {
     let (state, token, _td) = seed_state_with_live_tv().await;
     let app = test::init_service(build_app(state)).await;
     let req = test::TestRequest::get()
-        .uri(
-            "/LiveTv/Programs?minStartDate=2024-01-01T00:00:00Z&maxEndDate=2024-01-02T00:00:00Z",
-        )
+        .uri("/LiveTv/Programs?minStartDate=2024-01-01T00:00:00Z&maxEndDate=2024-01-02T00:00:00Z")
         .insert_header(("X-Emby-Token", token.as_str()))
         .to_request();
     let body = test::call_and_read_body(&app, req).await;

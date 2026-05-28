@@ -45,10 +45,7 @@ impl ClockOffset {
         if self.samples.len() == self.window {
             self.samples.pop_front();
         }
-        self.samples.push_back(Sample {
-            offset_ms,
-            rtt_ms,
-        });
+        self.samples.push_back(Sample { offset_ms, rtt_ms });
     }
 
     pub fn len(&self) -> usize {
@@ -105,8 +102,8 @@ mod tests {
             c.observe(0, 100, 110, 10); // offset 100
         }
         c.observe(0, 100000, 100010, 10); // huge outlier
-        // 4 samples at 100, 1 at ~100000. Sorted: 100,100,100,100,100000.
-        // Median index = 2 -> 100.
+                                          // 4 samples at 100, 1 at ~100000. Sorted: 100,100,100,100,100000.
+                                          // Median index = 2 -> 100.
         assert_eq!(c.median_offset_ms(), Some(100));
     }
 

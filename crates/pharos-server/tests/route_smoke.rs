@@ -24,7 +24,12 @@ use pharos_server::{
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 
-async fn seed() -> (web::Data<AppState>, web::Data<GroupRegistry>, String, UserId) {
+async fn seed() -> (
+    web::Data<AppState>,
+    web::Data<GroupRegistry>,
+    String,
+    UserId,
+) {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();

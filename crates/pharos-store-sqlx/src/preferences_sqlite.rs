@@ -15,13 +15,12 @@ impl PreferenceStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
     async fn get_user_configuration(&self, user: UserId) -> DomainResult<Option<String>> {
         let id_bytes = user.0.as_bytes().to_vec();
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT config FROM user_configuration WHERE user_id = ?",
-        )
-        .bind(id_bytes)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT config FROM user_configuration WHERE user_id = ?")
+                .bind(id_bytes)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(row.map(|(s,)| s))
     }
 
@@ -116,13 +115,17 @@ mod tests {
         let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
         let uid = seed_user(&s).await;
         assert!(s.get_user_configuration(uid).await.unwrap().is_none());
-        s.set_user_configuration(uid, r#"{"audio":"en"}"#).await.unwrap();
+        s.set_user_configuration(uid, r#"{"audio":"en"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             s.get_user_configuration(uid).await.unwrap().as_deref(),
             Some(r#"{"audio":"en"}"#)
         );
         // Upsert overwrites.
-        s.set_user_configuration(uid, r#"{"audio":"de"}"#).await.unwrap();
+        s.set_user_configuration(uid, r#"{"audio":"de"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             s.get_user_configuration(uid).await.unwrap().as_deref(),
             Some(r#"{"audio":"de"}"#)

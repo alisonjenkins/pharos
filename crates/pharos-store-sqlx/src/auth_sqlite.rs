@@ -24,15 +24,14 @@ impl UserStore for SqliteStore {
     async fn create(&self, record: UserRecord) -> AuthResult<()> {
         let id_bytes = record.id.0.as_bytes().to_vec();
         let admin: i64 = if record.policy.admin { 1 } else { 0 };
-        let res = sqlx::query(
-            "INSERT INTO users (id, name, password_hash, admin) VALUES (?, ?, ?, ?)",
-        )
-        .bind(id_bytes)
-        .bind(&record.name)
-        .bind(record.password_hash.expose())
-        .bind(admin)
-        .execute(self.pool())
-        .await;
+        let res =
+            sqlx::query("INSERT INTO users (id, name, password_hash, admin) VALUES (?, ?, ?, ?)")
+                .bind(id_bytes)
+                .bind(&record.name)
+                .bind(record.password_hash.expose())
+                .bind(admin)
+                .execute(self.pool())
+                .await;
         match res {
             Ok(_) => Ok(()),
             Err(sqlx::Error::Database(e)) if e.message().contains("UNIQUE") => {
@@ -44,13 +43,12 @@ impl UserStore for SqliteStore {
 
     #[tracing::instrument(skip(self), fields(user.name = %name))]
     async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
-        let row: Option<(Vec<u8>, String, String, i64)> = sqlx::query_as(
-            "SELECT id, name, password_hash, admin FROM users WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i64)> =
+            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE name = ?")
+                .bind(name)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -59,13 +57,12 @@ impl UserStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
-        let row: Option<(Vec<u8>, String, String, i64)> = sqlx::query_as(
-            "SELECT id, name, password_hash, admin FROM users WHERE id = ?",
-        )
-        .bind(id_bytes)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i64)> =
+            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE id = ?")
+                .bind(id_bytes)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -182,10 +179,12 @@ impl TokenStore for SqliteStore {
         .map_err(map_sqlx)?;
         Ok(rows
             .into_iter()
-            .map(|(device_id, issued_at_unix_secs)| pharos_core::TokenRecord {
-                device_id,
-                issued_at_unix_secs,
-            })
+            .map(
+                |(device_id, issued_at_unix_secs)| pharos_core::TokenRecord {
+                    device_id,
+                    issued_at_unix_secs,
+                },
+            )
             .collect())
     }
 }

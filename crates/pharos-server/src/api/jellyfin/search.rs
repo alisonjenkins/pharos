@@ -20,7 +20,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase-only — `LowercasePath` middleware handles PascalCase.
     cfg.route("/search/hints", web::get().to(search_hints))
         .route("/search/suggestions", web::get().to(search_suggestions))
-        .route("/users/{user_id}/suggestions", web::get().to(user_suggestions));
+        .route(
+            "/users/{user_id}/suggestions",
+            web::get().to(user_suggestions),
+        );
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,12 +80,7 @@ async fn search_hints(
     // Unicode-aware lowercase so accented titles match queries typed
     // in different case (Pokémon / POKÉMON). ASCII-only
     // to_ascii_lowercase silently dropped these matches.
-    let needle = q
-        .search_term
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
+    let needle = q.search_term.as_deref().unwrap_or("").trim().to_lowercase();
     let kinds = parse_include_item_types(q.include_item_types.as_deref());
     let include_aggregates = q
         .include_item_types

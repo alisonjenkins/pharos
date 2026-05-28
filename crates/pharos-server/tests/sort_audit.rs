@@ -14,9 +14,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
     UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_mixed() -> (web::Data<AppState>, String) {
@@ -84,7 +82,11 @@ fn build_app(
 
 macro_rules! titles_for {
     ($app:expr, $token:expr, $sort_by:expr, $descending:expr) => {{
-        let order = if $descending { "Descending" } else { "Ascending" };
+        let order = if $descending {
+            "Descending"
+        } else {
+            "Ascending"
+        };
         let body = test::call_and_read_body(
             $app,
             test::TestRequest::get()
@@ -110,9 +112,9 @@ macro_rules! titles_for {
 async fn sort_name_ascending_and_descending() {
     let (state, token) = seed_mixed().await;
     let app = test::init_service(build_app(state)).await;
-    let asc = titles_for!(&app, token.as_str(),"SortName", false);
+    let asc = titles_for!(&app, token.as_str(), "SortName", false);
     assert_eq!(asc, vec!["Alpha", "Bravo", "Charlie", "Delta", "Echo"]);
-    let desc = titles_for!(&app, token.as_str(),"SortName", true);
+    let desc = titles_for!(&app, token.as_str(), "SortName", true);
     assert_eq!(desc, vec!["Echo", "Delta", "Charlie", "Bravo", "Alpha"]);
 }
 
@@ -120,10 +122,10 @@ async fn sort_name_ascending_and_descending() {
 async fn sort_runtime_ascending_orders_by_duration() {
     let (state, token) = seed_mixed().await;
     let app = test::init_service(build_app(state)).await;
-    let asc = titles_for!(&app, token.as_str(),"RuntimeTicks", false);
+    let asc = titles_for!(&app, token.as_str(), "RuntimeTicks", false);
     // Durations: Echo=1000, Alpha=3000, Delta=5000, Charlie=6000, Bravo=9000
     assert_eq!(asc, vec!["Echo", "Alpha", "Delta", "Charlie", "Bravo"]);
-    let desc = titles_for!(&app, token.as_str(),"RuntimeTicks", true);
+    let desc = titles_for!(&app, token.as_str(), "RuntimeTicks", true);
     assert_eq!(desc, vec!["Bravo", "Charlie", "Delta", "Alpha", "Echo"]);
 }
 
@@ -137,7 +139,7 @@ async fn sort_date_created_newest_first_with_none_tail() {
     // Delta + Echo land at the *front* of descending order. Tie
     // broken by id desc (Delta=14 before Echo=13). Some-ts items then
     // descend: Charlie=3000 > Bravo=2000 > Alpha=1000.
-    let desc = titles_for!(&app, token.as_str(),"DateCreated", false);
+    let desc = titles_for!(&app, token.as_str(), "DateCreated", false);
     assert_eq!(
         desc,
         vec!["Delta", "Echo", "Charlie", "Bravo", "Alpha"],
@@ -149,7 +151,7 @@ async fn sort_date_created_newest_first_with_none_tail() {
 async fn unknown_sort_key_falls_through_to_sort_name() {
     let (state, token) = seed_mixed().await;
     let app = test::init_service(build_app(state)).await;
-    let res = titles_for!(&app, token.as_str(),"NonsenseKey", false);
+    let res = titles_for!(&app, token.as_str(), "NonsenseKey", false);
     // Same as SortName ascending.
     assert_eq!(res, vec!["Alpha", "Bravo", "Charlie", "Delta", "Echo"]);
 }
@@ -162,10 +164,10 @@ async fn comma_chain_sort_uses_first_recognised_key() {
     // listed under SortName order. Real Jellyfin honours the chain;
     // pharos honours the first recognised key with SortName as the
     // tiebreaker — verify the documented behaviour, not the wish.
-    let res = titles_for!(&app, token.as_str(),"NonsenseKey,RuntimeTicks", false);
+    let res = titles_for!(&app, token.as_str(), "NonsenseKey,RuntimeTicks", false);
     // We document: first non-empty token wins; if unrecognised, falls
     // through to SortName. Either behaviour is acceptable as long as
     // the result is *deterministic*. Assert deterministic: rerun.
-    let res2 = titles_for!(&app, token.as_str(),"NonsenseKey,RuntimeTicks", false);
+    let res2 = titles_for!(&app, token.as_str(), "NonsenseKey,RuntimeTicks", false);
     assert_eq!(res, res2, "comma-chain sort must be deterministic");
 }

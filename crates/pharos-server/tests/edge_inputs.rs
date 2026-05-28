@@ -19,7 +19,12 @@ use pharos_server::{
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 
-async fn seed() -> (web::Data<AppState>, web::Data<GroupRegistry>, String, UserId) {
+async fn seed() -> (
+    web::Data<AppState>,
+    web::Data<GroupRegistry>,
+    String,
+    UserId,
+) {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -252,7 +257,9 @@ fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -278,7 +285,8 @@ async fn fields_query_param_is_silently_accepted() {
         .await
         .unwrap();
     let app = test::init_service(build_app(state, reg)).await;
-    let fields = "PrimaryImageAspectRatio,DateCreated,Path,MediaSourceCount,Overview,People,Tags,SortName";
+    let fields =
+        "PrimaryImageAspectRatio,DateCreated,Path,MediaSourceCount,Overview,People,Tags,SortName";
     let resp = test::call_service(
         &app,
         test::TestRequest::get()

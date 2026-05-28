@@ -293,8 +293,9 @@ mod tests {
             let raw = OsStr::from_bytes(b"/m/\xff\xfe.mkv");
             let p = std::path::Path::new(raw);
             let t = FfmpegTranscoder::new();
-            let res =
-                tokio::runtime::Runtime::new().unwrap().block_on(t.transcode(p, &opts()));
+            let res = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(t.transcode(p, &opts()));
             assert!(matches!(res, Err(TranscodeError::NonUtf8Path)));
         }
     }

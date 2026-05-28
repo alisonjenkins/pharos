@@ -30,7 +30,11 @@ fn fixtures_dir() -> Option<PathBuf> {
 fn fixture(name: &str) -> Option<PathBuf> {
     let dir = fixtures_dir()?;
     let p = dir.join(name);
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 /// True if ffmpeg resolves on PATH AND the fixture corpus exists.
@@ -106,7 +110,11 @@ async fn image_cache_extracts_primary_jpeg_from_real_video() {
     let bytes = tokio::fs::read(&p).await.unwrap();
     // JPEG SOI marker.
     assert_eq!(&bytes[..2], &[0xFF, 0xD8], "expected JPEG magic");
-    assert!(bytes.len() > 256, "tiny jpeg unexpected: {} bytes", bytes.len());
+    assert!(
+        bytes.len() > 256,
+        "tiny jpeg unexpected: {} bytes",
+        bytes.len()
+    );
     // Second call hits the cache — file mtime should not advance, but
     // simpler check: it just resolves to the same path without
     // erroring (which it would on a missing ffmpeg).
@@ -180,21 +188,17 @@ async fn ffmpeg_extracts_webvtt_from_embedded_stream() {
     // Drive the same shell-out the subtitles handler does, asserting
     // the stdout starts with `WEBVTT`.
     let out = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-        ])
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
         .arg(&fixture)
-        .args([
-            "-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", "pipe:1",
-        ])
+        .args(["-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", "pipe:1"])
         .output()
         .await
         .expect("spawn ffmpeg");
-    assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.trim_start().starts_with("WEBVTT"),

@@ -76,7 +76,10 @@ impl TranscodeSessionRegistry {
                 sessions.retain(|_, (_, last)| now.duration_since(*last) < EXPIRY);
                 match msg {
                     Msg::Insert(payload) => {
-                        let InsertPayload { session_id, session } = *payload;
+                        let InsertPayload {
+                            session_id,
+                            session,
+                        } = *payload;
                         sessions.insert(session_id, (session, now));
                     }
                     Msg::Get { session_id, reply } => {

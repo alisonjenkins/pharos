@@ -126,9 +126,9 @@ pub fn parse_m3u(body: &str) -> Result<Vec<LiveChannel>, LiveTvError> {
             // Other directives (#EXTVLCOPT, #EXTGRP, etc.) — skip.
             continue;
         }
-        let meta = pending.take().ok_or_else(|| {
-            LiveTvError::Malformed(format!("stream URL with no #EXTINF: {line}"))
-        })?;
+        let meta = pending
+            .take()
+            .ok_or_else(|| LiveTvError::Malformed(format!("stream URL with no #EXTINF: {line}")))?;
         let id = meta
             .tvg_id
             .clone()
@@ -317,14 +317,7 @@ fn parse_xmltv_time_ms(s: &str) -> Option<u64> {
 /// Civil-from-days algorithm (Howard Hinnant) — yields a unix-seconds
 /// timestamp from a Y-M-D + h:m:s. Returns None on date arithmetic
 /// overflow; otherwise infallible.
-fn ymd_hms_to_unix(
-    y: i64,
-    m: u32,
-    d: u32,
-    h: u32,
-    minute: u32,
-    s: u32,
-) -> Option<i64> {
+fn ymd_hms_to_unix(y: i64, m: u32, d: u32, h: u32, minute: u32, s: u32) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }

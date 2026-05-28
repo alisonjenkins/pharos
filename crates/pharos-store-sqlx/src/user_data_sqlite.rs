@@ -17,11 +17,7 @@ fn media_id_i64(id: MediaId) -> DomainResult<i64> {
 
 impl UserDataStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(user.id = %user.0, media.id = %item))]
-    async fn get_user_data(
-        &self,
-        user: UserId,
-        item: MediaId,
-    ) -> DomainResult<UserItemData> {
+    async fn get_user_data(&self, user: UserId, item: MediaId) -> DomainResult<UserItemData> {
         let id_bytes = user.0.as_bytes().to_vec();
         let item_i64 = media_id_i64(item)?;
         let row: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
@@ -131,8 +127,7 @@ impl UserDataStore for SqliteStore {
         .map_err(map_err)?;
         rows.into_iter()
             .map(|(id,)| {
-                u64::try_from(id)
-                    .map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+                u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
             })
             .collect()
     }

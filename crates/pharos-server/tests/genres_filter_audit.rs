@@ -10,9 +10,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
     UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_with_genres() -> (web::Data<AppState>, String) {
@@ -100,40 +98,28 @@ async fn names_for_genres(
 async fn single_genre_filters_to_matching_items() {
     let (state, token) = seed_with_genres().await;
     let names = names_for_genres(state, &token, "Action").await;
-    assert_eq!(
-        names,
-        ["A"].iter().map(|s| s.to_string()).collect()
-    );
+    assert_eq!(names, ["A"].iter().map(|s| s.to_string()).collect());
 }
 
 #[actix_web::test]
 async fn pipe_separated_genres_union() {
     let (state, token) = seed_with_genres().await;
     let names = names_for_genres(state, &token, "Action%7CDrama").await;
-    assert_eq!(
-        names,
-        ["A", "B"].iter().map(|s| s.to_string()).collect()
-    );
+    assert_eq!(names, ["A", "B"].iter().map(|s| s.to_string()).collect());
 }
 
 #[actix_web::test]
 async fn comma_separated_genres_union() {
     let (state, token) = seed_with_genres().await;
     let names = names_for_genres(state, &token, "Action,Comedy").await;
-    assert_eq!(
-        names,
-        ["A", "C"].iter().map(|s| s.to_string()).collect()
-    );
+    assert_eq!(names, ["A", "C"].iter().map(|s| s.to_string()).collect());
 }
 
 #[actix_web::test]
 async fn genre_match_is_case_insensitive() {
     let (state, token) = seed_with_genres().await;
     let names = names_for_genres(state, &token, "drama").await;
-    assert_eq!(
-        names,
-        ["B"].iter().map(|s| s.to_string()).collect()
-    );
+    assert_eq!(names, ["B"].iter().map(|s| s.to_string()).collect());
 }
 
 #[actix_web::test]
@@ -141,6 +127,9 @@ async fn items_without_genre_tag_drop_out_when_filter_active() {
     let (state, token) = seed_with_genres().await;
     // "D" has no genre — must NOT appear under any genre filter.
     let names = names_for_genres(state, &token, "Action%7CDrama%7CComedy").await;
-    assert!(!names.contains("D"), "items without genre must drop; got {names:?}");
+    assert!(
+        !names.contains("D"),
+        "items without genre must drop; got {names:?}"
+    );
     assert_eq!(names.len(), 3);
 }

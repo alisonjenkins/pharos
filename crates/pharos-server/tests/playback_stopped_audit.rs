@@ -14,12 +14,10 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserDataStore,
-    UserId, UserPolicy, UserRecord, UserStore,
+    MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserDataStore, UserId,
+    UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_with_runtime_ms(ms: u64) -> (web::Data<AppState>, String, UserId) {
@@ -83,9 +81,7 @@ async fn stop_near_end_marks_played_and_resets_position() {
             .uri("/Sessions/Playing/Stopped")
             .insert_header(("X-Emby-Token", token.as_str()))
             .insert_header(("content-type", "application/json"))
-            .set_payload(
-                r#"{"ItemId":"1","PlaySessionId":"x","PositionTicks":570000000}"#,
-            )
+            .set_payload(r#"{"ItemId":"1","PlaySessionId":"x","PositionTicks":570000000}"#)
             .to_request(),
     )
     .await;
@@ -110,9 +106,7 @@ async fn stop_midway_saves_resume_position_but_not_played() {
             .insert_header(("X-Emby-Token", token.as_str()))
             .insert_header(("content-type", "application/json"))
             // 50% in = 300_000_000 ticks. Well below the 90% cutoff.
-            .set_payload(
-                r#"{"ItemId":"1","PlaySessionId":"x","PositionTicks":300000000}"#,
-            )
+            .set_payload(r#"{"ItemId":"1","PlaySessionId":"x","PositionTicks":300000000}"#)
             .to_request(),
     )
     .await;

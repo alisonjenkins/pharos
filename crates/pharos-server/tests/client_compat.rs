@@ -90,10 +90,7 @@ async fn full_jellyfin_client_flow() {
     assert!(!info.version.is_empty());
 
     // 2. Authenticate. Client stashes the token internally.
-    let auth = client
-        .authenticate_by_name("ali", "hunter2")
-        .await
-        .unwrap();
+    let auth = client.authenticate_by_name("ali", "hunter2").await.unwrap();
     assert!(!auth.access_token.is_empty());
     assert_eq!(auth.user.name, "ali");
     assert!(auth.user.policy.is_administrator);
@@ -114,10 +111,7 @@ async fn full_jellyfin_client_flow() {
     assert!(!first.id.is_empty());
     assert!(!first.name.is_empty());
     // Type one of the strings clients pattern-match on.
-    assert!(matches!(
-        first.kind.as_str(),
-        "Movie" | "Episode" | "Audio"
-    ));
+    assert!(matches!(first.kind.as_str(), "Movie" | "Episode" | "Audio"));
 
     // 5. Detail by id.
     let one = client.item(&first.id).await.unwrap();
@@ -167,11 +161,7 @@ async fn full_jellyfin_client_flow() {
             .send()
             .await
             .unwrap();
-        assert!(
-            resp.status().is_success(),
-            "{path} → {}",
-            resp.status()
-        );
+        assert!(resp.status().is_success(), "{path} → {}", resp.status());
         let body = resp.body().await.unwrap();
         let _v: serde_json::Value =
             serde_json::from_slice(&body).unwrap_or_else(|e| panic!("{path}: bad json {e}"));

@@ -17,9 +17,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_n(n: usize) -> (web::Data<AppState>, String) {
@@ -98,21 +96,27 @@ macro_rules! names_random {
 async fn random_sort_without_seed_is_stable_per_bearer() {
     let (state, token) = seed_n(12).await;
     let app = test::init_service(build_app(state)).await;
-    let a: Vec<String> = names_random!(&app, token.as_str(),Option::<u64>::None);
-    let b: Vec<String> = names_random!(&app, token.as_str(),Option::<u64>::None);
-    assert_eq!(a, b, "same bearer must see the same Random order across requests");
+    let a: Vec<String> = names_random!(&app, token.as_str(), Option::<u64>::None);
+    let b: Vec<String> = names_random!(&app, token.as_str(), Option::<u64>::None);
+    assert_eq!(
+        a, b,
+        "same bearer must see the same Random order across requests"
+    );
     // And not just because shuffle didn't move things — confirm some
     // permutation happened (sorted-by-id would be It01,It02,...).
     let sorted: Vec<String> = (1..=12).map(|i| format!("It{i:02}")).collect();
-    assert_ne!(a, sorted, "shuffle must actually shuffle (high probability)");
+    assert_ne!(
+        a, sorted,
+        "shuffle must actually shuffle (high probability)"
+    );
 }
 
 #[actix_web::test]
 async fn explicit_sort_seed_is_deterministic() {
     let (state, token) = seed_n(12).await;
     let app = test::init_service(build_app(state)).await;
-    let a: Vec<String> = names_random!(&app, token.as_str(),Some(424242));
-    let b: Vec<String> = names_random!(&app, token.as_str(),Some(424242));
+    let a: Vec<String> = names_random!(&app, token.as_str(), Some(424242));
+    let b: Vec<String> = names_random!(&app, token.as_str(), Some(424242));
     assert_eq!(a, b, "same SortSeed must produce the same order");
 }
 
@@ -120,8 +124,8 @@ async fn explicit_sort_seed_is_deterministic() {
 async fn different_seeds_produce_different_orders() {
     let (state, token) = seed_n(12).await;
     let app = test::init_service(build_app(state)).await;
-    let a: Vec<String> = names_random!(&app, token.as_str(),Some(1));
-    let b: Vec<String> = names_random!(&app, token.as_str(),Some(987654321));
+    let a: Vec<String> = names_random!(&app, token.as_str(), Some(1));
+    let b: Vec<String> = names_random!(&app, token.as_str(), Some(987654321));
     assert_ne!(
         a, b,
         "different SortSeeds should produce different permutations (high probability)"

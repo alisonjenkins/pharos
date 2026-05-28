@@ -5,12 +5,10 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId,
-    UserPolicy, UserRecord, UserStore,
+    MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
+    UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_widths() -> (web::Data<AppState>, String) {
@@ -28,10 +26,10 @@ async fn seed_widths() -> (web::Data<AppState>, String) {
         .await
         .unwrap();
     let rows: &[(u64, &str, Option<u32>)] = &[
-        (1, "SD",    Some(640)),
+        (1, "SD", Some(640)),
         (2, "HD720", Some(1280)),
         (3, "HD1080", Some(1920)),
-        (4, "UHD",   Some(3840)),
+        (4, "UHD", Some(3840)),
         (5, "NoData", None),
     ];
     for (id, title, width) in rows {
@@ -108,7 +106,10 @@ async fn is_hd_true_returns_720_and_1080() {
 async fn is_4k_drops_items_without_width() {
     let (state, token) = seed_widths().await;
     let n = names(state, &token, "Is4K=true").await;
-    assert!(!n.contains(&"NoData".to_string()), "NoData must drop; got {n:?}");
+    assert!(
+        !n.contains(&"NoData".to_string()),
+        "NoData must drop; got {n:?}"
+    );
 }
 
 #[actix_web::test]

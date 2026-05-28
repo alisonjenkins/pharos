@@ -14,16 +14,25 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // middleware normalises incoming requests, so jellyfin-web's
     // mixed-case URIs (/Users/AuthenticateByName, /Branding/Css)
     // resolve here too.
-    cfg.route("/users/authenticatebyname", web::post().to(authenticate_by_name))
-        .route("/users/me", web::get().to(me))
-        .route("/users/public", web::get().to(public_users))
-        .route("/users/{user_id}", web::get().to(user_by_id))
-        .route("/quickconnect/enabled", web::get().to(quick_connect_enabled))
-        .route("/branding/configuration", web::get().to(branding_configuration))
-        .route("/branding/css", web::get().to(branding_css))
-        // Some Jellyfin clients (jellyfin-web included) request the
-        // branding CSS with a `.css` suffix; same handler.
-        .route("/branding/css.css", web::get().to(branding_css));
+    cfg.route(
+        "/users/authenticatebyname",
+        web::post().to(authenticate_by_name),
+    )
+    .route("/users/me", web::get().to(me))
+    .route("/users/public", web::get().to(public_users))
+    .route("/users/{user_id}", web::get().to(user_by_id))
+    .route(
+        "/quickconnect/enabled",
+        web::get().to(quick_connect_enabled),
+    )
+    .route(
+        "/branding/configuration",
+        web::get().to(branding_configuration),
+    )
+    .route("/branding/css", web::get().to(branding_css))
+    // Some Jellyfin clients (jellyfin-web included) request the
+    // branding CSS with a `.css` suffix; same handler.
+    .route("/branding/css.css", web::get().to(branding_css));
 }
 
 /// Jellyfin's "tile picker" on the login page calls this. Return an
@@ -48,9 +57,7 @@ async fn branding_configuration() -> impl Responder {
 }
 
 async fn branding_css() -> impl Responder {
-    HttpResponse::Ok()
-        .content_type("text/css")
-        .body("")
+    HttpResponse::Ok().content_type("text/css").body("")
 }
 
 async fn authenticate_by_name(
@@ -61,11 +68,7 @@ async fn authenticate_by_name(
     let body = body.into_inner();
     let password = SecretString::new(body.pw);
 
-    let user = match state
-        .auth
-        .authenticate(&body.username, &password)
-        .await
-    {
+    let user = match state.auth.authenticate(&body.username, &password).await {
         Ok(u) => u,
         Err(AuthError::InvalidCredentials) | Err(AuthError::UserNotFound) => {
             return Err(ErrorUnauthorized("invalid credentials"));
@@ -124,10 +127,7 @@ async fn user_by_id(
 
 /// Build a `UserDto` overriding the default `Configuration` block
 /// with whatever the user last POSTed to `/Users/{u}/Configuration`.
-async fn user_dto_with_config(
-    state: &AppState,
-    user: &pharos_core::User,
-) -> UserDto {
+async fn user_dto_with_config(state: &AppState, user: &pharos_core::User) -> UserDto {
     let mut dto = UserDto::from_domain(user, &state.server_id);
     if let Ok(Some(json)) = state.stores.get_user_configuration(user.id).await {
         if let Ok(cfg) = serde_json::from_str(&json) {
@@ -136,4 +136,3 @@ async fn user_dto_with_config(
     }
     dto
 }
-

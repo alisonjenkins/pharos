@@ -579,14 +579,11 @@ impl BaseItemDto {
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
             series_name: item.series.as_ref().map(|s| s.series_name.clone()),
-            series_id: item
+            series_id: item.series.as_ref().map(|s| series_id_for(&s.series_name)),
+            season_id: item
                 .series
                 .as_ref()
-                .map(|s| series_id_for(&s.series_name)),
-            season_id: item.series.as_ref().and_then(|s| {
-                s.season_number
-                    .map(|n| season_id_for(&s.series_name, n))
-            }),
+                .and_then(|s| s.season_number.map(|n| season_id_for(&s.series_name, n))),
             season_name: item
                 .series
                 .as_ref()
@@ -660,8 +657,8 @@ pub fn series_id_for(name: &str) -> String {
 /// Stable 32-hex id for the synthesised Season item.
 pub fn season_id_for(series_name: &str, season_number: u32) -> String {
     use xxhash_rust::xxh3::xxh3_64;
-    let h = xxh3_64(format!("season:{series_name}:{season_number}").as_bytes())
-        & 0x7FFFFFFFFFFFFFFF;
+    let h =
+        xxh3_64(format!("season:{series_name}:{season_number}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}{h:016x}")
 }
 

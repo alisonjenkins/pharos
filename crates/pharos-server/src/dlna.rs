@@ -17,27 +17,30 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // T31 lowercase routes — LowercasePath middleware handles
     // PascalCase variants. UPnP clients send mixed case for both
     // /Dlna/{id}/... and the per-service paths.
-    cfg.route("/dlna/{server_id}/description.xml", web::get().to(description))
-        .route(
-            "/dlna/{server_id}/contentdirectory/scpd.xml",
-            web::get().to(content_directory_scpd),
-        )
-        .route(
-            "/dlna/{server_id}/contentdirectory/control",
-            web::post().to(content_directory_control),
-        )
-        .route(
-            "/dlna/{server_id}/contentdirectory/events",
-            web::route().to(events_stub),
-        )
-        .route(
-            "/dlna/{server_id}/connectionmanager/scpd.xml",
-            web::get().to(connection_manager_scpd),
-        )
-        .route(
-            "/dlna/{server_id}/connectionmanager/control",
-            web::post().to(connection_manager_control),
-        );
+    cfg.route(
+        "/dlna/{server_id}/description.xml",
+        web::get().to(description),
+    )
+    .route(
+        "/dlna/{server_id}/contentdirectory/scpd.xml",
+        web::get().to(content_directory_scpd),
+    )
+    .route(
+        "/dlna/{server_id}/contentdirectory/control",
+        web::post().to(content_directory_control),
+    )
+    .route(
+        "/dlna/{server_id}/contentdirectory/events",
+        web::route().to(events_stub),
+    )
+    .route(
+        "/dlna/{server_id}/connectionmanager/scpd.xml",
+        web::get().to(connection_manager_scpd),
+    )
+    .route(
+        "/dlna/{server_id}/connectionmanager/control",
+        web::post().to(connection_manager_control),
+    );
 }
 
 async fn description(
@@ -56,7 +59,10 @@ async fn description(
         .body(body)
 }
 
-async fn content_directory_scpd(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn content_directory_scpd(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
     if path.into_inner() != state.server_id {
         return HttpResponse::NotFound().body("");
     }
@@ -96,10 +102,8 @@ async fn content_directory_control(
             // points that scroll a 50k library don't re-fetch the
             // whole DIDL response on every page.
             let object_id = extract_xml_tag(body_str, "ObjectID").unwrap_or_default();
-            let starting_index =
-                parse_browse_u32(body_str, "StartingIndex").unwrap_or(0);
-            let requested_count =
-                parse_browse_u32(body_str, "RequestedCount").unwrap_or(0);
+            let starting_index = parse_browse_u32(body_str, "StartingIndex").unwrap_or(0);
+            let requested_count = parse_browse_u32(body_str, "RequestedCount").unwrap_or(0);
             let items = match state.stores.list().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -119,8 +123,7 @@ async fn content_directory_control(
                 .content_type("text/xml; charset=\"utf-8\"")
                 .body(xml)
         }
-        Some("GetSortCapabilities") | Some("GetSearchCapabilities")
-        | Some("GetSystemUpdateID") => {
+        Some("GetSortCapabilities") | Some("GetSearchCapabilities") | Some("GetSystemUpdateID") => {
             HttpResponse::Ok()
                 .content_type("text/xml; charset=\"utf-8\"")
                 .body(empty_soap_response(&action.unwrap_or_default()))
@@ -392,11 +395,7 @@ mod tests {
 
     #[test]
     fn device_description_carries_server_id_and_service_urls() {
-        let xml = device_description_xml(
-            "abc123",
-            "pharos-test",
-            "http://example",
-        );
+        let xml = device_description_xml("abc123", "pharos-test", "http://example");
         assert!(xml.contains("uuid:abc123"));
         assert!(xml.contains("pharos-test"));
         assert!(xml.contains("MediaServer:1"));
@@ -460,8 +459,7 @@ mod tests {
 
     #[test]
     fn extract_xml_tag_handles_namespaced_open_tag() {
-        let body =
-            r#"<s:Envelope><Browse><ObjectID xmlns="x">42</ObjectID></Browse></s:Envelope>"#;
+        let body = r#"<s:Envelope><Browse><ObjectID xmlns="x">42</ObjectID></Browse></s:Envelope>"#;
         assert_eq!(extract_xml_tag(body, "ObjectID"), Some("42".into()));
     }
 

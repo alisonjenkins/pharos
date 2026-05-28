@@ -15,9 +15,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserDataStore, UserId,
     UserItemData, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 /// Items seeded:
@@ -58,8 +56,23 @@ async fn seed_with_user_data() -> (web::Data<AppState>, String) {
             s.set_user_data(uid, id, ud).await.unwrap();
         }
     };
-    set(2, UserItemData { is_favorite: true, ..Default::default() }).await;
-    set(3, UserItemData { played: true, play_count: 1, ..Default::default() }).await;
+    set(
+        2,
+        UserItemData {
+            is_favorite: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    set(
+        3,
+        UserItemData {
+            played: true,
+            play_count: 1,
+            ..Default::default()
+        },
+    )
+    .await;
     set(
         4,
         UserItemData {
@@ -124,7 +137,7 @@ macro_rules! list_ids {
 async fn is_favorite_filter_returns_only_favorites() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
-    let names: Vec<String> = list_ids!(&app, token.as_str(),"IsFavorite");
+    let names: Vec<String> = list_ids!(&app, token.as_str(), "IsFavorite");
     // It2 + It5 are favorited.
     assert_eq!(
         names.iter().collect::<std::collections::BTreeSet<_>>(),
@@ -141,7 +154,7 @@ async fn is_favorite_filter_returns_only_favorites() {
 async fn is_played_filter_returns_only_played() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
-    let names: Vec<String> = list_ids!(&app, token.as_str(),"IsPlayed");
+    let names: Vec<String> = list_ids!(&app, token.as_str(), "IsPlayed");
     assert_eq!(
         names.iter().collect::<std::collections::BTreeSet<_>>(),
         ["It3", "It5"]
@@ -157,7 +170,7 @@ async fn is_played_filter_returns_only_played() {
 async fn is_unplayed_returns_only_not_played() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
-    let names: Vec<String> = list_ids!(&app, token.as_str(),"IsUnplayed");
+    let names: Vec<String> = list_ids!(&app, token.as_str(), "IsUnplayed");
     // It1, It2, It4 are unplayed.
     assert_eq!(
         names.iter().collect::<std::collections::BTreeSet<_>>(),
@@ -174,7 +187,7 @@ async fn is_unplayed_returns_only_not_played() {
 async fn is_resumable_returns_items_with_position_and_not_played() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
-    let names: Vec<String> = list_ids!(&app, token.as_str(),"IsResumable");
+    let names: Vec<String> = list_ids!(&app, token.as_str(), "IsResumable");
     // Only It4 has resume position AND is not played.
     assert_eq!(names, vec!["It4"]);
 }
@@ -183,7 +196,7 @@ async fn is_resumable_returns_items_with_position_and_not_played() {
 async fn combined_filters_intersect() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
-    let names: Vec<String> = list_ids!(&app, token.as_str(),"IsFavorite,IsPlayed");
+    let names: Vec<String> = list_ids!(&app, token.as_str(), "IsFavorite,IsPlayed");
     // Both flags ⇒ only It5.
     assert_eq!(names, vec!["It5"]);
 }
@@ -237,6 +250,6 @@ async fn unknown_filter_tokens_ignored() {
     let (state, token) = seed_with_user_data().await;
     let app = test::init_service(build_app(state)).await;
     // Junk token → no filter applied, all items returned.
-    let names: Vec<String> = list_ids!(&app, token.as_str(),"GibberishFilter");
+    let names: Vec<String> = list_ids!(&app, token.as_str(), "GibberishFilter");
     assert_eq!(names.len(), 5);
 }

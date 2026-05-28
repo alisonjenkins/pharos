@@ -7,12 +7,10 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaStore, SecretString, SeriesInfo, TokenStore, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    MediaItem, MediaKind, MediaStore, SecretString, SeriesInfo, TokenStore, UserDataStore, UserId,
+    UserItemData, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_episodes_and_favs() -> (web::Data<AppState>, String) {

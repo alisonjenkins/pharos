@@ -76,7 +76,10 @@ impl GroupRegistry {
     pub async fn get_or_create(&self, group_id: GroupId) -> Result<GroupHandle, RegistryError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(Msg::GetOrCreate { group_id, reply: tx })
+            .send(Msg::GetOrCreate {
+                group_id,
+                reply: tx,
+            })
             .await
             .map_err(|_| RegistryError::ActorDown)?;
         rx.await.map_err(|_| RegistryError::ReplyDropped)
@@ -85,7 +88,10 @@ impl GroupRegistry {
     pub async fn get(&self, group_id: GroupId) -> Result<Option<GroupHandle>, RegistryError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(Msg::Get { group_id, reply: tx })
+            .send(Msg::Get {
+                group_id,
+                reply: tx,
+            })
             .await
             .map_err(|_| RegistryError::ActorDown)?;
         rx.await.map_err(|_| RegistryError::ReplyDropped)

@@ -17,9 +17,7 @@ use crate::{
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
-use pharos_transcode::{
-    AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec,
-};
+use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 
 /// Segment length in seconds. 6 s matches Apple's HLS authoring spec
 /// recommendation and what most clients ask for; Jellyfin's own
@@ -174,12 +172,17 @@ async fn segment(
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
 
-    let start_ticks =
-        (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
+    let start_ticks = (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
     let duration_ticks = (SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64;
 
-    let opts = build_segment_opts(&state, q.play_session_id.as_deref(), &item, start_ticks, duration_ticks)
-        .await;
+    let opts = build_segment_opts(
+        &state,
+        q.play_session_id.as_deref(),
+        &item,
+        start_ticks,
+        duration_ticks,
+    )
+    .await;
 
     // T42: when an HLS cache is wired, route through it. Otherwise
     // fall back to live transcoding (every request spawns ffmpeg).
@@ -296,13 +299,13 @@ fn playback_qs(req: &HttpRequest) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use crate::auth::BuiltinAuth;
     use actix_web::test;
     use actix_web::App;
     use pharos_core::{
-        MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
-        UserRecord, UserStore,
+        MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
+        UserStore,
     };
-    use crate::auth::BuiltinAuth;
     use pharos_store_sqlx::sqlite::SqliteStore;
 
     async fn seed() -> (web::Data<AppState>, String) {
@@ -345,9 +348,7 @@ mod tests {
         assert_eq!(resp.status(), 401);
     }
 
-    async fn seed_with_probe(
-        probe: pharos_core::MediaProbe,
-    ) -> (web::Data<AppState>, String) {
+    async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>, String) {
         let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
         let auth = BuiltinAuth::new(stores.clone());
         let hash = auth.hash_password(&SecretString::new("p")).unwrap();

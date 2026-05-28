@@ -137,10 +137,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
 /// Path-only — no probe required. Files in a "Movies/" tree never hit
 /// either signal and stay Movie.
 pub fn is_episode_path(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if has_sxxeyy_token(name) {
         return true;
     }
@@ -160,10 +157,7 @@ fn has_sxxeyy_token(name: &str) -> bool {
     while i + 5 < lower.len() {
         // boundary: start or non-letter before 's'
         let at_boundary = i == 0 || !lower[i - 1].is_ascii_alphabetic();
-        if at_boundary
-            && lower[i] == b's'
-            && lower[i + 1].is_ascii_digit()
-        {
+        if at_boundary && lower[i] == b's' && lower[i + 1].is_ascii_digit() {
             // optional second season digit
             let mut j = i + 2;
             if j < lower.len() && lower[j].is_ascii_digit() {
@@ -296,8 +290,7 @@ fn looks_like_season_dir(name: &str) -> bool {
     let lower = n.to_ascii_lowercase();
     // "Season 1", "Season 02", "Season 10"
     if let Some(rest) = lower.strip_prefix("season ") {
-        return rest.trim().chars().all(|c| c.is_ascii_digit())
-            && !rest.trim().is_empty();
+        return rest.trim().chars().all(|c| c.is_ascii_digit()) && !rest.trim().is_empty();
     }
     // Compact "S01", "S1" — only when whole component is that form so
     // we don't grab a file named "S01E03.mkv" (handled by SxxEyy path).
@@ -344,8 +337,8 @@ mod tests {
 
     use super::*;
     use pharos_core::{MediaKind, ProbeInfo};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[derive(Clone, Default)]

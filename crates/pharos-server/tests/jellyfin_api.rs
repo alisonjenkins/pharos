@@ -6,11 +6,7 @@
 use actix_web::{test, web, App};
 use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
-    api::jellyfin,
-    auth::BuiltinAuth,
-    middleware::LowercasePath,
-    router,
-    state::AppState,
+    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, router, state::AppState,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 

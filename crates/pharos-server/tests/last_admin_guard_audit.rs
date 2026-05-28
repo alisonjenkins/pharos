@@ -10,12 +10,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use actix_web::{test, web, App};
-use pharos_core::{
-    SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
-};
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_single_admin() -> (web::Data<AppState>, UserId, String) {
@@ -32,7 +28,13 @@ async fn seed_single_admin() -> (web::Data<AppState>, UserId, String) {
         })
         .await
         .unwrap();
-    let token = stores.issue(admin, "d").await.unwrap().0.expose().to_string();
+    let token = stores
+        .issue(admin, "d")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     (state, admin, token)
 }

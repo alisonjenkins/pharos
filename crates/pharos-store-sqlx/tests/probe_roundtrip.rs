@@ -76,20 +76,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
         })
         .prop_map(
             |(
-                (
-                    size,
-                    dur,
-                    container,
-                    br,
-                    vc,
-                    ac,
-                    w,
-                    h,
-                    fr,
-                    ch,
-                    sr,
-                    subs,
-                ),
+                (size, dur, container, br, vc, ac, w, h, fr, ch, sr, subs),
                 artist,
                 album,
                 album_artist,

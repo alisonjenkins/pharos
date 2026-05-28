@@ -18,9 +18,7 @@ use actix_web::{test, web, App};
 use pharos_core::{
     AuthBackend, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::collections::HashSet;
 
@@ -40,7 +38,9 @@ async fn seed() -> (web::Data<AppState>, UserId) {
         .unwrap();
     // Sanity check: BuiltinAuth resolves the seeded credentials so
     // the parallel logins actually reach the issuance path.
-    let _ = AuthBackend::authenticate(&auth, "u", &SecretString::new("p")).await.unwrap();
+    let _ = AuthBackend::authenticate(&auth, "u", &SecretString::new("p"))
+        .await
+        .unwrap();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     (state, uid)
 }
@@ -100,7 +100,10 @@ async fn parallel_authenticate_by_name_yields_distinct_tokens() {
     let mut tokens: HashSet<String> = HashSet::new();
     for t in &results {
         assert!(!t.is_empty(), "every concurrent login must return a token");
-        assert!(tokens.insert(t.clone()), "duplicate token across concurrent logins: {t}");
+        assert!(
+            tokens.insert(t.clone()),
+            "duplicate token across concurrent logins: {t}"
+        );
     }
 
     // All N tokens must show up in the auth_tokens table for this user.

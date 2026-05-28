@@ -188,7 +188,9 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         .first()
         .cloned()
         .unwrap_or_else(|| fixture_dir.clone());
-    tokio::fs::create_dir_all(&target_dir).await.map_err(AppError::Io)?;
+    tokio::fs::create_dir_all(&target_dir)
+        .await
+        .map_err(AppError::Io)?;
     let mut per_id_paths: Vec<(u64, MediaKind, std::path::PathBuf)> = Vec::new();
     for (i, kind) in [
         (1u64, MediaKind::Movie),

@@ -6,9 +6,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use pharos_core::{
-    AuthBackend, AuthError, AuthResult, SecretString, User, UserStore,
-};
+use pharos_core::{AuthBackend, AuthError, AuthResult, SecretString, User, UserStore};
 
 pub struct BuiltinAuth<U: UserStore> {
     users: U,
@@ -159,10 +157,7 @@ mod tests {
     async fn wrong_password_is_invalid_credentials() {
         let auth = fresh().await;
         seed(&auth, "ali", "hunter2").await;
-        match auth
-            .authenticate("ali", &SecretString::new("wrong"))
-            .await
-        {
+        match auth.authenticate("ali", &SecretString::new("wrong")).await {
             Err(AuthError::InvalidCredentials) => {}
             other => panic!("expected InvalidCredentials, got {other:?}"),
         }
@@ -172,10 +167,7 @@ mod tests {
     async fn unknown_user_is_invalid_credentials_not_user_not_found() {
         // V8 spirit: do not leak existence of accounts via differing errors.
         let auth = fresh().await;
-        match auth
-            .authenticate("nope", &SecretString::new("x"))
-            .await
-        {
+        match auth.authenticate("nope", &SecretString::new("x")).await {
             Err(AuthError::InvalidCredentials) => {}
             other => panic!("expected InvalidCredentials, got {other:?}"),
         }

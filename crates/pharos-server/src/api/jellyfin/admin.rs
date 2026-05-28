@@ -26,17 +26,26 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/users/new", web::post().to(create_user))
         .route("/users/{user_id}", web::delete().to(delete_user))
         .route("/users/{user_id}/policy", web::post().to(set_user_policy))
-        .route("/users/{user_id}/password", web::post().to(set_user_password))
+        .route(
+            "/users/{user_id}/password",
+            web::post().to(set_user_password),
+        )
         // Library admin.
         .route("/library/refresh", web::post().to(library_refresh))
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(empty_array))
         .route("/plugins", web::get().to(empty_array))
         .route("/system/logs", web::get().to(empty_array))
-        .route("/system/activitylog/entries", web::get().to(empty_items_result))
+        .route(
+            "/system/activitylog/entries",
+            web::get().to(empty_items_result),
+        )
         // POST writes to /System/Configuration are accepted + no-op'd;
         // pharos's runtime config is the toml file (re-read on restart).
-        .route("/system/configuration", web::post().to(post_system_configuration))
+        .route(
+            "/system/configuration",
+            web::post().to(post_system_configuration),
+        )
         .route(
             "/system/configuration/{key}",
             web::post().to(post_system_configuration_key),
@@ -68,12 +77,7 @@ async fn list_users(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let dtos: Vec<UserDto> = users
         .iter()
-        .map(|u| {
-            UserDto::from_domain(
-                &u.clone().into_user(),
-                &state.server_id,
-            )
-        })
+        .map(|u| UserDto::from_domain(&u.clone().into_user(), &state.server_id))
         .collect();
     Ok(HttpResponse::Ok().json(dtos))
 }
@@ -275,9 +279,7 @@ async fn library_refresh(
     // completion is enough for connected clients to invalidate caches).
     let state = state.into_inner();
     actix_web::rt::spawn(async move {
-        let scanner = pharos_scanner::FsScanner::new(
-            pharos_scanner::FfmpegProber::new(),
-        );
+        let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new());
         for root in &state.media_roots {
             match scanner.scan_into(root, &state.stores).await {
                 Ok(n) => tracing::info!(

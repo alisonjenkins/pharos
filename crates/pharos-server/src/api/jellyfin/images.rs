@@ -131,14 +131,7 @@ async fn delete_image_indexed(
     user: AuthUser,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    remove_image(
-        &state,
-        &user,
-        &path.id,
-        &path.image_type,
-        path.image_index,
-    )
-    .await
+    remove_image(&state, &user, &path.id, &path.image_type, path.image_index).await
 }
 
 async fn serve_image(
@@ -198,7 +191,9 @@ async fn upload_image(
         return Err(error::ErrorBadRequest("unknown image type"));
     };
     let Some(cache) = state.images.as_ref() else {
-        return Err(error::ErrorInternalServerError("image cache not configured"));
+        return Err(error::ErrorInternalServerError(
+            "image cache not configured",
+        ));
     };
     let id: u64 = id_str
         .parse()
@@ -265,8 +260,7 @@ mod tests {
     #[actix_web::test]
     async fn known_type_returns_404_not_500() {
         let state = seed_state().await;
-        let app =
-            test::init_service(App::new().app_data(state).configure(register)).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
         for t in ["primary", "backdrop", "thumb", "logo", "banner", "art"] {
             let req = test::TestRequest::get()
                 .uri(&format!("/items/abc/images/{t}"))
@@ -279,8 +273,7 @@ mod tests {
     #[actix_web::test]
     async fn indexed_route_404s() {
         let state = seed_state().await;
-        let app =
-            test::init_service(App::new().app_data(state).configure(register)).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
             .uri("/items/abc/images/backdrop/0")
             .to_request();
@@ -291,8 +284,7 @@ mod tests {
     #[actix_web::test]
     async fn unknown_type_returns_400() {
         let state = seed_state().await;
-        let app =
-            test::init_service(App::new().app_data(state).configure(register)).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
             .uri("/items/abc/images/bogus")
             .to_request();
@@ -303,8 +295,7 @@ mod tests {
     #[actix_web::test]
     async fn head_request_returns_no_body_404() {
         let state = seed_state().await;
-        let app =
-            test::init_service(App::new().app_data(state).configure(register)).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::default()
             .method(actix_web::http::Method::HEAD)
             .uri("/items/abc/images/primary")
@@ -320,8 +311,7 @@ mod tests {
         // param is not always available. Endpoint must respond to
         // unauthenticated GETs (whether 404 or eventually 200).
         let state = seed_state().await;
-        let app =
-            test::init_service(App::new().app_data(state).configure(register)).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
             .uri("/items/abc/images/primary")
             .to_request();
@@ -332,8 +322,7 @@ mod tests {
     #[actix_web::test]
     async fn post_requires_auth_and_returns_401_without_token() {
         let state = seed_state().await;
-        let app =
-            test::init_service(App::new().app_data(state).configure(register)).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::post()
             .uri("/items/1/images/primary")
             .set_payload(vec![0xFFu8, 0xD8, 0xFF, 0xE0])

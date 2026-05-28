@@ -13,9 +13,7 @@ use actix_web::{test, web, App};
 use pharos_core::{
     AuthBackend, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 struct Fixture {
@@ -63,8 +61,20 @@ async fn seed() -> Fixture {
         })
         .await
         .unwrap();
-    let alice_token = stores.issue(alice_id, "ad").await.unwrap().0.expose().to_string();
-    let admin_token = stores.issue(admin_id, "ad").await.unwrap().0.expose().to_string();
+    let alice_token = stores
+        .issue(alice_id, "ad")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
+    let admin_token = stores
+        .issue(admin_id, "ad")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     Fixture {
         state,

@@ -146,8 +146,8 @@ impl JellyfinClient {
             });
         }
         let bytes = resp.bytes().await?;
-        let parsed: AuthenticationResult = serde_json::from_slice(&bytes)
-            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        let parsed: AuthenticationResult =
+            serde_json::from_slice(&bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
         self.token = Some(parsed.access_token.clone());
         Ok(parsed)
     }
@@ -208,11 +208,7 @@ impl JellyfinClient {
     }
 }
 
-async fn get_json<T>(
-    client: &Client,
-    url: &str,
-    headers: HeaderMap,
-) -> Result<T, ClientError>
+async fn get_json<T>(client: &Client, url: &str, headers: HeaderMap) -> Result<T, ClientError>
 where
     T: for<'de> Deserialize<'de>,
 {

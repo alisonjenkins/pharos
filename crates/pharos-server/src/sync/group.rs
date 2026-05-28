@@ -226,9 +226,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.elect_leader();
             }
             let summaries = state.member_summaries();
-            let leader = state
-                .leader
-                .unwrap_or(member_id); // Always Some after election above.
+            let leader = state.leader.unwrap_or(member_id); // Always Some after election above.
             let _ = reply.send(Joined {
                 group_id: state.id,
                 leader,
@@ -295,7 +293,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
             state.broadcast(ServerMsg::MemberLeft { member_id });
         }
-        GroupMsg::LeaderPlay { sender, position_ms } => {
+        GroupMsg::LeaderPlay {
+            sender,
+            position_ms,
+        } => {
             if state.leader != Some(sender) {
                 state.send_one(
                     sender,
@@ -312,7 +313,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 position_ms,
                 anchor_server_ms: server_ms,
             };
-            state.broadcast(ServerMsg::Play { at_server_ms, position_ms });
+            state.broadcast(ServerMsg::Play {
+                at_server_ms,
+                position_ms,
+            });
         }
         GroupMsg::LeaderPause { sender } => {
             if state.leader != Some(sender) {
@@ -341,7 +345,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
             state.broadcast(ServerMsg::Pause { at_server_ms });
         }
-        GroupMsg::LeaderSeek { sender, position_ms } => {
+        GroupMsg::LeaderSeek {
+            sender,
+            position_ms,
+        } => {
             if state.leader != Some(sender) {
                 state.send_one(
                     sender,
@@ -379,15 +386,16 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 rec.offset.observe(t1, t2, t3, t4);
             }
         }
-        GroupMsg::BufferingStart { member_id, position_ms: _ } => {
+        GroupMsg::BufferingStart {
+            member_id,
+            position_ms: _,
+        } => {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = true;
             }
             // V19: one corrective Pause, not a storm. If already paused due
             // to another member's buffering, do nothing.
-            if !state.group_paused_due_to_buffering
-                && state.members.values().any(|m| m.buffering)
-            {
+            if !state.group_paused_due_to_buffering && state.members.values().any(|m| m.buffering) {
                 state.group_paused_due_to_buffering = true;
                 let at_server_ms = state.server_ms_now() + MIN_LEAD_MS;
                 state.broadcast(ServerMsg::Pause { at_server_ms });
@@ -397,9 +405,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = false;
             }
-            if state.group_paused_due_to_buffering
-                && !state.members.values().any(|m| m.buffering)
-            {
+            if state.group_paused_due_to_buffering && !state.members.values().any(|m| m.buffering) {
                 state.group_paused_due_to_buffering = false;
                 // No automatic resume — leader decides when to continue.
             }
@@ -409,11 +415,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 id: state.id,
                 leader: state.leader,
                 member_count: state.members.len(),
-                buffering_member_count: state
-                    .members
-                    .values()
-                    .filter(|m| m.buffering)
-                    .count(),
+                buffering_member_count: state.members.values().filter(|m| m.buffering).count(),
             };
             let _ = reply.send(snap);
         }
@@ -574,9 +576,18 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(matches!(leader_rx.recv().await.unwrap(), ServerMsg::Pause { .. }));
-        assert!(matches!(m2_rx.recv().await.unwrap(), ServerMsg::Pause { .. }));
-        assert!(matches!(m3_rx.recv().await.unwrap(), ServerMsg::Pause { .. }));
+        assert!(matches!(
+            leader_rx.recv().await.unwrap(),
+            ServerMsg::Pause { .. }
+        ));
+        assert!(matches!(
+            m2_rx.recv().await.unwrap(),
+            ServerMsg::Pause { .. }
+        ));
+        assert!(matches!(
+            m3_rx.recv().await.unwrap(),
+            ServerMsg::Pause { .. }
+        ));
 
         // Second buffering report from a different member while group is
         // already paused → no broadcast, no Pause on any sink.

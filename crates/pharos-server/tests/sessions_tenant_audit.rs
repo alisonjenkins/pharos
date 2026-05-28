@@ -6,9 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use actix_web::{test, web, App};
-use pharos_core::{
-    SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
-};
+use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
     api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, sessions::SessionEvent,
     state::AppState,
@@ -39,8 +37,20 @@ async fn seed_two_users_and_sessions() -> (web::Data<AppState>, String, String) 
         })
         .await
         .unwrap();
-    let alice_t = stores.issue(alice, "ad").await.unwrap().0.expose().to_string();
-    let bob_t = stores.issue(bob, "bd").await.unwrap().0.expose().to_string();
+    let alice_t = stores
+        .issue(alice, "ad")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
+    let bob_t = stores
+        .issue(bob, "bd")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     // Each user starts one playback session.
     state
@@ -137,7 +147,13 @@ async fn admin_bearer_sees_every_session() {
         })
         .await
         .unwrap();
-    let admin_t = stores.issue(admin_uid, "ad").await.unwrap().0.expose().to_string();
+    let admin_t = stores
+        .issue(admin_uid, "ad")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     // One session per user.
     for (id, sess_id) in [(admin_uid, "a"), (user_uid, "u")] {

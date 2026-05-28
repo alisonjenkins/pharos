@@ -9,7 +9,7 @@
 
 use crate::state::AppState;
 use actix_web::{
-    dev::Payload, error::ErrorUnauthorized, error::ErrorInternalServerError, web, FromRequest,
+    dev::Payload, error::ErrorInternalServerError, error::ErrorUnauthorized, web, FromRequest,
     HttpRequest,
 };
 use pharos_core::{TokenStore, User, UserStore};
@@ -26,8 +26,7 @@ impl FromRequest for AuthUser {
         let state = req.app_data::<web::Data<AppState>>().cloned();
         Box::pin(async move {
             let token = token.ok_or_else(|| ErrorUnauthorized("missing token"))?;
-            let state = state
-                .ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
+            let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
             let uid = state
                 .stores
                 .resolve(&token)
@@ -57,10 +56,7 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             return Some(trimmed.to_string());
         }
     }
-    if let Some(v) = h
-        .get("X-MediaBrowser-Token")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(v) = h.get("X-MediaBrowser-Token").and_then(|v| v.to_str().ok()) {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
@@ -73,9 +69,12 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             }
         }
     }
-    for (k, v) in req.query_string().split('&').filter_map(|kv| kv.split_once('=')) {
-        if (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey"))
-            && !v.is_empty()
+    for (k, v) in req
+        .query_string()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+    {
+        if (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey")) && !v.is_empty()
         {
             return Some(v.to_string());
         }
@@ -152,7 +151,9 @@ fn merge(mut a: AuthHeader, b: AuthHeader) -> AuthHeader {
 /// Version="1.0", Token="…"` — parse every k=v pair the schemes
 /// recognised by Emby/Jellyfin use. Unknown keys are ignored.
 pub fn parse_auth_header(value: &str) -> Option<AuthHeader> {
-    let after = value.strip_prefix("MediaBrowser").or_else(|| value.strip_prefix("Emby"))?;
+    let after = value
+        .strip_prefix("MediaBrowser")
+        .or_else(|| value.strip_prefix("Emby"))?;
     let mut out = AuthHeader::default();
     for part in after.split(',') {
         let part = part.trim();

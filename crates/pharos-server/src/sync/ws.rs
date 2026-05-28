@@ -24,7 +24,9 @@ async fn ws_entry(
     registry: web::Data<GroupRegistry>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, session, stream) = actix_ws::handle(&req, body)?;
-    let stream = stream.aggregate_continuations().max_continuation_size(64 * 1024);
+    let stream = stream
+        .aggregate_continuations()
+        .max_continuation_size(64 * 1024);
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
@@ -157,9 +159,7 @@ async fn handle_connection<S>(
     }
 
     // 6) drop membership.
-    let _ = group_tx
-        .send(GroupMsg::RemoveMember { member_id })
-        .await;
+    let _ = group_tx.send(GroupMsg::RemoveMember { member_id }).await;
     let _ = session.clone().close(None).await;
 }
 
@@ -180,8 +180,8 @@ where
         AggregatedMessage::Text(t) => t,
         _ => return Err(WsError::Protocol("expected text Hello".into())),
     };
-    let msg: ClientMsg = sonic_rs::from_str(&txt)
-        .map_err(|e| WsError::Protocol(format!("hello parse: {e}")))?;
+    let msg: ClientMsg =
+        sonic_rs::from_str(&txt).map_err(|e| WsError::Protocol(format!("hello parse: {e}")))?;
     let ClientMsg::Hello {
         token,
         client: _client,
@@ -223,8 +223,8 @@ where
         AggregatedMessage::Text(t) => t,
         _ => return Err(WsError::Protocol("expected text Join".into())),
     };
-    let msg: ClientMsg = sonic_rs::from_str(&txt)
-        .map_err(|e| WsError::Protocol(format!("join parse: {e}")))?;
+    let msg: ClientMsg =
+        sonic_rs::from_str(&txt).map_err(|e| WsError::Protocol(format!("join parse: {e}")))?;
     match msg {
         ClientMsg::Join { group_id } => registry
             .get_or_create(group_id)
@@ -308,14 +308,10 @@ async fn dispatch_client_msg(
                 .await;
         }
         ClientMsg::BufferingEnd { position_ms: _ } => {
-            let _ = group_tx
-                .send(GroupMsg::BufferingEnd { member_id })
-                .await;
+            let _ = group_tx.send(GroupMsg::BufferingEnd { member_id }).await;
         }
         ClientMsg::Leave => {
-            let _ = group_tx
-                .send(GroupMsg::RemoveMember { member_id })
-                .await;
+            let _ = group_tx.send(GroupMsg::RemoveMember { member_id }).await;
         }
         ClientMsg::Heartbeat => { /* no-op */ }
     }

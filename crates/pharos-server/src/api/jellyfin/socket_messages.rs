@@ -93,8 +93,7 @@ mod tests {
 
     #[test]
     fn inbound_parses_pascalcase() {
-        let raw =
-            r#"{"MessageType":"SyncPlayJoinGroup","MessageId":"abc","Data":{"GroupId":"00000000-0000-0000-0000-000000000001"}}"#;
+        let raw = r#"{"MessageType":"SyncPlayJoinGroup","MessageId":"abc","Data":{"GroupId":"00000000-0000-0000-0000-000000000001"}}"#;
         let m: Inbound = serde_json::from_str(raw).unwrap();
         assert_eq!(m.message_type, "SyncPlayJoinGroup");
         let join: SyncPlayJoinData = serde_json::from_value(m.data).unwrap();

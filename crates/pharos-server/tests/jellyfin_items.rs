@@ -5,9 +5,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed() -> (web::Data<AppState>, String, UserId) {
@@ -359,10 +357,7 @@ async fn get_item_omits_size_when_probe_absent() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let src = &v["MediaSources"][0];
     assert!(src.get("Size").is_none(), "Size omitted, got {src:?}");
-    assert!(
-        src.get("Bitrate").is_none(),
-        "Bitrate omitted, got {src:?}"
-    );
+    assert!(src.get("Bitrate").is_none(), "Bitrate omitted, got {src:?}");
 }
 
 #[actix_web::test]
@@ -482,8 +477,7 @@ async fn get_item_by_library_id_returns_collection_folder() {
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
     let state = web::Data::new(
-        AppState::new(stores, "srv".into())
-            .with_media_roots(vec!["/media/Movies".into()]),
+        AppState::new(stores, "srv".into()).with_media_roots(vec!["/media/Movies".into()]),
     );
     let app = test::init_service(build_app(state.clone())).await;
     // Discover library id from /Views.
@@ -759,10 +753,7 @@ async fn list_items_filters_by_series_id() {
     let items = v["Items"].as_array().unwrap();
     assert_eq!(items.len(), 2, "expected 2 Show A episodes, got {v:?}");
     for it in items {
-        assert!(
-            it["Name"].as_str().unwrap().starts_with("Show A"),
-            "{it:?}"
-        );
+        assert!(it["Name"].as_str().unwrap().starts_with("Show A"), "{it:?}");
     }
 }
 
@@ -1128,8 +1119,11 @@ async fn sort_by_runtime_ticks_orders_by_duration() {
         .await
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
-    for (id, title, dur_ms) in [(1u64, "Long", 30_000u64), (2, "Mid", 10_000), (3, "Short", 3_000)]
-    {
+    for (id, title, dur_ms) in [
+        (1u64, "Long", 30_000u64),
+        (2, "Mid", 10_000),
+        (3, "Short", 3_000),
+    ] {
         stores
             .put(MediaItem {
                 id,

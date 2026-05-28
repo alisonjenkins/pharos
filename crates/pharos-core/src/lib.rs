@@ -155,14 +155,9 @@ pub enum DomainError {
 pub type DomainResult<T> = Result<T, DomainError>;
 
 pub trait MediaStore: Send + Sync {
-    fn get(
-        &self,
-        id: MediaId,
-    ) -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
-    fn put(
-        &self,
-        item: MediaItem,
-    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+    fn get(&self, id: MediaId)
+        -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
+    fn put(&self, item: MediaItem) -> impl std::future::Future<Output = DomainResult<()>> + Send;
     fn list(&self) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 }
 
@@ -317,9 +312,7 @@ pub struct EpgProgram {
 }
 
 pub trait TunerBackend: Send + Sync {
-    fn channels(
-        &self,
-    ) -> impl std::future::Future<Output = DomainResult<Vec<LiveChannel>>> + Send;
+    fn channels(&self) -> impl std::future::Future<Output = DomainResult<Vec<LiveChannel>>> + Send;
 
     /// EPG programmes in `[start_unix_ms, end_unix_ms)`. Backends
     /// without an EPG return an empty Vec.

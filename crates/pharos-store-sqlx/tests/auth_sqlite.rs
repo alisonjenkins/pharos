@@ -1,9 +1,7 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_core::{
-    AuthError, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
-};
+use pharos_core::{AuthError, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn fresh() -> SqliteStore {

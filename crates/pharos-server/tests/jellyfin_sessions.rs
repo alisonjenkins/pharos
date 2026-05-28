@@ -1,9 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use actix_web::{test, web, App};
-use pharos_core::{
-    SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
-};
+use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
@@ -184,11 +182,8 @@ async fn capabilities_accepts_body_and_returns_204() {
 async fn sessions_requires_auth() {
     let (state, _t) = seed().await;
     let app = test::init_service(build_app(state)).await;
-    let resp = test::call_service(
-        &app,
-        test::TestRequest::get().uri("/Sessions").to_request(),
-    )
-    .await;
+    let resp =
+        test::call_service(&app, test::TestRequest::get().uri("/Sessions").to_request()).await;
     assert_eq!(resp.status(), 401);
 }
 

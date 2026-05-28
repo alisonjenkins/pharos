@@ -37,10 +37,7 @@ async fn add_member_with_cap(
     (mid, rx)
 }
 
-async fn add_member(
-    h: &GroupHandle,
-    name: &str,
-) -> (MemberId, mpsc::Receiver<ServerMsg>) {
+async fn add_member(h: &GroupHandle, name: &str) -> (MemberId, mpsc::Receiver<ServerMsg>) {
     add_member_with_cap(h, name, 64).await
 }
 
@@ -200,7 +197,10 @@ async fn slow_member_does_not_block_broadcasts() {
         matches!(m, ServerMsg::Seek { .. })
     })
     .await;
-    assert!(leader_got.is_some(), "actor wedged: leader received nothing");
+    assert!(
+        leader_got.is_some(),
+        "actor wedged: leader received nothing"
+    );
     assert!(m3_got.is_some(), "actor wedged: m3 received nothing");
 }
 

@@ -23,9 +23,7 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed() -> (web::Data<AppState>, String, UserId) {
@@ -246,7 +244,14 @@ async fn baseline_views_envelope_keys() {
     let item = &v["Items"][0];
     assert_keys_present(
         item,
-        &["Id", "Name", "ServerId", "Type", "CollectionType", "IsFolder"],
+        &[
+            "Id",
+            "Name",
+            "ServerId",
+            "Type",
+            "CollectionType",
+            "IsFolder",
+        ],
         "/Users/{u}/Views[0]",
     );
 }

@@ -27,7 +27,9 @@ async fn stream_video(
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<NamedFile, actix_web::Error> {
-    open_item(&state, path.id_str()).await.map(|f| f.into_response_file(&req))
+    open_item(&state, path.id_str())
+        .await
+        .map(|f| f.into_response_file(&req))
 }
 
 async fn stream_audio(
@@ -36,7 +38,9 @@ async fn stream_audio(
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<NamedFile, actix_web::Error> {
-    open_item(&state, path.id_str()).await.map(|f| f.into_response_file(&req))
+    open_item(&state, path.id_str())
+        .await
+        .map(|f| f.into_response_file(&req))
 }
 
 #[derive(serde::Deserialize)]

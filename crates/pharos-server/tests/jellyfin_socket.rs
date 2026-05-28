@@ -4,12 +4,8 @@
 //! enforces auth, and rejects non-upgrade requests.
 
 use actix_web::{test, web, App};
-use pharos_core::{
-    SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
-};
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, state::AppState, sync::GroupRegistry,
-};
+use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, state::AppState, sync::GroupRegistry};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed() -> (web::Data<AppState>, web::Data<GroupRegistry>, String) {

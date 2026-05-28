@@ -35,7 +35,9 @@ fn authenticate_by_name_request_debug_redacts_pw() {
 async fn admin_create_user_response_never_echoes_password() {
     use actix_web::{test, web, App};
     use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
-    use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
+    use pharos_server::{
+        api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
+    };
     use pharos_store_sqlx::sqlite::SqliteStore;
 
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
