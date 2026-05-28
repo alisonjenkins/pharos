@@ -14,7 +14,7 @@
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
     ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
-    RemoteSession, SearchHint, UserConfiguration,
+    LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -544,6 +544,39 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             async move { fetch_activity_entries(&base, &token).await }
         })
     };
+    let scheduled_tasks_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_scheduled_tasks(&base, &token).await }
+        })
+    };
+    let plugins_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_plugins(&base, &token).await }
+        })
+    };
+    let logs_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let base = base.clone();
+            let token = token.clone();
+            async move { fetch_logs(&base, &token).await }
+        })
+    };
 
     let action_handler = {
         let access_token = access_token.clone();
@@ -601,6 +634,19 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
     };
+    let scheduled_tasks: Vec<ScheduledTask> =
+        match scheduled_tasks_resource.read_unchecked().as_ref() {
+            Some(Ok(v)) => v.clone(),
+            _ => Vec::new(),
+        };
+    let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+    let logs: Vec<LogEntry> = match logs_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
+    };
     let combined_status = fetch_err.or_else(|| status.read().clone());
     let tab_now = *active_tab.read();
 
@@ -614,6 +660,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             libraries: libraries,
             devices: devices,
             activity: activity,
+            scheduled_tasks: scheduled_tasks,
+            plugins: plugins,
+            logs: logs,
         }
     }
 }
@@ -1329,6 +1378,45 @@ async fn send_general(
     _arg: serde_json::Value,
 ) -> Result<(), String> {
     Err("send_session_general is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_scheduled_tasks(base: &str, token: &str) -> Result<Vec<ScheduledTask>, String> {
+    crate::client::web::list_scheduled_tasks(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_scheduled_tasks(
+    _base: &str,
+    _token: &str,
+) -> Result<Vec<ScheduledTask>, String> {
+    Err("list_scheduled_tasks is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_plugins(base: &str, token: &str) -> Result<Vec<PluginEntry>, String> {
+    crate::client::web::list_plugins(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_plugins(_base: &str, _token: &str) -> Result<Vec<PluginEntry>, String> {
+    Err("list_plugins is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, String> {
+    crate::client::web::list_logs(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_logs(_base: &str, _token: &str) -> Result<Vec<LogEntry>, String> {
+    Err("list_logs is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

@@ -13,7 +13,7 @@ use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::{
     ActivityEntry, AdminUser, DeviceEntry, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
-    RemoteSession, SearchHint, UserConfiguration,
+    LogEntry, PluginEntry, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
@@ -411,6 +411,83 @@ fn admin_view_activity_tab_renders_empty_state() {
     assert!(html.contains(r#"data-tab="activity""#), "{html}");
     assert!(html.contains("pharos-admin-section-activity"), "{html}");
     assert!(html.contains("No activity recorded"), "{html}");
+}
+
+fn admin_scheduled_tasks_tab() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::ScheduledTasks,
+            scheduled_tasks: vec![ScheduledTask {
+                id: "t1".into(),
+                name: "Library scan".into(),
+                category: "Library".into(),
+                state: "Idle".into(),
+                last_execution_iso: "2026-05-28T05:00:00Z".into(),
+            }],
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_plugins_tab_empty() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Plugins,
+            plugins: Vec::<PluginEntry>::new(),
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_logs_tab() -> Element {
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Logs,
+            logs: vec![LogEntry {
+                name: "pharos.log".into(),
+                size_bytes: 12345,
+                date_modified_iso: "2026-05-28T07:00:00Z".into(),
+            }],
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn admin_view_scheduled_tasks_tab_renders_table() {
+    let html = render_root(admin_scheduled_tasks_tab);
+    assert!(html.contains(r#"data-tab="scheduledtasks""#), "{html}");
+    assert!(html.contains("pharos-admin-section-scheduledtasks"), "{html}");
+    assert!(html.contains("Library scan"), "{html}");
+    assert!(html.contains("pharos-admin-task-state"), "{html}");
+    assert!(html.contains(">Idle<"), "{html}");
+    assert!(html.contains("2026-05-28T05:00:00Z"), "{html}");
+}
+
+#[test]
+fn admin_view_plugins_tab_renders_empty_state() {
+    let html = render_root(admin_plugins_tab_empty);
+    assert!(html.contains(r#"data-tab="plugins""#), "{html}");
+    assert!(html.contains("pharos-admin-section-plugins"), "{html}");
+    assert!(html.contains("No plugins installed"), "{html}");
+}
+
+#[test]
+fn admin_view_logs_tab_renders_log_list() {
+    let html = render_root(admin_logs_tab);
+    assert!(html.contains(r#"data-tab="logs""#), "{html}");
+    assert!(html.contains("pharos-admin-section-logs"), "{html}");
+    assert!(html.contains("pharos.log"), "{html}");
+    assert!(html.contains("12345"), "{html}");
 }
 
 // ---- ServerPickerView ------------------------------------------

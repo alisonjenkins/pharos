@@ -566,6 +566,126 @@ pub fn parse_sessions_response(bytes: &[u8]) -> Result<Vec<RemoteSession>, Clien
         .collect())
 }
 
+/// T58 phase 2 — `/ScheduledTasks` row. Server emits an empty array
+/// today; the projection types so the UI renders the table chrome.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScheduledTask {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub state: String,
+    pub last_execution_iso: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ScheduledTaskDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    last_execution_result: serde_json::Value,
+}
+
+pub fn parse_scheduled_tasks_response(
+    bytes: &[u8],
+) -> Result<Vec<ScheduledTask>, ClientError> {
+    let parsed: Vec<ScheduledTaskDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|t| ScheduledTask {
+            id: t.id,
+            name: t.name,
+            category: t.category,
+            state: if t.state.is_empty() {
+                "Idle".to_string()
+            } else {
+                t.state
+            },
+            last_execution_iso: t
+                .last_execution_result
+                .get("EndTimeUtc")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect())
+}
+
+/// T58 phase 2 — `/Plugins` row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginEntry {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PluginDto {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    status: String,
+}
+
+pub fn parse_plugins_response(bytes: &[u8]) -> Result<Vec<PluginEntry>, ClientError> {
+    let parsed: Vec<PluginDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|p| PluginEntry {
+            id: p.id,
+            name: p.name,
+            version: p.version,
+            status: p.status,
+        })
+        .collect())
+}
+
+/// T58 phase 2 — `/System/Logs` row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogEntry {
+    pub name: String,
+    pub size_bytes: u64,
+    pub date_modified_iso: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LogEntryDto {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    date_modified: String,
+}
+
+pub fn parse_logs_response(bytes: &[u8]) -> Result<Vec<LogEntry>, ClientError> {
+    let parsed: Vec<LogEntryDto> =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|e| LogEntry {
+            name: e.name,
+            size_bytes: e.size,
+            date_modified_iso: e.date_modified,
+        })
+        .collect())
+}
+
 /// T58 — VirtualFolder ("library") entry from `/Library/VirtualFolders`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LibraryFolder {
@@ -1046,6 +1166,63 @@ pub mod web {
         Ok(())
     }
 
+    pub async fn list_scheduled_tasks(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<ScheduledTask>, ClientError> {
+        let resp = Request::get(&format!("{base}/ScheduledTasks"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_scheduled_tasks_response(&bytes)
+    }
+
+    pub async fn list_plugins(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<PluginEntry>, ClientError> {
+        let resp = Request::get(&format!("{base}/Plugins"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_plugins_response(&bytes)
+    }
+
+    pub async fn list_logs(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<LogEntry>, ClientError> {
+        let resp = Request::get(&format!("{base}/System/Logs"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_logs_response(&bytes)
+    }
+
     pub async fn list_virtual_folders(
         base: &str,
         token: &str,
@@ -1279,6 +1456,46 @@ mod tests {
         assert_eq!(v[0].now_playing_item_id.as_deref(), Some("item-9"));
         assert_eq!(v[0].position_ticks, 1234567890);
         assert!(v[1].now_playing_item_id.is_none());
+    }
+
+    #[test]
+    fn parse_scheduled_tasks_handles_empty_and_populated() {
+        let empty = b"[]";
+        assert!(parse_scheduled_tasks_response(empty).unwrap().is_empty());
+        let body = br#"[
+            {"Id":"t1","Name":"Library scan","Category":"Library","State":"Idle",
+             "LastExecutionResult":{"EndTimeUtc":"2026-05-28T05:00:00Z"}},
+            {"Id":"t2","Name":"Refresh metadata","Category":"Library","State":"Running"}
+        ]"#;
+        let v = parse_scheduled_tasks_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "Library scan");
+        assert_eq!(v[0].state, "Idle");
+        assert_eq!(v[0].last_execution_iso, "2026-05-28T05:00:00Z");
+        assert_eq!(v[1].state, "Running");
+        assert_eq!(v[1].last_execution_iso, "");
+    }
+
+    #[test]
+    fn parse_plugins_extracts_name_version_status() {
+        let body = br#"[
+            {"Id":"p1","Name":"Subtitle Edit","Version":"1.2.3","Status":"Active"}
+        ]"#;
+        let v = parse_plugins_response(body).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "Subtitle Edit");
+        assert_eq!(v[0].version, "1.2.3");
+    }
+
+    #[test]
+    fn parse_logs_extracts_name_size_date() {
+        let body = br#"[
+            {"Name":"pharos.log","Size":12345,"DateModified":"2026-05-28T07:00:00Z"}
+        ]"#;
+        let v = parse_logs_response(body).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "pharos.log");
+        assert_eq!(v[0].size_bytes, 12345);
     }
 
     #[test]

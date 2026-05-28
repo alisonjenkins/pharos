@@ -14,8 +14,8 @@ pub mod views;
 pub use api_types::{ItemKind, LibraryItem, LoggedInUser};
 pub use client::{
     parse_auth_response, parse_items_response, ActivityEntry, AdminUser, ClientError, DeviceEntry,
-    ItemDetail, ItemPerson, LibraryFolder, LiveChannel, LiveProgram, RemoteSession, SearchHint,
-    UserConfiguration,
+    ItemDetail, ItemPerson, LibraryFolder, LiveChannel, LiveProgram, LogEntry, PluginEntry,
+    RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 pub use views::{
     AdminAction, AdminTab, AdminView, App, AppRoute, DetailAction, GroupAction, GroupMember,

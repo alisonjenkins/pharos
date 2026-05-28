@@ -5,7 +5,9 @@
 //! Devices, Activity log. Tabs that read a server-side empty stub still
 //! render so the UI is in place when entries land.
 
-use crate::client::{ActivityEntry, AdminUser, DeviceEntry, LibraryFolder};
+use crate::client::{
+    ActivityEntry, AdminUser, DeviceEntry, LibraryFolder, LogEntry, PluginEntry, ScheduledTask,
+};
 use dioxus::prelude::*;
 
 /// What the user typed into the create-user form when they hit submit.
@@ -33,6 +35,9 @@ pub enum AdminTab {
     Libraries,
     Devices,
     Activity,
+    ScheduledTasks,
+    Plugins,
+    Logs,
 }
 
 impl AdminTab {
@@ -42,6 +47,9 @@ impl AdminTab {
             Self::Libraries => "Libraries",
             Self::Devices => "Devices",
             Self::Activity => "Activity",
+            Self::ScheduledTasks => "Tasks",
+            Self::Plugins => "Plugins",
+            Self::Logs => "Logs",
         }
     }
     fn class_suffix(self) -> &'static str {
@@ -50,10 +58,21 @@ impl AdminTab {
             Self::Libraries => "libraries",
             Self::Devices => "devices",
             Self::Activity => "activity",
+            Self::ScheduledTasks => "scheduledtasks",
+            Self::Plugins => "plugins",
+            Self::Logs => "logs",
         }
     }
-    fn all() -> [AdminTab; 4] {
-        [Self::Users, Self::Libraries, Self::Devices, Self::Activity]
+    fn all() -> [AdminTab; 7] {
+        [
+            Self::Users,
+            Self::Libraries,
+            Self::Devices,
+            Self::Activity,
+            Self::ScheduledTasks,
+            Self::Plugins,
+            Self::Logs,
+        ]
     }
 }
 
@@ -71,6 +90,12 @@ pub struct AdminViewProps {
     pub devices: Vec<DeviceEntry>,
     #[props(default)]
     pub activity: Vec<ActivityEntry>,
+    #[props(default)]
+    pub scheduled_tasks: Vec<ScheduledTask>,
+    #[props(default)]
+    pub plugins: Vec<PluginEntry>,
+    #[props(default)]
+    pub logs: Vec<LogEntry>,
 }
 
 #[component]
@@ -278,6 +303,89 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         }
                     }
                 },
+                AdminTab::ScheduledTasks => rsx! {
+                    section {
+                        class: "pharos-admin-section pharos-admin-section-scheduledtasks",
+                        h3 { "Scheduled tasks" }
+                        if props.scheduled_tasks.is_empty() {
+                            p { class: "pharos-empty", "No scheduled tasks registered" }
+                        } else {
+                            table {
+                                class: "pharos-admin-tasks-table",
+                                thead {
+                                    tr {
+                                        th { "Task" }
+                                        th { "Category" }
+                                        th { "State" }
+                                        th { "Last run" }
+                                    }
+                                }
+                                tbody {
+                                    for t in props.scheduled_tasks.iter() {
+                                        tr {
+                                            key: "{t.id}",
+                                            td { "{t.name}" }
+                                            td { "{t.category}" }
+                                            td { class: "pharos-admin-task-state", "{t.state}" }
+                                            td { "{t.last_execution_iso}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                AdminTab::Plugins => rsx! {
+                    section {
+                        class: "pharos-admin-section pharos-admin-section-plugins",
+                        h3 { "Plugins" }
+                        if props.plugins.is_empty() {
+                            p { class: "pharos-empty", "No plugins installed" }
+                        } else {
+                            ul {
+                                class: "pharos-admin-plugin-list",
+                                for p in props.plugins.iter() {
+                                    li {
+                                        class: "pharos-admin-plugin",
+                                        key: "{p.id}",
+                                        span { class: "pharos-admin-plugin-name", "{p.name}" }
+                                        span { class: "pharos-admin-plugin-version", " · v{p.version}" }
+                                        if !p.status.is_empty() {
+                                            span { class: "pharos-admin-plugin-status", " ({p.status})" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                AdminTab::Logs => rsx! {
+                    section {
+                        class: "pharos-admin-section pharos-admin-section-logs",
+                        h3 { "Log files" }
+                        if props.logs.is_empty() {
+                            p { class: "pharos-empty", "No log files" }
+                        } else {
+                            ul {
+                                class: "pharos-admin-log-list",
+                                for l in props.logs.iter() {
+                                    li {
+                                        class: "pharos-admin-log",
+                                        key: "{l.name}",
+                                        span { class: "pharos-admin-log-name", "{l.name}" }
+                                        span { class: "pharos-admin-log-size", " · {l.size_bytes} B" }
+                                        if !l.date_modified_iso.is_empty() {
+                                            span {
+                                                class: "pharos-admin-log-date",
+                                                " · {l.date_modified_iso}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
             }
         }
     }
@@ -355,6 +463,9 @@ mod tests {
     fn tabs_round_trip_label_and_suffix() {
         assert_eq!(AdminTab::Users.label(), "Users");
         assert_eq!(AdminTab::Activity.class_suffix(), "activity");
-        assert_eq!(AdminTab::all().len(), 4);
+        assert_eq!(AdminTab::ScheduledTasks.label(), "Tasks");
+        assert_eq!(AdminTab::Plugins.class_suffix(), "plugins");
+        assert_eq!(AdminTab::Logs.label(), "Logs");
+        assert_eq!(AdminTab::all().len(), 7);
     }
 }
