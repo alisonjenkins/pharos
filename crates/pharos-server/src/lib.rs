@@ -16,3 +16,4 @@ pub mod ssdp;
 pub mod state;
 pub mod sync;
 pub mod transcode_sessions;
+pub mod trickplay_cache;

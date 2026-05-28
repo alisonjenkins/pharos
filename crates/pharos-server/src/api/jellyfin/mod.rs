@@ -18,6 +18,7 @@ pub mod stubs;
 pub mod subtitles;
 pub mod syncplay;
 pub mod system;
+pub mod trickplay;
 pub mod user_data;
 pub mod users;
 
@@ -38,6 +39,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     images::register(cfg);
     stream::register(cfg);
     hls::register(cfg);
+    trickplay::register(cfg);
     sessions::register(cfg);
     socket::register(cfg);
     subtitles::register(cfg);

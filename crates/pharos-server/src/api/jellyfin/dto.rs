@@ -459,6 +459,23 @@ impl BaseItemDto {
         Self::from_domain_with_user_data(item, server_id, pharos_core::UserItemData::default())
     }
 
+    /// Populate `Trickplay` with the layout map for the configured
+    /// widths. No-op when widths is empty or the probe lacks the
+    /// duration / dimensions required to compute a layout.
+    pub fn with_trickplay(
+        mut self,
+        probe: &pharos_core::MediaProbe,
+        widths: &[u32],
+        interval_ms: u32,
+    ) -> Self {
+        if widths.is_empty() {
+            return self;
+        }
+        self.trickplay =
+            crate::api::jellyfin::trickplay::build_dto_layout_map(probe, widths, interval_ms);
+        self
+    }
+
     pub fn from_domain_with_user_data(
         item: &pharos_core::MediaItem,
         server_id: &str,

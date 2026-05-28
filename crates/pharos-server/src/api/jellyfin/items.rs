@@ -221,7 +221,11 @@ async fn items_similar(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
         })
         .collect();
     fill_parent_ids(&state, &mut dtos, &picks);
@@ -565,7 +569,11 @@ async fn shows_next_up(
         .iter()
         .map(|(idx, item)| {
             let ud = user_data.get(*idx).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
         })
         .collect();
     let total = dtos.len() as u32;
@@ -746,7 +754,11 @@ async fn list_user_items_latest(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
         })
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
@@ -1574,13 +1586,13 @@ async fn fetch_item_dto(
         .get_user_data(user_id, id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(
-        HttpResponse::Ok().json(BaseItemDto::from_domain_with_user_data(
-            &item,
-            &state.server_id,
-            user_data,
-        )),
-    )
+    Ok(HttpResponse::Ok().json(
+        BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data).with_trickplay(
+            &item.probe,
+            &state.trickplay_widths,
+            state.trickplay_interval_ms,
+        ),
+    ))
 }
 
 /// If `id_str` matches the library id of any configured root, return
@@ -1728,7 +1740,11 @@ async fn list_user_items_resume(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
         })
         .collect();
     Ok(HttpResponse::Ok().json(ItemsResultDto {
@@ -1781,7 +1797,11 @@ async fn paginate(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
         })
         .collect();
     let refs: Vec<&pharos_core::MediaItem> = slice.iter().collect();

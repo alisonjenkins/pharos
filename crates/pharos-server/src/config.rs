@@ -33,6 +33,23 @@ pub struct ServerConfig {
     /// least-recently-used segments are evicted. Default 1 GiB.
     #[serde(default = "default_transcode_cache_bytes")]
     pub transcode_cache_max_bytes: u64,
+    /// Directory used to cache Trickplay sprite sheets. When unset,
+    /// trickplay generation is disabled and BaseItemDto.Trickplay emits
+    /// an empty map.
+    #[serde(default)]
+    pub trickplay_cache_dir: Option<PathBuf>,
+    /// Soft cap on the Trickplay cache, in bytes. LRU eviction kicks in
+    /// once exceeded. Default 256 MiB.
+    #[serde(default = "default_trickplay_cache_bytes")]
+    pub trickplay_cache_max_bytes: u64,
+    /// Milliseconds between thumbnails. Default 10000 (one thumb per
+    /// 10s). Lower = denser sprite + more disk + more ffmpeg work.
+    #[serde(default = "default_trickplay_interval_ms")]
+    pub trickplay_interval_ms: u32,
+    /// Sprite widths to generate. Empty = trickplay disabled even when
+    /// `trickplay_cache_dir` is set. Default `[320]`.
+    #[serde(default = "default_trickplay_widths")]
+    pub trickplay_widths: Vec<u32>,
     /// Live-TV M3U playlist path (T47). When set, /LiveTv/Channels
     /// + /LiveTv/Programs serve channels + EPG from this backend.
     #[serde(default)]
@@ -57,6 +74,18 @@ pub struct ServerConfig {
 
 fn default_transcode_cache_bytes() -> u64 {
     1024 * 1024 * 1024
+}
+
+fn default_trickplay_cache_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_trickplay_interval_ms() -> u32 {
+    10_000
+}
+
+fn default_trickplay_widths() -> Vec<u32> {
+    vec![320]
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

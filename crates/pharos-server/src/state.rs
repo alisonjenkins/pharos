@@ -6,7 +6,7 @@
 use crate::{
     auth::BuiltinAuth, hls_cache::HlsSegmentCache, image_cache::ImageCache,
     live_tv::M3uXmltvBackend, sessions::SessionRegistry,
-    transcode_sessions::TranscodeSessionRegistry,
+    transcode_sessions::TranscodeSessionRegistry, trickplay_cache::TrickplayCache,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::path::PathBuf;
@@ -51,6 +51,11 @@ pub struct AppState {
     pub transcode_sessions: TranscodeSessionRegistry,
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
+    pub trickplay: Option<TrickplayCache>,
+    /// Trickplay layout knobs surfaced to handlers + DTO emitter so
+    /// the wire shape matches what was actually generated.
+    pub trickplay_widths: Vec<u32>,
+    pub trickplay_interval_ms: u32,
     pub live_tv: Option<M3uXmltvBackend>,
     pub server_id: String,
     pub server_name: String,
@@ -88,6 +93,9 @@ impl AppState {
             transcode_sessions,
             images: None,
             hls: None,
+            trickplay: None,
+            trickplay_widths: Vec::new(),
+            trickplay_interval_ms: 10_000,
             live_tv: None,
             media_roots: Vec::new(),
             log_dir: None,
@@ -133,6 +141,9 @@ impl AppState {
             transcode_sessions,
             images: None,
             hls: None,
+            trickplay: None,
+            trickplay_widths: Vec::new(),
+            trickplay_interval_ms: 10_000,
             live_tv: None,
             media_roots: Vec::new(),
             log_dir: None,
@@ -151,6 +162,17 @@ impl AppState {
 
     pub fn with_hls_cache(mut self, cache: HlsSegmentCache) -> Self {
         self.hls = Some(cache);
+        self
+    }
+
+    pub fn with_trickplay_cache(mut self, cache: TrickplayCache) -> Self {
+        self.trickplay = Some(cache);
+        self
+    }
+
+    pub fn with_trickplay_layout(mut self, widths: Vec<u32>, interval_ms: u32) -> Self {
+        self.trickplay_widths = widths;
+        self.trickplay_interval_ms = interval_ms.max(1_000);
         self
     }
 

@@ -279,6 +279,19 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             cfg.server.transcode_cache_max_bytes,
         ));
     }
+    if !cfg.server.trickplay_widths.is_empty() {
+        if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
+            state =
+                state.with_trickplay_cache(pharos_server::trickplay_cache::TrickplayCache::new(
+                    cache_dir,
+                    cfg.server.trickplay_cache_max_bytes,
+                ));
+        }
+        state = state.with_trickplay_layout(
+            cfg.server.trickplay_widths.clone(),
+            cfg.server.trickplay_interval_ms,
+        );
+    }
     if let Some(backend) = build_live_tv_backend(
         cfg.server.live_tv_m3u.clone(),
         cfg.server.live_tv_xmltv.clone(),
