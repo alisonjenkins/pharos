@@ -11,7 +11,14 @@ default = []
 # Enable the `[[bin]] web` target — adds the wasm renderer + gloo-net
 # HTTP client. Build with `dx serve` or
 # `cargo build --target wasm32-unknown-unknown --bin pharos-ui-web --features web`.
-web = ["dep:dioxus-web", "dep:gloo-net", "dep:web-sys", "dep:wasm-bindgen"]
+web = [
+    "dep:dioxus-web",
+    "dep:gloo-net",
+    "dep:web-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+]
 
 [[bin]]
 name = "pharos-ui-web"
@@ -38,6 +45,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "Crypto",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true

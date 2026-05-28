@@ -13,13 +13,14 @@ use dioxus::prelude::*;
 use pharos_ui::api_types::{ItemKind, LibraryItem};
 use pharos_ui::client::{
     ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
-    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, RemoteSession,
-    ScheduledTask, SearchHint, UserConfiguration,
+    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, QuickConnectInitiate,
+    RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
     LibraryView, LiveTvStatus, LiveTvView, LoginForm, PlayerView, PrefsTab, PrefsView,
-    RemoteControlView, SavedServer, SearchStatus, SearchView, ServerPickerView,
+    QuickConnectAuthorizeView, QuickConnectGuestStatus, QuickConnectGuestView, RemoteControlView,
+    SavedServer, SearchStatus, SearchView, ServerPickerView,
 };
 
 fn render_root(root: fn() -> Element) -> String {
@@ -1283,4 +1284,68 @@ fn prefs_view_languages_tab_renders_dropdowns() {
     assert!(html.contains("Japanese"), "{html}");
     // Languages tab is wired into the tab strip.
     assert!(html.contains(">Languages<"), "{html}");
+}
+
+// ---- QuickConnect ------------------------------------------------
+
+fn qc_guest_pending() -> Element {
+    rsx! {
+        QuickConnectGuestView {
+            pending: Some(QuickConnectInitiate {
+                code: "654321".into(),
+                secret: "sec".into(),
+                device_id: "dev".into(),
+            }),
+            status: QuickConnectGuestStatus::Pending,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn qc_guest_idle() -> Element {
+    rsx! {
+        QuickConnectGuestView {
+            pending: None,
+            status: QuickConnectGuestStatus::Idle,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn qc_authorize_form() -> Element {
+    rsx! {
+        QuickConnectAuthorizeView {
+            status: None,
+            on_action: move |_| {},
+        }
+    }
+}
+
+#[test]
+fn quick_connect_guest_pending_renders_code_and_status() {
+    let html = render_root(qc_guest_pending);
+    assert!(html.contains("pharos-qc-guest"), "{html}");
+    assert!(html.contains("654321"), "{html}");
+    assert!(html.contains("Waiting for approval"), "{html}");
+    assert!(html.contains("pharos-qc-guest-start"), "{html}");
+    assert!(html.contains(">New code<"), "{html}");
+}
+
+#[test]
+fn quick_connect_guest_idle_shows_start_prompt() {
+    let html = render_root(qc_guest_idle);
+    assert!(html.contains("pharos-qc-guest-empty"), "{html}");
+    assert!(html.contains(">Start<"), "{html}");
+    // No code rendered until Initiate.
+    assert!(!html.contains("pharos-qc-guest-code"), "{html}");
+}
+
+#[test]
+fn quick_connect_authorize_renders_input_and_submit() {
+    let html = render_root(qc_authorize_form);
+    assert!(html.contains("pharos-qc-authorize"), "{html}");
+    assert!(html.contains(r#"inputmode="numeric""#), "{html}");
+    assert!(html.contains(r#"maxlength="6""#), "{html}");
+    assert!(html.contains("pharos-qc-authorize-submit"), "{html}");
+    assert!(html.contains(">Authorize<"), "{html}");
 }

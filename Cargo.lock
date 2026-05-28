@@ -2581,10 +2581,12 @@ dependencies = [
  "dioxus-ssr",
  "dioxus-web",
  "gloo-net",
+ "js-sys",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

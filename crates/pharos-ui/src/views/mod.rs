@@ -12,6 +12,7 @@ pub mod live_tv;
 pub mod login;
 pub mod player;
 pub mod prefs;
+pub mod quick_connect;
 pub mod remote;
 pub mod search;
 pub mod server_picker;
@@ -25,6 +26,10 @@ pub use live_tv::{LiveTvAction, LiveTvStatus, LiveTvView};
 pub use login::{LoginAttempt, LoginForm};
 pub use player::{PlaybackEvent, PlayerProps, PlayerView, QualityOption};
 pub use prefs::{PrefsAction, PrefsTab, PrefsView};
+pub use quick_connect::{
+    QuickConnectAuthorizeAction, QuickConnectAuthorizeView, QuickConnectGuestAction,
+    QuickConnectGuestStatus, QuickConnectGuestView,
+};
 pub use remote::{RemoteAction, RemoteControlView};
 pub use search::{SearchStatus, SearchView};
 pub use server_picker::{SavedServer, ServerPickerAction, ServerPickerView};

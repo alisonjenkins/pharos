@@ -14,15 +14,16 @@
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, DeviceEntry, ItemChapter, ItemDetail, LibraryFolder,
-    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, RemoteSession,
-    ScheduledTask, SearchHint, UserConfiguration,
+    LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry, QuickConnectInitiate,
+    RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
     AdminAction, AdminTab, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
     LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, PrefsAction,
-    PrefsTab, PrefsView, RemoteAction, RemoteControlView, SavedServer, SearchStatus, SearchView,
-    ServerPickerAction, ServerPickerView,
+    PrefsTab, PrefsView, QuickConnectAuthorizeAction, QuickConnectAuthorizeView,
+    QuickConnectGuestAction, QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction,
+    RemoteControlView, SavedServer, SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
 };
 use dioxus::prelude::*;
 
@@ -43,6 +44,9 @@ pub enum AppRoute {
     Prefs(PrefsTab),
     Remote,
     SelectServer,
+    /// T63 follow-on — admin enters a code to authorize a guest's
+    /// QuickConnect request.
+    QuickConnectAuthorize,
 }
 
 #[component]
@@ -54,6 +58,8 @@ pub fn RootApp() -> Element {
     // ServerPickerPane. Post-login the same flow is reachable via
     // `AppRoute::SelectServer`.
     let mut pre_login_picker = use_signal(|| false);
+    // Pre-login QuickConnect guest toggle.
+    let mut pre_login_qc = use_signal(|| false);
 
     rsx! {
         div {
@@ -68,11 +74,23 @@ pub fn RootApp() -> Element {
                                 on_done: move |_| pre_login_picker.set(false),
                             }
                         }
+                    } else if *pre_login_qc.read() {
+                        rsx! {
+                            QuickConnectGuestPane {
+                                user: user,
+                                on_done: move |_| pre_login_qc.set(false),
+                            }
+                        }
                     } else {
                         rsx! {
                             div {
                                 class: "pharos-pre-login",
                                 LoginGate { user: user, error: error }
+                                button {
+                                    class: "pharos-qc-toggle",
+                                    onclick: move |_| pre_login_qc.set(true),
+                                    "Use Quick Connect"
+                                }
                                 button {
                                     class: "pharos-switch-server",
                                     onclick: move |_| pre_login_picker.set(true),
@@ -191,6 +209,11 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
                 onclick: move |_| route.set(AppRoute::SelectServer),
                 "Server"
             }
+            button {
+                class: "pharos-nav-qc-authorize",
+                onclick: move |_| route.set(AppRoute::QuickConnectAuthorize),
+                "Quick Connect"
+            }
             if is_admin {
                 button {
                     class: "pharos-nav-admin",
@@ -292,6 +315,13 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
             },
             AppRoute::SelectServer => rsx! {
                 ServerPickerPane {
+                    on_done: move |_| { route.set(AppRoute::Library); },
+                }
+            },
+            AppRoute::QuickConnectAuthorize => rsx! {
+                QuickConnectAuthorizePane {
+                    access_token: access_token.clone(),
+                    server_base: server_base_from_window(),
                     on_done: move |_| { route.set(AppRoute::Library); },
                 }
             }
@@ -1353,6 +1383,137 @@ fn LiveTvPane(access_token: String, server_base: String, on_tune: EventHandler<S
 /// Switching servers updates `pharos.active_server_url` then reloads
 /// the page so every cached fetch / `use_resource` drops cleanly.
 #[component]
+fn QuickConnectGuestPane(
+    user: Signal<Option<LoggedInUser>>,
+    on_done: EventHandler<()>,
+) -> Element {
+    let pending = use_signal::<Option<QuickConnectInitiate>>(|| None);
+    let status = use_signal::<QuickConnectGuestStatus>(|| QuickConnectGuestStatus::Idle);
+    let cancel_signal = use_signal(|| false);
+
+    // Auto-poll loop: once pending is Some, hit /Connect every 2 s
+    // until either Authenticated:true (issue token, set user) or
+    // expired (404).
+    {
+        let mut status_for_poll = status;
+        let mut cancel_signal = cancel_signal;
+        let mut user_signal = user;
+        let on_done_for_poll = on_done;
+        let mut pending_for_poll = pending;
+        use_effect(move || {
+            let secret = pending.read().as_ref().map(|p| p.secret.clone());
+            let Some(secret) = secret else { return };
+            spawn(async move {
+                loop {
+                    if *cancel_signal.read() {
+                        cancel_signal.set(false);
+                        return;
+                    }
+                    let base = server_base_from_window();
+                    match poll_quick_connect(&base, &secret).await {
+                        Ok(poll) if poll.authenticated => {
+                            if let Some(tok) = poll.access_token {
+                                let active_user = build_user_from_token(&base, &tok).await;
+                                if let Some(u) = active_user {
+                                    user_signal.set(Some(u));
+                                    on_done_for_poll.call(());
+                                }
+                            }
+                            return;
+                        }
+                        Ok(_) => {
+                            status_for_poll.set(QuickConnectGuestStatus::Pending);
+                        }
+                        Err(e) => {
+                            status_for_poll.set(QuickConnectGuestStatus::Error(e));
+                            pending_for_poll.set(None);
+                            return;
+                        }
+                    }
+                    sleep_ms(2_000).await;
+                }
+            });
+        });
+    }
+
+    let action_handler = {
+        let mut pending = pending;
+        let mut status = status;
+        let mut cancel_signal = cancel_signal;
+        let on_done = on_done;
+        move |action: QuickConnectGuestAction| match action {
+            QuickConnectGuestAction::Initiate => {
+                let base = server_base_from_window();
+                cancel_signal.set(true);
+                spawn(async move {
+                    let device_id = generate_play_session_id();
+                    match initiate_quick_connect(&base, &device_id).await {
+                        Ok(p) => {
+                            pending.set(Some(p));
+                            status.set(QuickConnectGuestStatus::Pending);
+                        }
+                        Err(e) => status.set(QuickConnectGuestStatus::Error(e)),
+                    }
+                });
+            }
+            QuickConnectGuestAction::Cancel => {
+                cancel_signal.set(true);
+                pending.set(None);
+                on_done.call(());
+            }
+        }
+    };
+
+    let pending_now = pending.read().clone();
+    let status_now = status.read().clone();
+    rsx! {
+        QuickConnectGuestView {
+            pending: pending_now,
+            status: status_now,
+            on_action: action_handler,
+        }
+    }
+}
+
+#[component]
+fn QuickConnectAuthorizePane(
+    access_token: String,
+    server_base: String,
+    on_done: EventHandler<()>,
+) -> Element {
+    let status = use_signal::<Option<String>>(|| None);
+    let action_handler = {
+        let access_token = access_token.clone();
+        let server_base = server_base.clone();
+        let mut status_signal = status;
+        let on_done = on_done;
+        move |action: QuickConnectAuthorizeAction| match action {
+            QuickConnectAuthorizeAction::Submit { code } => {
+                let token = access_token.clone();
+                let base = server_base.clone();
+                let on_done = on_done;
+                spawn(async move {
+                    match authorize_quick_connect(&base, &token, &code).await {
+                        Ok(()) => {
+                            status_signal.set(Some(format!("Authorized {code}")));
+                            on_done.call(());
+                        }
+                        Err(e) => status_signal.set(Some(format!("Authorize failed: {e}"))),
+                    }
+                });
+            }
+        }
+    };
+    let status_now = status.read().clone();
+    rsx! {
+        QuickConnectAuthorizeView {
+            status: status_now,
+            on_action: action_handler,
+        }
+    }
+}
+
+#[component]
 fn ServerPickerPane(on_done: EventHandler<()>) -> Element {
     let saved = use_signal::<Vec<SavedServer>>(load_saved_servers);
     let status = use_signal::<Option<String>>(|| None);
@@ -1886,6 +2047,122 @@ async fn fetch_activity_entries(base: &str, token: &str) -> Result<Vec<ActivityE
 #[cfg(not(feature = "web"))]
 async fn fetch_activity_entries(_base: &str, _token: &str) -> Result<Vec<ActivityEntry>, String> {
     Err("list_activity_entries is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn initiate_quick_connect(
+    base: &str,
+    device_id: &str,
+) -> Result<QuickConnectInitiate, String> {
+    crate::client::web::quick_connect_initiate(base, device_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn initiate_quick_connect(
+    _base: &str,
+    _device_id: &str,
+) -> Result<QuickConnectInitiate, String> {
+    Err("quick_connect_initiate is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn poll_quick_connect(
+    base: &str,
+    secret: &str,
+) -> Result<crate::client::QuickConnectPoll, String> {
+    crate::client::web::quick_connect_connect(base, secret)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn poll_quick_connect(
+    _base: &str,
+    _secret: &str,
+) -> Result<crate::client::QuickConnectPoll, String> {
+    Err("quick_connect_connect is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn authorize_quick_connect(
+    base: &str,
+    token: &str,
+    code: &str,
+) -> Result<(), String> {
+    crate::client::web::quick_connect_authorize(base, token, code)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn authorize_quick_connect(
+    _base: &str,
+    _token: &str,
+    _code: &str,
+) -> Result<(), String> {
+    Err("quick_connect_authorize is only wired in the web build".into())
+}
+
+/// Once QuickConnect resolves with a token, build a fully-fledged
+/// LoggedInUser by fetching /Users/Me.
+#[cfg(feature = "web")]
+async fn build_user_from_token(base: &str, token: &str) -> Option<LoggedInUser> {
+    use gloo_net::http::Request;
+    let resp = Request::get(&format!("{base}/Users/Me"))
+        .header("X-Emby-Token", token)
+        .send()
+        .await
+        .ok()?;
+    if !resp.ok() {
+        return None;
+    }
+    let bytes = resp.binary().await.ok()?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Me {
+        id: String,
+        name: String,
+        server_id: String,
+        policy: Policy,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Policy {
+        is_administrator: bool,
+    }
+    let me: Me = serde_json::from_slice(&bytes).ok()?;
+    Some(LoggedInUser {
+        id: me.id,
+        name: me.name,
+        server_id: me.server_id,
+        access_token: token.to_string(),
+        is_admin: me.policy.is_administrator,
+    })
+}
+
+#[cfg(not(feature = "web"))]
+async fn build_user_from_token(_base: &str, _token: &str) -> Option<LoggedInUser> {
+    None
+}
+
+#[cfg(feature = "web")]
+async fn sleep_ms(ms: u32) {
+    let win = web_sys::window();
+    let Some(win) = win else { return };
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+            &resolve,
+            ms as i32,
+        );
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+#[cfg(not(feature = "web"))]
+async fn sleep_ms(_ms: u32) {
+    // Polling loop is WASM-only; host-side tests never enter this path.
 }
 
 #[cfg(feature = "web")]

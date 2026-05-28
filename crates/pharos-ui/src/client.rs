@@ -342,6 +342,60 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
         .collect())
 }
 
+/// T63 / UI — `/QuickConnect/Initiate` response.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuickConnectInitiate {
+    pub code: String,
+    pub secret: String,
+    pub device_id: String,
+}
+
+/// T63 / UI — `/QuickConnect/Connect` poll response.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuickConnectPoll {
+    pub authenticated: bool,
+    pub access_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct QcInitiateDto {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct QcPollDto {
+    #[serde(default)]
+    authenticated: bool,
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+pub fn parse_quick_connect_initiate(bytes: &[u8]) -> Result<QuickConnectInitiate, ClientError> {
+    let dto: QcInitiateDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(QuickConnectInitiate {
+        code: dto.code,
+        secret: dto.secret,
+        device_id: dto.device_id,
+    })
+}
+
+pub fn parse_quick_connect_poll(bytes: &[u8]) -> Result<QuickConnectPoll, ClientError> {
+    let dto: QcPollDto =
+        serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))?;
+    Ok(QuickConnectPoll {
+        authenticated: dto.authenticated,
+        access_token: dto.access_token,
+    })
+}
+
 /// T55 ph2 — `/Localization/Cultures` row (subset of the upstream
 /// Jellyfin DTO — pharos's prefs view only needs the picker label +
 /// the two-letter code).
@@ -1604,6 +1658,66 @@ pub mod web {
         parse_activity_entries_response(&bytes)
     }
 
+    pub async fn quick_connect_initiate(
+        base: &str,
+        device_id: &str,
+    ) -> Result<QuickConnectInitiate, ClientError> {
+        let header = format!(
+            r#"MediaBrowser Client="pharos-ui", Device="browser", DeviceId="{device_id}", Version="0""#,
+        );
+        let resp = Request::post(&format!("{base}/QuickConnect/Initiate"))
+            .header("X-Emby-Authorization", &header)
+            .body("")
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_quick_connect_initiate(&bytes)
+    }
+
+    pub async fn quick_connect_authorize(
+        base: &str,
+        token: &str,
+        code: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!("{base}/QuickConnect/Authorize?Code={code}"))
+            .header("X-Emby-Token", token)
+            .body("")
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn quick_connect_connect(
+        base: &str,
+        secret: &str,
+    ) -> Result<QuickConnectPoll, ClientError> {
+        let resp = Request::get(&format!("{base}/QuickConnect/Connect?Secret={secret}"))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_quick_connect_poll(&bytes)
+    }
+
     pub async fn list_cultures(
         base: &str,
         token: &str,
@@ -1905,6 +2019,35 @@ mod tests {
         let v = parse_activity_entries_response(body).unwrap();
         assert_eq!(v[0].id, "abc");
         assert_eq!(v[1].id, "42");
+    }
+
+    #[test]
+    fn parse_quick_connect_initiate_extracts_code_secret() {
+        let body = br#"{
+            "Code":"123456","Secret":"abc123def","DeviceId":"pw-1","Authenticated":false
+        }"#;
+        let v = parse_quick_connect_initiate(body).unwrap();
+        assert_eq!(v.code, "123456");
+        assert_eq!(v.secret, "abc123def");
+        assert_eq!(v.device_id, "pw-1");
+    }
+
+    #[test]
+    fn parse_quick_connect_poll_pending_has_no_token() {
+        let body = br#"{"Code":"1","DeviceId":"d","Authenticated":false}"#;
+        let v = parse_quick_connect_poll(body).unwrap();
+        assert!(!v.authenticated);
+        assert!(v.access_token.is_none());
+    }
+
+    #[test]
+    fn parse_quick_connect_poll_authorized_carries_token() {
+        let body = br#"{
+            "Code":"1","DeviceId":"d","Authenticated":true,"AccessToken":"tok-xyz"
+        }"#;
+        let v = parse_quick_connect_poll(body).unwrap();
+        assert!(v.authenticated);
+        assert_eq!(v.access_token.as_deref(), Some("tok-xyz"));
     }
 
     #[test]
