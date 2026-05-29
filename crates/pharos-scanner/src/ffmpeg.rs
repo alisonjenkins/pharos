@@ -143,6 +143,33 @@ struct FfprobeStreamTags {
     language: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    /// P37 — ReplayGain track gain string ffprobe reports as
+    /// `"-7.34 dB"`. Parsed at AudioTrack construction time.
+    #[serde(default, rename = "replaygain_track_gain")]
+    replaygain_track_gain: Option<String>,
+    #[serde(default, rename = "replaygain_album_gain")]
+    replaygain_album_gain: Option<String>,
+    /// Some ffprobe builds emit the uppercase variant. Same string
+    /// shape; just match either casing.
+    #[serde(default, rename = "REPLAYGAIN_TRACK_GAIN")]
+    replaygain_track_gain_upper: Option<String>,
+    #[serde(default, rename = "REPLAYGAIN_ALBUM_GAIN")]
+    replaygain_album_gain_upper: Option<String>,
+}
+
+/// P37 — parse a ReplayGain string of the form `"-7.34 dB"` /
+/// `"+0.10 dB"` / `"-7.34"` into centidecibels (× 100). Returns
+/// `None` on garbage input or values that overflow i16.
+fn parse_replaygain_centidb(s: &str) -> Option<i16> {
+    let trimmed = s.trim().trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let trimmed = trimmed.trim();
+    let v: f32 = trimmed.parse().ok()?;
+    let scaled = (v * 100.0).round();
+    if scaled.is_finite() && scaled >= i16::MIN as f32 && scaled <= i16::MAX as f32 {
+        Some(scaled as i16)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -151,6 +178,12 @@ struct FfprobeDisposition {
     default: i32,
     #[serde(default)]
     forced: i32,
+    /// P35 — ffprobe reports `disposition.hearing_impaired` for SDH
+    /// / CC tracks. Promotes through to `SubtitleTrack` so the
+    /// jellyfin-web picker labels the track and the audio-only deaf
+    /// filter on `/Items` returns the right rows.
+    #[serde(default)]
+    hearing_impaired: i32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,14 +254,30 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         .streams
         .iter()
         .filter(|s| s.codec_type == "audio")
-        .map(|s| pharos_core::AudioTrack {
-            stream_index: s.index.unwrap_or(0),
-            codec: s.codec_name.clone(),
-            channels: s.channels,
-            sample_rate: s.sample_rate.as_deref().and_then(|r| r.parse::<u32>().ok()),
-            language: s.tags.language.clone(),
-            title: s.tags.title.clone(),
-            is_default: s.disposition.default != 0,
+        .map(|s| {
+            let rg_track = s
+                .tags
+                .replaygain_track_gain
+                .as_deref()
+                .or(s.tags.replaygain_track_gain_upper.as_deref())
+                .and_then(parse_replaygain_centidb);
+            let rg_album = s
+                .tags
+                .replaygain_album_gain
+                .as_deref()
+                .or(s.tags.replaygain_album_gain_upper.as_deref())
+                .and_then(parse_replaygain_centidb);
+            pharos_core::AudioTrack {
+                stream_index: s.index.unwrap_or(0),
+                codec: s.codec_name.clone(),
+                channels: s.channels,
+                sample_rate: s.sample_rate.as_deref().and_then(|r| r.parse::<u32>().ok()),
+                language: s.tags.language.clone(),
+                title: s.tags.title.clone(),
+                is_default: s.disposition.default != 0,
+                replaygain_track_centidb: rg_track,
+                replaygain_album_centidb: rg_album,
+            }
         })
         .collect();
 
@@ -270,6 +319,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
                 title: s.tags.title.clone(),
                 is_default: s.disposition.default != 0,
                 is_forced: s.disposition.forced != 0,
+                is_hearing_impaired: s.disposition.hearing_impaired != 0,
             })
         })
         .collect();
@@ -332,6 +382,11 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             album_artist: parsed.format.tags.album_artist,
             genre: parsed.format.tags.genre,
             chapters,
+            // P34 — alternate editions enrichment lives in a
+            // future scanner pass (sibling-file convention reader
+            // or NFO metadata). FfmpegProber today only probes a
+            // single file.
+            alternate_sources: Vec::new(),
         },
     })
 }

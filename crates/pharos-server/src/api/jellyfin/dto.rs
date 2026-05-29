@@ -338,9 +338,32 @@ pub struct MediaStreamDto {
     /// Subtitle-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_forced: Option<bool>,
+    /// P35 — Subtitle-only. `true` when the track's
+    /// `disposition.hearing_impaired` flag is set (SDH / CC).
+    /// jellyfin-web reads this to label the picker entry and an
+    /// accessibility filter on `/Items` reuses the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_hearing_impaired: Option<bool>,
     /// Jellyfin's URL the player fetches the rendered .vtt from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_url: Option<String>,
+    /// P37 — Audio-only. `{ "TrackGain": …, "AlbumGain": … }` in dB.
+    /// Finamp reads this and applies loudness normalisation; absent
+    /// keys leave the player at unity gain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_gain: Option<ReplayGainDto>,
+}
+
+/// P37 — wire shape for `MediaStream.ReplayGain`. Floats are in dB
+/// (centidecibels divided by 100). Both fields skip when absent so
+/// clients fall back to unity gain rather than -infinity.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ReplayGainDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_gain: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_gain: Option<f32>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -786,6 +809,23 @@ pub(crate) fn build_media_streams(
     build_media_streams_with_subtitles(probe, is_video, None)
 }
 
+/// P37 — convert an AudioTrack's stored centidecibel ReplayGain
+/// fields back to dB. Both fields stay independently `Option<f32>`
+/// so a track with only album-level RG (FLAC pressings + a single
+/// tag run) doesn't emit a zero TrackGain that would silence the
+/// player.
+fn build_replay_gain(t: &pharos_core::AudioTrack) -> Option<ReplayGainDto> {
+    let track = t.replaygain_track_centidb.map(|c| c as f32 / 100.0);
+    let album = t.replaygain_album_centidb.map(|c| c as f32 / 100.0);
+    if track.is_none() && album.is_none() {
+        return None;
+    }
+    Some(ReplayGainDto {
+        track_gain: track,
+        album_gain: album,
+    })
+}
+
 pub(crate) fn build_media_streams_with_subtitles(
     probe: &pharos_core::MediaProbe,
     is_video: bool,
@@ -815,7 +855,9 @@ pub(crate) fn build_media_streams_with_subtitles(
             title: None,
             is_external: None,
             is_forced: None,
+            is_hearing_impaired: None,
             delivery_url: None,
+            replay_gain: None,
         });
         // P16 — multi-track audio when the probe carries the new
         // audio_tracks Vec. Falls through to the scalar
@@ -842,7 +884,9 @@ pub(crate) fn build_media_streams_with_subtitles(
                     title: t.title.clone(),
                     is_external: None,
                     is_forced: None,
+                    is_hearing_impaired: None,
                     delivery_url: None,
+                    replay_gain: build_replay_gain(t),
                 });
             }
         } else if let Some(codec) = probe.audio_codec.clone() {
@@ -867,7 +911,9 @@ pub(crate) fn build_media_streams_with_subtitles(
                 title: None,
                 is_external: None,
                 is_forced: None,
+                is_hearing_impaired: None,
                 delivery_url: None,
+                replay_gain: None,
             });
         }
         // Subtitle tracks — embedded first, then sidecars.
@@ -877,13 +923,30 @@ pub(crate) fn build_media_streams_with_subtitles(
                 // picker shows the disposition without the user
                 // having to memorise indices.
                 let base = t.title.clone().or_else(|| t.language.clone());
-                let title = if t.is_forced {
-                    Some(match base.as_deref() {
-                        Some(s) if !s.is_empty() => format!("{s} (forced)"),
-                        _ => "Forced".to_string(),
-                    })
-                } else {
-                    base
+                // P30 forced suffix + P35 SDH suffix. Real Jellyfin's
+                // picker shows both — order matches what jellyfin-web
+                // renders so the strings sort-stable across reloads.
+                let title = {
+                    let mut s = base.clone().unwrap_or_default();
+                    if t.is_hearing_impaired {
+                        if s.is_empty() {
+                            s = "SDH".to_string();
+                        } else {
+                            s.push_str(" [SDH]");
+                        }
+                    }
+                    if t.is_forced {
+                        if s.is_empty() {
+                            s = "Forced".to_string();
+                        } else {
+                            s.push_str(" (forced)");
+                        }
+                    }
+                    if s.is_empty() {
+                        base
+                    } else {
+                        Some(s)
+                    }
                 };
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
@@ -902,11 +965,13 @@ pub(crate) fn build_media_streams_with_subtitles(
                     title,
                     is_external: Some(false),
                     is_forced: Some(t.is_forced),
+                    is_hearing_impaired: Some(t.is_hearing_impaired),
                     delivery_url: Some(format!(
                         "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
                         id = ctx.item_id,
                         idx = t.stream_index,
                     )),
+                    replay_gain: None,
                 });
             }
             // Sidecars: stream_index = SIDECAR_BASE + offset.
@@ -929,10 +994,12 @@ pub(crate) fn build_media_streams_with_subtitles(
                     title: Some(format!("External {}", offset + 1)),
                     is_external: Some(true),
                     is_forced: Some(false),
+                    is_hearing_impaired: Some(false),
                     delivery_url: Some(format!(
                         "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
                         id = ctx.item_id,
                     )),
+                    replay_gain: None,
                 });
             }
         }
@@ -954,7 +1021,9 @@ pub(crate) fn build_media_streams_with_subtitles(
             title: None,
             is_external: None,
             is_forced: None,
+            is_hearing_impaired: None,
             delivery_url: None,
+            replay_gain: None,
         });
     }
     streams

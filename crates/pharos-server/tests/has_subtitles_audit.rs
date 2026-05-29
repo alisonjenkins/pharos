@@ -32,6 +32,7 @@ async fn seed_mixed_subs() -> (web::Data<AppState>, String) {
         title: None,
         is_default: true,
         is_forced: false,
+        is_hearing_impaired: false,
     }];
     for (id, subs) in [(1u64, &with_subs), (2u64, &with_subs)] {
         stores

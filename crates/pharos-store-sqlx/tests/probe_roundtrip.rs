@@ -42,6 +42,7 @@ fn arb_subtitle_track() -> impl Strategy<Value = SubtitleTrack> {
             title,
             is_default: dflt,
             is_forced: forced,
+            is_hearing_impaired: false,
         })
 }
 
@@ -106,6 +107,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 album_artist,
                 genre,
                 chapters: Vec::new(),
+                alternate_sources: Vec::new(),
             },
         )
 }

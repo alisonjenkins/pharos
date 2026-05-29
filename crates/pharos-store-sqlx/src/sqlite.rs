@@ -335,6 +335,10 @@ impl MediaRow {
             album_artist: self.album_artist,
             genre: self.genre,
             chapters: crate::chapter_json::decode(self.chapters_json.as_deref()),
+            // P34 — alternate editions land via a future scanner
+            // enrichment pass. Today's persisted probes never carry
+            // them so default to an empty Vec.
+            alternate_sources: Vec::new(),
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

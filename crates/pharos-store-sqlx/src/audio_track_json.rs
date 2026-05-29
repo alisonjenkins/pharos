@@ -23,6 +23,13 @@ pub struct AudioTrackJson {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_default: bool,
+    /// P37 — track-level ReplayGain in centidecibels (gain × 100).
+    /// Rows persisted before this field landed decode to None via the
+    /// serde default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaygain_track_centidb: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaygain_album_centidb: Option<i16>,
 }
 
 impl From<&AudioTrack> for AudioTrackJson {
@@ -35,6 +42,8 @@ impl From<&AudioTrack> for AudioTrackJson {
             language: t.language.clone(),
             title: t.title.clone(),
             is_default: t.is_default,
+            replaygain_track_centidb: t.replaygain_track_centidb,
+            replaygain_album_centidb: t.replaygain_album_centidb,
         }
     }
 }
@@ -49,6 +58,8 @@ impl From<AudioTrackJson> for AudioTrack {
             language: j.language,
             title: j.title,
             is_default: j.is_default,
+            replaygain_track_centidb: j.replaygain_track_centidb,
+            replaygain_album_centidb: j.replaygain_album_centidb,
         }
     }
 }
@@ -85,6 +96,8 @@ mod tests {
                 language: Some("eng".into()),
                 title: Some("English".into()),
                 is_default: true,
+                replaygain_track_centidb: Some(-734),
+                replaygain_album_centidb: Some(-682),
             },
             AudioTrack {
                 stream_index: 2,
@@ -94,6 +107,8 @@ mod tests {
                 language: Some("jpn".into()),
                 title: None,
                 is_default: false,
+                replaygain_track_centidb: None,
+                replaygain_album_centidb: None,
             },
         ];
         let s = encode(&tracks).unwrap();
@@ -110,5 +125,16 @@ mod tests {
     #[test]
     fn malformed_json_decodes_to_empty() {
         assert!(decode(Some("not json")).is_empty());
+    }
+
+    #[test]
+    fn legacy_rows_without_replaygain_decode_to_none() {
+        // P37 — rows persisted before the ReplayGain fields landed
+        // must still decode and produce `None` track/album gain.
+        let legacy = r#"[{"stream_index":1,"codec":"aac","channels":2,"sample_rate":48000,"is_default":true}]"#;
+        let back = decode(Some(legacy));
+        assert_eq!(back.len(), 1);
+        assert!(back[0].replaygain_track_centidb.is_none());
+        assert!(back[0].replaygain_album_centidb.is_none());
     }
 }

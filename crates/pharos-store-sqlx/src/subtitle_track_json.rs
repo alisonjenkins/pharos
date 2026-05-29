@@ -20,6 +20,8 @@ pub struct SubtitleTrackJson {
     pub is_default: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_forced: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_hearing_impaired: bool,
 }
 
 impl From<&SubtitleTrack> for SubtitleTrackJson {
@@ -31,6 +33,7 @@ impl From<&SubtitleTrack> for SubtitleTrackJson {
             title: t.title.clone(),
             is_default: t.is_default,
             is_forced: t.is_forced,
+            is_hearing_impaired: t.is_hearing_impaired,
         }
     }
 }
@@ -44,6 +47,7 @@ impl From<SubtitleTrackJson> for SubtitleTrack {
             title: j.title,
             is_default: j.is_default,
             is_forced: j.is_forced,
+            is_hearing_impaired: j.is_hearing_impaired,
         }
     }
 }
@@ -81,10 +85,22 @@ mod tests {
             title: Some("English".into()),
             is_default: true,
             is_forced: false,
+            is_hearing_impaired: true,
         }];
         let s = encode(&tracks).unwrap();
         let back = decode(Some(s.as_str()));
         assert_eq!(back, tracks);
+    }
+
+    #[test]
+    fn legacy_rows_without_hearing_impaired_decode_to_false() {
+        // P35 — rows persisted before the field was added must still
+        // decode. The skip-serializing-default ensures new writes
+        // don't bloat existing pre-SDH rows either.
+        let legacy = r#"[{"stream_index":2,"language":"eng","is_default":true}]"#;
+        let back = decode(Some(legacy));
+        assert_eq!(back.len(), 1);
+        assert!(!back[0].is_hearing_impaired);
     }
 
     #[test]

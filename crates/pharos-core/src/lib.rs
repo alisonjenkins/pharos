@@ -107,6 +107,42 @@ pub struct MediaProbe {
     /// Embedded chapter markers extracted by ffprobe `-show_chapters`.
     /// Each entry's `start_ms` lands on Jellyfin's `Chapters[].StartPositionTicks`.
     pub chapters: Vec<MediaChapter>,
+    /// P34 — alternate playable versions of the same logical item
+    /// (theatrical / director's cut / extended / alternate dubs).
+    /// PlaybackInfo emits one MediaSource per entry in addition to
+    /// the primary version this struct describes. Empty Vec leaves
+    /// PlaybackInfo single-source. A future scanner enrichment pass
+    /// populates this from sibling-file convention or NFO metadata.
+    pub alternate_sources: Vec<AlternateMediaSource>,
+}
+
+/// P34 — minimal MediaSource shape carried alongside the primary
+/// probe so PlaybackInfo can advertise multiple editions of the same
+/// item. Path is stored so the segment + direct-play handlers know
+/// which file to mux. Fields not listed here fall back to the primary
+/// probe at PlaybackInfo build time (saves duplicating the entire
+/// codec stack for every edition).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlternateMediaSource {
+    /// Stable id suffix appended to the parent item id when forming
+    /// the wire `MediaSourceInfo.Id`. Real Jellyfin uses a free-form
+    /// string here so existing client URLs survive a re-scan.
+    pub id: String,
+    /// Filesystem path to the alternate-edition source file. Same
+    /// shape as `MediaItem.path`; the request-path handlers honour
+    /// it instead of the primary path when the wire MediaSourceId
+    /// selects this entry.
+    pub path: std::path::PathBuf,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub bitrate_bps: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    /// Human-readable edition tag (`"Director's Cut"`, `"Extended"`,
+    /// `"Theatrical"`). Surfaces as `MediaSourceInfo.Name` so the
+    /// jellyfin-web edition picker labels rows correctly.
+    pub name: Option<String>,
 }
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
@@ -131,6 +167,14 @@ pub struct AudioTrack {
     pub language: Option<String>,
     pub title: Option<String>,
     pub is_default: bool,
+    /// P37 — track-level ReplayGain in centidecibels (× 100). ffprobe
+    /// reports `tags.replaygain_track_gain` as `"-7.34 dB"`; the
+    /// scanner parses the leading float and rounds to centidecibels.
+    /// `Option<i16>` keeps the Eq derive (Option<f32> would break it)
+    /// and the range easily fits all realistic gain values.
+    pub replaygain_track_centidb: Option<i16>,
+    /// P37 — album-level ReplayGain, same encoding as the track field.
+    pub replaygain_album_centidb: Option<i16>,
 }
 
 /// One embedded subtitle stream from the source file.
@@ -149,6 +193,11 @@ pub struct SubtitleTrack {
     pub is_default: bool,
     /// `true` when the stream's `disposition.forced` flag is set.
     pub is_forced: bool,
+    /// P35 — `true` when ffprobe reports `disposition.hearing_impaired`
+    /// (the SDH / CC flag). Surfaces in MediaStream as
+    /// `IsHearingImpaired` so jellyfin-web's subtitle picker can
+    /// label the track and accessibility filtering works.
+    pub is_hearing_impaired: bool,
 }
 
 impl MediaProbe {

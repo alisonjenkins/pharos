@@ -80,6 +80,7 @@ async fn picks_default_flagged_track() {
             title: None,
             is_default: false,
             is_forced: false,
+            is_hearing_impaired: false,
         },
         SubtitleTrack {
             stream_index: 3,
@@ -88,6 +89,7 @@ async fn picks_default_flagged_track() {
             title: None,
             is_default: true,
             is_forced: false,
+            is_hearing_impaired: false,
         },
     ];
     let (state, token) = seed(tracks).await;
@@ -104,6 +106,7 @@ async fn picks_english_when_no_default() {
             title: None,
             is_default: false,
             is_forced: false,
+            is_hearing_impaired: false,
         },
         SubtitleTrack {
             stream_index: 3,
@@ -112,6 +115,7 @@ async fn picks_english_when_no_default() {
             title: None,
             is_default: false,
             is_forced: false,
+            is_hearing_impaired: false,
         },
     ];
     let (state, token) = seed(tracks).await;
@@ -128,6 +132,7 @@ async fn picks_first_track_when_no_default_and_no_english() {
             title: None,
             is_default: false,
             is_forced: false,
+            is_hearing_impaired: false,
         },
         SubtitleTrack {
             stream_index: 3,
@@ -136,6 +141,7 @@ async fn picks_first_track_when_no_default_and_no_english() {
             title: None,
             is_default: false,
             is_forced: false,
+            is_hearing_impaired: false,
         },
     ];
     let (state, token) = seed(tracks).await;

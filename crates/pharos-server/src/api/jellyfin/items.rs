@@ -745,45 +745,102 @@ async fn playback_info(
         None
     };
 
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "MediaSources": [{
-            "Id": id_str,
-            // V9: media file paths never leak to clients. Jellyfin's
-            // own server omits this for non-admins; pharos omits it
-            // wholesale — playback uses the StreamUrl / DirectStreamUrl
-            // the client already has, not the on-disk path.
+    let primary_source = serde_json::json!({
+        "Id": id_str,
+        // V9: media file paths never leak to clients. Jellyfin's
+        // own server omits this for non-admins; pharos omits it
+        // wholesale — playback uses the StreamUrl / DirectStreamUrl
+        // the client already has, not the on-disk path.
+        "Type": "Default",
+        "Container": advertised_container,
+        "IsRemote": false,
+        "ETag": "",
+        "RunTimeTicks": probe.run_time_ticks(),
+        "Size": probe.size_bytes,
+        "Name": item.title,
+        "Protocol": "File",
+        "SupportsDirectPlay": direct_play,
+        "SupportsDirectStream": supports_direct_stream,
+        "SupportsTranscoding": true,
+        "TranscodingUrl": transcoding_url,
+        "TranscodingSubProtocol": transcoding_sub_protocol,
+        "RequiresOpening": false,
+        "RequiresClosing": false,
+        "RequiresLooping": false,
+        "SupportsProbing": true,
+        "MediaStreams": streams,
+        "Bitrate": probe.bitrate_bps,
+        "VideoType": "VideoFile",
+        "DefaultAudioStreamIndex": default_audio_stream_index,
+        "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
+        // P17 — playback tuning hints. Defaults match Jellyfin's
+        // own server: 3 s prebuffer, 2 s HLS analyze window,
+        // stereo cap for transcoded audio.
+        "BufferMs": 3000u32,
+        "AnalyzeDurationMs": 2_000_000u32,
+        "TranscodingMaxAudioChannels": 2u32,
+        // P4 — resume offset. Mirrors the top-level field for
+        // clients that read the MediaSource directly.
+        "StartPositionTicks": resume_ticks,
+    });
+
+    // P34 — additional editions probed for this item. We don't
+    // re-run negotiation per alternate (a scanner-side enrichment
+    // task should land that); each row inherits the primary's
+    // Decision so jellyfin-web's edition picker hands the user a
+    // playable URL. Direct-play falls back to the primary's
+    // container negotiation result rather than asserting the
+    // alternate matches.
+    let mut media_sources = Vec::with_capacity(1 + probe.alternate_sources.len());
+    media_sources.push(primary_source);
+    for alt in &probe.alternate_sources {
+        let alt_id = format!("{id_str}-{}", alt.id);
+        let alt_container = alt
+            .container
+            .clone()
+            .unwrap_or_else(|| advertised_container.clone());
+        media_sources.push(serde_json::json!({
+            "Id": alt_id,
             "Type": "Default",
-            "Container": advertised_container,
+            "Container": alt_container,
             "IsRemote": false,
             "ETag": "",
-            "RunTimeTicks": probe.run_time_ticks(),
-            "Size": probe.size_bytes,
-            "Name": item.title,
+            "RunTimeTicks": alt.duration_ms.map(|ms| ms.saturating_mul(10_000)),
+            "Size": alt.size_bytes.or(probe.size_bytes),
+            // P34 — `Name` carries the edition label so jellyfin-web's
+            // version dropdown renders "Director's Cut" / "Extended"
+            // alongside the primary's title.
+            "Name": alt.name.clone().unwrap_or_else(|| item.title.clone()),
             "Protocol": "File",
-            "SupportsDirectPlay": direct_play,
-            "SupportsDirectStream": supports_direct_stream,
+            // Alternates default to transcode-only until scanner-side
+            // negotiation lands. Safer than asserting direct-play of
+            // a file we haven't actually negotiated against.
+            "SupportsDirectPlay": false,
+            "SupportsDirectStream": false,
             "SupportsTranscoding": true,
-            "TranscodingUrl": transcoding_url,
-            "TranscodingSubProtocol": transcoding_sub_protocol,
+            "TranscodingUrl": Option::<String>::None,
+            "TranscodingSubProtocol": Option::<&str>::None,
             "RequiresOpening": false,
             "RequiresClosing": false,
             "RequiresLooping": false,
             "SupportsProbing": true,
+            // Reuse the primary's stream list — alternates today
+            // don't carry independent stream enrichment. Future
+            // scanner work fills this per-source.
             "MediaStreams": streams,
-            "Bitrate": probe.bitrate_bps,
+            "Bitrate": alt.bitrate_bps.or(probe.bitrate_bps),
             "VideoType": "VideoFile",
             "DefaultAudioStreamIndex": default_audio_stream_index,
             "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
-            // P17 — playback tuning hints. Defaults match Jellyfin's
-            // own server: 3 s prebuffer, 2 s HLS analyze window,
-            // stereo cap for transcoded audio.
             "BufferMs": 3000u32,
             "AnalyzeDurationMs": 2_000_000u32,
             "TranscodingMaxAudioChannels": 2u32,
-            // P4 — resume offset. Mirrors the top-level field for
-            // clients that read the MediaSource directly.
-            "StartPositionTicks": resume_ticks,
-        }],
+            "StartPositionTicks": 0u64,
+        }));
+    }
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
         // P4 — top-level resume offset. jellyfin-web reads this when
         // it didn't keep a local copy of UserData.PlaybackPositionTicks.

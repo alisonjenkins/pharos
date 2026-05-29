@@ -323,6 +323,7 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
             title: Some("English".into()),
             is_default: true,
             is_forced: false,
+            is_hearing_impaired: false,
         }],
         ..Default::default()
     };

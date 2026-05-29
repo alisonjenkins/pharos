@@ -59,6 +59,7 @@ async fn master_playlist_emits_ext_x_media_per_subtitle_track() {
             title: Some("English".into()),
             is_default: true,
             is_forced: false,
+            is_hearing_impaired: false,
         },
         SubtitleTrack {
             stream_index: 3,
@@ -67,6 +68,7 @@ async fn master_playlist_emits_ext_x_media_per_subtitle_track() {
             title: None,
             is_default: false,
             is_forced: false,
+            is_hearing_impaired: false,
         },
     ];
     let (state, token) = seed_with_subs(tracks).await;
@@ -138,6 +140,7 @@ async fn subtitle_playlist_returns_single_extinf_pointing_at_vtt() {
         title: Some("English".into()),
         is_default: true,
         is_forced: false,
+        is_hearing_impaired: false,
     }];
     let (state, token) = seed_with_subs(tracks).await;
     let app = test::init_service(
