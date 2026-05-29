@@ -42,10 +42,24 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/videos/{id}/subtitles/{stream_index}/stream.vtt",
         web::get().to(stream_vtt_short),
+    )
+    // P40 — legacy `.subtitles.{vtt,srt}` form some older Android
+    // and Roku clients still emit. Same body, different URL.
+    .route(
+        "/videos/{id}/{media_source_id}/subtitles/{stream_index}/subtitles.vtt",
+        web::get().to(stream_vtt),
+    )
+    .route(
+        "/videos/{id}/{media_source_id}/subtitles/{stream_index}/subtitles.srt",
+        web::get().to(stream_srt),
+    )
+    .route(
+        "/videos/{id}/subtitles/{stream_index}/subtitles.srt",
+        web::get().to(stream_srt_short),
     );
 }
 
-async fn stream_vtt(
+async fn stream_srt(
     state: web::Data<AppState>,
     _user: AuthUser,
     req: HttpRequest,
@@ -53,10 +67,10 @@ async fn stream_vtt(
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, _media_source_id, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
-    deliver_vtt(&state, &id, stream_index, forced_only).await
+    deliver_srt(&state, &id, stream_index, forced_only).await
 }
 
-async fn stream_vtt_short(
+async fn stream_srt_short(
     state: web::Data<AppState>,
     _user: AuthUser,
     req: HttpRequest,
@@ -64,7 +78,105 @@ async fn stream_vtt_short(
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
-    deliver_vtt(&state, &id, stream_index, forced_only).await
+    deliver_srt(&state, &id, stream_index, forced_only).await
+}
+
+/// P40 — SRT-form delivery. ffmpeg converts the embedded stream to
+/// `-c:s subrip -f srt`. Hits the same image-codec refusal as the
+/// VTT path so PGS/DVB return 415 instead of empty bodies.
+async fn deliver_srt(
+    state: &AppState,
+    id_str: &str,
+    stream_index: u32,
+    forced_only: bool,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    if let Some(track) = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .find(|t| t.stream_index == stream_index)
+    {
+        if let Some(codec) = track.codec.as_deref() {
+            if is_image_subtitle_codec(codec) {
+                return Ok(HttpResponse::UnsupportedMediaType()
+                    .content_type("application/json")
+                    .body(format!(
+                        r#"{{"error":"image-based subtitles cannot convert to SRT","codec":"{codec}"}}"#
+                    )));
+            }
+        }
+        if forced_only && !track.is_forced {
+            return Ok(HttpResponse::NotFound()
+                .content_type("application/json")
+                .body(
+                    r#"{"error":"track is not a forced-only track; pick the forced disposition track"}"#,
+                ));
+        }
+    }
+    let input = item
+        .path
+        .to_str()
+        .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+    let out = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            input,
+            "-map",
+            &format!("0:{stream_index}"),
+            "-c:s",
+            "subrip",
+            "-f",
+            "srt",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("ffmpeg spawn: {e}")))?;
+    if !out.status.success() {
+        return Err(error::ErrorNotFound(format!(
+            "ffmpeg extract: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(HttpResponse::Ok()
+        .content_type("application/x-subrip; charset=utf-8")
+        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+        .body(out.stdout))
+}
+
+async fn stream_vtt(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<(String, String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, _media_source_id, stream_index) = path.into_inner();
+    let forced_only = parse_forced_only(req.query_string());
+    let style = subtitle_style_for(&state, user.0.id).await;
+    deliver_vtt(&state, &id, stream_index, forced_only, style).await
+}
+
+async fn stream_vtt_short(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, stream_index) = path.into_inner();
+    let forced_only = parse_forced_only(req.query_string());
+    let style = subtitle_style_for(&state, user.0.id).await;
+    deliver_vtt(&state, &id, stream_index, forced_only, style).await
 }
 
 fn parse_forced_only(qs: &str) -> bool {
@@ -85,6 +197,7 @@ async fn deliver_vtt(
     id_str: &str,
     stream_index: u32,
     forced_only: bool,
+    style: SubtitleStyle,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = id_str
         .parse()
@@ -160,7 +273,7 @@ async fn deliver_vtt(
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
         {
-            return Ok(vtt_response((*bytes).clone(), style_lossy));
+            return Ok(vtt_response((*bytes).clone(), style_lossy, &style));
         }
         // Per-key fetch lock dedupes concurrent first-fetchers so
         // they share one ffmpeg spawn.
@@ -173,40 +286,135 @@ async fn deliver_vtt(
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
         {
-            return Ok(vtt_response((*bytes).clone(), style_lossy));
+            return Ok(vtt_response((*bytes).clone(), style_lossy, &style));
         }
         let out = run_ffmpeg_embedded(input, stream_index).await?;
         let stored = cache
             .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
             .await;
-        return Ok(vtt_response((*stored).clone(), style_lossy));
+        return Ok(vtt_response((*stored).clone(), style_lossy, &style));
     }
 
     // No cache configured — fall back to the original spawn-per-fetch
     // path. (Default config keeps the cache on; this branch only
     // fires for tests / minimal deployments.)
     let out = run_ffmpeg_embedded(input, stream_index).await?;
-    Ok(vtt_response(out, style_lossy))
+    Ok(vtt_response(out, style_lossy, &style))
+}
+
+/// P33 — per-user subtitle styling. Resolved from the user's
+/// `UserConfiguration.SubtitleSettings` JSON blob (jellyfin-web's
+/// shape: `{ Color: "#ffff00", Background: "...", Position: "Bottom" }`).
+#[derive(Debug, Default, Clone)]
+pub struct SubtitleStyle {
+    pub color: Option<String>,
+    pub background: Option<String>,
+    pub font_size: Option<String>,
+    pub position: Option<String>,
+}
+
+impl SubtitleStyle {
+    pub fn is_empty(&self) -> bool {
+        self.color.is_none()
+            && self.background.is_none()
+            && self.font_size.is_none()
+            && self.position.is_none()
+    }
+
+    /// Emit a WebVTT STYLE block applying the captured prefs to all
+    /// cues. Returns an empty Vec when no prefs are set.
+    pub fn render_style_block(&self) -> Vec<u8> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let mut s = String::from("STYLE\n::cue {\n");
+        if let Some(c) = sanitise_css_value(self.color.as_deref()) {
+            s.push_str(&format!("  color: {c};\n"));
+        }
+        if let Some(c) = sanitise_css_value(self.background.as_deref()) {
+            s.push_str(&format!("  background-color: {c};\n"));
+        }
+        if let Some(c) = sanitise_css_value(self.font_size.as_deref()) {
+            s.push_str(&format!("  font-size: {c};\n"));
+        }
+        s.push_str("}\n\n");
+        s.into_bytes()
+    }
+}
+
+/// P33 — guard rail for CSS values. Reject `;` / `{` / `}` / quote /
+/// newline so a malicious config blob can't break out of the
+/// `::cue` rule and inject arbitrary CSS into the served WebVTT.
+fn sanitise_css_value(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    if v.is_empty()
+        || v.bytes()
+            .any(|b| matches!(b, b';' | b'{' | b'}' | b'\n' | b'\r' | b'"' | b'\''))
+    {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// P33 — read the bound user's `UserConfiguration.SubtitleSettings`
+/// JSON object. Tolerates missing fields + a missing configuration
+/// row (defaults to no styling).
+pub(crate) async fn subtitle_style_for(
+    state: &AppState,
+    user_id: pharos_core::UserId,
+) -> SubtitleStyle {
+    use pharos_core::PreferenceStore;
+    let json = match state.stores.get_user_configuration(user_id).await {
+        Ok(Some(j)) => j,
+        _ => return SubtitleStyle::default(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(_) => return SubtitleStyle::default(),
+    };
+    // jellyfin-web stores the block under `SubtitleSettings`, but
+    // older clients used flat `Subtitle*` keys. Accept both.
+    let settings = v.get("SubtitleSettings").cloned().unwrap_or(v);
+    let pick = |key: &str| -> Option<String> {
+        settings
+            .get(key)
+            .and_then(|x| x.as_str().map(|s| s.to_string()))
+    };
+    SubtitleStyle {
+        color: pick("Color").or_else(|| pick("SubtitleColor")),
+        background: pick("Background").or_else(|| pick("SubtitleBackground")),
+        font_size: pick("FontSize").or_else(|| pick("SubtitleFontSize")),
+        position: pick("Position").or_else(|| pick("SubtitlePosition")),
+    }
 }
 
 /// P26 — shared WebVTT response builder. Adds the
 /// `X-Subtitle-Style-Lossy` header + an in-body WEBVTT NOTE comment
 /// when the source codec carried styling that didn't survive the
-/// conversion (ASS/SSA).
-fn vtt_response(mut body: Vec<u8>, style_lossy: bool) -> HttpResponse {
-    if style_lossy {
-        // Prepend the NOTE before the existing WEBVTT magic so the
-        // WebVTT parser keeps treating the file as valid.
-        let mut prefixed = Vec::with_capacity(body.len() + 128);
-        prefixed.extend_from_slice(
-            b"WEBVTT\nNOTE Source format was ASS/SSA; styling lost in WebVTT conversion.\n\n",
-        );
-        // Strip an existing WEBVTT magic line so we don't end up with
-        // two of them.
+/// conversion (ASS/SSA). P33 — prepends a STYLE block carrying the
+/// per-user color/background/font-size prefs when set.
+fn vtt_response(mut body: Vec<u8>, style_lossy: bool, style: &SubtitleStyle) -> HttpResponse {
+    let user_style = style.render_style_block();
+    if style_lossy || !user_style.is_empty() {
+        let mut prefixed = Vec::with_capacity(body.len() + 256);
+        prefixed.extend_from_slice(b"WEBVTT\n");
+        if style_lossy {
+            prefixed.extend_from_slice(
+                b"NOTE Source format was ASS/SSA; styling lost in WebVTT conversion.\n\n",
+            );
+        } else {
+            prefixed.extend_from_slice(b"\n");
+        }
+        if !user_style.is_empty() {
+            prefixed.extend_from_slice(&user_style);
+        }
         if body.starts_with(b"WEBVTT") {
             if let Some(nl) = body.iter().position(|c| *c == b'\n') {
                 body = body[nl + 1..].to_vec();
             }
+        }
+        if body.starts_with(b"\n") {
+            body = body[1..].to_vec();
         }
         prefixed.extend_from_slice(&body);
         body = prefixed;
@@ -432,6 +640,56 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn empty_style_renders_no_block() {
+        // P33 — when the user never set any subtitle prefs the VTT
+        // body must be byte-identical to the un-styled output so the
+        // subtitle cache stays a single shared entry across users.
+        let s = SubtitleStyle::default();
+        assert!(s.is_empty());
+        assert!(s.render_style_block().is_empty());
+    }
+
+    #[test]
+    fn styled_block_includes_color_and_background_in_cue_rule() {
+        let s = SubtitleStyle {
+            color: Some("#ffff00".into()),
+            background: Some("rgba(0,0,0,0.5)".into()),
+            font_size: Some("120%".into()),
+            position: None,
+        };
+        let block = s.render_style_block();
+        let text = std::str::from_utf8(&block).unwrap();
+        assert!(text.starts_with("STYLE\n::cue {\n"));
+        assert!(text.contains("color: #ffff00;"));
+        assert!(text.contains("background-color: rgba(0,0,0,0.5);"));
+        assert!(text.contains("font-size: 120%;"));
+        assert!(text.ends_with("}\n\n"));
+    }
+
+    #[test]
+    fn css_injection_via_style_value_gets_rejected() {
+        // P33 — guard rail. A malicious user configuration that
+        // tried to break out of `::cue` and inject `body { ... }`
+        // must not make it into the served WebVTT body.
+        let s = SubtitleStyle {
+            color: Some("#fff; } body { display:none; ::cue {".into()),
+            background: Some("red\nINJECT".into()),
+            font_size: Some("12px}".into()),
+            position: None,
+        };
+        let block = s.render_style_block();
+        let text = std::str::from_utf8(&block).unwrap();
+        assert!(!text.contains("body"), "got: {text}");
+        assert!(!text.contains("INJECT"), "got: {text}");
+        // The struct was not empty so the block opens, but with all
+        // values rejected the body is just the empty `::cue { }`.
+        assert!(text.starts_with("STYLE\n::cue {\n"));
+        assert!(!text.contains("color:"));
+        assert!(!text.contains("background-color:"));
+        assert!(!text.contains("font-size:"));
+    }
 
     #[tokio::test]
     async fn discover_sidecars_returns_vtt_and_srt_in_order() {
