@@ -413,6 +413,10 @@ async fn master_playlist(
 
     let mut body = String::new();
     body.push_str("#EXTM3U\n#EXT-X-VERSION:3\n");
+    // P18 — Safari refuses to seek on a master playlist without this
+    // tag. Asserting independent segments is true for h264/hevc HLS
+    // (each segment starts on an IDR / SPS boundary).
+    body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
     // P8 — softsub. Emit EXT-X-MEDIA per subtitle track so HLS
     // clients render a subtitle selector instead of forcing burn-in.
@@ -504,6 +508,20 @@ async fn master_playlist(
         .body(body))
 }
 
+/// P18 — query-string-only parser for `StartTimeTicks`, mirroring
+/// the stream.rs helper. Pulled out so both modules don't depend on
+/// the actix HttpRequest type for a simple ticks lookup.
+fn parse_start_time_ticks_qs(qs: &str) -> u64 {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("StartTimeTicks") {
+                return v.parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 /// Render a human-readable label for a subtitle track. Falls back to
 /// `Track {idx}` when neither title nor language is present.
 fn subtitle_display_name(track: &pharos_core::SubtitleTrack, idx: usize) -> String {
@@ -576,11 +594,20 @@ async fn render_variant_playlist(
     let mut body = String::with_capacity(256 + segment_count as usize * 80);
     body.push_str("#EXTM3U\n");
     body.push_str("#EXT-X-VERSION:3\n");
+    body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
     body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     body.push_str(&format!(
         "#EXT-X-TARGETDURATION:{}\n",
         SEGMENT_SECONDS as u32
     ));
+    // P18 — resume hint. When the client embedded `StartTimeTicks`
+    // in the playlist URL, advertise the offset so the player jumps
+    // straight there instead of scanning from segment 0.
+    let start_ticks = parse_start_time_ticks_qs(req.query_string());
+    if start_ticks > 0 {
+        let secs = start_ticks as f64 / TICKS_PER_SECOND as f64;
+        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     for seg in 0..segment_count {
         let remaining = duration - (seg as f64 * SEGMENT_SECONDS);
@@ -630,28 +657,31 @@ where
 async fn segment_main(
     state: web::Data<AppState>,
     user: AuthUser,
+    req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, seg) = path.into_inner();
-    serve_segment(state, user, id, seg, None, q).await
+    serve_segment(state, user, req, id, seg, None, q).await
 }
 
 async fn segment_named(
     state: web::Data<AppState>,
     user: AuthUser,
+    req: HttpRequest,
     path: web::Path<(String, String, u32)>,
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, variant, seg) = path.into_inner();
     let av =
         AnyVariant::from_name(&variant).ok_or_else(|| error::ErrorNotFound("unknown variant"))?;
-    serve_segment(state, user, id, seg, Some(av), q).await
+    serve_segment(state, user, req, id, seg, Some(av), q).await
 }
 
 async fn serve_segment(
     state: web::Data<AppState>,
     _user: AuthUser,
+    req: HttpRequest,
     id: String,
     seg: u32,
     variant: Option<AnyVariant>,
@@ -733,6 +763,35 @@ async fn serve_segment(
         }
     }
 
+    // P18 — stable ETag derived from cache key inputs. Same
+    // `(media_id, seg, audio_idx, sub_idx, bitrate)` tuple drives the
+    // disk cache, so the ETag implicitly invalidates whenever the
+    // cached bytes would.
+    let etag = segment_etag(
+        id_num,
+        seg,
+        opts.audio_source_stream_index,
+        opts.burn_subtitle_stream_index,
+        opts.video_bitrate_bps,
+    );
+
+    // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
+    if let Some(inm) = req
+        .headers()
+        .get(actix_web::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if inm.split(',').any(|t| t.trim() == etag) {
+            return Ok(HttpResponse::NotModified()
+                .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+                .insert_header((
+                    actix_web::http::header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ))
+                .finish());
+        }
+    }
+
     // T42: when an HLS cache is wired, route through it. Otherwise
     // fall back to live transcoding (every request spawns ffmpeg).
     if let Some(cache) = state.hls.as_ref() {
@@ -749,6 +808,11 @@ async fn serve_segment(
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
         return Ok(HttpResponse::Ok()
             .content_type(opts.container.content_type())
+            .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+            .insert_header((
+                actix_web::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ))
             .body(bytes));
     }
 
@@ -759,7 +823,33 @@ async fn serve_segment(
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok(HttpResponse::Ok()
         .content_type(opts.container.content_type())
+        .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
         .streaming(stream.into_stream()))
+}
+
+/// P18 — stable weak-ETag string for a segment. Encodes every
+/// dimension that drives the disk-cache filename so mutating any of
+/// them produces a different ETag.
+fn segment_etag(
+    media_id: u64,
+    seg: u32,
+    audio_idx: Option<u32>,
+    sub_idx: Option<u32>,
+    bitrate: Option<u64>,
+) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let key = format!(
+        "{media_id}-{seg}-{audio}-{sub}-{br}",
+        audio = audio_idx.map_or_else(|| "d".to_string(), |n| n.to_string()),
+        sub = sub_idx.map_or_else(|| "off".to_string(), |n| n.to_string()),
+        br = bitrate.map_or_else(|| "auto".to_string(), |b| b.to_string()),
+    );
+    let h = xxh3_64(key.as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+    format!("W/\"seg-{h:016x}\"")
 }
 
 /// Resolve the per-segment `TranscodeOptions` for this request.
