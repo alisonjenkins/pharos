@@ -700,6 +700,35 @@ async fn playback_info(
     let default_audio_stream_index: Option<u32> =
         streams.iter().find(|s| s.kind == "Audio").map(|s| s.index);
 
+    // P12 — `DefaultSubtitleStreamIndex` resolution priority:
+    //   1. Any subtitle track flagged `is_default` (probed from the
+    //      container's disposition bits).
+    //   2. The first English-language track.
+    //   3. The first subtitle track of any kind.
+    // None when no subtitle tracks exist — client renders no default.
+    let default_subtitle_stream_index: Option<u32> = streams
+        .iter()
+        .find(|s| s.kind == "Subtitle" && s.is_default)
+        .map(|s| s.index)
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|s| {
+                    s.kind == "Subtitle"
+                        && s.language
+                            .as_deref()
+                            .map(|l| l.eq_ignore_ascii_case("eng") || l.eq_ignore_ascii_case("en"))
+                            .unwrap_or(false)
+                })
+                .map(|s| s.index)
+        })
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|s| s.kind == "Subtitle")
+                .map(|s| s.index)
+        });
+
     // TranscodingSubProtocol only makes sense alongside a real
     // TranscodingUrl. Emitting `"hls"` unconditionally made
     // jellyfin-web's htmlVideoPlayer route the direct-play webm URL
@@ -739,7 +768,7 @@ async fn playback_info(
             "Bitrate": probe.bitrate_bps,
             "VideoType": "VideoFile",
             "DefaultAudioStreamIndex": default_audio_stream_index,
-            "DefaultSubtitleStreamIndex": null,
+            "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
             // P4 — resume offset. Mirrors the top-level field for
             // clients that read the MediaSource directly.
             "StartPositionTicks": resume_ticks,
