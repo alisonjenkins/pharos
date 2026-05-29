@@ -18,6 +18,17 @@ pub struct SessionRecord {
     pub now_playing_item_id: Option<String>,
     pub position_ticks: u64,
     pub is_paused: bool,
+    /// P28 — capabilities the client advertised via
+    /// `/Sessions/Capabilities`. Empty Vec when the client never
+    /// posted; jellyfin-web's remote-control screen uses this to grey
+    /// out unsupported commands.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub playable_media_types: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supported_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_streaming_bitrate: Option<u64>,
+    pub supports_media_control: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +52,17 @@ pub enum SessionEvent {
     },
     Stopped {
         session_id: String,
+    },
+    /// P28 — apply a client's advertised capabilities to its
+    /// session record. No-op when the session isn't tracked yet
+    /// (the next Started event refreshes the capabilities from the
+    /// last seen Set).
+    SetCapabilities {
+        session_id: String,
+        playable_media_types: Vec<String>,
+        supported_commands: Vec<String>,
+        max_streaming_bitrate: Option<u64>,
+        supports_media_control: bool,
     },
 }
 
@@ -81,6 +103,17 @@ impl SessionRegistry {
                         item_id,
                         position_ticks,
                     }) => {
+                        // Preserve any capabilities the client
+                        // advertised earlier (P28) — Started events
+                        // refresh playback state but not caps.
+                        let existing_caps = state.get(&session_id).map(|s| {
+                            (
+                                s.playable_media_types.clone(),
+                                s.supported_commands.clone(),
+                                s.max_streaming_bitrate,
+                                s.supports_media_control,
+                            )
+                        });
                         state.insert(
                             session_id.clone(),
                             SessionRecord {
@@ -94,6 +127,19 @@ impl SessionRegistry {
                                 now_playing_item_id: Some(item_id),
                                 position_ticks,
                                 is_paused: false,
+                                playable_media_types: existing_caps
+                                    .as_ref()
+                                    .map(|c| c.0.clone())
+                                    .unwrap_or_default(),
+                                supported_commands: existing_caps
+                                    .as_ref()
+                                    .map(|c| c.1.clone())
+                                    .unwrap_or_default(),
+                                max_streaming_bitrate: existing_caps.as_ref().and_then(|c| c.2),
+                                supports_media_control: existing_caps
+                                    .as_ref()
+                                    .map(|c| c.3)
+                                    .unwrap_or(false),
                             },
                         );
                     }
@@ -111,6 +157,40 @@ impl SessionRegistry {
                     }
                     Msg::Apply(SessionEvent::Stopped { session_id }) => {
                         state.remove(&session_id);
+                    }
+                    Msg::Apply(SessionEvent::SetCapabilities {
+                        session_id,
+                        playable_media_types,
+                        supported_commands,
+                        max_streaming_bitrate,
+                        supports_media_control,
+                    }) => {
+                        // Apply when the session already exists. When
+                        // it doesn't, stash a stub so subsequent
+                        // Started events inherit the caps.
+                        let entry =
+                            state
+                                .entry(session_id.clone())
+                                .or_insert_with(|| SessionRecord {
+                                    id: session_id,
+                                    user_id: String::new(),
+                                    user_name: String::new(),
+                                    device_id: String::new(),
+                                    device_name: String::new(),
+                                    client: String::new(),
+                                    application_version: String::new(),
+                                    now_playing_item_id: None,
+                                    position_ticks: 0,
+                                    is_paused: false,
+                                    playable_media_types: Vec::new(),
+                                    supported_commands: Vec::new(),
+                                    max_streaming_bitrate: None,
+                                    supports_media_control: false,
+                                });
+                        entry.playable_media_types = playable_media_types;
+                        entry.supported_commands = supported_commands;
+                        entry.max_streaming_bitrate = max_streaming_bitrate;
+                        entry.supports_media_control = supports_media_control;
                     }
                     Msg::Snapshot(reply) => {
                         let mut all: Vec<SessionRecord> = state.values().cloned().collect();

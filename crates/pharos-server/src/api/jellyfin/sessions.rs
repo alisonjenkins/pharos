@@ -78,15 +78,22 @@ struct StoppedBody {
     position_ticks: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct CapabilitiesBody {
     #[serde(default)]
-    #[allow(dead_code)]
     playable_media_types: Vec<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     supported_commands: Vec<String>,
+    #[serde(default)]
+    max_streaming_bitrate: Option<u64>,
+    #[serde(default)]
+    supports_media_control: bool,
+    /// Optional explicit session id binding. Most clients send the
+    /// device id instead; we derive the session via the auth header
+    /// when this is missing.
+    #[serde(default)]
+    id: Option<String>,
 }
 
 async fn list_sessions(
@@ -264,12 +271,33 @@ async fn playing_stopped(
 }
 
 async fn capabilities(
-    _state: web::Data<AppState>,
-    _user: AuthUser,
-    _body: web::Json<CapabilitiesBody>,
+    state: web::Data<AppState>,
+    user: AuthUser,
+    req: HttpRequest,
+    body: web::Json<CapabilitiesBody>,
 ) -> impl Responder {
-    // Phase 1: accept + discard. Real client-capability tracking lands when
-    // session-targeted commands (remote control) are needed.
+    // P28 — persist client capabilities so the /Sessions snapshot
+    // reflects them. jellyfin-web's remote-control screen reads the
+    // resulting `SupportedCommands` to grey out unsupported buttons.
+    let body = body.into_inner();
+    // Session-id binding priority: explicit Id field → derive from
+    // device-id in the Emby Authorization header (matches our
+    // Started event session-id pattern: user.0.id + device-id hash).
+    let auth = crate::api::jellyfin::auth_extractor::auth_header_from_request(&req);
+    let session_id = body.id.unwrap_or_else(|| {
+        let device_id = auth.device_id.clone().unwrap_or_else(|| "unknown".into());
+        format!("{}-{}", user.0.id.0.simple(), device_id)
+    });
+    let _ = state
+        .sessions
+        .apply(SessionEvent::SetCapabilities {
+            session_id,
+            playable_media_types: body.playable_media_types,
+            supported_commands: body.supported_commands,
+            max_streaming_bitrate: body.max_streaming_bitrate,
+            supports_media_control: body.supports_media_control,
+        })
+        .await;
     HttpResponse::NoContent().finish()
 }
 
