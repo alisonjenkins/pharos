@@ -31,6 +31,7 @@ fn mp4_h264_aac_profile() -> DeviceProfile {
         transcoding_profiles: vec![],
         max_streaming_bitrate: None,
         max_static_bitrate: None,
+        codec_profiles: vec![],
     }
 }
 
@@ -42,6 +43,7 @@ fn mkv_h264_aac_against_mp4_profile_remuxes_container_only() {
         audio_codec: Some("aac".into()),
         bitrate_bps: Some(4_000_000),
         is_video: true,
+        ..Default::default()
     };
     let decision = negotiate(&mp4_h264_aac_profile(), &source);
     match decision {
@@ -65,6 +67,7 @@ fn mkv_h264_ac3_against_mp4_profile_remuxes_with_audio_aac_target() {
         audio_codec: Some("ac3".into()),
         bitrate_bps: Some(4_000_000),
         is_video: true,
+        ..Default::default()
     };
     let decision = negotiate(&mp4_h264_aac_profile(), &source);
     match decision {
@@ -89,6 +92,7 @@ fn mkv_vp9_against_mp4_h264_profile_does_not_remux() {
         audio_codec: Some("aac".into()),
         bitrate_bps: Some(4_000_000),
         is_video: true,
+        ..Default::default()
     };
     let decision = negotiate(&mp4_h264_aac_profile(), &source);
     assert!(
@@ -107,6 +111,7 @@ fn matching_container_still_takes_direct_play_or_audio_remux_path() {
         audio_codec: Some("aac".into()),
         bitrate_bps: Some(4_000_000),
         is_video: true,
+        ..Default::default()
     };
     let decision = negotiate(&mp4_h264_aac_profile(), &source);
     assert!(matches!(decision, Decision::DirectPlay), "{decision:?}");

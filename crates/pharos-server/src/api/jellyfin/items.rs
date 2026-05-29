@@ -629,6 +629,11 @@ async fn playback_info(
         audio_codec: probe.audio_codec.clone(),
         bitrate_bps: probe.bitrate_bps,
         is_video,
+        video_level: probe.video_level,
+        video_profile: probe.video_profile.clone(),
+        audio_channels: probe.audio_channels,
+        width: probe.width,
+        height: probe.height,
     };
 
     let profile = body

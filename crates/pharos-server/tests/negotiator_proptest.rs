@@ -75,6 +75,7 @@ fn profile_strat() -> impl Strategy<Value = DeviceProfile> {
             transcoding_profiles: tp,
             max_streaming_bitrate: max_br,
             max_static_bitrate: None,
+            codec_profiles: vec![],
         })
 }
 
@@ -91,6 +92,7 @@ fn source_strat() -> impl Strategy<Value = SourceMedia> {
             audio_codec: a,
             bitrate_bps: br,
             is_video: true,
+            ..Default::default()
         })
 }
 
@@ -157,6 +159,7 @@ proptest! {
             audio_codec: None,
             bitrate_bps: Some(2_000_000),
             is_video: true,
+            ..Default::default()
         };
         let d = negotiate(&profile, &source);
         prop_assert!(matches!(d, Decision::DirectPlay), "silent video must direct-play: {d:?}");
@@ -185,6 +188,7 @@ proptest! {
             audio_codec: Some(audio),
             bitrate_bps: Some(2_000_000),
             is_video: true,
+            ..Default::default()
         };
         let d = negotiate(&profile, &source);
         prop_assert!(matches!(d, Decision::DirectPlay), "case mismatch broke direct play: {d:?}");

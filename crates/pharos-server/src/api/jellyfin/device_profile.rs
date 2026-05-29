@@ -24,6 +24,43 @@ pub struct DeviceProfile {
     pub transcoding_profiles: Vec<TranscodingProfile>,
     pub max_streaming_bitrate: Option<u64>,
     pub max_static_bitrate: Option<u64>,
+    /// P27 — clause-based codec restrictions, e.g.
+    /// `{Codec:"h264", Conditions:[{Condition:"LessThanEqual",
+    /// Property:"VideoLevel", Value:"41", IsRequired:true}]}`.
+    /// Evaluated after the DirectPlay codec/container match — failed
+    /// required conditions fall through to Transcode.
+    #[serde(default)]
+    pub codec_profiles: Vec<CodecProfileDto>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct CodecProfileDto {
+    /// Jellyfin spells `Video` / `Audio` / `VideoAudio`. Empty / unset
+    /// = match any kind.
+    #[serde(rename = "Type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub codec: String,
+    #[serde(default)]
+    pub conditions: Vec<ProfileCondition>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct ProfileCondition {
+    /// Jellyfin op names: `LessThanEqual`, `GreaterThanEqual`,
+    /// `Equals`, `NotEquals`, `EqualsAny`.
+    #[serde(default)]
+    pub condition: String,
+    /// `VideoLevel`, `VideoProfile`, `VideoBitDepth`, `AudioChannels`,
+    /// `Width`, `Height`, `AudioBitRate`.
+    #[serde(default)]
+    pub property: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub is_required: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -58,13 +95,21 @@ pub struct TranscodingProfile {
 
 /// What pharos probed about the source file. Concise — only the fields
 /// the negotiation actually inspects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SourceMedia {
     pub container: String,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub bitrate_bps: Option<u64>,
     pub is_video: bool,
+    /// P27 — extended source descriptors used by CodecProfile.Conditions
+    /// evaluation. All optional; when missing, the comparator treats
+    /// the condition permissively (no-op).
+    pub video_level: Option<u32>,
+    pub video_profile: Option<String>,
+    pub audio_channels: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +150,106 @@ impl Decision {
     }
 }
 
+/// P27 — evaluate a CodecProfile's required conditions against the
+/// source. Returns `true` when every required condition passes; an
+/// empty or non-matching profile is permissive.
+pub fn codec_profile_passes(
+    profiles: &[CodecProfileDto],
+    source: &SourceMedia,
+    source_video_level: Option<u32>,
+    source_video_profile: Option<&str>,
+    source_audio_channels: Option<u32>,
+) -> bool {
+    for cp in profiles {
+        if !cp.kind.is_empty() && !cp.kind.eq_ignore_ascii_case("Video") && source.is_video {
+            // Profile is scoped to a non-video kind — skip on video.
+            continue;
+        }
+        if !cp.codec.is_empty() {
+            let want = cp.codec.to_ascii_lowercase();
+            let have = source
+                .video_codec
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Codec may be CSV.
+            let mut codec_matches = false;
+            for token in want.split(',') {
+                if token.trim() == have {
+                    codec_matches = true;
+                    break;
+                }
+            }
+            if !codec_matches {
+                continue;
+            }
+        }
+        for cond in &cp.conditions {
+            if !cond.is_required {
+                continue;
+            }
+            let ok = match cond.property.as_str() {
+                "VideoLevel" => compare_numeric(
+                    &cond.condition,
+                    source_video_level.map(|n| n as i64),
+                    cond.value.parse::<i64>().ok(),
+                ),
+                "AudioChannels" => compare_numeric(
+                    &cond.condition,
+                    source_audio_channels.map(|n| n as i64),
+                    cond.value.parse::<i64>().ok(),
+                ),
+                "Width" => compare_numeric(
+                    &cond.condition,
+                    source.width.map(|n| n as i64),
+                    cond.value.parse::<i64>().ok(),
+                ),
+                "Height" => compare_numeric(
+                    &cond.condition,
+                    source.height.map(|n| n as i64),
+                    cond.value.parse::<i64>().ok(),
+                ),
+                "VideoProfile" => compare_string(
+                    &cond.condition,
+                    source_video_profile,
+                    Some(cond.value.as_str()),
+                ),
+                _ => true, // unknown property — permissive
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn compare_numeric(op: &str, source: Option<i64>, target: Option<i64>) -> bool {
+    let (Some(s), Some(t)) = (source, target) else {
+        return true; // missing input — permissive
+    };
+    match op {
+        "LessThanEqual" => s <= t,
+        "GreaterThanEqual" => s >= t,
+        "Equals" => s == t,
+        "NotEquals" => s != t,
+        "EqualsAny" => s == t,
+        _ => true,
+    }
+}
+
+fn compare_string(op: &str, source: Option<&str>, target: Option<&str>) -> bool {
+    let (Some(s), Some(t)) = (source, target) else {
+        return true;
+    };
+    match op {
+        "Equals" => s.eq_ignore_ascii_case(t),
+        "NotEquals" => !s.eq_ignore_ascii_case(t),
+        "EqualsAny" => t.split(',').any(|opt| opt.trim().eq_ignore_ascii_case(s)),
+        _ => true,
+    }
+}
+
 /// Pick the right action given the source + a client profile. Caller
 /// is expected to use `DeviceProfile::default()` when the client
 /// didn't send a body (matches Jellyfin's permissive default).
@@ -129,7 +274,20 @@ pub fn negotiate(profile: &DeviceProfile, source: &SourceMedia) -> Decision {
         let video_ok = matches_codec(&p.video_codec, source.video_codec.as_deref());
         let audio_ok = matches_codec(&p.audio_codec, source.audio_codec.as_deref());
         if video_ok && audio_ok && !over_bitrate {
-            return Decision::DirectPlay;
+            // P27 — clause-based codec restrictions. When the profile
+            // pins e.g. VideoLevel ≤ 41 and the source is Level 51,
+            // fall through to Transcode even though container + codec
+            // match. Conditions that pharos doesn't probe (e.g. AV1
+            // tier) are permissive.
+            if codec_profile_passes(
+                &profile.codec_profiles,
+                source,
+                source.video_level,
+                source.video_profile.as_deref(),
+                source.audio_channels,
+            ) {
+                return Decision::DirectPlay;
+            }
         }
         // Video matches but audio doesn't → audio-remux is viable
         // (container + video codec stay).
@@ -276,6 +434,7 @@ mod tests {
             audio_codec: Some("opus".into()),
             bitrate_bps: Some(2_000_000),
             is_video: true,
+            ..Default::default()
         }
     }
 
@@ -384,6 +543,7 @@ mod tests {
             audio_codec: Some("mp3".into()),
             bitrate_bps: Some(192_000),
             is_video: false,
+            ..Default::default()
         };
         // Video profile present but disregarded; Audio profile is the
         // one that gets consulted.
@@ -413,6 +573,7 @@ mod tests {
             audio_codec: None,
             bitrate_bps: Some(2_000_000),
             is_video: true,
+            ..Default::default()
         };
         assert_eq!(negotiate(&profile, &source), Decision::DirectPlay);
     }
