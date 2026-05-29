@@ -21,6 +21,7 @@ pub mod system;
 pub mod trickplay;
 pub mod user_data;
 pub mod users;
+pub mod waveform;
 
 use actix_web::web;
 
@@ -44,5 +45,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     socket::register(cfg);
     subtitles::register(cfg);
     syncplay::register(cfg);
+    waveform::register(cfg);
     stubs::register(cfg);
 }
