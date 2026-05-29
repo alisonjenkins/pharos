@@ -23,7 +23,7 @@ use crate::{
     state::AppState,
     subtitle_cache::{mtime_secs, SubtitleKind},
 };
-use actix_web::{error, http::header, web, HttpResponse};
+use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_core::MediaStore;
 use tokio::process::Command;
 
@@ -48,25 +48,43 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 async fn stream_vtt(
     state: web::Data<AppState>,
     _user: AuthUser,
+    req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, _media_source_id, stream_index) = path.into_inner();
-    deliver_vtt(&state, &id, stream_index).await
+    let forced_only = parse_forced_only(req.query_string());
+    deliver_vtt(&state, &id, stream_index, forced_only).await
 }
 
 async fn stream_vtt_short(
     state: web::Data<AppState>,
     _user: AuthUser,
+    req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
-    deliver_vtt(&state, &id, stream_index).await
+    let forced_only = parse_forced_only(req.query_string());
+    deliver_vtt(&state, &id, stream_index, forced_only).await
+}
+
+fn parse_forced_only(qs: &str) -> bool {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("ForcedOnly")
+                && matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn deliver_vtt(
     state: &AppState,
     id_str: &str,
     stream_index: u32,
+    forced_only: bool,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = id_str
         .parse()
@@ -111,6 +129,20 @@ async fn deliver_vtt(
             if is_styled_text_subtitle_codec(codec) {
                 style_lossy = true;
             }
+        }
+        // P30 — `?ForcedOnly=1` requested AND this track does NOT
+        // carry the forced disposition. Real Jellyfin clients pass
+        // the flag to ask "give me only forced lines"; pharos can't
+        // reliably filter cue-by-cue (ffmpeg converts ASS/SSA to
+        // WebVTT without forced markers), so refuse and let the
+        // client fall back to either the actually-forced track or
+        // the burn-in HLS path.
+        if forced_only && !track.is_forced {
+            return Ok(HttpResponse::NotFound()
+                .content_type("application/json")
+                .body(
+                    r#"{"error":"track is not a forced-only track; pick the forced disposition track"}"#,
+                ));
         }
     }
 

@@ -873,7 +873,18 @@ pub(crate) fn build_media_streams_with_subtitles(
         // Subtitle tracks — embedded first, then sidecars.
         if let Some(ctx) = subtitle_ctx {
             for t in &probe.subtitle_tracks {
-                let title = t.title.clone().or_else(|| t.language.clone());
+                // P30 — append `(forced)` so jellyfin-web's track
+                // picker shows the disposition without the user
+                // having to memorise indices.
+                let base = t.title.clone().or_else(|| t.language.clone());
+                let title = if t.is_forced {
+                    Some(match base.as_deref() {
+                        Some(s) if !s.is_empty() => format!("{s} (forced)"),
+                        _ => "Forced".to_string(),
+                    })
+                } else {
+                    base
+                };
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
                     index: t.stream_index,
