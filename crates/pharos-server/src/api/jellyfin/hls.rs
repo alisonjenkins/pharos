@@ -85,6 +85,7 @@ async fn subtitle_playlist(
     body.push_str("#EXT-X-ENDLIST\n");
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
         .body(body))
 }
 
@@ -460,6 +461,7 @@ async fn master_playlist(
         }
         return Ok(HttpResponse::Ok()
             .content_type("application/vnd.apple.mpegurl")
+            .insert_header(playlist_cache_control(true))
             .body(body));
     }
 
@@ -505,7 +507,21 @@ async fn master_playlist(
     }
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(true))
         .body(body))
+}
+
+/// P22 — Cache-Control header for HLS playlists. Master stays
+/// cacheable for an hour (PSID-bound decisions stable for the
+/// session lifetime); variant + subtitle playlists 5 minutes so a
+/// re-negotiated bitrate cap or sub set propagates quickly.
+fn playlist_cache_control(is_master: bool) -> (actix_web::http::header::HeaderName, &'static str) {
+    let value = if is_master {
+        "public, max-age=3600"
+    } else {
+        "public, max-age=300"
+    };
+    (actix_web::http::header::CACHE_CONTROL, value)
 }
 
 /// P18 — query-string-only parser for `StartTimeTicks`, mirroring
@@ -621,6 +637,7 @@ async fn render_variant_playlist(
     body.push_str("#EXT-X-ENDLIST\n");
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
         .body(body))
 }
 
