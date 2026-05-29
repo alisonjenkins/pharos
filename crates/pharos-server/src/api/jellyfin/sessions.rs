@@ -156,13 +156,22 @@ async fn playing_progress(
         state
             .sessions
             .apply(SessionEvent::Progress {
-                session_id,
+                session_id: session_id.clone(),
                 item_id: body.item_id,
                 position_ticks,
                 is_paused: body.is_paused,
             })
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        // P10 — fan out to /socket subscribers so the Currently
+        // Watching sidebar updates live without polling.
+        state.notify_playback_progress(
+            &session_id,
+            &user.0.id.0.simple().to_string(),
+            &item_id_str,
+            position_ticks,
+            body.is_paused,
+        );
     }
 
     // T33: persist the resume position so the Resume row picks the

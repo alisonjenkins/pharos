@@ -39,6 +39,17 @@ pub enum SocketBroadcast {
         command: String,
         arg: serde_json::Value,
     },
+    /// P10 — playback progress update fans out so jellyfin-web's
+    /// "Currently Watching" sidebar + remote-control UIs reflect the
+    /// active position without polling. Fired by
+    /// `/Sessions/Playing/Progress`.
+    PlaybackProgress {
+        session_id: String,
+        user_id: String,
+        item_id: String,
+        position_ticks: u64,
+        is_paused: bool,
+    },
 }
 
 pub struct AppState {
@@ -216,6 +227,26 @@ impl AppState {
             session_id: session_id.to_string(),
             command: command.to_string(),
             arg,
+        });
+    }
+
+    /// P10 — fan out a `PlaybackProgress` event so connected `/socket`
+    /// subscribers can update their Currently Watching UI without
+    /// polling. Fired from `/Sessions/Playing/Progress`.
+    pub fn notify_playback_progress(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        item_id: &str,
+        position_ticks: u64,
+        is_paused: bool,
+    ) {
+        let _ = self.bus.send(SocketBroadcast::PlaybackProgress {
+            session_id: session_id.to_string(),
+            user_id: user_id.to_string(),
+            item_id: item_id.to_string(),
+            position_ticks,
+            is_paused,
         });
     }
 }

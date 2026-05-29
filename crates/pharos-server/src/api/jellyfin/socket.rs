@@ -82,11 +82,17 @@ async fn handle_connection<S>(
                 // subscriber. Stay connected; the next library refresh
                 // will sync the client anyway.
                 let Ok(b) = broadcast_msg else { continue };
-                // V9: UserDataChanged is scoped to one user. Drop the
-                // broadcast on this socket unless the bound bearer
-                // matches — otherwise user A learns user B watched
-                // item 42 (info leak across tenants).
+                // V9: UserDataChanged + PlaybackProgress are scoped
+                // to one user. Drop the broadcast on this socket
+                // unless the bound bearer matches — otherwise user A
+                // learns user B watched item 42 (info leak across
+                // tenants).
                 if let SocketBroadcast::UserDataChanged { user_id, .. } = &b {
+                    if user_id != &bound_user_id {
+                        continue;
+                    }
+                }
+                if let SocketBroadcast::PlaybackProgress { user_id, .. } = &b {
                     if user_id != &bound_user_id {
                         continue;
                     }
@@ -402,6 +408,28 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 }),
             )
         }),
+        // P10 — minimal Sessions payload carrying just the session
+        // that changed. jellyfin-web's Currently Watching sidebar +
+        // remote-control screens listen for this MessageType and
+        // patch the matched session in-place by Id.
+        SocketBroadcast::PlaybackProgress {
+            session_id,
+            user_id,
+            item_id,
+            position_ticks,
+            is_paused,
+        } => Some(Outbound::new(
+            "Sessions",
+            serde_json::json!([{
+                "Id": session_id,
+                "UserId": user_id,
+                "NowPlayingItem": { "Id": item_id },
+                "PlayState": {
+                    "PositionTicks": position_ticks,
+                    "IsPaused": is_paused,
+                },
+            }]),
+        )),
     }
 }
 
@@ -450,6 +478,26 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["UserId"], "u-1");
         assert_eq!(v["Data"]["UserDataList"][0]["ItemId"], "42");
+    }
+
+    #[test]
+    fn translate_playback_progress_emits_sessions_outbound() {
+        let out = translate_broadcast(SocketBroadcast::PlaybackProgress {
+            session_id: "s-1".into(),
+            user_id: "u-1".into(),
+            item_id: "42".into(),
+            position_ticks: 12_345_000,
+            is_paused: true,
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "Sessions");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"][0]["Id"], "s-1");
+        assert_eq!(v["Data"][0]["UserId"], "u-1");
+        assert_eq!(v["Data"][0]["NowPlayingItem"]["Id"], "42");
+        assert_eq!(v["Data"][0]["PlayState"]["PositionTicks"], 12_345_000);
+        assert_eq!(v["Data"][0]["PlayState"]["IsPaused"], true);
     }
 
     #[test]
