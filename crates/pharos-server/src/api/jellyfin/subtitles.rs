@@ -90,6 +90,10 @@ async fn deliver_vtt(
     // convert to WebVTT. Refuse with 415 + JSON error so clients
     // surface a clear "unsupported track" UI hint instead of the
     // generic 500 they'd get when ffmpeg fails the convert.
+    // P26 — styled text codecs (ASS / SSA) survive the conversion
+    // but lose colors / position / italics. Flag the response so
+    // clients can choose burn-in via HLS instead.
+    let mut style_lossy = false;
     if let Some(track) = item
         .probe
         .subtitle_tracks
@@ -103,6 +107,9 @@ async fn deliver_vtt(
                     .body(format!(
                         r#"{{"error":"image-based subtitles cannot convert to WebVTT","codec":"{codec}"}}"#
                     )));
+            }
+            if is_styled_text_subtitle_codec(codec) {
+                style_lossy = true;
             }
         }
     }
@@ -121,10 +128,7 @@ async fn deliver_vtt(
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
         {
-            return Ok(HttpResponse::Ok()
-                .content_type("text/vtt; charset=utf-8")
-                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-                .body((*bytes).clone()));
+            return Ok(vtt_response((*bytes).clone(), style_lossy));
         }
         // Per-key fetch lock dedupes concurrent first-fetchers so
         // they share one ffmpeg spawn.
@@ -137,29 +141,52 @@ async fn deliver_vtt(
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
         {
-            return Ok(HttpResponse::Ok()
-                .content_type("text/vtt; charset=utf-8")
-                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-                .body((*bytes).clone()));
+            return Ok(vtt_response((*bytes).clone(), style_lossy));
         }
         let out = run_ffmpeg_embedded(input, stream_index).await?;
         let stored = cache
             .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
             .await;
-        return Ok(HttpResponse::Ok()
-            .content_type("text/vtt; charset=utf-8")
-            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-            .body((*stored).clone()));
+        return Ok(vtt_response((*stored).clone(), style_lossy));
     }
 
     // No cache configured — fall back to the original spawn-per-fetch
     // path. (Default config keeps the cache on; this branch only
     // fires for tests / minimal deployments.)
     let out = run_ffmpeg_embedded(input, stream_index).await?;
-    Ok(HttpResponse::Ok()
+    Ok(vtt_response(out, style_lossy))
+}
+
+/// P26 — shared WebVTT response builder. Adds the
+/// `X-Subtitle-Style-Lossy` header + an in-body WEBVTT NOTE comment
+/// when the source codec carried styling that didn't survive the
+/// conversion (ASS/SSA).
+fn vtt_response(mut body: Vec<u8>, style_lossy: bool) -> HttpResponse {
+    if style_lossy {
+        // Prepend the NOTE before the existing WEBVTT magic so the
+        // WebVTT parser keeps treating the file as valid.
+        let mut prefixed = Vec::with_capacity(body.len() + 128);
+        prefixed.extend_from_slice(
+            b"WEBVTT\nNOTE Source format was ASS/SSA; styling lost in WebVTT conversion.\n\n",
+        );
+        // Strip an existing WEBVTT magic line so we don't end up with
+        // two of them.
+        if body.starts_with(b"WEBVTT") {
+            if let Some(nl) = body.iter().position(|c| *c == b'\n') {
+                body = body[nl + 1..].to_vec();
+            }
+        }
+        prefixed.extend_from_slice(&body);
+        body = prefixed;
+    }
+    let mut builder = HttpResponse::Ok();
+    builder
         .content_type("text/vtt; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-        .body(out))
+        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"));
+    if style_lossy {
+        builder.insert_header(("X-Subtitle-Style-Lossy", "true"));
+    }
+    builder.body(body)
 }
 
 async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, actix_web::Error> {
@@ -189,6 +216,17 @@ async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, 
         )));
     }
     Ok(out.stdout)
+}
+
+/// P26 — text codecs that carry styling ffmpeg's `-c:s webvtt`
+/// strips on conversion (colors / position / italics). Clients see
+/// the response header + DTO flag and can fall back to HLS burn-in
+/// when they care about styling fidelity (anime / fan-sub libraries).
+fn is_styled_text_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "ass" | "ssa" | "advanced substation alpha"
+    )
 }
 
 /// P15 — known image-based subtitle codecs. ffmpeg can't convert
@@ -416,6 +454,19 @@ mod tests {
         }
         for c in ["subrip", "srt", "webvtt", "ass", "ssa", "mov_text"] {
             assert!(!is_image_subtitle_codec(c), "{c} should NOT be flagged");
+        }
+    }
+
+    #[test]
+    fn styled_codec_detection_covers_ass_ssa() {
+        for c in ["ass", "ASS", "ssa", "advanced substation alpha"] {
+            assert!(is_styled_text_subtitle_codec(c), "{c} should be flagged");
+        }
+        for c in ["subrip", "webvtt", "mov_text", "pgssub"] {
+            assert!(
+                !is_styled_text_subtitle_codec(c),
+                "{c} should NOT be flagged"
+            );
         }
     }
 }
