@@ -2,9 +2,10 @@
 //! Walk lives in `spawn_blocking` — never parks async runtime (V5).
 
 use pharos_core::{
-    DomainError, DomainResult, MediaItem, MediaKind, MediaStore, Prober, Scanner, SeriesInfo,
+    AlternateMediaSource, DomainError, DomainResult, MediaItem, MediaKind, MediaStore, Prober,
+    Scanner, SeriesInfo,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -27,6 +28,9 @@ pub fn stable_id(path: &Path) -> u64 {
 pub struct FsScanner<P: Prober> {
     prober: P,
     extensions: HashSet<String>,
+    /// P43 — inter-probe pause in milliseconds. Zero (default) keeps
+    /// the original full-throttle behaviour the CLI scan ships with.
+    rate_limit: std::time::Duration,
 }
 
 impl<P: Prober> FsScanner<P> {
@@ -37,6 +41,7 @@ impl<P: Prober> FsScanner<P> {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            rate_limit: std::time::Duration::ZERO,
         }
     }
 
@@ -44,7 +49,16 @@ impl<P: Prober> FsScanner<P> {
         Self {
             prober,
             extensions: exts.into_iter().collect(),
+            rate_limit: std::time::Duration::ZERO,
         }
+    }
+
+    /// P43 — apply a per-probe rate-limit. `0` disables. Used by the
+    /// `/Library/Refresh` background path so a re-scan of a large
+    /// library doesn't saturate ffmpeg + disk during active playback.
+    pub fn with_rate_limit_ms(mut self, ms: u64) -> Self {
+        self.rate_limit = std::time::Duration::from_millis(ms);
+        self
     }
 
     /// Scan and push items into the given store. Streaming variant — avoids
@@ -52,14 +66,65 @@ impl<P: Prober> FsScanner<P> {
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
     pub async fn scan_into<S: MediaStore>(&self, root: &Path, store: &S) -> DomainResult<usize> {
         let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
+        let groups = group_editions(paths);
         let mut n = 0;
-        for p in paths {
-            if let Some(item) = self.probe_one(p).await {
+        for (primary, alts) in groups {
+            if let Some(item) = self.probe_with_alternates(primary, alts).await {
                 store.put(item).await?;
                 n += 1;
             }
+            if !self.rate_limit.is_zero() {
+                tokio::time::sleep(self.rate_limit).await;
+            }
         }
         Ok(n)
+    }
+
+    /// P41 — probe primary + each alternate edition sibling, then
+    /// attach the alternates to the primary's `MediaProbe`. Alternates
+    /// are not indexed as independent items (the edition picker on
+    /// PlaybackInfo lets users pick between them).
+    async fn probe_with_alternates(
+        &self,
+        primary: PathBuf,
+        alts: Vec<(String, PathBuf)>,
+    ) -> Option<MediaItem> {
+        let mut item = self.probe_one(primary).await?;
+        for (edition, alt_path) in alts {
+            match self.prober.probe(&alt_path).await {
+                Ok(info) => {
+                    let mut probe = info.probe;
+                    if probe.size_bytes.is_none() {
+                        if let Ok(meta) = tokio::fs::metadata(&alt_path).await {
+                            probe.size_bytes = Some(meta.len());
+                        }
+                    }
+                    // Stable id suffix derived from the edition tag so
+                    // URL paths survive re-scans the same way the
+                    // primary's id does.
+                    let id = edition_id_slug(&edition);
+                    item.probe.alternate_sources.push(AlternateMediaSource {
+                        id,
+                        path: alt_path,
+                        container: probe.container,
+                        video_codec: probe.video_codec,
+                        audio_codec: probe.audio_codec,
+                        bitrate_bps: probe.bitrate_bps,
+                        size_bytes: probe.size_bytes,
+                        duration_ms: probe.duration_ms,
+                        name: Some(edition),
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %alt_path.display(),
+                        error = %err,
+                        "alt edition probe failed, skipping just this alternate",
+                    );
+                }
+            }
+        }
+        Some(item)
     }
 
     async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
@@ -115,14 +180,141 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
     #[tracing::instrument(skip(self), fields(root = %root.display()))]
     async fn scan(&self, root: &Path) -> DomainResult<Vec<MediaItem>> {
         let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
-        let mut items = Vec::with_capacity(paths.len());
-        for p in paths {
-            if let Some(item) = self.probe_one(p).await {
+        let groups = group_editions(paths);
+        let mut items = Vec::with_capacity(groups.len());
+        for (primary, alts) in groups {
+            if let Some(item) = self.probe_with_alternates(primary, alts).await {
                 items.push(item);
+            }
+            if !self.rate_limit.is_zero() {
+                tokio::time::sleep(self.rate_limit).await;
             }
         }
         Ok(items)
     }
+}
+
+/// P41 — known edition labels that demote a sibling file to an
+/// `AlternateMediaSource` of the matching primary instead of a
+/// standalone library item. Matched case-insensitively against the
+/// trailing ` - Edition` portion of the file stem.
+const KNOWN_EDITIONS: &[&str] = &[
+    "director's cut",
+    "directors cut",
+    "extended",
+    "extended cut",
+    "extended edition",
+    "theatrical",
+    "theatrical cut",
+    "remastered",
+    "imax",
+    "imax edition",
+    "unrated",
+    "uncut",
+    "special edition",
+    "criterion",
+    "criterion collection",
+    "original",
+    "original cut",
+    "redux",
+    "final cut",
+    "international cut",
+    "ultimate edition",
+    "anniversary edition",
+];
+
+/// P41 — split a file stem like `"Movie Title - Director's Cut"` into
+/// its primary title + edition tag. Returns `None` when the trailing
+/// segment isn't in `KNOWN_EDITIONS` so titles that legitimately
+/// contain ` - ` ("Crouching Tiger, Hidden Dragon") aren't mangled.
+pub fn split_edition_tag(stem: &str) -> Option<(&str, &str)> {
+    let (left, right) = stem.rsplit_once(" - ")?;
+    let edition = right.trim();
+    if !is_known_edition(edition) {
+        return None;
+    }
+    Some((left.trim(), edition))
+}
+
+fn is_known_edition(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    KNOWN_EDITIONS.iter().any(|e| *e == lower)
+}
+
+/// P41 — slugify an edition label into a URL-stable identifier suffix
+/// for `MediaSourceInfo.Id`. Lowercase, ascii-only, `-` separator.
+fn edition_id_slug(edition: &str) -> String {
+    let mut s = String::with_capacity(edition.len());
+    for c in edition.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+        } else if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    s.trim_matches('-').to_string()
+}
+
+/// P41 — group walk output into `(primary, Vec<(edition_label, alt_path)>)`
+/// tuples. Files whose stem matches `Title - <known_edition>` and that
+/// share a directory + a primary file (`Title.ext`) are demoted to
+/// alternates of the primary. Files without a matching primary
+/// remain stand-alone items (the edition tag is preserved in the
+/// title).
+pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
+    // Index primaries by (parent_dir, lowercase_title). BTreeMap so
+    // iteration order is deterministic, which matters for tests +
+    // for the deterministic stable_id seed.
+    let mut primaries: BTreeMap<(PathBuf, String), PathBuf> = BTreeMap::new();
+    let mut alternates: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+    let mut standalone: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            standalone.push(path);
+            continue;
+        };
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        if split_edition_tag(stem).is_some() {
+            alternates.push((parent, stem.to_string(), path));
+        } else {
+            primaries.insert((parent.clone(), stem.to_ascii_lowercase()), path.clone());
+            standalone.push(path);
+        }
+    }
+    let mut groups: BTreeMap<PathBuf, Vec<(String, PathBuf)>> = BTreeMap::new();
+    let mut orphan_alts: Vec<PathBuf> = Vec::new();
+    for (parent, stem, alt_path) in alternates {
+        let (title, edition) = match split_edition_tag(&stem) {
+            Some(t) => t,
+            None => {
+                orphan_alts.push(alt_path);
+                continue;
+            }
+        };
+        let key = (parent, title.to_ascii_lowercase());
+        match primaries.get(&key) {
+            Some(primary) => {
+                groups
+                    .entry(primary.clone())
+                    .or_default()
+                    .push((edition.to_string(), alt_path));
+            }
+            None => {
+                // No matching primary in the same directory — keep as
+                // standalone item so the user still sees the file.
+                orphan_alts.push(alt_path);
+            }
+        }
+    }
+    let mut out: Vec<(PathBuf, Vec<(String, PathBuf)>)> = Vec::new();
+    for path in standalone {
+        let alts = groups.remove(&path).unwrap_or_default();
+        out.push((path, alts));
+    }
+    for path in orphan_alts {
+        out.push((path, Vec::new()));
+    }
+    out
 }
 
 /// Heuristic: does `path` look like a TV episode?
@@ -506,5 +698,58 @@ mod tests {
         assert_eq!(a, b);
         let c = stable_id(Path::new("/srv/media/other.mkv"));
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn split_edition_tag_recognises_known_editions() {
+        // P41 — the matcher requires the trailing ` - <known>` so a
+        // movie called "Crouching Tiger - Original" splits, but
+        // "Crouching Tiger - Hidden Dragon" does not (Hidden Dragon
+        // is not a known edition tag).
+        assert_eq!(
+            split_edition_tag("Movie Title - Director's Cut"),
+            Some(("Movie Title", "Director's Cut"))
+        );
+        assert_eq!(
+            split_edition_tag("The Film - Extended"),
+            Some(("The Film", "Extended"))
+        );
+        assert_eq!(split_edition_tag("Crouching Tiger - Hidden Dragon"), None);
+    }
+
+    #[test]
+    fn group_editions_pairs_primary_with_director_cut_alternate() {
+        // P41 — `Movie.mkv` + `Movie - Director's Cut.mkv` in the same
+        // directory becomes one MediaItem with a single
+        // AlternateMediaSource hanging off the primary's probe.
+        let dir = std::path::PathBuf::from("/srv/m");
+        let primary = dir.join("Movie.mkv");
+        let alt = dir.join("Movie - Director's Cut.mkv");
+        let groups = group_editions(vec![primary.clone(), alt.clone()]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, primary);
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[0].1[0].0, "Director's Cut");
+        assert_eq!(groups[0].1[0].1, alt);
+    }
+
+    #[test]
+    fn group_editions_keeps_orphan_alts_standalone() {
+        // P41 — an edition file with no matching primary in the same
+        // directory still surfaces as a standalone library item so a
+        // user-curated rip doesn't disappear from the catalog.
+        let dir = std::path::PathBuf::from("/srv/m");
+        let orphan = dir.join("OnlyEdition - Extended.mkv");
+        let groups = group_editions(vec![orphan.clone()]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, orphan);
+        assert!(groups[0].1.is_empty());
+    }
+
+    #[test]
+    fn edition_id_slug_is_url_safe() {
+        assert_eq!(edition_id_slug("Director's Cut"), "director-s-cut");
+        assert_eq!(edition_id_slug("IMAX"), "imax");
+        assert_eq!(edition_id_slug("Extended Edition"), "extended-edition");
     }
 }
