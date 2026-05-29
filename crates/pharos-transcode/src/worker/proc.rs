@@ -16,15 +16,21 @@
 //! carry `SCM_RIGHTS` fds for the live-stream sink.
 
 use crate::protocol::{read_frame, write_frame, Handshake, WorkerCmd, WorkerEvent};
-use crate::scheduler::{RunFuture, SpawnFuture, Worker, WorkerRunResult, WorkerSpawner};
 use crate::protocol::{JobSpec, WorkerId};
+use crate::scheduler::{
+    LiveByteStream, RunFuture, SpawnFuture, StreamFuture, Worker, WorkerRunResult, WorkerSpawner,
+};
+use bytes::Bytes;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio_util::io::ReaderStream;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -101,64 +107,78 @@ fn make_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
+/// Spawn a `transcode-worker` over a fresh control socketpair (fd 3) and
+/// read its `Hello`. `media_stdout` pipes the child's stdout (live media
+/// path) instead of inheriting it (log path). Returns the child, the
+/// control halves, and the handshake.
+async fn spawn_worker_proc(
+    worker_bin: &std::path::Path,
+    handshake_timeout: Duration,
+    media_stdout: bool,
+) -> io::Result<(Child, OwnedReadHalf, OwnedWriteHalf, Handshake)> {
+    let (parent_fd, child_fd) = make_socketpair()?;
+    // Don't leak the parent end into the child.
+    unsafe {
+        libc::fcntl(parent_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let child_raw = child_fd.as_raw_fd();
+
+    let mut cmd = Command::new(worker_bin);
+    cmd.stdin(Stdio::null())
+        .stdout(if media_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    // SAFETY: dup2 is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            // Move the child end to the well-known fd 3. dup2 clears
+            // CLOEXEC on the new fd, so it survives exec.
+            if libc::dup2(child_raw, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    // Parent no longer needs the child end (the fork has its own copy).
+    drop(child_fd);
+
+    let parent_raw = parent_fd.into_raw_fd();
+    // SAFETY: we own parent_raw exclusively now.
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
+    std_stream.set_nonblocking(true)?;
+    let stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let (mut rd, wr) = stream.into_split();
+
+    // Handshake: the worker's first frame must be Hello.
+    let hello = tokio::time::timeout(handshake_timeout, read_frame::<_, WorkerEvent>(&mut rd))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker handshake timeout"))?
+        .map_err(|e| io::Error::other(format!("worker handshake frame: {e}")))?;
+    let handshake = match hello {
+        Some(WorkerEvent::Hello(h)) => h,
+        Some(other) => {
+            return Err(io::Error::other(format!(
+                "worker sent {other:?} before Hello"
+            )))
+        }
+        None => return Err(io::Error::other("worker closed before Hello")),
+    };
+    Ok((child, rd, wr, handshake))
+}
+
 impl WorkerSpawner for ProcSpawner {
     fn spawn(&self, id: WorkerId) -> SpawnFuture {
         let worker_bin = self.worker_bin.clone();
         let handshake_timeout = self.handshake_timeout;
         let heartbeat_timeout = self.heartbeat_timeout;
         Box::pin(async move {
-            let (parent_fd, child_fd) = make_socketpair()?;
-            // Don't leak the parent end into the child.
-            unsafe {
-                libc::fcntl(parent_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            let child_raw = child_fd.as_raw_fd();
-
-            let mut cmd = Command::new(&worker_bin);
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .kill_on_drop(true);
-            // SAFETY: dup2 + the (no-op) closes are async-signal-safe.
-            unsafe {
-                cmd.pre_exec(move || {
-                    // Move the child end to the well-known fd 3. dup2
-                    // clears CLOEXEC on the new fd, so it survives exec.
-                    if libc::dup2(child_raw, 3) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let child = cmd.spawn()?;
-            // Parent no longer needs the child end (the forked child has
-            // its own copy, already dup'd to fd 3).
-            drop(child_fd);
-
-            // Wrap the parent end as a tokio UnixStream.
-            let parent_raw = parent_fd.into_raw_fd();
-            // SAFETY: we own parent_raw exclusively now.
-            let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
-            std_stream.set_nonblocking(true)?;
-            let stream = tokio::net::UnixStream::from_std(std_stream)?;
-            let (mut rd, wr) = stream.into_split();
-
-            // Handshake: the worker's first frame must be Hello.
-            let hello =
-                tokio::time::timeout(handshake_timeout, read_frame::<_, WorkerEvent>(&mut rd))
-                    .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker handshake timeout"))?
-                .map_err(|e| io::Error::other(format!("worker handshake frame: {e}")))?;
-            let handshake = match hello {
-                Some(WorkerEvent::Hello(h)) => h,
-                Some(other) => {
-                    return Err(io::Error::other(format!(
-                        "worker sent {other:?} before Hello"
-                    )))
-                }
-                None => return Err(io::Error::other("worker closed before Hello")),
-            };
-
+            let (child, rd, wr, handshake) =
+                spawn_worker_proc(&worker_bin, handshake_timeout, false).await?;
             Ok(Box::new(ProcWorker {
                 id,
                 rd,
@@ -168,6 +188,67 @@ impl WorkerSpawner for ProcSpawner {
                 heartbeat_timeout,
             }) as Box<dyn Worker>)
         })
+    }
+
+    fn spawn_streaming(&self, spec: JobSpec) -> StreamFuture {
+        let worker_bin = self.worker_bin.clone();
+        let handshake_timeout = self.handshake_timeout;
+        Box::pin(async move {
+            let (mut child, mut rd, mut wr, _handshake) =
+                spawn_worker_proc(&worker_bin, handshake_timeout, true).await?;
+            // The media pipe = the worker's (and thus ffmpeg's) stdout.
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("worker stdout not captured"))?;
+            // Dispatch the job (Stdout sink) + confirm acceptance before
+            // handing back the stream, so an immediate spawn failure
+            // surfaces as an error rather than an empty stream.
+            write_frame(&mut wr, &WorkerCmd::Job(spec))
+                .await
+                .map_err(|e| io::Error::other(format!("send job: {e}")))?;
+            match tokio::time::timeout(handshake_timeout, read_frame::<_, WorkerEvent>(&mut rd))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker accept timeout"))?
+                .map_err(|e| io::Error::other(format!("worker accept frame: {e}")))?
+            {
+                Some(WorkerEvent::Accepted { .. }) => {}
+                Some(WorkerEvent::Failed { error, .. }) => {
+                    return Err(io::Error::other(format!("worker rejected job: {error}")))
+                }
+                Some(other) => {
+                    return Err(io::Error::other(format!("unexpected pre-stream {other:?}")))
+                }
+                None => return Err(io::Error::other("worker closed before accepting job")),
+            }
+            let stream: LiveByteStream = Box::pin(StreamingWorker {
+                media: ReaderStream::new(stdout),
+                _child: child,
+                _control_rd: rd,
+                _control_wr: wr,
+            });
+            Ok(stream)
+        })
+    }
+}
+
+/// A one-shot live worker streaming muxed bytes off its stdout. Owns the
+/// child (kill_on_drop) + the control socket halves so the worker (and
+/// its ffmpeg) live exactly as long as the stream is consumed; dropping
+/// the stream closes the read end → ffmpeg gets EPIPE and exits.
+struct StreamingWorker {
+    media: ReaderStream<ChildStdout>,
+    _child: Child,
+    _control_rd: OwnedReadHalf,
+    _control_wr: OwnedWriteHalf,
+}
+
+impl futures_core::Stream for StreamingWorker {
+    type Item = io::Result<Bytes>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // StreamingWorker is Unpin (all fields are), so project by hand.
+        let this = self.get_mut();
+        Pin::new(&mut this.media).poll_next(cx)
     }
 }
 

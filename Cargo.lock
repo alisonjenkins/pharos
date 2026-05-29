@@ -2741,6 +2741,7 @@ dependencies = [
  "bytes",
  "ffmpeg-next",
  "futures-core",
+ "futures-util",
  "libc",
  "pharos-core",
  "serde",

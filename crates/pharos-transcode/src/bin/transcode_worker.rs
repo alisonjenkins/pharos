@@ -65,9 +65,20 @@ async fn run() {
         return;
     }
 
+    use pharos_transcode::protocol::OutputSink;
     loop {
         match read_frame::<_, WorkerCmd>(&mut rd).await {
-            Ok(Some(WorkerCmd::Job(spec))) => run_job(&mut wr, spec).await,
+            Ok(Some(WorkerCmd::Job(spec))) => {
+                // A live (Stdout) job is one-shot: after it finishes the
+                // worker must exit so its stdout closes and the reading
+                // parent sees EOF. Pooled file jobs keep the worker alive
+                // for reuse.
+                let one_shot = matches!(spec.sink, OutputSink::Stdout);
+                run_job(&mut wr, spec).await;
+                if one_shot {
+                    break;
+                }
+            }
             Ok(Some(WorkerCmd::Cancel { .. })) => {
                 // Single-job-at-a-time worker: nothing is in flight
                 // between reads, so a cancel is a no-op here.
@@ -92,20 +103,28 @@ async fn run_job(
     let is_hw = matches!(spec.device, DeviceId::Hw { .. });
     let _ = write_frame(wr, &WorkerEvent::Accepted { job_id }).await;
 
-    let (args, out) = match exec::spawn_job_args(&spec) {
+    let (args, target) = match exec::spawn_job_args(&spec) {
         Ok(v) => v,
         Err(e) => {
             let _ = write_frame(wr, &WorkerEvent::Failed { job_id, error: e }).await;
             return;
         }
     };
+    let stdout_passthrough = matches!(target, exec::SpawnTarget::Stdout);
 
     let mut cmd = tokio::process::Command::new(exec::ffmpeg_bin());
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if stdout_passthrough {
+        // ffmpeg writes the muxed stream to `pipe:1` = this worker's
+        // stdout, which the spawner connected to the main process's read
+        // pipe. Inherit so the bytes flow straight through.
+        cmd.stdout(std::process::Stdio::inherit());
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -133,25 +152,43 @@ async fn run_job(
         String::from_utf8_lossy(&buf).into_owned()
     });
 
-    // Heartbeat + progress: while ffmpeg runs, periodically report the
-    // growing output size so the scheduler's heartbeat window stays open
-    // on long encodes.
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let status = loop {
-        tokio::select! {
-            s = child.wait() => break s,
-            _ = ticker.tick() => {
-                let sz = tokio::fs::metadata(&out).await.map(|m| m.len()).unwrap_or(0);
-                let _ = write_frame(wr, &WorkerEvent::Progress { job_id, out_bytes: sz, frames: 0 }).await;
+    // Heartbeat + progress: while ffmpeg runs, periodically report
+    // progress so the scheduler's heartbeat window stays open on long
+    // encodes. For the file sink we report the growing output size; for
+    // the stdout/live sink we just emit a tick (the main process sees
+    // bytes flow directly on the pipe).
+    let file_out = match &target {
+        exec::SpawnTarget::File(p) => Some(p.clone()),
+        exec::SpawnTarget::Stdout => None,
+    };
+    let status = if let Some(out_path) = file_out.clone() {
+        // File sink: emit periodic size-based progress so the scheduler's
+        // heartbeat window stays open on long encodes.
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                s = child.wait() => break s,
+                _ = ticker.tick() => {
+                    let sz = tokio::fs::metadata(&out_path).await.map(|m| m.len()).unwrap_or(0);
+                    let _ = write_frame(wr, &WorkerEvent::Progress { job_id, out_bytes: sz, frames: 0 }).await;
+                }
             }
         }
+    } else {
+        // Stdout sink: the parent observes bytes flow directly on the
+        // pipe, so no progress frames are needed (and the control channel
+        // isn't drained during the stream). Just await completion.
+        child.wait().await
     };
 
     let stderr_text = stderr_task.await.unwrap_or_default();
     match status {
         Ok(s) if s.success() => {
-            let out_bytes = tokio::fs::metadata(&out).await.map(|m| m.len()).unwrap_or(0);
+            let out_bytes = match &file_out {
+                Some(p) => tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0),
+                None => 0,
+            };
             let _ = write_frame(wr, &WorkerEvent::Done { job_id, out_bytes }).await;
         }
         Ok(_) => {

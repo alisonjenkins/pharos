@@ -313,29 +313,37 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
         state = state.with_image_cache(ImageCache::new(cache_dir));
     }
+    // P14 — resolve `auto` against the live `ffmpeg -hwaccels` output
+    // once. Logs the chosen encoder so admins see what's wired.
+    let detected = pharos_transcode::hwaccel::detect_available("ffmpeg").await;
+    let accel = cfg.server.hwaccel.resolve_auto(&detected);
+    tracing::info!(?accel, ?detected, "hardware encoder resolved");
+    // Bring up the load-balancing transcode scheduler (multi-GPU +
+    // all-CPU, crash-isolated workers) once, shared by the HLS cache
+    // (segment path) + the live/uncached path on AppState. Falls back to
+    // inline ffmpeg when disabled or when the worker can't be brought up.
+    let transcode_scheduler = if cfg.server.transcode_hw_session_cap > 0 {
+        match build_transcode_scheduler(&detected, cfg.server.transcode_hw_session_cap).await {
+            Some(sched) => {
+                tracing::info!("transcode scheduler enabled (load-balanced workers)");
+                Some(sched)
+            }
+            None => {
+                tracing::warn!("transcode worker unavailable; using the inline ffmpeg path");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(sched) = transcode_scheduler.as_ref() {
+        state = state.with_transcode_scheduler(sched.clone());
+    }
     if let Some(cache_dir) = cfg.server.transcode_cache_dir.clone() {
-        // P14 — resolve `auto` against the live `ffmpeg -hwaccels`
-        // output once. Logs the chosen encoder so admins see what's
-        // wired without reading the source.
-        let detected = pharos_transcode::hwaccel::detect_available("ffmpeg").await;
-        let accel = cfg.server.hwaccel.resolve_auto(&detected);
-        tracing::info!(?accel, ?detected, "hardware encoder resolved");
         let mut hls = HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
             .with_hwaccel(accel);
-        // Bring up the load-balancing transcode scheduler (multi-GPU +
-        // all-CPU, crash-isolated workers). Falls back to the inline
-        // ffmpeg path when disabled or when the worker binary can't be
-        // brought up, so HLS keeps working on minimal deployments.
-        if cfg.server.transcode_hw_session_cap > 0 {
-            match build_transcode_scheduler(&detected, cfg.server.transcode_hw_session_cap).await {
-                Some(sched) => {
-                    tracing::info!("transcode scheduler enabled (load-balanced workers)");
-                    hls = hls.with_scheduler(sched);
-                }
-                None => tracing::warn!(
-                    "transcode worker unavailable; HLS uses the inline ffmpeg path"
-                ),
-            }
+        if let Some(sched) = transcode_scheduler.as_ref() {
+            hls = hls.with_scheduler(sched.clone());
         }
         state = state.with_hls_cache(hls);
     }

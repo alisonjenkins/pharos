@@ -25,14 +25,23 @@
 use crate::device::DeviceTable;
 use crate::options::TranscodeOptions;
 use crate::protocol::{DeviceId, JobId, JobSpec, OutputSink, WorkerError, WorkerId};
+use bytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
+
+/// A live transcode output as a stream of muxed byte chunks. Boxed so the
+/// type stays platform-agnostic (the concrete unix worker stream lives in
+/// `worker::proc`). The stream owns the worker process + its device
+/// permit; dropping it tears the encode down (broken pipe → ffmpeg exits)
+/// and frees the slot.
+pub type LiveByteStream = Pin<Box<dyn futures_core::Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// Terminal result of one worker running one job.
 #[derive(Debug)]
@@ -59,11 +68,26 @@ pub trait Worker: Send {
     fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a>;
 }
 
+/// Boxed future a [`WorkerSpawner::spawn_streaming`] call returns.
+pub type StreamFuture = Pin<Box<dyn Future<Output = std::io::Result<LiveByteStream>> + Send>>;
+
 /// Spawns fresh workers on demand (process fork for the real backend; an
 /// in-process stub for tests). Injectable so the scheduler core is
 /// testable with zero ffmpeg.
 pub trait WorkerSpawner: Send + Sync + 'static {
     fn spawn(&self, id: WorkerId) -> SpawnFuture;
+
+    /// Spawn a one-shot streaming worker for the live path: it encodes
+    /// `spec` (sink = `Stdout`) and streams the muxed bytes back. The
+    /// default errors so spawners that don't support streaming (e.g. the
+    /// in-process test mock) cleanly decline; `ProcSpawner` overrides it.
+    fn spawn_streaming(&self, _spec: JobSpec) -> StreamFuture {
+        Box::pin(async {
+            Err(std::io::Error::other(
+                "this spawner does not support live streaming",
+            ))
+        })
+    }
 }
 
 /// Where the caller wants output to land.
@@ -158,6 +182,11 @@ enum SchedMsg {
         sink: SinkRequest,
         reply: oneshot::Sender<Result<JobDone, SchedError>>,
     },
+    SubmitLive {
+        input: PathBuf,
+        opts: TranscodeOptions,
+        reply: oneshot::Sender<Result<LiveByteStream, SchedError>>,
+    },
     JobFinished {
         job_id: JobId,
         device: DeviceId,
@@ -242,10 +271,44 @@ impl TranscodeScheduler {
             .map_err(|_| SchedError::Io("scheduler dropped reply".into()))?
     }
 
+    /// Submit a live transcode and get a byte stream of the muxed output.
+    /// The job is dispatched to the least-loaded eligible device; the
+    /// returned stream owns the worker + its device permit, so the slot
+    /// frees when the consumer drops the stream (also tearing down the
+    /// encode). Returns `Busy` when no device has a free permit.
+    pub async fn submit_live(
+        &self,
+        input: PathBuf,
+        opts: TranscodeOptions,
+    ) -> Result<LiveByteStream, SchedError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(SchedMsg::SubmitLive { input, opts, reply })
+            .await
+            .map_err(|_| SchedError::Io("scheduler stopped".into()))?;
+        rx.await
+            .map_err(|_| SchedError::Io("scheduler dropped reply".into()))?
+    }
+
     pub async fn snapshot(&self) -> Option<SchedSnapshot> {
         let (reply, rx) = oneshot::channel();
         self.tx.send(SchedMsg::Snapshot { reply }).await.ok()?;
         rx.await.ok()
+    }
+}
+
+/// Wraps a live byte stream so it owns the device permit for its
+/// lifetime — dropping the stream frees the slot (RAII), same discipline
+/// as the segment path.
+struct PermitStream {
+    inner: LiveByteStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl futures_core::Stream for PermitStream {
+    type Item = std::io::Result<Bytes>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
@@ -274,6 +337,56 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 last_error: None,
             };
             place(state, job_id, ctx, self_tx);
+        }
+        SchedMsg::SubmitLive { input, opts, reply } => {
+            // Live path: acquire a permit best-first, then spawn a
+            // streaming worker off-actor. The permit rides inside the
+            // returned stream (RAII release on drop) — no inflight
+            // bookkeeping, no JobFinished.
+            let now = Instant::now();
+            let eligible = state.devices.eligible_for(&opts, now);
+            let mut acquired = None;
+            for dev in eligible.iter().copied() {
+                if let Some(slot) = state.devices.slot(dev) {
+                    if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
+                        acquired = Some((dev, permit));
+                        break;
+                    }
+                }
+            }
+            let Some((device, permit)) = acquired else {
+                let _ = reply.send(Err(if eligible.is_empty() {
+                    SchedError::Unsupported
+                } else {
+                    SchedError::Busy
+                }));
+                return;
+            };
+            let job_id = JobId(state.next_job);
+            state.next_job += 1;
+            let spec = JobSpec {
+                job_id,
+                input,
+                opts,
+                device,
+                sink: OutputSink::Stdout,
+            };
+            let spawner = state.spawner.clone();
+            tokio::spawn(async move {
+                match spawner.spawn_streaming(spec).await {
+                    Ok(inner) => {
+                        let stream: LiveByteStream = Box::pin(PermitStream {
+                            inner,
+                            _permit: permit,
+                        });
+                        let _ = reply.send(Ok(stream));
+                    }
+                    Err(e) => {
+                        drop(permit);
+                        let _ = reply.send(Err(SchedError::Io(e.to_string())));
+                    }
+                }
+            });
         }
         SchedMsg::JobFinished {
             job_id,
@@ -508,7 +621,9 @@ fn to_output_sink(sink: &SinkRequest) -> OutputSink {
         SinkRequest::FileDirect { out_path } => OutputSink::FileDirect {
             path: out_path.clone(),
         },
-        SinkRequest::LiveStream => OutputSink::Fd,
+        // LiveStream is dispatched via `submit_live` (OutputSink::Stdout),
+        // never through the segment `place` path; map defensively.
+        SinkRequest::LiveStream => OutputSink::Stdout,
     }
 }
 

@@ -131,6 +131,58 @@ async fn worker_reports_bad_input() {
     );
 }
 
+#[tokio::test]
+async fn worker_streams_live_to_stdout() {
+    use futures_util::StreamExt;
+    use pharos_transcode::protocol::OutputSink;
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.webm");
+    synth_fixture(&input).await;
+
+    let spawner = ProcSpawner::with_worker_bin(WORKER_BIN);
+    let spec = JobSpec {
+        job_id: JobId(9),
+        input,
+        opts: TranscodeOptions {
+            container: Container::Mpegts,
+            video: Some(VideoCodec::H264),
+            audio: Some(AudioCodec::Aac),
+            video_bitrate_bps: None,
+            audio_bitrate_bps: None,
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+        },
+        device: DeviceId::Cpu,
+        sink: OutputSink::Stdout,
+    };
+
+    let mut stream = spawner.spawn_streaming(spec).await.expect("spawn streaming");
+    let mut total = 0usize;
+    let mut first_byte = None;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Ok(Some(chunk)) => {
+                let b = chunk.expect("stream chunk");
+                if first_byte.is_none() && !b.is_empty() {
+                    first_byte = Some(b[0]);
+                }
+                total += b.len();
+            }
+            Ok(None) => break,
+            Err(_) => panic!("live stream timed out"),
+        }
+    }
+    assert!(total > 0, "live stream produced no bytes");
+    // MPEG-TS packets begin with the 0x47 sync byte.
+    assert_eq!(first_byte, Some(0x47), "expected MPEG-TS sync byte");
+}
+
 async fn synth_fixture(path: &Path) {
     // 2s VP9/Opus WebM — small + FOSS-decodable.
     let status = tokio::process::Command::new("ffmpeg")

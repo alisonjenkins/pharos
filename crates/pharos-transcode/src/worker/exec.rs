@@ -66,21 +66,29 @@ pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
     WorkerError::Other(tail)
 }
 
-/// Build the ffmpeg argv + resolve the output path for a `FileDirect`
-/// spawn job. Errors map to the appropriate non-transient class.
-pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, PathBuf), WorkerError> {
-    let out = match &spec.sink {
-        OutputSink::FileDirect { path } => path.clone(),
-        OutputSink::Fd => {
-            return Err(WorkerError::Other(
-                "fd output sink not supported by the spawn worker".into(),
-            ))
-        }
-    };
+/// Resolved output target for a spawn job.
+pub enum SpawnTarget {
+    /// Write to this file path (FileDirect / cached segment).
+    File(PathBuf),
+    /// Write the muxed stream to the worker's stdout (live path).
+    Stdout,
+}
+
+/// Build the ffmpeg argv + resolve the output target for a spawn job.
+/// Errors map to the appropriate non-transient class.
+pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), WorkerError> {
     let input = spec.input.to_str().ok_or(WorkerError::BadInput)?;
-    let out_str = out.to_str().ok_or(WorkerError::BadInput)?;
-    let args = ffmpeg_transcode_args(input, &spec.opts, spec.device, out_str);
-    Ok((args, out))
+    match &spec.sink {
+        OutputSink::FileDirect { path } => {
+            let out_str = path.to_str().ok_or(WorkerError::BadInput)?;
+            let args = ffmpeg_transcode_args(input, &spec.opts, spec.device, out_str);
+            Ok((args, SpawnTarget::File(path.clone())))
+        }
+        OutputSink::Stdout => {
+            let args = ffmpeg_transcode_args(input, &spec.opts, spec.device, "pipe:1");
+            Ok((args, SpawnTarget::Stdout))
+        }
+    }
 }
 
 #[cfg(test)]

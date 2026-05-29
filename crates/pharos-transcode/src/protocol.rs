@@ -116,11 +116,12 @@ pub enum OutputSink {
     /// (`.tmp`), the scheduler renames to the final name on `Done`. No
     /// cross-process byte copy.
     FileDirect { path: PathBuf },
-    /// Live path: the worker writes to a pipe whose write-end fd was
-    /// handed over out-of-band via `SCM_RIGHTS` on the control socket.
-    /// The frame carries no fd (bincode can't); the fd rides the same
-    /// `sendmsg` that delivers this `JobSpec`.
-    Fd,
+    /// Live path: the worker writes the muxed stream to its own stdout,
+    /// which the spawner connected to an OS pipe the main process reads
+    /// and forwards to the HTTP client. The fd is "passed" by stdout
+    /// inheritance (main↔worker pipe, worker→ffmpeg inherit) — no
+    /// userspace copy in the worker; bytes flow ffmpeg → pipe → client.
+    Stdout,
 }
 
 /// One unit of transcode work.

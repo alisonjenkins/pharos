@@ -830,6 +830,29 @@ async fn serve_segment(
             .body(bytes));
     }
 
+    // Uncached live path. Prefer the load-balancing scheduler (spreads
+    // across every GPU + CPU, crash-isolated worker) when available;
+    // fall back to a direct inline ffmpeg otherwise.
+    if let Some(sched) = state.transcode_scheduler.as_ref() {
+        match sched.submit_live(item.path.clone(), opts.clone()).await {
+            Ok(stream) => {
+                return Ok(HttpResponse::Ok()
+                    .content_type(opts.container.content_type())
+                    .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+                    .insert_header((
+                        actix_web::http::header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable",
+                    ))
+                    .streaming(stream));
+            }
+            Err(e) => {
+                // Busy / worker error — fall through to inline ffmpeg so
+                // the request still succeeds.
+                tracing::warn!(error = %e, "scheduler live transcode failed; inline fallback");
+            }
+        }
+    }
+
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
         .transcode(&item.path, &opts)

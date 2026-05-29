@@ -49,6 +49,7 @@ path = "src/bin/transcode_tool.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+futures-util = "0.3"
 
 [lints]
 workspace = true
