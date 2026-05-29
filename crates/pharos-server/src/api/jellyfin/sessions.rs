@@ -243,7 +243,11 @@ async fn playing_stopped(
                 .ok()
                 .and_then(|it| it.probe.run_time_ticks())
                 .unwrap_or(0);
-            let finished = runtime > 0 && position >= runtime.saturating_sub(runtime / 10);
+            // P36 — threshold configurable via [server].played_threshold_pct
+            // (default 90, clamped to [50, 100] at boot).
+            let played_complement = 100u64.saturating_sub(state.played_threshold_pct as u64);
+            let finished = runtime > 0
+                && position >= runtime.saturating_sub(runtime * played_complement / 100);
             if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
                 if finished {
                     data.played = true;

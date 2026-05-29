@@ -86,6 +86,11 @@ pub struct AppState {
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
     pub bus: broadcast::Sender<SocketBroadcast>,
+    /// P36 — clamped played-flag threshold (50–100) used by
+    /// `Sessions/Playing/Stopped` to decide when an item flips to
+    /// `played=true`. Surfaced here so handlers stay zero-allocation
+    /// per-request.
+    pub played_threshold_pct: u32,
 }
 
 impl AppState {
@@ -117,6 +122,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            played_threshold_pct: 90,
         }
     }
 
@@ -166,7 +172,17 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            played_threshold_pct: 90,
         })
+    }
+
+    /// P36 builder — apply the configured played-threshold,
+    /// clamping to `[50, 100]` so a misconfigured 0 doesn't
+    /// flip every play to played=true and a 250 doesn't make
+    /// played unreachable.
+    pub fn with_played_threshold_pct(mut self, pct: u32) -> Self {
+        self.played_threshold_pct = pct.clamp(50, 100);
+        self
     }
 
     pub fn with_image_cache(mut self, cache: ImageCache) -> Self {

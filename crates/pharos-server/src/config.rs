@@ -85,6 +85,18 @@ pub struct ServerConfig {
     /// unset.
     #[serde(default)]
     pub ssdp_advertise_url: Option<String>,
+    /// P36 — percentage-of-runtime threshold for marking an item
+    /// `played=true` when `POST /Sessions/Playing/Stopped` fires.
+    /// Real-world tuning: 80 lets the credits-skipper crowd flip
+    /// before the recap; 95 keeps documentary watchers from auto-
+    /// completing during the credits roll. Clamped to `[50, 100]`
+    /// on read so a typo doesn't make every touch mark played.
+    #[serde(default = "default_played_threshold_pct")]
+    pub played_threshold_pct: u32,
+}
+
+fn default_played_threshold_pct() -> u32 {
+    90
 }
 
 fn default_transcode_cache_bytes() -> u64 {

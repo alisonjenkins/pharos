@@ -316,6 +316,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state = state.with_live_tv(backend);
     }
     state = state.with_log_dir(cfg.obs.log_dir.clone());
+    state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
 
