@@ -50,6 +50,7 @@ js-sys = { version = "0.3", optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 # T51 phase 1: dioxus-ssr renders components to HTML strings inside

@@ -2572,6 +2572,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2583,6 +2584,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2598,6 +2600,7 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+ "workspace-hack",
  "xxhash-rust",
 ]
 
@@ -2640,6 +2643,7 @@ dependencies = [
  "tracing-actix-web",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
  "xxhash-rust",
 ]
 
@@ -2656,6 +2660,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2672,6 +2677,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2689,6 +2695,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4893,6 +4900,68 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "actix-router",
+ "actix-rt",
+ "base64",
+ "bitflags",
+ "byteorder",
+ "cc",
+ "clap",
+ "clap_builder",
+ "crossbeam-utils",
+ "crypto-common 0.1.7",
+ "digest 0.10.7",
+ "dioxus-core",
+ "either",
+ "foldhash",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.4.2",
+ "itertools",
+ "libc",
+ "log",
+ "memchr",
+ "mio",
+ "percent-encoding",
+ "ppv-lite86",
+ "proc-macro2",
+ "rand 0.8.6",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rand_core 0.6.4",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2",
+ "slab",
+ "smallvec",
+ "sqlx",
+ "sqlx-core",
+ "sqlx-macros",
+ "sqlx-macros-core",
+ "sqlx-postgres",
+ "sqlx-sqlite",
+ "syn",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-core",
+ "typenum",
+ "zerocopy",
 ]
 
 [[package]]

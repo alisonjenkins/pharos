@@ -69,6 +69,20 @@ test-changed from="main":
 lint:
     nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
+# P53 — regenerate the workspace-hack contents after a dep change.
+# Run this whenever a Cargo.toml in any crate gains / drops a dep
+# or feature flag. hakari diffs the unified feature set and emits a
+# fresh `[dependencies]` block in `workspace-hack/Cargo.toml`.
+hakari-regen:
+    nix develop --command cargo hakari generate
+    nix develop --command cargo hakari manage-deps --yes
+
+# P53 — fail the build if workspace-hack is stale. CI runs this so
+# a dep change without a regenerate is caught before merge.
+hakari-check:
+    nix develop --command cargo hakari generate --diff
+    nix develop --command cargo hakari verify
+
 # Supply-chain checks (T45). Runs cargo-audit (RustSec advisories) and
 # cargo-deny (licenses + bans + sources) under the policies in
 # deny.toml.

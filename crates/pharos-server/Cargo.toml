@@ -41,6 +41,7 @@ tracing.workspace = true
 tracing-actix-web.workspace = true
 tracing-subscriber.workspace = true
 xxhash-rust.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
 # P48 — ffmpeg backend selection. Mutually exclusive — pick one.

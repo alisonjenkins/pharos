@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["fs", "process", "macros", "rt-multi-thr
 tracing.workspace = true
 walkdir.workspace = true
 xxhash-rust.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 criterion = { workspace = true }

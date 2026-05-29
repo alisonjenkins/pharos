@@ -13,6 +13,7 @@
   - `just test-changed [from=main]` — `cargo-guppy` enumerates packages touched vs `from`, then `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'` runs only the transitively-affected tests.
   - `just test` — full workspace (strips macOS Gatekeeper quarantine attr first).
   - `just test-thorough` — full workspace with `PROPTEST_CASES=512` for nightly / pre-release.
+- After a dep change in any crate's `Cargo.toml`, run `just hakari-regen` to refresh `workspace-hack`. CI runs `just hakari-check` so a stale hack crate fails before merge.
 
 Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) requires clippy from the pinned toolchain. Host system may not have it.
 

@@ -8,6 +8,7 @@ members = [
     "crates/pharos-store-sqlx",
     "crates/pharos-transcode",
     "crates/pharos-ui",
+    "workspace-hack",
 ]
 
 [workspace.package]
