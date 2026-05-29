@@ -100,7 +100,10 @@ fn default_trickplay_interval_ms() -> u32 {
 }
 
 fn default_trickplay_widths() -> Vec<u32> {
-    vec![320]
+    // P21 — three rungs cover mobile (320) + desktop hover (640)
+    // + TV-overlay (1280). Default cap is 256 MiB which handles
+    // all three for typical libraries.
+    vec![320, 640, 1280]
 }
 
 fn default_subtitle_cache_bytes() -> u64 {
