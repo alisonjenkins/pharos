@@ -20,7 +20,13 @@ fn main() {
 
 #[cfg(unix)]
 fn main() {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("transcode-tool: tokio runtime init failed: {e}");
+            std::process::exit(1);
+        }
+    };
     let code = rt.block_on(real_main());
     std::process::exit(code);
 }

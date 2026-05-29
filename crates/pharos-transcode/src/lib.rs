@@ -208,16 +208,6 @@ fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
     build_args_for_device(input, opts, crate::protocol::DeviceId::Cpu, "pipe:1")
 }
 
-#[cfg(test)]
-fn build_args_with_hwaccel(
-    input: &str,
-    opts: &TranscodeOptions,
-    hwaccel: HwAccel,
-    output: &str,
-) -> Vec<String> {
-    build_args_for_device(input, opts, hwaccel_to_device(hwaccel), output)
-}
-
 /// Map a legacy `HwAccel` selection to a concrete `DeviceId` (GPU
 /// ordinal 0). `Off`/`Auto` → CPU (software).
 fn hwaccel_to_device(h: HwAccel) -> crate::protocol::DeviceId {

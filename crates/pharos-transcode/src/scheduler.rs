@@ -44,26 +44,26 @@ pub enum WorkerRunResult {
     Died,
 }
 
+/// Boxed future a [`Worker::run`] call returns.
+pub type RunFuture<'a> = Pin<Box<dyn Future<Output = WorkerRunResult> + Send + 'a>>;
+
+/// Boxed future a [`WorkerSpawner::spawn`] call returns.
+pub type SpawnFuture = Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Worker>>> + Send>>;
+
 /// A reusable worker bound to one job at a time. The implementation is
 /// responsible for its own liveness watchdog — `run` must eventually
 /// resolve (returning `Died` on a hung/dead worker), never hang, so the
 /// scheduler's detached task can't leak.
 pub trait Worker: Send {
     fn id(&self) -> WorkerId;
-    fn run<'a>(
-        &'a mut self,
-        job: JobSpec,
-    ) -> Pin<Box<dyn Future<Output = WorkerRunResult> + Send + 'a>>;
+    fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a>;
 }
 
 /// Spawns fresh workers on demand (process fork for the real backend; an
 /// in-process stub for tests). Injectable so the scheduler core is
 /// testable with zero ffmpeg.
 pub trait WorkerSpawner: Send + Sync + 'static {
-    fn spawn(
-        &self,
-        id: WorkerId,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Worker>>> + Send>>;
+    fn spawn(&self, id: WorkerId) -> SpawnFuture;
 }
 
 /// Where the caller wants output to land.
@@ -647,7 +647,7 @@ mod tests {
         fn spawn(
             &self,
             id: WorkerId,
-        ) -> Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Worker>>> + Send>> {
+        ) -> SpawnFuture {
             self.spawned.fetch_add(1, Ordering::SeqCst);
             let f = self.f.clone();
             let delay = self.delay;
@@ -667,10 +667,7 @@ mod tests {
         fn id(&self) -> WorkerId {
             self.id
         }
-        fn run<'a>(
-            &'a mut self,
-            job: JobSpec,
-        ) -> Pin<Box<dyn Future<Output = WorkerRunResult> + Send + 'a>> {
+        fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
             let f = self.f.clone();
             let delay = self.delay;
             let id = self.id;

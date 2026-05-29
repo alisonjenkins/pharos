@@ -16,13 +16,11 @@
 //! carry `SCM_RIGHTS` fds for the live-stream sink.
 
 use crate::protocol::{read_frame, write_frame, Handshake, WorkerCmd, WorkerEvent};
-use crate::scheduler::{Worker, WorkerRunResult, WorkerSpawner};
+use crate::scheduler::{RunFuture, SpawnFuture, Worker, WorkerRunResult, WorkerSpawner};
 use crate::protocol::{JobSpec, WorkerId};
-use std::future::Future;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -104,10 +102,7 @@ fn make_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 impl WorkerSpawner for ProcSpawner {
-    fn spawn(
-        &self,
-        id: WorkerId,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Worker>>> + Send>> {
+    fn spawn(&self, id: WorkerId) -> SpawnFuture {
         let worker_bin = self.worker_bin.clone();
         let handshake_timeout = self.handshake_timeout;
         let heartbeat_timeout = self.heartbeat_timeout;
@@ -199,10 +194,7 @@ impl Worker for ProcWorker {
         self.id
     }
 
-    fn run<'a>(
-        &'a mut self,
-        job: JobSpec,
-    ) -> Pin<Box<dyn Future<Output = WorkerRunResult> + Send + 'a>> {
+    fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
         Box::pin(async move {
             if write_frame(&mut self.wr, &WorkerCmd::Job(job)).await.is_err() {
                 return WorkerRunResult::Died;
