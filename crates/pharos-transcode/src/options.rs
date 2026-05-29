@@ -12,6 +12,10 @@ pub enum Container {
     Mp3,
     Flac,
     Ogg,
+    /// P11 — raw ADTS (AAC) stream. Used by `/Audio/{id}/universal`
+    /// when remuxing FLAC / lossless sources to AAC for clients
+    /// without FLAC decode.
+    Adts,
 }
 
 impl Container {
@@ -25,6 +29,7 @@ impl Container {
             Self::Mp3 => "mp3",
             Self::Flac => "flac",
             Self::Ogg => "ogg",
+            Self::Adts => "adts",
         }
     }
 
@@ -37,6 +42,7 @@ impl Container {
             Self::Mp3 => "audio/mpeg",
             Self::Flac => "audio/flac",
             Self::Ogg => "audio/ogg",
+            Self::Adts => "audio/aac",
         }
     }
 
@@ -52,6 +58,7 @@ impl Container {
             "mp3" => Some(Self::Mp3),
             "flac" => Some(Self::Flac),
             "ogg" => Some(Self::Ogg),
+            "aac" | "adts" => Some(Self::Adts),
             _ => None,
         }
     }

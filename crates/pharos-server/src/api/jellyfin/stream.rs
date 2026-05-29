@@ -28,8 +28,179 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // rewrites jellyfin-web's PascalCase before the router matches.
     cfg.route("/videos/{id}/stream", web::get().to(stream_video))
         .route("/videos/{id}/stream.{ext}", web::get().to(stream_video))
+        .route("/videos/{id}/stream", web::head().to(head_video))
         .route("/audio/{id}/stream", web::get().to(stream_audio))
-        .route("/audio/{id}/universal", web::get().to(stream_audio));
+        .route("/audio/{id}/stream", web::head().to(head_audio))
+        // P11 — universal honours AudioCodec + MaxStreamingBitrate.
+        .route("/audio/{id}/universal", web::get().to(audio_universal))
+        .route("/audio/{id}/universal", web::head().to(head_audio));
+}
+
+async fn head_video(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<StreamPath>,
+) -> Result<HttpResponse, actix_web::Error> {
+    head_response(&state, path.id_str()).await
+}
+
+async fn head_audio(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<StreamPath>,
+) -> Result<HttpResponse, actix_web::Error> {
+    head_response(&state, path.id_str()).await
+}
+
+/// P11 — HEAD short-circuit. Returns Content-Length + Content-Type
+/// from the probe / stat without opening the body. Mobile clients
+/// use HEAD to validate a stream URL before issuing the playback
+/// GET; without this they fall back to GET-then-cancel.
+async fn head_response(state: &AppState, id_str: &str) -> Result<HttpResponse, actix_web::Error> {
+    let item = load_item(state, id_str).await?;
+    let size = match item.probe.size_bytes {
+        Some(s) => s,
+        None => tokio::fs::metadata(&item.path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0),
+    };
+    let mime = mime_guess::from_path(&item.path)
+        .first_or_octet_stream()
+        .to_string();
+    Ok(HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, mime))
+        .insert_header((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")))
+        .insert_header((
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&size.to_string()).map_err(error::ErrorInternalServerError)?,
+        ))
+        .finish())
+}
+
+/// P11 — `/Audio/{id}/universal`. Parses `AudioCodec` (CSV of
+/// acceptable codecs) + `MaxStreamingBitrate` and either streams the
+/// source directly (when its codec is acceptable) or remuxes via
+/// ffmpeg to the first acceptable target (typically AAC).
+async fn audio_universal(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<StreamPath>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let item = load_item(&state, path.id_str()).await?;
+    let qs = req.query_string();
+    let acceptable = parse_audio_codec_list(qs);
+    let bitrate = parse_max_streaming_bitrate(qs);
+    let source_codec = item.probe.audio_codec.as_deref().unwrap_or("");
+
+    if acceptable.is_empty()
+        || acceptable
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(source_codec))
+    {
+        // Direct path — defer to the existing delivery (StartTimeTicks
+        // + Range honoured by `deliver_stream`).
+        return deliver_stream(&state, &req, path.id_str()).await;
+    }
+
+    // Remux. Pick the first acceptable target the server knows how to
+    // emit. AAC is the lowest-common-denominator and always present
+    // in modern ffmpeg.
+    let target = acceptable
+        .iter()
+        .find(|c| matches!(c.to_ascii_lowercase().as_str(), "aac"))
+        .cloned()
+        .unwrap_or_else(|| "aac".to_string());
+    audio_remux(&item, &target, bitrate).await
+}
+
+async fn audio_remux(
+    item: &MediaItem,
+    target_codec: &str,
+    bitrate_bps: Option<u64>,
+) -> Result<HttpResponse, actix_web::Error> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let codec = target_codec.to_ascii_lowercase();
+    let (ffmpeg_codec, muxer, content_type) = match codec.as_str() {
+        "aac" => ("aac", "adts", "audio/aac"),
+        "mp3" => ("libmp3lame", "mp3", "audio/mpeg"),
+        "opus" => ("libopus", "ogg", "audio/ogg"),
+        other => {
+            return Err(error::ErrorBadRequest(format!(
+                "unsupported audio remux target: {other}"
+            )));
+        }
+    };
+    let bitrate = bitrate_bps.unwrap_or(192_000);
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(&item.path)
+        .arg("-vn")
+        .arg("-c:a")
+        .arg(ffmpeg_codec)
+        .arg("-b:a")
+        .arg(bitrate.to_string())
+        .arg("-f")
+        .arg(muxer)
+        .arg("pipe:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| error::ErrorInternalServerError(format!("ffmpeg spawn: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| error::ErrorInternalServerError("ffmpeg stdout missing"))?;
+    let reader = tokio_util::io::ReaderStream::with_capacity(stdout, 64 * 1024);
+    let stream = futures_util::TryStreamExt::map_err(reader, |e| {
+        actix_web::error::ErrorInternalServerError(format!("read: {e}"))
+    });
+    // Spawn a watcher so the child gets reaped even when the client
+    // disconnects mid-stream. V6 invariant: child Drop kills it; but
+    // explicit await keeps zombies off PIDs.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(HttpResponse::Ok()
+        .content_type(content_type)
+        .body(actix_web::body::BodyStream::new(stream)))
+}
+
+fn parse_audio_codec_list(qs: &str) -> Vec<String> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("AudioCodec") && !v.is_empty() {
+                return v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("MaxStreamingBitrate") {
+                return v.parse::<u64>().ok();
+            }
+        }
+    }
+    None
 }
 
 async fn stream_video(
@@ -270,5 +441,35 @@ mod tests {
         assert_eq!(parse_start_time_ticks(""), 0);
         assert_eq!(parse_start_time_ticks("foo=bar"), 0);
         assert_eq!(parse_start_time_ticks("StartTimeTicks=notanumber"), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn parse_audio_codec_list_csv() {
+        assert_eq!(
+            parse_audio_codec_list("AudioCodec=aac,mp3,opus"),
+            vec!["aac", "mp3", "opus"]
+        );
+        assert_eq!(parse_audio_codec_list("audiocodec=aac"), vec!["aac"]);
+        assert!(parse_audio_codec_list("").is_empty());
+        assert!(parse_audio_codec_list("foo=bar").is_empty());
+        // Whitespace-trim + drop empty entries.
+        assert_eq!(
+            parse_audio_codec_list("AudioCodec= aac , , mp3 "),
+            vec!["aac", "mp3"]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn parse_max_streaming_bitrate_extracts_numeric_value() {
+        assert_eq!(
+            parse_max_streaming_bitrate("MaxStreamingBitrate=128000"),
+            Some(128_000)
+        );
+        assert_eq!(
+            parse_max_streaming_bitrate("maxstreamingbitrate=1500000"),
+            Some(1_500_000)
+        );
+        assert_eq!(parse_max_streaming_bitrate(""), None);
+        assert_eq!(parse_max_streaming_bitrate("MaxStreamingBitrate=abc"), None);
     }
 }
