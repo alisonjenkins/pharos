@@ -93,6 +93,14 @@ pub struct ServerConfig {
     /// on read so a typo doesn't make every touch mark played.
     #[serde(default = "default_played_threshold_pct")]
     pub played_threshold_pct: u32,
+    /// P43 — inter-probe sleep in milliseconds for the scanner +
+    /// `/Library/Refresh` background pass. 0 (default) keeps the
+    /// CLI scan behaviour unchanged. Production deployments with
+    /// active streaming during re-scan can set this to 50–500 ms
+    /// so ffprobe spawns don't saturate disk + CPU during the
+    /// catalog walk.
+    #[serde(default)]
+    pub scan_rate_limit_ms: u64,
 }
 
 fn default_played_threshold_pct() -> u32 {

@@ -395,7 +395,8 @@ async fn library_refresh(
     // completion is enough for connected clients to invalidate caches).
     let state = state.into_inner();
     actix_web::rt::spawn(async move {
-        let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new());
+        let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+            .with_rate_limit_ms(state.scan_rate_limit_ms);
         for root in &state.media_roots {
             match scanner.scan_into(root, &state.stores).await {
                 Ok(n) => tracing::info!(

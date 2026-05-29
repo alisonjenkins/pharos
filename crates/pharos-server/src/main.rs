@@ -68,7 +68,8 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     }
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
-    let scanner = FsScanner::new(FfmpegProber::new());
+    let scanner =
+        FsScanner::new(FfmpegProber::new()).with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -317,6 +318,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     }
     state = state.with_log_dir(cfg.obs.log_dir.clone());
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
+    state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
 

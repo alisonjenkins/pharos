@@ -91,6 +91,11 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
+    /// P43 — inter-probe sleep in milliseconds for background
+    /// `/Library/Refresh` passes. 0 disables rate-limiting. Surfaced
+    /// here so the admin spawn reads the configured value without
+    /// re-parsing the toml config.
+    pub scan_rate_limit_ms: u64,
 }
 
 impl AppState {
@@ -123,6 +128,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION"),
             bus,
             played_threshold_pct: 90,
+            scan_rate_limit_ms: 0,
         }
     }
 
@@ -173,6 +179,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION"),
             bus,
             played_threshold_pct: 90,
+            scan_rate_limit_ms: 0,
         })
     }
 
@@ -182,6 +189,14 @@ impl AppState {
     /// played unreachable.
     pub fn with_played_threshold_pct(mut self, pct: u32) -> Self {
         self.played_threshold_pct = pct.clamp(50, 100);
+        self
+    }
+
+    /// P43 builder — apply the configured per-probe rate-limit for
+    /// background library refresh. Capped at 5 seconds so a typo
+    /// can't make a refresh run effectively forever.
+    pub fn with_scan_rate_limit_ms(mut self, ms: u64) -> Self {
+        self.scan_rate_limit_ms = ms.min(5_000);
         self
     }
 
