@@ -20,6 +20,7 @@ actix-files.workspace = true
 actix-web.workspace = true
 actix-ws.workspace = true
 futures-util = "0.3"
+httpdate = "1"
 mime_guess = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 anyhow.workspace = true

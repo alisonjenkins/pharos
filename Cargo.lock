@@ -2521,6 +2521,7 @@ dependencies = [
  "clap",
  "futures-util",
  "getrandom 0.2.17",
+ "httpdate",
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",

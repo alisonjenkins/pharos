@@ -79,7 +79,35 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             return Some(v.to_string());
         }
     }
+    // P24 — last-resort cookie fallback. Stream endpoints set a
+    // `JellyfinAuth` cookie after the first authenticated request so
+    // `<video src=…>` (which can't inject headers, and on Safari /
+    // tvOS can't trust query strings under strict CSP) keeps working.
+    if let Some(cookie_hdr) = h
+        .get(actix_web::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    {
+        for entry in cookie_hdr.split(';') {
+            let entry = entry.trim();
+            if let Some((name, value)) = entry.split_once('=') {
+                if name.trim().eq_ignore_ascii_case("JellyfinAuth") {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
     None
+}
+
+/// P24 — Set-Cookie value emitted when a media-element-style URL
+/// successfully authenticated via `?api_key=`. Caller uses it on the
+/// stream / HLS response so subsequent fetches don't have to repeat
+/// the query string.
+pub fn auth_cookie_header(token: &str) -> String {
+    format!("JellyfinAuth={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400")
 }
 
 /// Parse `MediaBrowser Token="abc", Client="x", …` style headers.

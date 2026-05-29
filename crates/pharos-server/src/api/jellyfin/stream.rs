@@ -7,7 +7,10 @@
 //! the `MediaStore` from elsewhere must validate root-prefix at the
 //! call site; tracked in §B if violated.
 
-use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use crate::{
+    api::jellyfin::auth_extractor::{auth_cookie_header, AuthUser},
+    state::AppState,
+};
 use actix_files::NamedFile;
 use actix_web::{
     error,
@@ -55,27 +58,57 @@ async fn head_audio(
 /// P11 — HEAD short-circuit. Returns Content-Length + Content-Type
 /// from the probe / stat without opening the body. Mobile clients
 /// use HEAD to validate a stream URL before issuing the playback
-/// GET; without this they fall back to GET-then-cancel.
+/// GET; without this they fall back to GET-then-cancel. P25 — also
+/// emits `Last-Modified` so a phone re-opening the player can
+/// conditional-GET the range cache instead of re-downloading.
 async fn head_response(state: &AppState, id_str: &str) -> Result<HttpResponse, actix_web::Error> {
     let item = load_item(state, id_str).await?;
-    let size = match item.probe.size_bytes {
-        Some(s) => s,
-        None => tokio::fs::metadata(&item.path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0),
-    };
+    let meta = tokio::fs::metadata(&item.path).await.ok();
+    let size = item
+        .probe
+        .size_bytes
+        .or_else(|| meta.as_ref().map(|m| m.len()))
+        .unwrap_or(0);
     let mime = mime_guess::from_path(&item.path)
         .first_or_octet_stream()
         .to_string();
-    Ok(HttpResponse::Ok()
+    let mut builder = HttpResponse::Ok();
+    builder
         .insert_header((header::CONTENT_TYPE, mime))
         .insert_header((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")))
         .insert_header((
             header::CONTENT_LENGTH,
             HeaderValue::from_str(&size.to_string()).map_err(error::ErrorInternalServerError)?,
-        ))
-        .finish())
+        ));
+    if let Some(lm) = last_modified_from_meta(meta.as_ref()) {
+        builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
+    }
+    Ok(builder.finish())
+}
+
+/// P25 — `Last-Modified` header formatting from a `Metadata`.
+fn last_modified_from_meta(meta: Option<&std::fs::Metadata>) -> Option<String> {
+    let m = meta?.modified().ok()?;
+    Some(httpdate::fmt_http_date(m))
+}
+
+/// P25 — parse the `If-Modified-Since` header and decide if the
+/// caller's snapshot is still current.
+fn not_modified(req: &HttpRequest, file_modified: std::time::SystemTime) -> bool {
+    let Some(ims) = req
+        .headers()
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    httpdate::parse_http_date(ims)
+        .map(|since| {
+            // HTTP-date has 1-second resolution; treat anything earlier
+            // than or equal to the cache snapshot as "still current".
+            file_modified <= since
+        })
+        .unwrap_or(false)
 }
 
 /// P11 — `/Audio/{id}/universal`. Parses `AudioCodec` (CSV of
@@ -220,6 +253,24 @@ fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
     None
 }
 
+/// P24 — extract the `api_key` (or `ApiKey`) query value so the
+/// stream / audio handlers can echo it back as a JellyfinAuth cookie
+/// on the response. Returns None when the auth source was a header
+/// instead — no need to set a cookie when the client could already
+/// inject one.
+fn api_key_query_value(qs: &str) -> Option<String> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey"))
+                && !v.is_empty()
+            {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn parse_max_audio_channels(qs: &str) -> Option<u32> {
     for kv in qs.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
@@ -266,7 +317,7 @@ async fn deliver_stream(
 
     if !has_range && start_ticks > 0 {
         if let Some(offset) = byte_offset_from_ticks(&item, start_ticks).await {
-            return serve_from_offset(&item, offset).await;
+            return serve_from_offset(&item, offset, req).await;
         }
     }
 
@@ -275,7 +326,15 @@ async fn deliver_stream(
         .map_err(|e| error::ErrorNotFound(e.to_string()))?
         .use_etag(true)
         .use_last_modified(true);
-    Ok(file.into_response(req))
+    let mut resp = file.into_response(req);
+    // P24 — echo the auth as a cookie so a follow-up `<video>`-style
+    // fetch can drop the `?api_key=` and still authenticate.
+    if let Some(token) = api_key_query_value(req.query_string()) {
+        if let Ok(hv) = HeaderValue::from_str(&auth_cookie_header(&token)) {
+            resp.headers_mut().insert(header::SET_COOKIE, hv);
+        }
+    }
+    Ok(resp)
 }
 
 fn parse_start_time_ticks(qs: &str) -> u64 {
@@ -328,7 +387,21 @@ async fn byte_offset_from_ticks(item: &MediaItem, start_ticks: u64) -> Option<u6
 async fn serve_from_offset(
     item: &MediaItem,
     offset: u64,
+    req: &HttpRequest,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // P25 — conditional GET. When the client's cached snapshot is
+    // still current per `If-Modified-Since`, short-circuit with 304.
+    let meta_for_lm = tokio::fs::metadata(&item.path).await.ok();
+    if let Some(modified) = meta_for_lm.as_ref().and_then(|m| m.modified().ok()) {
+        if not_modified(req, modified) {
+            let mut resp = HttpResponse::NotModified();
+            if let Some(lm) = last_modified_from_meta(meta_for_lm.as_ref()) {
+                resp.insert_header((header::LAST_MODIFIED, lm.as_str()));
+            }
+            return Ok(resp.finish());
+        }
+    }
+
     let mut file = tokio::fs::File::open(&item.path)
         .await
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
@@ -366,7 +439,8 @@ async fn serve_from_offset(
     let mime = mime_guess::from_path(&item.path)
         .first_or_octet_stream()
         .to_string();
-    let mut resp = HttpResponse::build(StatusCode::PARTIAL_CONTENT)
+    let mut resp_builder = HttpResponse::build(StatusCode::PARTIAL_CONTENT);
+    resp_builder
         .insert_header((header::CONTENT_TYPE, mime))
         .insert_header((
             header::CONTENT_RANGE,
@@ -378,8 +452,11 @@ async fn serve_from_offset(
             header::CONTENT_LENGTH,
             HeaderValue::from_str(&remaining.to_string())
                 .map_err(error::ErrorInternalServerError)?,
-        ))
-        .body(body);
+        ));
+    if let Some(lm) = last_modified_from_meta(meta_for_lm.as_ref()) {
+        resp_builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
+    }
+    let mut resp = resp_builder.body(body);
     // Strip Content-Length on streaming bodies — actix sets
     // transfer-encoding: chunked for those automatically.
     if remaining > 16 * 1024 * 1024 {
