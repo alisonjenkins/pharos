@@ -32,6 +32,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -44,11 +45,15 @@ const ANSWERABLE_TARGETS: &[&str] = &[
     "urn:schemas-upnp-org:device:MediaServer:1",
 ];
 
-/// SSDP responder handle. Drop → task ends (no graceful byebye yet —
-/// the network sees the device fall silent and ages it out via
-/// CACHE-CONTROL).
+/// SSDP responder handle. Drop → task ends. P31 — call
+/// `send_byebye().await` before drop so DLNA clients evict the
+/// device promptly instead of waiting for CACHE-CONTROL TTL.
 pub struct SsdpResponder {
     handle: tokio::task::JoinHandle<()>,
+    sock: Arc<UdpSocket>,
+    server_id: String,
+    advertise_url: String,
+    server_header: String,
 }
 
 impl SsdpResponder {
@@ -61,17 +66,47 @@ impl SsdpResponder {
         server_name: String,
         advertise_url: String,
     ) -> io::Result<Self> {
-        let sock = bind_multicast()?;
+        let sock = Arc::new(bind_multicast()?);
         let server_header = format!("pharos/{} UPnP/1.0 DLNADOC/1.50", env!("CARGO_PKG_VERSION"));
         let _ = server_name;
+        let sock_for_task = sock.clone();
+        let server_id_for_task = server_id.clone();
+        let advertise_url_for_task = advertise_url.clone();
+        let server_header_for_task = server_header.clone();
         let handle = tokio::spawn(async move {
-            run_loop(sock, server_id, advertise_url, server_header).await;
+            run_loop(
+                sock_for_task,
+                server_id_for_task,
+                advertise_url_for_task,
+                server_header_for_task,
+            )
+            .await;
         });
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            sock,
+            server_id,
+            advertise_url,
+            server_header,
+        })
     }
 
     pub fn abort(self) {
         self.handle.abort();
+    }
+
+    /// P31 — broadcast `ssdp:byebye` NOTIFY frames so DLNA clients
+    /// drop pharos from their device list immediately instead of
+    /// waiting for the 30-minute CACHE-CONTROL TTL. One NOTIFY per
+    /// (target, USN) pair the responder also covers in `alive`.
+    pub async fn send_byebye(&self) {
+        send_byebyes(
+            &self.sock,
+            &self.server_id,
+            &self.advertise_url,
+            &self.server_header,
+        )
+        .await;
     }
 }
 
@@ -96,7 +131,7 @@ fn bind_multicast() -> io::Result<UdpSocket> {
 }
 
 async fn run_loop(
-    sock: UdpSocket,
+    sock: Arc<UdpSocket>,
     server_id: String,
     advertise_url: String,
     server_header: String,
@@ -225,6 +260,40 @@ pub fn build_notify_alive(
          NT: {target}\r\n\
          NTS: ssdp:alive\r\n\
          SERVER: {server_header}\r\n\
+         USN: {usn}\r\n\
+         \r\n",
+    )
+}
+
+/// P31 — broadcast `ssdp:byebye` NOTIFY frames matching every target
+/// the alive loop also covers, so DLNA control points drop pharos
+/// from their device list immediately on shutdown.
+async fn send_byebyes(sock: &UdpSocket, server_id: &str, advertise_url: &str, server_header: &str) {
+    let mcast: SocketAddr = SocketAddr::new(MCAST_GROUP.into(), MCAST_PORT);
+    let uuid_target = format!("uuid:{server_id}");
+    let targets: Vec<String> = ANSWERABLE_TARGETS
+        .iter()
+        .filter(|s| **s != "ssdp:all")
+        .map(|s| s.to_string())
+        .chain(std::iter::once(uuid_target))
+        .collect();
+    let _ = advertise_url;
+    let _ = server_header;
+    for target in targets {
+        let msg = build_notify_byebye(server_id, &target);
+        let _ = sock.send_to(msg.as_bytes(), mcast).await;
+    }
+}
+
+/// P31 — `NTS: ssdp:byebye` form of NOTIFY. No LOCATION / CACHE-CONTROL
+/// (control points drop the entry on receipt).
+pub fn build_notify_byebye(server_id: &str, target: &str) -> String {
+    let usn = usn_for(server_id, target);
+    format!(
+        "NOTIFY * HTTP/1.1\r\n\
+         HOST: 239.255.255.250:1900\r\n\
+         NT: {target}\r\n\
+         NTS: ssdp:byebye\r\n\
          USN: {usn}\r\n\
          \r\n",
     )

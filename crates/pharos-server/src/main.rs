@@ -390,5 +390,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     .bind(&cfg.server.bind)?
     .run()
     .await?;
+    // P31 — shutdown reached. If the SSDP responder is alive, send
+    // byebye frames so DLNA clients drop pharos immediately instead
+    // of waiting out the CACHE-CONTROL TTL.
+    if let Some(g) = _ssdp_guard.as_ref() {
+        g.send_byebye().await;
+    }
     Ok(())
 }
