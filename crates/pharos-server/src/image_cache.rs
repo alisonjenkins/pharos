@@ -220,6 +220,79 @@ impl ImageCache {
         }
     }
 
+    /// P32 — chapter thumbnail extractor. Seeks to `start_ms`, emits
+    /// a 480-px-wide JPEG cached at `{root}/{media_id}/chapter-{idx}.jpg`.
+    /// Returns the path on hit; ffmpeg runs only on miss + writes
+    /// atomically via the existing `.tmp → final` pattern.
+    #[instrument(skip(self), fields(media.id = %id, idx = %chapter_idx, start_ms = %start_ms))]
+    pub async fn chapter(
+        &self,
+        id: u64,
+        source: &Path,
+        chapter_idx: u32,
+        start_ms: u64,
+    ) -> Result<PathBuf, ImageCacheError> {
+        let out_path = self
+            .root
+            .join(id.to_string())
+            .join(format!("chapter-{chapter_idx}.jpg"));
+        if tokio::fs::try_exists(&out_path).await.unwrap_or(false) {
+            return Ok(out_path);
+        }
+        if let Some(parent) = out_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = out_path.with_extension("jpg.tmp");
+        self.extract_chapter(source, start_ms, &tmp_path).await?;
+        tokio::fs::rename(&tmp_path, &out_path).await?;
+        Ok(out_path)
+    }
+
+    async fn extract_chapter(
+        &self,
+        source: &Path,
+        start_ms: u64,
+        out: &Path,
+    ) -> Result<(), ImageCacheError> {
+        let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        let seek = format!("{}", start_ms as f64 / 1000.0);
+        let args: [&str; 15] = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            &seek,
+            "-i",
+            source_str,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            "-vf",
+            "scale=480:-1",
+        ];
+        let output = Command::new(&self.ffmpeg_bin)
+            .args(args)
+            .arg("-f")
+            .arg("mjpeg")
+            .arg(out_str)
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(ImageCacheError::Ffmpeg(output.status.code(), stderr));
+        }
+        let meta = tokio::fs::metadata(out).await?;
+        if meta.len() == 0 {
+            let _ = tokio::fs::remove_file(out).await;
+            return Err(ImageCacheError::Ffmpeg(Some(0), "no image written".into()));
+        }
+        Ok(())
+    }
+
     async fn extract(
         &self,
         source: &Path,

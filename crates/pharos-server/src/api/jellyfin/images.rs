@@ -48,7 +48,45 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/items/{id}/images/{image_type}/{image_index}",
             web::delete().to(delete_image_indexed),
+        )
+        // P32 — chapter image thumbnails. Same shape as the indexed
+        // image-type route but dispatches to `ImageCache::chapter`
+        // which seeks ffmpeg to the chapter's start_ms.
+        .route(
+            "/items/{id}/images/chapter/{image_index}",
+            web::get().to(get_chapter_image),
         );
+}
+
+async fn get_chapter_image(
+    state: web::Data<AppState>,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id_str, idx) = path.into_inner();
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let chapter = item
+        .probe
+        .chapters
+        .get(idx as usize)
+        .ok_or_else(|| error::ErrorNotFound("chapter index out of range"))?;
+    let cache = state
+        .images
+        .as_ref()
+        .ok_or_else(|| error::ErrorNotFound("image cache not configured"))?;
+    let path = cache
+        .chapter(item.id, &item.path, idx, chapter.start_ms)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("chapter image: {e}")))?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("read chapter image: {e}")))?;
+    Ok(HttpResponse::Ok().content_type("image/jpeg").body(bytes))
 }
 
 #[derive(Debug, Deserialize)]
