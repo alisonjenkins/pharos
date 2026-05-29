@@ -12,7 +12,7 @@ use crate::{
     image_cache::{ImageCacheError, ImageRole},
     state::AppState,
 };
-use actix_web::{error, web, HttpResponse};
+use actix_web::{error, web, HttpRequest, HttpResponse};
 use pharos_core::MediaStore;
 use serde::Deserialize;
 
@@ -104,30 +104,66 @@ struct IndexedImagePath {
 
 async fn get_image(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, 0, false).await
+    serve_image(
+        &state,
+        &path.id,
+        &path.image_type,
+        0,
+        false,
+        parse_image_format(req.query_string()),
+    )
+    .await
 }
 
 async fn head_image(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, 0, true).await
+    serve_image(
+        &state,
+        &path.id,
+        &path.image_type,
+        0,
+        true,
+        parse_image_format(req.query_string()),
+    )
+    .await
 }
 
 async fn get_image_indexed(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, path.image_index, false).await
+    serve_image(
+        &state,
+        &path.id,
+        &path.image_type,
+        path.image_index,
+        false,
+        parse_image_format(req.query_string()),
+    )
+    .await
 }
 
 async fn head_image_indexed(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    serve_image(&state, &path.id, &path.image_type, path.image_index, true).await
+    serve_image(
+        &state,
+        &path.id,
+        &path.image_type,
+        path.image_index,
+        true,
+        parse_image_format(req.query_string()),
+    )
+    .await
 }
 
 async fn post_image(
@@ -178,6 +214,7 @@ async fn serve_image(
     image_type: &str,
     index: u32,
     head_only: bool,
+    format: ImageFormat,
 ) -> Result<HttpResponse, actix_web::Error> {
     let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
@@ -193,7 +230,7 @@ async fn serve_image(
         Ok(it) => it,
         Err(_) => return Ok(HttpResponse::NotFound().body("")),
     };
-    let path = match cache.fetch(id, role, item.kind, &item.path, index).await {
+    let jpeg_path = match cache.fetch(id, role, item.kind, &item.path, index).await {
         Ok(p) => p,
         // Upload-only roles (Logo/Banner/Art/Disc) report
         // `UploadOnly` when no upload has happened — surface as 404
@@ -204,14 +241,108 @@ async fn serve_image(
             return Ok(HttpResponse::NotFound().body(""));
         }
     };
+    // P46 — optional re-encode to webp / avif. Cached as a sibling
+    // path next to the source jpeg so subsequent fetches skip the
+    // ffmpeg spawn entirely.
+    let (final_path, content_type) = match format {
+        ImageFormat::Jpeg => (jpeg_path, "image/jpeg"),
+        ImageFormat::Webp => match transcode_image(&jpeg_path, "webp").await {
+            Ok(p) => (p, "image/webp"),
+            Err(e) => {
+                tracing::warn!(error = %e, "webp transcode failed; serving jpeg");
+                (jpeg_path, "image/jpeg")
+            }
+        },
+        ImageFormat::Avif => match transcode_image(&jpeg_path, "avif").await {
+            Ok(p) => (p, "image/avif"),
+            Err(e) => {
+                tracing::warn!(error = %e, "avif transcode failed; serving jpeg");
+                (jpeg_path, "image/jpeg")
+            }
+        },
+    };
     if head_only {
-        return Ok(HttpResponse::Ok().content_type("image/jpeg").finish());
+        return Ok(HttpResponse::Ok().content_type(content_type).finish());
     }
-    let bytes = match tokio::fs::read(&path).await {
+    let bytes = match tokio::fs::read(&final_path).await {
         Ok(b) => b,
         Err(_) => return Ok(HttpResponse::NotFound().body("")),
     };
-    Ok(HttpResponse::Ok().content_type("image/jpeg").body(bytes))
+    Ok(HttpResponse::Ok().content_type(content_type).body(bytes))
+}
+
+/// P46 — client-requested image encoding. Modern web clients +
+/// jellyfin-web can hint a preferred format via `?format=`; pharos
+/// returns jpeg for any unknown / unsupported value so a typo
+/// can't break image rendering on existing clients.
+#[derive(Debug, Clone, Copy)]
+enum ImageFormat {
+    Jpeg,
+    Webp,
+    Avif,
+}
+
+fn parse_image_format(qs: &str) -> ImageFormat {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("format") {
+                return match v.to_ascii_lowercase().as_str() {
+                    "webp" => ImageFormat::Webp,
+                    "avif" => ImageFormat::Avif,
+                    _ => ImageFormat::Jpeg,
+                };
+            }
+        }
+    }
+    ImageFormat::Jpeg
+}
+
+/// P46 — transcode the cached jpeg into a sibling `.{ext}` file when
+/// requested. Returns the sibling path. Atomic via `.tmp → final`.
+async fn transcode_image(
+    jpeg_path: &std::path::Path,
+    ext: &str,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    let mut out = jpeg_path.to_path_buf();
+    out.set_extension(ext);
+    if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+        return Ok(out);
+    }
+    let tmp = jpeg_path.with_extension(format!("{ext}.tmp"));
+    let codec = match ext {
+        "webp" => "libwebp",
+        "avif" => "libaom-av1",
+        _ => "mjpeg",
+    };
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+    ]);
+    cmd.arg(jpeg_path);
+    cmd.args(["-c:v", codec]);
+    // avif still-picture needs a single frame + tuning flags so the
+    // libaom encoder produces a usable still rather than a 1-frame
+    // video clip the browser refuses to decode.
+    if ext == "avif" {
+        cmd.args(["-still-picture", "1", "-cpu-used", "8"]);
+    } else {
+        cmd.args(["-quality", "80"]);
+    }
+    cmd.arg(&tmp);
+    let status = cmd.status().await?;
+    if !status.success() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(std::io::Error::other(format!(
+            "ffmpeg {ext} transcode failed",
+        )));
+    }
+    tokio::fs::rename(&tmp, &out).await?;
+    Ok(out)
 }
 
 async fn upload_image(
@@ -289,6 +420,18 @@ mod tests {
     use super::*;
     use actix_web::{test, App};
     use pharos_store_sqlx::sqlite::SqliteStore;
+
+    #[::core::prelude::v1::test]
+    fn parse_image_format_picks_webp_and_avif() {
+        // P46 — explicit ?format= overrides; unknown values stay
+        // jpeg so a typo doesn't break image rendering. Fully-qualified
+        // `::core::prelude::v1::test` so this file's `use actix_web::test`
+        // import (the async-test macro) doesn't shadow the builtin.
+        assert!(matches!(parse_image_format("format=webp"), ImageFormat::Webp));
+        assert!(matches!(parse_image_format("Format=AVIF"), ImageFormat::Avif));
+        assert!(matches!(parse_image_format("format=xxx"), ImageFormat::Jpeg));
+        assert!(matches!(parse_image_format(""), ImageFormat::Jpeg));
+    }
 
     async fn seed_state() -> web::Data<crate::state::AppState> {
         let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
