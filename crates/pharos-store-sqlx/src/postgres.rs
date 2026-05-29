@@ -27,7 +27,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
     subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
-    video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space";
+    video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
+    audio_tracks_json";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -185,10 +186,11 @@ impl MediaStore for PostgresStore {
                 subtitle_tracks_json, \
                 artist, album, album_artist, genre, created_at, chapters_json, \
                 video_profile, video_level, \
-                pixel_format, color_primaries, color_transfer, color_space) \
+                pixel_format, color_primaries, color_transfer, color_space, \
+                audio_tracks_json) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
-                     $28, $29, $30, $31)
+                     $28, $29, $30, $31, $32)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             kind = EXCLUDED.kind,
@@ -218,6 +220,7 @@ impl MediaStore for PostgresStore {
                                             color_primaries = EXCLUDED.color_primaries,
                                             color_transfer = EXCLUDED.color_transfer,
                                             color_space = EXCLUDED.color_space,
+                                            audio_tracks_json = EXCLUDED.audio_tracks_json,
                                             created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
@@ -251,6 +254,7 @@ impl MediaStore for PostgresStore {
         .bind(p.color_primaries.as_deref())
         .bind(p.color_transfer.as_deref())
         .bind(p.color_space.as_deref())
+        .bind(crate::audio_track_json::encode(&p.audio_tracks))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -570,6 +574,7 @@ struct MediaRow {
     color_primaries: Option<String>,
     color_transfer: Option<String>,
     color_space: Option<String>,
+    audio_tracks_json: Option<String>,
 }
 
 impl MediaRow {
@@ -598,6 +603,7 @@ impl MediaRow {
             subtitle_tracks: crate::subtitle_track_json::decode(
                 self.subtitle_tracks_json.as_deref(),
             ),
+            audio_tracks: crate::audio_track_json::decode(self.audio_tracks_json.as_deref()),
             artist: self.artist,
             album: self.album,
             album_artist: self.album_artist,

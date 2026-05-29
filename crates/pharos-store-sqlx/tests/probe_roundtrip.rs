@@ -100,6 +100,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 audio_channels: ch,
                 sample_rate: sr,
                 subtitle_tracks: subs,
+                audio_tracks: Vec::new(),
                 artist,
                 album,
                 album_artist,

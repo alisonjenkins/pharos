@@ -91,6 +91,12 @@ pub struct MediaProbe {
     /// Embedded subtitle tracks discovered by the prober. Stored
     /// JSON-serialised in the `subtitle_tracks` column.
     pub subtitle_tracks: Vec<SubtitleTrack>,
+    /// P16 — every audio stream the source carries. The scalar
+    /// `audio_codec` / `audio_channels` / `sample_rate` above stay
+    /// populated from the first stream for back-compat with rows that
+    /// pre-date the multi-track migration. Empty Vec = no audio
+    /// streams in source.
+    pub audio_tracks: Vec<AudioTrack>,
     /// Common audio-file format tags (`title` / `artist` / `album` /
     /// `album_artist` / `genre`). Populated by FfmpegProber from
     /// ffprobe's `format.tags`. None when the file lacks the tag.
@@ -110,6 +116,21 @@ pub struct MediaChapter {
     pub start_ms: u64,
     pub end_ms: u64,
     pub title: String,
+}
+
+/// P16 — one embedded audio stream from the source file. Multi-track
+/// containers (TV episodes with eng + jpn dubs, movies with director
+/// commentary) emit one entry per stream so the PlaybackInfo wire
+/// shape surfaces a track picker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioTrack {
+    pub stream_index: u32,
+    pub codec: Option<String>,
+    pub channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
 }
 
 /// One embedded subtitle stream from the source file.

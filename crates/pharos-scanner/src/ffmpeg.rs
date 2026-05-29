@@ -214,6 +214,24 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
     let video_stream = parsed.streams.iter().find(|s| s.codec_type == "video");
     let audio_stream = parsed.streams.iter().find(|s| s.codec_type == "audio");
 
+    // P16 — every audio stream surfaces as an AudioTrack. The scalar
+    // `audio_codec` / `audio_channels` / `sample_rate` fields stay
+    // populated from the first stream for back-compat.
+    let audio_tracks: Vec<pharos_core::AudioTrack> = parsed
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "audio")
+        .map(|s| pharos_core::AudioTrack {
+            stream_index: s.index.unwrap_or(0),
+            codec: s.codec_name.clone(),
+            channels: s.channels,
+            sample_rate: s.sample_rate.as_deref().and_then(|r| r.parse::<u32>().ok()),
+            language: s.tags.language.clone(),
+            title: s.tags.title.clone(),
+            is_default: s.disposition.default != 0,
+        })
+        .collect();
+
     let video_codec = video_stream.and_then(|s| s.codec_name.clone());
     let video_profile = video_stream.and_then(|s| s.profile.clone());
     // ffprobe sometimes reports level=-99 for unknown / inapplicable
@@ -308,6 +326,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             audio_channels,
             sample_rate,
             subtitle_tracks,
+            audio_tracks,
             artist: parsed.format.tags.artist,
             album: parsed.format.tags.album,
             album_artist: parsed.format.tags.album_artist,

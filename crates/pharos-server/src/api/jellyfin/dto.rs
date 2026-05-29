@@ -817,12 +817,39 @@ pub(crate) fn build_media_streams_with_subtitles(
             is_forced: None,
             delivery_url: None,
         });
-        // Only advertise an audio stream when probe actually found one.
-        // Some test fixtures (the BBB WebM corpus) are video-only;
-        // fabricating an `aac` stream there breaks DirectPlay because
-        // the file has no AAC bytes and the client's audio decoder
-        // errors out → "Playback Error".
-        if let Some(codec) = probe.audio_codec.clone() {
+        // P16 — multi-track audio when the probe carries the new
+        // audio_tracks Vec. Falls through to the scalar
+        // single-stream path when the Vec is empty (rows from
+        // pre-P16 probe passes). Each track surfaces its real
+        // language + title so jellyfin-web's player renders an
+        // audio picker.
+        if !probe.audio_tracks.is_empty() {
+            for t in &probe.audio_tracks {
+                streams.push(MediaStreamDto {
+                    kind: "Audio",
+                    index: t.stream_index,
+                    codec: t.codec.clone(),
+                    is_default: t.is_default,
+                    width: None,
+                    height: None,
+                    channels: t.channels,
+                    sample_rate: t.sample_rate,
+                    bit_rate: None,
+                    aspect_ratio: None,
+                    real_frame_rate: None,
+                    average_frame_rate: None,
+                    language: t.language.clone(),
+                    title: t.title.clone(),
+                    is_external: None,
+                    is_forced: None,
+                    delivery_url: None,
+                });
+            }
+        } else if let Some(codec) = probe.audio_codec.clone() {
+            // Back-compat scalar path — older rows have audio_codec
+            // populated but audio_tracks empty. Some test fixtures
+            // (BBB WebM corpus) are video-only; only emit when probe
+            // actually saw audio.
             streams.push(MediaStreamDto {
                 kind: "Audio",
                 index: 1,

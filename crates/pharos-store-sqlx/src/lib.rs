@@ -25,6 +25,9 @@ pub mod subtitle_track_json;
 // / T57 phase 2). Same pattern as subtitle_tracks.
 pub mod chapter_json;
 
+// JSON adapter for MediaProbe.audio_tracks (P16). Same pattern.
+pub mod audio_track_json;
+
 /// T-fix-RC1 — single-row mutable branding/config snapshot persisted
 /// in the `runtime_config` table by both sqlite + postgres backends.
 /// None for any field means "no override; fall back to config.toml".
