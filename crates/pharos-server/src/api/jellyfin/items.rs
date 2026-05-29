@@ -769,6 +769,12 @@ async fn playback_info(
             "VideoType": "VideoFile",
             "DefaultAudioStreamIndex": default_audio_stream_index,
             "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
+            // P17 — playback tuning hints. Defaults match Jellyfin's
+            // own server: 3 s prebuffer, 2 s HLS analyze window,
+            // stereo cap for transcoded audio.
+            "BufferMs": 3000u32,
+            "AnalyzeDurationMs": 2_000_000u32,
+            "TranscodingMaxAudioChannels": 2u32,
             // P4 — resume offset. Mirrors the top-level field for
             // clients that read the MediaSource directly.
             "StartPositionTicks": resume_ticks,
