@@ -18,11 +18,8 @@
 //! starting at `1_000_000` so their numeric IDs never collide with
 //! real ffprobe stream indices.
 
-use crate::{
-    api::jellyfin::auth_extractor::AuthUser,
-    state::AppState,
-    subtitle_cache::{mtime_secs, SubtitleKind},
-};
+use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_core::MediaStore;
 use tokio::process::Command;
@@ -30,7 +27,10 @@ use tokio::process::Command;
 /// Sidecar streams get indices starting at this offset so they never
 /// collide with ffprobe-reported embedded indices (which top out
 /// around 100 even for absurd files).
-pub const SIDECAR_BASE_INDEX: u32 = 1_000_000;
+// SIDECAR_BASE_INDEX moved to `pharos_jellyfin_api::dto` in Phase A.2.
+// Re-exported here so `crate::api::jellyfin::subtitles::SIDECAR_BASE_INDEX`
+// still resolves for any historical caller.
+pub use pharos_jellyfin_api::dto::SIDECAR_BASE_INDEX;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths.

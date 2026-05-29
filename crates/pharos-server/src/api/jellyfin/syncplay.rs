@@ -9,7 +9,8 @@
 //! polling happy and expose the group list so the dropdown can show
 //! existing groups before the user joins one.
 
-use crate::{api::jellyfin::auth_extractor::AuthUser, sync::GroupRegistry};
+use crate::api::jellyfin::auth_extractor::AuthUser;
+use pharos_sync::GroupRegistry;
 use actix_web::{web, HttpResponse, Responder};
 use serde::Serialize;
 

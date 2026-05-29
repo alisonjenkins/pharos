@@ -4,9 +4,9 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+use pharos_discovery::live_tv::M3uXmltvBackend;
 use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, live_tv::M3uXmltvBackend, middleware::LowercasePath,
-    state::AppState,
+    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use tempfile::TempDir;

@@ -1,17 +1,28 @@
 //! Extended `/sync/v1/ws` WebSocket handler. Bridges raw WS frames to the
 //! group actor's `ClientMsg` / `ServerMsg`. Jellyfin-shaped `/socket` is
 //! T16 phase 2; this path is for pharos-native clients (Dioxus, etc.).
+//!
+//! Auth is delegated to the `TokenResolver` trait — server impls it over
+//! its concrete `TokenStore` and registers as actix
+//! `web::Data<Arc<dyn TokenResolver>>` so this crate stays free of
+//! `pharos-server::AppState`.
 
 use super::group::{GroupMsg, Joined};
+use super::host::TokenResolver;
 use super::messages::{ClientMsg, ErrorCode, MemberId, ServerMsg};
 use super::registry::GroupRegistry;
-use crate::state::AppState;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, Session};
 use futures_util::StreamExt;
-use pharos_core::{SecretString, TokenStore};
+use pharos_core::SecretString;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Actix `web::Data` carrier for the `Arc<dyn TokenResolver>`. Newtype
+/// keeps the `register` signature explicit and the type unambiguous when
+/// multiple `Arc<dyn _>`s are registered.
+pub type TokenResolverData = Arc<dyn TokenResolver>;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/sync/v1/ws", web::get().to(ws_entry));
@@ -20,7 +31,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 async fn ws_entry(
     req: HttpRequest,
     body: web::Payload,
-    state: web::Data<AppState>,
+    resolver: web::Data<TokenResolverData>,
     registry: web::Data<GroupRegistry>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, session, stream) = actix_ws::handle(&req, body)?;
@@ -30,7 +41,7 @@ async fn ws_entry(
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
-        state.clone(),
+        resolver.get_ref().clone(),
         registry.get_ref().clone(),
     ));
     Ok(response)
@@ -47,20 +58,21 @@ enum WsError {
 async fn handle_connection<S>(
     mut session: Session,
     mut stream: S,
-    state: web::Data<AppState>,
+    resolver: TokenResolverData,
     registry: GroupRegistry,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
     let started = Instant::now();
     // 1) wait for Hello, authenticate.
-    let (member_name, member_id) = match expect_hello(&mut session, &mut stream, &state).await {
-        Ok(v) => v,
-        Err(e) => {
-            close_with_error(&mut session, ErrorCode::AuthFailed, &e.to_string()).await;
-            return;
-        }
-    };
+    let (member_name, member_id) =
+        match expect_hello(&mut session, &mut stream, resolver.as_ref()).await {
+            Ok(v) => v,
+            Err(e) => {
+                close_with_error(&mut session, ErrorCode::AuthFailed, &e.to_string()).await;
+                return;
+            }
+        };
 
     // 2) send Welcome.
     let _ = send(
@@ -166,7 +178,7 @@ async fn handle_connection<S>(
 async fn expect_hello<S>(
     session: &mut Session,
     stream: &mut S,
-    state: &AppState,
+    resolver: &dyn TokenResolver,
 ) -> Result<(String, MemberId), WsError>
 where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
@@ -193,11 +205,7 @@ where
     };
     // V8: wrap immediately and drop the wire-side String.
     let token = SecretString::new(token);
-    let user_id = state
-        .stores
-        .resolve(token.expose())
-        .await
-        .map_err(|_| WsError::AuthFailed)?;
+    let user_id = resolver.resolve(&token).await.ok_or(WsError::AuthFailed)?;
     // Use the user's UUID as the member id base — but generate a new one
     // per connection so a user with multiple devices doesn't conflict.
     let _ = user_id;

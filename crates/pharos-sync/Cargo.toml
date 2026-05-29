@@ -1,0 +1,26 @@
+[package]
+name = "pharos-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pharos-core = { path = "../pharos-core" }
+actix-web.workspace = true
+actix-ws.workspace = true
+futures-util = "0.3"
+serde.workspace = true
+serde_json = "1"
+sonic-rs.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

@@ -3,8 +3,6 @@
 
 pub mod admin;
 pub mod auth_extractor;
-pub mod device_profile;
-pub mod dto;
 pub mod hls;
 pub mod images;
 pub mod items;
@@ -12,7 +10,6 @@ pub mod live_tv;
 pub mod search;
 pub mod sessions;
 pub mod socket;
-pub mod socket_messages;
 pub mod stream;
 pub mod stubs;
 pub mod subtitles;
@@ -22,6 +19,13 @@ pub mod trickplay;
 pub mod user_data;
 pub mod users;
 pub mod waveform;
+
+// Phase A — DTO + serde leaf-crate extraction. Modules now live in
+// `pharos-jellyfin-api`; re-exported here so existing call sites
+// (`crate::api::jellyfin::dto::*`,
+// `pharos_server::api::jellyfin::socket_messages::*`) keep compiling
+// without edit churn.
+pub use pharos_jellyfin_api::{device_profile, dto, socket_messages};
 
 use actix_web::web;
 

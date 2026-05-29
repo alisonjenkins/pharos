@@ -22,9 +22,8 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
     UserRecord, UserStore,
 };
-use pharos_server::{
-    api::jellyfin::trickplay, auth::BuiltinAuth, state::AppState, trickplay_cache::TrickplayCache,
-};
+use pharos_cache::TrickplayCache;
+use pharos_server::{api::jellyfin::trickplay, auth::BuiltinAuth, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -187,7 +186,7 @@ async fn dto_layout_map_advertises_configured_widths() {
         height: Some(1080),
         ..Default::default()
     };
-    let map = trickplay::build_dto_layout_map(&probe, &[320], 10_000);
+    let map = pharos_jellyfin_api::dto::build_dto_layout_map(&probe, &[320], 10_000);
     assert!(map.contains_key("320"));
     let v = map.get("320").unwrap();
     assert_eq!(v.get("Width").unwrap().as_u64().unwrap(), 320);

@@ -165,3 +165,23 @@ compat-playwright-full:
     trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
     sleep 2
     nix develop --command bash -c 'cd compat-playwright && npx playwright test'
+
+# Render every docs/*.d2 source to a sibling SVG. `d2` is not in the
+# devShell; `nix run nixpkgs#d2` pulls it on demand and caches in the
+# nix store after first run. SVGs are intentionally not committed —
+# the .d2 source is canonical, SVGs regenerate on demand.
+diagrams:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    found=0
+    for src in docs/*.d2; do
+      found=1
+      out="${src%.d2}.svg"
+      echo "rendering $src -> $out"
+      nix run nixpkgs#d2 -- "$src" "$out"
+    done
+    if [[ $found -eq 0 ]]; then
+      echo "no docs/*.d2 sources found"
+      exit 1
+    fi

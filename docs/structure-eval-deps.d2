@@ -1,0 +1,57 @@
+title: pharos — workspace crate dependencies {
+  near: top-center
+  shape: text
+  style.font-size: 24
+  style.bold: true
+}
+
+direction: down
+
+server: "pharos-server\n(bin + lib, ~5.4k LOC)" {
+  style.fill: "#f8d7da"
+  style.stroke: "#a02020"
+}
+
+core: "pharos-core\nLEAF — domain traits" {
+  style.fill: "#d4edda"
+  style.stroke: "#1e7e34"
+}
+
+scan: "pharos-scanner\nfs walk + ffprobe parse"
+store: "pharos-store-sqlx\nfeat: sqlite | postgres"
+tx: "pharos-transcode\nfeat: spawn | lib"
+
+ui: "pharos-ui\nDioxus / WASM" {
+  style.fill: "#fff3cd"
+  style.stroke: "#856404"
+}
+
+tc: "pharos-jellyfin-test-client\ntest-only HTTP client" {
+  style.fill: "#fff3cd"
+  style.stroke: "#856404"
+}
+
+server -> core
+server -> scan
+server -> store
+server -> tx
+server -> tc: dev {
+  style.stroke-dash: 4
+  style.stroke: "#888888"
+}
+scan -> core
+store -> core
+tx -> core
+
+legend: |md
+  **Legend**
+
+  - green = leaf (foundational, stable)
+  - red = root (binary / app entry)
+  - yellow = detached from production cone
+  - dashed edge = dev-only
+| {
+  near: bottom-right
+  shape: text
+  style.font-size: 14
+}

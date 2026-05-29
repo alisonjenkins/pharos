@@ -7,11 +7,8 @@
 //! `<img src=…>` tags where header auth isn't an option. POST/DELETE
 //! (admin uploads) **do** require an admin bearer (V8/V9).
 
-use crate::{
-    api::jellyfin::auth_extractor::AuthUser,
-    image_cache::{ImageCacheError, ImageRole},
-    state::AppState,
-};
+use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use pharos_cache::image_cache::{ImageCacheError, ImageRole};
 use actix_web::{error, web, HttpRequest, HttpResponse};
 use pharos_core::MediaStore;
 use serde::Deserialize;

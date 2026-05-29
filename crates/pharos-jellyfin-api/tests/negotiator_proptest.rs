@@ -18,7 +18,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_server::api::jellyfin::device_profile::{
+use pharos_jellyfin_api::device_profile::{
     negotiate, Decision, DeviceProfile, DirectPlayProfile, SourceMedia, TranscodingProfile,
 };
 use proptest::prelude::*;

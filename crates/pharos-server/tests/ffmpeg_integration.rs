@@ -15,7 +15,7 @@
 
 use pharos_core::{MediaKind, Prober};
 use pharos_scanner::FfmpegProber;
-use pharos_server::image_cache::ImageCache;
+use pharos_cache::ImageCache;
 use pharos_transcode::{FfmpegTranscoder, TranscodeOptions};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;

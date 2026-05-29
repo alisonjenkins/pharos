@@ -1,18 +1,18 @@
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use clap::Parser;
+use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
+use pharos_discovery::live_tv::build_backend as build_live_tv_backend;
 use pharos_server::{
     cli::{AdminOp, Cli, Cmd},
     config::Config,
     health::{ReadinessError, ReadinessHandle},
-    hls_cache::HlsSegmentCache,
-    image_cache::ImageCache,
-    live_tv::build_backend as build_live_tv_backend,
     middleware::{LowercasePath, RedMetrics},
     obs, router,
     state::AppState,
-    sync::GroupRegistry,
+    sync_resolver,
 };
+use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
@@ -268,6 +268,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
     let mut state = AppState::load(stores, cfg.server.name.clone())
         .await?
         .with_media_roots(cfg.media.roots.clone());
@@ -289,18 +290,17 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // P5 — subtitle cache, always on. Pure in-process; the only
     // tunables are bytes + entry cap. Disabled by setting both to 0.
     if cfg.server.subtitle_cache_max_bytes > 0 && cfg.server.subtitle_cache_max_entries > 0 {
-        state = state.with_subtitle_cache(pharos_server::subtitle_cache::SubtitleCache::new(
+        state = state.with_subtitle_cache(SubtitleCache::new(
             cfg.server.subtitle_cache_max_bytes,
             cfg.server.subtitle_cache_max_entries,
         ));
     }
     if !cfg.server.trickplay_widths.is_empty() {
         if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
-            state =
-                state.with_trickplay_cache(pharos_server::trickplay_cache::TrickplayCache::new(
-                    cache_dir,
-                    cfg.server.trickplay_cache_max_bytes,
-                ));
+            state = state.with_trickplay_cache(TrickplayCache::new(
+                cache_dir,
+                cfg.server.trickplay_cache_max_bytes,
+            ));
         }
         state = state.with_trickplay_layout(
             cfg.server.trickplay_widths.clone(),
@@ -321,6 +321,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
+    let token_resolver_data = web::Data::new(token_resolver);
 
     // Probes whose readiness must flip true before /readyz returns 200.
     let readiness = ReadinessHandle::spawn(&["process", "store"]);
@@ -334,7 +335,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         let advertise = cfg.server.ssdp_advertise_url.clone().unwrap_or_else(|| {
             format!("http://{}", cfg.server.bind.replace("0.0.0.0", "127.0.0.1"))
         });
-        match pharos_server::ssdp::SsdpResponder::spawn(
+        match pharos_discovery::ssdp::SsdpResponder::spawn(
             app_state.server_id.clone(),
             app_state.server_name.clone(),
             advertise,
@@ -367,6 +368,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
+            .app_data(token_resolver_data.clone())
             .wrap(cors)
             // Lowercase the URI path before metrics + tracing capture
             // it, so RedMetrics labels and TracingLogger spans use the

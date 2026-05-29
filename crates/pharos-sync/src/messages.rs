@@ -63,7 +63,7 @@ pub enum ClientMsg {
     /// V8: `token` is plain `String` at the wire boundary so this type can
     /// derive `Deserialize`. Handler must wrap into `SecretString` *before*
     /// any logging/tracing and immediately drop the original. See
-    /// `sync/ws.rs::expect_hello`.
+    /// `ws::expect_hello`.
     Hello {
         token: String,
         client: String,
@@ -163,7 +163,7 @@ mod tests {
         let s = serde_json::to_string(&h).unwrap();
         assert!(s.contains("\"token\":\"wire-token\""), "{s}");
         // Defensive note: handler must wrap into SecretString immediately
-        // after deserializing — see sync/ws.rs::expect_hello.
+        // after deserializing — see ws::expect_hello.
     }
 
     #[test]

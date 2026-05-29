@@ -18,6 +18,7 @@ publish = false
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 actix-rt = { version = "2" }
 base64 = { version = "0.22" }
+bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 crossbeam-utils = { version = "0.8" }
@@ -51,6 +52,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_generics", "serde"] }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
@@ -65,6 +67,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 [build-dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 base64 = { version = "0.22" }
+bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }

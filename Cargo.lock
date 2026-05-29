@@ -511,6 +511,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2566,6 +2575,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pharos-cache"
+version = "0.0.0"
+dependencies = [
+ "pharos-core",
+ "pharos-transcode",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "pharos-core"
 version = "0.0.0"
 dependencies = [
@@ -2573,6 +2595,33 @@ dependencies = [
  "tokio",
  "uuid",
  "workspace-hack",
+]
+
+[[package]]
+name = "pharos-discovery"
+version = "0.0.0"
+dependencies = [
+ "pharos-core",
+ "socket2 0.5.10",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
+name = "pharos-jellyfin-api"
+version = "0.0.0"
+dependencies = [
+ "pharos-cache",
+ "pharos-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "uuid",
+ "workspace-hack",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2623,10 +2672,14 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
+ "pharos-cache",
  "pharos-core",
+ "pharos-discovery",
+ "pharos-jellyfin-api",
  "pharos-jellyfin-test-client",
  "pharos-scanner",
  "pharos-store-sqlx",
+ "pharos-sync",
  "pharos-transcode",
  "proptest",
  "regex-lite",
@@ -2664,15 +2717,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "pharos-transcode"
+name = "pharos-sync"
 version = "0.0.0"
 dependencies = [
- "bytes",
- "ffmpeg-next",
- "futures-core",
+ "actix-web",
+ "actix-ws",
+ "futures-util",
  "pharos-core",
  "serde",
  "serde_json",
+ "sonic-rs",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "pharos-transcode"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "ffmpeg-next",
+ "futures-core",
+ "libc",
+ "pharos-core",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -4911,6 +4985,7 @@ dependencies = [
  "base64",
  "bitflags",
  "byteorder",
+ "bytes",
  "cc",
  "clap",
  "clap_builder",
@@ -4949,6 +5024,7 @@ dependencies = [
  "sha2",
  "slab",
  "smallvec",
+ "socket2 0.5.10",
  "sqlx",
  "sqlx-core",
  "sqlx-macros",

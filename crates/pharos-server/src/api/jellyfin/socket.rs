@@ -11,7 +11,7 @@ use super::socket_messages::{
     SyncPlaySeekData,
 };
 use crate::state::{AppState, SocketBroadcast};
-use crate::sync::{
+use pharos_sync::{
     group::{GroupHandle, GroupMsg, Joined},
     messages::{GroupId, MemberId, ServerMsg},
     registry::GroupRegistry,

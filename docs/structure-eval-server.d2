@@ -1,0 +1,81 @@
+title: pharos-server — internal module clusters {
+  near: top-center
+  shape: text
+  style.font-size: 24
+  style.bold: true
+}
+
+direction: right
+
+http: "HTTP surface" {
+  main: "main.rs (403)"
+  router: "router.rs (47)"
+  apij: "api/jellyfin/"
+  mw: "middleware/"
+  health: "health.rs (198)"
+}
+
+auth_sess: "Auth / sessions" {
+  auth: "auth.rs (183)"
+  sess: "sessions.rs (281)"
+  qc: "quick_connect.rs (290)"
+  txs: "transcode_sessions.rs (185)"
+}
+
+caches: "Caches\n~1720 LOC — unit-testable\n[split candidate]" {
+  style.fill: "#ffe5b4"
+  style.stroke: "#cc7000"
+  hls: "hls_cache.rs (488)"
+  img: "image_cache.rs (487)"
+  tp: "trickplay_cache.rs (450)"
+  sub: "subtitle_cache.rs (293)"
+}
+
+discovery: "Discovery / protocols" {
+  ssdp: "ssdp.rs (393)"
+  dlna: "dlna.rs (470)"
+  ltv: "live_tv.rs (439)"
+}
+
+sync_grp: "Sync / group playback\nWebSocket state machine\n[split candidate]" {
+  style.fill: "#ffe5b4"
+  style.stroke: "#cc7000"
+  syncmod: "sync/mod.rs"
+  ws: "sync/ws.rs"
+  grp: "sync/group.rs"
+  reg: "sync/registry.rs"
+  msg: "sync/messages.rs"
+  clk: "sync/clock.rs"
+}
+
+core_glue: "App glue" {
+  state: "state.rs (318)"
+  cfg: "config.rs (283)"
+  cli: "cli.rs (67)"
+  obs: "obs.rs (72)"
+}
+
+http -> core_glue.state: AppState
+auth_sess -> core_glue.state
+caches -> core_glue.state
+discovery -> core_glue.state
+sync_grp -> core_glue.state
+
+http.apij -> auth_sess.sess
+http.apij -> caches.hls
+http.apij -> sync_grp.ws
+http.apij -> auth_sess.txs
+
+test_attrib: |md
+  **Integration tests in `tests/` (55 files)**
+
+  - `jellyfin_*` (~25) → HTTP / api/jellyfin
+  - `*_audit.rs` (~18) → cross-cutting, mostly http + auth_sess
+  - `group_*` + `socket_*` (4) → sync_grp
+  - `dlna.rs` (1) → discovery
+  - rest (~7) → boot, route smoke, redaction
+| {
+  near: bottom-left
+  shape: text
+  style.font-size: 12
+}

@@ -16,7 +16,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_server::api::jellyfin::socket_messages::{
+use pharos_jellyfin_api::socket_messages::{
     Inbound, SyncPlayBufferingData, SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData,
 };
 use proptest::prelude::*;

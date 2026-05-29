@@ -4,10 +4,10 @@
 //! Swap point: change the type aliases below — handlers are untouched.
 
 use crate::{
-    auth::BuiltinAuth, hls_cache::HlsSegmentCache, image_cache::ImageCache,
-    live_tv::M3uXmltvBackend, sessions::SessionRegistry, subtitle_cache::SubtitleCache,
-    transcode_sessions::TranscodeSessionRegistry, trickplay_cache::TrickplayCache,
+    auth::BuiltinAuth, sessions::SessionRegistry, transcode_sessions::TranscodeSessionRegistry,
 };
+use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
+use pharos_discovery::live_tv::M3uXmltvBackend;
 use pharos_store_sqlx::sqlite::SqliteStore;
 use pharos_transcode::FfmpegBackend;
 use std::path::PathBuf;

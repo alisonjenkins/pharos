@@ -4,6 +4,12 @@
 use pharos_core::{User, UserPolicy};
 use serde::{Deserialize, Serialize};
 
+/// Sidecar subtitle streams numbered starting here so their indices
+/// never collide with real ffprobe stream indices (which start at 0
+/// and are typically single-digit). Lifted here in Phase A.2 so the
+/// DTO crate is self-contained.
+pub const SIDECAR_BASE_INDEX: u32 = 1_000_000;
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SystemInfoDto {
@@ -407,7 +413,7 @@ impl UserItemDataDto {
 /// Minimal ISO-8601 (Z) formatter for the `LastPlayedDate` field —
 /// avoids pulling in `chrono` just for one render path. T58 phase 3
 /// reuses it from the admin module for `/Auth/Keys` DateCreated.
-pub(crate) fn format_iso8601(unix_secs: i64) -> String {
+pub fn format_iso8601(unix_secs: i64) -> String {
     // Constants: days/month etc. Use the same algorithm as
     // chrono::NaiveDateTime::from_timestamp — straightforward Gregorian
     // calendar arithmetic. Good enough for "last played" display.
@@ -499,8 +505,7 @@ impl BaseItemDto {
         if widths.is_empty() {
             return self;
         }
-        self.trickplay =
-            crate::api::jellyfin::trickplay::build_dto_layout_map(probe, widths, interval_ms);
+        self.trickplay = build_dto_layout_map(probe, widths, interval_ms);
         self
     }
 
@@ -760,7 +765,7 @@ pub struct SessionInfoDto {
 /// Falls back to a kind-default when no probe ran, because an empty
 /// Container makes jellyfin-web pick Transcode with no TranscodingUrl
 /// → "Playback Error" dialog (caught in dev).
-pub(crate) fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> String {
+pub fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> String {
     const PREFERRED: &[&str] = &["webm", "m4v", "mp4", "mp3", "flac", "ogg", "opus", "aac"];
     if let Some(c) = probe.container.as_deref() {
         let aliases: Vec<&str> = c
@@ -802,7 +807,7 @@ impl SubtitleStreamCtx {
     }
 }
 
-pub(crate) fn build_media_streams(
+pub fn build_media_streams(
     probe: &pharos_core::MediaProbe,
     is_video: bool,
 ) -> Vec<MediaStreamDto> {
@@ -826,7 +831,7 @@ fn build_replay_gain(t: &pharos_core::AudioTrack) -> Option<ReplayGainDto> {
     })
 }
 
-pub(crate) fn build_media_streams_with_subtitles(
+pub fn build_media_streams_with_subtitles(
     probe: &pharos_core::MediaProbe,
     is_video: bool,
     subtitle_ctx: Option<&SubtitleStreamCtx>,
@@ -976,7 +981,7 @@ pub(crate) fn build_media_streams_with_subtitles(
             }
             // Sidecars: stream_index = SIDECAR_BASE + offset.
             for offset in 0..ctx.sidecar_count {
-                let idx = crate::api::jellyfin::subtitles::SIDECAR_BASE_INDEX + offset;
+                let idx = SIDECAR_BASE_INDEX + offset;
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
                     index: idx,
@@ -1095,5 +1100,125 @@ mod tests {
         assert_eq!(streams[1].kind, "Audio");
         assert_eq!(streams[1].codec.as_deref(), Some("opus"));
         assert_eq!(streams[1].channels, Some(2));
+    }
+}
+
+// ---------------------------------------------------------------------
+// Trickplay DTO helpers — lifted from the server-side `trickplay`
+// handler in Phase A.2 so `BaseItemDto::with_trickplay` is self-
+// contained on this side of the crate boundary. The handler now
+// imports these from `pharos_jellyfin_api::dto`.
+
+use pharos_cache::trickplay_cache::{Layout, TILE_GRID};
+
+/// Compose a `Layout` for the requested width when probe has the
+/// data we need. Returns `None` when duration_ms / dimensions are
+/// missing — callers (HTTP routes) 404 rather than 500.
+pub fn build_layout(
+    probe: &pharos_core::MediaProbe,
+    width: u32,
+    interval_ms: u32,
+) -> Option<Layout> {
+    let duration_ms = probe.duration_ms?;
+    let src_w = probe.width?;
+    let src_h = probe.height?;
+    Layout::compute(duration_ms, src_w, src_h, width, interval_ms)
+}
+
+/// Render `BaseItemDto.Trickplay` for a video item. Returns the
+/// `{ width_str → TileInfo }` map; empty when no width yields a
+/// valid layout (no probe data, audio-only item, or widths
+/// unconfigured).
+///
+/// Wire shape per width:
+/// ```json
+/// "320": {
+///   "Width": 320, "Height": 180,
+///   "TileWidth": 10, "TileHeight": 10,
+///   "ThumbnailCount": 89, "Interval": 10000, "Bandwidth": 0
+/// }
+/// ```
+pub fn build_dto_layout_map(
+    probe: &pharos_core::MediaProbe,
+    widths: &[u32],
+    interval_ms: u32,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for &w in widths {
+        if let Some(layout) = build_layout(probe, w, interval_ms) {
+            out.insert(
+                w.to_string(),
+                serde_json::json!({
+                    "Width": layout.width,
+                    "Height": layout.height,
+                    "TileWidth": TILE_GRID,
+                    "TileHeight": TILE_GRID,
+                    "ThumbnailCount": layout.thumb_count,
+                    "Interval": layout.interval_ms,
+                    "Bandwidth": 0u64,
+                }),
+            );
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod trickplay_helper_tests {
+    use super::{build_dto_layout_map, build_layout};
+    use pharos_core::MediaProbe;
+
+    fn probe_1080p_10min() -> MediaProbe {
+        MediaProbe {
+            duration_ms: Some(10 * 60 * 1000),
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dto_layout_map_emits_one_entry_per_configured_width() {
+        let probe = probe_1080p_10min();
+        let map = build_dto_layout_map(&probe, &[320, 640], 10_000);
+        assert_eq!(map.len(), 2);
+        let v320 = map.get("320").unwrap();
+        assert_eq!(v320.get("Width").unwrap().as_u64().unwrap(), 320);
+        assert_eq!(v320.get("Height").unwrap().as_u64().unwrap(), 180);
+        assert_eq!(v320.get("Interval").unwrap().as_u64().unwrap(), 10_000);
+        assert_eq!(v320.get("TileWidth").unwrap().as_u64().unwrap(), 10);
+        // 10 min @ 10s = 60 thumbs.
+        assert_eq!(v320.get("ThumbnailCount").unwrap().as_u64().unwrap(), 60);
+    }
+
+    #[test]
+    fn dto_layout_map_empty_when_probe_lacks_dimensions() {
+        let probe = MediaProbe {
+            duration_ms: Some(60_000),
+            width: None,
+            height: None,
+            ..Default::default()
+        };
+        let map = build_dto_layout_map(&probe, &[320], 10_000);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn dto_layout_map_empty_when_no_widths_configured() {
+        let probe = probe_1080p_10min();
+        let map = build_dto_layout_map(&probe, &[], 10_000);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn build_layout_returns_none_when_duration_missing() {
+        let probe = MediaProbe {
+            duration_ms: None,
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        };
+        assert!(build_layout(&probe, 320, 10_000).is_none());
     }
 }

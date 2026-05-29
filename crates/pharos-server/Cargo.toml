@@ -11,9 +11,13 @@ name = "pharos"
 path = "src/main.rs"
 
 [dependencies]
+pharos-cache = { path = "../pharos-cache", default-features = false }
 pharos-core = { path = "../pharos-core" }
+pharos-discovery = { path = "../pharos-discovery" }
+pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
 pharos-scanner = { path = "../pharos-scanner" }
 pharos-store-sqlx = { path = "../pharos-store-sqlx" }
+pharos-sync = { path = "../pharos-sync" }
 pharos-transcode = { path = "../pharos-transcode", default-features = false }
 actix-cors.workspace = true
 actix-files.workspace = true
@@ -48,8 +52,8 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # Default mirrors pharos-transcode's default (spawn). Flip to
 # `ffmpeg-lib` once P49-P51 ship the library implementations.
 default = ["ffmpeg-spawn"]
-ffmpeg-spawn = ["pharos-transcode/backend-spawn"]
-ffmpeg-lib = ["pharos-transcode/backend-lib"]
+ffmpeg-spawn = ["pharos-transcode/backend-spawn", "pharos-cache/ffmpeg-spawn"]
+ffmpeg-lib = ["pharos-transcode/backend-lib", "pharos-cache/ffmpeg-lib"]
 
 [dev-dependencies]
 actix-test = "0.1"

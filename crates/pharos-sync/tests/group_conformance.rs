@@ -12,8 +12,8 @@
 //! - network-blip: a member who drops and rejoins picks up the current
 //!   playback state on rejoin.
 
-use pharos_server::sync::group::{GroupHandle, GroupMsg, GroupSnapshot, Joined, MIN_LEAD_MS};
-use pharos_server::sync::messages::{GroupId, MemberId, ServerMsg};
+use pharos_sync::group::{GroupHandle, GroupMsg, GroupSnapshot, Joined, MIN_LEAD_MS};
+use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 

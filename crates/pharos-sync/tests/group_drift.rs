@@ -18,8 +18,8 @@
 //! and the computed positions across a 5-second sample window must
 //! stay within the V3 budget.
 
-use pharos_server::sync::group::{GroupHandle, GroupMsg, Joined};
-use pharos_server::sync::messages::{GroupId, MemberId, ServerMsg};
+use pharos_sync::group::{GroupHandle, GroupMsg, Joined};
+use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 

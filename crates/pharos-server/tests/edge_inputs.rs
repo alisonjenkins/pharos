@@ -15,8 +15,8 @@ use actix_web::{test, web, App};
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
     api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-    sync::GroupRegistry,
 };
+use pharos_sync::GroupRegistry;
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed() -> (
