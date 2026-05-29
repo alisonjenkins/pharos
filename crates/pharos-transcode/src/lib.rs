@@ -11,9 +11,15 @@
 //! no IO traits leak into core. Transcoder swap (e.g. a future GPU-
 //! accelerated impl) happens at the wiring layer.
 
+pub mod backend;
 pub mod hwaccel;
 pub mod options;
 
+#[cfg(feature = "backend-lib")]
+pub use backend::LibBackend;
+#[cfg(feature = "backend-spawn")]
+pub use backend::SpawnBackend;
+pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, WaveformPoint};
 pub use hwaccel::HwAccel;
 pub use options::{AudioCodec, Container, TranscodeOptions, VideoCodec};
 

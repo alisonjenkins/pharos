@@ -9,7 +9,9 @@ use crate::{
     transcode_sessions::TranscodeSessionRegistry, trickplay_cache::TrickplayCache,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_transcode::FfmpegBackend;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -96,6 +98,12 @@ pub struct AppState {
     /// here so the admin spawn reads the configured value without
     /// re-parsing the toml config.
     pub scan_rate_limit_ms: u64,
+    /// P48 — ffmpeg operations backend. `Arc<dyn FfmpegBackend>` so
+    /// the spawn / lib-FFI swap happens at construction time without
+    /// rippling generic parameters through every handler signature.
+    /// Default at `AppState::new` is the spawn backend so tests get
+    /// the production behaviour without extra wiring.
+    pub ffmpeg: Arc<dyn FfmpegBackend>,
 }
 
 impl AppState {
@@ -129,6 +137,7 @@ impl AppState {
             bus,
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
+            ffmpeg: default_ffmpeg_backend(),
         }
     }
 
@@ -180,6 +189,7 @@ impl AppState {
             bus,
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
+            ffmpeg: default_ffmpeg_backend(),
         })
     }
 
@@ -197,6 +207,15 @@ impl AppState {
     /// can't make a refresh run effectively forever.
     pub fn with_scan_rate_limit_ms(mut self, ms: u64) -> Self {
         self.scan_rate_limit_ms = ms.min(5_000);
+        self
+    }
+
+    /// P48 builder — install a custom `FfmpegBackend`. Tests use
+    /// this to short-circuit real ffmpeg invocations entirely;
+    /// production wiring picks `SpawnBackend` or `LibBackend` via
+    /// the `pharos-transcode` cargo features.
+    pub fn with_ffmpeg_backend(mut self, backend: Arc<dyn FfmpegBackend>) -> Self {
+        self.ffmpeg = backend;
         self
     }
 
@@ -279,5 +298,21 @@ impl AppState {
             position_ticks,
             is_paused,
         });
+    }
+}
+
+/// P48 — produce the compile-time-selected default backend. The
+/// feature flags on `pharos-transcode` are mutually exclusive at
+/// link time (build script enforces); pick whichever feature is
+/// enabled. Tests + main both share this path so swap behaviour
+/// stays consistent.
+fn default_ffmpeg_backend() -> Arc<dyn FfmpegBackend> {
+    #[cfg(feature = "ffmpeg-lib")]
+    {
+        Arc::new(pharos_transcode::LibBackend::new())
+    }
+    #[cfg(not(feature = "ffmpeg-lib"))]
+    {
+        Arc::new(pharos_transcode::SpawnBackend::new())
     }
 }

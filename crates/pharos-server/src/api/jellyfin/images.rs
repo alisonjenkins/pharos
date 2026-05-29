@@ -241,19 +241,21 @@ async fn serve_image(
             return Ok(HttpResponse::NotFound().body(""));
         }
     };
-    // P46 — optional re-encode to webp / avif. Cached as a sibling
-    // path next to the source jpeg so subsequent fetches skip the
-    // ffmpeg spawn entirely.
+    // P46 + P48 — optional re-encode to webp / avif via the
+    // FfmpegBackend trait (was a direct Command::new in P46; routed
+    // through the backend so the swap to ffmpeg-next in P49+ touches
+    // exactly one place). Cached as a sibling path so subsequent
+    // fetches skip the encode entirely.
     let (final_path, content_type) = match format {
         ImageFormat::Jpeg => (jpeg_path, "image/jpeg"),
-        ImageFormat::Webp => match transcode_image(&jpeg_path, "webp").await {
+        ImageFormat::Webp => match transcode_via_backend(state, &jpeg_path, "webp").await {
             Ok(p) => (p, "image/webp"),
             Err(e) => {
                 tracing::warn!(error = %e, "webp transcode failed; serving jpeg");
                 (jpeg_path, "image/jpeg")
             }
         },
-        ImageFormat::Avif => match transcode_image(&jpeg_path, "avif").await {
+        ImageFormat::Avif => match transcode_via_backend(state, &jpeg_path, "avif").await {
             Ok(p) => (p, "image/avif"),
             Err(e) => {
                 tracing::warn!(error = %e, "avif transcode failed; serving jpeg");
@@ -297,9 +299,11 @@ fn parse_image_format(qs: &str) -> ImageFormat {
     ImageFormat::Jpeg
 }
 
-/// P46 — transcode the cached jpeg into a sibling `.{ext}` file when
-/// requested. Returns the sibling path. Atomic via `.tmp → final`.
-async fn transcode_image(
+/// P46 + P48 — transcode the cached jpeg into a sibling `.{ext}`
+/// file via the `FfmpegBackend` trait. Atomic via `.tmp → final` so
+/// concurrent first-readers don't observe a half-written output.
+async fn transcode_via_backend(
+    state: &AppState,
     jpeg_path: &std::path::Path,
     ext: &str,
 ) -> Result<std::path::PathBuf, std::io::Error> {
@@ -309,38 +313,11 @@ async fn transcode_image(
         return Ok(out);
     }
     let tmp = jpeg_path.with_extension(format!("{ext}.tmp"));
-    let codec = match ext {
-        "webp" => "libwebp",
-        "avif" => "libaom-av1",
-        _ => "mjpeg",
-    };
-    let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.args([
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-i",
-    ]);
-    cmd.arg(jpeg_path);
-    cmd.args(["-c:v", codec]);
-    // avif still-picture needs a single frame + tuning flags so the
-    // libaom encoder produces a usable still rather than a 1-frame
-    // video clip the browser refuses to decode.
-    if ext == "avif" {
-        cmd.args(["-still-picture", "1", "-cpu-used", "8"]);
-    } else {
-        cmd.args(["-quality", "80"]);
-    }
-    cmd.arg(&tmp);
-    let status = cmd.status().await?;
-    if !status.success() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(std::io::Error::other(format!(
-            "ffmpeg {ext} transcode failed",
-        )));
-    }
+    state
+        .ffmpeg
+        .transcode_image(jpeg_path, ext, &tmp)
+        .await
+        .map_err(|e| std::io::Error::other(format!("backend {ext} transcode: {e}")))?;
     tokio::fs::rename(&tmp, &out).await?;
     Ok(out)
 }
@@ -427,9 +404,18 @@ mod tests {
         // jpeg so a typo doesn't break image rendering. Fully-qualified
         // `::core::prelude::v1::test` so this file's `use actix_web::test`
         // import (the async-test macro) doesn't shadow the builtin.
-        assert!(matches!(parse_image_format("format=webp"), ImageFormat::Webp));
-        assert!(matches!(parse_image_format("Format=AVIF"), ImageFormat::Avif));
-        assert!(matches!(parse_image_format("format=xxx"), ImageFormat::Jpeg));
+        assert!(matches!(
+            parse_image_format("format=webp"),
+            ImageFormat::Webp
+        ));
+        assert!(matches!(
+            parse_image_format("Format=AVIF"),
+            ImageFormat::Avif
+        ));
+        assert!(matches!(
+            parse_image_format("format=xxx"),
+            ImageFormat::Jpeg
+        ));
         assert!(matches!(parse_image_format(""), ImageFormat::Jpeg));
     }
 

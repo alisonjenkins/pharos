@@ -11,10 +11,28 @@ pharos-core = { path = "../pharos-core" }
 bytes.workspace = true
 futures-core = "0.3"
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs"] }
 tokio-util.workspace = true
 tracing.workspace = true
+# P48 — optional ffmpeg-next FFI backend. Enabled via the
+# `backend-lib` feature. Linker pulls in libavcodec / libavformat /
+# libavfilter / libswscale at build time, supplied by the nix
+# devShell. Maintenance-mode crate but supports ffmpeg 3.4–8.0 and
+# has the broadest doc coverage.
+ffmpeg-next = { version = "7", optional = true }
+
+[features]
+default = ["backend-spawn"]
+# P48 — current behaviour: tokio::process::Command spawning a real
+# ffmpeg binary on PATH. Crash-isolated (V6); pays ~30-100ms/spawn
+# on macOS dyld + fork.
+backend-spawn = []
+# P48 — FFI backend via ffmpeg-next. Hot-path operations (HLS
+# segment generation, trickplay tile burn) avoid the spawn cost
+# entirely. Mutually exclusive with `backend-spawn`.
+backend-lib = ["dep:ffmpeg-next"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
