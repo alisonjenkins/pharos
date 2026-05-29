@@ -16,6 +16,12 @@ pub enum Container {
     /// when remuxing FLAC / lossless sources to AAC for clients
     /// without FLAC decode.
     Adts,
+    /// P38 — fragmented MP4 segment for HLSv6. Same mp4 muxer as
+    /// `Container::Mp4` but the HLS handler picks a different
+    /// `-hls_segment_type` and the master playlist bumps to
+    /// `EXT-X-VERSION:6`. Safari + iOS native HLS prefer this; the
+    /// MPEG-TS path stays default for everyone else.
+    Fmp4,
 }
 
 impl Container {
@@ -30,6 +36,9 @@ impl Container {
             Self::Flac => "flac",
             Self::Ogg => "ogg",
             Self::Adts => "adts",
+            // fMP4 segments use the mp4 muxer with movflags tuned for
+            // fragmentation; the HLS handler appends the flags.
+            Self::Fmp4 => "mp4",
         }
     }
 
@@ -43,6 +52,10 @@ impl Container {
             Self::Flac => "audio/flac",
             Self::Ogg => "audio/ogg",
             Self::Adts => "audio/aac",
+            // RFC 6381 / Apple HLS Tech Note 281 — fMP4 segments are
+            // `video/iso.segment`; the matching init segment is
+            // `video/mp4` but the segment endpoint returns this.
+            Self::Fmp4 => "video/iso.segment",
         }
     }
 
@@ -52,6 +65,9 @@ impl Container {
     pub fn from_name(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "mp4" | "m4v" => Some(Self::Mp4),
+            // P38 — explicit fMP4 token; only handler code currently
+            // surfaces this. Device profiles continue to emit "mp4".
+            "fmp4" | "iso-segment" | "iso.segment" => Some(Self::Fmp4),
             "mkv" | "matroska" => Some(Self::Mkv),
             "webm" => Some(Self::WebM),
             "ts" | "mpegts" => Some(Self::Mpegts),
@@ -219,6 +235,22 @@ mod tests {
         assert_eq!(Container::Mp4.content_type(), "video/mp4");
         assert_eq!(Container::Mpegts.content_type(), "video/mp2t");
         assert_eq!(Container::Mp3.content_type(), "audio/mpeg");
+    }
+
+    #[test]
+    fn fmp4_container_muxes_as_mp4_with_segment_type() {
+        // P38 — the muxer name has to stay "mp4" so ffmpeg pipes the
+        // bytes through the same demuxer the HLS handler initialises
+        // its `-movflags` for. The wire-shape content-type swap to
+        // `video/iso.segment` is what tells Safari it's HLSv6.
+        assert_eq!(Container::Fmp4.ffmpeg_muxer(), "mp4");
+        assert_eq!(Container::Fmp4.content_type(), "video/iso.segment");
+        assert_eq!(Container::from_name("fmp4"), Some(Container::Fmp4));
+        assert_eq!(Container::from_name("iso-segment"), Some(Container::Fmp4));
+        // "mp4" itself stays the regular mp4 progressive container so
+        // device-profile parsers don't accidentally upgrade clients
+        // that asked for plain mp4.
+        assert_eq!(Container::from_name("mp4"), Some(Container::Mp4));
     }
 
     #[test]
