@@ -8,6 +8,11 @@
 - Interactive: `nix develop` (or `direnv allow` if `.envrc` is set up).
 - Do not invoke `cargo`, `rustc`, `clippy`, `ffmpeg`, etc. from the host shell — versions may drift from the flake.
 - Tests run via **`cargo nextest run --workspace`** (config in `.config/nextest.toml`). Faster + better output than the built-in runner. Use `cargo test --doc --workspace` separately for doctests.
+- Fast-feedback recipes via `just`:
+  - `just test-fast` — workspace `--lib` only, skips heavy `tests/*.rs` binaries.
+  - `just test-changed [from=main]` — `cargo-guppy` enumerates packages touched vs `from`, then `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'` runs only the transitively-affected tests.
+  - `just test` — full workspace (strips macOS Gatekeeper quarantine attr first).
+  - `just test-thorough` — full workspace with `PROPTEST_CASES=512` for nightly / pre-release.
 
 Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) requires clippy from the pinned toolchain. Host system may not have it.
 

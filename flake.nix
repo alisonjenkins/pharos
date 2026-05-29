@@ -480,6 +480,14 @@
             pkgs.cargo-nextest
             pkgs.cargo-watch
             pkgs.cargo-deny
+            # P52 — workspace dependency-graph + selective test tooling.
+            # cargo-guppy enumerates packages affected by a git range
+            # (consumed by `just test-changed`); cargo-hakari manages
+            # the workspace-hack crate that dedupes feature unification
+            # so cargo only compiles a dep once per feature-set
+            # (1.7× cumulative speedup on workspace builds).
+            pkgs.cargo-guppy
+            pkgs.cargo-hakari
             pkgs.cargo-audit
             # crate2nix regenerates Cargo.nix when Cargo.lock changes.
             # Run `just regen-cargo-nix` after touching dependencies.
