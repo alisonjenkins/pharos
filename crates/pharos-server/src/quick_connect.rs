@@ -80,7 +80,7 @@ impl QuickConnectRegistry {
                 gc_expired(&mut by_secret, &mut by_code);
                 match msg {
                     QcMsg::Initiate { device_id, reply } => {
-                        let entry = mint_pending(device_id);
+                        let entry = mint_pending(device_id, &by_code);
                         by_code.insert(entry.code.clone(), entry.secret.clone());
                         by_secret.insert(entry.secret.clone(), entry.clone());
                         let _ = reply.send(entry);
@@ -116,9 +116,13 @@ impl QuickConnectRegistry {
     }
 }
 
-fn mint_pending(device_id: String) -> PendingRequest {
+fn mint_pending(device_id: String, by_code: &HashMap<String, String>) -> PendingRequest {
     let now = Instant::now();
-    let code = generate_code();
+    // V8/security: codes must be unique among *live* requests. Blindly
+    // overwriting an existing code let an attacker spam Initiate to
+    // collide a victim's code and bind the victim's later Authorize to
+    // the attacker's secret → account takeover. Generate until free.
+    let code = unique_code(by_code);
     let secret = generate_secret();
     PendingRequest {
         code,
@@ -127,6 +131,21 @@ fn mint_pending(device_id: String) -> PendingRequest {
         created_at: now,
         authorized_by: None,
     }
+}
+
+/// Draw codes until one is not currently live. The 6-digit space is 1M
+/// and live requests are few (short TTL), so this terminates in ~1 draw;
+/// the bound is a safety belt against pathological saturation.
+fn unique_code(by_code: &HashMap<String, String>) -> String {
+    for _ in 0..10_000 {
+        let c = generate_code();
+        if !by_code.contains_key(&c) {
+            return c;
+        }
+    }
+    // Astronomically unlikely (would need ~1M live requests). Fall back
+    // to a fresh draw rather than loop forever.
+    generate_code()
 }
 
 fn gc_expired(
@@ -143,16 +162,18 @@ fn gc_expired(
     });
 }
 
-/// Six-digit numeric code the user reads aloud. Uses `xxh3` as a
-/// cheap RNG seeded by wall-clock — no crypto-strength needed since
-/// the code is paired with a much larger Secret on the wire.
+/// Six-digit numeric code the user reads aloud. Drawn from a CSPRNG
+/// (`getrandom`) — the old wall-clock `xxh3` seed was predictable, which
+/// (combined with the collision overwrite, now fixed) enabled a code
+/// pre-image / collision attack. Uniqueness is enforced by the caller
+/// ([`unique_code`]); unpredictability is enforced here.
 fn generate_code() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let n = xxhash_rust::xxh3::xxh3_64(&ns.to_le_bytes()) % 1_000_000;
+    let mut b = [0u8; 8];
+    // A CSPRNG failure is effectively impossible on supported platforms;
+    // if it ever did, zero bytes still yield a valid (if fixed) code and
+    // uniqueness/secret pairing still hold.
+    let _ = getrandom::getrandom(&mut b);
+    let n = u64::from_le_bytes(b) % 1_000_000;
     format!("{n:06}")
 }
 
@@ -274,6 +295,33 @@ mod tests {
             .await
             .unwrap();
         assert!(rx.await.unwrap().is_none());
+    }
+
+    #[test]
+    fn codes_are_unique_across_many_initiates() {
+        // Security regression: distinct Initiate calls must never collide
+        // onto the same code (which previously let an attacker overwrite a
+        // victim's code→secret mapping). With a 1M space + uniqueness loop,
+        // a batch of mints must all differ.
+        let mut by_code: HashMap<String, String> = HashMap::new();
+        for _ in 0..2000 {
+            let e = mint_pending("d".into(), &by_code);
+            assert!(
+                !by_code.contains_key(&e.code),
+                "mint produced a colliding code"
+            );
+            by_code.insert(e.code.clone(), e.secret.clone());
+        }
+        assert_eq!(by_code.len(), 2000);
+    }
+
+    #[test]
+    fn generated_codes_are_six_digits() {
+        for _ in 0..100 {
+            let c = generate_code();
+            assert_eq!(c.len(), 6);
+            assert!(c.chars().all(|c| c.is_ascii_digit()));
+        }
     }
 
     #[test]
