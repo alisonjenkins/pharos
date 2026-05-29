@@ -66,10 +66,27 @@ async fn handle_connection<S>(
     let member_id = MemberId::new();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
     let mut current_group: Option<GroupHandle> = None;
+    // P23 — server-initiated keep-alive. Tick every 30 s; track the
+    // last time we observed client traffic so a peer that stopped
+    // responding (TCP black-holed) gets dropped instead of leaking
+    // file descriptors.
+    let mut keepalive_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_client_seen = Instant::now();
+    const IDLE_DROP: std::time::Duration = std::time::Duration::from_secs(120);
 
     'pump: loop {
         tokio::select! {
             biased;
+            _ = keepalive_tick.tick() => {
+                if last_client_seen.elapsed() > IDLE_DROP {
+                    break 'pump;
+                }
+                let out = Outbound::new("KeepAlive", serde_json::Value::Null);
+                if send_outbound(&mut session, &out).await.is_err() {
+                    break 'pump;
+                }
+            }
             Some(server_msg) = out_rx.recv() => {
                 if let Some(out) = translate_outbound(server_msg, current_group.as_ref().map(|h| h.group_id)) {
                     if send_outbound(&mut session, &out).await.is_err() {
@@ -105,6 +122,8 @@ async fn handle_connection<S>(
             }
             frame = stream.next() => {
                 let Some(frame) = frame else { break 'pump };
+                // Any incoming frame counts as client liveness.
+                last_client_seen = Instant::now();
                 match frame {
                     Ok(AggregatedMessage::Text(txt)) => {
                         let inbound: Inbound = match serde_json::from_str(&txt) {
