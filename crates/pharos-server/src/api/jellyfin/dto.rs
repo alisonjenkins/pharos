@@ -246,6 +246,11 @@ pub struct BaseItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_number: Option<u32>,
     pub screenshot_image_tags: Vec<String>,
+    /// P13 — Jellyfin video range. "HDR" for HDR10 / HLG / DV
+    /// sources; "SDR" otherwise. Clients use this to enable HDR
+    /// playback paths on capable displays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_range: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -621,6 +626,13 @@ impl BaseItemDto {
                 .and_then(|s| s.season_number.map(season_display_name)),
             parent_index_number: item.series.as_ref().and_then(|s| s.season_number),
             index_number: item.series.as_ref().and_then(|s| s.episode_number),
+            // P13 — VideoRange is HDR-only when the probe says so.
+            // Audio items + SDR videos skip the field entirely.
+            video_range: if is_video && item.probe.is_hdr() {
+                Some("HDR")
+            } else {
+                None
+            },
         }
     }
 }

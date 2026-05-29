@@ -107,6 +107,15 @@ struct FfprobeStream {
     /// VP9/AV1/Opus etc.
     #[serde(default)]
     level: Option<i32>,
+    /// P13 — HDR / color metadata.
+    #[serde(default)]
+    pix_fmt: Option<String>,
+    #[serde(default)]
+    color_primaries: Option<String>,
+    #[serde(default)]
+    color_transfer: Option<String>,
+    #[serde(default)]
+    color_space: Option<String>,
     #[serde(default)]
     width: Option<u32>,
     #[serde(default)]
@@ -213,6 +222,10 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         .and_then(|s| s.level)
         .filter(|&l| l > 0)
         .map(|l| l as u32);
+    let pixel_format = video_stream.and_then(|s| s.pix_fmt.clone());
+    let color_primaries = video_stream.and_then(|s| s.color_primaries.clone());
+    let color_transfer = video_stream.and_then(|s| s.color_transfer.clone());
+    let color_space = video_stream.and_then(|s| s.color_space.clone());
     let audio_codec = audio_stream.and_then(|s| s.codec_name.clone());
     let width = video_stream.and_then(|s| s.width);
     let height = video_stream.and_then(|s| s.height);
@@ -284,6 +297,10 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             video_codec,
             video_profile,
             video_level,
+            pixel_format,
+            color_primaries,
+            color_transfer,
+            color_space,
             audio_codec,
             width,
             height,
@@ -368,6 +385,49 @@ mod tests {
         assert_eq!(p.sample_rate, Some(48000));
         // 24000/1001 ≈ 23.976 fps → 23_976 in mille.
         assert_eq!(p.frame_rate_mille, Some(23_976));
+    }
+
+    #[test]
+    fn parse_hdr10_extracts_color_transfer() {
+        let json = br#"{
+            "streams": [
+                {"codec_type": "video", "codec_name": "hevc",
+                 "profile": "Main 10", "level": 153,
+                 "pix_fmt": "yuv420p10le",
+                 "color_primaries": "bt2020",
+                 "color_transfer": "smpte2084",
+                 "color_space": "bt2020nc",
+                 "width": 3840, "height": 2160}
+            ],
+            "format": {"format_name": "matroska", "duration": "100"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        let p = &info.probe;
+        assert_eq!(p.pixel_format.as_deref(), Some("yuv420p10le"));
+        assert_eq!(p.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(p.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(p.color_space.as_deref(), Some("bt2020nc"));
+        // HDR derivation lands via the MediaProbe helper.
+        assert!(p.is_hdr());
+        assert_eq!(p.video_range(), "HDR");
+    }
+
+    #[test]
+    fn parse_sdr_video_reports_sdr_video_range() {
+        let json = br#"{
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264",
+                 "pix_fmt": "yuv420p",
+                 "color_primaries": "bt709",
+                 "color_transfer": "bt709",
+                 "color_space": "bt709",
+                 "width": 1920, "height": 1080}
+            ],
+            "format": {"format_name": "mp4"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(info.probe.video_range(), "SDR");
+        assert!(!info.probe.is_hdr());
     }
 
     #[test]

@@ -12,7 +12,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
     subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
-    video_profile, video_level";
+    video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -176,8 +176,9 @@ impl MediaStore for SqliteStore {
                 series_name, season_number, episode_number, \
                 subtitle_tracks_json, \
                 artist, album, album_artist, genre, created_at, chapters_json, \
-                video_profile, video_level) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                video_profile, video_level, \
+                pixel_format, color_primaries, color_transfer, color_space) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            kind = excluded.kind,
@@ -203,6 +204,10 @@ impl MediaStore for SqliteStore {
                                            chapters_json = excluded.chapters_json,
                                            video_profile = excluded.video_profile,
                                            video_level = excluded.video_level,
+                                           pixel_format = excluded.pixel_format,
+                                           color_primaries = excluded.color_primaries,
+                                           color_transfer = excluded.color_transfer,
+                                           color_space = excluded.color_space,
                                            -- Preserve original
                                            -- created_at on rescans;
                                            -- COALESCE keeps existing
@@ -237,6 +242,10 @@ impl MediaStore for SqliteStore {
         .bind(chapters_json)
         .bind(p.video_profile.as_deref())
         .bind(p.video_level.map(|v| v as i64))
+        .bind(p.pixel_format.as_deref())
+        .bind(p.color_primaries.as_deref())
+        .bind(p.color_transfer.as_deref())
+        .bind(p.color_space.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -283,6 +292,10 @@ struct MediaRow {
     chapters_json: Option<String>,
     video_profile: Option<String>,
     video_level: Option<i64>,
+    pixel_format: Option<String>,
+    color_primaries: Option<String>,
+    color_transfer: Option<String>,
+    color_space: Option<String>,
 }
 
 impl MediaRow {
@@ -298,6 +311,10 @@ impl MediaRow {
             video_codec: self.video_codec,
             video_profile: self.video_profile,
             video_level: self.video_level.and_then(|v| u32::try_from(v).ok()),
+            pixel_format: self.pixel_format,
+            color_primaries: self.color_primaries,
+            color_transfer: self.color_transfer,
+            color_space: self.color_space,
             audio_codec: self.audio_codec,
             width: self.width.and_then(|v| u32::try_from(v).ok()),
             height: self.height.and_then(|v| u32::try_from(v).ok()),

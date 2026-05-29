@@ -71,6 +71,17 @@ pub struct MediaProbe {
     /// format for the trailing two hex digits of `avc1.…` /
     /// `hvc1.…L<level>` codec tokens.
     pub video_level: Option<u32>,
+    /// P13 — ffprobe `pix_fmt` token (e.g. `"yuv420p"`,
+    /// `"yuv420p10le"`). Distinguishes 8-bit vs 10-bit pipelines so
+    /// HDR-capable clients pick the right decoder path.
+    pub pixel_format: Option<String>,
+    /// ffprobe `color_primaries` (`"bt709"`, `"bt2020"`).
+    pub color_primaries: Option<String>,
+    /// ffprobe `color_transfer` (`"bt709"`, `"smpte2084"` = HDR10,
+    /// `"arib-std-b67"` = HLG). Primary HDR discriminator.
+    pub color_transfer: Option<String>,
+    /// ffprobe `color_space` (`"bt709"`, `"bt2020nc"`).
+    pub color_space: Option<String>,
     pub audio_codec: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -129,6 +140,22 @@ impl MediaProbe {
     /// Convert duration_ms → Jellyfin's 100-ns ticks (10_000 ticks / ms).
     pub fn run_time_ticks(&self) -> Option<u64> {
         self.duration_ms.map(|ms| ms.saturating_mul(10_000))
+    }
+
+    /// P13 — derive the Jellyfin `VideoRange` discriminator (`"HDR"`
+    /// vs `"SDR"`) from probe color metadata. HDR10 uses
+    /// `smpte2084`; HLG broadcast uses `arib-std-b67`; Dolby Vision
+    /// ffprobe also reports `smpte2084` for the base layer.
+    pub fn video_range(&self) -> &'static str {
+        match self.color_transfer.as_deref() {
+            Some("smpte2084") | Some("arib-std-b67") => "HDR",
+            _ => "SDR",
+        }
+    }
+
+    /// True when the probe carries HDR transfer characteristics.
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.video_range(), "HDR")
     }
 }
 
