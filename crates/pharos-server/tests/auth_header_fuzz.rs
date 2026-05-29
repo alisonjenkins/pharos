@@ -15,12 +15,25 @@
 use pharos_server::api::jellyfin::auth_extractor::{auth_header_from_request, parse_auth_header};
 use proptest::prelude::*;
 
+// P47 — `PROPTEST_CASES` env override. Local `just test` runs at
+// 32 cases (default); CI + `just test-thorough` runs at the full
+// 512. Shrink iters scale with case count so a regression still
+// shrinks to a minimal repro at full size but doesn't waste local
+// time on tiny case loads.
+fn cfg() -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    ProptestConfig {
+        cases,
+        max_shrink_iters: cases.saturating_mul(4).min(256),
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 512,
-        max_shrink_iters: 256,
-        .. ProptestConfig::default()
-    })]
+    #![proptest_config(cfg())]
 
     /// Pure parser fuzz. Any UTF-8 string, no prefix constraint.
     #[test]

@@ -45,12 +45,22 @@ fn json_object_strategy() -> impl Strategy<Value = serde_json::Value> {
     })
 }
 
+// P47 — `PROPTEST_CASES` env override; see auth_header_fuzz.rs for
+// the design notes.
+fn cfg() -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    ProptestConfig {
+        cases,
+        max_shrink_iters: cases.saturating_mul(4).min(256),
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 512,
-        max_shrink_iters: 256,
-        .. ProptestConfig::default()
-    })]
+    #![proptest_config(cfg())]
 
     /// 1. Arbitrary UTF-8 — most reject as malformed JSON, but the
     ///    rare valid-shaped ones still must not panic.

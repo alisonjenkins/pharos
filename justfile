@@ -1,8 +1,23 @@
 set shell := ["bash", "-cu"]
 
 # Run the full nextest suite via the nix devShell.
+# P47 — strip macOS Gatekeeper quarantine attr off freshly-linked
+# test binaries before nextest lists them. Cold first-launch on
+# macOS triggers a synchronous Gatekeeper scan per binary (~1-5s
+# each); the workspace's ~60 test bins burn 1-3 min there.
+# Stripping the attr collapses that overhead to zero. No-op on
+# Linux + CI.
 test:
+    -xattr -dr com.apple.quarantine target/debug/ 2>/dev/null || true
     nix develop --command cargo nextest run --workspace
+
+# P47 — same as `test` but with full proptest case counts. Default
+# `test` runs proptests at 32 cases each via PROPTEST_CASES unset
+# (the test config falls back to 32); CI + nightly should run with
+# 512 to catch the rare shrink seeds.
+test-thorough:
+    -xattr -dr com.apple.quarantine target/debug/ 2>/dev/null || true
+    PROPTEST_CASES=512 nix develop --command cargo nextest run --workspace
 
 # Clippy under workspace lints (denies warnings).
 lint:

@@ -96,10 +96,21 @@ fn source_strat() -> impl Strategy<Value = SourceMedia> {
         })
 }
 
+// P47 — `PROPTEST_CASES` env override; see auth_header_fuzz.rs for
+// the design notes.
+fn cfg() -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 256, .. ProptestConfig::default()
-    })]
+    #![proptest_config(cfg())]
 
     /// Invariant 1: the negotiator never panics on adversarial input.
     /// All shapes must produce *some* Decision.

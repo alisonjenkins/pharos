@@ -163,9 +163,15 @@ fn arbitrary_media_item_roundtrips_through_sqlite() {
         .build()
         .unwrap();
 
+    // P47 — `PROPTEST_CASES` env override. Local default 16 since
+    // each case spins up a fresh in-memory sqlite + full migration.
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let mut runner = TestRunner::new(ProptestConfig {
-        cases: 64,
-        max_shrink_iters: 64,
+        cases,
+        max_shrink_iters: cases.saturating_mul(2).min(64),
         ..ProptestConfig::default()
     });
 
