@@ -86,6 +86,27 @@ async fn deliver_vtt(
         return serve_sidecar(state, &sidecar_path, kind, stream_index).await;
     }
 
+    // P15 — image-based subtitle codecs (PGS / DVB / VobSub) cannot
+    // convert to WebVTT. Refuse with 415 + JSON error so clients
+    // surface a clear "unsupported track" UI hint instead of the
+    // generic 500 they'd get when ffmpeg fails the convert.
+    if let Some(track) = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .find(|t| t.stream_index == stream_index)
+    {
+        if let Some(codec) = track.codec.as_deref() {
+            if is_image_subtitle_codec(codec) {
+                return Ok(HttpResponse::UnsupportedMediaType()
+                    .content_type("application/json")
+                    .body(format!(
+                        r#"{{"error":"image-based subtitles cannot convert to WebVTT","codec":"{codec}"}}"#
+                    )));
+            }
+        }
+    }
+
     // Embedded stream: ffmpeg -map 0:<idx> -f webvtt.
     let input = item
         .path
@@ -168,6 +189,24 @@ async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, 
         )));
     }
     Ok(out.stdout)
+}
+
+/// P15 — known image-based subtitle codecs. ffmpeg can't convert
+/// these to text-WebVTT (they're rasters); attempts produce empty
+/// or malformed output. Refused with 415 so the client doesn't
+/// mistake an empty track for a working one.
+fn is_image_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "hdmv_pgs_subtitle"
+            | "pgs"
+            | "pgssub"
+            | "dvb_subtitle"
+            | "dvbsub"
+            | "dvd_subtitle"
+            | "dvdsub"
+            | "vobsub"
+    )
 }
 
 /// Sidecar kind — `.vtt` ships as-is, `.srt` runs through ffmpeg to
@@ -361,5 +400,22 @@ mod tests {
             .await
             .unwrap();
         assert!(discover_sidecars(&media).await.is_empty());
+    }
+
+    #[test]
+    fn image_codec_detection_covers_common_names() {
+        for c in [
+            "hdmv_pgs_subtitle",
+            "PGS",
+            "pgssub",
+            "dvb_subtitle",
+            "DVDSub",
+            "VobSub",
+        ] {
+            assert!(is_image_subtitle_codec(c), "{c} should be flagged");
+        }
+        for c in ["subrip", "srt", "webvtt", "ass", "ssa", "mov_text"] {
+            assert!(!is_image_subtitle_codec(c), "{c} should NOT be flagged");
+        }
     }
 }
