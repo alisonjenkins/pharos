@@ -8,12 +8,15 @@ publish.workspace = true
 
 [dependencies]
 pharos-core = { path = "../pharos-core" }
+bincode = "1"
 bytes.workspace = true
 futures-core = "0.3"
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+smallvec = { version = "1", features = ["serde"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs"] }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs", "time", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true
 # P48 — optional ffmpeg-next FFI backend. Enabled via the
@@ -35,8 +38,17 @@ backend-spawn = []
 # entirely. Mutually exclusive with `backend-spawn`.
 backend-lib = ["dep:ffmpeg-next"]
 
+[[bin]]
+name = "transcode-worker"
+path = "src/bin/transcode_worker.rs"
+
+[[bin]]
+name = "transcode-tool"
+path = "src/bin/transcode_tool.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
 
 [lints]
 workspace = true
