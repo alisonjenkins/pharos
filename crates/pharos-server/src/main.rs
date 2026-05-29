@@ -274,10 +274,16 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state = state.with_image_cache(ImageCache::new(cache_dir));
     }
     if let Some(cache_dir) = cfg.server.transcode_cache_dir.clone() {
-        state = state.with_hls_cache(HlsSegmentCache::new(
-            cache_dir,
-            cfg.server.transcode_cache_max_bytes,
-        ));
+        // P14 — resolve `auto` against the live `ffmpeg -hwaccels`
+        // output once. Logs the chosen encoder so admins see what's
+        // wired without reading the source.
+        let detected = pharos_transcode::hwaccel::detect_available("ffmpeg").await;
+        let accel = cfg.server.hwaccel.resolve_auto(&detected);
+        tracing::info!(?accel, ?detected, "hardware encoder resolved");
+        state = state.with_hls_cache(
+            HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
+                .with_hwaccel(accel),
+        );
     }
     // P5 — subtitle cache, always on. Pure in-process; the only
     // tunables are bytes + entry cap. Disabled by setting both to 0.

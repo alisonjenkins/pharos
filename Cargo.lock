@@ -2569,6 +2569,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "pharos-core",
+ "serde",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

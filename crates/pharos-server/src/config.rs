@@ -50,6 +50,12 @@ pub struct ServerConfig {
     /// `trickplay_cache_dir` is set. Default `[320]`.
     #[serde(default = "default_trickplay_widths")]
     pub trickplay_widths: Vec<u32>,
+    /// P14 — hardware encoder selection. `"auto"` probes
+    /// `ffmpeg -hwaccels` at boot and prefers VideoToolbox →
+    /// NVENC → QSV → VAAPI in that order. `"off"` keeps the
+    /// software libx264 / libx265 path. Default `"auto"`.
+    #[serde(default)]
+    pub hwaccel: pharos_transcode::HwAccel,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.

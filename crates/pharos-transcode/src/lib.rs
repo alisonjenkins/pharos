@@ -11,8 +11,10 @@
 //! no IO traits leak into core. Transcoder swap (e.g. a future GPU-
 //! accelerated impl) happens at the wiring layer.
 
+pub mod hwaccel;
 pub mod options;
 
+pub use hwaccel::HwAccel;
 pub use options::{AudioCodec, Container, TranscodeOptions, VideoCodec};
 
 use bytes::Bytes;
@@ -37,6 +39,7 @@ pub enum TranscodeError {
 #[derive(Debug, Clone)]
 pub struct FfmpegTranscoder {
     ffmpeg_bin: PathBuf,
+    hwaccel: HwAccel,
 }
 
 impl Default for FfmpegTranscoder {
@@ -49,13 +52,27 @@ impl FfmpegTranscoder {
     pub fn new() -> Self {
         Self {
             ffmpeg_bin: PathBuf::from("ffmpeg"),
+            hwaccel: HwAccel::Off,
         }
     }
 
     pub fn with_binary(p: impl Into<PathBuf>) -> Self {
         Self {
             ffmpeg_bin: p.into(),
+            hwaccel: HwAccel::Off,
         }
+    }
+
+    /// P14 — attach a hardware encoder. `HwAccel::Off` keeps the
+    /// software libx264/libx265 path; anything else swaps the `-c:v`
+    /// to the matching platform encoder for h264 / hevc targets.
+    pub fn with_hwaccel(mut self, accel: HwAccel) -> Self {
+        self.hwaccel = accel;
+        self
+    }
+
+    pub fn hwaccel(&self) -> HwAccel {
+        self.hwaccel
     }
 
     pub fn binary(&self) -> &Path {
@@ -72,7 +89,7 @@ impl FfmpegTranscoder {
         opts: &TranscodeOptions,
     ) -> Result<TranscodeStream, TranscodeError> {
         let input_str = input.to_str().ok_or(TranscodeError::NonUtf8Path)?;
-        let args = build_args(input_str, opts);
+        let args = build_args_with_hwaccel(input_str, opts, self.hwaccel);
         let mut cmd = Command::new(&self.ffmpeg_bin);
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
@@ -171,7 +188,12 @@ fn escape_subtitles_path(p: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
+    build_args_with_hwaccel(input, opts, HwAccel::Off)
+}
+
+fn build_args_with_hwaccel(input: &str, opts: &TranscodeOptions, hwaccel: HwAccel) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -206,7 +228,15 @@ fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
         }
         Some(c) => {
             a.push("-c:v".into());
-            a.push(c.ffmpeg_codec().into());
+            // P14 — swap libx264/libx265 for the platform hw encoder
+            // when the transcoder was wired with one. Other codecs
+            // (no hw mapping) fall through to the software default.
+            let encoder = match c {
+                VideoCodec::H264 => hwaccel.h264_encoder().unwrap_or(c.ffmpeg_codec()),
+                VideoCodec::H265 => hwaccel.hevc_encoder().unwrap_or(c.ffmpeg_codec()),
+                _ => c.ffmpeg_codec(),
+            };
+            a.push(encoder.into());
             if let Some(b) = opts.video_bitrate_bps {
                 a.push("-b:v".into());
                 a.push(format!("{b}"));

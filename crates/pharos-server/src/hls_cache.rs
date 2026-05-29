@@ -118,6 +118,13 @@ impl HlsSegmentCache {
         self
     }
 
+    /// P14 — attach a hardware encoder to the underlying transcoder.
+    /// Pass `HwAccel::Off` for the software path.
+    pub fn with_hwaccel(mut self, accel: pharos_transcode::HwAccel) -> Self {
+        self.transcoder = self.transcoder.clone().with_hwaccel(accel);
+        self
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
