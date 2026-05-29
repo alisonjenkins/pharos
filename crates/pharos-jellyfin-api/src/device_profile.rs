@@ -161,17 +161,31 @@ pub fn codec_profile_passes(
     source_audio_channels: Option<u32>,
 ) -> bool {
     for cp in profiles {
-        if !cp.kind.is_empty() && !cp.kind.eq_ignore_ascii_case("Video") && source.is_video {
-            // Profile is scoped to a non-video kind — skip on video.
+        // Scope the profile by kind. "Audio" profiles never apply to a
+        // video source's video stream, and "Video" profiles never apply
+        // to an audio source. "VideoAudio"/empty apply to both.
+        let is_audio_profile = cp.kind.eq_ignore_ascii_case("Audio");
+        let is_video_profile = cp.kind.eq_ignore_ascii_case("Video");
+        if source.is_video && is_audio_profile {
+            continue;
+        }
+        if !source.is_video && is_video_profile {
             continue;
         }
         if !cp.codec.is_empty() {
             let want = cp.codec.to_ascii_lowercase();
-            let have = source
-                .video_codec
-                .as_deref()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            // Compare against the stream the profile is about: audio
+            // codec for an Audio profile (or an audio source), else the
+            // video codec. The previous code always compared the video
+            // codec, so Audio CodecProfile restrictions (e.g. a 2-channel
+            // AudioChannels cap) were silently dropped — too-permissive.
+            let compare_audio = is_audio_profile || !source.is_video;
+            let have = if compare_audio {
+                source.audio_codec.as_deref().unwrap_or("")
+            } else {
+                source.video_codec.as_deref().unwrap_or("")
+            }
+            .to_ascii_lowercase();
             // Codec may be CSV.
             let mut codec_matches = false;
             for token in want.split(',') {
@@ -192,23 +206,17 @@ pub fn codec_profile_passes(
                 "VideoLevel" => compare_numeric(
                     &cond.condition,
                     source_video_level.map(|n| n as i64),
-                    cond.value.parse::<i64>().ok(),
+                    &cond.value,
                 ),
                 "AudioChannels" => compare_numeric(
                     &cond.condition,
                     source_audio_channels.map(|n| n as i64),
-                    cond.value.parse::<i64>().ok(),
+                    &cond.value,
                 ),
-                "Width" => compare_numeric(
-                    &cond.condition,
-                    source.width.map(|n| n as i64),
-                    cond.value.parse::<i64>().ok(),
-                ),
-                "Height" => compare_numeric(
-                    &cond.condition,
-                    source.height.map(|n| n as i64),
-                    cond.value.parse::<i64>().ok(),
-                ),
+                "Width" => compare_numeric(&cond.condition, source.width.map(|n| n as i64), &cond.value),
+                "Height" => {
+                    compare_numeric(&cond.condition, source.height.map(|n| n as i64), &cond.value)
+                }
                 "VideoProfile" => compare_string(
                     &cond.condition,
                     source_video_profile,
@@ -224,16 +232,26 @@ pub fn codec_profile_passes(
     true
 }
 
-fn compare_numeric(op: &str, source: Option<i64>, target: Option<i64>) -> bool {
-    let (Some(s), Some(t)) = (source, target) else {
-        return true; // missing input — permissive
+fn compare_numeric(op: &str, source: Option<i64>, raw_target: &str) -> bool {
+    let Some(s) = source else {
+        return true; // missing source value — permissive
+    };
+    // Jellyfin delimits `EqualsAny` lists with the pipe `|`, e.g.
+    // Value="2|6". Membership over the pipe-separated tokens.
+    if op == "EqualsAny" {
+        return raw_target
+            .split('|')
+            .filter_map(|t| t.trim().parse::<i64>().ok())
+            .any(|t| s == t);
+    }
+    let Some(t) = raw_target.trim().parse::<i64>().ok() else {
+        return true; // unparseable single target — permissive
     };
     match op {
         "LessThanEqual" => s <= t,
         "GreaterThanEqual" => s >= t,
         "Equals" => s == t,
         "NotEquals" => s != t,
-        "EqualsAny" => s == t,
         _ => true,
     }
 }
@@ -245,7 +263,8 @@ fn compare_string(op: &str, source: Option<&str>, target: Option<&str>) -> bool 
     match op {
         "Equals" => s.eq_ignore_ascii_case(t),
         "NotEquals" => !s.eq_ignore_ascii_case(t),
-        "EqualsAny" => t.split(',').any(|opt| opt.trim().eq_ignore_ascii_case(s)),
+        // Jellyfin delimits EqualsAny with '|' (e.g. "high|main|baseline").
+        "EqualsAny" => t.split('|').any(|opt| opt.trim().eq_ignore_ascii_case(s)),
         _ => true,
     }
 }
@@ -407,6 +426,31 @@ fn pick_first_csv(csv: &str) -> Option<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equals_any_string_splits_on_pipe() {
+        // Jellyfin sends "high|main|baseline"; a "high" source must match.
+        assert!(compare_string(
+            "EqualsAny",
+            Some("high"),
+            Some("high|main|baseline")
+        ));
+        assert!(compare_string("EqualsAny", Some("MAIN"), Some("high|main")));
+        assert!(!compare_string("EqualsAny", Some("high10"), Some("high|main")));
+        // A comma value is a single token (not a delimiter) — no false match.
+        assert!(!compare_string("EqualsAny", Some("high"), Some("high,main")));
+    }
+
+    #[test]
+    fn equals_any_numeric_splits_on_pipe() {
+        assert!(compare_numeric("EqualsAny", Some(6), "2|6"));
+        assert!(!compare_numeric("EqualsAny", Some(8), "2|6"));
+        // Single-value numeric ops still work via the raw string.
+        assert!(compare_numeric("LessThanEqual", Some(2), "2"));
+        assert!(!compare_numeric("GreaterThanEqual", Some(1), "2"));
+        // Missing source → permissive.
+        assert!(compare_numeric("EqualsAny", None, "2|6"));
+    }
 
     fn dp(container: &str, video: &str, audio: &str, kind: &str) -> DirectPlayProfile {
         DirectPlayProfile {

@@ -511,17 +511,14 @@ async fn master_playlist(
         .body(body))
 }
 
-/// P22 — Cache-Control header for HLS playlists. Master stays
-/// cacheable for an hour (PSID-bound decisions stable for the
-/// session lifetime); variant + subtitle playlists 5 minutes so a
-/// re-negotiated bitrate cap or sub set propagates quickly.
-fn playlist_cache_control(is_master: bool) -> (actix_web::http::header::HeaderName, &'static str) {
-    let value = if is_master {
-        "public, max-age=3600"
-    } else {
-        "public, max-age=300"
-    };
-    (actix_web::http::header::CACHE_CONTROL, value)
+/// Cache-Control for HLS playlists. The playlist *body* embeds the
+/// caller's bearer token (`api_key=…` on every segment/sub URL), so it
+/// is per-user secret and MUST NOT be stored by any shared cache/CDN/
+/// proxy — `public` previously let a shared cache serve user A's token
+/// to user B (token leak). `no-store` keeps the token out of all caches;
+/// playlists are cheap to regenerate per request.
+fn playlist_cache_control(_is_master: bool) -> (actix_web::http::header::HeaderName, &'static str) {
+    (actix_web::http::header::CACHE_CONTROL, "no-store")
 }
 
 /// P18 — query-string-only parser for `StartTimeTicks`, mirroring

@@ -167,10 +167,17 @@ impl HlsSegmentCache {
         );
         let path = self.segment_path_keyed(key);
 
-        // Fast hit path: file present, just bump LRU.
+        // Fast hit path: file present, just bump LRU. A concurrent
+        // eviction can delete the file between try_exists and read; treat
+        // that NotFound as a miss and fall through to regenerate rather
+        // than surfacing a spurious 500 on a genuine cache hit.
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             self.touch(key).await;
-            return tokio::fs::read(&path).await.map_err(Into::into);
+            match tokio::fs::read(&path).await {
+                Ok(b) => return Ok(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */ }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         let lock = {
@@ -186,7 +193,11 @@ impl HlsSegmentCache {
         // Re-check: another task may have populated while we waited.
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             self.touch(key).await;
-            return tokio::fs::read(&path).await.map_err(Into::into);
+            match tokio::fs::read(&path).await {
+                Ok(b) => return Ok(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */ }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         if let Some(parent) = path.parent() {

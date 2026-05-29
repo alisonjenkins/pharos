@@ -123,6 +123,20 @@ mod tests {
             }
             Err(AuthError::UserNotFound)
         }
+        async fn set_password(
+            &self,
+            id: UserId,
+            password_hash: SecretString,
+        ) -> AuthResult<()> {
+            let mut g = self.by_name.lock().await;
+            for rec in g.values_mut() {
+                if rec.id == id {
+                    rec.password_hash = password_hash;
+                    return Ok(());
+                }
+            }
+            Err(AuthError::UserNotFound)
+        }
     }
 
     async fn fresh() -> BuiltinAuth<MemUsers> {

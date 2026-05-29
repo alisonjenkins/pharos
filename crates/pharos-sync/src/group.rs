@@ -397,7 +397,24 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // to another member's buffering, do nothing.
             if !state.group_paused_due_to_buffering && state.members.values().any(|m| m.buffering) {
                 state.group_paused_due_to_buffering = true;
-                let at_server_ms = state.server_ms_now() + MIN_LEAD_MS;
+                let server_ms = state.server_ms_now();
+                // Freeze playback state too, the same way LeaderPause does.
+                // Without this, `playback` stays `Playing` for the whole
+                // buffering window, so a member joining during the window
+                // hits the late-joiner catch-up and is told to *Play* —
+                // desynced from everyone else who is paused. (V19 buffer
+                // isolation.)
+                if let PlaybackState::Playing {
+                    position_ms,
+                    anchor_server_ms,
+                } = state.playback
+                {
+                    let elapsed = server_ms.saturating_sub(anchor_server_ms);
+                    state.playback = PlaybackState::Paused {
+                        position_ms: position_ms + elapsed,
+                    };
+                }
+                let at_server_ms = server_ms + MIN_LEAD_MS;
                 state.broadcast(ServerMsg::Pause { at_server_ms });
             }
         }
@@ -608,6 +625,48 @@ mod tests {
             }
         }
         assert_eq!(extra_pauses, 0, "buffer storm: extra Pauses observed");
+    }
+
+    #[tokio::test]
+    async fn late_joiner_during_buffer_pause_gets_pause_not_play() {
+        // V19: while the group is paused waiting on a buffering member, a
+        // freshly-joined member must NOT be told to Play (which would
+        // desync it from the paused cohort). The buffering pause freezes
+        // playback state, so the late joiner's catch-up yields Seek+Pause.
+        let (h, mut leader_rx, leader) = fresh().await;
+        let (m2, mut _m2_rx) = add_member(&h, "b").await;
+        while leader_rx.try_recv().is_ok() {}
+
+        // Leader is playing.
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        // m2 buffers → group pauses + freezes.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+
+        // Late joiner during the buffer-pause window.
+        let (_late, mut late_rx) = add_member(&h, "late").await;
+        // Collect a few messages; must include Pause and must NOT include Play.
+        let mut saw_pause = false;
+        let mut saw_play = false;
+        for _ in 0..6 {
+            match tokio::time::timeout(Duration::from_millis(100), late_rx.recv()).await {
+                Ok(Some(ServerMsg::Pause { .. })) => saw_pause = true,
+                Ok(Some(ServerMsg::Play { .. })) => saw_play = true,
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_pause, "late joiner should receive Pause");
+        assert!(!saw_play, "late joiner must NOT receive Play during buffer pause");
     }
 
     #[tokio::test]

@@ -45,16 +45,35 @@ impl GroupRegistry {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     Msg::GetOrCreate { group_id, reply } => {
-                        let handle = groups
-                            .entry(group_id)
-                            .or_insert_with(|| GroupHandle::spawn(group_id))
-                            .clone();
-                        // Detect a closed group (tx error on send-ping is overkill;
-                        // simplest: rely on Create on next request after a panic).
-                        let _ = reply.send(handle);
+                        // A group actor terminates (and closes its tx) when its
+                        // last member leaves. A stale, present-but-dead handle
+                        // must be respawned, else every future join to a reused
+                        // GroupId silently fails (`tx.send` → Err). Treat a
+                        // closed handle as absent.
+                        let needs_spawn = groups
+                            .get(&group_id)
+                            .map(|h| h.tx.is_closed())
+                            .unwrap_or(true);
+                        if needs_spawn {
+                            groups.insert(group_id, GroupHandle::spawn(group_id));
+                        }
+                        let handle = groups.get(&group_id).cloned();
+                        // Always Some — we just inserted if needed.
+                        if let Some(h) = handle {
+                            let _ = reply.send(h);
+                        }
                     }
                     Msg::Get { group_id, reply } => {
-                        let h = groups.get(&group_id).cloned();
+                        // Don't surface a dead handle. Drop the stale entry so
+                        // the map doesn't leak terminated groups.
+                        let h = match groups.get(&group_id) {
+                            Some(h) if !h.tx.is_closed() => Some(h.clone()),
+                            Some(_) => {
+                                groups.remove(&group_id);
+                                None
+                            }
+                            None => None,
+                        };
                         let _ = reply.send(h);
                     }
                     Msg::Create { reply } => {
@@ -64,6 +83,8 @@ impl GroupRegistry {
                         let _ = reply.send(h);
                     }
                     Msg::List { reply } => {
+                        // Prune terminated groups, surface only live ones.
+                        groups.retain(|_, h| !h.tx.is_closed());
                         let all: Vec<GroupHandle> = groups.values().cloned().collect();
                         let _ = reply.send(all);
                     }
@@ -146,5 +167,88 @@ mod tests {
         let r = GroupRegistry::spawn();
         let res = r.get(GroupId::new()).await.unwrap();
         assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_or_create_respawns_after_group_terminates() {
+        use crate::group::GroupMsg;
+        use crate::messages::MemberId;
+        use std::time::Duration;
+        use tokio::sync::{mpsc, oneshot};
+
+        let r = GroupRegistry::spawn();
+        let id = GroupId::new();
+        let h1 = r.get_or_create(id).await.unwrap();
+
+        // Add then remove the sole member → the actor empties + terminates.
+        let (sink, _rx) = mpsc::channel(8);
+        let mid = MemberId::new();
+        let (rtx, rrx) = oneshot::channel();
+        h1.tx
+            .send(GroupMsg::AddMember {
+                member_id: mid,
+                name: "x".into(),
+                sink,
+                reply: rtx,
+            })
+            .await
+            .unwrap();
+        let _ = rrx.await.unwrap();
+        h1.tx
+            .send(GroupMsg::RemoveMember { member_id: mid })
+            .await
+            .unwrap();
+
+        // Wait for the actor task to exit (its tx closes).
+        for _ in 0..200 {
+            if h1.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(h1.tx.is_closed(), "group actor should have terminated");
+
+        // The bug: registry returned the dead handle so every future join
+        // failed. Now it must respawn a LIVE one.
+        let h2 = r.get_or_create(id).await.unwrap();
+        assert!(!h2.tx.is_closed(), "respawned handle must be live");
+        assert_eq!(h2.group_id, id);
+    }
+
+    #[tokio::test]
+    async fn get_drops_dead_handle() {
+        use crate::group::GroupMsg;
+        use crate::messages::MemberId;
+        use std::time::Duration;
+        use tokio::sync::{mpsc, oneshot};
+
+        let r = GroupRegistry::spawn();
+        let h1 = r.create().await.unwrap();
+        let id = h1.group_id;
+        let (sink, _rx) = mpsc::channel(8);
+        let mid = MemberId::new();
+        let (rtx, rrx) = oneshot::channel();
+        h1.tx
+            .send(GroupMsg::AddMember {
+                member_id: mid,
+                name: "x".into(),
+                sink,
+                reply: rtx,
+            })
+            .await
+            .unwrap();
+        let _ = rrx.await.unwrap();
+        h1.tx
+            .send(GroupMsg::RemoveMember { member_id: mid })
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if h1.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // get() must not surface the dead handle.
+        assert!(r.get(id).await.unwrap().is_none());
     }
 }

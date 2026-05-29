@@ -369,16 +369,19 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
             .app_data(token_resolver_data.clone())
-            .wrap(cors)
-            // Lowercase the URI path before metrics + tracing capture
-            // it, so RedMetrics labels and TracingLogger spans use the
-            // canonical lowercase form (and label cardinality stays
-            // bounded). actix runs wraps in registration order, so
-            // this needs to sit between cors (outermost) and the
-            // observability layers below.
-            .wrap(LowercasePath)
-            .wrap(RedMetrics)
+            // actix runs `.wrap()` layers in REVERSE registration order
+            // (last registered = outermost = first on ingress). We want
+            // ingress order: cors -> LowercasePath -> RedMetrics ->
+            // TracingLogger -> router, so that the path is lowercased
+            // BEFORE RedMetrics/TracingLogger label it — otherwise
+            // jellyfin-web's PascalCase paths miss the (lowercase-only)
+            // route patterns and RedMetrics falls back to the concrete
+            // URI, exploding Prometheus label cardinality (one series per
+            // item id). To get that ingress order, register bottom-up.
             .wrap(TracingLogger::default())
+            .wrap(RedMetrics)
+            .wrap(LowercasePath)
+            .wrap(cors)
             .configure(router::configure);
         if let Some(path) = ui_dir.as_ref() {
             // Dioxus default-routes the SPA in hash mode unless configured

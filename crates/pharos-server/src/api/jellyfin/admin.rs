@@ -362,25 +362,18 @@ async fn set_user_password(
     let hash = auth
         .hash_password(&new_password)
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // No `set_password` on the store yet — refetch + recreate.
-    let mut record = state.stores.get(target).await.map_err(|e| match e {
-        AuthError::UserNotFound => error::ErrorNotFound("user not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
-    // Delete + re-create round-trips through a single transaction-like
-    // sequence; the sqlite cascade drops tokens, forcing a re-login on
-    // the user, which matches Jellyfin's behaviour.
+    // Atomic single-UPDATE password swap. The previous delete+create
+    // path could irreversibly destroy the account (+ cascaded tokens /
+    // user_data) if the re-create failed for any reason — a routine
+    // password change must never be able to lose a user.
     state
         .stores
-        .delete(record.id)
+        .set_password(target, hash)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    record.password_hash = hash;
-    state
-        .stores
-        .create(record)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| match e {
+            AuthError::UserNotFound => error::ErrorNotFound("user not found"),
+            other => error::ErrorInternalServerError(other.to_string()),
+        })?;
     Ok(HttpResponse::NoContent().finish())
 }
 

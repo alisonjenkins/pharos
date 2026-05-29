@@ -170,7 +170,13 @@ impl TrickplayCache {
 
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             self.touch(key).await;
-            return tokio::fs::read(&path).await.map_err(Into::into);
+            // Concurrent eviction may delete between try_exists and read;
+            // treat NotFound as a miss and regenerate rather than 500.
+            match tokio::fs::read(&path).await {
+                Ok(b) => return Ok(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
 
         let lock = {
@@ -187,7 +193,13 @@ impl TrickplayCache {
         // generated the set while we waited.
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             self.touch(key).await;
-            return tokio::fs::read(&path).await.map_err(Into::into);
+            // Concurrent eviction may delete between try_exists and read;
+            // treat NotFound as a miss and regenerate rather than 500.
+            match tokio::fs::read(&path).await {
+                Ok(b) => return Ok(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
 
         let bytes_written = self.generate(key, layout, source).await?;
@@ -267,20 +279,39 @@ impl TrickplayCache {
             ));
         }
 
-        // Move ffmpeg's 1-based outputs into 0-based final names.
+        // Move ffmpeg's 1-based outputs into 0-based final names. The
+        // real tile count depends on the decoded frame count, which
+        // routinely differs from the duration-metadata estimate
+        // (`layout.tile_count`) on VFR sources or with a rounded
+        // container duration. Stop at the first missing tile (treat it
+        // as end-of-output) instead of erroring — otherwise one missing
+        // trailing tile discarded the entire successfully-generated
+        // sprite set and 500'd every request for that item forever.
         let mut total: u64 = 0;
+        let mut produced: u32 = 0;
         for n in 1..=layout.tile_count {
             let from = tmp_dir.join(format!("{n}.jpg"));
             let to = dir.join(format!("{}.jpg", n - 1));
-            if let Err(e) = tokio::fs::rename(&from, &to).await {
-                let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-                return Err(TrickplayCacheError::Io(e));
-            }
-            if let Ok(meta) = tokio::fs::metadata(&to).await {
-                total = total.saturating_add(meta.len());
+            match tokio::fs::rename(&from, &to).await {
+                Ok(()) => {
+                    produced += 1;
+                    if let Ok(meta) = tokio::fs::metadata(&to).await {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+                    return Err(TrickplayCacheError::Io(e));
+                }
             }
         }
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        if produced == 0 {
+            // ffmpeg succeeded but emitted nothing usable — surface a
+            // duration error rather than caching an empty set.
+            return Err(TrickplayCacheError::UnknownDuration);
+        }
         Ok(total)
     }
 

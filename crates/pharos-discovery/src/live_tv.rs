@@ -187,11 +187,15 @@ fn parse_extinf(rest: &str) -> ExtinfMeta {
             // identifier ending in `=` — anything before is leftover
             // (`-1`, the previous value's neighbours, etc.).
             let trimmed = tok.trim_end_matches(|c: char| c.is_whitespace() || c == '=');
-            let key_start = trimmed
-                .rfind(|c: char| c.is_whitespace())
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let key = trimmed[key_start..].to_string();
+            // The key is the trailing whitespace-delimited token. Use
+            // `rsplit` rather than byte-index slicing so a multi-byte
+            // Unicode whitespace separator (e.g. NBSP) can't land us on a
+            // non-char-boundary and panic.
+            let key = trimmed
+                .rsplit(char::is_whitespace)
+                .next()
+                .unwrap_or(trimmed)
+                .to_string();
             let lower = key.to_ascii_lowercase();
             match lower.as_str() {
                 "tvg-id" => meta.tvg_id = Some(v),
@@ -288,23 +292,28 @@ fn extract_tag_text(body: &str, tag: &str) -> Option<String> {
 /// is optional but typically present.
 fn parse_xmltv_time_ms(s: &str) -> Option<u64> {
     let s = s.trim();
-    if s.len() < 14 {
-        return None;
-    }
-    let year: i64 = s[0..4].parse().ok()?;
-    let month: u32 = s[4..6].parse().ok()?;
-    let day: u32 = s[6..8].parse().ok()?;
-    let hour: u32 = s[8..10].parse().ok()?;
-    let minute: u32 = s[10..12].parse().ok()?;
-    let second: u32 = s[12..14].parse().ok()?;
+    // The attribute value is fully input-controlled (third-party EPG
+    // files). Operate on bytes via `get` so a multi-byte UTF-8 char that
+    // straddles a fixed index returns None instead of panicking on a
+    // non-char-boundary slice.
+    let b = s.as_bytes();
+    let field = |range: std::ops::Range<usize>| -> Option<&str> {
+        s.get(range).filter(|x| x.is_ascii())
+    };
+    let year: i64 = field(0..4)?.parse().ok()?;
+    let month: u32 = field(4..6)?.parse().ok()?;
+    let day: u32 = field(6..8)?.parse().ok()?;
+    let hour: u32 = field(8..10)?.parse().ok()?;
+    let minute: u32 = field(10..12)?.parse().ok()?;
+    let second: u32 = field(12..14)?.parse().ok()?;
     let offset_minutes: i64 = if s.len() >= 20 {
-        let sign = match s.as_bytes()[15] {
+        let sign = match b.get(15)? {
             b'+' => 1,
             b'-' => -1,
             _ => return None,
         };
-        let hh: i64 = s[16..18].parse().ok()?;
-        let mm: i64 = s[18..20].parse().ok()?;
+        let hh: i64 = field(16..18)?.parse().ok()?;
+        let mm: i64 = field(18..20)?.parse().ok()?;
         sign * (hh * 60 + mm)
     } else {
         0
@@ -354,6 +363,27 @@ pub async fn build_backend(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xmltv_time_multibyte_does_not_panic() {
+        // Multi-byte char straddling a fixed index must yield None, not
+        // panic. (é is 2 bytes; placing it inside the field region used
+        // to slice on a non-char boundary.)
+        assert!(parse_xmltv_time_ms("20é40101000000").is_none());
+        assert!(parse_xmltv_time_ms("2024010100000é +0000").is_none());
+        // Valid input still parses.
+        assert!(parse_xmltv_time_ms("20240101103000 +0000").is_some());
+    }
+
+    #[test]
+    fn extinf_nbsp_separator_does_not_panic() {
+        // A non-breaking space (U+00A0, 2 bytes) before a key used to
+        // panic on a non-char-boundary slice. Must parse without panic.
+        let line = "#EXTINF:-1\u{a0}tvg-id=\"x\" group-title=\"G\",Name";
+        let m3u = format!("#EXTM3U\n{line}\nhttp://e/x.ts\n");
+        let chans = parse_m3u(&m3u).unwrap();
+        assert_eq!(chans.len(), 1);
+    }
 
     const SAMPLE_M3U: &str = r#"#EXTM3U
 #EXTINF:-1 tvg-id="bbc1" tvg-logo="https://example/bbc.png" tvg-chno="1" group-title="UK",BBC One

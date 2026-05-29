@@ -115,6 +115,16 @@ pub trait UserStore: Send + Sync {
         id: UserId,
         policy: UserPolicy,
     ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+
+    /// Atomically replace a user's password hash (single UPDATE). The
+    /// password-change endpoint MUST use this rather than delete+create —
+    /// a failed re-create after a delete would irreversibly destroy the
+    /// account and all cascaded data.
+    fn set_password(
+        &self,
+        id: UserId,
+        password_hash: SecretString,
+    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 }
 
 /// Persistence of session tokens.
