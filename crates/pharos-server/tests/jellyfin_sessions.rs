@@ -160,6 +160,74 @@ async fn stopped_removes_session() {
 }
 
 #[actix_web::test]
+async fn capabilities_then_sessions_reflects_caps() {
+    // P39 — round-trip check. POST /Sessions/Capabilities must
+    // persist into the snapshot the GET /Sessions handler returns,
+    // and the JSON wire shape must use Jellyfin's PascalCase field
+    // names so jellyfin-web's remote-control UI greys the right
+    // buttons.
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+
+    // Start a session so the SetCapabilities event has a record to
+    // mutate alongside the stub-insert fallback.
+    test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/Sessions/Playing")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(serde_json::json!({
+                "ItemId": "100", "PlaySessionId":"sess-cap", "PositionTicks": 0u64
+            }))
+            .to_request(),
+    )
+    .await;
+
+    let caps = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/Sessions/Capabilities")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(serde_json::json!({
+                "Id": "sess-cap",
+                "PlayableMediaTypes": ["Video", "Audio"],
+                "SupportedCommands": ["VolumeUp", "VolumeDown", "Pause"],
+                "MaxStreamingBitrate": 8_000_000u64,
+                "SupportsMediaControl": true
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(caps.status(), 204);
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Sessions")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entry = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Id"] == "sess-cap")
+        .expect("session sess-cap missing from /Sessions snapshot");
+    assert_eq!(
+        entry["PlayableMediaTypes"],
+        serde_json::json!(["Video", "Audio"])
+    );
+    assert_eq!(
+        entry["SupportedCommands"],
+        serde_json::json!(["VolumeUp", "VolumeDown", "Pause"])
+    );
+    assert_eq!(entry["MaxStreamingBitrate"], 8_000_000u64);
+    assert_eq!(entry["SupportsMediaControl"], true);
+}
+
+#[actix_web::test]
 async fn capabilities_accepts_body_and_returns_204() {
     let (state, token) = seed().await;
     let app = test::init_service(build_app(state)).await;
