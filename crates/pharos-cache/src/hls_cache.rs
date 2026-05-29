@@ -88,6 +88,12 @@ pub struct HlsSegmentCache {
     root: PathBuf,
     max_bytes: u64,
     transcoder: FfmpegTranscoder,
+    /// When set, segment transcodes are dispatched through the
+    /// load-balancing scheduler (multi-GPU + all-CPU, crash-isolated
+    /// workers writing the segment file directly) instead of the inline
+    /// `transcoder`. `None` keeps the legacy single-ffmpeg path (tests,
+    /// or builds without a worker binary).
+    scheduler: Option<pharos_transcode::scheduler::TranscodeScheduler>,
     state: Arc<Mutex<CacheState>>,
 }
 
@@ -106,8 +112,21 @@ impl HlsSegmentCache {
             root: root.into(),
             max_bytes,
             transcoder: FfmpegTranscoder::new(),
+            scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
         }
+    }
+
+    /// Route segment transcodes through the load-balancing scheduler.
+    /// Each segment is dispatched to the least-loaded eligible device
+    /// (every GPU + the CPU), encoded by a crash-isolated worker that
+    /// writes the `.ts` file directly (no cross-process byte copy).
+    pub fn with_scheduler(
+        mut self,
+        sched: pharos_transcode::scheduler::TranscodeScheduler,
+    ) -> Self {
+        self.scheduler = Some(sched);
+        self
     }
 
     /// Override the ffmpeg binary path. Used by the integration tests
@@ -257,6 +276,23 @@ impl HlsSegmentCache {
         out: &Path,
     ) -> Result<(), HlsCacheError> {
         let _ = source.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
+        // Scheduler path: the worker writes the segment file itself,
+        // load-balanced across GPUs + CPU. We just await completion.
+        if let Some(sched) = &self.scheduler {
+            use pharos_transcode::scheduler::SinkRequest;
+            sched
+                .submit(
+                    source.to_path_buf(),
+                    opts.clone(),
+                    SinkRequest::FileDirect {
+                        out_path: out.to_path_buf(),
+                    },
+                )
+                .await
+                .map_err(|e| HlsCacheError::Transcode(e.to_string()))?;
+            return Ok(());
+        }
+        // Legacy inline path: one ffmpeg, stream to file.
         let mut stream = self
             .transcoder
             .transcode(source, opts)

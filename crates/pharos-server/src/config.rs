@@ -56,6 +56,14 @@ pub struct ServerConfig {
     /// software libx264 / libx265 path. Default `"auto"`.
     #[serde(default)]
     pub hwaccel: pharos_transcode::HwAccel,
+    /// Concurrent encode sessions to allow per hardware device (per GPU
+    /// / render node). The load-balancing transcode scheduler caps each
+    /// GPU at this many simultaneous segment encodes; the CPU device gets
+    /// one permit per logical core. Default 2 (a safe value for consumer
+    /// GPUs; raise for server-class cards). Set to 0 to disable the
+    /// scheduler and use the legacy single-ffmpeg path.
+    #[serde(default = "default_transcode_hw_session_cap")]
+    pub transcode_hw_session_cap: usize,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.
@@ -109,6 +117,10 @@ fn default_played_threshold_pct() -> u32 {
 
 fn default_transcode_cache_bytes() -> u64 {
     1024 * 1024 * 1024
+}
+
+fn default_transcode_hw_session_cap() -> usize {
+    2
 }
 
 fn default_trickplay_cache_bytes() -> u64 {

@@ -264,6 +264,44 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Build the load-balancing transcode scheduler. Returns `None` (so the
+/// caller falls back to the inline ffmpeg path) when the worker binary
+/// can't be brought up — validated by spawning one probe worker + reading
+/// its handshake before committing.
+async fn build_transcode_scheduler(
+    detected: &[pharos_transcode::HwAccel],
+    hw_session_cap: usize,
+) -> Option<pharos_transcode::scheduler::TranscodeScheduler> {
+    use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
+    use pharos_transcode::protocol::{DeviceId, WorkerId};
+    use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler, WorkerSpawner};
+    use pharos_transcode::worker::ProcSpawner;
+
+    // Probe: confirm a worker spawns + handshakes before wiring the
+    // scheduler. The probe worker is dropped (killed) immediately.
+    let probe = ProcSpawner::new();
+    if let Err(e) = probe.spawn(WorkerId(0)).await {
+        tracing::warn!(error = %e, worker = %probe.worker_bin().display(), "transcode worker probe failed");
+        return None;
+    }
+
+    let caps: Vec<(DeviceId, usize)> = enumerate(detected)
+        .into_iter()
+        .map(|d| (d, hw_session_cap.max(1)))
+        .collect();
+    let table = DeviceTable::from_probe(&caps, default_cpu_permits());
+    tracing::info!(
+        devices = caps.len(),
+        cpu_permits = default_cpu_permits(),
+        "transcode scheduler device table built"
+    );
+    Some(TranscodeScheduler::spawn(
+        table,
+        std::sync::Arc::new(ProcSpawner::new()),
+        SchedConfig::default(),
+    ))
+}
+
 async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
@@ -282,10 +320,24 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         let detected = pharos_transcode::hwaccel::detect_available("ffmpeg").await;
         let accel = cfg.server.hwaccel.resolve_auto(&detected);
         tracing::info!(?accel, ?detected, "hardware encoder resolved");
-        state = state.with_hls_cache(
-            HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
-                .with_hwaccel(accel),
-        );
+        let mut hls = HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
+            .with_hwaccel(accel);
+        // Bring up the load-balancing transcode scheduler (multi-GPU +
+        // all-CPU, crash-isolated workers). Falls back to the inline
+        // ffmpeg path when disabled or when the worker binary can't be
+        // brought up, so HLS keeps working on minimal deployments.
+        if cfg.server.transcode_hw_session_cap > 0 {
+            match build_transcode_scheduler(&detected, cfg.server.transcode_hw_session_cap).await {
+                Some(sched) => {
+                    tracing::info!("transcode scheduler enabled (load-balanced workers)");
+                    hls = hls.with_scheduler(sched);
+                }
+                None => tracing::warn!(
+                    "transcode worker unavailable; HLS uses the inline ffmpeg path"
+                ),
+            }
+        }
+        state = state.with_hls_cache(hls);
     }
     // P5 — subtitle cache, always on. Pure in-process; the only
     // tunables are bytes + entry cap. Disabled by setting both to 0.
