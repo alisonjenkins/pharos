@@ -92,12 +92,22 @@ async fn audio_universal(
     let qs = req.query_string();
     let acceptable = parse_audio_codec_list(qs);
     let bitrate = parse_max_streaming_bitrate(qs);
+    let max_channels = parse_max_audio_channels(qs);
     let source_codec = item.probe.audio_codec.as_deref().unwrap_or("");
+    let source_channels = item.probe.audio_channels.unwrap_or(0);
 
-    if acceptable.is_empty()
-        || acceptable
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(source_codec))
+    // P19 — when source channels exceed the cap, force a remux even
+    // when the codec matches (Direct path can't downmix). Downmix
+    // target is AAC at the supplied codec list's first acceptable
+    // hit, or AAC by default.
+    let needs_downmix =
+        max_channels.is_some_and(|cap| source_channels > 0 && source_channels > cap);
+
+    if !needs_downmix
+        && (acceptable.is_empty()
+            || acceptable
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(source_codec)))
     {
         // Direct path — defer to the existing delivery (StartTimeTicks
         // + Range honoured by `deliver_stream`).
@@ -112,13 +122,14 @@ async fn audio_universal(
         .find(|c| matches!(c.to_ascii_lowercase().as_str(), "aac"))
         .cloned()
         .unwrap_or_else(|| "aac".to_string());
-    audio_remux(&item, &target, bitrate).await
+    audio_remux(&item, &target, bitrate, max_channels).await
 }
 
 async fn audio_remux(
     item: &MediaItem,
     target_codec: &str,
     bitrate_bps: Option<u64>,
+    max_channels: Option<u32>,
 ) -> Result<HttpResponse, actix_web::Error> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -147,8 +158,14 @@ async fn audio_remux(
         .arg("-c:a")
         .arg(ffmpeg_codec)
         .arg("-b:a")
-        .arg(bitrate.to_string())
-        .arg("-f")
+        .arg(bitrate.to_string());
+    // P19 — downmix to the requested channel count when the client
+    // asked for one. ffmpeg's `-ac N` runs a default mix-down for
+    // surround → stereo / mono.
+    if let Some(n) = max_channels.filter(|n| *n > 0) {
+        cmd.arg("-ac").arg(n.to_string());
+    }
+    cmd.arg("-f")
         .arg(muxer)
         .arg("pipe:1")
         .stdin(Stdio::null())
@@ -197,6 +214,17 @@ fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
         if let Some((k, v)) = kv.split_once('=') {
             if k.eq_ignore_ascii_case("MaxStreamingBitrate") {
                 return v.parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
+fn parse_max_audio_channels(qs: &str) -> Option<u32> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("MaxAudioChannels") {
+                return v.parse::<u32>().ok();
             }
         }
     }
@@ -457,6 +485,14 @@ mod tests {
             parse_audio_codec_list("AudioCodec= aac , , mp3 "),
             vec!["aac", "mp3"]
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn parse_max_audio_channels_extracts_numeric_value() {
+        assert_eq!(parse_max_audio_channels("MaxAudioChannels=2"), Some(2));
+        assert_eq!(parse_max_audio_channels("maxaudiochannels=6"), Some(6));
+        assert_eq!(parse_max_audio_channels(""), None);
+        assert_eq!(parse_max_audio_channels("MaxAudioChannels=abc"), None);
     }
 
     #[::core::prelude::v1::test]
