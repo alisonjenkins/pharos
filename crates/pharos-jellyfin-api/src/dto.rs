@@ -778,7 +778,9 @@ pub fn album_id_for(name: &str) -> String {
     name_aggregate_id_for("album", name)
 }
 pub fn genre_id_for(name: &str) -> String {
-    name_aggregate_id_for("genre", name)
+    // LIB-C4 — delegate to core so the id matches the `genres.wire_id`
+    // the store stamps at upsert (single source of truth for the hash).
+    pharos_core::genre_wire_id(name)
 }
 fn name_aggregate_id_for(kind: &str, name: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;

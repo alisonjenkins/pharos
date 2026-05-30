@@ -1,7 +1,8 @@
 use crate::StoreError;
 use pharos_core::{
-    DomainError, DomainResult, Fingerprint, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore,
-    ScanState, SeriesInfo,
+    DomainError, DomainResult, Fingerprint, Genre, GenreCount, GenreStore, Library, LibraryKind,
+    LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaStore, ScanState,
+    SeriesInfo,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -460,6 +461,242 @@ impl MediaStore for SqliteStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(())
+    }
+}
+
+impl GenreStore for SqliteStore {
+    #[tracing::instrument(skip(self))]
+    async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
+        let wire_id = pharos_core::genre_wire_id(name);
+        // INSERT-OR-IGNORE on the UNIQUE name, then read the id back —
+        // works whether the row was just created or already existed.
+        sqlx::query(
+            "INSERT INTO genres (name, wire_id) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(&wire_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (id,) = sqlx::query_as::<_, (i64,)>("SELECT id FROM genres WHERE name = ?")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(id)
+    }
+
+    #[tracing::instrument(skip(self, names), fields(media.id = %item))]
+    async fn link_item_genres(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+        let item_i64 =
+            i64::try_from(item).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        // Normalise: trim, drop blanks, de-dup — the same set the
+        // /Genres list + ParentId pivot resolve against.
+        let mut wanted: Vec<String> = Vec::new();
+        for n in names {
+            let t = n.trim();
+            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                wanted.push(t.to_string());
+            }
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // Replace this item's links wholesale so a rescan that dropped a
+        // genre doesn't leave a stale join row.
+        sqlx::query("DELETE FROM item_genres WHERE item_id = ?")
+            .bind(item_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for name in &wanted {
+            let wire_id = pharos_core::genre_wire_id(name);
+            sqlx::query(
+                "INSERT INTO genres (name, wire_id) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&wire_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (gid,) = sqlx::query_as::<_, (i64,)>("SELECT id FROM genres WHERE name = ?")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            sqlx::query(
+                "INSERT INTO item_genres (item_id, genre_id) VALUES (?, ?) \
+                 ON CONFLICT(item_id, genre_id) DO NOTHING",
+            )
+            .bind(item_i64)
+            .bind(gid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn genres_with_counts(&self) -> DomainResult<Vec<GenreCount>> {
+        let rows = sqlx::query_as::<_, (i64, String, String, i64)>(
+            "SELECT g.id, g.name, g.wire_id, COUNT(ig.item_id) \
+             FROM genres g LEFT JOIN item_genres ig ON ig.genre_id = g.id \
+             GROUP BY g.id, g.name, g.wire_id ORDER BY g.name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, wire_id, count)| GenreCount {
+                genre: Genre { id, name, wire_id },
+                item_count: count.max(0) as u32,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn item_ids_for_genre(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "SELECT ig.item_id FROM item_genres ig \
+             JOIN genres g ON g.id = ig.genre_id \
+             WHERE g.wire_id = ? ORDER BY ig.item_id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn backfill_genres(&self) -> DomainResult<u64> {
+        // Read every (id, genre) pair, split the genre string, and
+        // re-link. link_item_genres is idempotent so this is safe to run
+        // repeatedly (e.g. lazily on the first /Genres after upgrade).
+        let rows = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id, genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for (id, genre) in rows {
+            let Some(raw) = genre else { continue };
+            let names = pharos_core::split_genre_field(&raw);
+            if names.is_empty() {
+                continue;
+            }
+            let mid = id as MediaId;
+            self.link_item_genres(mid, &names).await?;
+        }
+        let (total,) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM item_genres")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(total.max(0) as u64)
+    }
+}
+
+impl LibraryStore for SqliteStore {
+    #[tracing::instrument(skip(self))]
+    async fn upsert_library(
+        &self,
+        name: &str,
+        root_path: &str,
+        kind: LibraryKind,
+        wire_id: &str,
+    ) -> DomainResult<i64> {
+        let now = now_unix_secs();
+        // Upsert on the UNIQUE root_path: re-running with changed config
+        // refreshes the name/kind/wire_id but preserves created_at + id.
+        sqlx::query(
+            "INSERT INTO libraries (name, root_path, kind, wire_id, created_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(root_path) DO UPDATE SET name = excluded.name, \
+                kind = excluded.kind, wire_id = excluded.wire_id",
+        )
+        .bind(name)
+        .bind(root_path)
+        .bind(kind.collection_type())
+        .bind(wire_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (id,) = sqlx::query_as::<_, (i64,)>("SELECT id FROM libraries WHERE root_path = ?")
+            .bind(root_path)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(id)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn libraries(&self) -> DomainResult<Vec<Library>> {
+        let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
+            "SELECT id, name, root_path, kind, wire_id FROM libraries ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, root_path, kind, wire_id)| Library {
+                id,
+                name,
+                root_path,
+                kind: LibraryKind::parse(&kind),
+                wire_id,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn backfill_library_ids(&self) -> DomainResult<u64> {
+        // Path-boundary-safe: for each library, stamp every media_items row
+        // strictly under its root (root + '/'). root_like_pattern escapes
+        // wildcards + appends "/%", so /media/movies never claims
+        // /media/movies-4k. Longest-root-wins is not needed (roots don't
+        // nest in practice); a later root simply overwrites if it does.
+        let libs = self.libraries().await?;
+        let mut total: i64 = 0;
+        for lib in &libs {
+            let like = crate::root_like_pattern(&lib.root_path);
+            sqlx::query("UPDATE media_items SET library_id = ? WHERE path LIKE ? ESCAPE '\\'")
+                .bind(lib.id)
+                .bind(like)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        let (count,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM media_items WHERE library_id IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        total += count;
+        Ok(total.max(0) as u64)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn item_ids_for_library(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "SELECT m.id FROM media_items m \
+             JOIN libraries l ON l.id = m.library_id \
+             WHERE l.wire_id = ? ORDER BY m.id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
     }
 }
 

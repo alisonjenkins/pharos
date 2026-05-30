@@ -3,8 +3,8 @@
 
 use futures_util::stream::StreamExt;
 use pharos_core::{
-    AlternateMediaSource, DomainError, DomainResult, Fingerprint, MediaId, MediaItem, MediaKind,
-    MediaStore, Prober, ScanOutcome, Scanner, SeriesInfo,
+    AlternateMediaSource, DomainError, DomainResult, Fingerprint, GenreStore, MediaId, MediaItem,
+    MediaKind, MediaStore, Prober, ScanOutcome, Scanner, SeriesInfo,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -160,7 +160,7 @@ impl<P: Prober> FsScanner<P> {
     /// swept count is threaded into [`MediaStore::finish_scan`] and the
     /// deleted ids are logged at info (broadcasting deltas is A4).
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
-    pub async fn scan_into<S: MediaStore>(
+    pub async fn scan_into<S: MediaStore + GenreStore>(
         &self,
         root: &Path,
         store: &S,
@@ -346,7 +346,19 @@ impl<P: Prober> FsScanner<P> {
         while let Some((_id, sig, existed, fp, item)) = stream.next().await {
             let Some(item) = item else { continue };
             let item_id = item.id;
+            // LIB-C4 — capture genre names before `put` consumes the item.
+            let genres = item
+                .probe
+                .genre
+                .as_deref()
+                .map(pharos_core::split_genre_field)
+                .unwrap_or_default();
             store.put(item).await?;
+            // LIB-C4 — populate the item_genres join from the probe's
+            // (possibly comma/pipe-separated) genre string. The DISTINCT
+            // probe.genre column stays for back-compat; this is the
+            // entity-backed path /Genres + ParentId=<genre> resolve against.
+            store.link_item_genres(item_id, &genres).await?;
             // Persist the freshly-stat'd signature so the next scan can
             // skip this file. mark_seen is an UPDATE — the put() above
             // guarantees the row exists first.
@@ -407,7 +419,7 @@ impl<P: Prober> FsScanner<P> {
     /// right delta. Errors only on a store failure — a probe / stat / hash
     /// failure on the one file is logged and yields [`PathUpdate::Skipped`]
     /// (V6: a bad file never aborts the watcher loop).
-    pub async fn update_path<S: MediaStore>(
+    pub async fn update_path<S: MediaStore + GenreStore>(
         &self,
         path: &Path,
         store: &S,
@@ -484,7 +496,7 @@ impl<P: Prober> FsScanner<P> {
     /// LIB-A8 — probe a single path and persist it (the create/modify tail
     /// shared by [`update_path`]). `existed` drives the added-vs-updated
     /// result; `fp` is reused when already computed during move-detect.
-    async fn probe_put_one<S: MediaStore>(
+    async fn probe_put_one<S: MediaStore + GenreStore>(
         &self,
         path: &Path,
         store: &S,
@@ -505,7 +517,16 @@ impl<P: Prober> FsScanner<P> {
             return Ok(PathUpdate::Skipped);
         };
         let item_id = item.id;
+        // LIB-C4 — capture genres before `put` consumes the item.
+        let genres = item
+            .probe
+            .genre
+            .as_deref()
+            .map(pharos_core::split_genre_field)
+            .unwrap_or_default();
         store.put(item).await?;
+        // LIB-C4 — keep the item_genres join in step with the probe.
+        store.link_item_genres(item_id, &genres).await?;
         if let Some((mtime, size)) = sig {
             store.mark_seen(item_id, scan_id, mtime, size).await?;
         }
@@ -1036,6 +1057,8 @@ mod tests {
         states: Mutex<HashMap<MediaId, ScanState>>,
         fps: Mutex<HashMap<MediaId, pharos_core::Fingerprint>>,
         next_scan_id: AtomicI64,
+        // LIB-C4 — item_genres mirror: item id → its linked genre names.
+        item_genres: Mutex<HashMap<MediaId, Vec<String>>>,
     }
 
     impl MediaStore for MemStore {
@@ -1199,10 +1222,107 @@ mod tests {
         }
     }
 
+    // LIB-C4 — minimal in-memory GenreStore so the scanner's
+    // link-on-write path can be exercised without the sqlx store.
+    impl GenreStore for MemStore {
+        async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
+            // Deterministic surrogate id from the wire id's prefix.
+            let wid = pharos_core::genre_wire_id(name);
+            let id = i64::from_str_radix(&wid[..15], 16).unwrap_or(0);
+            Ok(id)
+        }
+        async fn link_item_genres(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+            let mut wanted: Vec<String> = Vec::new();
+            for n in names {
+                let t = n.trim();
+                if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                    wanted.push(t.to_string());
+                }
+            }
+            self.item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(item, wanted);
+            Ok(())
+        }
+        async fn genres_with_counts(&self) -> DomainResult<Vec<pharos_core::GenreCount>> {
+            use std::collections::BTreeMap;
+            let links = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+            for names in links.values() {
+                for n in names {
+                    *counts.entry(n.clone()).or_insert(0) += 1;
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .map(|(name, item_count)| pharos_core::GenreCount {
+                    genre: pharos_core::Genre {
+                        id: 0,
+                        wire_id: pharos_core::genre_wire_id(&name),
+                        name,
+                    },
+                    item_count,
+                })
+                .collect())
+        }
+        async fn item_ids_for_genre(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            let links = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut ids: Vec<MediaId> = links
+                .iter()
+                .filter(|(_, names)| {
+                    names
+                        .iter()
+                        .any(|n| pharos_core::genre_wire_id(n) == wire_id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        }
+        async fn backfill_genres(&self) -> DomainResult<u64> {
+            let items: Vec<(MediaId, Option<String>)> = {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|e| DomainError::Backend(e.to_string()))?;
+                inner
+                    .iter()
+                    .map(|(id, item)| (*id, item.probe.genre.clone()))
+                    .collect()
+            };
+            for (id, genre) in items {
+                if let Some(raw) = genre {
+                    let names = pharos_core::split_genre_field(&raw);
+                    if !names.is_empty() {
+                        self.link_item_genres(id, &names).await?;
+                    }
+                }
+            }
+            let total: usize = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .map(Vec::len)
+                .sum();
+            Ok(total as u64)
+        }
+    }
+
     #[derive(Clone, Default)]
     struct FakeProber {
         calls: Arc<AtomicUsize>,
         force_fail_for: Option<String>,
+        // LIB-C4 — when set, every probed item carries this genre string
+        // so the scanner's link-on-write path can be asserted.
+        genre: Option<String>,
     }
 
     impl Prober for FakeProber {
@@ -1297,6 +1417,33 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_populates_item_genres_join_from_probe_genre() {
+        // LIB-C4 — scanning a file whose probe carries a comma/pipe
+        // separated genre string links it into the item_genres join, and
+        // the genre's wire id resolves the item back.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "movie.mkv", b"aaaa").await;
+        let prober = FakeProber {
+            genre: Some("Action, Sci-Fi".into()),
+            ..Default::default()
+        };
+        let s = FsScanner::new(prober);
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+        let item_id = store.list().await.unwrap()[0].id;
+
+        use pharos_core::{genre_wire_id, GenreStore};
+        let rows = store.genres_with_counts().await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|g| g.genre.name.as_str()).collect();
+        assert_eq!(names, vec!["Action", "Sci-Fi"]);
+        let ids = store
+            .item_ids_for_genre(&genre_wire_id("Action"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![item_id]);
     }
 
     #[tokio::test]

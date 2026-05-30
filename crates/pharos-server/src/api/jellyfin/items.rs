@@ -294,30 +294,34 @@ async fn list_genres(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    use crate::api::jellyfin::dto::genre_id_for;
-    use std::collections::HashSet;
-    let all = state
+    use pharos_core::GenreStore;
+    // LIB-C4 — genres are now entity rows. Lazily backfill the join from
+    // the legacy probe.genre strings on first read after upgrade so rows
+    // scanned before C4 still surface (idempotent; later scans keep the
+    // join current). Then list the rows with their item counts; the `Id`
+    // stays the 32-hex genre_id_for(name) wire id (= genres.wire_id) so
+    // existing client URLs + the /Items?ParentId pivot keep resolving.
+    state
         .stores
-        .list()
+        .backfill_genres()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut genres: Vec<&str> = all
+    let rows = state
+        .stores
+        .genres_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let items: Vec<serde_json::Value> = rows
         .iter()
-        .filter_map(|i| i.probe.genre.as_deref())
-        .filter(|g| !g.is_empty() && seen.insert(g.to_string()))
-        .collect();
-    genres.sort_unstable();
-    let items: Vec<serde_json::Value> = genres
-        .iter()
-        .map(|g| {
+        .map(|gc| {
             serde_json::json!({
-                "Id": genre_id_for(g),
-                "Name": g,
+                "Id": gc.genre.wire_id,
+                "Name": gc.genre.name,
                 "ServerId": state.server_id,
                 "Type": "Genre",
                 "MediaType": "Unknown",
                 "IsFolder": true,
+                "ChildCount": gc.item_count,
             })
         })
         .collect();
@@ -1406,12 +1410,23 @@ fn restrict_to_parent(
             })
             .collect();
     }
-    // 6) Genre id → every item tagged with that genre.
+    // 6) Genre id → every item tagged with that genre. LIB-C4: resolve
+    //    via the genres.wire_id → item_genres → items indexed join when
+    //    the genre is a real row (the entity-backed exact pivot). If the
+    //    wire id matches no genre row yet (rows scanned before C4 and not
+    //    backfilled), fall back to the legacy in-memory probe.genre scan.
+    if let Ok(ids) = state.stores.item_ids_for_genre(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+        }
+    }
     if items.iter().any(|i| {
         i.probe
             .genre
             .as_deref()
-            .is_some_and(|g| genre_id_for(g) == pid)
+            .map(pharos_core::split_genre_field)
+            .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
     }) {
         return items
             .into_iter()
@@ -1419,7 +1434,8 @@ fn restrict_to_parent(
                 i.probe
                     .genre
                     .as_deref()
-                    .is_some_and(|g| genre_id_for(g) == pid)
+                    .map(pharos_core::split_genre_field)
+                    .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
             })
             .collect();
     }

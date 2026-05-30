@@ -8854,6 +8854,11 @@ rec {
             name = "workspace-hack";
             packageId = "workspace-hack";
           }
+          {
+            name = "xxhash-rust";
+            packageId = "xxhash-rust";
+            features = [ "xxh3" ];
+          }
         ];
         devDependencies = [
           {
