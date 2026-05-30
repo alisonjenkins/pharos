@@ -1,0 +1,165 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pharos.fullname" . }}
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: {{ .Values.strategy }}
+  selector:
+    matchLabels:
+      {{- include "pharos.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include "pharos.configToml" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "pharos.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.gpu.nvidia.enabled }}
+      runtimeClassName: {{ .Values.gpu.nvidia.runtimeClassName }}
+      {{- end }}
+      {{- if .Values.scan.initContainer }}
+      initContainers:
+        - name: scan
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/pharos/config.toml", "scan"]
+          env:
+            - name: PHAROS_LOG_LEVEL
+              value: {{ .Values.config.obs.logLevel | quote }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pharos
+              readOnly: true
+            {{- if eq (include "pharos.usesSqlite" .) "true" }}
+            - name: db
+              mountPath: /var/lib/pharos/db
+            {{- end }}
+            - name: media
+              mountPath: /var/lib/pharos/media
+              readOnly: {{ .Values.persistence.media.readOnly }}
+            - name: tmp
+              mountPath: /tmp
+      {{- end }}
+      containers:
+        - name: pharos
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/pharos/config.toml", "serve"]
+          env:
+            - name: PHAROS_BIND
+              value: {{ .Values.config.server.bind | quote }}
+            - name: PHAROS_LOG_LEVEL
+              value: {{ .Values.config.obs.logLevel | quote }}
+            {{- if .Values.config.obs.otlpEndpoint }}
+            - name: PHAROS_OTLP_ENDPOINT
+              value: {{ .Values.config.obs.otlpEndpoint | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8096
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pharos
+              readOnly: true
+            {{- if eq (include "pharos.usesSqlite" .) "true" }}
+            - name: db
+              mountPath: /var/lib/pharos/db
+            {{- end }}
+            - name: cache
+              mountPath: /var/lib/pharos/cache
+            - name: media
+              mountPath: /var/lib/pharos/media
+              readOnly: {{ .Values.persistence.media.readOnly }}
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.gpu.vaapi.enabled }}
+            - name: dri
+              mountPath: {{ .Values.gpu.vaapi.devicePath }}
+            {{- end }}
+          {{- if .Values.gpu.nvidia.enabled }}
+          # NVENC: also request a GPU; resources.limits merged below.
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pharos.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+        {{- if eq (include "pharos.usesSqlite" .) "true" }}
+        - name: db
+          {{- if .Values.persistence.db.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "pharos.fullname" . }}-db
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        - name: cache
+          {{- if .Values.persistence.cache.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "pharos.fullname" . }}-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: media
+          {{- $m := .Values.persistence.media }}
+          {{- if eq $m.type "existingClaim" }}
+          persistentVolumeClaim:
+            claimName: {{ required "persistence.media.existingClaim is required when type=existingClaim" $m.existingClaim }}
+          {{- else if eq $m.type "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ include "pharos.fullname" . }}-media
+          {{- else if eq $m.type "hostPath" }}
+          hostPath:
+            path: {{ required "persistence.media.hostPath is required when type=hostPath" $m.hostPath }}
+          {{- else if eq $m.type "nfs" }}
+          nfs:
+            server: {{ required "persistence.media.nfs.server is required" $m.nfs.server }}
+            path: {{ required "persistence.media.nfs.path is required" $m.nfs.path }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.gpu.vaapi.enabled }}
+        - name: dri
+          hostPath:
+            path: {{ .Values.gpu.vaapi.devicePath }}
+        {{- end }}

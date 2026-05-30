@@ -194,3 +194,37 @@ diagrams:
       echo "no docs/*.d2 sources found"
       exit 1
     fi
+
+# ── Kubernetes / Tilt (charts/pharos + Tiltfile) ──────────────────
+# Create a local kind cluster (if absent) + start the Tilt inner-loop.
+# kind/tilt/helm/kubectl come from the nix devShell.
+KIND_CLUSTER := "pharos"
+
+tilt-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! kind get clusters | grep -qx "{{KIND_CLUSTER}}"; then
+      echo "creating kind cluster {{KIND_CLUSTER}}…"
+      kind create cluster --name "{{KIND_CLUSTER}}"
+    fi
+    kubectl config use-context "kind-{{KIND_CLUSTER}}"
+    tilt up
+
+# Stop Tilt (tears down the deployed resources). Pass `delete=1` to also
+# delete the kind cluster.
+tilt-down delete="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tilt down || true
+    if [ "{{delete}}" = "1" ]; then
+      kind delete cluster --name "{{KIND_CLUSTER}}"
+    fi
+
+# Lint the Helm chart.
+helm-lint:
+    nix develop --command helm lint charts/pharos
+
+# Render the chart to stdout (override values with `args`, e.g.
+# `just helm-template '--set ui.enabled=false'`).
+helm-template *args:
+    nix develop --command helm template pharos charts/pharos {{args}}

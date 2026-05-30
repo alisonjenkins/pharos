@@ -1,0 +1,196 @@
+# Default values for the pharos chart.
+# Production-leaning defaults: SQLite on a PVC, single replica (sqlite is a
+# single-writer), local-artwork/transcode caches on a PVC, media read-only.
+
+image:
+  repository: pharos
+  # Overridden by Tilt / your registry. The nix-built image is `pharos:latest`.
+  tag: "latest"
+  pullPolicy: IfNotPresent
+pullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# replicas is intentionally fixed at 1: SQLite is single-writer and the
+# in-process caches/transcode-scheduler are not HA-safe. Use an external
+# Postgres (config.database.url) before considering >1 — and even then the
+# app is not yet horizontally scalable, so this stays 1.
+strategy: Recreate
+
+# ── pharos config.toml, rendered into a ConfigMap mounted at
+#    /etc/pharos/config.toml. Optional fields are omitted when null/empty.
+config:
+  server:
+    bind: "0.0.0.0:8096"
+    name: "pharos"
+    # In-image Dioxus UI bundle path (only if the image was built with it).
+    # Leave null to use the optional jellyfin-web UI deployment instead.
+    uiDir: null
+    # Caches live under the cache volume (see persistence.cache).
+    imageCacheDir: "/var/lib/pharos/cache/images"
+    imageSeekSeconds: 30
+    transcodeCacheDir: "/var/lib/pharos/cache/transcode"
+    transcodeCacheMaxBytes: 1073741824      # 1 GiB
+    trickplayCacheDir: "/var/lib/pharos/cache/trickplay"
+    trickplayCacheMaxBytes: 268435456       # 256 MiB
+    trickplayIntervalMs: 10000
+    trickplayWidths: [320, 640, 1280]
+    # auto | off | VideoToolbox | NVENC | QSV | VAAPI. With a hw value set,
+    # see `gpu` below to expose the device.
+    hwaccel: "auto"
+    transcodeHwSessionCap: 2
+    transcodeProbeCaps: true
+    subtitleCacheMaxBytes: 67108864         # 64 MiB
+    subtitleCacheMaxEntries: 1024
+    liveTvM3u: null
+    liveTvXmltv: null
+    ssdpEnabled: false
+    ssdpAdvertiseUrl: null
+    playedThresholdPct: 90
+    scanRateLimitMs: 0
+    libraryWatchEnabled: true
+    libraryPollIntervalSecs: 300
+  obs:
+    logLevel: "info"
+    otlpEndpoint: null
+    logDir: null
+  media:
+    # Plain roots (each becomes a "mixed" library named after its basename).
+    roots:
+      - "/var/lib/pharos/media"
+    # Typed libraries (LIB-C1). Each: {path, name?, kind: movies|tvshows|music|mixed}.
+    libraries: []
+  database:
+    # SQLite on the db PVC by default. Set a postgres:// URL to use Postgres
+    # (the db PVC is then not created).
+    url: "sqlite:///var/lib/pharos/db/pharos.db?mode=rwc"
+
+# ── Persistence
+persistence:
+  db:
+    # Only used when config.database.url is a sqlite URL.
+    enabled: true
+    size: 1Gi
+    storageClass: null          # null = cluster default
+    accessMode: ReadWriteOnce
+  cache:
+    enabled: true               # false → emptyDir
+    size: 5Gi
+    storageClass: null
+    accessMode: ReadWriteOnce
+  media:
+    # How the read-only media root is provided. One of:
+    #   existingClaim | pvc | hostPath | nfs | emptyDir
+    type: emptyDir
+    existingClaim: ""
+    pvc:
+      size: 100Gi
+      storageClass: null
+      accessMode: ReadWriteMany
+    hostPath: ""
+    nfs:
+      server: ""
+      path: ""
+    readOnly: true
+
+service:
+  type: ClusterIP
+  port: 8096
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""                 # e.g. "traefik"
+  annotations: {}               # e.g. cert-manager.io/cluster-issuer: letsencrypt
+  hosts:
+    - host: pharos.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Prometheus-operator ServiceMonitor scraping /metrics.
+serviceMonitor:
+  enabled: false
+  namespace: ""                 # default: release namespace
+  interval: 30s
+  labels: {}                    # e.g. release: kube-prometheus-stack
+
+# Library scan.
+scan:
+  # Run `pharos scan` as an initContainer before `serve` starts. This
+  # populates the library on first boot (the server's poll tier skips its
+  # first tick, so without this a fresh deploy is empty until the first
+  # poll interval). Same pod + db volume → sqlite-safe (sequential, no
+  # concurrent writer). On large libraries an incremental rescan is cheap.
+  initContainer: true
+  # Optional separate CronJob running `pharos scan`. Intended for Postgres
+  # (multi-writer) or when you set config.server.libraryPollIntervalSecs=0
+  # to disable the in-process poll. With SQLite + the in-process poll on,
+  # leave this off (a concurrent scan pod would contend on the db lock).
+  cron:
+    enabled: false
+    schedule: "0 * * * *"
+
+# Optional UI: deploy the pinned jellyfin-web image as the web client.
+# (When config.server.uiDir is set to an in-image bundle, you can leave this off.)
+ui:
+  enabled: true
+  image:
+    repository: pharos-jellyfin-web
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  port: 8097
+  service:
+    type: ClusterIP
+
+# GPU passthrough for hardware transcode (config.server.hwaccel != off/auto-cpu).
+gpu:
+  # VAAPI: mount /dev/dri (needs a privileged-ish securityContext or a device
+  # plugin). NVENC: set runtimeClassName + nvidia.com/gpu resource.
+  vaapi:
+    enabled: false
+    devicePath: /dev/dri
+  nvidia:
+    enabled: false
+    runtimeClassName: nvidia
+    count: 1
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "4"
+    memory: 2Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false   # ffmpeg/tokio want a writable /tmp
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10

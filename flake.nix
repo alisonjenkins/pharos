@@ -58,6 +58,15 @@
 
         pharos = cargoNix.workspaceMembers."pharos-server".build;
 
+        # The out-of-process transcode worker (crash-isolated HLS/segment
+        # encoder + libav tiny-op pool). Same build graph as the server.
+        # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
+        # so the scheduler uses the worker pool instead of the inline-ffmpeg
+        # fallback (the two binaries live in distinct store paths, so the
+        # server's sibling-of-exe discovery can't find it — the env var is
+        # the explicit first-choice lookup in worker/proc.rs).
+        transcodeWorker = cargoNix.workspaceMembers."pharos-transcode".build;
+
         # ─── Creative-Commons test media ──────────────────────────
         # Pinned URLs + sha256 so the corpus is bit-identical across
         # hosts. Licenses recorded inline so the audit trail lives
@@ -353,6 +362,7 @@
           architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
           contents = [
             pharos
+            transcodeWorker
             pkgs.ffmpeg-headless
             pkgs.cacert
             pkgs.tzdata
@@ -370,7 +380,10 @@
             };
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "PATH=${pharos}/bin:${pkgs.ffmpeg-headless}/bin"
+              "PATH=${pharos}/bin:${transcodeWorker}/bin:${pkgs.ffmpeg-headless}/bin"
+              # Explicit worker path so the transcode scheduler uses the
+              # crash-isolated worker pool, not the inline-ffmpeg fallback.
+              "PHAROS_TRANSCODE_WORKER=${transcodeWorker}/bin/transcode-worker"
             ];
             WorkingDir = "/var/lib/pharos";
           };
@@ -499,6 +512,15 @@
             pkgs.git
             pkgs.just
             pkgs.curl
+            # k8s deploy + Tilt inner-loop (charts/pharos + Tiltfile).
+            # `just tilt-up` uses kind (Tilt-managed local cluster), loads
+            # the nix-built OCI image directly (no registry), and deploys
+            # the Helm chart. helm renders/lint the chart; kubectl for ops.
+            pkgs.kubernetes-helm
+            pkgs.kind
+            pkgs.kubectl
+            pkgs.tilt
+            pkgs.docker-client
             # Node + Playwright drive T29 phase 3. jellyfin-web is the
             # upstream prebuilt static bundle, referenced via
             # JELLYFIN_WEB_DIR at runtime. Browser binaries come from the

@@ -1,0 +1,72 @@
+{{- if .Values.scan.cron.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pharos.fullname" . }}-scan
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.scan.cron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "pharos.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: scan
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["--config", "/etc/pharos/config.toml", "scan"]
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/pharos
+                  readOnly: true
+                {{- if eq (include "pharos.usesSqlite" .) "true" }}
+                - name: db
+                  mountPath: /var/lib/pharos/db
+                {{- end }}
+                - name: media
+                  mountPath: /var/lib/pharos/media
+                  readOnly: {{ .Values.persistence.media.readOnly }}
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: config
+              configMap:
+                name: {{ include "pharos.fullname" . }}-config
+            - name: tmp
+              emptyDir: {}
+            {{- if eq (include "pharos.usesSqlite" .) "true" }}
+            - name: db
+              persistentVolumeClaim:
+                claimName: {{ include "pharos.fullname" . }}-db
+            {{- end }}
+            - name: media
+              {{- $m := .Values.persistence.media }}
+              {{- if eq $m.type "existingClaim" }}
+              persistentVolumeClaim:
+                claimName: {{ $m.existingClaim }}
+              {{- else if eq $m.type "pvc" }}
+              persistentVolumeClaim:
+                claimName: {{ include "pharos.fullname" . }}-media
+              {{- else if eq $m.type "hostPath" }}
+              hostPath:
+                path: {{ $m.hostPath }}
+              {{- else if eq $m.type "nfs" }}
+              nfs:
+                server: {{ $m.nfs.server }}
+                path: {{ $m.nfs.path }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+{{- end }}

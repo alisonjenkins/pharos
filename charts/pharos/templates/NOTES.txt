@@ -1,0 +1,32 @@
+pharos {{ .Chart.AppVersion }} deployed as {{ include "pharos.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Database: {{ if eq (include "pharos.usesSqlite" .) "true" }}SQLite (PVC {{ include "pharos.fullname" . }}-db){{ else }}external — {{ .Values.config.database.url }}{{ end }}
+Media:    {{ .Values.persistence.media.type }}{{ if eq .Values.persistence.media.type "existingClaim" }} ({{ .Values.persistence.media.existingClaim }}){{ end }}
+
+Reach the API:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pharos.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://127.0.0.1:{{ .Values.service.port }}/healthz
+  curl http://127.0.0.1:{{ .Values.service.port }}/System/Info/Public
+
+{{- if .Values.ui.enabled }}
+
+Web UI (jellyfin-web):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pharos.fullname" . }}-ui {{ .Values.ui.port }}:{{ .Values.ui.port }}
+  open http://127.0.0.1:{{ .Values.ui.port }}  (add server: http://<pharos-host>:{{ .Values.service.port }})
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+Ingress:
+{{- range .Values.ingress.hosts }}
+  http://{{ .host }}
+{{- end }}
+{{- end }}
+
+Probes: liveness /healthz · readiness /readyz · metrics /metrics
+{{- if not .Values.scan.initContainer }}
+
+NOTE: scan.initContainer is off — a fresh library stays empty until the first
+poll ({{ .Values.config.server.libraryPollIntervalSecs }}s) or a watch event.
+Run a one-shot scan with:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "pharos.fullname" . }} -- pharos --config /etc/pharos/config.toml scan
+{{- end }}
