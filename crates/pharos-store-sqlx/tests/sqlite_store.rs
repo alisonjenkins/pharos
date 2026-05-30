@@ -751,3 +751,392 @@ async fn item_ids_for_unknown_library_wire_is_empty() {
         .unwrap()
         .is_empty());
 }
+
+// ---- LIB-C3: studios as entities ------------------------------------
+
+#[tokio::test]
+async fn studio_wire_id_matches_dto_helper_and_resolves_items() {
+    // LIB-C3 — /Items?ParentId=studio_id_for("Warner Bros.") resolves to
+    // the linked item via the wire_id index (exact pivot).
+    use pharos_core::{studio_wire_id, StudioStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_studios(1, &["Warner Bros.".into(), "Village Roadshow".into()])
+        .await
+        .unwrap();
+    let rows = s.studios_with_counts().await.unwrap();
+    let names: Vec<&str> = rows.iter().map(|c| c.studio.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Village Roadshow", "Warner Bros."],
+        "ordered by name"
+    );
+    let wb = rows
+        .iter()
+        .find(|c| c.studio.name == "Warner Bros.")
+        .unwrap();
+    assert_eq!(wb.studio.wire_id, studio_wire_id("Warner Bros."));
+    assert_eq!(wb.item_count, 1);
+    let ids = s
+        .item_ids_for_studio(&studio_wire_id("Warner Bros."))
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1]);
+    // An unknown wire id resolves to no items.
+    assert!(s
+        .item_ids_for_studio("ffffffffffffffffffffffffffffffff")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn shared_studio_increments_count_across_items() {
+    // LIB-C3 — a second item sharing a studio bumps that studio's count
+    // and both items resolve under the shared studio id.
+    use pharos_core::{studio_wire_id, StudioStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(2, "/m/b.mkv", "B", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_studios(1, &["Warner Bros.".into(), "Village Roadshow".into()])
+        .await
+        .unwrap();
+    s.link_item_studios(2, &["Warner Bros.".into()])
+        .await
+        .unwrap();
+    let rows = s.studios_with_counts().await.unwrap();
+    let wb = rows
+        .iter()
+        .find(|c| c.studio.name == "Warner Bros.")
+        .unwrap();
+    let vr = rows
+        .iter()
+        .find(|c| c.studio.name == "Village Roadshow")
+        .unwrap();
+    assert_eq!(wb.item_count, 2, "Warner Bros. shared by both items");
+    assert_eq!(vr.item_count, 1, "Village Roadshow on one item");
+    let mut ids = s
+        .item_ids_for_studio(&studio_wire_id("Warner Bros."))
+        .await
+        .unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn link_item_studios_replaces_stale_links() {
+    // A rescan that drops a studio clears the stale join row.
+    use pharos_core::{studio_wire_id, StudioStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_studios(1, &["Warner Bros.".into(), "Village Roadshow".into()])
+        .await
+        .unwrap();
+    // Re-link with only Netflix: the old studios no longer resolve item 1.
+    s.link_item_studios(1, &["Netflix".into()]).await.unwrap();
+    assert!(s
+        .item_ids_for_studio(&studio_wire_id("Warner Bros."))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.item_ids_for_studio(&studio_wire_id("Netflix"))
+            .await
+            .unwrap(),
+        vec![1]
+    );
+    // studios_for_item projects the surviving studio, name-ordered.
+    let studios = s.studios_for_item(1).await.unwrap();
+    let names: Vec<&str> = studios.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["Netflix"]);
+    assert_eq!(studios[0].wire_id, studio_wire_id("Netflix"));
+}
+
+#[tokio::test]
+async fn upsert_studio_is_idempotent() {
+    // Re-upserting an existing studio name returns the same id.
+    use pharos_core::StudioStore;
+    let s = fresh().await;
+    let id1 = s.upsert_studio("Warner Bros.").await.unwrap();
+    let id2 = s.upsert_studio("Warner Bros.").await.unwrap();
+    assert_eq!(id1, id2);
+    assert_eq!(s.studios_with_counts().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn collection_wire_id_matches_dto_helper_and_resolves_members_in_order() {
+    // LIB-C5 — /Items?ParentId=collection_wire_id("Trilogy") resolves to
+    // the members via the wire_id index, in curated sort_order.
+    use pharos_core::{collection_wire_id, CollectionStore};
+    let s = fresh().await;
+    for (id, p) in [(10u64, "/m/c.mkv"), (11, "/m/a.mkv"), (12, "/m/b.mkv")] {
+        s.put(item(id, p, "x", MediaKind::Movie)).await.unwrap();
+    }
+    // Link in a non-id order so we prove sort_order (not item id) drives it.
+    s.link_item_collections(12, &["Trilogy".into()])
+        .await
+        .unwrap();
+    s.link_item_collections(10, &["Trilogy".into()])
+        .await
+        .unwrap();
+    s.link_item_collections(11, &["Trilogy".into()])
+        .await
+        .unwrap();
+    let rows = s.collections_with_counts().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].collection.name, "Trilogy");
+    assert_eq!(rows[0].collection.wire_id, collection_wire_id("Trilogy"));
+    assert_eq!(rows[0].collection.kind, "boxset");
+    assert_eq!(rows[0].item_count, 3);
+    let members = s
+        .collection_items(&collection_wire_id("Trilogy"))
+        .await
+        .unwrap();
+    assert_eq!(members, vec![12, 10, 11], "members in scan/sort order");
+    // Unknown wire id resolves to no members.
+    assert!(s
+        .collection_items("ffffffffffffffffffffffffffffffff")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn link_item_collections_is_idempotent_and_appends() {
+    // Re-linking an item already a member is a no-op (no duplicate, order
+    // preserved); a new item appends after the current max.
+    use pharos_core::{collection_wire_id, CollectionStore};
+    let s = fresh().await;
+    for id in [1u64, 2] {
+        s.put(item(id, &format!("/m/{id}.mkv"), "x", MediaKind::Movie))
+            .await
+            .unwrap();
+    }
+    s.link_item_collections(1, &["Set".into()]).await.unwrap();
+    s.link_item_collections(1, &["Set".into()]).await.unwrap(); // no-op
+    s.link_item_collections(2, &["Set".into()]).await.unwrap();
+    let members = s
+        .collection_items(&collection_wire_id("Set"))
+        .await
+        .unwrap();
+    assert_eq!(members, vec![1, 2]);
+    let rows = s.collections_with_counts().await.unwrap();
+    assert_eq!(rows[0].item_count, 2);
+}
+
+#[tokio::test]
+async fn upsert_collection_refreshes_overview_without_clobbering() {
+    // overview/kind COALESCE: a later None doesn't wipe a set value.
+    use pharos_core::{collection_wire_id, CollectionStore};
+    let s = fresh().await;
+    let id1 = s
+        .upsert_collection("Set", None, Some("synopsis"))
+        .await
+        .unwrap();
+    let id2 = s.upsert_collection("Set", None, None).await.unwrap();
+    assert_eq!(id1, id2, "idempotent on name");
+    let c = s
+        .collection_by_wire_id(&collection_wire_id("Set"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        c.overview.as_deref(),
+        Some("synopsis"),
+        "None didn't clobber"
+    );
+    // A new overview overwrites.
+    s.upsert_collection("Set", None, Some("revised"))
+        .await
+        .unwrap();
+    let c = s
+        .collection_by_wire_id(&collection_wire_id("Set"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.overview.as_deref(), Some("revised"));
+}
+
+#[tokio::test]
+async fn create_add_remove_collection_crud_roundtrip() {
+    // LIB-C5 manual CRUD: create seeded, add more, remove, browse order.
+    use pharos_core::{collection_wire_id, CollectionStore};
+    let s = fresh().await;
+    for id in [1u64, 2, 3, 4] {
+        s.put(item(id, &format!("/m/{id}.mkv"), "x", MediaKind::Movie))
+            .await
+            .unwrap();
+    }
+    // Create seeded with [2, 1] — order preserved.
+    let c = s.create_collection("MySet", &[2, 1]).await.unwrap();
+    assert_eq!(c.wire_id, collection_wire_id("MySet"));
+    assert_eq!(
+        s.collection_items(&c.wire_id).await.unwrap(),
+        vec![2, 1],
+        "seed order"
+    );
+    // Add [3, 1, 4]: 1 already present (skipped), 3 and 4 appended.
+    let added = s
+        .add_collection_items(&c.wire_id, &[3, 1, 4])
+        .await
+        .unwrap();
+    assert_eq!(added, Some(2), "only 3 and 4 newly added");
+    assert_eq!(
+        s.collection_items(&c.wire_id).await.unwrap(),
+        vec![2, 1, 3, 4]
+    );
+    // Remove [1, 99]: 1 removed, 99 not a member.
+    let removed = s
+        .remove_collection_items(&c.wire_id, &[1, 99])
+        .await
+        .unwrap();
+    assert_eq!(removed, Some(1));
+    assert_eq!(s.collection_items(&c.wire_id).await.unwrap(), vec![2, 3, 4]);
+    // CRUD against an unknown collection → None (handler maps to 404).
+    let bogus = "ffffffffffffffffffffffffffffffff";
+    assert_eq!(s.add_collection_items(bogus, &[1]).await.unwrap(), None);
+    assert_eq!(s.remove_collection_items(bogus, &[1]).await.unwrap(), None);
+}
+
+// ---- LIB-C6: tags as entities --------------------------------------
+
+#[tokio::test]
+async fn tag_wire_id_matches_dto_helper_and_resolves_items() {
+    // LIB-C6 — /Items?ParentId=tag_id_for("1080p") resolves to the linked
+    // item via the wire_id index (exact pivot).
+    use pharos_core::{tag_wire_id, TagStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_tags(1, &["1080p".into(), "cyberpunk".into()])
+        .await
+        .unwrap();
+    let rows = s.tags_with_counts().await.unwrap();
+    let names: Vec<&str> = rows.iter().map(|c| c.tag.name.as_str()).collect();
+    assert_eq!(names, vec!["1080p", "cyberpunk"], "ordered by name");
+    let cp = rows.iter().find(|c| c.tag.name == "cyberpunk").unwrap();
+    assert_eq!(cp.tag.wire_id, tag_wire_id("cyberpunk"));
+    assert_eq!(cp.item_count, 1);
+    let ids = s.item_ids_for_tag(&tag_wire_id("1080p")).await.unwrap();
+    assert_eq!(ids, vec![1]);
+    // An unknown wire id resolves to no items.
+    assert!(s
+        .item_ids_for_tag("ffffffffffffffffffffffffffffffff")
+        .await
+        .unwrap()
+        .is_empty());
+    // tags_for_item projects name-ordered.
+    let t = s.tags_for_item(1).await.unwrap();
+    let tnames: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(tnames, vec!["1080p", "cyberpunk"]);
+}
+
+#[tokio::test]
+async fn shared_tag_increments_count_across_items() {
+    // LIB-C6 — a second item sharing a tag bumps that tag's count and both
+    // items resolve under the shared tag id.
+    use pharos_core::{tag_wire_id, TagStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(2, "/m/b.mkv", "B", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_tags(1, &["1080p".into(), "cyberpunk".into()])
+        .await
+        .unwrap();
+    s.link_item_tags(2, &["1080p".into()]).await.unwrap();
+    let rows = s.tags_with_counts().await.unwrap();
+    let hd = rows.iter().find(|c| c.tag.name == "1080p").unwrap();
+    assert_eq!(hd.item_count, 2);
+    let mut ids = s.item_ids_for_tag(&tag_wire_id("1080p")).await.unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn link_item_tags_replaces_stale_links() {
+    // A rescan that drops a tag clears the stale join row (wholesale
+    // replace), unlike the incremental add/remove path.
+    use pharos_core::{tag_wire_id, TagStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_tags(1, &["1080p".into(), "cyberpunk".into()])
+        .await
+        .unwrap();
+    s.link_item_tags(1, &["webrip".into()]).await.unwrap();
+    assert!(s
+        .item_ids_for_tag(&tag_wire_id("1080p"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.item_ids_for_tag(&tag_wire_id("webrip")).await.unwrap(),
+        vec![1]
+    );
+    let t = s.tags_for_item(1).await.unwrap();
+    let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(names, vec!["webrip"]);
+}
+
+#[tokio::test]
+async fn add_remove_item_tags_is_incremental() {
+    // LIB-C6 — the manual mutation path adds/removes WITHOUT clobbering
+    // the item's other tags (distinct from link's wholesale replace).
+    use pharos_core::{tag_wire_id, TagStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_tags(1, &["1080p".into()]).await.unwrap();
+    // Add two more (one duplicate) — only the genuinely-new one counts.
+    let added = s
+        .add_item_tags(1, &["cyberpunk".into(), "1080p".into()])
+        .await
+        .unwrap();
+    assert_eq!(added, 1, "1080p already present, only cyberpunk is new");
+    let t = s.tags_for_item(1).await.unwrap();
+    let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(names, vec!["1080p", "cyberpunk"], "both survive");
+    // Remove one — the other stays; removing an absent tag is a no-op.
+    let removed = s
+        .remove_item_tags(1, &["1080p".into(), "nope".into()])
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+    let names: Vec<String> = s
+        .tags_for_item(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|x| x.name)
+        .collect();
+    assert_eq!(names, vec!["cyberpunk".to_string()]);
+    // The dropped tag's row survives (count drops to 0 but it still lists).
+    let rows = s.tags_with_counts().await.unwrap();
+    let hd = rows.iter().find(|c| c.tag.name == "1080p").unwrap();
+    assert_eq!(hd.item_count, 0);
+    assert_eq!(hd.tag.wire_id, tag_wire_id("1080p"));
+}
+
+#[tokio::test]
+async fn upsert_tag_is_idempotent() {
+    use pharos_core::TagStore;
+    let s = fresh().await;
+    let id1 = s.upsert_tag("cyberpunk").await.unwrap();
+    let id2 = s.upsert_tag("cyberpunk").await.unwrap();
+    assert_eq!(id1, id2);
+    assert_eq!(s.tags_with_counts().await.unwrap().len(), 1);
+}

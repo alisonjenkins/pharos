@@ -652,37 +652,77 @@ async fn list_albums(
     })))
 }
 
-/// `GET /Studios` — same shape as /Genres but pivoting on
-/// album_artist (closest field we persist to a "studio" — Jellyfin's
-/// schema overloads the term across music + film). Real studio
-/// metadata waits on a metadata-provider layer.
+/// `GET /Studios` — LIB-C3: studios (production companies / TV networks)
+/// as entity rows. Lists every studio with its item count, name-ordered,
+/// `Id` = the 32-hex studio wire id (= `studios.wire_id` =
+/// `studio_id_for(name)`), so a client click routes to
+/// `/Items?ParentId=<studio id>` which `restrict_to_parent` resolves via
+/// the `item_studios` indexed join. Replaces the old stub that aggregated
+/// `album_artist` (a music-path stand-in that never reflected real
+/// production studios). Unlike /Genres there is no backfill (no legacy
+/// studio column on media_items); studios come purely from the scanner
+/// wire-in of MetadataResult.studios.
 async fn list_studios(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    use std::collections::HashSet;
-    let all = state
+    use pharos_core::StudioStore;
+    let rows = state
         .stores
-        .list()
+        .studios_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut studios: Vec<&str> = all
+    let items: Vec<serde_json::Value> = rows
         .iter()
-        .filter_map(|i| i.probe.album_artist.as_deref())
-        .filter(|s| !s.is_empty() && seen.insert(s.to_string()))
-        .collect();
-    studios.sort_unstable();
-    let items: Vec<serde_json::Value> = studios
-        .iter()
-        .map(|s| {
+        .map(|sc| {
             serde_json::json!({
-                "Id": crate::api::jellyfin::dto::artist_id_for(s),
-                "Name": s,
+                "Id": sc.studio.wire_id,
+                "Name": sc.studio.name,
                 "ServerId": state.server_id,
                 "Type": "Studio",
                 "MediaType": "Unknown",
                 "IsFolder": true,
+                "ChildCount": sc.item_count,
+            })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// `GET /Tags` — LIB-C6: tags (free-form labels) as entity rows. Lists
+/// every tag with its item count, name-ordered, `Id` = the 32-hex tag
+/// wire id (= `tags.wire_id` = `tag_id_for(name)`), so a client click
+/// routes to `/Items?ParentId=<tag id>` which `restrict_to_parent`
+/// resolves via the `item_tags` indexed join. Unlike /Genres there is no
+/// backfill (no legacy tag column on media_items); tags come from the
+/// scanner wire-in of MetadataResult.tags + the manual add/remove
+/// endpoints.
+async fn list_tags(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::TagStore;
+    let rows = state
+        .stores
+        .tags_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "Id": tc.tag.wire_id,
+                "Name": tc.tag.name,
+                "ServerId": state.server_id,
+                "Type": "Tag",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+                "ChildCount": tc.item_count,
             })
         })
         .collect();
