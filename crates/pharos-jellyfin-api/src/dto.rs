@@ -661,19 +661,28 @@ impl BaseItemDto {
             // audio with album tag, else None (handler fills with the
             // library root id; we can't compute it without
             // media_roots).
+            // LIB-C11 — series/season ids key on the show FOLDER (via
+            // `series_key()`), so same-name shows don't merge. Falls back
+            // to the bare name for legacy rows lacking a folder.
             parent_id: item
                 .series
                 .as_ref()
-                .and_then(|s| s.season_number.map(|n| season_id_for(&s.series_name, n)))
+                .and_then(|s| {
+                    s.season_number
+                        .map(|n| season_id_for_key(s.series_folder.as_deref(), &s.series_name, n))
+                })
                 .or_else(|| item.probe.album.as_deref().map(album_id_for)),
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
             series_name: item.series.as_ref().map(|s| s.series_name.clone()),
-            series_id: item.series.as_ref().map(|s| series_id_for(&s.series_name)),
-            season_id: item
+            series_id: item
                 .series
                 .as_ref()
-                .and_then(|s| s.season_number.map(|n| season_id_for(&s.series_name, n))),
+                .map(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name)),
+            season_id: item.series.as_ref().and_then(|s| {
+                s.season_number
+                    .map(|n| season_id_for_key(s.series_folder.as_deref(), &s.series_name, n))
+            }),
             season_name: item
                 .series
                 .as_ref()
@@ -777,19 +786,61 @@ fn name_aggregate_id_for(kind: &str, name: &str) -> String {
     format!("{h:016x}{h:016x}")
 }
 
-/// Stable 32-hex id for the synthesised Series item.
+/// Stable 32-hex id for the synthesised Series item, keyed on the bare
+/// series NAME.
+///
+/// LIB-C11 — this name-only variant is the *legacy* identity. Two shows
+/// that share a name collapse to one id here, interleaving their
+/// episodes. Prefer [`series_id_for_key`] (folder-keyed) for newly
+/// scanned items; this stays as the fallback for rows lacking a folder
+/// so existing client URLs survive the migration.
 pub fn series_id_for(name: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let h = xxh3_64(format!("series:{name}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}{h:016x}")
 }
 
-/// Stable 32-hex id for the synthesised Season item.
+/// LIB-C11 — stable 32-hex Series id keyed on the show's FOLDER path when
+/// known, falling back to the bare NAME otherwise. Folder-keyed ids make
+/// same-name shows (`Cosmos (1980)` vs `Cosmos (2014)`) distinct so their
+/// episodes don't interleave. Passing `None` is byte-identical to
+/// [`series_id_for`], so legacy/backfilled rows keep their existing wire
+/// id and client URLs keep resolving.
+pub fn series_id_for_key(folder: Option<&str>, name: &str) -> String {
+    match folder {
+        Some(f) => {
+            use xxhash_rust::xxh3::xxh3_64;
+            let h = xxh3_64(format!("series-folder:{f}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+            format!("{h:016x}{h:016x}")
+        }
+        None => series_id_for(name),
+    }
+}
+
+/// Stable 32-hex id for the synthesised Season item, keyed on the bare
+/// series NAME + season number. LIB-C11 legacy variant — see
+/// [`season_id_for_key`].
 pub fn season_id_for(series_name: &str, season_number: u32) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let h =
         xxh3_64(format!("season:{series_name}:{season_number}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}{h:016x}")
+}
+
+/// LIB-C11 — stable 32-hex Season id keyed on the show's FOLDER path (+
+/// season number) when known, falling back to the bare NAME otherwise.
+/// Keeps a season under the right folder-keyed series. `None` folder is
+/// byte-identical to [`season_id_for`] so legacy rows are unaffected.
+pub fn season_id_for_key(folder: Option<&str>, series_name: &str, season_number: u32) -> String {
+    match folder {
+        Some(f) => {
+            use xxhash_rust::xxh3::xxh3_64;
+            let h = xxh3_64(format!("season-folder:{f}:{season_number}").as_bytes())
+                & 0x7FFFFFFFFFFFFFFF;
+            format!("{h:016x}{h:016x}")
+        }
+        None => season_id_for(series_name, season_number),
+    }
 }
 
 /// Human-readable season name. "Specials" for 0, "Season N" otherwise.

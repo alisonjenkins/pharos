@@ -170,8 +170,16 @@ impl MediaStore for PostgresStore {
         let series_name = item.series.as_ref().map(|s| s.series_name.as_str());
         let season_number = item.series.as_ref().and_then(|s| s.season_number);
         let episode_number = item.series.as_ref().and_then(|s| s.episode_number);
+        // LIB-C11 — show-folder identity + parsed year.
+        let series_folder = item
+            .series
+            .as_ref()
+            .and_then(|s| s.series_folder.as_deref());
+        let series_year = item.series.as_ref().and_then(|s| s.series_year);
         let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
         let chapters_json = crate::chapter_json::encode(&p.chapters);
+        let m = &item.metadata;
+        let provider_ids_json = crate::provider_ids_json::encode(&m.provider_ids);
         let created_at = item.created_at.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

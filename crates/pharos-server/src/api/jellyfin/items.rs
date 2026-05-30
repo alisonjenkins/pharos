@@ -112,7 +112,9 @@ async fn items_counts(
             MediaKind::Episode => {
                 episodes += 1;
                 if let Some(s) = i.series.as_ref() {
-                    series.insert(s.series_name.as_str());
+                    // LIB-C11 — count distinct shows by folder identity so
+                    // same-name shows aren't undercounted.
+                    series.insert(s.series_key());
                 }
             }
             MediaKind::Audio => audio += 1,
@@ -241,9 +243,11 @@ async fn items_similar(
 /// similar. Zero excludes.
 fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
     let mut s = 0u32;
-    // Same Series (Episode) is the strongest signal.
+    // Same Series (Episode) is the strongest signal. LIB-C11 — compare
+    // on the folder-keyed identity so two same-name shows in distinct
+    // folders aren't treated as one. Falls back to name for legacy rows.
     if let (Some(t), Some(c)) = (target.series.as_ref(), candidate.series.as_ref()) {
-        if t.series_name.eq_ignore_ascii_case(&c.series_name) {
+        if t.series_key().eq_ignore_ascii_case(c.series_key()) {
             s += 100;
         }
     }
@@ -528,8 +532,11 @@ async fn shows_next_up(
         if user_data.get(idx).copied().unwrap_or_default().played {
             continue;
         }
+        // LIB-C11 — bucket by the folder-keyed identity, not the bare
+        // name, so two same-name shows in distinct folders stay separate
+        // and don't interleave into one NextUp pick.
         buckets
-            .entry(series.series_name.clone())
+            .entry(series.series_key().to_string())
             .or_default()
             .push((idx, item));
     }
@@ -867,7 +874,7 @@ async fn list_user_items_latest(
     // Honour ParentId so home-page "Latest" rows match the library
     // the user clicked into. Library / series / season ids all
     // resolve via the shared restrict_to_parent helper.
-    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref());
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
     // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
     // row filters to Type=Movie.
     let typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
@@ -1199,11 +1206,8 @@ async fn list_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let seed = effective_sort_seed(&q, user.0.id);
-    let filtered = filter_and_sort(
-        restrict_to_parent(&state, all, q.parent_id.as_deref()),
-        &q,
-        seed,
-    );
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
+    let filtered = filter_and_sort(scoped, &q, seed);
     let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
@@ -1227,11 +1231,8 @@ async fn list_user_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let seed = effective_sort_seed(&q, user.0.id);
-    let filtered = filter_and_sort(
-        restrict_to_parent(&state, all, q.parent_id.as_deref()),
-        &q,
-        seed,
-    );
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
+    let filtered = filter_and_sort(scoped, &q, seed);
     let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
@@ -1326,34 +1327,39 @@ fn restrict_to_parent(
             .filter(|i| i.path.starts_with(root))
             .collect();
     }
-    // 2) Series id → every episode whose series_name hashes to pid.
+    // 2) Series id → every episode whose folder-keyed series id matches
+    //    pid. LIB-C11: resolves via the show FOLDER (falling back to the
+    //    bare name for legacy rows), so a same-name show in another folder
+    //    isn't pulled in under the wrong series.
     if items.iter().any(|i| {
         i.series
             .as_ref()
-            .is_some_and(|s| series_id_for(&s.series_name) == pid)
+            .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
     }) {
         return items
             .into_iter()
             .filter(|i| {
-                i.series
-                    .as_ref()
-                    .is_some_and(|s| series_id_for(&s.series_name) == pid)
+                i.series.as_ref().is_some_and(|s| {
+                    series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
+                })
             })
             .collect();
     }
-    // 3) Season id → every episode in that (series, season) pair.
+    // 3) Season id → every episode in that (folder, season) pair.
     if items.iter().any(|i| {
         i.series.as_ref().is_some_and(|s| {
-            s.season_number
-                .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
+            s.season_number.is_some_and(|n| {
+                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+            })
         })
     }) {
         return items
             .into_iter()
             .filter(|i| {
                 i.series.as_ref().is_some_and(|s| {
-                    s.season_number
-                        .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
+                    s.season_number.is_some_and(|n| {
+                        season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+                    })
                 })
             })
             .collect();
@@ -1761,22 +1767,24 @@ async fn synth_series_or_season(
     state: &AppState,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, season_id_for, series_id_for};
+    use crate::api::jellyfin::dto::{season_display_name, season_id_for_key, series_id_for_key};
     let all = state
         .stores
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // First: series match.
+    // First: series match. LIB-C11 — resolve via the folder-keyed id so
+    // the synth DTO matches the ids minted on episodes, and same-name
+    // shows in distinct folders surface as distinct Series.
     for item in all.iter() {
         let Some(series) = item.series.as_ref() else {
             continue;
         };
-        if series_id_for(&series.series_name) == id_str {
-            return Ok(Some(series_dto(&state.server_id, &series.series_name)));
+        if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
+            return Ok(Some(series_dto(&state.server_id, series)));
         }
     }
-    // Then: season match. We need (series_name, season_number) so
+    // Then: season match. We need (folder/series, season_number) so
     // walk every Episode again.
     for item in all.iter() {
         let Some(series) = item.series.as_ref() else {
@@ -1785,10 +1793,15 @@ async fn synth_series_or_season(
         let Some(season_n) = series.season_number else {
             continue;
         };
-        if season_id_for(&series.series_name, season_n) == id_str {
+        if season_id_for_key(
+            series.series_folder.as_deref(),
+            &series.series_name,
+            season_n,
+        ) == id_str
+        {
             return Ok(Some(season_dto(
                 &state.server_id,
-                &series.series_name,
+                series,
                 season_n,
                 &season_display_name(season_n),
             )));
@@ -1797,11 +1810,11 @@ async fn synth_series_or_season(
     Ok(None)
 }
 
-fn series_dto(server_id: &str, series_name: &str) -> serde_json::Value {
-    use crate::api::jellyfin::dto::series_id_for;
-    serde_json::json!({
-        "Id": series_id_for(series_name),
-        "Name": series_name,
+fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::Value {
+    use crate::api::jellyfin::dto::series_id_for_key;
+    let mut dto = serde_json::json!({
+        "Id": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
+        "Name": series.series_name,
         "ServerId": server_id,
         "Type": "Series",
         "MediaType": "Unknown",
@@ -1812,26 +1825,32 @@ fn series_dto(server_id: &str, series_name: &str) -> serde_json::Value {
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
         "ProductionLocations": [], "RemoteTrailers": [], "Chapters": [],
         "ImageTags": {}, "BackdropImageTags": [], "ProviderIds": {},
-    })
+    });
+    // LIB-C11 — surface the folder-parsed year so jellyfin-web can tell
+    // same-name shows apart in the Series view.
+    if let (Some(obj), Some(year)) = (dto.as_object_mut(), series.series_year) {
+        obj.insert("ProductionYear".into(), serde_json::json!(year));
+    }
+    dto
 }
 
 fn season_dto(
     server_id: &str,
-    series_name: &str,
+    series: &pharos_core::SeriesInfo,
     season_number: u32,
     season_name: &str,
 ) -> serde_json::Value {
-    use crate::api::jellyfin::dto::{season_id_for, series_id_for};
+    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
     serde_json::json!({
-        "Id": season_id_for(series_name, season_number),
+        "Id": season_id_for_key(series.series_folder.as_deref(), &series.series_name, season_number),
         "Name": season_name,
         "ServerId": server_id,
         "Type": "Season",
         "MediaType": "Unknown",
         "IsFolder": true,
         "CanPlay": false,
-        "SeriesName": series_name,
-        "SeriesId": series_id_for(series_name),
+        "SeriesName": series.series_name,
+        "SeriesId": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
         "IndexNumber": season_number,
         "UserData": { "Played": false, "PlayCount": 0 },
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],

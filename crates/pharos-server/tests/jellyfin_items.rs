@@ -892,6 +892,88 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
     assert_eq!(by_show.get("Show B"), Some(&1));
 }
 
+// LIB-C11 — two same-name shows in DISTINCT folders must stay two
+// separate series in /Shows/NextUp with distinct, non-interleaved
+// episode picks and distinct SeriesIds carrying their own years. Before
+// the folder-keyed fix these collapsed into one interleaved series.
+#[actix_web::test]
+async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    // Cosmos (1980) and Cosmos (2014): same display name, different
+    // folders + years. Each has two unwatched episodes.
+    for (id, folder, year, ep) in [
+        (1u64, "/tv/Cosmos (1980)", 1980u32, 1u32),
+        (2, "/tv/Cosmos (1980)", 1980, 2),
+        (3, "/tv/Cosmos (2014)", 2014, 1),
+        (4, "/tv/Cosmos (2014)", 2014, 2),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("{folder}/Season 01/S01E0{ep}.mkv").into(),
+                title: format!("Cosmos E{ep}"),
+                kind: MediaKind::Episode,
+                series: Some(pharos_core::SeriesInfo {
+                    series_name: "Cosmos".into(),
+                    season_number: Some(1),
+                    episode_number: Some(ep),
+                    series_folder: Some(folder.into()),
+                    series_year: Some(year),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Shows/NextUp")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().unwrap();
+    // TWO distinct series, not one merged/interleaved show.
+    assert_eq!(items.len(), 2, "{v:?}");
+    let series_ids: std::collections::HashSet<&str> = items
+        .iter()
+        .map(|it| it["SeriesId"].as_str().unwrap())
+        .collect();
+    assert_eq!(series_ids.len(), 2, "distinct SeriesId per folder: {v:?}");
+    // Each NextUp pick is that folder's E1 (non-interleaved) and carries
+    // its own year so clients can tell the two Cosmos shows apart.
+    let years: std::collections::HashSet<u64> = items
+        .iter()
+        .map(|it| {
+            assert_eq!(it["SeriesName"], "Cosmos");
+            assert_eq!(it["IndexNumber"].as_u64().unwrap(), 1);
+            it["ProductionYear"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        years,
+        std::collections::HashSet::from([1980, 2014]),
+        "each show keeps its own year: {v:?}"
+    );
+}
+
 #[actix_web::test]
 async fn audio_item_surfaces_artist_album_genre_from_probe() {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();

@@ -829,39 +829,88 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let (filename_season, episode) = parse_sxxeyy(name);
 
-    // Walk parents from closest to farthest.
-    let mut parents: Vec<&str> = path
-        .ancestors()
-        .skip(1)
-        .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
-        .collect();
+    // Walk parents from closest to farthest, retaining the &Path so the
+    // first non-season ancestor's FULL path becomes the C11 folder key.
+    let parents: Vec<&Path> = path.ancestors().skip(1).collect();
 
     let mut season_from_dir: Option<u32> = None;
     let mut series_name: Option<String> = None;
+    let mut series_folder: Option<PathBuf> = None;
 
-    for parent in parents.drain(..) {
-        if let Some(n) = parse_season_dir(parent) {
+    for parent in parents {
+        let Some(component) = parent.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(n) = parse_season_dir(component) {
             season_from_dir = season_from_dir.or(Some(n));
             continue;
         }
-        if parent.eq_ignore_ascii_case("specials") {
+        if component.eq_ignore_ascii_case("specials") {
             season_from_dir = season_from_dir.or(Some(0));
             continue;
         }
-        // First non-season ancestor wins as the series name.
-        if series_name.is_none() {
-            series_name = Some(parent.to_string());
-            break;
-        }
+        // First non-season ancestor wins as the series. LIB-C11: capture
+        // both the display name AND the canonical folder path (the show
+        // root that holds the season dirs / episodes) for identity.
+        series_name = Some(component.to_string());
+        series_folder = Some(parent.to_path_buf());
+        break;
     }
 
-    let series_name = series_name?;
+    let mut series_name = series_name?;
     let season_number = season_from_dir.or(filename_season);
+    // LIB-C11: parse a `Show Name (YYYY)` year from the folder component.
+    let series_year = series_folder
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .and_then(parse_folder_year);
+    // When a year was parsed, strip the trailing `(YYYY)` from the display
+    // name so the title stays clean ("Cosmos", not "Cosmos (1980)") while
+    // identity stays keyed on the full folder path.
+    if series_year.is_some() {
+        series_name = strip_trailing_year(&series_name).to_string();
+    }
+    let series_folder = series_folder.map(|p| p.to_string_lossy().into_owned());
     Some(SeriesInfo {
         series_name,
         season_number,
         episode_number: episode,
+        series_folder,
+        series_year,
     })
+}
+
+/// LIB-C11 — drop a trailing `(YYYY)` marker from a show display name so
+/// the clean title surfaces while identity stays keyed on the folder
+/// path. Only strips when [`parse_folder_year`] would match, so a name
+/// without a year marker is returned untouched.
+fn strip_trailing_year(name: &str) -> &str {
+    if parse_folder_year(name).is_none() {
+        return name;
+    }
+    let trimmed = name.trim_end();
+    match trimmed.rfind('(') {
+        Some(open) => trimmed[..open].trim_end(),
+        None => name,
+    }
+}
+
+/// LIB-C11 — extract the release year from a `Show Name (YYYY)` folder
+/// convention. Matches a 4-digit year in trailing parentheses
+/// (`Cosmos (1980)` → `1980`). Returns `None` when the folder carries no
+/// such marker. Restricted to a plausible 1800–2999 window so a
+/// parenthesised non-year (e.g. `(Uncut)`, `(1)`) doesn't masquerade.
+fn parse_folder_year(folder_name: &str) -> Option<u32> {
+    let trimmed = folder_name.trim_end();
+    let close = trimmed.strip_suffix(')')?;
+    let open = close.rfind('(')?;
+    let inner = close[open + 1..].trim();
+    if inner.len() != 4 || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: u32 = inner.parse().ok()?;
+    (1800..3000).contains(&year).then_some(year)
 }
 
 /// Return the (season, episode) numbers when `name` carries an
@@ -1817,6 +1866,45 @@ mod tests {
         assert_eq!(info.series_name, "Show Without Season Dir");
         assert_eq!(info.season_number, Some(5));
         assert_eq!(info.episode_number, Some(11));
+    }
+
+    // LIB-C11 — two distinct shows sharing a name must yield the SAME
+    // series_name but DIFFERENT series_folder + year so their synthesised
+    // wire ids diverge and their episodes don't interleave.
+    #[test]
+    fn same_name_shows_get_distinct_folders_and_years() {
+        let p80 = Path::new("/tv/Cosmos (1980)/Season 01/S01E01.mkv");
+        let p14 = Path::new("/tv/Cosmos (2014)/Season 01/S01E01.mkv");
+        let i80 = parse_series_info(p80).expect("series info 1980");
+        let i14 = parse_series_info(p14).expect("series info 2014");
+
+        // Display name is identical (the bare show name)…
+        assert_eq!(i80.series_name, "Cosmos");
+        assert_eq!(i14.series_name, "Cosmos");
+        // …but the folder identity + parsed year differ.
+        assert_eq!(i80.series_folder.as_deref(), Some("/tv/Cosmos (1980)"));
+        assert_eq!(i14.series_folder.as_deref(), Some("/tv/Cosmos (2014)"));
+        assert_eq!(i80.series_year, Some(1980));
+        assert_eq!(i14.series_year, Some(2014));
+        assert_ne!(i80.series_key(), i14.series_key());
+    }
+
+    #[test]
+    fn folder_year_only_parsed_from_trailing_parenthesised_4digit() {
+        // No year marker → None.
+        let p = Path::new("/tv/Firefly/Season 01/S01E01.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Firefly");
+        assert_eq!(info.series_folder.as_deref(), Some("/tv/Firefly"));
+        assert_eq!(info.series_year, None);
+        // Falls back to the bare name as identity key when no folder year.
+        assert_eq!(info.series_key(), "/tv/Firefly");
+
+        // Parenthesised non-year doesn't masquerade as a year.
+        assert_eq!(parse_folder_year("Show (Uncut)"), None);
+        assert_eq!(parse_folder_year("Show (1)"), None);
+        assert_eq!(parse_folder_year("Cosmos (1980)"), Some(1980));
+        assert_eq!(parse_folder_year("The Office (US) (2005)"), Some(2005));
     }
 
     #[test]

@@ -39,6 +39,7 @@ async fn seed_episodes_and_favs() -> (web::Data<AppState>, String) {
                     series_name: "Show".into(),
                     season_number: Some(1),
                     episode_number: Some(n),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
