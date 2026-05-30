@@ -227,6 +227,25 @@ async fn serve_image(
         Ok(it) => it,
         Err(_) => return Ok(HttpResponse::NotFound().body("")),
     };
+    // LIB-D5 — local-sidecar-first resolution. D4 records artwork
+    // discovered at scan time (poster.jpg / fanart.jpg / logo.png /…
+    // beside the media, or under the series folder for episodes) as
+    // `artwork` rows keyed by (item, role). Serve that recorded file
+    // directly — ahead of any uploaded asset and the ffmpeg
+    // frame-extract fallback — so a user's own artwork wins and
+    // upload-only roles (Logo/Banner/Art/Disc) become servable.
+    //
+    // The artwork table is one row per (item, role) with no index, so
+    // only the canonical index (0) can resolve locally; higher Backdrop
+    // indices fall through to the existing path. A best-effort lookup:
+    // any store error or a recorded-but-missing file silently falls
+    // through to the upload / extract path (V6 spirit — never 500 a
+    // public image route on a stale row).
+    if index == 0 {
+        if let Some(local) = local_artwork_path(state, id, role).await {
+            return serve_local_artwork(&local, head_only, format, state).await;
+        }
+    }
     let jpeg_path = match cache.fetch(id, role, item.kind, &item.path, index).await {
         Ok(p) => p,
         // Upload-only roles (Logo/Banner/Art/Disc) report
@@ -268,6 +287,152 @@ async fn serve_image(
         Err(_) => return Ok(HttpResponse::NotFound().body("")),
     };
     Ok(HttpResponse::Ok().content_type(content_type).body(bytes))
+}
+
+/// The `ArtworkRole::as_str` token (D4 stores these in `artwork.role`)
+/// that corresponds to a cache [`ImageRole`]. `ImageRole::as_dir` is
+/// private + lowercase; the artwork rows use the capitalised tokens,
+/// so map explicitly. Match is exhaustive so a new role can't silently
+/// stop resolving locally.
+fn artwork_role_token(role: ImageRole) -> &'static str {
+    match role {
+        ImageRole::Primary => "Primary",
+        ImageRole::Backdrop => "Backdrop",
+        ImageRole::Thumb => "Thumb",
+        ImageRole::Logo => "Logo",
+        ImageRole::Banner => "Banner",
+        ImageRole::Art => "Art",
+        ImageRole::Disc => "Disc",
+    }
+}
+
+/// LIB-D5 — the recorded local sidecar path for `(id, role)`, if D4
+/// scanning found one and the file still exists. Best-effort: a store
+/// error or a stale (deleted) sidecar yields `None` so the caller falls
+/// through to the upload / frame-extract path rather than 404ing or
+/// erroring on a public route (V6 spirit).
+async fn local_artwork_path(
+    state: &AppState,
+    id: u64,
+    role: ImageRole,
+) -> Option<std::path::PathBuf> {
+    let token = artwork_role_token(role);
+    let rows = match state.stores.artwork_for(id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = id, "artwork lookup failed");
+            return None;
+        }
+    };
+    let locator = rows
+        .into_iter()
+        .find(|(r, source, _)| r.eq_ignore_ascii_case(token) && source == "local")
+        .map(|(_, _, locator)| locator)?;
+    let path = std::path::PathBuf::from(locator);
+    match tokio::fs::try_exists(&path).await {
+        Ok(true) => Some(path),
+        _ => {
+            tracing::warn!(
+                media.id = id,
+                role = token,
+                "recorded local artwork missing on disk"
+            );
+            None
+        }
+    }
+}
+
+/// Content-type for a local sidecar by extension. Defaults to jpeg for
+/// unknown / missing extensions (the bytes still render in browsers,
+/// and the D4 detector only records png/jpg/jpeg/webp anyway).
+fn content_type_for_ext(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => "image/jpeg",
+    }
+}
+
+/// LIB-D5 — serve a recorded local sidecar file directly. Honours the
+/// `?format=` webp/avif negotiation by transcoding through the same
+/// backend the frame-extract path uses, but writes the transcoded copy
+/// into the cache directory (keyed by a hash of the sidecar path) so we
+/// never pollute the user's media folder. A transcode failure — or no
+/// cache to write into — falls back to the original sidecar bytes.
+async fn serve_local_artwork(
+    path: &std::path::Path,
+    head_only: bool,
+    format: ImageFormat,
+    state: &AppState,
+) -> Result<HttpResponse, actix_web::Error> {
+    let ext = match format {
+        ImageFormat::Jpeg => None,
+        ImageFormat::Webp => Some("webp"),
+        ImageFormat::Avif => Some("avif"),
+    };
+    let (final_path, content_type): (std::path::PathBuf, &'static str) = match ext {
+        None => (path.to_path_buf(), content_type_for_ext(path)),
+        Some(ext) => match transcode_sidecar(state, path, ext).await {
+            Ok(p) => (
+                p,
+                if ext == "webp" {
+                    "image/webp"
+                } else {
+                    "image/avif"
+                },
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, target_ext = ext, "sidecar transcode failed; serving original");
+                (path.to_path_buf(), content_type_for_ext(path))
+            }
+        },
+    };
+    if head_only {
+        return Ok(HttpResponse::Ok().content_type(content_type).finish());
+    }
+    match tokio::fs::read(&final_path).await {
+        Ok(bytes) => Ok(HttpResponse::Ok().content_type(content_type).body(bytes)),
+        Err(_) => Ok(HttpResponse::NotFound().body("")),
+    }
+}
+
+/// Transcode a local sidecar into `ext` (webp/avif), writing the output
+/// into a cache-owned `sidecar/` subdir keyed by a hash of the source
+/// path so re-encodes are skipped and the user's media folder is left
+/// untouched. Errors if no image cache is configured.
+async fn transcode_sidecar(
+    state: &AppState,
+    src: &std::path::Path,
+    ext: &str,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    let cache = state
+        .images
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("image cache not configured"))?;
+    use xxhash_rust::xxh3::xxh3_64;
+    let key = xxh3_64(src.as_os_str().as_encoded_bytes());
+    let dir = cache.root().join("sidecar");
+    tokio::fs::create_dir_all(&dir).await?;
+    let out = dir.join(format!("{key:016x}.{ext}"));
+    if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+        return Ok(out);
+    }
+    let tmp = dir.join(format!("{key:016x}.{ext}.tmp"));
+    state
+        .ffmpeg
+        .transcode_image(src, ext, &tmp)
+        .await
+        .map_err(|e| std::io::Error::other(format!("backend {ext} transcode: {e}")))?;
+    tokio::fs::rename(&tmp, &out).await?;
+    Ok(out)
 }
 
 /// P46 — client-requested image encoding. Modern web clients +
@@ -493,5 +658,138 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);
+    }
+
+    // LIB-D5 — a 1x1 PNG, used as a real sidecar fixture. The local
+    // branch serves these bytes verbatim (no ffmpeg), so the content is
+    // byte-comparable.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    async fn seed_state_with_cache(
+        cache_dir: &std::path::Path,
+    ) -> web::Data<crate::state::AppState> {
+        use pharos_cache::image_cache::ImageCache;
+        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let state = crate::state::AppState::new(stores, "t".into())
+            .with_image_cache(ImageCache::new(cache_dir.to_path_buf()));
+        web::Data::new(state)
+    }
+
+    async fn put_movie(state: &crate::state::AppState, id: u64, path: &std::path::Path) {
+        use pharos_core::{MediaItem, MediaKind, MediaStore};
+        let item = MediaItem {
+            id,
+            path: path.to_path_buf(),
+            title: "A".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        state.stores.put(item).await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn local_primary_artwork_is_served_verbatim() {
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        // A movie file that doesn't exist on disk — frame-extraction
+        // would fail, so a 200 here proves the local branch ran.
+        let media_path = dir.path().join("movie.mkv");
+        let poster = dir.path().join("poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 42, &media_path).await;
+        state
+            .stores
+            .set_artwork(42, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+
+        let app = test::init_service(App::new().app_data(state.clone()).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri("/items/42/images/primary")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let body = test::read_body(resp).await;
+        assert_eq!(body.as_ref(), PNG_1X1, "served bytes must be the sidecar");
+    }
+
+    #[actix_web::test]
+    async fn upload_only_role_served_from_local_sidecar() {
+        // Logo is upload-only (no frame-extract). A recorded local
+        // sidecar makes it servable.
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let logo = dir.path().join("logo.png");
+        std::fs::write(&logo, PNG_1X1).unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 7, &dir.path().join("movie.mkv")).await;
+        state
+            .stores
+            .set_artwork(7, "Logo", "local", &logo.to_string_lossy())
+            .await
+            .unwrap();
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri("/items/7/images/logo")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body = test::read_body(resp).await;
+        assert_eq!(body.as_ref(), PNG_1X1);
+    }
+
+    #[actix_web::test]
+    async fn no_local_art_and_no_extract_source_404s() {
+        // No artwork row + a non-existent media file => extraction
+        // fails => 404 (existing fallback behaviour preserved).
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 9, &dir.path().join("missing.mkv")).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri("/items/9/images/primary")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[actix_web::test]
+    async fn stale_local_art_row_falls_through_to_404() {
+        // A recorded artwork row whose file was deleted must not 500
+        // or serve garbage — it falls through to the extract path,
+        // which 404s for a missing source.
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 11, &dir.path().join("missing.mkv")).await;
+        state
+            .stores
+            .set_artwork(
+                11,
+                "Primary",
+                "local",
+                &dir.path().join("gone.png").to_string_lossy(),
+            )
+            .await
+            .unwrap();
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri("/items/11/images/primary")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404);
     }
 }

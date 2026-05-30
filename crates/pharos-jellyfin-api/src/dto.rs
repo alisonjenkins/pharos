@@ -535,6 +535,30 @@ impl BaseItemDto {
         self
     }
 
+    /// LIB-D5 — advertise additional `ImageTags` for roles that have a
+    /// recorded local sidecar (D4 `artwork` rows). `roles` are the
+    /// `ArtworkRole::as_str` tokens (`"Logo"` / `"Banner"` / `"Disc"` /
+    /// `"Art"`, and also `"Primary"` / `"Backdrop"` / `"Thumb"` when a
+    /// sidecar overrides the frame-extract default). Purely additive:
+    /// the frame-extract Primary/Backdrop/Thumb tags `image_tags_for`
+    /// already set stay in place; this fills the upload-only roles a
+    /// client otherwise wouldn't request. Backdrop, being a list role,
+    /// also gets its tag appended to `backdrop_image_tags` if absent.
+    pub fn with_local_artwork_tags(mut self, id: u64, roles: &[String]) -> Self {
+        for role in roles {
+            if role.eq_ignore_ascii_case("backdrop") {
+                let tag = image_tag_for(id, "backdrop");
+                if !self.backdrop_image_tags.contains(&tag) {
+                    self.backdrop_image_tags.push(tag);
+                }
+            }
+            self.image_tags.entry(role.clone()).or_insert_with(|| {
+                serde_json::Value::String(image_tag_for(id, &role.to_ascii_lowercase()))
+            });
+        }
+        self
+    }
+
     pub fn from_domain_with_user_data(
         item: &pharos_core::MediaItem,
         server_id: &str,
@@ -1459,5 +1483,29 @@ mod trickplay_helper_tests {
             ..Default::default()
         };
         assert!(build_layout(&probe, 320, 10_000).is_none());
+    }
+
+    #[test]
+    fn local_artwork_tags_add_upload_only_roles_additively() {
+        use pharos_core::{MediaItem, MediaKind};
+        let item = MediaItem {
+            id: 5,
+            path: "/m/a.mkv".into(),
+            title: "A".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        let dto = super::BaseItemDto::from_domain(&item, "srv")
+            .with_local_artwork_tags(5, &["Logo".into(), "Backdrop".into()]);
+        // Existing frame-extract Primary tag stays.
+        assert!(dto.image_tags.contains_key("Primary"));
+        // Upload-only Logo now advertised.
+        assert!(dto.image_tags.contains_key("Logo"));
+        // Backdrop list role appended once.
+        assert_eq!(dto.backdrop_image_tags.len(), 1);
+        assert_eq!(
+            dto.backdrop_image_tags[0],
+            super::image_tag_for(5, "backdrop")
+        );
     }
 }

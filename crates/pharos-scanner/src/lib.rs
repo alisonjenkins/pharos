@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod fs;
 #[cfg(feature = "libav-probe")]
 pub mod libav_prober;
+pub mod metadata;
 #[cfg(feature = "watch")]
 pub mod watcher;
 
@@ -19,5 +20,9 @@ pub use fs::{
 };
 #[cfg(feature = "libav-probe")]
 pub use libav_prober::LibavProber;
+pub use metadata::filename::{FilenameProvider, ParsedName};
+pub use metadata::nfo::NfoProvider;
+pub use metadata::sidecar::SidecarArtworkProvider;
+pub use metadata::{ErasedProvider, MetadataResolver};
 #[cfg(feature = "watch")]
 pub use watcher::{spawn_watch, WatchError, WatchHandle, WatchOptions};
