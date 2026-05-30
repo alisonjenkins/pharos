@@ -49,17 +49,314 @@ pub struct MediaItem {
     /// rescans don't reset "added on" dates. `None` for rows
     /// imported before migration 0010.
     pub created_at: Option<i64>,
+    /// LIB-C7/C8/C9 — descriptive (non-technical) metadata: overview,
+    /// tagline, ratings, production year, premiere date, external
+    /// provider ids. Distinct from [`MediaProbe`], which stays
+    /// TECHNICAL-only (codecs/HDR/streams). EPIC D populates these from
+    /// NFO / online providers; here we PLUMB them so they round-trip
+    /// through the store and project down into the Jellyfin
+    /// `BaseItemDto`. `Default` = all `None` / empty.
+    pub metadata: MediaMetadata,
+}
+
+/// LIB-C7/C8/C9 — item-level descriptive metadata persisted alongside
+/// the [`MediaProbe`]. All fields optional: a freshly-scanned file that
+/// hasn't been enriched yet still yields a row, just with
+/// `MediaMetadata::default()`. The Jellyfin DTO omits fields whose value
+/// is `None` (and emits an empty `Taglines` array when `tagline` is
+/// `None`) to preserve wire compatibility.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MediaMetadata {
+    /// Jellyfin `CommunityRating` (0–10 audience score).
+    pub community_rating: Option<f32>,
+    /// Jellyfin `CriticRating` (0–100 critic score).
+    pub critic_rating: Option<f32>,
+    /// Parental rating string, e.g. `"PG-13"` → Jellyfin
+    /// `OfficialRating`.
+    pub official_rating: Option<String>,
+    /// Release / production year → Jellyfin `ProductionYear`.
+    pub production_year: Option<u32>,
+    /// Original premiere/air date as unix-seconds (mirrors
+    /// `created_at`'s encoding). The DTO converts to Jellyfin's ISO-8601
+    /// `PremiereDate`.
+    pub premiere_date: Option<i64>,
+    /// Long-form synopsis → Jellyfin `Overview`.
+    pub overview: Option<String>,
+    /// Short tagline → Jellyfin `Taglines` (an array carrying the single
+    /// value, or empty when `None`).
+    pub tagline: Option<String>,
+    /// External provider ids → Jellyfin `ProviderIds` map.
+    pub provider_ids: ProviderIds,
+}
+
+/// LIB-C9 — external metadata-provider identifiers. Persisted as a JSON
+/// object string in the `provider_ids` column; projected into the
+/// Jellyfin `BaseItemDto.ProviderIds` map under the canonical provider
+/// keys (`Tmdb` / `Tvdb` / `Imdb` / `MusicBrainzTrack`). All optional —
+/// `Default` = no known ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderIds {
+    /// TheMovieDB id (→ `Tmdb`).
+    pub tmdb: Option<String>,
+    /// TheTVDB id (→ `Tvdb`).
+    pub tvdb: Option<String>,
+    /// IMDb id, e.g. `tt0111161` (→ `Imdb`).
+    pub imdb: Option<String>,
+    /// MusicBrainz track id (→ `MusicBrainzTrack`).
+    pub mbid: Option<String>,
+}
+
+impl ProviderIds {
+    /// True when no provider id is set (so the DTO can emit an empty
+    /// `ProviderIds` map rather than fabricating keys).
+    pub fn is_empty(&self) -> bool {
+        self.tmdb.is_none() && self.tvdb.is_none() && self.imdb.is_none() && self.mbid.is_none()
+    }
+}
+
+/// LIB-C4 — stable 32-hex wire id for an aggregate entity (genre /
+/// artist / album / studio), keyed on a `kind` namespace + `name`. Pure
+/// arithmetic over the UTF-8 bytes — not IO, so it lives in core (V12
+/// only forbids IO impls, not deterministic hashing). The Jellyfin DTO's
+/// `genre_id_for` / `artist_id_for` / … delegate here so the wire id a
+/// `genres.wire_id` column stores at upsert is byte-identical to the id
+/// clients send back as `?ParentId=`.
+///
+/// Layout: `xxh3_64("{kind}:{name}") & 0x7FFF…` rendered as the 16-hex
+/// digest repeated twice (32 chars) — a GUID-shaped string jellyfin-web
+/// accepts as an item id.
+pub fn name_aggregate_wire_id(kind: &str, name: &str) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let h = xxh3_64(format!("{kind}:{name}").as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF;
+    format!("{h:016x}{h:016x}")
+}
+
+/// LIB-C4 — the `genres.wire_id` value for a genre `name`. Thin wrapper
+/// over [`name_aggregate_wire_id`] with the `"genre"` namespace; the
+/// store stamps this at upsert so `/Items?ParentId=<genre id>` resolves
+/// by an indexed `wire_id` lookup instead of an in-memory DISTINCT scan.
+pub fn genre_wire_id(name: &str) -> String {
+    name_aggregate_wire_id("genre", name)
+}
+
+/// LIB-C4 — a genre entity row. `wire_id` is the stable
+/// [`genre_wire_id`] the Jellyfin DTO emits as the Genre's `Id`; the
+/// integer `id` is the internal PK used by the `item_genres` join.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Genre {
+    pub id: i64,
+    pub name: String,
+    pub wire_id: String,
+}
+
+/// LIB-C4 — one genre plus how many items carry it, for the `/Genres`
+/// list (jellyfin-web shows the tile; the count drives library stats).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenreCount {
+    pub genre: Genre,
+    pub item_count: u32,
+}
+
+/// LIB-C4 — genres as first-class entities. Split from [`MediaStore`] so
+/// the in-memory test stores that only need item round-tripping don't
+/// have to implement the join, while the scanner (which links items to
+/// genres on write) and the API (which lists genres + resolves the
+/// ParentId pivot) require both bounds.
+///
+/// The wire id a genre row stores is [`genre_wire_id`] of its name,
+/// computed at [`upsert_genre`](Self::upsert_genre) time — so the
+/// `/Items?ParentId=<genre id>` pivot is an indexed `wire_id` lookup
+/// (see [`item_ids_for_genre`](Self::item_ids_for_genre)) rather than the
+/// legacy in-memory DISTINCT scan over every item's `genre` string.
+pub trait GenreStore: Send + Sync {
+    /// Upsert a genre by `name`, returning its internal PK. Idempotent:
+    /// re-upserting an existing name returns the same id without
+    /// duplicating the row. Empty/whitespace names are rejected by the
+    /// caller (the scanner trims + drops blanks before linking).
+    fn upsert_genre(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// Replace `item`'s genre links with exactly `names` (trimmed,
+    /// de-duplicated, blanks dropped by the impl). Upserts any missing
+    /// genre rows first. Idempotent — a rescan that yields the same
+    /// genres leaves the join unchanged.
+    fn link_item_genres(
+        &self,
+        item: MediaId,
+        names: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Every genre with its item count, ordered by name, for `/Genres`.
+    fn genres_with_counts(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<GenreCount>>> + Send;
+
+    /// Item ids tagged with the genre whose `wire_id` matches — the exact
+    /// `/Items?ParentId=<genre id>` pivot. Empty Vec when no genre row
+    /// carries that wire id (so the caller renders an empty library).
+    fn item_ids_for_genre(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// One-time backfill: read every `media_items.genre` string, split on
+    /// comma/pipe, and populate `genres` + `item_genres` for rows scanned
+    /// before C4. Idempotent (upsert + INSERT-OR-IGNORE join), so it is
+    /// safe to run repeatedly. Returns the number of `item_genres` links
+    /// present after the pass.
+    fn backfill_genres(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+}
+
+/// LIB-C4 — split a raw `media_items.genre` string into individual genre
+/// names. Jellyfin's wire convention separates genres with `|`; NFO /
+/// ffprobe tags often use `,`. We split on either, trim, and drop blanks.
+/// Shared by the scanner (link on write) and the backfill so both derive
+/// the same genre set from one source column.
+pub fn split_genre_field(raw: &str) -> Vec<String> {
+    raw.split(['|', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// LIB-C1 — the typed kind of a top-level library, driving the Jellyfin
+/// `CollectionType` a `/Library/VirtualFolders` / `/Library/MediaFolders`
+/// entry advertises. `Mixed` is the back-compat default for a plain
+/// `[media].roots` entry that didn't declare a kind (matches the legacy
+/// single "All Media / mixed" stub).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LibraryKind {
+    Movies,
+    TvShows,
+    Music,
+    #[default]
+    Mixed,
+}
+
+impl LibraryKind {
+    /// The Jellyfin `CollectionType` wire token. `Mixed` serialises as
+    /// `"mixed"` — the same value the legacy stub emitted, so existing
+    /// clients keep resolving the view.
+    pub fn collection_type(self) -> &'static str {
+        match self {
+            LibraryKind::Movies => "movies",
+            LibraryKind::TvShows => "tvshows",
+            LibraryKind::Music => "music",
+            LibraryKind::Mixed => "mixed",
+        }
+    }
+
+    /// Parse a config / wire token (case-insensitive) into a kind.
+    /// Unknown / empty tokens fall back to [`LibraryKind::Mixed`] so a
+    /// typo never crashes startup — the operator just gets a mixed view.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "movies" | "movie" => LibraryKind::Movies,
+            "tvshows" | "tvshow" | "tv" | "shows" | "series" => LibraryKind::TvShows,
+            "music" | "audio" => LibraryKind::Music,
+            _ => LibraryKind::Mixed,
+        }
+    }
+}
+
+/// LIB-C1 — a typed top-level library: one per configured media root.
+/// `wire_id` is the stable 32-hex `library_id_for_root(root_path)` the
+/// Jellyfin views/virtual-folder DTOs already emit as a library `Id`, so
+/// existing client URLs survive promoting the single "All Media" stub to
+/// real per-root typed libraries. The integer `id` is the internal PK;
+/// `media_items.library_id` references it after the path-prefix backfill.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Library {
+    pub id: i64,
+    pub name: String,
+    pub root_path: String,
+    pub kind: LibraryKind,
+    pub wire_id: String,
+}
+
+/// LIB-C1 — typed libraries as first-class rows. Split from
+/// [`MediaStore`] so in-memory test stores that only round-trip items
+/// don't have to implement library reconciliation. Reconciled from
+/// `[media]` config at boot (one row per root), then
+/// [`backfill_library_ids`](Self::backfill_library_ids) stamps each
+/// existing `media_items.library_id` by path-prefix.
+pub trait LibraryStore: Send + Sync {
+    /// Upsert a library by its unique `root_path`, returning its internal
+    /// PK. Idempotent: re-upserting the same root updates the name/kind
+    /// (config may have changed) and returns the existing id without
+    /// duplicating the row. `wire_id` is supplied by the caller (computed
+    /// from the root via the DTO's `library_id_for_root` so the hash
+    /// lives at the API boundary, not in the store).
+    fn upsert_library(
+        &self,
+        name: &str,
+        root_path: &str,
+        kind: LibraryKind,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// Every configured library, ordered by name, for
+    /// `/Library/VirtualFolders` + `/Library/MediaFolders` + the view list.
+    fn libraries(&self) -> impl std::future::Future<Output = DomainResult<Vec<Library>>> + Send;
+
+    /// Path-boundary-safe backfill: assign `media_items.library_id` for
+    /// every item whose path is strictly under the library's `root_path`
+    /// (so `/media/movies` never claims `/media/movies-4k`). Idempotent —
+    /// re-running re-points each item at the library covering its path.
+    /// Returns the number of items assigned to some library.
+    fn backfill_library_ids(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
+    /// Item ids belonging to the library whose `wire_id` matches — the
+    /// exact `/Items?ParentId=<library id>` pivot. Empty Vec when no
+    /// library row carries that wire id.
+    fn item_ids_for_library(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
 }
 
 /// Parent-show / season / episode metadata for items the scanner
 /// promoted to `MediaKind::Episode`. `season_number` + `episode_number`
 /// fall back to None when the path didn't yield them but the
 /// containing dir still flagged as a season layout.
+///
+/// LIB-C11 — series identity is keyed on the **show folder path**
+/// (`series_folder`), not the bare `series_name`, so two distinct shows
+/// that happen to share a name (`Cosmos (1980)` vs `Cosmos (2014)`) get
+/// distinct synthesised Series/Season wire ids and don't interleave
+/// their episodes. `series_folder` is the canonical filesystem path of
+/// the directory that holds the season dirs / episode files (captured by
+/// the scanner). `series_year` is parsed from a `Show Name (YYYY)` folder
+/// convention so clients can disambiguate the two shows visually. Both
+/// are `Option` and additive: rows scanned before C11 (or items whose
+/// path didn't yield a folder) decode with `None` and fall back to the
+/// legacy name-keyed identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SeriesInfo {
     pub series_name: String,
     pub season_number: Option<u32>,
     pub episode_number: Option<u32>,
+    /// LIB-C11 — canonical filesystem path of the show's root folder
+    /// (the closest non-"Season NN" ancestor of the episode). `None` for
+    /// legacy rows; the wire-id helpers fall back to `series_name` then.
+    pub series_folder: Option<String>,
+    /// LIB-C11 — release year parsed from a `Show Name (YYYY)` folder
+    /// name, surfaced as `ProductionYear` so same-name shows are
+    /// distinguishable in clients. `None` when the folder carries no year.
+    pub series_year: Option<u32>,
+}
+
+impl SeriesInfo {
+    /// LIB-C11 — the identity key the synthesised Series/Season wire ids
+    /// hash on. Prefers the stable, per-show-on-disk `series_folder`;
+    /// falls back to `series_name` for legacy rows lacking a folder so
+    /// pre-backfill client URLs keep resolving.
+    pub fn series_key(&self) -> &str {
+        self.series_folder.as_deref().unwrap_or(&self.series_name)
+    }
 }
 
 /// Stream/format metadata pulled by `Prober::probe` (today: ffprobe).

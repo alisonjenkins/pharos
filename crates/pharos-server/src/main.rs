@@ -29,6 +29,35 @@ enum AppError {
     Readiness(#[from] ReadinessError),
     #[error("store: {0}")]
     Store(#[from] pharos_store_sqlx::StoreError),
+    #[error("domain: {0}")]
+    Domain(#[from] pharos_core::DomainError),
+}
+
+/// LIB-C1 — reconcile the `libraries` table from `[media]` config and
+/// backfill `media_items.library_id` by path-prefix, returning the typed
+/// libraries for `AppState`. Idempotent: re-runs on every boot, upserting
+/// one row per configured root/typed-library (the typed kind/name winning
+/// for a path listed both ways) and re-pointing each item's library_id.
+async fn reconcile_libraries(
+    stores: &SqliteStore,
+    cfg: &Config,
+) -> Result<Vec<pharos_core::Library>, AppError> {
+    use pharos_core::LibraryStore;
+    use pharos_server::api::jellyfin::items::library_id_for_root;
+    for (name, path, kind) in cfg.media.library_specs() {
+        let wire_id = library_id_for_root(&path);
+        stores
+            .upsert_library(&name, &path.to_string_lossy(), kind, &wire_id)
+            .await?;
+    }
+    let assigned = stores.backfill_library_ids().await?;
+    let libraries = stores.libraries().await?;
+    tracing::info!(
+        libraries = libraries.len(),
+        items_assigned = assigned,
+        "reconciled typed libraries"
+    );
+    Ok(libraries)
 }
 
 #[actix_web::main]
@@ -58,7 +87,10 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     use pharos_scanner::FfmpegProber;
     use pharos_scanner::FsScanner;
 
-    if cfg.media.roots.is_empty() {
+    // LIB-C1 — the union of `[media].roots` + any `[[media.libraries]]`
+    // paths, so a path declared only as a typed library is still scanned.
+    let scan_roots = cfg.media.scan_roots();
+    if scan_roots.is_empty() {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
         writeln!(
@@ -88,7 +120,7 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     let mut total_updated: usize = 0;
     let mut total_removed: usize = 0;
     let mut total_skipped: usize = 0;
-    for root in &cfg.media.roots {
+    for root in &scan_roots {
         writeln!(lock, "scanning {}…", root.display())?;
         match scanner.scan_into(root.as_path(), &stores).await {
             Ok(outcome) => {
@@ -345,9 +377,16 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
     let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
+    // LIB-C1 — reconcile the typed `libraries` table from config (one row
+    // per configured root/typed-library, with its kind + stable wire id),
+    // then backfill `media_items.library_id` by path-prefix so the
+    // /Items?ParentId=<library id> pivot resolves via an indexed join.
+    let libraries = reconcile_libraries(&stores, &cfg).await?;
+    let scan_roots = cfg.media.scan_roots();
     let mut state = AppState::load(stores, cfg.server.name.clone())
         .await?
-        .with_media_roots(cfg.media.roots.clone());
+        .with_media_roots(scan_roots.clone())
+        .with_libraries(libraries);
     // P48 — one resident libav worker pool shared by the image + trickplay
     // caches (and the scanner prober) in the `ffmpeg-lib` build. Tiny ops
     // run in-process in crash-isolated workers; the fork/exec is amortised.
@@ -464,7 +503,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     .with_rate_limit_ms(rate_limit_ms)
             }
         };
-        spawn_for_roots(app_state.clone(), &cfg.media.roots, watch_cfg, make_scanner)
+        spawn_for_roots(app_state.clone(), &scan_roots, watch_cfg, make_scanner)
     };
 
     let group_registry = web::Data::new(GroupRegistry::spawn());

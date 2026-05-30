@@ -229,8 +229,95 @@ pub struct ObsConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MediaConfig {
+    /// Back-compat plain root list. Each entry becomes a `mixed` library
+    /// named after the directory basename. Still the simplest config;
+    /// existing files keep working unchanged.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
+    /// LIB-C1 — richer per-library declaration. When present, each entry
+    /// becomes a typed library with an explicit `kind` + optional display
+    /// `name`. `[[media.libraries]]` and `roots` coexist: the union of
+    /// both is reconciled into the `libraries` table at boot (a path
+    /// appearing in both is treated as one library, the typed entry
+    /// winning its kind/name).
+    #[serde(default)]
+    pub libraries: Vec<LibraryConfig>,
+}
+
+/// LIB-C1 — one typed library in `[[media.libraries]]`.
+///
+/// ```toml
+/// [[media.libraries]]
+/// path = "/srv/Movies"
+/// name = "Movies"
+/// kind = "movies"   # movies | tvshows | music | mixed (default)
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LibraryConfig {
+    pub path: PathBuf,
+    /// Display name. Defaults to the directory basename when omitted.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `movies` | `tvshows` | `music` | `mixed`. Unknown / omitted →
+    /// `mixed` (parsed leniently by `LibraryKind::parse`).
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+impl MediaConfig {
+    /// The full set of filesystem roots pharos scans — the union of the
+    /// plain `roots` list and any `[[media.libraries]]` paths, de-duped
+    /// preserving order (plain roots first, then typed-only paths). Used
+    /// by the scanner + watcher so a path declared only under
+    /// `[[media.libraries]]` is still walked.
+    pub fn scan_roots(&self) -> Vec<PathBuf> {
+        let mut out = self.roots.clone();
+        for lib in &self.libraries {
+            if !out.iter().any(|r| r == &lib.path) {
+                out.push(lib.path.clone());
+            }
+        }
+        out
+    }
+
+    /// LIB-C1 — reconcile config into `(name, root_path, kind)` tuples for
+    /// the `libraries` table. A path appearing in both `roots` and
+    /// `[[media.libraries]]` yields a single typed entry (the typed kind
+    /// wins); a plain-only root yields a `mixed` library named after its
+    /// basename.
+    pub fn library_specs(&self) -> Vec<(String, PathBuf, pharos_core::LibraryKind)> {
+        let mut out: Vec<(String, PathBuf, pharos_core::LibraryKind)> = Vec::new();
+        let basename = |p: &Path| -> String {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Media")
+                .to_string()
+        };
+        // Plain roots first (mixed unless overridden by a typed entry below).
+        for root in &self.roots {
+            out.push((
+                basename(root),
+                root.clone(),
+                pharos_core::LibraryKind::Mixed,
+            ));
+        }
+        for lib in &self.libraries {
+            let kind = lib
+                .kind
+                .as_deref()
+                .map(pharos_core::LibraryKind::parse)
+                .unwrap_or_default();
+            let name = lib.name.clone().unwrap_or_else(|| basename(&lib.path));
+            if let Some(existing) = out.iter_mut().find(|(_, p, _)| p == &lib.path) {
+                // Typed entry wins for a path also listed under `roots`.
+                existing.0 = name;
+                existing.2 = kind;
+            } else {
+                out.push((name, lib.path.clone(), kind));
+            }
+        }
+        out
+    }
 }
 
 fn default_log_level() -> String {
@@ -335,5 +422,94 @@ mod tests {
         std::env::remove_var("PHAROS_BIND");
         std::env::remove_var("PHAROS_LOG_LEVEL");
         std::env::remove_var("PHAROS_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn plain_roots_synthesise_mixed_libraries_back_compat() {
+        // LIB-C1 — a legacy config with only `roots` keeps working: each
+        // root becomes one `mixed` library named after its basename.
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+            roots = ["/srv/Movies", "/srv/TV"]
+        "#;
+        let c = Config::from_toml_str(s).unwrap();
+        assert!(c.media.libraries.is_empty());
+        let specs = c.media.library_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].0, "Movies");
+        assert_eq!(specs[0].2, pharos_core::LibraryKind::Mixed);
+        assert_eq!(specs[1].0, "TV");
+        // scan_roots = the plain roots (no extra typed paths).
+        assert_eq!(
+            c.media.scan_roots(),
+            vec![PathBuf::from("/srv/Movies"), PathBuf::from("/srv/TV")]
+        );
+    }
+
+    #[test]
+    fn typed_libraries_array_drives_kind_and_name() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+            roots = ["/srv/Shared"]
+
+            [[media.libraries]]
+            path = "/srv/Films"
+            name = "Films"
+            kind = "movies"
+
+            [[media.libraries]]
+            path = "/srv/Shows"
+            kind = "tvshows"
+        "#;
+        let c = Config::from_toml_str(s).unwrap();
+        let specs = c.media.library_specs();
+        // Shared (mixed, from roots) + Films (movies) + Shows (tvshows,
+        // name defaulted to basename).
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].0, "Shared");
+        assert_eq!(specs[0].2, pharos_core::LibraryKind::Mixed);
+        assert_eq!(specs[1].0, "Films");
+        assert_eq!(specs[1].2, pharos_core::LibraryKind::Movies);
+        assert_eq!(specs[2].0, "Shows");
+        assert_eq!(specs[2].2, pharos_core::LibraryKind::TvShows);
+        // scan_roots unions both lists.
+        assert_eq!(
+            c.media.scan_roots(),
+            vec![
+                PathBuf::from("/srv/Shared"),
+                PathBuf::from("/srv/Films"),
+                PathBuf::from("/srv/Shows"),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_entry_wins_for_path_listed_under_both_roots_and_libraries() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+            roots = ["/srv/Movies"]
+
+            [[media.libraries]]
+            path = "/srv/Movies"
+            name = "My Movies"
+            kind = "movies"
+        "#;
+        let c = Config::from_toml_str(s).unwrap();
+        let specs = c.media.library_specs();
+        // One entry — the typed declaration overrides the plain root's
+        // mixed/basename defaults, not a duplicate.
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].0, "My Movies");
+        assert_eq!(specs[0].2, pharos_core::LibraryKind::Movies);
+        assert_eq!(c.media.scan_roots(), vec![PathBuf::from("/srv/Movies")]);
     }
 }

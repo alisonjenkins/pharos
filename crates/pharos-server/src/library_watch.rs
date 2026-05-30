@@ -229,6 +229,17 @@ where
                     skipped = outcome.skipped,
                     "library rescan applied a delta",
                 );
+                // LIB-C1 — re-stamp media_items.library_id by path-prefix so
+                // freshly-added items land in the right typed library (the
+                // /Items?ParentId=<library id> pivot resolves via the
+                // indexed join, not just the boot-time backfill). Idempotent;
+                // a backend error here is non-fatal to the rescan.
+                if !outcome.added.is_empty() {
+                    use pharos_core::LibraryStore;
+                    if let Err(e) = state.stores.backfill_library_ids().await {
+                        tracing::warn!(error = %e, "library_id backfill after rescan failed");
+                    }
+                }
                 broadcast_outcome(state, &outcome);
             }
         }

@@ -962,9 +962,33 @@ fn synth_views_body(state: &AppState) -> serde_json::Value {
 }
 
 fn library_views(state: &AppState) -> Vec<serde_json::Value> {
+    // LIB-C1 — prefer the typed libraries reconciled from config (each
+    // carries its own CollectionType). The wire_id is the same
+    // library_id_for_root hash a plain root would yield, so client URLs
+    // are stable whether or not a library is typed.
+    if !state.libraries.is_empty() {
+        return state
+            .libraries
+            .iter()
+            .map(|lib| {
+                serde_json::json!({
+                    "Id": lib.wire_id,
+                    "Name": lib.name,
+                    "ServerId": state.server_id,
+                    "Type": "CollectionFolder",
+                    "CollectionType": lib.kind.collection_type(),
+                    "MediaType": "Unknown",
+                    "IsFolder": true,
+                    "UserData": { "Played": false, "PlayCount": 0 },
+                })
+            })
+            .collect();
+    }
     if state.media_roots.is_empty() {
         return vec![all_media_placeholder(&state.server_id)];
     }
+    // Fallback: synthesise one `mixed` library per configured root (the
+    // legacy shape — used by tests that only call `with_media_roots`).
     state
         .media_roots
         .iter()
@@ -1006,7 +1030,7 @@ fn all_media_placeholder(server_id: &str) -> serde_json::Value {
 /// same id across restarts. Two roots only collide if their xxh3 hashes
 /// collide (cryptographically unlikely for any realistic library
 /// count).
-pub(crate) fn library_id_for_root(path: &std::path::Path) -> String {
+pub fn library_id_for_root(path: &std::path::Path) -> String {
     let h = pharos_scanner::stable_id(path);
     // Pad to 32 hex chars so jellyfin-web's uuid-shaped id regex
     // accepts it (some downstream code assumes 32-hex shapes).
@@ -1306,21 +1330,42 @@ async fn apply_userdata_filter(
 /// Drop items that don't live under the configured root / series /
 /// season mapped to `parent_id`. Unknown `parent_id` → empty list.
 /// The All-Media placeholder + `None` pass everything through.
-fn restrict_to_parent(
+async fn restrict_to_parent(
     state: &AppState,
     items: Vec<MediaItem>,
     parent_id: Option<&str>,
 ) -> Vec<MediaItem> {
     use crate::api::jellyfin::dto::{
-        album_id_for, artist_id_for, genre_id_for, season_id_for, series_id_for,
+        album_id_for, artist_id_for, genre_id_for, season_id_for_key, series_id_for_key,
     };
+    use pharos_core::{GenreStore, LibraryStore};
     let Some(pid) = parent_id else {
         return items;
     };
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return items;
     }
-    // 1) Library / root match (per-root collections).
+    // 1) Library / root match. LIB-C1 — prefer the typed `libraries` table:
+    //    resolve the ParentId by wire_id to the set of item ids assigned
+    //    that library (backfilled by path-prefix at boot, kept current by
+    //    the scanner). Fall back to the legacy path-prefix scan over
+    //    `media_roots` for libraries not yet backfilled (or test states
+    //    wired only with `with_media_roots`).
+    if let Some(lib) = state.libraries.iter().find(|l| l.wire_id == pid) {
+        if let Ok(ids) = state.stores.item_ids_for_library(&lib.wire_id).await {
+            if !ids.is_empty() {
+                let want: std::collections::HashSet<u64> = ids.into_iter().collect();
+                return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+            }
+        }
+        // No backfilled rows yet → fall back to the path-prefix scan
+        // against this library's root so the view still resolves.
+        let root = std::path::PathBuf::from(&lib.root_path);
+        return items
+            .into_iter()
+            .filter(|i| i.path.starts_with(&root))
+            .collect();
+    }
     if let Some(root) = state
         .media_roots
         .iter()
@@ -1923,17 +1968,51 @@ async fn virtual_folders(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    // Phase 1: report a single synthesized "All Media" library covering the
-    // entire store. Real per-root libraries land with media-roots wiring.
-    let folder = VirtualFolderInfoDto {
-        name: "All Media".into(),
-        locations: vec![],
-        collection_type: "mixed",
-        item_id: "00000000000000000000000000000000".into(),
-        library_options: VirtualFolderOptionsDto::default(),
+    // LIB-C1 — one VirtualFolderInfoDto per real typed library, with its
+    // root path as the single `Locations` entry and the per-kind
+    // CollectionType. Item id = the stable library wire id so client URLs
+    // survive. Falls back to synthesising one `mixed` folder per
+    // configured `media_roots` entry, then to the legacy "All Media" stub
+    // when neither is configured (keeps the wire shape jellyfin-web
+    // accepts).
+    let folders: Vec<VirtualFolderInfoDto> = if !state.libraries.is_empty() {
+        state
+            .libraries
+            .iter()
+            .map(|lib| VirtualFolderInfoDto {
+                name: lib.name.clone(),
+                locations: vec![lib.root_path.clone()],
+                collection_type: lib.kind.collection_type(),
+                item_id: lib.wire_id.clone(),
+                library_options: VirtualFolderOptionsDto::default(),
+            })
+            .collect()
+    } else if !state.media_roots.is_empty() {
+        state
+            .media_roots
+            .iter()
+            .map(|root| VirtualFolderInfoDto {
+                name: root
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Media")
+                    .to_string(),
+                locations: vec![root.to_string_lossy().into_owned()],
+                collection_type: "mixed",
+                item_id: library_id_for_root(root),
+                library_options: VirtualFolderOptionsDto::default(),
+            })
+            .collect()
+    } else {
+        vec![VirtualFolderInfoDto {
+            name: "All Media".into(),
+            locations: vec![],
+            collection_type: "mixed",
+            item_id: "00000000000000000000000000000000".into(),
+            library_options: VirtualFolderOptionsDto::default(),
+        }]
     };
-    let _ = &state.stores;
-    Ok(HttpResponse::Ok().json(vec![folder]))
+    Ok(HttpResponse::Ok().json(folders))
 }
 
 async fn paginate(

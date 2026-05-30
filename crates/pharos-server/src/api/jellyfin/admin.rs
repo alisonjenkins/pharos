@@ -418,6 +418,14 @@ async fn library_refresh(
                 ),
             }
         }
+        // LIB-C1 — re-stamp media_items.library_id by path-prefix so any
+        // newly-imported items resolve under their typed library. Idempotent.
+        if !added.is_empty() {
+            use pharos_core::LibraryStore;
+            if let Err(e) = state.stores.backfill_library_ids().await {
+                tracing::warn!(error = %e, "library refresh: library_id backfill failed");
+            }
+        }
         state.notify_library_delta(&added, &removed);
     });
     Ok(HttpResponse::NoContent().finish())
