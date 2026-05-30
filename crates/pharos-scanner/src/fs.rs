@@ -3,9 +3,9 @@
 
 use futures_util::stream::StreamExt;
 use pharos_core::{
-    AlternateMediaSource, ArtworkSource, DomainError, DomainResult, Fingerprint, GenreStore,
-    MediaId, MediaItem, MediaKind, MediaStore, MetadataRequest, MetadataResult, Prober,
-    ScanOutcome, Scanner, SeriesInfo,
+    AlternateMediaSource, ArtworkSource, CollectionStore, DomainError, DomainResult, Fingerprint,
+    GenreStore, MediaId, MediaItem, MediaKind, MediaStore, MetadataRequest, MetadataResult,
+    PersonStore, Prober, ScanOutcome, Scanner, SeriesInfo, StudioStore, TagStore,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -208,7 +208,9 @@ impl<P: Prober> FsScanner<P> {
     /// swept count is threaded into [`MediaStore::finish_scan`] and the
     /// deleted ids are logged at info (broadcasting deltas is A4).
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
-    pub async fn scan_into<S: MediaStore + GenreStore>(
+    pub async fn scan_into<
+        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+    >(
         &self,
         root: &Path,
         store: &S,
@@ -410,13 +412,42 @@ impl<P: Prober> FsScanner<P> {
             // also returns the UNION of probe + NFO genres and consumes the
             // artwork refs, so we capture them here (genres + artwork are
             // applied after the row exists — FK on item id).
-            let (genres, artwork) = merge_metadata_into_item(&mut item, meta);
+            let MergedEntities {
+                genres,
+                artwork,
+                people,
+                studios,
+                collections,
+                tags,
+            } = merge_metadata_into_item(&mut item, meta);
             store.put(item).await?;
             // LIB-C4 — populate the item_genres join. UNION of the probe's
             // (possibly comma/pipe-separated) `genre` column with the NFO
             // `<genre>` tags resolved above; `link_item_genres` is idempotent
             // (de-dupes), so the union never double-inserts.
             store.link_item_genres(item_id, &genres).await?;
+            // LIB-C2 — populate the item_people join from the NFO cast/crew
+            // the resolver parsed. `link_item_people` upserts each person row
+            // (carrying its headshot / provider ids) then replaces the item's
+            // credits wholesale, so a rescan keeps the join current.
+            store.link_item_people(item_id, &people).await?;
+            // LIB-C3 — populate the item_studios join from the NFO <studio>
+            // tags the resolver parsed. `link_item_studios` upserts each
+            // studio row then replaces the item's studios wholesale, so a
+            // rescan keeps the join current.
+            store.link_item_studios(item_id, &studios).await?;
+            // LIB-C5 — populate the collection_items membership join from the
+            // NFO <set>/<collection> tags the resolver parsed. Each named box
+            // set is upserted and the item appended (idempotent), so a rescan
+            // keeps NFO-driven box-set membership current alongside any manual
+            // CRUD additions.
+            store.link_item_collections(item_id, &collections).await?;
+            // LIB-C6 — populate the item_tags join from the NFO <tag>
+            // elements + the filename provider's quality/source tokens the
+            // resolver parsed. `link_item_tags` upserts each tag row then
+            // replaces the item's tags wholesale, so a rescan keeps the join
+            // current (a dropped <tag> clears its stale link).
+            store.link_item_tags(item_id, &tags).await?;
             // LIB-D7 — persist discovered artwork (local sidecars from D4 +
             // any NFO thumb/fanart URLs) keyed by item id + role. One row per
             // role; the resolver fed refs in priority order so the first per
@@ -482,7 +513,9 @@ impl<P: Prober> FsScanner<P> {
     /// right delta. Errors only on a store failure — a probe / stat / hash
     /// failure on the one file is logged and yields [`PathUpdate::Skipped`]
     /// (V6: a bad file never aborts the watcher loop).
-    pub async fn update_path<S: MediaStore + GenreStore>(
+    pub async fn update_path<
+        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+    >(
         &self,
         path: &Path,
         store: &S,
@@ -559,7 +592,9 @@ impl<P: Prober> FsScanner<P> {
     /// LIB-A8 — probe a single path and persist it (the create/modify tail
     /// shared by [`update_path`]). `existed` drives the added-vs-updated
     /// result; `fp` is reused when already computed during move-detect.
-    async fn probe_put_one<S: MediaStore + GenreStore>(
+    async fn probe_put_one<
+        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+    >(
         &self,
         path: &Path,
         store: &S,
@@ -586,10 +621,31 @@ impl<P: Prober> FsScanner<P> {
         // way a full scan does). A bad NFO / sidecar is logged + skipped by
         // the resolver (V6); the item still imports from probe data.
         let meta = self.resolve_metadata(&item).await;
-        let (genres, artwork) = merge_metadata_into_item(&mut item, meta);
+        let MergedEntities {
+            genres,
+            artwork,
+            people,
+            studios,
+            collections,
+            tags,
+        } = merge_metadata_into_item(&mut item, meta);
         store.put(item).await?;
         // LIB-C4 — keep the item_genres join in step (probe ∪ NFO genres).
         store.link_item_genres(item_id, &genres).await?;
+        // LIB-C2 — keep the item_people join in step (watched create/modify
+        // enriches cast/crew the same way a full scan does).
+        store.link_item_people(item_id, &people).await?;
+        // LIB-C3 — keep the item_studios join in step (watched create/modify
+        // enriches studios the same way a full scan does).
+        store.link_item_studios(item_id, &studios).await?;
+        // LIB-C5 — keep the collection_items join in step (watched
+        // create/modify links NFO <set> box-set membership the same way a
+        // full scan does).
+        store.link_item_collections(item_id, &collections).await?;
+        // LIB-C6 — keep the item_tags join in step (watched create/modify
+        // links NFO <tag> + filename quality/source tokens the same way a
+        // full scan does).
+        store.link_item_tags(item_id, &tags).await?;
         // LIB-D7 — persist discovered artwork (FK on the row just put).
         persist_artwork(store, item_id, &artwork).await?;
         if let Some((mtime, size)) = sig {
@@ -722,9 +778,29 @@ impl<P: Prober> FsScanner<P> {
     }
 }
 
+/// LIB-D7 — the entity side-effects [`merge_metadata_into_item`] hands
+/// back for the caller to link once the media row exists (the joins carry
+/// FKs on the item id, so they must follow `store.put`). Each `Vec` is the
+/// resolved-and-deduped set for one entity kind.
+struct MergedEntities {
+    /// Genre names — UNION of the probe `genre` column + NFO `<genre>`.
+    genres: Vec<String>,
+    /// Resolved artwork refs (local sidecars + NFO thumb/fanart URLs).
+    artwork: Vec<pharos_core::ArtworkRef>,
+    /// Cast/crew credits (LIB-C2 `item_people`).
+    people: Vec<pharos_core::PersonRef>,
+    /// Studio names (LIB-C3 `item_studios`).
+    studios: Vec<String>,
+    /// Collection / box-set names (LIB-C5 `collection_items`).
+    collections: Vec<String>,
+    /// Free-form tag names (LIB-C6 `item_tags`) — NFO `<tag>` + the
+    /// filename provider's quality/source tokens.
+    tags: Vec<String>,
+}
+
 /// LIB-D7 — merge a resolved [`MetadataResult`] onto a probe-built
-/// [`MediaItem`] in place, then return the side-effects the caller must
-/// apply once the row exists: `(genres, artwork)`.
+/// [`MediaItem`] in place, then return the [`MergedEntities`] the caller
+/// must link once the row exists.
 ///
 /// Scalars (`overview` / `tagline` / `production_year` / `premiere_date` /
 /// ratings / `official_rating` / each `provider_ids` slot) overwrite the
@@ -735,13 +811,11 @@ impl<P: Prober> FsScanner<P> {
 ///
 /// Genres are the UNION of the probe's `genre` column (split on `|`/`,`) and
 /// the NFO `<genre>` tags, de-duped in that order (probe first for stable
-/// ordering). `people` / `studios` / `tags` / `collections` have no store
-/// table this run — they are logged at `debug` as dropped counts (visible
-/// but never fatal) and not persisted.
-fn merge_metadata_into_item(
-    item: &mut MediaItem,
-    meta: MetadataResult,
-) -> (Vec<String>, Vec<pharos_core::ArtworkRef>) {
+/// ordering). `people` (LIB-C2) / `studios` (LIB-C3) / `collections`
+/// (LIB-C5) / `tags` (LIB-C6) are all returned in [`MergedEntities`] so the
+/// caller links them into their respective joins after `put` — nothing from
+/// the [`MetadataResult`] is dropped any more.
+fn merge_metadata_into_item(item: &mut MediaItem, meta: MetadataResult) -> MergedEntities {
     let MetadataResult {
         title,
         overview,
@@ -797,21 +871,26 @@ fn merge_metadata_into_item(
         }
     }
 
-    // LIB-D7 — entities with no table yet: carried by the resolver, logged
-    // as dropped so the gap is observable, never fatal.
-    if !people.is_empty() || !studios.is_empty() || !tags.is_empty() || !collections.is_empty() {
-        tracing::debug!(
-            item_id = item.id,
-            path = %item.path.display(),
-            people = people.len(),
-            studios = studios.len(),
-            tags = tags.len(),
-            collections = collections.len(),
-            "resolved metadata entities with no store table this run; dropped (not persisted)"
-        );
+    // LIB-C6 — tags (NFO `<tag>` + filename quality/source tokens) are now
+    // a real join: normalise (trim + drop blanks + de-dup, preserving the
+    // resolver's source order) and hand them to the caller to link after
+    // `put`. The last entity that was logged-and-dropped now persists.
+    let mut merged_tags: Vec<String> = Vec::with_capacity(tags.len());
+    for t in tags {
+        let t = t.trim().to_string();
+        if !t.is_empty() && !merged_tags.iter().any(|e| e == &t) {
+            merged_tags.push(t);
+        }
     }
 
-    (genres, artwork)
+    MergedEntities {
+        genres,
+        artwork,
+        people,
+        studios,
+        collections,
+        tags: merged_tags,
+    }
 }
 
 /// Overwrite `slot` with `value` only when the resolver produced one. The
@@ -1274,6 +1353,15 @@ mod tests {
         item_genres: Mutex<HashMap<MediaId, Vec<String>>>,
         // LIB-D4 — artwork mirror: (item id, role) → (source, locator).
         artwork: Mutex<HashMap<(MediaId, String), (String, String)>>,
+        // LIB-C2 — item_people mirror: item id → its linked credits.
+        item_people: Mutex<HashMap<MediaId, Vec<pharos_core::PersonRef>>>,
+        // LIB-C3 — item_studios mirror: item id → its linked studio names.
+        item_studios: Mutex<HashMap<MediaId, Vec<String>>>,
+        // LIB-C5 — collections mirror: collection name → ordered member ids
+        // (the curated sort_order). Append-on-link, idempotent.
+        collections: Mutex<HashMap<String, Vec<MediaId>>>,
+        // LIB-C6 — item_tags mirror: item id → its linked tag names.
+        item_tags: Mutex<HashMap<MediaId, Vec<String>>>,
     }
 
     impl MediaStore for MemStore {
@@ -1300,6 +1388,69 @@ mod tests {
                 .values()
                 .cloned()
                 .collect())
+        }
+        async fn query(&self, q: &pharos_core::MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+            // Scanner test store: kind filter + id-ordered page + total.
+            // Entity / parent pivots live in the SQL backends, not here.
+            let mut items: Vec<MediaItem> = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .filter(|i| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+                .cloned()
+                .collect();
+            items.sort_by_key(|i| i.id);
+            let total = items.len() as u64;
+            let start = usize::try_from(q.start_index).unwrap_or(usize::MAX);
+            let mut page: Vec<MediaItem> = items.into_iter().skip(start).collect();
+            if let Some(limit) = q.limit {
+                page.truncate(limit as usize);
+            }
+            Ok((page, total))
+        }
+        async fn search(
+            &self,
+            q: &pharos_core::SearchQuery,
+        ) -> DomainResult<(Vec<MediaItem>, u64)> {
+            // Scanner test store: title/overview substring superset, kind
+            // filter, id-ordered. The SQL backends carry the real FTS.
+            let tokens = pharos_core::search_tokens(&q.term);
+            if tokens.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let needle = q.term.trim().to_lowercase();
+            let mut items: Vec<MediaItem> = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .filter(|i| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+                .filter(|i| {
+                    i.title.to_lowercase().contains(&needle)
+                        || i.metadata
+                            .overview
+                            .as_deref()
+                            .map(|o| o.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            items.sort_by_key(|i| i.id);
+            let total = items.len() as u64;
+            let start = usize::try_from(q.offset).unwrap_or(usize::MAX);
+            let mut page: Vec<MediaItem> = items.into_iter().skip(start).collect();
+            page.truncate(q.limit.max(1) as usize);
+            Ok((page, total))
+        }
+        async fn facets(
+            &self,
+            _base: &pharos_core::MediaQuery,
+            _req: &pharos_core::FacetRequest,
+        ) -> DomainResult<pharos_core::MediaFacets> {
+            // Scanner test store has no entity tables; facets aren't
+            // exercised here.
+            Ok(pharos_core::MediaFacets::default())
         }
         async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
             Ok(self
@@ -1564,6 +1715,497 @@ mod tests {
                 .map(Vec::len)
                 .sum();
             Ok(total as u64)
+        }
+    }
+
+    // LIB-C2 — minimal in-memory PersonStore so the scanner's
+    // link-on-write path can be exercised without the sqlx store.
+    impl PersonStore for MemStore {
+        async fn upsert_person(
+            &self,
+            name: &str,
+            _sort_name: Option<&str>,
+            _provider_ids: Option<&str>,
+            _thumb_url: Option<&str>,
+        ) -> DomainResult<i64> {
+            let wid = pharos_core::person_wire_id(name);
+            let id = i64::from_str_radix(&wid[..15], 16).unwrap_or(0);
+            Ok(id)
+        }
+        async fn link_item_people(
+            &self,
+            item: MediaId,
+            people: &[pharos_core::PersonRef],
+        ) -> DomainResult<()> {
+            let mut wanted: Vec<pharos_core::PersonRef> = Vec::new();
+            for p in people {
+                if p.name.trim().is_empty() {
+                    continue;
+                }
+                let role = p.role.as_deref().unwrap_or("").trim();
+                let dup = wanted.iter().any(|w| {
+                    w.name.trim() == p.name.trim() && w.role.as_deref().unwrap_or("").trim() == role
+                });
+                if !dup {
+                    wanted.push(p.clone());
+                }
+            }
+            self.item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(item, wanted);
+            Ok(())
+        }
+        async fn people_with_counts(&self) -> DomainResult<Vec<pharos_core::PersonCount>> {
+            use std::collections::BTreeMap;
+            let links = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+            for people in links.values() {
+                for p in people {
+                    *counts.entry(p.name.clone()).or_insert(0) += 1;
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .map(|(name, item_count)| pharos_core::PersonCount {
+                    person: pharos_core::Person {
+                        id: 0,
+                        wire_id: pharos_core::person_wire_id(&name),
+                        name,
+                        sort_name: None,
+                        provider_ids: None,
+                        thumb_url: None,
+                    },
+                    item_count,
+                })
+                .collect())
+        }
+        async fn person_by_wire_id(
+            &self,
+            wire_id: &str,
+        ) -> DomainResult<Option<pharos_core::Person>> {
+            let links = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            for people in links.values() {
+                for p in people {
+                    if pharos_core::person_wire_id(&p.name) == wire_id {
+                        return Ok(Some(pharos_core::Person {
+                            id: 0,
+                            wire_id: wire_id.to_string(),
+                            name: p.name.clone(),
+                            sort_name: None,
+                            provider_ids: p.provider_ids.clone(),
+                            thumb_url: p.thumb.clone(),
+                        }));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        async fn item_ids_for_person(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            let links = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut ids: Vec<MediaId> = links
+                .iter()
+                .filter(|(_, people)| {
+                    people
+                        .iter()
+                        .any(|p| pharos_core::person_wire_id(&p.name) == wire_id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        }
+        async fn people_for_item(
+            &self,
+            item: MediaId,
+        ) -> DomainResult<Vec<pharos_core::ItemPerson>> {
+            let links = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut out: Vec<pharos_core::ItemPerson> = links
+                .get(&item)
+                .map(|people| {
+                    people
+                        .iter()
+                        .map(|p| pharos_core::ItemPerson {
+                            name: p.name.clone(),
+                            wire_id: pharos_core::person_wire_id(&p.name),
+                            role: p.role.clone(),
+                            character: p.character.clone(),
+                            kind: p.kind,
+                            sort_order: p.sort_order,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort_by(|a, b| {
+                a.sort_order
+                    .is_none()
+                    .cmp(&b.sort_order.is_none())
+                    .then(a.sort_order.cmp(&b.sort_order))
+                    .then(a.name.cmp(&b.name))
+            });
+            Ok(out)
+        }
+    }
+
+    // LIB-C3 — minimal in-memory StudioStore so the scanner's
+    // link-on-write path can be exercised without the sqlx store.
+    impl StudioStore for MemStore {
+        async fn upsert_studio(&self, name: &str) -> DomainResult<i64> {
+            let wid = pharos_core::studio_wire_id(name);
+            let id = i64::from_str_radix(&wid[..15], 16).unwrap_or(0);
+            Ok(id)
+        }
+        async fn link_item_studios(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+            let mut wanted: Vec<String> = Vec::new();
+            for n in names {
+                let t = n.trim();
+                if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                    wanted.push(t.to_string());
+                }
+            }
+            self.item_studios
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(item, wanted);
+            Ok(())
+        }
+        async fn studios_with_counts(&self) -> DomainResult<Vec<pharos_core::StudioCount>> {
+            use std::collections::BTreeMap;
+            let links = self
+                .item_studios
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+            for names in links.values() {
+                for n in names {
+                    *counts.entry(n.clone()).or_insert(0) += 1;
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .map(|(name, item_count)| pharos_core::StudioCount {
+                    studio: pharos_core::Studio {
+                        id: 0,
+                        wire_id: pharos_core::studio_wire_id(&name),
+                        name,
+                    },
+                    item_count,
+                })
+                .collect())
+        }
+        async fn item_ids_for_studio(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            let links = self
+                .item_studios
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut ids: Vec<MediaId> = links
+                .iter()
+                .filter(|(_, names)| {
+                    names
+                        .iter()
+                        .any(|n| pharos_core::studio_wire_id(n) == wire_id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        }
+        async fn studios_for_item(&self, item: MediaId) -> DomainResult<Vec<pharos_core::Studio>> {
+            let links = self
+                .item_studios
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut out: Vec<pharos_core::Studio> = links
+                .get(&item)
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|name| pharos_core::Studio {
+                            id: 0,
+                            wire_id: pharos_core::studio_wire_id(name),
+                            name: name.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(out)
+        }
+    }
+
+    // LIB-C6 — minimal in-memory TagStore so the scanner's link-on-write
+    // path (NFO <tag> + filename quality tokens) can be exercised without
+    // the sqlx store. Tags are a Vec per item; add/remove mutate in place.
+    impl TagStore for MemStore {
+        async fn upsert_tag(&self, name: &str) -> DomainResult<i64> {
+            let wid = pharos_core::tag_wire_id(name);
+            let id = i64::from_str_radix(&wid[..15], 16).unwrap_or(0);
+            Ok(id)
+        }
+        async fn link_item_tags(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+            let mut wanted: Vec<String> = Vec::new();
+            for n in names {
+                let t = n.trim();
+                if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                    wanted.push(t.to_string());
+                }
+            }
+            self.item_tags
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(item, wanted);
+            Ok(())
+        }
+        async fn add_item_tags(&self, item: MediaId, names: &[String]) -> DomainResult<u64> {
+            let mut links = self
+                .item_tags
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let cur = links.entry(item).or_default();
+            let mut added = 0u64;
+            for n in names {
+                let t = n.trim();
+                if !t.is_empty() && !cur.iter().any(|w| w == t) {
+                    cur.push(t.to_string());
+                    added += 1;
+                }
+            }
+            Ok(added)
+        }
+        async fn remove_item_tags(&self, item: MediaId, names: &[String]) -> DomainResult<u64> {
+            let mut links = self
+                .item_tags
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let Some(cur) = links.get_mut(&item) else {
+                return Ok(0);
+            };
+            let drop: Vec<&str> = names.iter().map(|n| n.trim()).collect();
+            let before = cur.len();
+            cur.retain(|t| !drop.contains(&t.as_str()));
+            Ok((before - cur.len()) as u64)
+        }
+        async fn tags_with_counts(&self) -> DomainResult<Vec<pharos_core::TagCount>> {
+            use std::collections::BTreeMap;
+            let links = self
+                .item_tags
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+            for names in links.values() {
+                for n in names {
+                    *counts.entry(n.clone()).or_insert(0) += 1;
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .map(|(name, item_count)| pharos_core::TagCount {
+                    tag: pharos_core::Tag {
+                        id: 0,
+                        wire_id: pharos_core::tag_wire_id(&name),
+                        name,
+                    },
+                    item_count,
+                })
+                .collect())
+        }
+        async fn item_ids_for_tag(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            let links = self
+                .item_tags
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut ids: Vec<MediaId> = links
+                .iter()
+                .filter(|(_, names)| names.iter().any(|n| pharos_core::tag_wire_id(n) == wire_id))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        }
+        async fn tags_for_item(&self, item: MediaId) -> DomainResult<Vec<pharos_core::Tag>> {
+            let links = self
+                .item_tags
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut out: Vec<pharos_core::Tag> = links
+                .get(&item)
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|name| pharos_core::Tag {
+                            id: 0,
+                            wire_id: pharos_core::tag_wire_id(name),
+                            name: name.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(out)
+        }
+    }
+
+    // LIB-C5 — minimal in-memory CollectionStore so the scanner's
+    // link-on-write path (NFO <set>) can be exercised without the sqlx
+    // store. Membership is an ordered Vec per name (curated sort_order).
+    impl CollectionStore for MemStore {
+        async fn upsert_collection(
+            &self,
+            name: &str,
+            _kind: Option<&str>,
+            _overview: Option<&str>,
+        ) -> DomainResult<i64> {
+            self.collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .entry(name.to_string())
+                .or_default();
+            let wid = pharos_core::collection_wire_id(name);
+            Ok(i64::from_str_radix(&wid[..15], 16).unwrap_or(0))
+        }
+        async fn link_item_collections(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+            let mut map = self
+                .collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            for n in names {
+                let t = n.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let members = map.entry(t.to_string()).or_default();
+                if !members.contains(&item) {
+                    members.push(item);
+                }
+            }
+            Ok(())
+        }
+        async fn collections_with_counts(&self) -> DomainResult<Vec<pharos_core::CollectionCount>> {
+            use std::collections::BTreeMap;
+            let map = self
+                .collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let ordered: BTreeMap<String, usize> =
+                map.iter().map(|(n, m)| (n.clone(), m.len())).collect();
+            Ok(ordered
+                .into_iter()
+                .map(|(name, count)| pharos_core::CollectionCount {
+                    collection: pharos_core::Collection {
+                        id: 0,
+                        wire_id: pharos_core::collection_wire_id(&name),
+                        name,
+                        kind: "boxset".into(),
+                        overview: None,
+                    },
+                    item_count: count as u32,
+                })
+                .collect())
+        }
+        async fn collection_by_wire_id(
+            &self,
+            wire_id: &str,
+        ) -> DomainResult<Option<pharos_core::Collection>> {
+            let map = self
+                .collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            Ok(map
+                .keys()
+                .find(|n| pharos_core::collection_wire_id(n) == wire_id)
+                .map(|name| pharos_core::Collection {
+                    id: 0,
+                    wire_id: pharos_core::collection_wire_id(name),
+                    name: name.clone(),
+                    kind: "boxset".into(),
+                    overview: None,
+                }))
+        }
+        async fn collection_items(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            let map = self
+                .collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            Ok(map
+                .iter()
+                .find(|(n, _)| pharos_core::collection_wire_id(n) == wire_id)
+                .map(|(_, members)| members.clone())
+                .unwrap_or_default())
+        }
+        async fn create_collection(
+            &self,
+            name: &str,
+            item_ids: &[MediaId],
+        ) -> DomainResult<pharos_core::Collection> {
+            self.upsert_collection(name, None, None).await?;
+            let wid = pharos_core::collection_wire_id(name);
+            self.add_collection_items(&wid, item_ids).await?;
+            Ok(pharos_core::Collection {
+                id: 0,
+                wire_id: wid,
+                name: name.to_string(),
+                kind: "boxset".into(),
+                overview: None,
+            })
+        }
+        async fn add_collection_items(
+            &self,
+            wire_id: &str,
+            item_ids: &[MediaId],
+        ) -> DomainResult<Option<u64>> {
+            let mut map = self
+                .collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let Some(name) = map
+                .keys()
+                .find(|n| pharos_core::collection_wire_id(n) == wire_id)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let members = map.entry(name).or_default();
+            let mut added = 0u64;
+            for id in item_ids {
+                if !members.contains(id) {
+                    members.push(*id);
+                    added += 1;
+                }
+            }
+            Ok(Some(added))
+        }
+        async fn remove_collection_items(
+            &self,
+            wire_id: &str,
+            item_ids: &[MediaId],
+        ) -> DomainResult<Option<u64>> {
+            let mut map = self
+                .collections
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let Some(name) = map
+                .keys()
+                .find(|n| pharos_core::collection_wire_id(n) == wire_id)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let members = map.entry(name).or_default();
+            let before = members.len();
+            members.retain(|id| !item_ids.contains(id));
+            Ok(Some((before - members.len()) as u64))
         }
     }
 
@@ -2460,6 +3102,263 @@ mod tests {
             "Primary should point at poster.jpg, got {}",
             primary.2
         );
+    }
+
+    #[tokio::test]
+    async fn scan_persists_people_from_nfo_cast_and_crew() {
+        // LIB-C2 — a movie with a Kodi NFO carrying <actor> (name / role /
+        // order / thumb) + <director> + <credits>. After a scan the cast &
+        // crew are linked into item_people, the person wire id resolves the
+        // item back, and the headshot is persisted on the person row.
+        use pharos_core::{person_wire_id, PersonKind, PersonStore};
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Movie (2017).mkv", b"video-bytes").await;
+        write_file(
+            td.path(),
+            "Movie (2017).nfo",
+            br#"<?xml version="1.0"?>
+<movie>
+  <title>The Real Movie</title>
+  <director>Lana Wachowski</director>
+  <credits>David Mitchell</credits>
+  <actor>
+    <name>Keanu Reeves</name>
+    <role>Neo</role>
+    <order>0</order>
+    <thumb>http://img/keanu.jpg</thumb>
+  </actor>
+  <actor>
+    <name>Carrie-Anne Moss</name>
+    <role>Trinity</role>
+    <order>1</order>
+  </actor>
+</movie>"#,
+        )
+        .await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 1);
+
+        let movie_path = td.path().join("Movie (2017).mkv");
+        let id = stable_id(&movie_path);
+
+        // All four credits linked into item_people, in NFO order
+        // (actors first by sort_order; crew with no order trail).
+        let credits = store.people_for_item(id).await.unwrap();
+        let names: Vec<&str> = credits.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names[0], "Keanu Reeves", "order 0 first");
+        assert_eq!(names[1], "Carrie-Anne Moss", "order 1 second");
+        assert!(names.contains(&"Lana Wachowski"));
+        assert!(names.contains(&"David Mitchell"));
+
+        // Structured kind + character round-trip.
+        let keanu = credits.iter().find(|c| c.name == "Keanu Reeves").unwrap();
+        assert_eq!(keanu.kind, PersonKind::Actor);
+        assert_eq!(keanu.character.as_deref(), Some("Neo"));
+        let dir = credits.iter().find(|c| c.name == "Lana Wachowski").unwrap();
+        assert_eq!(dir.kind, PersonKind::Director);
+        let wri = credits.iter().find(|c| c.name == "David Mitchell").unwrap();
+        assert_eq!(wri.kind, PersonKind::Writer);
+
+        // ParentId pivot: person wire id → the crediting item.
+        let ids = store
+            .item_ids_for_person(&person_wire_id("Keanu Reeves"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![id]);
+
+        // Headshot persisted on the person row.
+        let p = store
+            .person_by_wire_id(&person_wire_id("Keanu Reeves"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.thumb_url.as_deref(), Some("http://img/keanu.jpg"));
+    }
+
+    #[tokio::test]
+    async fn scan_persists_studios_from_nfo() {
+        // LIB-C3 — a movie with a Kodi NFO carrying two <studio> tags. After
+        // a scan the studios are linked into item_studios, the studio wire id
+        // resolves the item back, and the item's studios project name-ordered.
+        use pharos_core::{studio_wire_id, StudioStore};
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Movie (2017).mkv", b"video-bytes").await;
+        write_file(
+            td.path(),
+            "Movie (2017).nfo",
+            br#"<?xml version="1.0"?>
+<movie>
+  <title>The Real Movie</title>
+  <studio>Warner Bros.</studio>
+  <studio>Village Roadshow</studio>
+</movie>"#,
+        )
+        .await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 1);
+
+        let movie_path = td.path().join("Movie (2017).mkv");
+        let id = stable_id(&movie_path);
+
+        // Both studios linked into item_studios, projected name-ordered.
+        let studios = store.studios_for_item(id).await.unwrap();
+        let names: Vec<&str> = studios.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Village Roadshow", "Warner Bros."]);
+        // The projected studio carries the wire id the DTO emits.
+        assert_eq!(studios[1].wire_id, studio_wire_id("Warner Bros."));
+
+        // /Studios list reflects both with a per-studio item count.
+        let counts = store.studios_with_counts().await.unwrap();
+        let wb = counts
+            .iter()
+            .find(|c| c.studio.name == "Warner Bros.")
+            .expect("Warner Bros. studio");
+        assert_eq!(wb.item_count, 1);
+        assert_eq!(wb.studio.wire_id, studio_wire_id("Warner Bros."));
+
+        // ParentId pivot: studio wire id → the tagged item.
+        let ids = store
+            .item_ids_for_studio(&studio_wire_id("Warner Bros."))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![id]);
+        // An unknown wire id resolves to nothing.
+        let none = store.item_ids_for_studio("deadbeef").await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_persists_tags_from_nfo_and_filename() {
+        // LIB-C6 — a movie whose filename carries a quality token (1080p,
+        // BluRay) and whose NFO carries a <tag>. After a scan all the tags
+        // are linked into item_tags, project name-ordered onto the item,
+        // resolve back via the tag wire id, and count in tags_with_counts.
+        use pharos_core::{tag_wire_id, TagStore};
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Movie (2017) [1080p] BluRay.mkv", b"video-bytes").await;
+        write_file(
+            td.path(),
+            "Movie (2017) [1080p] BluRay.nfo",
+            br#"<?xml version="1.0"?>
+<movie>
+  <title>The Real Movie</title>
+  <tag>cyberpunk</tag>
+</movie>"#,
+        )
+        .await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 1);
+
+        let movie_path = td.path().join("Movie (2017) [1080p] BluRay.mkv");
+        let id = stable_id(&movie_path);
+
+        // The NFO <tag> + filename quality/source tokens all land in
+        // item_tags. We assert the NFO tag + at least the quality tokens
+        // the filename provider extracts are present and name-ordered.
+        let tags = store.tags_for_item(id).await.unwrap();
+        let names: Vec<String> = tags.iter().map(|t| t.name.clone()).collect();
+        assert!(
+            names.contains(&"cyberpunk".to_string()),
+            "NFO <tag> persisted, got {names:?}"
+        );
+        assert!(
+            names.contains(&"1080p".to_string()),
+            "filename quality token persisted, got {names:?}"
+        );
+        assert!(
+            names.contains(&"BluRay".to_string()),
+            "filename source token persisted, got {names:?}"
+        );
+        // Name-ordered (tags_for_item sorts).
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "tags project name-ordered");
+
+        // ParentId pivot: the NFO tag's wire id → the tagged item.
+        let ids = store
+            .item_ids_for_tag(&tag_wire_id("cyberpunk"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![id]);
+        // /Tags list reflects the NFO tag with a per-tag item count.
+        let counts = store.tags_with_counts().await.unwrap();
+        let cp = counts
+            .iter()
+            .find(|c| c.tag.name == "cyberpunk")
+            .expect("cyberpunk tag");
+        assert_eq!(cp.item_count, 1);
+        assert_eq!(cp.tag.wire_id, tag_wire_id("cyberpunk"));
+        // An unknown wire id resolves to nothing.
+        assert!(store.item_ids_for_tag("deadbeef").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_persists_collections_from_nfo() {
+        // LIB-C5 — a movie with a Kodi NFO carrying a <set> tag. After a
+        // scan the box set is created, the item is a member, and the
+        // collection wire id resolves the item back via collection_items.
+        // Covers BOTH the flat <set>Name</set> and the nested
+        // <set><name>Name</name></set> Jellyfin form.
+        use pharos_core::{collection_wire_id, CollectionStore};
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Movie (2017).mkv", b"video-bytes").await;
+        write_file(
+            td.path(),
+            "Movie (2017).nfo",
+            br#"<?xml version="1.0"?>
+<movie>
+  <title>The Real Movie</title>
+  <set><name>The Matrix Collection</name></set>
+  <collection>Wachowski Films</collection>
+</movie>"#,
+        )
+        .await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 1);
+
+        let movie_path = td.path().join("Movie (2017).mkv");
+        let id = stable_id(&movie_path);
+
+        // Both the nested <set><name> and the flat <collection> are box sets.
+        let counts = store.collections_with_counts().await.unwrap();
+        let names: Vec<&str> = counts.iter().map(|c| c.collection.name.as_str()).collect();
+        assert_eq!(names, vec!["The Matrix Collection", "Wachowski Films"]);
+
+        // ParentId pivot: collection wire id → the member item.
+        let members = store
+            .collection_items(&collection_wire_id("The Matrix Collection"))
+            .await
+            .unwrap();
+        assert_eq!(members, vec![id]);
+        assert_eq!(
+            store
+                .collection_items(&collection_wire_id("Wachowski Films"))
+                .await
+                .unwrap(),
+            vec![id]
+        );
+        // An unknown wire id resolves to nothing.
+        assert!(store.collection_items("deadbeef").await.unwrap().is_empty());
+
+        // Idempotent: a rescan keeps a single membership (no dupes).
+        let _ = s.scan_into(td.path(), &store).await.unwrap();
+        let members = store
+            .collection_items(&collection_wire_id("The Matrix Collection"))
+            .await
+            .unwrap();
+        assert_eq!(members, vec![id], "rescan keeps one membership");
     }
 
     #[tokio::test]

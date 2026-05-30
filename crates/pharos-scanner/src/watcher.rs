@@ -398,6 +398,65 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn query(&self, q: &pharos_core::MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+            let mut items: Vec<MediaItem> = self
+                .0
+                .items
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .filter(|i| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+                .cloned()
+                .collect();
+            items.sort_by_key(|i| i.id);
+            let total = items.len() as u64;
+            let start = usize::try_from(q.start_index).unwrap_or(usize::MAX);
+            let mut page: Vec<MediaItem> = items.into_iter().skip(start).collect();
+            if let Some(limit) = q.limit {
+                page.truncate(limit as usize);
+            }
+            Ok((page, total))
+        }
+        async fn search(
+            &self,
+            q: &pharos_core::SearchQuery,
+        ) -> DomainResult<(Vec<MediaItem>, u64)> {
+            let tokens = pharos_core::search_tokens(&q.term);
+            if tokens.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let needle = q.term.trim().to_lowercase();
+            let mut items: Vec<MediaItem> = self
+                .0
+                .items
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .filter(|i| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+                .filter(|i| {
+                    i.title.to_lowercase().contains(&needle)
+                        || i.metadata
+                            .overview
+                            .as_deref()
+                            .map(|o| o.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            items.sort_by_key(|i| i.id);
+            let total = items.len() as u64;
+            let start = usize::try_from(q.offset).unwrap_or(usize::MAX);
+            let mut page: Vec<MediaItem> = items.into_iter().skip(start).collect();
+            page.truncate(q.limit.max(1) as usize);
+            Ok((page, total))
+        }
+        async fn facets(
+            &self,
+            _base: &pharos_core::MediaQuery,
+            _req: &pharos_core::FacetRequest,
+        ) -> DomainResult<pharos_core::MediaFacets> {
+            Ok(pharos_core::MediaFacets::default())
+        }
         async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
             Ok(self
                 .0

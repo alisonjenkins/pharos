@@ -242,6 +242,12 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
     // the first `<value>` inside `<ratings>` as community_rating if a flat
     // `<rating>` wasn't already seen.
     let mut in_ratings = false;
+    // LIB-C5 — Jellyfin/Kodi write box-set membership two ways: a flat
+    // `<set>Name</set>` (text on the element) or a nested
+    // `<set><name>Name</name></set>`. Track whether we're inside a <set>
+    // so the nested `<name>` routes to collections (outside <set> a bare
+    // `<name>` has no top-level meaning).
+    let mut in_set = false;
     let mut buf = Vec::new();
 
     loop {
@@ -252,6 +258,7 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                 match tag.as_slice() {
                     b"actor" => actor = Some(ActorBuilder::default()),
                     b"ratings" => in_ratings = true,
+                    b"set" | b"collection" => in_set = true,
                     b"uniqueid" | b"thumb" | b"fanart" => {
                         // Capture attributes for the upcoming text/child.
                         if tag.as_slice() == b"uniqueid" {
@@ -305,6 +312,7 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                     &mut actor,
                     &mut uniqueid_type,
                     in_ratings,
+                    in_set,
                 );
             }
             Ok(Event::End(e)) => {
@@ -319,6 +327,7 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                         }
                     }
                     b"ratings" => in_ratings = false,
+                    b"set" | b"collection" => in_set = false,
                     b"uniqueid" => uniqueid_type = None,
                     _ => {}
                 }
@@ -354,6 +363,7 @@ fn apply_text(
     actor: &mut Option<ActorBuilder>,
     uniqueid_type: &mut Option<String>,
     in_ratings: bool,
+    in_set: bool,
 ) {
     // If we're assembling an actor, its child elements (name/role/order)
     // take precedence over the top-level field names.
@@ -371,9 +381,22 @@ fn apply_text(
                 b.order = text.parse::<u32>().ok();
                 return;
             }
-            // Other actor children (thumb, etc.) are ignored.
+            // LIB-C2 — capture the actor's headshot URL (persisted on the
+            // person row's thumb_url). Other actor children are ignored.
+            b"thumb" => {
+                b.thumb = Some(text.to_string());
+                return;
+            }
             _ => return,
         }
+    }
+
+    // LIB-C5 — nested box-set form `<set><name>Name</name></set>`: a
+    // `<name>` text run inside a <set> is the collection name. (The flat
+    // `<set>Name</set>` form is handled by the `b"set"` arm below.)
+    if in_set && tag == b"name" {
+        push_unique(&mut result.collections, text);
+        return;
     }
 
     match tag {
@@ -409,6 +432,8 @@ fn apply_text(
             kind: PersonKind::Director,
             character: None,
             sort_order: None,
+            thumb: None,
+            provider_ids: None,
         }),
         b"credits" => result.people.push(PersonRef {
             name: text.to_string(),
@@ -416,6 +441,8 @@ fn apply_text(
             kind: PersonKind::Writer,
             character: None,
             sort_order: None,
+            thumb: None,
+            provider_ids: None,
         }),
         b"uniqueid" => apply_uniqueid(&mut result.provider_ids, uniqueid_type.as_deref(), text),
         // Bare <id> — Kodi movies use TMDB by convention; only set tmdb if a
@@ -614,6 +641,9 @@ struct ActorBuilder {
     name: Option<String>,
     character: Option<String>,
     order: Option<u32>,
+    /// LIB-C2 — `<actor><thumb>` headshot URL, persisted on the person
+    /// row so the image API can serve a cast portrait.
+    thumb: Option<String>,
 }
 
 impl ActorBuilder {
@@ -629,6 +659,8 @@ impl ActorBuilder {
             kind: PersonKind::Actor,
             character: self.character,
             sort_order: self.order,
+            thumb: self.thumb.filter(|t| !t.trim().is_empty()),
+            provider_ids: None,
         })
     }
 }

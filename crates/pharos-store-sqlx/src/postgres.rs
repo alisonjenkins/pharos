@@ -18,9 +18,11 @@
 
 use crate::StoreError;
 use pharos_core::{
-    AuthError, AuthResult, AuthToken, DomainError, DomainResult, Fingerprint, Genre, GenreCount,
-    GenreStore, Library, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata,
-    MediaProbe, MediaStore, ScanState, SecretString, SeriesInfo, TokenStore, UserDataStore, UserId,
+    AuthError, AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainError,
+    DomainResult, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
+    LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore,
+    Person, PersonCount, PersonKind, PersonRef, PersonStore, ScanState, SecretString, SeriesInfo,
+    Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, TokenStore, UserDataStore, UserId,
     UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
@@ -36,6 +38,18 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+
+/// LIB-B4 — `MEDIA_COLUMNS` with each column qualified by a table alias,
+/// for the search join (so the FromRow still maps the plain column names).
+fn media_columns_prefixed_pg(alias: &str) -> String {
+    MEDIA_COLUMNS
+        .split(',')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{alias}.{c} AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -70,6 +84,266 @@ impl PostgresStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// LIB-B1 — total matching rows for `q` BEFORE LIMIT/OFFSET, the
+    /// empty-page fallback for `query()`. Mirrors
+    /// `SqliteStore::query_count`.
+    async fn query_count(&self, q: &pharos_core::MediaQuery) -> DomainResult<u64> {
+        use crate::media_query::{self, Param};
+        let mut counting = q.clone();
+        counting.limit = None;
+        counting.start_index = 0;
+        counting.sort = Vec::new();
+        let user = media_query::user_data_user(&counting);
+        let join_active = media_query::needs_user_data_join(&counting);
+        let offset = usize::from(join_active);
+        let built = media_query::build(&counting, |n| format!("${}", n + offset), "ALL");
+        let join = if join_active {
+            "LEFT JOIN user_data ud ON ud.item_id = media_items.id AND ud.user_id = $1"
+        } else {
+            ""
+        };
+        let where_clause = if built.where_sql.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", built.where_sql)
+        };
+        let sql = format!("SELECT COUNT(*) FROM media_items {join} {where_clause}");
+        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        if let Some(uid) = user {
+            query = query.bind(uid.0.as_bytes().to_vec());
+        }
+        for p in &built.params {
+            query = match p {
+                Param::Text(s) => query.bind(s.clone()),
+                Param::Int(i) => query.bind(*i),
+            };
+        }
+        let (count,) = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(u64::try_from(count.max(0)).unwrap_or(0))
+    }
+
+    /// LIB-B4 — the FTS (`search_tsv @@ to_tsquery`) ∪ substring
+    /// `hit(rid, score)` subquery shared by the postgres search page +
+    /// total. `score` is `ts_rank` for FTS hits (HIGHER = better; ORDER BY
+    /// score DESC) and `-1` for substring-only hits so the ranked FTS hits
+    /// sort first. Placeholders: `$1` = tsquery text, `$2` = LIKE needle
+    /// (reused for title + overview). `MAX(score)` keeps a row's best arm.
+    fn search_hit_subquery_pg() -> &'static str {
+        "SELECT rid, MAX(score) AS score FROM ( \
+             SELECT m1.id AS rid, ts_rank(m1.search_tsv, to_tsquery('simple', $1)) AS score \
+             FROM media_items m1 WHERE m1.search_tsv @@ to_tsquery('simple', $1) \
+             UNION ALL \
+             SELECT m2.id AS rid, -1::real AS score FROM media_items m2 \
+             WHERE (LOWER(m2.title) LIKE $2 OR LOWER(COALESCE(m2.overview, '')) LIKE $2) \
+         ) hits GROUP BY rid"
+    }
+
+    /// LIB-B4 — one ranked page of postgres search hits.
+    async fn search_page_pg(
+        &self,
+        tsquery: &str,
+        needle: &str,
+        kinds: &[MediaKind],
+        limit: i64,
+        offset: i64,
+    ) -> DomainResult<Vec<MediaItem>> {
+        // $1 tsquery, $2 needle are consumed by the hit subquery; kinds
+        // start at $3, then limit/offset.
+        let mut next = 3usize;
+        let kind_clause = if kinds.is_empty() {
+            String::new()
+        } else {
+            let holes: Vec<String> = kinds
+                .iter()
+                .map(|_| {
+                    let p = format!("${next}");
+                    next += 1;
+                    p
+                })
+                .collect();
+            format!("AND m.kind IN ({})", holes.join(", "))
+        };
+        let limit_ph = format!("${next}");
+        next += 1;
+        let offset_ph = format!("${next}");
+        let sql = format!(
+            "SELECT {cols} FROM ({hit}) hit \
+             JOIN media_items m ON m.id = hit.rid \
+             WHERE TRUE {kind_clause} \
+             ORDER BY hit.score DESC, m.id ASC LIMIT {limit_ph} OFFSET {offset_ph}",
+            cols = media_columns_prefixed_pg("m"),
+            hit = Self::search_hit_subquery_pg(),
+        );
+        let mut query = sqlx::query_as::<_, MediaRow>(&sql)
+            .bind(tsquery)
+            .bind(needle);
+        for k in kinds {
+            query = query.bind(k.as_str());
+        }
+        query = query.bind(limit).bind(offset);
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+
+    /// LIB-B4 — total distinct postgres search hits BEFORE limit/offset.
+    async fn search_total_pg(
+        &self,
+        tsquery: &str,
+        needle: &str,
+        kinds: &[MediaKind],
+    ) -> DomainResult<u64> {
+        let mut next = 3usize;
+        let kind_clause = if kinds.is_empty() {
+            String::new()
+        } else {
+            let holes: Vec<String> = kinds
+                .iter()
+                .map(|_| {
+                    let p = format!("${next}");
+                    next += 1;
+                    p
+                })
+                .collect();
+            format!("AND m.kind IN ({})", holes.join(", "))
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM ({hit}) hit \
+             JOIN media_items m ON m.id = hit.rid WHERE TRUE {kind_clause}",
+            hit = Self::search_hit_subquery_pg(),
+        );
+        let mut query = sqlx::query_as::<_, (i64,)>(&sql).bind(tsquery).bind(needle);
+        for k in kinds {
+            query = query.bind(k.as_str());
+        }
+        let (count,) = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(u64::try_from(count.max(0)).unwrap_or(0))
+    }
+
+    /// LIB-B5 — aggregate facet counts over the base query's WHERE scope
+    /// (postgres mirror of `SqliteStore::facets_impl`).
+    async fn facets_impl(
+        &self,
+        base: &pharos_core::MediaQuery,
+        req: &pharos_core::FacetRequest,
+    ) -> DomainResult<pharos_core::MediaFacets> {
+        use crate::media_query::{self, Param};
+        use pharos_core::{FacetValue, MediaFacets};
+        let mut out = MediaFacets::default();
+        if !req.is_any() {
+            return Ok(out);
+        }
+        let mut scope = base.clone();
+        scope.sort = Vec::new();
+        scope.limit = None;
+        scope.start_index = 0;
+        let user = media_query::user_data_user(&scope);
+        let join_active = media_query::needs_user_data_join(&scope);
+        // The user-data join binds $1; the base builder placeholders start at
+        // $2 (offset by one). Each facet statement appends NO further params,
+        // so the builder offset is the only adjustment.
+        let base_offset = usize::from(join_active);
+        let built = media_query::build(&scope, |n| format!("${}", n + base_offset), "ALL");
+        let join = if join_active {
+            "LEFT JOIN user_data ud ON ud.item_id = media_items.id AND ud.user_id = $1"
+        } else {
+            ""
+        };
+        let where_clause = if built.where_sql.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", built.where_sql)
+        };
+        let matched = format!("SELECT media_items.id FROM media_items {join} {where_clause}");
+
+        async fn run_facet(
+            pool: &PgPool,
+            sql: &str,
+            user: Option<UserId>,
+            params: &[Param],
+        ) -> DomainResult<Vec<FacetValue>> {
+            let mut q = sqlx::query_as::<_, (String, String, i64)>(sql);
+            if let Some(uid) = user {
+                q = q.bind(uid.0.as_bytes().to_vec());
+            }
+            for p in params {
+                q = match p {
+                    Param::Text(s) => q.bind(s.clone()),
+                    Param::Int(i) => q.bind(*i),
+                };
+            }
+            let rows = q
+                .fetch_all(pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(value, wire_id, c)| FacetValue {
+                    value,
+                    wire_id,
+                    count: c.max(0) as u32,
+                })
+                .collect())
+        }
+
+        let entity_facets: &[(bool, &str, &str)] = &[
+            (req.genres, "item_genres", "genre_id"),
+            (req.studios, "item_studios", "studio_id"),
+            (req.tags, "item_tags", "tag_id"),
+            (req.people, "item_people", "person_id"),
+        ];
+        let entity_tables: &[&str] = &["genres", "studios", "tags", "people"];
+        for (idx, (want, join_tbl, join_col)) in entity_facets.iter().enumerate() {
+            if !*want {
+                continue;
+            }
+            let entity = entity_tables[idx];
+            let sql = format!(
+                "SELECT e.name, e.wire_id, COUNT(DISTINCT j.item_id) AS c \
+                 FROM {entity} e JOIN {join_tbl} j ON j.{join_col} = e.id \
+                 WHERE j.item_id IN ({matched}) \
+                 GROUP BY e.id, e.name, e.wire_id \
+                 ORDER BY c DESC, e.name ASC"
+            );
+            let vals = run_facet(&self.pool, &sql, user, &built.params).await?;
+            match entity {
+                "genres" => out.genres = vals,
+                "studios" => out.studios = vals,
+                "tags" => out.tags = vals,
+                "people" => out.people = vals,
+                _ => {}
+            }
+        }
+
+        if req.years {
+            let sql = format!(
+                "SELECT production_year::text, production_year::text, COUNT(*) AS c \
+                 FROM media_items WHERE production_year IS NOT NULL \
+                 AND id IN ({matched}) GROUP BY production_year \
+                 ORDER BY production_year DESC"
+            );
+            out.years = run_facet(&self.pool, &sql, user, &built.params).await?;
+        }
+        if req.official_ratings {
+            let sql = format!(
+                "SELECT official_rating, official_rating, COUNT(*) AS c \
+                 FROM media_items WHERE official_rating IS NOT NULL AND official_rating <> '' \
+                 AND id IN ({matched}) GROUP BY official_rating \
+                 ORDER BY c DESC, official_rating ASC"
+            );
+            out.official_ratings = run_facet(&self.pool, &sql, user, &built.params).await?;
+        }
+        Ok(out)
     }
 
     /// Read or initialise this server's stable identity UUID. Mirrors
@@ -142,6 +416,64 @@ impl PostgresStore {
         .await?;
         Ok(())
     }
+
+    /// LIB-B2 — distinct `(series_folder, series_name)` keys (see the sqlite
+    /// twin). Used by the API to resolve a `?ParentId=<series synth id>`.
+    pub async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
+        let rows = sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT DISTINCT series_folder, series_name FROM media_items \
+             WHERE series_name IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys.
+    pub async fn distinct_season_keys(
+        &self,
+    ) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
+        let rows = sqlx::query_as::<_, (Option<String>, String, i64)>(
+            "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
+             WHERE series_name IS NOT NULL AND season_number IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// LIB-B2 — distinct non-empty artist + album_artist names.
+    pub async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT artist AS n FROM media_items WHERE artist IS NOT NULL AND artist <> '' \
+             UNION SELECT DISTINCT album_artist FROM media_items \
+             WHERE album_artist IS NOT NULL AND album_artist <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// LIB-B2 — distinct non-empty album names.
+    pub async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT album FROM media_items WHERE album IS NOT NULL AND album <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// LIB-B2 — distinct raw `genre` probe strings (legacy ParentId=genre
+    /// fallback; see the sqlite twin).
+    pub async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
 }
 
 impl MediaStore for PostgresStore {
@@ -200,13 +532,14 @@ impl MediaStore for PostgresStore {
                 audio_tracks_json, \
                 community_rating, critic_rating, official_rating, production_year, \
                 premiere_date, overview, tagline, provider_ids, \
-                series_folder, series_year) \
+                series_folder, series_year, title_fold) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
-                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)
+                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
+                                            title_fold = EXCLUDED.title_fold,
                                             kind = EXCLUDED.kind,
                                             size_bytes = EXCLUDED.size_bytes,
                                             duration_ms = EXCLUDED.duration_ms,
@@ -289,6 +622,8 @@ impl MediaStore for PostgresStore {
         .bind(provider_ids_json)
         .bind(series_folder)
         .bind(series_year.map(|v| v as i32))
+        // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
+        .bind(item.title.to_lowercase())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -303,6 +638,92 @@ impl MediaStore for PostgresStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+
+    #[tracing::instrument(skip(self, q))]
+    async fn query(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+        use crate::media_query::{self, Param};
+        let user = media_query::user_data_user(q);
+        let join_active = media_query::needs_user_data_join(q);
+        // Postgres uses `$N`. When the user-data join is present its user id
+        // binds as `$1`, so every builder placeholder is offset by one.
+        let offset = usize::from(join_active);
+        let built = media_query::build(q, |n| format!("${}", n + offset), "ALL");
+        let join = if join_active {
+            "LEFT JOIN user_data ud ON ud.item_id = media_items.id AND ud.user_id = $1"
+        } else {
+            ""
+        };
+        let where_clause = if built.where_sql.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", built.where_sql)
+        };
+        let limit_clause = built.limit_sql;
+        let sql = format!(
+            "SELECT {MEDIA_COLUMNS}, COUNT(*) OVER () AS total_count \
+             FROM media_items {join} {where_clause} ORDER BY {} {limit_clause}",
+            built.order_sql,
+        );
+        let mut query = sqlx::query_as::<_, QueryRow>(&sql);
+        if let Some(uid) = user {
+            query = query.bind(uid.0.as_bytes().to_vec());
+        }
+        for p in &built.params {
+            query = match p {
+                Param::Text(s) => query.bind(s.clone()),
+                Param::Int(i) => query.bind(*i),
+            };
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let total = match rows.first() {
+            Some(r) => u64::try_from(r.total_count.max(0)).unwrap_or(0),
+            None => self.query_count(q).await?,
+        };
+        let items = rows
+            .into_iter()
+            .map(|r| r.media.into_domain())
+            .collect::<DomainResult<Vec<_>>>()?;
+        Ok((items, total))
+    }
+
+    #[tracing::instrument(skip(self, q))]
+    async fn search(&self, q: &pharos_core::SearchQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+        let tokens = pharos_core::search_tokens(&q.term);
+        if tokens.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        // to_tsquery('simple', $1) input: prefix-marked, AND-joined tokens.
+        // Tokens are alphanumeric-only (search_tokens), so no tsquery
+        // operator can leak; bound as a single parameter, never interpolated.
+        let tsquery = tokens
+            .iter()
+            .map(|t| format!("{t}:*"))
+            .collect::<Vec<_>>()
+            .join(" & ");
+        let needle = format!(
+            "%{}%",
+            crate::media_query::like_escape(&q.term.trim().to_lowercase())
+        );
+        let limit = i64::from(q.limit.max(1));
+        let offset = i64::from(q.offset);
+        let total = self.search_total_pg(&tsquery, &needle, &q.kinds).await?;
+        let rows = self
+            .search_page_pg(&tsquery, &needle, &q.kinds, limit, offset)
+            .await?;
+        Ok((rows, total))
+    }
+
+    #[tracing::instrument(skip(self, base, req))]
+    async fn facets(
+        &self,
+        base: &pharos_core::MediaQuery,
+        req: &pharos_core::FacetRequest,
+    ) -> DomainResult<pharos_core::MediaFacets> {
+        self.facets_impl(base, req).await
     }
 
     #[tracing::instrument(skip(self), fields(media.id = %id))]
@@ -626,6 +1047,839 @@ impl GenreStore for PostgresStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(total.max(0) as u64)
+    }
+}
+
+impl PersonStore for PostgresStore {
+    #[tracing::instrument(skip(self))]
+    async fn upsert_person(
+        &self,
+        name: &str,
+        sort_name: Option<&str>,
+        provider_ids: Option<&str>,
+        thumb_url: Option<&str>,
+    ) -> DomainResult<i64> {
+        let wire_id = pharos_core::person_wire_id(name);
+        sqlx::query(
+            "INSERT INTO people (name, sort_name, wire_id, provider_ids, thumb_url) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT(name) DO UPDATE SET \
+                 sort_name    = COALESCE(excluded.sort_name, people.sort_name), \
+                 provider_ids = COALESCE(excluded.provider_ids, people.provider_ids), \
+                 thumb_url    = COALESCE(excluded.thumb_url, people.thumb_url)",
+        )
+        .bind(name)
+        .bind(sort_name)
+        .bind(&wire_id)
+        .bind(provider_ids)
+        .bind(thumb_url)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // people.id is INTEGER (i32) on postgres; widen to i64 for the
+        // core signature (the join column item_id is BIGINT).
+        let (id,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM people WHERE name = $1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(id as i64)
+    }
+
+    #[tracing::instrument(skip(self, people), fields(media.id = %item))]
+    async fn link_item_people(&self, item: MediaId, people: &[PersonRef]) -> DomainResult<()> {
+        let item_i64 = media_id_i64(item)?;
+        let mut wanted: Vec<&PersonRef> = Vec::new();
+        for p in people {
+            if p.name.trim().is_empty() {
+                continue;
+            }
+            let role = p.role.as_deref().unwrap_or("").trim();
+            let dup = wanted.iter().any(|w| {
+                w.name.trim() == p.name.trim() && w.role.as_deref().unwrap_or("").trim() == role
+            });
+            if !dup {
+                wanted.push(p);
+            }
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        sqlx::query("DELETE FROM item_people WHERE item_id = $1")
+            .bind(item_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for p in &wanted {
+            let name = p.name.trim();
+            let wire_id = pharos_core::person_wire_id(name);
+            sqlx::query(
+                "INSERT INTO people (name, sort_name, wire_id, provider_ids, thumb_url) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT(name) DO UPDATE SET \
+                     provider_ids = COALESCE(excluded.provider_ids, people.provider_ids), \
+                     thumb_url    = COALESCE(excluded.thumb_url, people.thumb_url)",
+            )
+            .bind(name)
+            .bind(Option::<&str>::None)
+            .bind(&wire_id)
+            .bind(p.provider_ids.as_deref())
+            .bind(p.thumb.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (pid,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM people WHERE name = $1")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let role = p.role.as_deref().unwrap_or("").trim();
+            let sort_order = p.sort_order.map(|n| n as i32);
+            sqlx::query(
+                "INSERT INTO item_people \
+                     (item_id, person_id, role, character, person_kind, sort_order) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT(item_id, person_id, role) DO NOTHING",
+            )
+            .bind(item_i64)
+            .bind(pid)
+            .bind(role)
+            .bind(p.character.as_deref())
+            .bind(p.kind.as_str())
+            .bind(sort_order)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn people_with_counts(&self) -> DomainResult<Vec<PersonCount>> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i32,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+            ),
+        >(
+            "SELECT p.id, p.name, p.sort_name, p.wire_id, p.provider_ids, p.thumb_url, \
+                    COUNT(ip.item_id) \
+             FROM people p LEFT JOIN item_people ip ON ip.person_id = p.id \
+             GROUP BY p.id, p.name, p.sort_name, p.wire_id, p.provider_ids, p.thumb_url \
+             ORDER BY COALESCE(p.sort_name, p.name)",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, name, sort_name, wire_id, provider_ids, thumb_url, count)| PersonCount {
+                    person: Person {
+                        id: id as i64,
+                        name,
+                        sort_name,
+                        wire_id,
+                        provider_ids,
+                        thumb_url,
+                    },
+                    item_count: count.max(0) as u32,
+                },
+            )
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn person_by_wire_id(&self, wire_id: &str) -> DomainResult<Option<Person>> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                i32,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT id, name, sort_name, wire_id, provider_ids, thumb_url \
+             FROM people WHERE wire_id = $1 LIMIT 1",
+        )
+        .bind(wire_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(
+            |(id, name, sort_name, wire_id, provider_ids, thumb_url)| Person {
+                id: id as i64,
+                name,
+                sort_name,
+                wire_id,
+                provider_ids,
+                thumb_url,
+            },
+        ))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn item_ids_for_person(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "SELECT DISTINCT ip.item_id FROM item_people ip \
+             JOIN people p ON p.id = ip.person_id \
+             WHERE p.wire_id = $1 ORDER BY ip.item_id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn people_for_item(&self, item: MediaId) -> DomainResult<Vec<ItemPerson>> {
+        let item_i64 = media_id_i64(item)?;
+        let rows =
+            sqlx::query_as::<_, (String, String, String, Option<String>, String, Option<i32>)>(
+                "SELECT p.name, p.wire_id, ip.role, ip.character, ip.person_kind, ip.sort_order \
+             FROM item_people ip JOIN people p ON p.id = ip.person_id \
+             WHERE ip.item_id = $1 \
+             ORDER BY ip.sort_order IS NULL, ip.sort_order, p.name",
+            )
+            .bind(item_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(name, wire_id, role, character, kind, sort_order)| ItemPerson {
+                    name,
+                    wire_id,
+                    role: Some(role).filter(|r| !r.is_empty()),
+                    character,
+                    kind: PersonKind::parse(&kind),
+                    sort_order: sort_order.map(|n| n.max(0) as u32),
+                },
+            )
+            .collect())
+    }
+}
+
+impl StudioStore for PostgresStore {
+    #[tracing::instrument(skip(self))]
+    async fn upsert_studio(&self, name: &str) -> DomainResult<i64> {
+        let wire_id = pharos_core::studio_wire_id(name);
+        sqlx::query(
+            "INSERT INTO studios (name, wire_id) VALUES ($1, $2) ON CONFLICT(name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(&wire_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // studios.id is INTEGER (i32) on postgres; widen to i64 for the
+        // core signature (the join column item_id is BIGINT).
+        let (id,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM studios WHERE name = $1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(id as i64)
+    }
+
+    #[tracing::instrument(skip(self, names), fields(media.id = %item))]
+    async fn link_item_studios(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+        let item_i64 = media_id_i64(item)?;
+        let mut wanted: Vec<String> = Vec::new();
+        for n in names {
+            let t = n.trim();
+            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                wanted.push(t.to_string());
+            }
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        sqlx::query("DELETE FROM item_studios WHERE item_id = $1")
+            .bind(item_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for name in &wanted {
+            let wire_id = pharos_core::studio_wire_id(name);
+            sqlx::query(
+                "INSERT INTO studios (name, wire_id) VALUES ($1, $2) ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&wire_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (sid,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM studios WHERE name = $1")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            sqlx::query(
+                "INSERT INTO item_studios (item_id, studio_id) VALUES ($1, $2) \
+                 ON CONFLICT(item_id, studio_id) DO NOTHING",
+            )
+            .bind(item_i64)
+            .bind(sid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn studios_with_counts(&self) -> DomainResult<Vec<StudioCount>> {
+        let rows = sqlx::query_as::<_, (i32, String, String, i64)>(
+            "SELECT s.id, s.name, s.wire_id, COUNT(is_.item_id) \
+             FROM studios s LEFT JOIN item_studios is_ ON is_.studio_id = s.id \
+             GROUP BY s.id, s.name, s.wire_id ORDER BY s.name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, wire_id, count)| StudioCount {
+                studio: Studio {
+                    id: id as i64,
+                    name,
+                    wire_id,
+                },
+                item_count: count.max(0) as u32,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn item_ids_for_studio(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "SELECT is_.item_id FROM item_studios is_ \
+             JOIN studios s ON s.id = is_.studio_id \
+             WHERE s.wire_id = $1 ORDER BY is_.item_id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn studios_for_item(&self, item: MediaId) -> DomainResult<Vec<Studio>> {
+        let item_i64 = media_id_i64(item)?;
+        let rows = sqlx::query_as::<_, (i32, String, String)>(
+            "SELECT s.id, s.name, s.wire_id FROM item_studios is_ \
+             JOIN studios s ON s.id = is_.studio_id \
+             WHERE is_.item_id = $1 ORDER BY s.name",
+        )
+        .bind(item_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, wire_id)| Studio {
+                id: id as i64,
+                name,
+                wire_id,
+            })
+            .collect())
+    }
+}
+
+impl TagStore for PostgresStore {
+    #[tracing::instrument(skip(self))]
+    async fn upsert_tag(&self, name: &str) -> DomainResult<i64> {
+        let wire_id = pharos_core::tag_wire_id(name);
+        sqlx::query(
+            "INSERT INTO tags (name, wire_id) VALUES ($1, $2) ON CONFLICT(name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(&wire_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // tags.id is INTEGER (i32) on postgres; widen to i64 for the core
+        // signature (the join column item_id is BIGINT).
+        let (id,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM tags WHERE name = $1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(id as i64)
+    }
+
+    #[tracing::instrument(skip(self, names), fields(media.id = %item))]
+    async fn link_item_tags(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+        let item_i64 = media_id_i64(item)?;
+        let mut wanted: Vec<String> = Vec::new();
+        for n in names {
+            let t = n.trim();
+            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                wanted.push(t.to_string());
+            }
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        sqlx::query("DELETE FROM item_tags WHERE item_id = $1")
+            .bind(item_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for name in &wanted {
+            let wire_id = pharos_core::tag_wire_id(name);
+            sqlx::query(
+                "INSERT INTO tags (name, wire_id) VALUES ($1, $2) ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&wire_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (tid,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM tags WHERE name = $1")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            sqlx::query(
+                "INSERT INTO item_tags (item_id, tag_id) VALUES ($1, $2) \
+                 ON CONFLICT(item_id, tag_id) DO NOTHING",
+            )
+            .bind(item_i64)
+            .bind(tid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self, names), fields(media.id = %item))]
+    async fn add_item_tags(&self, item: MediaId, names: &[String]) -> DomainResult<u64> {
+        let item_i64 = media_id_i64(item)?;
+        let mut wanted: Vec<String> = Vec::new();
+        for n in names {
+            let t = n.trim();
+            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                wanted.push(t.to_string());
+            }
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut added = 0u64;
+        for name in &wanted {
+            let wire_id = pharos_core::tag_wire_id(name);
+            sqlx::query(
+                "INSERT INTO tags (name, wire_id) VALUES ($1, $2) ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&wire_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (tid,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM tags WHERE name = $1")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let res = sqlx::query(
+                "INSERT INTO item_tags (item_id, tag_id) VALUES ($1, $2) \
+                 ON CONFLICT(item_id, tag_id) DO NOTHING",
+            )
+            .bind(item_i64)
+            .bind(tid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            added += res.rows_affected();
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(added)
+    }
+
+    #[tracing::instrument(skip(self, names), fields(media.id = %item))]
+    async fn remove_item_tags(&self, item: MediaId, names: &[String]) -> DomainResult<u64> {
+        let item_i64 = media_id_i64(item)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut removed = 0u64;
+        for name in names {
+            let t = name.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let res = sqlx::query(
+                "DELETE FROM item_tags WHERE item_id = $1 \
+                 AND tag_id = (SELECT id FROM tags WHERE name = $2)",
+            )
+            .bind(item_i64)
+            .bind(t)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            removed += res.rows_affected();
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(removed)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn tags_with_counts(&self) -> DomainResult<Vec<TagCount>> {
+        let rows = sqlx::query_as::<_, (i32, String, String, i64)>(
+            "SELECT t.id, t.name, t.wire_id, COUNT(it.item_id) \
+             FROM tags t LEFT JOIN item_tags it ON it.tag_id = t.id \
+             GROUP BY t.id, t.name, t.wire_id ORDER BY t.name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, wire_id, count)| TagCount {
+                tag: Tag {
+                    id: id as i64,
+                    name,
+                    wire_id,
+                },
+                item_count: count.max(0) as u32,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn item_ids_for_tag(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "SELECT it.item_id FROM item_tags it \
+             JOIN tags t ON t.id = it.tag_id \
+             WHERE t.wire_id = $1 ORDER BY it.item_id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn tags_for_item(&self, item: MediaId) -> DomainResult<Vec<Tag>> {
+        let item_i64 = media_id_i64(item)?;
+        let rows = sqlx::query_as::<_, (i32, String, String)>(
+            "SELECT t.id, t.name, t.wire_id FROM item_tags it \
+             JOIN tags t ON t.id = it.tag_id \
+             WHERE it.item_id = $1 ORDER BY t.name",
+        )
+        .bind(item_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, wire_id)| Tag {
+                id: id as i64,
+                name,
+                wire_id,
+            })
+            .collect())
+    }
+}
+
+impl CollectionStore for PostgresStore {
+    #[tracing::instrument(skip(self))]
+    async fn upsert_collection(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        overview: Option<&str>,
+    ) -> DomainResult<i64> {
+        let wire_id = pharos_core::collection_wire_id(name);
+        sqlx::query(
+            "INSERT INTO collections (name, wire_id, kind, overview) \
+             VALUES ($1, $2, COALESCE($3, 'boxset'), $4) \
+             ON CONFLICT(name) DO UPDATE SET \
+                 kind     = COALESCE(excluded.kind, collections.kind), \
+                 overview = COALESCE(excluded.overview, collections.overview)",
+        )
+        .bind(name)
+        .bind(&wire_id)
+        .bind(kind)
+        .bind(overview)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // collections.id is INTEGER (i32) on postgres; widen for the core
+        // signature (the join column item_id is BIGINT).
+        let (id,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM collections WHERE name = $1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(id as i64)
+    }
+
+    #[tracing::instrument(skip(self, names), fields(media.id = %item))]
+    async fn link_item_collections(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+        let item_i64 = media_id_i64(item)?;
+        let mut wanted: Vec<String> = Vec::new();
+        for n in names {
+            let t = n.trim();
+            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                wanted.push(t.to_string());
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for name in &wanted {
+            let wire_id = pharos_core::collection_wire_id(name);
+            sqlx::query(
+                "INSERT INTO collections (name, wire_id, kind) VALUES ($1, $2, 'boxset') \
+                 ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&wire_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (cid,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM collections WHERE name = $1")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let (next_order,) = sqlx::query_as::<_, (i32,)>(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM collection_items \
+                 WHERE collection_id = $1",
+            )
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            sqlx::query(
+                "INSERT INTO collection_items (collection_id, item_id, sort_order) \
+                 VALUES ($1, $2, $3) ON CONFLICT(collection_id, item_id) DO NOTHING",
+            )
+            .bind(cid)
+            .bind(item_i64)
+            .bind(next_order)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn collections_with_counts(&self) -> DomainResult<Vec<CollectionCount>> {
+        let rows = sqlx::query_as::<_, (i32, String, String, String, Option<String>, i64)>(
+            "SELECT c.id, c.name, c.wire_id, c.kind, c.overview, COUNT(ci.item_id) \
+             FROM collections c LEFT JOIN collection_items ci ON ci.collection_id = c.id \
+             GROUP BY c.id, c.name, c.wire_id, c.kind, c.overview ORDER BY c.name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, name, wire_id, kind, overview, count)| CollectionCount {
+                    collection: Collection {
+                        id: id as i64,
+                        name,
+                        wire_id,
+                        kind,
+                        overview,
+                    },
+                    item_count: count.max(0) as u32,
+                },
+            )
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn collection_by_wire_id(&self, wire_id: &str) -> DomainResult<Option<Collection>> {
+        let row = sqlx::query_as::<_, (i32, String, String, String, Option<String>)>(
+            "SELECT id, name, wire_id, kind, overview FROM collections WHERE wire_id = $1 LIMIT 1",
+        )
+        .bind(wire_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(id, name, wire_id, kind, overview)| Collection {
+            id: id as i64,
+            name,
+            wire_id,
+            kind,
+            overview,
+        }))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn collection_items(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "SELECT ci.item_id FROM collection_items ci \
+             JOIN collections c ON c.id = ci.collection_id \
+             WHERE c.wire_id = $1 ORDER BY ci.sort_order, ci.item_id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
+    }
+
+    #[tracing::instrument(skip(self, item_ids))]
+    async fn create_collection(
+        &self,
+        name: &str,
+        item_ids: &[MediaId],
+    ) -> DomainResult<Collection> {
+        let wire_id = pharos_core::collection_wire_id(name);
+        self.upsert_collection(name, None, None).await?;
+        if !item_ids.is_empty() {
+            self.add_collection_items(&wire_id, item_ids).await?;
+        }
+        self.collection_by_wire_id(&wire_id)
+            .await?
+            .ok_or_else(|| DomainError::Backend("collection vanished after create".into()))
+    }
+
+    #[tracing::instrument(skip(self, item_ids))]
+    async fn add_collection_items(
+        &self,
+        wire_id: &str,
+        item_ids: &[MediaId],
+    ) -> DomainResult<Option<u64>> {
+        let Some((cid,)) =
+            sqlx::query_as::<_, (i32,)>("SELECT id FROM collections WHERE wire_id = $1")
+                .bind(wire_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (mut next_order,) = sqlx::query_as::<_, (i32,)>(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM collection_items WHERE collection_id = $1",
+        )
+        .bind(cid)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut added = 0u64;
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for item in item_ids {
+            let item_i64 = media_id_i64(*item)?;
+            if !seen.insert(item_i64) {
+                continue;
+            }
+            let res = sqlx::query(
+                "INSERT INTO collection_items (collection_id, item_id, sort_order) \
+                 VALUES ($1, $2, $3) ON CONFLICT(collection_id, item_id) DO NOTHING",
+            )
+            .bind(cid)
+            .bind(item_i64)
+            .bind(next_order)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            if res.rows_affected() > 0 {
+                added += 1;
+                next_order += 1;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(Some(added))
+    }
+
+    #[tracing::instrument(skip(self, item_ids))]
+    async fn remove_collection_items(
+        &self,
+        wire_id: &str,
+        item_ids: &[MediaId],
+    ) -> DomainResult<Option<u64>> {
+        let Some((cid,)) =
+            sqlx::query_as::<_, (i32,)>("SELECT id FROM collections WHERE wire_id = $1")
+                .bind(wire_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut removed = 0u64;
+        for item in item_ids {
+            let item_i64 = media_id_i64(*item)?;
+            let res = sqlx::query(
+                "DELETE FROM collection_items WHERE collection_id = $1 AND item_id = $2",
+            )
+            .bind(cid)
+            .bind(item_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            removed += res.rows_affected();
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(Some(removed))
     }
 }
 
@@ -1003,6 +2257,14 @@ impl UserDataStore for PostgresStore {
             })
             .collect()
     }
+}
+
+/// LIB-B1 — page row: flattened [`MediaRow`] + the window count total.
+#[derive(sqlx::FromRow)]
+struct QueryRow {
+    #[sqlx(flatten)]
+    media: MediaRow,
+    total_count: i64,
 }
 
 #[derive(sqlx::FromRow)]

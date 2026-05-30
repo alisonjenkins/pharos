@@ -6,10 +6,10 @@
 //! `SearchHintsResult` shape — `SearchHints[]` + `TotalRecordCount`.
 //!
 //! Scope: substring match against `MediaItem.title`, case-insensitive,
-//! against everything in the store. People + studios + genres come in
-//! when T33's user-data and T34's metadata-by-name surfaces exist —
-//! they share the same SearchHint shape, so the handler grows
-//! additively.
+//! against everything in the store, plus aggregate name hints for
+//! artists / albums / genres (LIB-C4) / people (LIB-C2) / studios
+//! (LIB-C3) — each a synthetic IsFolder hint sharing the SearchHint
+//! shape so the handler grows additively.
 
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, HttpResponse, Responder};
@@ -91,6 +91,9 @@ async fn search_hints(
                 t.eq_ignore_ascii_case("MusicArtist")
                     || t.eq_ignore_ascii_case("MusicAlbum")
                     || t.eq_ignore_ascii_case("Genre")
+                    || t.eq_ignore_ascii_case("Person")
+                    || t.eq_ignore_ascii_case("Studio")
+                    || t.eq_ignore_ascii_case("Tag")
             })
         })
         .unwrap_or(true);
@@ -102,13 +105,48 @@ async fn search_hints(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
 
     let mut hints: Vec<SearchHint> = Vec::new();
-    // 1. Title matches on real items.
-    let filtered: Vec<&MediaItem> = all
-        .iter()
-        .filter(|i| kinds.as_ref().map_or(true, |k| k.contains(&i.kind)))
-        .filter(|i| needle.is_empty() || i.title.to_lowercase().contains(&needle))
-        .collect();
-    for i in &filtered {
+    // 1. Title (+ overview) matches on real items.
+    //
+    // With a term: LIB-B4 full-text search — the backend's FTS (sqlite
+    // fts5 / postgres tsvector) returns ranked, prefix-friendly hits over
+    // title + overview that are a strict SUPERSET of the legacy substring
+    // scan (mid-word substrings included), so results never shrink versus
+    // the old in-memory path.
+    //
+    // Without a term (the "browse everything" case jellyfin-web uses to
+    // pre-populate the search page): FTS matches nothing by contract, so
+    // fall back to listing every item, kind-filtered — preserving the
+    // legacy empty-term-returns-the-corpus behaviour.
+    let term_items: Vec<MediaItem> = if needle.is_empty() {
+        all.iter()
+            .filter(|i| kinds.as_ref().map_or(true, |k| k.contains(&i.kind)))
+            .cloned()
+            .collect()
+    } else {
+        use pharos_core::SearchQuery;
+        let item_kinds = kinds.clone().unwrap_or_default();
+        let term = q.search_term.clone().unwrap_or_default();
+        // Pull a generous window so aggregate hints + the result page can
+        // both draw from it; bounded so a one-letter query can't load the
+        // whole library. The handler re-paginates the combined hint list.
+        let fetch = q
+            .start_index
+            .saturating_add(q.limit)
+            .saturating_add(200)
+            .max(200);
+        let (items, _total) = state
+            .stores
+            .search(&SearchQuery {
+                term: term.trim().to_string(),
+                kinds: item_kinds,
+                limit: fetch,
+                offset: 0,
+            })
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        items
+    };
+    for i in &term_items {
         hints.push(SearchHint {
             item_id: i.id.to_string(),
             id: i.id.to_string(),
@@ -175,6 +213,97 @@ async fn search_hints(
                         matched_term: q.search_term.clone().unwrap_or_default(),
                         is_folder: true,
                     });
+                }
+            }
+        }
+        // LIB-C2 — Person aggregate hints, entity-backed (people +
+        // item_people) rather than probe-derived. Each match is a
+        // synthetic IsFolder hint jellyfin-web routes to
+        // /Items?ParentId=<person wire id>.
+        {
+            use pharos_core::PersonStore;
+            if let Ok(people) = state.stores.people_with_counts().await {
+                for pc in &people {
+                    if pc.person.name.to_lowercase().contains(&needle) {
+                        hints.push(SearchHint {
+                            item_id: pc.person.wire_id.clone(),
+                            id: pc.person.wire_id.clone(),
+                            name: pc.person.name.clone(),
+                            kind: "Person",
+                            media_type: "Unknown",
+                            run_time_ticks: None,
+                            matched_term: q.search_term.clone().unwrap_or_default(),
+                            is_folder: true,
+                        });
+                    }
+                }
+            }
+        }
+        // LIB-C3 — Studio aggregate hints, entity-backed (studios +
+        // item_studios) rather than the old album_artist stand-in. Each
+        // match is a synthetic IsFolder hint jellyfin-web routes to
+        // /Items?ParentId=<studio wire id>.
+        {
+            use pharos_core::StudioStore;
+            if let Ok(studios) = state.stores.studios_with_counts().await {
+                for sc in &studios {
+                    if sc.studio.name.to_lowercase().contains(&needle) {
+                        hints.push(SearchHint {
+                            item_id: sc.studio.wire_id.clone(),
+                            id: sc.studio.wire_id.clone(),
+                            name: sc.studio.name.clone(),
+                            kind: "Studio",
+                            media_type: "Unknown",
+                            run_time_ticks: None,
+                            matched_term: q.search_term.clone().unwrap_or_default(),
+                            is_folder: true,
+                        });
+                    }
+                }
+            }
+        }
+        // LIB-C5 — Collection / BoxSet aggregate hints, entity-backed
+        // (collections + collection_items). Each match is a synthetic
+        // IsFolder hint jellyfin-web routes to
+        // /Items?ParentId=<collection wire id> (the box set's members).
+        {
+            use pharos_core::CollectionStore;
+            if let Ok(collections) = state.stores.collections_with_counts().await {
+                for cc in &collections {
+                    if cc.collection.name.to_lowercase().contains(&needle) {
+                        hints.push(SearchHint {
+                            item_id: cc.collection.wire_id.clone(),
+                            id: cc.collection.wire_id.clone(),
+                            name: cc.collection.name.clone(),
+                            kind: "BoxSet",
+                            media_type: "Unknown",
+                            run_time_ticks: None,
+                            matched_term: q.search_term.clone().unwrap_or_default(),
+                            is_folder: true,
+                        });
+                    }
+                }
+            }
+        }
+        // LIB-C6 — Tag aggregate hints, entity-backed (tags + item_tags).
+        // Each match is a synthetic IsFolder hint jellyfin-web routes to
+        // /Items?ParentId=<tag wire id> (the tag's tagged items).
+        {
+            use pharos_core::TagStore;
+            if let Ok(tags) = state.stores.tags_with_counts().await {
+                for tc in &tags {
+                    if tc.tag.name.to_lowercase().contains(&needle) {
+                        hints.push(SearchHint {
+                            item_id: tc.tag.wire_id.clone(),
+                            id: tc.tag.wire_id.clone(),
+                            name: tc.tag.name.clone(),
+                            kind: "Tag",
+                            media_type: "Unknown",
+                            run_time_ticks: None,
+                            matched_term: q.search_term.clone().unwrap_or_default(),
+                            is_folder: true,
+                        });
+                    }
                 }
             }
         }
