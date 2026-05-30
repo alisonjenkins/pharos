@@ -1,46 +1,61 @@
 # Tiltfile — local k8s inner-loop for pharos.
 #
-# Targets a Tilt-managed local *kind* cluster (context `kind-pharos`, docker
-# driver) and loads the nix-built OCI images directly (no registry). Brings
-# up pharos + the jellyfin-web UI via the Helm chart (charts/pharos). The
-# library is populated in-pod: a `mediaSeed` initContainer copies the nix CC
-# test-media corpus into the media volume, then `serve` starts and its
-# library poll tier indexes the corpus (~30s after boot — the dev poll
-# interval). Tilt then seeds the playwright admin user.
+# Targets a Tilt-managed local *kind* cluster (context `kind-pharos`) wired to
+# a local OCI registry by ctlptl (`ctlptl-cluster.yaml`, via `just kind-up`).
+# nix builds each image, Tilt pushes it to that registry, and the kind node
+# pulls it from there — Tilt auto-detects the registry from the cluster's
+# `local-registry-hosting` ConfigMap, so no `kind load`, no docker.io.
+#
+# Brings up pharos + the jellyfin-web UI via the Helm chart (charts/pharos).
+# The library is populated in-pod: a `mediaSeed` initContainer copies the nix
+# CC test-media corpus into the media volume, then `serve` starts and its
+# library poll tier indexes it (~30s after boot — the dev poll interval). The
+# jellyfin-web image is nginx serving the bundle + reverse-proxying the REST
+# API to the pharos service, so the UI talks to pharos same-origin (no manual
+# server entry). Tilt then seeds the playwright admin user.
 #
 # (A one-shot `scan` initContainer was tried first but its sqlite pool can't
 # establish under kind's containerd runtime; the running server's warm pool
 # scans fine. See docs/kubernetes.md "kind dev caveat".)
 #
-#   just tilt-up      # create the kind cluster (if absent) + `tilt up`
-#   just tilt-down    # `tilt down` (+ optionally delete the cluster)
+#   just tilt-up      # create the kind cluster + registry (if absent) + `tilt up`
+#   just tilt-down    # `tilt down` (delete=1 also removes cluster + registry)
 #
 # Safety: refuse to run against anything but the local kind context.
 allow_k8s_contexts('kind-pharos')
 
 update_settings(k8s_upsert_timeout_secs=180)
 
-# ── Images: build via nix, load into docker, hand Tilt a tagged ref.
-#    Tilt auto-loads into kind (no registry needed).
+# ── Images: build via nix, load into docker, push to the local registry.
+#    Tilt sets $EXPECTED_REF to a registry ref (localhost:<port>/<name>:<hash>);
+#    the kind node pulls from that registry.
 def nix_oci(image_name, flake_attr):
     custom_build(
         image_name,
-        # nix build → docker load → retag to the ref Tilt expects ($EXPECTED_REF).
+        # nix build → docker load (→ <name>:latest) → tag + push the ref Tilt
+        # expects ($EXPECTED_REF, in the ctlptl-managed local registry).
         'set -euo pipefail; ' +
         'out=$(nix build ".#%s" --no-link --print-out-paths); ' % flake_attr +
         'docker load -i "$out"; ' +
-        'docker tag %s:latest "$EXPECTED_REF"' % image_name,
+        'docker tag %s:latest "$EXPECTED_REF"; ' % image_name +
+        'docker push "$EXPECTED_REF"',
         deps=['flake.nix', 'Cargo.toml', 'Cargo.lock', 'Cargo.nix', 'crates'],
         skips_local_docker=False,
-        disable_push=True,
-        tag='dev',
     )
 
 nix_oci('pharos', 'oci')
 nix_oci('pharos-jellyfin-web', 'jellyfinWebOci')
 nix_oci('pharos-test-media', 'testMediaOci')
 
-# ── Deploy the chart (dev values).
+# ── Deploy the chart (dev values). Tilt's helm() renders with --namespace but
+#    doesn't create it (unlike `helm install --create-namespace`), so declare
+#    the namespace ourselves; Tilt applies Namespace objects before the rest.
+k8s_yaml(blob('''
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pharos
+'''))
 k8s_yaml(helm(
     'charts/pharos',
     name='pharos',

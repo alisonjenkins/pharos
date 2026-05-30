@@ -394,28 +394,97 @@
           };
         };
 
-        # Sibling OCI image for jellyfin-web. Static-only consumer of
-        # the pinned nixpkgs bundle. `darkhttpd` is a tiny single-binary
-        # static server — no nginx config sprawl, no upstream Docker
-        # Hub image, all from nix.
+        # Sibling OCI image for jellyfin-web. nginx serves the pinned
+        # nixpkgs bundle AND reverse-proxies every non-static request to
+        # pharos (`$PHAROS_URL`, default the in-cluster service), so the
+        # browser sees ONE same-origin server: jellyfin-web auto-detects
+        # pharos via the boot `/System/Info/Public` probe and all REST +
+        # websocket traffic falls through. Mirrors the compat suite's
+        # `http-server --proxy PHAROS?` fixture (cross-origin doesn't work:
+        # the connect probe must resolve same-origin). `__PHAROS_URL__` is
+        # the only runtime knob; the entrypoint seds it into the config.
+        jellyfinWebNginxConf = pkgs.writeText "jellyfin-web.nginx.conf" ''
+          daemon off;
+          worker_processes 1;
+          pid /tmp/nginx/nginx.pid;
+          error_log /dev/stderr warn;
+          events { worker_connections 1024; }
+          http {
+            include ${pkgs.nginx}/conf/mime.types;
+            default_type application/octet-stream;
+            access_log /dev/stdout;
+            sendfile on;
+            client_body_temp_path /tmp/nginx/client_body;
+            proxy_temp_path        /tmp/nginx/proxy;
+            fastcgi_temp_path      /tmp/nginx/fastcgi;
+            uwsgi_temp_path        /tmp/nginx/uwsgi;
+            scgi_temp_path         /tmp/nginx/scgi;
+
+            # websocket upgrade plumbing for jellyfin's /socket.
+            map $http_upgrade $connection_upgrade {
+              default upgrade;
+              ""      close;
+            }
+
+            server {
+              listen 8097;
+
+              # jellyfin-web is an SPA served under /web/ (the same URL
+              # prefix a real Jellyfin server mounts it at); the bundle's
+              # files live at the dir root, so alias them in.
+              location = /     { return 302 /web/; }
+              location = /web   { return 302 /web/; }
+              location /web/ {
+                alias ${pkgs.jellyfin-web}/share/jellyfin-web/;
+                try_files $uri $uri/ /web/index.html;
+              }
+
+              # Everything else (the REST API + websocket) is proxied to
+              # pharos, so the browser sees one same-origin server: the boot
+              # /System/Info/Public probe and all traffic resolve here.
+              location / {
+                proxy_pass __PHAROS_URL__;
+                proxy_http_version 1.1;
+                proxy_set_header Host              $host;
+                proxy_set_header X-Real-IP         $remote_addr;
+                proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header Upgrade           $http_upgrade;
+                proxy_set_header Connection        $connection_upgrade;
+              }
+            }
+          }
+        '';
+
+        jellyfinWebEntrypoint = pkgs.writeShellApplication {
+          name = "jellyfin-web-entrypoint";
+          runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.nginx ];
+          text = ''
+            : "''${PHAROS_URL:=http://pharos:8096}"
+            mkdir -p /tmp/nginx
+            sed "s|__PHAROS_URL__|''${PHAROS_URL}|g" \
+              ${jellyfinWebNginxConf} > /tmp/nginx/nginx.conf
+            # -e overrides the compiled-in default error-log path
+            # (/var/log/nginx) which the non-root image cannot create.
+            exec nginx -e /dev/stderr -c /tmp/nginx/nginx.conf
+          '';
+        };
+
         jellyfinWebImage = pkgs.dockerTools.buildLayeredImage {
           name = "pharos-jellyfin-web";
           tag = "latest";
           architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
           contents = [
-            pkgs.darkhttpd
+            jellyfinWebEntrypoint
             pkgs.jellyfin-web
             pkgs.cacert
           ];
+          # nginx writes its pid + temp dirs under /tmp; create a writable
+          # /tmp so the non-root (1000) container can boot.
+          extraCommands = "mkdir -p tmp && chmod 1777 tmp";
           config = {
-            Entrypoint = [
-              "${pkgs.darkhttpd}/bin/darkhttpd"
-              "${pkgs.jellyfin-web}/share/jellyfin-web"
-              "--addr"
-              "0.0.0.0"
-              "--port"
-              "8097"
-            ];
+            Entrypoint = [ "${jellyfinWebEntrypoint}/bin/jellyfin-web-entrypoint" ];
+            Env = [ "PHAROS_URL=http://pharos:8096" ];
             ExposedPorts = {
               "8097/tcp" = { };
             };
@@ -443,6 +512,10 @@
               image: pharos-jellyfin-web:latest
               container_name: pharos-jellyfin-web
               restart: unless-stopped
+              # nginx serves the bundle + proxies the REST API to pharos
+              # over the compose network, so the browser is same-origin.
+              environment:
+                - PHAROS_URL=http://pharos:8096
               ports:
                 - "127.0.0.1:8097:8097"
 
@@ -518,13 +591,15 @@
             pkgs.just
             pkgs.curl
             # k8s deploy + Tilt inner-loop (charts/pharos + Tiltfile).
-            # `just tilt-up` uses kind (Tilt-managed local cluster), loads
-            # the nix-built OCI image directly (no registry), and deploys
-            # the Helm chart. helm renders/lint the chart; kubectl for ops.
+            # `just tilt-up` uses ctlptl to stand up a kind cluster + a local
+            # OCI registry (wired together); nix builds the images, Tilt
+            # pushes them to the registry, the kind node pulls from it, and
+            # the Helm chart deploys. helm renders/lint; kubectl for ops.
             pkgs.kubernetes-helm
             pkgs.kind
             pkgs.kubectl
             pkgs.tilt
+            pkgs.ctlptl
             pkgs.docker-client
             # Node + Playwright drive T29 phase 3. jellyfin-web is the
             # upstream prebuilt static bundle, referenced via

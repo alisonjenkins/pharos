@@ -10,21 +10,27 @@ the inline-ffmpeg fallback).
 ## Prerequisites
 
 All tooling is in the nix devShell (`nix develop`): `helm`, `kind`, `kubectl`,
-`tilt`, plus `docker` (the daemon must be running on the host). No registry is
-needed for local dev — Tilt loads images straight into kind.
+`tilt`, `ctlptl`, plus `docker` (the daemon must be running and your shell must
+be in the `docker` group — `id` should list `docker`; if you were just added,
+log out/in or reboot).
+
+`ctlptl` (`ctlptl-cluster.yaml`) stands up the kind cluster **wired to a local
+OCI registry** (`localhost:5005`): nix builds each image, Tilt pushes it to the
+registry, and the kind node pulls from there. No `kind load`, no docker.io.
 
 ## Tilt dev loop
 
 ```sh
-just tilt-up      # creates the kind cluster `pharos` if absent, then `tilt up`
+just kind-up      # ctlptl: create the kind cluster `pharos` + local registry (idempotent)
+just tilt-up      # kind-up, then `tilt up`
 # … iterate; edit Rust/flake/chart → Tilt rebuilds the image + redeploys …
-just tilt-down            # tilt down (keeps the cluster)
-just tilt-down delete=1   # tilt down + delete the kind cluster
+just tilt-down            # tilt down (keeps the cluster + registry)
+just tilt-down delete=1   # tilt down + delete the kind cluster AND its registry
 ```
 
 What `tilt up` does:
-1. Builds `.#oci`, `.#jellyfinWebOci`, and `.#testMediaOci` via nix, loads them
-   into kind.
+1. Builds `.#oci`, `.#jellyfinWebOci`, and `.#testMediaOci` via nix; pushes each
+   to the local registry; the kind node pulls them (Tilt rewrites the refs).
 2. Deploys `charts/pharos` with `values-dev.yaml` (ephemeral storage, UI on). A
    `mediaSeed` initContainer copies the CC test-media corpus into the media
    volume; the running server's poll tier then indexes it (~30s after boot).
@@ -32,9 +38,17 @@ What `tilt up` does:
    reports the item count (`scripts/tilt-seed.sh`).
 4. Port-forwards `127.0.0.1:8096` (API) and `127.0.0.1:8097` (jellyfin-web UI).
 
+The jellyfin-web image is **nginx** serving the bundle under `/web/` and
+reverse-proxying every other path (the REST API + websocket) to the pharos
+service (`$PHAROS_URL`, default the in-cluster `pharos:8096`). So the browser
+sees one same-origin server — open `http://127.0.0.1:8097/` and it auto-connects
+to pharos (no manual "add server" step), mirroring the compat suite's
+`http-server --proxy` fixture.
+
 Verify: `curl 127.0.0.1:8096/healthz` → `ok`; `curl
-127.0.0.1:8096/System/Info/Public`; open `http://127.0.0.1:8097` and add server
-`http://127.0.0.1:8096`.
+127.0.0.1:8096/System/Info/Public`; `curl 127.0.0.1:8097/System/Info/Public`
+returns the same server info (proving the UI's same-origin proxy); open
+`http://127.0.0.1:8097/` and it connects to pharos directly.
 
 ## Standalone install (any cluster)
 

@@ -196,28 +196,28 @@ diagrams:
     fi
 
 # ── Kubernetes / Tilt (charts/pharos + Tiltfile) ──────────────────
-# Create a local kind cluster (if absent) + start the Tilt inner-loop.
-# kind/tilt/helm/kubectl come from the nix devShell.
+# ctlptl/kind/tilt/helm/kubectl come from the nix devShell. ctlptl-cluster.yaml
+# declares a kind cluster wired to a local OCI registry; nix builds the images,
+# Tilt pushes them to the registry, the node pulls from it (no docker.io).
 KIND_CLUSTER := "pharos"
 
-tilt-up:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! kind get clusters | grep -qx "{{KIND_CLUSTER}}"; then
-      echo "creating kind cluster {{KIND_CLUSTER}}…"
-      kind create cluster --name "{{KIND_CLUSTER}}"
-    fi
-    kubectl config use-context "kind-{{KIND_CLUSTER}}"
-    tilt up
+# Stand up the kind cluster + local registry (idempotent; no Tilt). Run this
+# on its own to (re)create the dev cluster; `tilt-up` calls it for you.
+kind-up:
+    nix develop --command ctlptl apply -f ctlptl-cluster.yaml
+
+# Create the kind cluster + registry (if absent), then start the Tilt loop.
+tilt-up: kind-up
+    nix develop --command bash -c 'kubectl config use-context "kind-{{KIND_CLUSTER}}" && tilt up'
 
 # Stop Tilt (tears down the deployed resources). Pass `delete=1` to also
-# delete the kind cluster.
+# delete the kind cluster *and* its local registry.
 tilt-down delete="0":
     #!/usr/bin/env bash
     set -euo pipefail
-    tilt down || true
+    nix develop --command tilt down || true
     if [ "{{delete}}" = "1" ]; then
-      kind delete cluster --name "{{KIND_CLUSTER}}"
+      nix develop --command ctlptl delete -f ctlptl-cluster.yaml || true
     fi
 
 # Lint the Helm chart.
