@@ -213,3 +213,85 @@ async fn store_usable_via_generic_bound() {
     let got = drive(&s, item(1, "/m/a.mkv", "A", MediaKind::Movie)).await;
     assert_eq!(got.title, "A");
 }
+
+#[tokio::test]
+async fn fingerprint_round_trips_through_set_and_find() {
+    // LIB-A6: put -> set_fingerprint -> find_by_fp returns the same row.
+    let s = fresh().await;
+    s.put(item(1, "/a/movie.mkv", "Movie", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    // Absent fingerprint -> no match.
+    let fp: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    assert!(
+        s.find_by_fp(fp).await.unwrap().is_none(),
+        "no row carries this fp yet"
+    );
+
+    s.set_fingerprint(1, fp).await.unwrap();
+    let got = s.find_by_fp(fp).await.unwrap().expect("fp now present");
+    assert_eq!(got.id, 1);
+    assert_eq!(got.title, "Movie");
+
+    // A different fp still misses.
+    let other: [u8; 8] = [9, 9, 9, 9, 9, 9, 9, 9];
+    assert!(s.find_by_fp(other).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn find_by_fp_returns_first_by_id() {
+    // Two rows sharing a fingerprint (a true duplicate) -> the lowest id wins.
+    let s = fresh().await;
+    s.put(item(5, "/a/five.mkv", "Five", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(2, "/a/two.mkv", "Two", MediaKind::Movie))
+        .await
+        .unwrap();
+    let fp: [u8; 8] = [0xAB; 8];
+    s.set_fingerprint(5, fp).await.unwrap();
+    s.set_fingerprint(2, fp).await.unwrap();
+    let got = s.find_by_fp(fp).await.unwrap().expect("match present");
+    assert_eq!(got.id, 2, "first match is the lowest id");
+}
+
+#[tokio::test]
+async fn set_fingerprint_on_absent_row_is_noop() {
+    let s = fresh().await;
+    // No row id 7 — UPDATE touches zero rows, no error.
+    s.set_fingerprint(7, [1; 8]).await.unwrap();
+    assert!(s.find_by_fp([1; 8]).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn rebind_path_keeps_id_and_repoints_path() {
+    // LIB-A7: a moved file's row keeps its id (so user_data FK survives) and
+    // just has its path column repointed in place.
+    let s = fresh().await;
+    s.put(item(3, "/old/movie.mkv", "Movie", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    s.rebind_path(3, std::path::Path::new("/new/film.mkv"))
+        .await
+        .unwrap();
+
+    let got = s.get(3).await.expect("row still present under same id");
+    assert_eq!(got.id, 3, "id preserved across rebind");
+    assert_eq!(
+        got.path,
+        std::path::PathBuf::from("/new/film.mkv"),
+        "path repointed to the new location"
+    );
+}
+
+#[tokio::test]
+async fn rebind_path_on_absent_row_is_noop() {
+    let s = fresh().await;
+    // No row id 42 — UPDATE touches zero rows, no error, no insert.
+    s.rebind_path(42, std::path::Path::new("/x/y.mkv"))
+        .await
+        .unwrap();
+    assert!(s.list().await.unwrap().is_empty());
+}

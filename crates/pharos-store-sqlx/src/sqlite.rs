@@ -1,7 +1,7 @@
 use crate::StoreError;
 use pharos_core::{
-    DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore, ScanState,
-    SeriesInfo,
+    DomainError, DomainResult, Fingerprint, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore,
+    ScanState, SeriesInfo,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -383,6 +383,49 @@ impl MediaStore for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self, fp))]
+    async fn find_by_fp(&self, fp: Fingerprint) -> DomainResult<Option<MediaItem>> {
+        // Raw 8 bytes bound as a BLOB; first match by ascending id.
+        let sql = format!(
+            "SELECT {MEDIA_COLUMNS} FROM media_items \
+             WHERE fingerprint = ? ORDER BY id LIMIT 1"
+        );
+        let row = sqlx::query_as::<_, MediaRow>(&sql)
+            .bind(fp.as_slice())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        row.map(MediaRow::into_domain).transpose()
+    }
+
+    #[tracing::instrument(skip(self, fp), fields(media.id = %id))]
+    async fn set_fingerprint(&self, id: MediaId, fp: Fingerprint) -> DomainResult<()> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        sqlx::query("UPDATE media_items SET fingerprint = ? WHERE id = ?")
+            .bind(fp.as_slice())
+            .bind(id_i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %id, media.path = %new_path.display()))]
+    async fn rebind_path(&self, id: MediaId, new_path: &std::path::Path) -> DomainResult<()> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        // UPDATE-only: keeps the id (and every user_data FK) intact, just
+        // repoints the path of a moved/renamed file. Zero rows when absent.
+        sqlx::query("UPDATE media_items SET path = ? WHERE id = ?")
+            .bind(new_path.to_string_lossy().as_ref())
+            .bind(id_i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(())
     }
 }

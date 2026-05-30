@@ -9,6 +9,7 @@ use std::sync::Mutex;
 struct MemStore {
     inner: Mutex<HashMap<MediaId, MediaItem>>,
     states: Mutex<HashMap<MediaId, ScanState>>,
+    fps: Mutex<HashMap<MediaId, Fingerprint>>,
     next_scan_id: std::sync::atomic::AtomicI64,
 }
 
@@ -105,6 +106,54 @@ impl MediaStore for MemStore {
         _items_seen: i64,
         _items_swept: i64,
     ) -> DomainResult<()> {
+        Ok(())
+    }
+
+    async fn find_by_fp(&self, fp: Fingerprint) -> DomainResult<Option<MediaItem>> {
+        let fps = self
+            .fps
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // First match by ascending id, mirroring the store's ORDER BY id.
+        let mut matches: Vec<MediaId> = fps
+            .iter()
+            .filter(|(_, v)| **v == fp)
+            .map(|(id, _)| *id)
+            .collect();
+        matches.sort_unstable();
+        Ok(matches.into_iter().find_map(|id| inner.get(&id).cloned()))
+    }
+
+    async fn set_fingerprint(&self, id: MediaId, fp: Fingerprint) -> DomainResult<()> {
+        // No-op when the row is absent, mirroring mark_seen.
+        if self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .contains_key(&id)
+        {
+            self.fps
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(id, fp);
+        }
+        Ok(())
+    }
+
+    async fn rebind_path(&self, id: MediaId, new_path: &Path) -> DomainResult<()> {
+        // UPDATE-only: no-op when the row is absent.
+        if let Some(item) = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .get_mut(&id)
+        {
+            item.path = new_path.to_path_buf();
+        }
         Ok(())
     }
 }
