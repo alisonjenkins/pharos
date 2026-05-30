@@ -111,6 +111,10 @@ pub struct TrickplayCache {
     max_bytes: u64,
     ffmpeg_bin: PathBuf,
     state: Arc<Mutex<CacheState>>,
+    /// P48 — optional resident libav worker pool. When set, sprite-sheet
+    /// generation runs in-process via a worker instead of forking ffmpeg.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pool: Option<pharos_transcode::worker::LibavWorkerPool>,
 }
 
 impl std::fmt::Debug for TrickplayCache {
@@ -129,11 +133,21 @@ impl TrickplayCache {
             max_bytes,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             state: Arc::new(Mutex::new(CacheState::default())),
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            pool: None,
         }
     }
 
     pub fn with_ffmpeg(mut self, p: impl Into<PathBuf>) -> Self {
         self.ffmpeg_bin = p.into();
+        self
+    }
+
+    /// Route sprite-sheet generation through the given resident libav
+    /// worker pool (server `ffmpeg-lib` build).
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pub fn with_pool(mut self, pool: pharos_transcode::worker::LibavWorkerPool) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -224,6 +238,36 @@ impl TrickplayCache {
     ) -> Result<u64, TrickplayCacheError> {
         let dir = self.key_dir(key);
         tokio::fs::create_dir_all(&dir).await?;
+
+        // P48 — resident-worker path: the libav helper writes 0-based
+        // {i}.jpg sheets straight into `dir` (no tmp/rename dance), so we
+        // just sum the produced bytes.
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            let produced = pool
+                .trickplay(
+                    source.to_path_buf(),
+                    layout.interval_ms as u64,
+                    layout.width,
+                    TILE_GRID,
+                    layout.tile_count,
+                    5,
+                    dir.clone(),
+                )
+                .await
+                .map_err(|e| TrickplayCacheError::Ffmpeg(-1, format!("libav: {e}")))?;
+            let mut total: u64 = 0;
+            for n in 0..produced {
+                if let Ok(meta) = tokio::fs::metadata(dir.join(format!("{n}.jpg"))).await {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+            if total == 0 {
+                return Err(TrickplayCacheError::UnknownDuration);
+            }
+            return Ok(total);
+        }
+
         let tmp_dir = dir.with_extension("tmp");
         // Wipe any prior failed run.
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;

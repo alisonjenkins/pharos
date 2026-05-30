@@ -51,6 +51,7 @@ pub enum PoolError {
 }
 
 /// One resident worker checked out of / into the idle set.
+#[derive(Debug)]
 struct PooledWorker {
     rd: OwnedReadHalf,
     wr: OwnedWriteHalf,
@@ -58,6 +59,7 @@ struct PooledWorker {
     _child: Child,
 }
 
+#[derive(Debug)]
 struct Inner {
     worker_bin: PathBuf,
     handshake_timeout: Duration,
@@ -68,7 +70,7 @@ struct Inner {
 }
 
 /// A cheap-to-clone handle to the resident libav-worker pool.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LibavWorkerPool {
     inner: Arc<Inner>,
 }

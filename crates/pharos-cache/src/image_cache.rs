@@ -19,6 +19,11 @@ pub struct ImageCache {
     root: PathBuf,
     ffmpeg_bin: PathBuf,
     seek_seconds: u32,
+    /// P48 — optional in-process libav worker pool. When set (server
+    /// `ffmpeg-lib` build), video-frame extraction routes through a
+    /// resident worker instead of forking ffmpeg per thumbnail.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pool: Option<pharos_transcode::worker::LibavWorkerPool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -113,11 +118,23 @@ impl ImageCache {
             root: root.into(),
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             seek_seconds: 30,
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            pool: None,
         }
     }
 
     pub fn with_ffmpeg(mut self, p: impl Into<PathBuf>) -> Self {
         self.ffmpeg_bin = p.into();
+        self
+    }
+
+    /// Route video-frame extraction through the given resident libav
+    /// worker pool (server `ffmpeg-lib` build). Audio cover-art extraction
+    /// stays on the spawn path (it's an embedded-stream remux, not a
+    /// decode-scale).
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pub fn with_pool(mut self, pool: pharos_transcode::worker::LibavWorkerPool) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -254,6 +271,13 @@ impl ImageCache {
         start_ms: u64,
         out: &Path,
     ) -> Result<(), ImageCacheError> {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            return pool
+                .extract_image(source.to_path_buf(), Some(start_ms), 480, 3, out.to_path_buf())
+                .await
+                .map_err(|e| ImageCacheError::Ffmpeg(None, format!("libav: {e}")));
+        }
         let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let seek = format!("{}", start_ms as f64 / 1000.0);
@@ -300,6 +324,34 @@ impl ImageCache {
         role: ImageRole,
         out: &Path,
     ) -> Result<(), ImageCacheError> {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            // Video-frame roles go through the resident worker. Audio
+            // cover art (embedded attached-pic remux) stays on spawn.
+            if matches!(kind, MediaKind::Movie | MediaKind::Episode) {
+                let seek = match role {
+                    ImageRole::Backdrop => {
+                        self.seek_seconds.saturating_mul(4).max(self.seek_seconds)
+                    }
+                    _ => self.seek_seconds,
+                };
+                let width = match role {
+                    ImageRole::Backdrop => 1280,
+                    ImageRole::Thumb => 640,
+                    _ => 480,
+                };
+                return pool
+                    .extract_image(
+                        source.to_path_buf(),
+                        Some(seek as u64 * 1000),
+                        width,
+                        3,
+                        out.to_path_buf(),
+                    )
+                    .await
+                    .map_err(|e| ImageCacheError::Ffmpeg(None, format!("libav: {e}")));
+            }
+        }
         let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         // Explicit `-f mjpeg` because the cache writes to a `.tmp`
