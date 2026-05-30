@@ -34,6 +34,7 @@ const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
     <name>Keanu Reeves</name>
     <role>Neo</role>
     <order>0</order>
+    <thumb>http://img/keanu.jpg</thumb>
   </actor>
   <actor>
     <name>Laurence Fishburne</name>
@@ -134,6 +135,8 @@ async fn movie_nfo_maps_all_common_fields() {
         .expect("Keanu present");
     assert_eq!(neo.kind, PersonKind::Actor);
     assert_eq!(neo.character.as_deref(), Some("Neo"));
+    // LIB-C2 — the actor's <thumb> headshot URL is captured.
+    assert_eq!(neo.thumb.as_deref(), Some("http://img/keanu.jpg"));
     assert_eq!(neo.sort_order, Some(0));
 }
 

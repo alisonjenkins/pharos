@@ -31,6 +31,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // /items/counts BEFORE /items/{id} so `Counts` doesn't match
         // as an item id.
         .route("/items/counts", web::get().to(items_counts))
+        // LIB-B5 — /Items/Filters (legacy) + /Items/Filters2 power the
+        // filter drawer; registered BEFORE /items/{id} so `Filters` /
+        // `Filters2` don't match as an item id.
+        .route("/items/filters", web::get().to(items_filters_legacy))
+        .route("/items/filters2", web::get().to(items_filters2))
         .route("/items/{id}", web::get().to(get_item))
         .route("/users/{user_id}/items", web::get().to(list_user_items))
         .route(
@@ -59,19 +64,51 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/items/{id}/specialfeatures",
         "/users/{user_id}/items/{item_id}/intros",
         "/shows/upcoming",
-        "/persons", // No people metadata yet — phase 3 of T34.
     ] {
         cfg.route(path, web::get().to(empty_items_result));
     }
     cfg.route("/items/{id}/similar", web::get().to(items_similar));
-    // /Genres + /Studios aggregate over MediaItem.{genre, album_artist}
-    // tags. Replace stub when those columns ship — T-fix-31.
+    // /Genres (LIB-C4) + /Studios (LIB-C3) are entity-backed: each lists
+    // its entity rows with an item count via the indexed *_with_counts
+    // store query (genres/item_genres, studios/item_studios).
     cfg.route("/genres", web::get().to(list_genres))
         .route("/studios", web::get().to(list_studios))
         // /Artists + /Albums power jellyfin-web's music navigation.
         .route("/artists", web::get().to(list_artists))
         .route("/artists/albumartists", web::get().to(list_artists))
-        .route("/albums", web::get().to(list_albums));
+        .route("/albums", web::get().to(list_albums))
+        // LIB-C2 — /Persons is now entity-backed (people + item_people).
+        // /persons/{id} BEFORE the list so a person wire id doesn't fall
+        // through to the list handler.
+        .route("/persons/{id}", web::get().to(get_person))
+        .route("/persons", web::get().to(list_persons))
+        // LIB-C6 — /Tags is entity-backed (tags + item_tags). Lists every
+        // tag with its count, name-ordered; /Items?ParentId=<tag id> +
+        // ?Tags=a,b resolve through the item_tags indexed join.
+        .route("/tags", web::get().to(list_tags));
+    // LIB-C6 — manual tag mutation on an item. POST adds the `Tags`
+    // (incremental, leaving existing tags intact); DELETE removes them.
+    // Registered before /items/{id} would shadow them — they share the
+    // /items/{id}/tags path which doesn't collide with the bare /items/{id}
+    // GET (different method + extra segment), so order is not load-bearing
+    // here, but kept explicit alongside the read routes.
+    cfg.route("/items/{id}/tags", web::post().to(item_tags_add))
+        .route("/items/{id}/tags", web::delete().to(item_tags_remove));
+    // LIB-C5 — collections / box sets. The /{id}/items add+remove routes
+    // are registered BEFORE the bare create + list so a collection wire id
+    // segment doesn't shadow them. POST /collections creates (optionally
+    // seeded); GET /collections lists every box set; the per-collection
+    // members add/remove drive the manual CRUD Jellyfin clients use.
+    cfg.route(
+        "/collections/{id}/items",
+        web::post().to(collection_items_add),
+    )
+    .route(
+        "/collections/{id}/items",
+        web::delete().to(collection_items_remove),
+    )
+    .route("/collections", web::post().to(create_collection))
+    .route("/collections", web::get().to(list_collections));
     // /Shows/NextUp has a real impl now that episode hierarchy
     // exists. Keep it after the empty-stub loop so the route is
     // registered with our handler.
@@ -148,6 +185,170 @@ async fn items_counts(
         // GenreCount isn't part of jellyfin-web's stats row but
         // clients sometimes read it; cheap to include.
         "GenreCount": genres.len() as u32,
+    })))
+}
+
+/// LIB-B5 — the `?ParentId=` / `?IncludeItemTypes=` / user-data scope a
+/// filter-drawer request carries. A subset of `ListQuery`; reused to build
+/// the base [`pharos_core::MediaQuery`] the facet counts aggregate over.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct FiltersQuery {
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    include_item_types: Option<String>,
+    #[serde(default)]
+    is_favorite: Option<bool>,
+    #[serde(default)]
+    is_played: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    user_id: Option<String>,
+}
+
+/// Build the base [`pharos_core::MediaQuery`] (parent + kind + user-data
+/// scope, NO sort/paging) the facet counts aggregate over.
+async fn build_facet_base(
+    state: &AppState,
+    user_id: UserId,
+    q: &FiltersQuery,
+) -> Result<Option<pharos_core::MediaQuery>, actix_web::Error> {
+    use pharos_core::{MediaQuery, UserDataQuery};
+    let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
+    if matches!(parent, ParentResolution::Empty) {
+        return Ok(None);
+    }
+    let mut mq = MediaQuery::default();
+    match &parent {
+        ParentResolution::Filter(pf) => mq.parent = Some(pf.clone()),
+        ParentResolution::PathPrefix(p) => mq.filters.path_prefix = Some(p.clone()),
+        ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t.clone()),
+        ParentResolution::All | ParentResolution::Empty => {}
+    }
+    if let Some(types) = q.include_item_types.as_deref() {
+        let wanted: Vec<pharos_core::MediaKind> = types
+            .split(',')
+            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
+            .collect();
+        if !wanted.is_empty() {
+            mq.kinds = wanted;
+        }
+    }
+    if q.is_favorite.is_some() || q.is_played.is_some() {
+        mq.user_data = UserDataQuery {
+            user: Some(user_id),
+            is_favorite: q.is_favorite,
+            is_played: q.is_played,
+            is_resumable: false,
+        };
+    }
+    Ok(Some(mq))
+}
+
+/// `GET /Items/Filters` (legacy `QueryFiltersLegacy` shape) — flat string /
+/// int arrays of the distinct facet values in scope. No counts in the wire
+/// shape (the legacy endpoint never carried them), but the values are
+/// derived from the SAME `facets()` aggregate as `/Items/Filters2`.
+async fn items_filters_legacy(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<FiltersQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::FacetRequest;
+    let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "Genres": [], "Tags": [], "OfficialRatings": [], "Years": [],
+        })));
+    };
+    let req = FacetRequest::default();
+    let facets = state
+        .stores
+        .facets(&base, &req)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let genres: Vec<&str> = facets.genres.iter().map(|f| f.value.as_str()).collect();
+    let tags: Vec<&str> = facets.tags.iter().map(|f| f.value.as_str()).collect();
+    let ratings: Vec<&str> = facets
+        .official_ratings
+        .iter()
+        .map(|f| f.value.as_str())
+        .collect();
+    let years: Vec<i64> = facets
+        .years
+        .iter()
+        .filter_map(|f| f.value.parse::<i64>().ok())
+        .collect();
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Genres": genres,
+        "Tags": tags,
+        "OfficialRatings": ratings,
+        "Years": years,
+    })))
+}
+
+/// `GET /Items/Filters2` (`QueryFiltersDto` shape) — `Genres` + `Studios`
+/// as `NameGuidPair[]` (Name + Id wire id), `Tags` as strings, plus the
+/// LIB-B5 per-facet COUNTS (the data a filter UI needs to render
+/// "Action (42)"). The counts ride in a `FacetCounts` extension object —
+/// Jellyfin clients ignore unknown fields, so the response stays
+/// Filters2-compatible while exposing the counts pharos computes.
+async fn items_filters2(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<FiltersQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::{FacetRequest, FacetValue};
+    let empty = serde_json::json!({
+        "Genres": [], "Studios": [], "Tags": [], "OfficialRatings": [], "Years": [],
+        "FacetCounts": { "Genres": [], "Studios": [], "Tags": [],
+                         "Years": [], "OfficialRatings": [] },
+    });
+    let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
+        return Ok(HttpResponse::Ok().json(empty));
+    };
+    let req = FacetRequest::default();
+    let facets = state
+        .stores
+        .facets(&base, &req)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // NameGuidPair[] for the entity facets.
+    let name_guid = |fs: &[FacetValue]| -> Vec<serde_json::Value> {
+        fs.iter()
+            .map(|f| serde_json::json!({ "Name": f.value, "Id": f.wire_id }))
+            .collect()
+    };
+    // (value, count) buckets for the counts extension.
+    let counted = |fs: &[FacetValue]| -> Vec<serde_json::Value> {
+        fs.iter()
+            .map(|f| serde_json::json!({ "Name": f.value, "Id": f.wire_id, "Count": f.count }))
+            .collect()
+    };
+    let tags: Vec<&str> = facets.tags.iter().map(|f| f.value.as_str()).collect();
+    let ratings: Vec<&str> = facets
+        .official_ratings
+        .iter()
+        .map(|f| f.value.as_str())
+        .collect();
+    let years: Vec<i64> = facets
+        .years
+        .iter()
+        .filter_map(|f| f.value.parse::<i64>().ok())
+        .collect();
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Genres": name_guid(&facets.genres),
+        "Studios": name_guid(&facets.studios),
+        "Tags": tags,
+        "OfficialRatings": ratings,
+        "Years": years,
+        "FacetCounts": {
+            "Genres": counted(&facets.genres),
+            "Studios": counted(&facets.studios),
+            "Tags": counted(&facets.tags),
+            "Years": counted(&facets.years),
+            "OfficialRatings": counted(&facets.official_ratings),
+        },
     })))
 }
 
@@ -491,6 +692,333 @@ async fn list_studios(
         "TotalRecordCount": total,
         "StartIndex": 0,
     })))
+}
+
+/// `POST /Items/{id}/Tags` — LIB-C6 manual mutation: add the `Tags` to the
+/// item's `item_tags` set WITHOUT clobbering tags it already carries
+/// (incremental). The path id is a numeric media id (the item being
+/// tagged); `Tags` is a comma/pipe-separated label list. 404 when no
+/// media item carries that id. Returns 204 (Jellyfin's metadata-mutation
+/// shape).
+async fn item_tags_add(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<TagMutateQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::{MediaStore, TagStore};
+    let id = parse_media_id(&path.into_inner())?;
+    // V-spirit: reject a tag mutation against a non-existent item rather
+    // than silently creating an orphan join row.
+    state
+        .stores
+        .get(id)
+        .await
+        .map_err(|_| error::ErrorNotFound("item not found"))?;
+    let names = split_tag_csv(q.tags.as_deref());
+    state
+        .stores
+        .add_item_tags(id, &names)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `DELETE /Items/{id}/Tags` — LIB-C6 manual mutation: remove the `Tags`
+/// from the item's `item_tags` set, leaving the rest intact. The tag rows
+/// stay (they may serve other items); only the join links drop. 404 when
+/// no media item carries that id. Returns 204.
+async fn item_tags_remove(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<TagMutateQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::{MediaStore, TagStore};
+    let id = parse_media_id(&path.into_inner())?;
+    state
+        .stores
+        .get(id)
+        .await
+        .map_err(|_| error::ErrorNotFound("item not found"))?;
+    let names = split_tag_csv(q.tags.as_deref());
+    state
+        .stores
+        .remove_item_tags(id, &names)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `GET /Persons` — LIB-C2: people (cast & crew) as entity rows. Lists
+/// every person with its item count, name-ordered, `Id` = the 32-hex
+/// person wire id (= `people.wire_id` = `person_id_for(name)`), so a
+/// client click routes to `/Items?ParentId=<person id>` which
+/// `restrict_to_parent` resolves via the `item_people` indexed join.
+/// Unlike /Genres there is no backfill (no legacy people column).
+async fn list_persons(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::PersonStore;
+    let rows = state
+        .stores
+        .people_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|pc| person_dto(&state, pc.person.clone(), pc.item_count))
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// `GET /Persons/{id}` — LIB-C2: a single Person item resolved by its
+/// wire id. 404 when no person row carries that wire id.
+async fn get_person(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::PersonStore;
+    let wire_id = path.into_inner();
+    let person = state
+        .stores
+        .person_by_wire_id(&wire_id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        .ok_or_else(|| error::ErrorNotFound("not found"))?;
+    // Count how many items credit this person so the detail tile renders
+    // "appears in N items" consistently with the list.
+    let count = state
+        .stores
+        .item_ids_for_person(&wire_id)
+        .await
+        .map(|ids| ids.len() as u32)
+        .unwrap_or(0);
+    Ok(HttpResponse::Ok().json(person_dto(&state, person, count)))
+}
+
+/// Shared Person item JSON. The Jellyfin Person item is an `IsFolder`
+/// view (clicking it lists the person's filmography via ParentId). When
+/// a headshot URL is recorded, advertise a `Primary` image tag so the
+/// client requests `/Items/{id}/Images/Primary`.
+fn person_dto(state: &AppState, person: pharos_core::Person, item_count: u32) -> serde_json::Value {
+    let mut image_tags = serde_json::Map::new();
+    if person.thumb_url.is_some() {
+        // A stable tag derived from the wire id; the image branch resolves
+        // the recorded thumb_url for this person id.
+        image_tags.insert(
+            "Primary".to_string(),
+            serde_json::Value::String(person.wire_id.clone()),
+        );
+    }
+    serde_json::json!({
+        "Id": person.wire_id,
+        "Name": person.name,
+        "ServerId": state.server_id,
+        "Type": "Person",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "ChildCount": item_count,
+        "ImageTags": serde_json::Value::Object(image_tags),
+    })
+}
+
+/// `GET /Collections` — LIB-C5: collections / box sets as entity rows.
+/// Lists every box set with its member count, name-ordered, `Id` = the
+/// 32-hex collection wire id (= `collections.wire_id` =
+/// `collection_id_for(name)`), so a client click routes to
+/// `/Items?ParentId=<collection id>` which `restrict_to_parent` resolves
+/// via the `collection_items` indexed join (members in `sort_order`).
+async fn list_collections(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let rows = state
+        .stores
+        .collections_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|cc| collection_dto(&state, &cc.collection, cc.item_count))
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// Manual-CRUD create/add/remove query: `Name` (create only) + `Ids`
+/// (comma-separated numeric media ids). Matches Jellyfin's
+/// `POST /Collections?Name=&Ids=` and `/Collections/{id}/Items?Ids=`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct CollectionMutateQuery {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    ids: Option<String>,
+}
+
+/// Parse a comma-separated `Ids=` into numeric media ids, dropping the
+/// 32-hex synth-id namespace (anything that doesn't parse as a u64 ≤ the
+/// 20-digit bound) so a stray wire id never collides with a numeric id.
+fn parse_id_csv(raw: Option<&str>) -> Vec<u64> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && t.len() <= 20)
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// LIB-C6 manual tag mutation query: `Tags` (comma/pipe-separated label
+/// names). Matches Jellyfin's `POST /Items/{id}/Tags?Tags=a,b`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct TagMutateQuery {
+    #[serde(default)]
+    tags: Option<String>,
+}
+
+/// Parse the numeric media id off an `/Items/{id}/...` path segment. A
+/// 32-hex synth id (or any non-numeric / over-long token) is rejected as
+/// 400 — tag mutation targets a real media row, never an aggregate id.
+fn parse_media_id(raw: &str) -> Result<u64, actix_web::Error> {
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|_| error::ErrorBadRequest("invalid item id"))
+}
+
+/// Split a `Tags=` value into individual tag names — accept both `|`
+/// (Jellyfin's wire convention) and `,`, trimming and dropping blanks.
+fn split_tag_csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(['|', ','])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// `POST /Collections` — LIB-C5 manual CRUD: create a box set named
+/// `Name`, optionally seeded with the `Ids` members (in request order).
+/// Returns the new BoxSet item (its `Id` is the collection wire id) so
+/// the client routes straight into it — matching Jellyfin's create shape.
+async fn create_collection(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    q: web::Query<CollectionMutateQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let name = q
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error::ErrorBadRequest("Name is required"))?;
+    let ids = parse_id_csv(q.ids.as_deref());
+    let collection = state
+        .stores
+        .create_collection(name, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let count = state
+        .stores
+        .collection_items(&collection.wire_id)
+        .await
+        .map(|m| m.len() as u32)
+        .unwrap_or(ids.len() as u32);
+    Ok(HttpResponse::Ok().json(collection_dto(&state, &collection, count)))
+}
+
+/// `POST /Collections/{id}/Items` — LIB-C5 manual CRUD: add the `Ids`
+/// members to the box set named by the wire id. 404 when the wire id
+/// matches no collection. Returns 204 (Jellyfin's add-items shape).
+async fn collection_items_add(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<CollectionMutateQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let wire_id = path.into_inner();
+    let ids = parse_id_csv(q.ids.as_deref());
+    let added = state
+        .stores
+        .add_collection_items(&wire_id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if added.is_none() {
+        return Err(error::ErrorNotFound("collection not found"));
+    }
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `DELETE /Collections/{id}/Items` — LIB-C5 manual CRUD: remove the
+/// `Ids` members from the box set named by the wire id. 404 when the wire
+/// id matches no collection. Returns 204 (Jellyfin's remove-items shape).
+async fn collection_items_remove(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<CollectionMutateQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let wire_id = path.into_inner();
+    let ids = parse_id_csv(q.ids.as_deref());
+    let removed = state
+        .stores
+        .remove_collection_items(&wire_id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if removed.is_none() {
+        return Err(error::ErrorNotFound("collection not found"));
+    }
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// Shared BoxSet item JSON. A Jellyfin collection is an `IsFolder`
+/// BoxSet view — clicking it lists the members via
+/// `/Items?ParentId=<wire id>`. The `Id` is the collection wire id so the
+/// id round-trips byte-identically through the ParentId pivot and the
+/// `/Items/{id}` BoxSet short-circuit.
+fn collection_dto(
+    state: &AppState,
+    collection: &pharos_core::Collection,
+    item_count: u32,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "Id": collection.wire_id,
+        "Name": collection.name,
+        "ServerId": state.server_id,
+        "Type": "BoxSet",
+        "CollectionType": "boxsets",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "ChildCount": item_count,
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "Genres": [], "Tags": [],
+    });
+    if let Some(o) = collection.overview.as_deref().filter(|s| !s.is_empty()) {
+        v["Overview"] = serde_json::Value::String(o.to_string());
+    }
+    v
 }
 
 #[derive(Debug, Deserialize)]
@@ -1338,7 +1866,9 @@ async fn restrict_to_parent(
     use crate::api::jellyfin::dto::{
         album_id_for, artist_id_for, genre_id_for, season_id_for_key, series_id_for_key,
     };
-    use pharos_core::{GenreStore, LibraryStore};
+    use pharos_core::{
+        CollectionStore, GenreStore, LibraryStore, PersonStore, StudioStore, TagStore,
+    };
     let Some(pid) = parent_id else {
         return items;
     };
@@ -1484,220 +2014,59 @@ async fn restrict_to_parent(
             })
             .collect();
     }
+    // 7) Person id → every item crediting that person. LIB-C2: resolve
+    //    via people.wire_id → item_people → items indexed join. People
+    //    have no legacy probe column, so there is no in-memory fallback
+    //    (an unknown wire id simply yields no items → empty library).
+    if let Ok(ids) = state.stores.item_ids_for_person(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+        }
+    }
+    // 8) Studio id → every item tagged with that studio. LIB-C3: resolve
+    //    via studios.wire_id → item_studios → items indexed join. Studios
+    //    have no legacy probe column (the old /Studios stub borrowed
+    //    album_artist but never linked it), so there is no in-memory
+    //    fallback — an unknown wire id yields no items → empty library.
+    if let Ok(ids) = state.stores.item_ids_for_studio(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+        }
+    }
+    // 9) Collection / box set id → its members in curated sort_order.
+    //    LIB-C5: resolve via collections.wire_id → collection_items →
+    //    items, returning the members in the join's `sort_order` (NOT the
+    //    id order of `items`) so a curated box set renders in order. The
+    //    membership ids are the source of truth for both membership AND
+    //    order; we index `items` by id and emit in member order. A wire id
+    //    matching a *known but empty* collection still resolves (to an
+    //    empty list) so a freshly-created empty box set browses cleanly,
+    //    rather than falling through to the unknown-id empty Vec.
+    if let Ok(collection) = state.stores.collection_by_wire_id(pid).await {
+        if collection.is_some() {
+            let member_ids = state.stores.collection_items(pid).await.unwrap_or_default();
+            let mut by_id: std::collections::HashMap<pharos_core::MediaId, MediaItem> =
+                items.into_iter().map(|i| (i.id, i)).collect();
+            return member_ids
+                .into_iter()
+                .filter_map(|id| by_id.remove(&id))
+                .collect();
+        }
+    }
+    // 10) Tag id → every item carrying that tag. LIB-C6: resolve via
+    //     tags.wire_id → item_tags → items indexed join. Tags have no
+    //     legacy probe column, so there is no in-memory fallback — an
+    //     unknown wire id yields no items → empty library.
+    if let Ok(ids) = state.stores.item_ids_for_tag(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+        }
+    }
     // Unknown id — render an empty library.
     Vec::new()
-}
-
-fn filter_and_sort(mut items: Vec<MediaItem>, q: &ListQuery, sort_seed: u64) -> Vec<MediaItem> {
-    if let Some(raw) = q.ids.as_ref() {
-        // 32-char synth ids (library / series / season / artist /
-        // album / genre) live in a different namespace from numeric
-        // store ids. Treat anything longer than u64::MAX's 20-digit
-        // bound as a non-match — `"00000…001".parse()` otherwise
-        // collides with id 1.
-        let wanted: std::collections::HashSet<u64> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| s.len() <= 20)
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect();
-        // Empty `Ids=` (or all-non-numeric, eg only synth ids) → no
-        // matches. Matches Jellyfin's "you asked for nothing, you
-        // get nothing" semantics.
-        items.retain(|i| wanted.contains(&i.id));
-    }
-    if let Some(term) = q.search_term.as_ref() {
-        // Unicode-aware lowercase so titles with accents ("Pokémon",
-        // "Café") match queries typed in different case. ASCII-only
-        // `to_ascii_lowercase` left the É / é alone and silently
-        // dropped the match.
-        let needle = term.to_lowercase();
-        if !needle.is_empty() {
-            items.retain(|i| i.title.to_lowercase().contains(&needle));
-        }
-    }
-    if let Some(types) = q.include_item_types.as_ref() {
-        let wanted: Vec<MediaKind> = types
-            .split(',')
-            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
-            .collect();
-        if !wanted.is_empty() {
-            items.retain(|i| wanted.contains(&i.kind));
-        }
-    }
-    if let Some(types) = q.exclude_item_types.as_ref() {
-        let blocked: Vec<MediaKind> = types
-            .split(',')
-            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
-            .collect();
-        if !blocked.is_empty() {
-            items.retain(|i| !blocked.contains(&i.kind));
-        }
-    }
-    if let Some(raw) = q.media_types.as_ref() {
-        let want_audio = raw
-            .split(',')
-            .any(|s| s.trim().eq_ignore_ascii_case("Audio"));
-        let want_video = raw
-            .split(',')
-            .any(|s| s.trim().eq_ignore_ascii_case("Video"));
-        if want_audio || want_video {
-            items.retain(|i| match i.kind {
-                MediaKind::Audio => want_audio,
-                MediaKind::Movie | MediaKind::Episode => want_video,
-            });
-        }
-    }
-    if let Some(want) = q.has_subtitles {
-        items.retain(|i| i.probe.subtitle_tracks.is_empty() != want);
-    }
-    // Resolution filters: "4K" ≥ 3840, "HD" 1280..3840, "SD" < 1280.
-    // Width-based — height alone undercounts widescreen content.
-    if let Some(want) = q.is_4k {
-        items.retain(|i| i.probe.width.map(|w| w >= 3840) == Some(want));
-    }
-    if let Some(want) = q.is_hd {
-        items.retain(|i| i.probe.width.map(|w| (1280..3840).contains(&w)) == Some(want));
-    }
-    if let Some(want) = q.is_3d {
-        // No 3D detection in the prober yet; report false for every
-        // item so `Is3D=false` returns everything and `Is3D=true`
-        // returns nothing. Lets clients tick the chip without 500'ing.
-        items.retain(|_| !want);
-    }
-    if let Some(min) = q.min_width {
-        items.retain(|i| i.probe.width.is_some_and(|w| w >= min));
-    }
-    if let Some(max) = q.max_width {
-        items.retain(|i| i.probe.width.is_some_and(|w| w <= max));
-    }
-    if let Some(min) = q.min_index_number {
-        items.retain(|i| {
-            i.series
-                .as_ref()
-                .and_then(|s| s.episode_number)
-                .map(|n| n >= min)
-                .unwrap_or(false)
-        });
-    }
-    if let Some(max) = q.max_index_number {
-        items.retain(|i| {
-            i.series
-                .as_ref()
-                .and_then(|s| s.episode_number)
-                .map(|n| n <= max)
-                .unwrap_or(false)
-        });
-    }
-    if let Some(prefix) = q
-        .name_starts_with
-        .as_deref()
-        .or(q.name_starts_with_or_greater.as_deref())
-    {
-        let lower = prefix.to_lowercase();
-        if !lower.is_empty() {
-            items.retain(|i| i.title.to_lowercase().starts_with(&lower));
-        }
-    }
-    if let Some(bound) = q.name_less_than.as_deref() {
-        let lower = bound.to_lowercase();
-        if !lower.is_empty() {
-            items.retain(|i| i.title.to_lowercase().as_str() < lower.as_str());
-        }
-    }
-    if let Some(raw) = q.genres.as_ref() {
-        // Jellyfin's wire convention splits genres on `|` but some
-        // clients use `,`. Accept both — empty tokens (trailing
-        // separator) are ignored.
-        let wanted: std::collections::HashSet<String> = raw
-            .split(['|', ','])
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !wanted.is_empty() {
-            items.retain(|i| {
-                i.probe
-                    .genre
-                    .as_deref()
-                    .map(|g| wanted.contains(&g.to_lowercase()))
-                    .unwrap_or(false)
-            });
-        }
-    }
-    let sort_by = q.sort_by.as_deref().unwrap_or("SortName");
-    let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
-    // Jellyfin's SortBy accepts a comma-separated chain — clients use
-    // it for stable secondary keys (e.g. "AlbumArtist,Album,SortName").
-    // We honour the first token that maps to a known key, then fall
-    // through to SortName so identical-by-primary items stay stable.
-    let primary = sort_by
-        .split(',')
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or("SortName");
-    match primary {
-        "Random" => shuffle_in_place(&mut items, sort_seed),
-        "DateCreated" | "DateAdded" => {
-            // Newest-first by default. Items without a created_at
-            // (pre-migration-0010 rows) sort to the end of the
-            // descending order via `unwrap_or(0)`.
-            items.sort_by(|a, b| {
-                b.created_at
-                    .unwrap_or(0)
-                    .cmp(&a.created_at.unwrap_or(0))
-                    .then(b.id.cmp(&a.id))
-            });
-            if descending {
-                items.reverse();
-            }
-        }
-        "RuntimeTicks" | "Runtime" => {
-            items.sort_by(|a, b| {
-                a.probe
-                    .duration_ms
-                    .unwrap_or(0)
-                    .cmp(&b.probe.duration_ms.unwrap_or(0))
-            });
-            if descending {
-                items.reverse();
-            }
-        }
-        "AlbumArtist" => {
-            // Unicode-aware case-fold so accented artist names sort
-            // consistently against ASCII ones (Ärzte vs Adele).
-            items.sort_by(|a, b| {
-                let an = a.probe.album_artist.as_deref().unwrap_or("");
-                let bn = b.probe.album_artist.as_deref().unwrap_or("");
-                an.to_lowercase()
-                    .cmp(&bn.to_lowercase())
-                    // Tiebreak by title for stable per-artist track order.
-                    .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-            });
-            if descending {
-                items.reverse();
-            }
-        }
-        "Album" => {
-            items.sort_by(|a, b| {
-                let an = a.probe.album.as_deref().unwrap_or("");
-                let bn = b.probe.album.as_deref().unwrap_or("");
-                an.to_lowercase()
-                    .cmp(&bn.to_lowercase())
-                    .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-            });
-            if descending {
-                items.reverse();
-            }
-        }
-        // SortName (default) and anything unrecognised.
-        _ => {
-            items.sort_by_key(|a| a.title.to_lowercase());
-            if descending {
-                items.reverse();
-            }
-        }
-    }
-    items
 }
 
 fn jellyfin_type_to_kind(s: &str) -> Option<MediaKind> {
@@ -1798,6 +2167,45 @@ async fn fetch_item_dto(
             Vec::new()
         }
     };
+    // LIB-C2 — project the item's cast/crew (item_people join, NFO order)
+    // onto BaseItemDto.People. Best-effort: a store error just means an
+    // empty cast list, never a 500.
+    let people: Vec<pharos_core::ItemPerson> = {
+        use pharos_core::PersonStore;
+        match state.stores.people_for_item(id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, media.id = id, "people lookup for item failed");
+                Vec::new()
+            }
+        }
+    };
+    // LIB-C3 — project the item's studios (item_studios join, name-ordered)
+    // onto BaseItemDto.Studios. Best-effort: a store error just means an
+    // empty studio list, never a 500.
+    let studios: Vec<pharos_core::Studio> = {
+        use pharos_core::StudioStore;
+        match state.stores.studios_for_item(id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, media.id = id, "studios lookup for item failed");
+                Vec::new()
+            }
+        }
+    };
+    // LIB-C6 — project the item's tags (item_tags join, name-ordered) onto
+    // BaseItemDto.Tags. Best-effort: a store error just means an empty tag
+    // list, never a 500.
+    let tags: Vec<pharos_core::Tag> = {
+        use pharos_core::TagStore;
+        match state.stores.tags_for_item(id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, media.id = id, "tags lookup for item failed");
+                Vec::new()
+            }
+        }
+    };
     Ok(HttpResponse::Ok().json(
         BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
             .with_trickplay(
@@ -1805,7 +2213,10 @@ async fn fetch_item_dto(
                 &state.trickplay_widths,
                 state.trickplay_interval_ms,
             )
-            .with_local_artwork_tags(id, &local_art_roles),
+            .with_local_artwork_tags(id, &local_art_roles)
+            .with_people(&people)
+            .with_studios(&studios)
+            .with_tags(&tags),
     ))
 }
 
@@ -2030,46 +2441,4 @@ async fn virtual_folders(
         }]
     };
     Ok(HttpResponse::Ok().json(folders))
-}
-
-async fn paginate(
-    state: &AppState,
-    user_id: UserId,
-    all: Vec<pharos_core::MediaItem>,
-    start_index: u32,
-    limit: u32,
-) -> Result<ItemsResultDto, actix_web::Error> {
-    let total = all.len() as u32;
-    let start = start_index as usize;
-    let end = (start + limit as usize).min(all.len());
-    let slice = if start >= all.len() {
-        &[][..]
-    } else {
-        &all[start..end]
-    };
-    let ids: Vec<u64> = slice.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user_id, &ids)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let mut items: Vec<BaseItemDto> = slice
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.trickplay_widths,
-                state.trickplay_interval_ms,
-            )
-        })
-        .collect();
-    let refs: Vec<&pharos_core::MediaItem> = slice.iter().collect();
-    fill_parent_ids(state, &mut items, &refs);
-    Ok(ItemsResultDto {
-        items,
-        total_record_count: total,
-        start_index,
-    })
 }

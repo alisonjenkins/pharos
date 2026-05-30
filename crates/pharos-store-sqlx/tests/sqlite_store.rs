@@ -504,6 +504,171 @@ async fn link_item_genres_replaces_stale_links() {
     );
 }
 
+// ---- LIB-C2: people as entities -------------------------------------
+
+fn person(name: &str, kind: pharos_core::PersonKind) -> pharos_core::PersonRef {
+    pharos_core::PersonRef {
+        name: name.into(),
+        kind,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn link_item_people_persists_credits_with_wire_id_and_detail() {
+    use pharos_core::{person_wire_id, PersonKind, PersonStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    let mut keanu = person("Keanu Reeves", PersonKind::Actor);
+    keanu.character = Some("Neo".into());
+    keanu.sort_order = Some(0);
+    keanu.thumb = Some("http://x/keanu.jpg".into());
+    let wachowski = person("Lana Wachowski", PersonKind::Director);
+    s.link_item_people(1, &[keanu, wachowski]).await.unwrap();
+
+    // /Persons list: name-ordered (Keanu < Lana), each carries the wire id.
+    let rows = s.people_with_counts().await.unwrap();
+    let names: Vec<&str> = rows.iter().map(|p| p.person.name.as_str()).collect();
+    assert_eq!(names, vec!["Keanu Reeves", "Lana Wachowski"]);
+    assert!(rows.iter().all(|p| p.item_count == 1));
+    let keanu_row = rows
+        .iter()
+        .find(|p| p.person.name == "Keanu Reeves")
+        .unwrap();
+    assert_eq!(keanu_row.person.wire_id, person_wire_id("Keanu Reeves"));
+    assert_eq!(
+        keanu_row.person.thumb_url.as_deref(),
+        Some("http://x/keanu.jpg")
+    );
+
+    // people_for_item: NFO order, structured kind + character round-trip.
+    let credits = s.people_for_item(1).await.unwrap();
+    assert_eq!(credits.len(), 2);
+    assert_eq!(credits[0].name, "Keanu Reeves");
+    assert_eq!(credits[0].kind, PersonKind::Actor);
+    assert_eq!(credits[0].character.as_deref(), Some("Neo"));
+    assert_eq!(credits[1].kind, PersonKind::Director);
+
+    // ParentId pivot: person wire id → the crediting item.
+    let ids = s
+        .item_ids_for_person(&person_wire_id("Keanu Reeves"))
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1]);
+    // Unknown wire id → no items.
+    assert!(s
+        .item_ids_for_person("ffffffffffffffffffffffffffffffff")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // person_by_wire_id resolves the single row.
+    let p = s
+        .person_by_wire_id(&person_wire_id("Lana Wachowski"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.name, "Lana Wachowski");
+    assert!(s.person_by_wire_id("00").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn person_in_two_roles_on_one_item_keeps_both_credits() {
+    // PK is (item_id, person_id, role) so one person can direct AND write.
+    use pharos_core::{PersonKind, PersonStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    let mut dir = person("Jane Doe", PersonKind::Director);
+    dir.role = Some("Director".into());
+    let mut wri = person("Jane Doe", PersonKind::Writer);
+    wri.role = Some("Writer".into());
+    s.link_item_people(1, &[dir, wri]).await.unwrap();
+    let credits = s.people_for_item(1).await.unwrap();
+    assert_eq!(credits.len(), 2, "both distinct-role credits kept");
+    let kinds: Vec<PersonKind> = credits.iter().map(|c| c.kind).collect();
+    assert!(kinds.contains(&PersonKind::Director));
+    assert!(kinds.contains(&PersonKind::Writer));
+    // One person row, item count 1 (distinct item).
+    let rows = s.people_with_counts().await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn link_item_people_replaces_stale_credits() {
+    use pharos_core::{person_wire_id, PersonKind, PersonStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_people(1, &[person("Alice", PersonKind::Actor)])
+        .await
+        .unwrap();
+    // Rescan crediting only Bob: Alice no longer resolves item 1.
+    s.link_item_people(1, &[person("Bob", PersonKind::Actor)])
+        .await
+        .unwrap();
+    assert!(s
+        .item_ids_for_person(&person_wire_id("Alice"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.item_ids_for_person(&person_wire_id("Bob")).await.unwrap(),
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn shared_person_increments_count_across_items() {
+    use pharos_core::{person_wire_id, PersonKind, PersonStore};
+    let s = fresh().await;
+    s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(2, "/m/b.mkv", "B", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.link_item_people(1, &[person("Tom Hanks", PersonKind::Actor)])
+        .await
+        .unwrap();
+    s.link_item_people(2, &[person("Tom Hanks", PersonKind::Actor)])
+        .await
+        .unwrap();
+    let rows = s.people_with_counts().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item_count, 2, "Tom Hanks in both items");
+    let mut ids = s
+        .item_ids_for_person(&person_wire_id("Tom Hanks"))
+        .await
+        .unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn upsert_person_refreshes_thumb_without_clobbering() {
+    // A later scan that learned the headshot fills thumb_url; a None on a
+    // re-upsert does not wipe an existing value (COALESCE).
+    use pharos_core::PersonStore;
+    let s = fresh().await;
+    s.upsert_person("Zoe", None, None, None).await.unwrap();
+    s.upsert_person("Zoe", None, None, Some("http://x/zoe.jpg"))
+        .await
+        .unwrap();
+    // Re-upsert with None thumb must not erase it.
+    s.upsert_person("Zoe", None, None, None).await.unwrap();
+    let rows = s.people_with_counts().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].person.thumb_url.as_deref(),
+        Some("http://x/zoe.jpg")
+    );
+}
+
 // ---- LIB-C1: typed libraries ----------------------------------------
 
 #[tokio::test]

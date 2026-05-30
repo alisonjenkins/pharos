@@ -559,6 +559,64 @@ impl BaseItemDto {
         self
     }
 
+    /// LIB-C2 — project an item's resolved cast/crew (from the
+    /// `item_people` join, in NFO order) onto `People`. Each entry's `Id`
+    /// is the person's `wire_id` (= [`person_id_for`] of the name), so a
+    /// client click routes to `/Items?ParentId=<wire id>`; `Role` carries
+    /// the played character for cast (falling back to the free-form role
+    /// string for crew), and `Type` is the Jellyfin `PersonType` token.
+    /// Replaces the hardcoded empty `people` `build` set.
+    pub fn with_people(mut self, people: &[pharos_core::ItemPerson]) -> Self {
+        self.people = people
+            .iter()
+            .map(|p| {
+                // Jellyfin's `Role` on a cast credit is the character;
+                // crew (no character) fall back to the free-form role.
+                let role = p
+                    .character
+                    .clone()
+                    .filter(|c| !c.is_empty())
+                    .or_else(|| p.role.clone().filter(|r| !r.is_empty()))
+                    .unwrap_or_default();
+                PersonDto {
+                    name: p.name.clone(),
+                    id: p.wire_id.clone(),
+                    role,
+                    kind: p.kind.as_str(),
+                    primary_image_tag: None,
+                }
+            })
+            .collect();
+        self
+    }
+
+    /// LIB-C3 — project an item's resolved studios (from the `item_studios`
+    /// join, name-ordered) onto `Studios`. Each pair's `Id` is the studio's
+    /// `wire_id` (= [`studio_id_for`] of the name), so a client click routes
+    /// to `/Items?ParentId=<wire id>`. Replaces the hardcoded empty
+    /// `studios` `build` set.
+    pub fn with_studios(mut self, studios: &[pharos_core::Studio]) -> Self {
+        self.studios = studios
+            .iter()
+            .map(|s| NameGuidPairDto {
+                name: s.name.clone(),
+                id: s.wire_id.clone(),
+            })
+            .collect();
+        self
+    }
+
+    /// LIB-C6 — project an item's resolved tags (from the `item_tags`
+    /// join, name-ordered) onto `Tags`. Jellyfin's `Tags` is a flat
+    /// `Vec<String>` of label names (no wire id; a tag's
+    /// `/Items?ParentId=<tag id>` link comes from the /Tags list, not the
+    /// item DTO), so we emit the bare names. Replaces the hardcoded empty
+    /// `tags` `build` set.
+    pub fn with_tags(mut self, tags: &[pharos_core::Tag]) -> Self {
+        self.tags = tags.iter().map(|t| t.name.clone()).collect();
+        self
+    }
+
     pub fn from_domain_with_user_data(
         item: &pharos_core::MediaItem,
         server_id: &str,
@@ -805,6 +863,38 @@ pub fn genre_id_for(name: &str) -> String {
     // LIB-C4 — delegate to core so the id matches the `genres.wire_id`
     // the store stamps at upsert (single source of truth for the hash).
     pharos_core::genre_wire_id(name)
+}
+/// LIB-C2 — stable 32-hex id for a synthesised Person item. Delegates to
+/// core's `person_wire_id` so the `Id` a Person DTO emits is byte-
+/// identical to the `people.wire_id` the store stamps at upsert (single
+/// source of truth) — `/Items?ParentId=<person id>` resolves by that
+/// wire_id index.
+pub fn person_id_for(name: &str) -> String {
+    pharos_core::person_wire_id(name)
+}
+/// LIB-C3 — stable 32-hex id for a synthesised Studio item. Delegates to
+/// core's `studio_wire_id` so the `Id` a Studio DTO emits is byte-
+/// identical to the `studios.wire_id` the store stamps at upsert (single
+/// source of truth) — `/Items?ParentId=<studio id>` resolves by that
+/// wire_id index.
+pub fn studio_id_for(name: &str) -> String {
+    pharos_core::studio_wire_id(name)
+}
+/// LIB-C5 — stable 32-hex id for a synthesised Collection / BoxSet item.
+/// Delegates to core's `collection_wire_id` so the `Id` a BoxSet DTO
+/// emits is byte-identical to the `collections.wire_id` the store stamps
+/// at upsert (single source of truth) — `/Items/{id}` resolves the
+/// BoxSet and `/Items?ParentId=<collection id>` lists its members by
+/// that wire_id index.
+pub fn collection_id_for(name: &str) -> String {
+    pharos_core::collection_wire_id(name)
+}
+/// LIB-C6 — stable 32-hex id for a synthesised Tag item. Delegates to
+/// core's `tag_wire_id` so the `Id` a Tag DTO emits is byte-identical to
+/// the `tags.wire_id` the store stamps at upsert (single source of truth)
+/// — `/Items?ParentId=<tag id>` resolves by that wire_id index.
+pub fn tag_id_for(name: &str) -> String {
+    pharos_core::tag_wire_id(name)
 }
 fn name_aggregate_id_for(kind: &str, name: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;

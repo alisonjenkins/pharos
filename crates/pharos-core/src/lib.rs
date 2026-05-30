@@ -208,14 +208,41 @@ impl PersonKind {
             PersonKind::Other => "Other",
         }
     }
+
+    /// LIB-C2 — parse a stored / wire `PersonType` token back into a
+    /// kind. Unknown tokens (and the empty string from a legacy row) fall
+    /// back to [`PersonKind::Other`] so a stray value never drops the
+    /// credit. Case-insensitive on the canonical tokens.
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "Actor" => PersonKind::Actor,
+            "Director" => PersonKind::Director,
+            "Writer" => PersonKind::Writer,
+            "Producer" => PersonKind::Producer,
+            "Composer" => PersonKind::Composer,
+            "GuestStar" => PersonKind::GuestStar,
+            _ => match s.trim().to_ascii_lowercase().as_str() {
+                "actor" => PersonKind::Actor,
+                "director" => PersonKind::Director,
+                "writer" => PersonKind::Writer,
+                "producer" => PersonKind::Producer,
+                "composer" => PersonKind::Composer,
+                "gueststar" | "guest star" => PersonKind::GuestStar,
+                _ => PersonKind::Other,
+            },
+        }
+    }
 }
 
-/// LIB-D1 — one person credit (cast / crew) carried by a
-/// [`MetadataResult`]. People have no store table yet (a later slice adds
-/// `people` + `item_people`); D7 carries these through the merge and logs
-/// them as not-yet-persisted. `role` is the free-form NFO `<role>` string
-/// (e.g. department) distinct from the structured [`kind`]; `character` is
-/// the played character for cast; `sort_order` preserves NFO ordering.
+/// LIB-D1 / LIB-C2 — one person credit (cast / crew) carried by a
+/// [`MetadataResult`]. The C2 `people` + `item_people` tables persist
+/// these: `name` keys the [`Person`] row; `role` (free-form NFO `<role>`
+/// string, e.g. department), `character` (played character for cast),
+/// [`kind`] (structured [`PersonKind`]), and `sort_order` (NFO ordering)
+/// are the per-link join columns. `thumb` is the NFO `<actor><thumb>`
+/// image URL (a cast headshot), stored on the [`Person`] row;
+/// `provider_ids` is a serialised per-person id blob (TMDB/IMDB person
+/// ids) carried for a later online-enrichment pass.
 ///
 /// [kind]: PersonRef::kind
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -225,6 +252,14 @@ pub struct PersonRef {
     pub kind: PersonKind,
     pub character: Option<String>,
     pub sort_order: Option<u32>,
+    /// LIB-C2 — NFO `<actor><thumb>` headshot URL, persisted on the
+    /// `people` row's `thumb_url` column so the image API can serve a
+    /// cast portrait. `None` when the NFO carried no actor thumb.
+    pub thumb: Option<String>,
+    /// LIB-C2 — serialised per-person provider ids (e.g. `tmdb:1234`)
+    /// carried for a later online-enrichment pass; stored on the
+    /// `people` row's `provider_ids` column. `None` when unknown.
+    pub provider_ids: Option<String>,
 }
 
 /// LIB-D1 — inputs a [`MetadataProvider`] resolves metadata from. Borrows
@@ -250,10 +285,11 @@ pub struct MetadataRequest<'a> {
 ///
 /// Only a subset has a persistence home today: `overview` / `tagline` /
 /// ratings / years / `provider_ids` land on [`MediaMetadata`], `genres`
-/// on the genre join, and `artwork` (LocalFile refs) on the D4 artwork
-/// table. `studios` / `people` / `tags` / `collections` are CARRIED now
-/// even though their tables don't exist yet — D7 logs them as
-/// not-yet-persisted and a later slice adds the tables.
+/// on the genre join, `people` on the C2 `people` + `item_people` join,
+/// and `artwork` (LocalFile refs) on the D4 artwork table. `studios` /
+/// `tags` / `collections` are CARRIED now even though their tables don't
+/// exist yet — the merge logs them as not-yet-persisted and a later
+/// slice adds the tables.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MetadataResult {
     /// Canonical title override (NFO `<title>`); `None` keeps the
@@ -337,6 +373,48 @@ pub fn genre_wire_id(name: &str) -> String {
     name_aggregate_wire_id("genre", name)
 }
 
+/// LIB-C2 — the `people.wire_id` value for a person `name`. Thin wrapper
+/// over [`name_aggregate_wire_id`] with the `"person"` namespace; the
+/// store stamps this at upsert so `/Items?ParentId=<person id>` resolves
+/// by an indexed `wire_id` lookup and the Jellyfin DTO's `person_id_for`
+/// delegates here (so the id a client sends back as `?ParentId=` is
+/// byte-identical to the stored `wire_id`).
+pub fn person_wire_id(name: &str) -> String {
+    name_aggregate_wire_id("person", name)
+}
+
+/// LIB-C3 — the `studios.wire_id` value for a studio `name`. Thin wrapper
+/// over [`name_aggregate_wire_id`] with the `"studio"` namespace; the
+/// store stamps this at upsert so `/Items?ParentId=<studio id>` resolves
+/// by an indexed `wire_id` lookup and the Jellyfin DTO's `studio_id_for`
+/// delegates here (so the id a client sends back as `?ParentId=` is
+/// byte-identical to the stored `wire_id`).
+pub fn studio_wire_id(name: &str) -> String {
+    name_aggregate_wire_id("studio", name)
+}
+
+/// LIB-C5 — the `collections.wire_id` value for a collection / box set
+/// `name`. Thin wrapper over [`name_aggregate_wire_id`] with the
+/// `"collection"` namespace; the store stamps this at upsert so the box
+/// set itself resolves by an indexed `wire_id` lookup
+/// (`/Items/{wire_id}` → a BoxSet DTO), `/Items?ParentId=<collection id>`
+/// pivots through `collection_items` to the members, and the Jellyfin
+/// DTO's `collection_id_for` delegates here (so the id a client sends
+/// back is byte-identical to the stored `wire_id`).
+pub fn collection_wire_id(name: &str) -> String {
+    name_aggregate_wire_id("collection", name)
+}
+
+/// LIB-C6 — the `tags.wire_id` value for a tag `name`. Thin wrapper over
+/// [`name_aggregate_wire_id`] with the `"tag"` namespace; the store
+/// stamps this at upsert so `/Items?ParentId=<tag id>` resolves by an
+/// indexed `wire_id` lookup and the Jellyfin DTO's `tag_id_for` delegates
+/// here (so the id a client clicks is byte-identical to the stored
+/// `wire_id`).
+pub fn tag_wire_id(name: &str) -> String {
+    name_aggregate_wire_id("tag", name)
+}
+
 /// LIB-C4 — a genre entity row. `wire_id` is the stable
 /// [`genre_wire_id`] the Jellyfin DTO emits as the Genre's `Id`; the
 /// integer `id` is the internal PK used by the `item_genres` join.
@@ -418,6 +496,441 @@ pub fn split_genre_field(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// LIB-B4 — split a raw search term into FTS-safe, prefix-marked tokens.
+///
+/// Pure / IO-free (V12) so both store backends derive an IDENTICAL token
+/// set from one source. The term is split on any non-alphanumeric run
+/// (Unicode-aware via `char::is_alphanumeric`), each token lower-cased; a
+/// blank result (term was all punctuation / whitespace) yields an empty
+/// Vec, which both backends treat as "match nothing". By sanitising to
+/// alphanumeric runs we strip every FTS operator (`"`, `:`, `*`, `(`, `^`,
+/// `-`, `OR`, `NEAR`, …) so a user term can never inject matcher syntax —
+/// the tokens reach the index only as a parameter the backend wraps in its
+/// own prefix marker (`token*` for fts5, `token:*` for `to_tsquery`).
+pub fn search_tokens(term: &str) -> Vec<String> {
+    term.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// LIB-C2 — a person entity row (one per distinct cast/crew member
+/// name). `wire_id` is the stable [`person_wire_id`] the Jellyfin DTO
+/// emits as the Person's `Id`; the integer `id` is the internal PK used
+/// by the `item_people` join. `sort_name` drives the name-ordered
+/// `/Persons` list; `provider_ids` (serialised TMDB/IMDB person ids) and
+/// `thumb_url` (NFO `<actor><thumb>` headshot) are carried for the image
+/// API + a later online-enrichment pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Person {
+    pub id: i64,
+    pub name: String,
+    pub sort_name: Option<String>,
+    pub wire_id: String,
+    pub provider_ids: Option<String>,
+    pub thumb_url: Option<String>,
+}
+
+/// LIB-C2 — one person plus how many items credit them, for the
+/// `/Persons` list (jellyfin-web shows the cast tile; the count drives
+/// "appears in N items").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonCount {
+    pub person: Person,
+    pub item_count: u32,
+}
+
+/// LIB-C2 — one resolved credit on a specific item: the [`Person`] row
+/// joined with the per-link detail from `item_people` (`role`,
+/// `character`, `kind`, `sort_order`). Built by
+/// [`PersonStore::people_for_item`] so the API can project an item's
+/// cast/crew onto its `BaseItemDto.People` in NFO order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemPerson {
+    pub name: String,
+    pub wire_id: String,
+    pub role: Option<String>,
+    pub character: Option<String>,
+    pub kind: PersonKind,
+    pub sort_order: Option<u32>,
+}
+
+/// LIB-C2 — people (cast & crew) as first-class entities. Split from
+/// [`MediaStore`] like [`GenreStore`] so in-memory test stores that only
+/// round-trip items don't have to implement the join, while the scanner
+/// (which links items to people on write) and the API (which lists
+/// people, resolves the ParentId pivot, and projects an item's cast)
+/// require both bounds.
+///
+/// The wire id a person row stores is [`person_wire_id`] of its name,
+/// computed at [`upsert_person`](Self::upsert_person) time — so the
+/// `/Items?ParentId=<person id>` pivot is an indexed `wire_id` lookup
+/// (see [`item_ids_for_person`](Self::item_ids_for_person)).
+///
+/// Unlike [`GenreStore`] there is NO backfill: `media_items` carries no
+/// legacy people column (genres backfill exists only because `probe.genre`
+/// predates the join), so people are populated purely by the scanner
+/// wire-in from [`MetadataResult::people`].
+pub trait PersonStore: Send + Sync {
+    /// Upsert a person by `name`, returning its internal PK. Idempotent:
+    /// re-upserting an existing name returns the same id and refreshes the
+    /// `sort_name` / `provider_ids` / `thumb_url` when the new values are
+    /// `Some` (so a later scan that learned the headshot fills it in
+    /// without clobbering an existing value with `None`). Empty/whitespace
+    /// names are rejected by the caller (the scanner trims + drops blanks).
+    fn upsert_person(
+        &self,
+        name: &str,
+        sort_name: Option<&str>,
+        provider_ids: Option<&str>,
+        thumb_url: Option<&str>,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// Replace `item`'s person links with exactly `people` (blank names
+    /// dropped, de-duplicated on (name, role) by the impl). Upserts any
+    /// missing person rows first, carrying each one's `thumb` /
+    /// `provider_ids` / sort_name onto the row. Idempotent — a rescan that
+    /// yields the same credits leaves the join unchanged.
+    fn link_item_people(
+        &self,
+        item: MediaId,
+        people: &[PersonRef],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Every person with their item count, ordered by sort_name (falling
+    /// back to name), for `/Persons`.
+    fn people_with_counts(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<PersonCount>>> + Send;
+
+    /// The single person whose `wire_id` matches, for `/Persons/{id}`.
+    /// `None` when no person row carries that wire id.
+    fn person_by_wire_id(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<Person>>> + Send;
+
+    /// Item ids crediting the person whose `wire_id` matches — the exact
+    /// `/Items?ParentId=<person id>` pivot. Empty Vec when no person row
+    /// carries that wire id.
+    fn item_ids_for_person(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// Every credit on `item`, in NFO order (sort_order asc, then name),
+    /// for projecting the item's cast/crew onto `BaseItemDto.People`.
+    fn people_for_item(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<ItemPerson>>> + Send;
+}
+
+/// LIB-C3 — a studio entity row (one per distinct production/network
+/// studio name). `wire_id` is the stable [`studio_wire_id`] the Jellyfin
+/// DTO emits as the Studio's `Id`; the integer `id` is the internal PK
+/// used by the `item_studios` join.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Studio {
+    pub id: i64,
+    pub name: String,
+    pub wire_id: String,
+}
+
+/// LIB-C3 — one studio plus how many items carry it, for the `/Studios`
+/// list (jellyfin-web shows the studio tile; the count drives library
+/// stats).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StudioCount {
+    pub studio: Studio,
+    pub item_count: u32,
+}
+
+/// LIB-C3 — studios (production companies / TV networks) as first-class
+/// entities. Split from [`MediaStore`] like [`GenreStore`] so in-memory
+/// test stores that only round-trip items don't have to implement the
+/// join, while the scanner (which links items to studios on write) and
+/// the API (which lists studios + resolves the ParentId pivot) require
+/// both bounds.
+///
+/// The wire id a studio row stores is [`studio_wire_id`] of its name,
+/// computed at [`upsert_studio`](Self::upsert_studio) time — so the
+/// `/Items?ParentId=<studio id>` pivot is an indexed `wire_id` lookup
+/// (see [`item_ids_for_studio`](Self::item_ids_for_studio)) rather than
+/// the legacy `/Studios` stub that aggregated `probe.album_artist`.
+///
+/// Unlike [`GenreStore`] there is NO backfill: `media_items` carries no
+/// legacy studio column (genres backfill exists only because `probe.genre`
+/// predates the join), so studios are populated purely by the scanner
+/// wire-in from [`MetadataResult::studios`].
+pub trait StudioStore: Send + Sync {
+    /// Upsert a studio by `name`, returning its internal PK. Idempotent:
+    /// re-upserting an existing name returns the same id without
+    /// duplicating the row. Empty/whitespace names are rejected by the
+    /// caller (the scanner trims + drops blanks before linking).
+    fn upsert_studio(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// Replace `item`'s studio links with exactly `names` (trimmed,
+    /// de-duplicated, blanks dropped by the impl). Upserts any missing
+    /// studio rows first. Idempotent — a rescan that yields the same
+    /// studios leaves the join unchanged.
+    fn link_item_studios(
+        &self,
+        item: MediaId,
+        names: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Every studio with its item count, ordered by name, for `/Studios`.
+    fn studios_with_counts(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<StudioCount>>> + Send;
+
+    /// Item ids tagged with the studio whose `wire_id` matches — the exact
+    /// `/Items?ParentId=<studio id>` pivot. Empty Vec when no studio row
+    /// carries that wire id (so the caller renders an empty library).
+    fn item_ids_for_studio(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// Every studio name on `item`, ordered by name, for projecting the
+    /// item's studios onto `BaseItemDto.Studios`. Empty Vec when the item
+    /// carries no studios.
+    fn studios_for_item(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Studio>>> + Send;
+}
+
+/// LIB-C5 — a collection / box set entity row (one per distinct
+/// collection name). `wire_id` is the stable [`collection_wire_id`] the
+/// Jellyfin DTO emits as the BoxSet's `Id`; the integer `id` is the
+/// internal PK used by the `collection_items` membership join. `kind` is
+/// the box-set discriminator (`"boxset"` by default); `overview` is the
+/// optional synopsis a manual create may carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collection {
+    pub id: i64,
+    pub name: String,
+    pub wire_id: String,
+    pub kind: String,
+    pub overview: Option<String>,
+}
+
+/// LIB-C5 — one collection plus how many items it contains, for the
+/// `/Collections`-style list and the BoxSet tile's `ChildCount`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollectionCount {
+    pub collection: Collection,
+    pub item_count: u32,
+}
+
+/// LIB-C5 — collections / box sets as first-class entities. Split from
+/// [`MediaStore`] like [`GenreStore`] so in-memory test stores that only
+/// round-trip items don't have to implement the join, while the scanner
+/// (which links NFO `<set>` membership on write) and the API (which
+/// lists box sets, resolves the ParentId pivot, surfaces the BoxSet DTO,
+/// and drives the manual CRUD endpoints) require both bounds.
+///
+/// The wire id a collection row stores is [`collection_wire_id`] of its
+/// name, computed at [`upsert_collection`](Self::upsert_collection) time
+/// — so the box set itself resolves by an indexed `wire_id` lookup and
+/// `/Items?ParentId=<collection id>` returns its members in `sort_order`
+/// (see [`collection_items`](Self::collection_items)).
+///
+/// Unlike [`GenreStore`] there is NO backfill: `media_items` carries no
+/// legacy collection column, so collections are populated by the scanner
+/// wire-in from [`MetadataResult::collections`] and by the manual CRUD
+/// endpoints — never derived from a probe column.
+pub trait CollectionStore: Send + Sync {
+    /// Upsert a collection by `name`, returning its internal PK.
+    /// Idempotent: re-upserting an existing name returns the same id and
+    /// refreshes `kind` / `overview` ONLY when a new value is supplied
+    /// (so a later NFO scan doesn't clobber an operator's manual
+    /// overview with `None`). Empty/whitespace names are rejected by the
+    /// caller. `wire_id` is computed via [`collection_wire_id`].
+    fn upsert_collection(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        overview: Option<&str>,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// Add `item` to the collection named by `names` (each upserted
+    /// first), appending after the current max `sort_order` so members
+    /// keep a stable curated order. Idempotent — re-linking an item
+    /// already in the set is a no-op (PK conflict ignored). This is the
+    /// scanner wire-in path: a movie's NFO `<set>` tags name the box
+    /// set(s) it belongs to.
+    fn link_item_collections(
+        &self,
+        item: MediaId,
+        names: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Every collection with its member count, ordered by name, for the
+    /// `/Collections`-style list + BoxSet tiles.
+    fn collections_with_counts(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<CollectionCount>>> + Send;
+
+    /// The single collection whose `wire_id` matches, for surfacing the
+    /// BoxSet `BaseItemDto` and resolving manual CRUD targets. `None`
+    /// when no collection row carries that wire id.
+    fn collection_by_wire_id(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<Collection>>> + Send;
+
+    /// Member item ids of the collection whose `wire_id` matches, in
+    /// curated `sort_order` (ties broken by item id) — the exact
+    /// `/Items?ParentId=<collection id>` pivot. Empty Vec when no
+    /// collection row carries that wire id (so the box set renders empty).
+    fn collection_items(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// Create a collection (manual CRUD: `POST /Collections`), upserting
+    /// the row and seeding it with `item_ids` (in the given order).
+    /// Returns the created/existing collection so the handler can echo
+    /// its wire id back as the new BoxSet's `Id`. Idempotent on the name.
+    fn create_collection(
+        &self,
+        name: &str,
+        item_ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Collection>> + Send;
+
+    /// Add `item_ids` to the collection named by `wire_id` (manual CRUD:
+    /// `POST /Collections/{id}/Items`), appending after the current max
+    /// `sort_order`. No-op for ids already present. Returns
+    /// `Some(rows newly added)`, or `None` when no collection carries
+    /// that wire id (the handler maps `None` to 404 — distinct from the
+    /// `MediaId`-keyed [`DomainError::NotFound`]).
+    fn add_collection_items(
+        &self,
+        wire_id: &str,
+        item_ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Option<u64>>> + Send;
+
+    /// Remove `item_ids` from the collection named by `wire_id` (manual
+    /// CRUD: `DELETE /Collections/{id}/Items`). Returns
+    /// `Some(rows actually removed)`, or `None` when no collection
+    /// carries that wire id (the handler maps `None` to 404).
+    fn remove_collection_items(
+        &self,
+        wire_id: &str,
+        item_ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Option<u64>>> + Send;
+}
+
+/// LIB-C6 — a tag entity row (one per distinct tag name). `wire_id` is the
+/// stable [`tag_wire_id`] the Jellyfin DTO emits for a synthesised Tag
+/// item; the integer `id` is the internal PK used by the `item_tags`
+/// join.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+    pub wire_id: String,
+}
+
+/// LIB-C6 — one tag plus how many items carry it, for a `/Tags`-style
+/// list + the tag tile's child count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagCount {
+    pub tag: Tag,
+    pub item_count: u32,
+}
+
+/// LIB-C6 — tags as first-class entities. Split from [`MediaStore`] like
+/// [`GenreStore`] so in-memory test stores that only round-trip items
+/// don't have to implement the join, while the scanner (which links NFO
+/// `<tag>` + filename quality/source tokens on write) and the API (which
+/// lists tags, resolves the ParentId pivot, projects the item's `Tags`,
+/// and drives the manual add/remove endpoints) require both bounds.
+///
+/// The wire id a tag row stores is [`tag_wire_id`] of its name, computed
+/// at [`upsert_tag`](Self::upsert_tag) time — so the
+/// `/Items?ParentId=<tag id>` pivot is an indexed `wire_id` lookup (see
+/// [`item_ids_for_tag`](Self::item_ids_for_tag)).
+///
+/// Unlike [`GenreStore`] there is NO backfill: `media_items` carries no
+/// legacy tag column (genres backfill exists only because `probe.genre`
+/// predates the join), so tags are populated by the scanner wire-in from
+/// [`MetadataResult::tags`] and by the manual add/remove endpoints.
+///
+/// Two mutation paths share the join: [`link_item_tags`](Self::link_item_tags)
+/// replaces an item's tags *wholesale* (the scanner rescan path — a
+/// dropped `<tag>` clears its stale link), while
+/// [`add_item_tags`](Self::add_item_tags) /
+/// [`remove_item_tags`](Self::remove_item_tags) mutate the set
+/// *incrementally* (the manual `POST`/`DELETE /Items/{id}/Tags` path,
+/// which must not clobber tags the operator didn't name).
+pub trait TagStore: Send + Sync {
+    /// Upsert a tag by `name`, returning its internal PK. Idempotent:
+    /// re-upserting an existing name returns the same id without
+    /// duplicating the row. Empty/whitespace names are rejected by the
+    /// caller (the scanner trims + drops blanks before linking).
+    fn upsert_tag(&self, name: &str)
+        -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// Replace `item`'s tag links with exactly `names` (trimmed,
+    /// de-duplicated, blanks dropped by the impl). Upserts any missing
+    /// tag rows first. Idempotent — a rescan that yields the same tags
+    /// leaves the join unchanged. This is the scanner wire-in path.
+    fn link_item_tags(
+        &self,
+        item: MediaId,
+        names: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Manual CRUD: add `names` to `item`'s tags (each upserted first)
+    /// WITHOUT touching tags the item already carries. Idempotent —
+    /// re-adding a tag already present is a no-op. Returns the count of
+    /// links newly created. The `POST /Items/{id}/Tags` path.
+    fn add_item_tags(
+        &self,
+        item: MediaId,
+        names: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
+    /// Manual CRUD: remove `names` from `item`'s tags, leaving the rest
+    /// intact. A name the item doesn't carry is a no-op. The tag *row*
+    /// stays (it may still be linked to other items); only the join link
+    /// is dropped. Returns the count of links actually removed. The
+    /// `DELETE /Items/{id}/Tags` path.
+    fn remove_item_tags(
+        &self,
+        item: MediaId,
+        names: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
+    /// Every tag with its item count, ordered by name, for a `/Tags`
+    /// list + the aggregate search hints.
+    fn tags_with_counts(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<TagCount>>> + Send;
+
+    /// Item ids carrying the tag whose `wire_id` matches — the exact
+    /// `/Items?ParentId=<tag id>` pivot. Empty Vec when no tag row carries
+    /// that wire id (so the caller renders an empty library).
+    fn item_ids_for_tag(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// Every tag name on `item`, ordered by name, for projecting onto
+    /// `BaseItemDto.Tags`. Empty Vec when the item carries no tags.
+    fn tags_for_item(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Tag>>> + Send;
 }
 
 /// LIB-C1 — the typed kind of a top-level library, driving the Jellyfin
