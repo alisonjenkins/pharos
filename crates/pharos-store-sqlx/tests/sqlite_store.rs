@@ -173,6 +173,37 @@ async fn sweep_is_root_scoped_and_never_touches_sibling_root() {
 }
 
 #[tokio::test]
+async fn sweep_respects_path_boundary_not_string_prefix() {
+    // Regression: sweeping /media/movies must NOT touch /media/movies-4k
+    // (a sibling whose name merely shares a string prefix). Pre-fix, the
+    // `path LIKE prefix || '%'` matched it.
+    let s = fresh().await;
+    s.put(item(1, "/media/movies/old.mkv", "Old", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(
+        2,
+        "/media/movies-4k/keep.mkv",
+        "Keep",
+        MediaKind::Movie,
+    ))
+    .await
+    .unwrap();
+
+    // Scan /media/movies, mark nothing (all gone on disk).
+    let scan = s
+        .begin_scan(std::path::Path::new("/media/movies"))
+        .await
+        .unwrap();
+    let swept = s.sweep_unseen(scan, "/media/movies").await.unwrap();
+    assert_eq!(swept, vec![1], "only the real /media/movies item swept");
+    assert!(
+        s.get(2).await.is_ok(),
+        "/media/movies-4k must survive a /media/movies sweep"
+    );
+}
+
+#[tokio::test]
 async fn store_usable_via_generic_bound() {
     async fn drive<S: MediaStore>(s: &S, it: MediaItem) -> MediaItem {
         s.put(it.clone()).await.unwrap();

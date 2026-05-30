@@ -713,10 +713,15 @@ mod tests {
                 .states
                 .lock()
                 .map_err(|e| DomainError::Backend(e.to_string()))?;
+            // Mirror the production store's path-boundary semantics: only
+            // items strictly under `root_prefix` (separator boundary), never
+            // a sibling sharing a string prefix.
+            let base = root_prefix.strip_suffix('/').unwrap_or(root_prefix);
+            let under_root = format!("{base}/");
             let doomed: Vec<MediaId> = inner
                 .iter()
                 .filter(|(id, item)| {
-                    item.path.to_string_lossy().starts_with(root_prefix)
+                    item.path.to_string_lossy().starts_with(&under_root)
                         && states.get(*id).map(|s| s.last_seen_scan_id) != Some(scan_id)
                 })
                 .map(|(id, _)| *id)

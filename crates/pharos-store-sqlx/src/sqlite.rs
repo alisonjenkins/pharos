@@ -341,14 +341,15 @@ impl MediaStore for SqliteStore {
 
     #[tracing::instrument(skip(self), fields(scan.id = scan_id))]
     async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
-        // Root-scoped, single atomic DELETE (V10). LIKE escapes are not
-        // applied to the caller's prefix; callers pass a filesystem root
-        // path which never contains LIKE wildcards in practice.
-        let like = format!("{root_prefix}%");
+        // Root-scoped, single atomic DELETE (V10). The pattern matches only
+        // items strictly under `root_prefix` (path-separator boundary), so a
+        // sibling root sharing a string prefix (/media/movies vs
+        // /media/movies-4k) is never swept; wildcards in the root are escaped.
+        let like = crate::root_like_pattern(root_prefix);
         let rows = sqlx::query_as::<_, (i64,)>(
             "DELETE FROM media_items \
              WHERE (last_seen_scan_id IS NULL OR last_seen_scan_id != ?) \
-               AND path LIKE ? \
+               AND path LIKE ? ESCAPE '\\' \
              RETURNING id",
         )
         .bind(scan_id)

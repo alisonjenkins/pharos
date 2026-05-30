@@ -336,12 +336,13 @@ impl MediaStore for PostgresStore {
 
     #[tracing::instrument(skip(self), fields(scan.id = scan_id))]
     async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
-        // Root-scoped, single atomic DELETE (V10).
-        let like = format!("{root_prefix}%");
+        // Root-scoped, single atomic DELETE (V10). Path-separator boundary so a
+        // sibling root sharing a string prefix is never swept; wildcards escaped.
+        let like = crate::root_like_pattern(root_prefix);
         let rows = sqlx::query_as::<_, (i64,)>(
             "DELETE FROM media_items \
              WHERE (last_seen_scan_id IS NULL OR last_seen_scan_id != $1) \
-               AND path LIKE $2 \
+               AND path LIKE $2 ESCAPE '\\' \
              RETURNING id",
         )
         .bind(scan_id)
