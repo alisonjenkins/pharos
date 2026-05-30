@@ -24,22 +24,23 @@ clap_builder = { version = "4", default-features = false, features = ["color", "
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
 digest = { version = "0.10", features = ["mac", "std"] }
-dioxus-core = { version = "0.6", default-features = false, features = ["serialize"] }
+dioxus-core = { version = "0.7", default-features = false, features = ["serialize"] }
 either = { version = "1", features = ["serde", "use_std"] }
 foldhash = { version = "0.1" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
+futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
+rand = { version = "0.9" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
@@ -76,9 +77,10 @@ foldhash = { version = "0.1" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
+futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
@@ -110,70 +112,54 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.x86_64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 ### END HAKARI SECTION

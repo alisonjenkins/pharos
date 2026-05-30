@@ -12,6 +12,8 @@ watch_path = ["src", "index.html", "assets"]
 [web.resource]
 style = ["/assets/pharos.css"]
 script = []
+# dev-only resources (required field; empty in release).
+dev = []
 
 [bundle.web]
 out_dir = "target/dx/pharos-ui/release/web"

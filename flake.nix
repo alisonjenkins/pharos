@@ -41,6 +41,25 @@
         # `cargo nextest` does.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
+        # `dx build` requires wasm-bindgen-cli to EXACTLY match the
+        # wasm-bindgen crate the project locks (dioxus 0.7.9 → 0.2.122),
+        # but the pinned nixpkgs ships 0.2.121. Build the matching version
+        # from crates.io. (Bump version + both hashes together when dioxus
+        # bumps its wasm-bindgen pin.)
+        wasmBindgenCli = pkgs.rustPlatform.buildRustPackage rec {
+          pname = "wasm-bindgen-cli";
+          version = "0.2.122";
+          src = pkgs.fetchCrate {
+            inherit pname version;
+            hash = "sha256-vO4RSxi/sMWxmsEs3GuljdMfIRSu75A+Q+c5wgYToRU=";
+          };
+          cargoHash = "sha256-Inup6vvJSG5ghNyeDPyZbfZo4d0LsMG2OJfStoaeDBs=";
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.curl ];
+          doCheck = false;
+        };
+
         # crate2nix's per-crate package set. `Cargo.nix` is generated
         # by running `crate2nix generate` at the workspace root (see
         # the `just regen-cargo-nix` recipe). The generated file
@@ -584,7 +603,7 @@
             # Run `just regen-cargo-nix` after touching dependencies.
             pkgs.crate2nix
             pkgs.dioxus-cli
-            pkgs.wasm-bindgen-cli
+            wasmBindgenCli
             pkgs.ffmpeg-headless
             pkgs.pkg-config
             pkgs.git
@@ -601,6 +620,8 @@
             pkgs.tilt
             pkgs.ctlptl
             pkgs.docker-client
+            # `dx build --release` runs wasm-opt (binaryen) over the wasm.
+            pkgs.binaryen
             # Node + Playwright drive T29 phase 3. jellyfin-web is the
             # upstream prebuilt static bundle, referenced via
             # JELLYFIN_WEB_DIR at runtime. Browser binaries come from the
