@@ -111,7 +111,7 @@ fn make_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
 /// read its `Hello`. `media_stdout` pipes the child's stdout (live media
 /// path) instead of inheriting it (log path). Returns the child, the
 /// control halves, and the handshake.
-async fn spawn_worker_proc(
+pub(crate) async fn spawn_worker_proc(
     worker_bin: &std::path::Path,
     handshake_timeout: Duration,
     media_stdout: bool,
@@ -306,8 +306,12 @@ impl Worker for ProcWorker {
                         WorkerEvent::Failed { error, .. } => {
                             return WorkerRunResult::Failed(error)
                         }
-                        // Unexpected mid-job Hello — ignore.
-                        WorkerEvent::Hello(_) => continue,
+                        // Unexpected mid-job Hello or stray tiny-op reply
+                        // (those belong to the LibavWorkerPool, not the
+                        // segment scheduler) — ignore.
+                        WorkerEvent::Hello(_)
+                        | WorkerEvent::ProbeResult { .. }
+                        | WorkerEvent::WaveformResult { .. } => continue,
                     },
                 }
             }

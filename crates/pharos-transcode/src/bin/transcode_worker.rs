@@ -79,6 +79,12 @@ async fn run() {
                     break;
                 }
             }
+            Ok(Some(WorkerCmd::Tiny { job_id, op })) => {
+                // Persistent libav request/reply op. The worker stays
+                // alive afterwards (the fork/exec is amortised across many
+                // ops); a libav crash kills only this process (V6).
+                run_tiny(&mut wr, job_id, op).await;
+            }
             Ok(Some(WorkerCmd::Cancel { .. })) => {
                 // Single-job-at-a-time worker: nothing is in flight
                 // between reads, so a cancel is a no-op here.
@@ -89,7 +95,12 @@ async fn run() {
     }
 }
 
-#[cfg(all(unix, not(feature = "backend-lib")))]
+// Video-segment / live transcode always shells out to ffmpeg, even in the
+// `backend-lib` build: the encode time dwarfs the fork/exec, and the spawn
+// path already load-balances every GPU + CPU. `backend-lib` adds the
+// in-process libav *tiny ops* (probe/image/trickplay/subtitle/waveform) on
+// top via `run_tiny`; it does not replace the segment encoder.
+#[cfg(unix)]
 async fn run_job(
     wr: &mut tokio::net::unix::OwnedWriteHalf,
     spec: pharos_transcode::protocol::JobSpec,
@@ -214,24 +225,141 @@ async fn run_job(
     }
 }
 
+/// Service one persistent-libav tiny op (`backend-lib` build): run the
+/// blocking libav helper off the async reactor and reply on the control
+/// socket. A libav SIGSEGV here takes down only this worker process — the
+/// pool sees EOF and respawns; the server is untouched (V6).
 #[cfg(all(unix, feature = "backend-lib"))]
-async fn run_job(
+async fn run_tiny(
     wr: &mut tokio::net::unix::OwnedWriteHalf,
-    spec: pharos_transcode::protocol::JobSpec,
+    job_id: pharos_transcode::protocol::JobId,
+    op: pharos_transcode::protocol::TinyOp,
 ) {
     use pharos_transcode::protocol::{write_frame, WorkerError, WorkerEvent};
-    // The in-process libav transcode (worker/ffi.rs) is WIP — it needs a
-    // few ffmpeg-the-third 3.0.2 API fixes before it compiles. Until then
-    // the lib build reports a clean non-recoverable error so the scheduler
-    // surfaces it rather than hanging; production uses the spawn worker,
-    // which already load-balances across every GPU + CPU.
-    let job_id = spec.job_id;
-    let _ = write_frame(wr, &WorkerEvent::Accepted { job_id }).await;
+    let ev = tokio::task::spawn_blocking(move || handle_tiny(job_id, op))
+        .await
+        .unwrap_or_else(|e| WorkerEvent::Failed {
+            job_id,
+            error: WorkerError::Other(format!("tiny op task join: {e}")),
+        });
+    let _ = write_frame(wr, &ev).await;
+}
+
+/// Blocking dispatch to the Phase-1 libav helpers. Maps their error kinds
+/// to the wire `WorkerError` contract (`BadInput` = non-recoverable
+/// malformed source; `Other` = internal/encode failure).
+#[cfg(all(unix, feature = "backend-lib"))]
+fn handle_tiny(
+    job_id: pharos_transcode::protocol::JobId,
+    op: pharos_transcode::protocol::TinyOp,
+) -> pharos_transcode::protocol::WorkerEvent {
+    use pharos_transcode::libav;
+    use pharos_transcode::libav::frames::FrameError;
+    use pharos_transcode::libav::probe::ProbeError;
+    use pharos_transcode::protocol::{TinyOp, WorkerError, WorkerEvent};
+
+    fn frame_err(job_id: pharos_transcode::protocol::JobId, e: FrameError) -> WorkerEvent {
+        let error = match e {
+            FrameError::BadInput(_) => WorkerError::BadInput,
+            FrameError::Other(s) => WorkerError::Other(s),
+        };
+        WorkerEvent::Failed { job_id, error }
+    }
+    fn file_len(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    match op {
+        TinyOp::Probe { input } => match libav::probe::probe(&input) {
+            Ok(info) => WorkerEvent::ProbeResult {
+                job_id,
+                info: Box::new(info),
+            },
+            Err(ProbeError::BadInput(_)) => WorkerEvent::Failed {
+                job_id,
+                error: WorkerError::BadInput,
+            },
+            Err(ProbeError::Other(s)) => WorkerEvent::Failed {
+                job_id,
+                error: WorkerError::Other(s),
+            },
+        },
+        TinyOp::Image {
+            input,
+            seek_ms,
+            width,
+            quality,
+            out,
+        } => match libav::image::extract_image(&input, seek_ms, width, quality, &out) {
+            Ok(()) => WorkerEvent::Done {
+                job_id,
+                out_bytes: file_len(&out),
+            },
+            Err(e) => frame_err(job_id, e),
+        },
+        TinyOp::Trickplay {
+            input,
+            interval_ms,
+            width,
+            grid,
+            max_sheets,
+            quality,
+            out_dir,
+        } => match libav::trickplay::trickplay_sprite(
+            &input, interval_ms, width, grid, max_sheets, quality, &out_dir,
+        ) {
+            // out_bytes carries the produced sheet count for this op.
+            Ok(produced) => WorkerEvent::Done {
+                job_id,
+                out_bytes: produced as u64,
+            },
+            Err(e) => frame_err(job_id, e),
+        },
+        TinyOp::SrtToWebvtt { input, out } => match std::fs::read_to_string(&input) {
+            Ok(srt) => {
+                let vtt = libav::subtitle::convert_srt_to_webvtt(&srt);
+                match std::fs::write(&out, vtt.as_bytes()) {
+                    Ok(()) => WorkerEvent::Done {
+                        job_id,
+                        out_bytes: file_len(&out),
+                    },
+                    Err(e) => WorkerEvent::Failed {
+                        job_id,
+                        error: WorkerError::Io(format!("write {}: {e}", out.display())),
+                    },
+                }
+            }
+            Err(e) => WorkerEvent::Failed {
+                job_id,
+                error: WorkerError::Io(format!("read {}: {e}", input.display())),
+            },
+        },
+        TinyOp::Waveform {
+            input,
+            samples_per_bin,
+            target_bins,
+        } => match libav::waveform::waveform_rms(&input, samples_per_bin, target_bins) {
+            Ok(bins) => WorkerEvent::WaveformResult { job_id, bins },
+            Err(e) => frame_err(job_id, e),
+        },
+    }
+}
+
+/// Tiny ops are unavailable in the spawn-only build — reply with a clean
+/// non-recoverable error so a misconfigured caller surfaces it rather than
+/// hanging.
+#[cfg(all(unix, not(feature = "backend-lib")))]
+async fn run_tiny(
+    wr: &mut tokio::net::unix::OwnedWriteHalf,
+    job_id: pharos_transcode::protocol::JobId,
+    _op: pharos_transcode::protocol::TinyOp,
+) {
+    use pharos_transcode::protocol::{write_frame, WorkerError, WorkerEvent};
     let _ = write_frame(
         wr,
         &WorkerEvent::Failed {
             job_id,
-            error: WorkerError::Other("FFI encode path not yet implemented".into()),
+            error: WorkerError::Other("libav backend not built (build with --features backend-lib)".into()),
         },
     )
     .await;

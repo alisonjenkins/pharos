@@ -5,8 +5,10 @@
 //! socketpair.
 
 pub mod exec;
+pub mod libav_pool;
 pub mod proc;
 
+pub use libav_pool::{LibavWorkerPool, PoolError};
 pub use proc::{ProcSpawner, ProcWorker};
 
 // `ffi.rs` holds the WIP in-process libav transcode pipeline. It is not

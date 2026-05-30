@@ -17,6 +17,7 @@
 
 use crate::hwaccel::HwAccel;
 use crate::options::TranscodeOptions;
+use pharos_core::ProbeInfo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -136,10 +137,51 @@ pub struct JobSpec {
     pub sink: OutputSink,
 }
 
+/// One in-process libav "tiny op" — the high-frequency ffmpeg/ffprobe
+/// calls that the persistent libav worker services without a per-call
+/// fork. Each carries the `JobId` it replies under. The encoded outputs
+/// of `Image`/`Trickplay`/`Subtitle` land on disk (the worker writes them
+/// directly, same as the segment sink) and reply `Done`; `Probe`/
+/// `Waveform` return their (small) data inline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TinyOp {
+    /// Probe a media file → `WorkerEvent::ProbeResult`.
+    Probe { input: PathBuf },
+    /// Extract one scaled JPEG frame to `out` → `Done`.
+    Image {
+        input: PathBuf,
+        seek_ms: Option<u64>,
+        width: u32,
+        quality: i32,
+        out: PathBuf,
+    },
+    /// Generate trickplay sprite sheets into `out_dir` (0-based `{i}.jpg`)
+    /// → `Done` (`out_bytes` carries the sheet count).
+    Trickplay {
+        input: PathBuf,
+        interval_ms: u64,
+        width: u32,
+        grid: u32,
+        max_sheets: u32,
+        quality: i32,
+        out_dir: PathBuf,
+    },
+    /// Convert a SubRip sidecar to WebVTT, written to `out` → `Done`.
+    SrtToWebvtt { input: PathBuf, out: PathBuf },
+    /// Audio RMS waveform → `WorkerEvent::WaveformResult`.
+    Waveform {
+        input: PathBuf,
+        samples_per_bin: u64,
+        target_bins: u32,
+    },
+}
+
 /// Scheduler → worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerCmd {
     Job(JobSpec),
+    /// A persistent libav-worker request/reply op (probe, image, …).
+    Tiny { job_id: JobId, op: TinyOp },
     Cancel { job_id: JobId },
     Shutdown,
 }
@@ -167,6 +209,16 @@ pub enum WorkerEvent {
     Failed {
         job_id: JobId,
         error: WorkerError,
+    },
+    /// Reply to `TinyOp::Probe`.
+    ProbeResult {
+        job_id: JobId,
+        info: Box<ProbeInfo>,
+    },
+    /// Reply to `TinyOp::Waveform` — per-bin RMS dBFS.
+    WaveformResult {
+        job_id: JobId,
+        bins: Vec<f32>,
     },
 }
 
