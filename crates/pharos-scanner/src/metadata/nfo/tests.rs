@@ -322,3 +322,46 @@ async fn uniqueid_typeless_and_bare_id() {
     assert_eq!(r.provider_ids.tmdb.as_deref(), Some("12345"));
     assert_eq!(r.provider_ids.imdb.as_deref(), Some("tt9999999"));
 }
+
+/// LIB-C5 — Jellyfin/Kodi also write box-set membership nested as
+/// `<set><name>Name</name></set>` (and `<set><overview>…</overview>`).
+/// The nested `<name>` must route to collections, distinct from the flat
+/// `<set>Name</set>` form (and never collide with an `<actor><name>`).
+#[tokio::test]
+async fn nested_set_name_form_parses_into_collections() {
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("Movie (2017).mkv");
+    std::fs::write(
+        dir.path().join("Movie (2017).nfo"),
+        r#"<?xml version="1.0"?>
+<movie>
+  <title>Movie</title>
+  <set>
+    <name>The Matrix Collection</name>
+    <overview>ignored</overview>
+  </set>
+  <collection>Wachowski Films</collection>
+  <actor>
+    <name>Keanu Reeves</name>
+    <role>Neo</role>
+  </actor>
+</movie>"#,
+    )
+    .unwrap();
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Movie,
+        probe: &p,
+        series: None,
+    };
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    assert_eq!(
+        r.collections,
+        vec!["The Matrix Collection", "Wachowski Films"],
+        "nested <set><name> + flat <collection>"
+    );
+    // The actor's nested <name> stays a person, not a collection.
+    assert!(r.people.iter().any(|pe| pe.name == "Keanu Reeves"));
+    assert!(!r.collections.iter().any(|c| c == "Keanu Reeves"));
+}

@@ -1791,21 +1791,66 @@ fn default_limit() -> u32 {
     100
 }
 
+/// LIB-C5 — a `/Items?IncludeItemTypes=BoxSet` request (with no media
+/// kinds alongside) is asking for the box-set list, which lives in the
+/// `collections` entity table, NOT the media_items `store.list()` set
+/// that powers the rest of `/Items`. Detect that shape so the handler
+/// can short-circuit to the box sets (the "Collections" library view
+/// jellyfin-web renders). Returns `None` when BoxSet wasn't requested
+/// (or was requested alongside real media kinds, which we don't mix).
+fn boxset_only_request(q: &ListQuery) -> bool {
+    let Some(types) = q.include_item_types.as_deref() else {
+        return false;
+    };
+    let mut saw_boxset = false;
+    for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if t.eq_ignore_ascii_case("BoxSet") {
+            saw_boxset = true;
+        } else {
+            // Any non-BoxSet type → this isn't a pure box-set request.
+            return false;
+        }
+    }
+    saw_boxset
+}
+
+/// Build the box-set `/Items` page (entity-backed) for a BoxSet-only
+/// request, honouring StartIndex / Limit. Shared by `/Items` and
+/// `/Users/{u}/Items`.
+async fn list_boxsets_page(
+    state: &AppState,
+    q: &ListQuery,
+) -> Result<serde_json::Value, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let rows = state
+        .stores
+        .collections_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|cc| collection_dto(state, &cc.collection, cc.item_count))
+        .collect();
+    let total = all.len() as u32;
+    let start = q.start_index as usize;
+    let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.limit as usize).collect();
+    Ok(serde_json::json!({
+        "Items": page,
+        "TotalRecordCount": total,
+        "StartIndex": q.start_index,
+    }))
+}
+
 async fn list_items(
     state: web::Data<AppState>,
     user: AuthUser,
     q: web::Query<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    let all = state
-        .stores
-        .list()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let seed = effective_sort_seed(&q, user.0.id);
-    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
-    let filtered = filter_and_sort(scoped, &q, seed);
-    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
-    let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
+    // LIB-C5 — BoxSet-only listing comes from the collections entity table.
+    if boxset_only_request(&q) {
+        return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+    }
+    let dto = run_items_list(&state, user.0.id, &q).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
 
@@ -1821,17 +1866,584 @@ async fn list_user_items(
     if user_path != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
-    let all = state
+    // LIB-C5 — BoxSet-only listing comes from the collections entity table.
+    if boxset_only_request(&q) {
+        return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+    }
+    let dto = run_items_list(&state, user.0.id, &q).await?;
+    Ok(HttpResponse::Ok().json(dto))
+}
+
+/// LIB-B2 — the single `/Items` + `/Users/{u}/Items` list path, routed
+/// ENTIRELY through `MediaStore::query`. The legacy whole-library
+/// `list()` + `restrict_to_parent` + `filter_and_sort` + in-memory
+/// pagination is gone: the parent pivot, kind/search/entity/user-data
+/// scope, the residual chip filters, the sort chain, and the page all
+/// resolve in one parameterised SQL statement. `SortBy=Random` is the lone
+/// exception — a seeded Fisher–Yates shuffle can't be a stable SQL order, so
+/// for that case the filtered set is fetched unpaged via `query()` (no
+/// whole-library load — the SQL filters still apply) then shuffled + paged in
+/// memory with the same deterministic permutation the legacy path used.
+async fn run_items_list(
+    state: &AppState,
+    user_id: UserId,
+    q: &ListQuery,
+) -> Result<ItemsResultDto, actix_web::Error> {
+    let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
+    // An unknown ParentId resolves to nothing — render an empty library
+    // without touching the store (mirrors the legacy `Vec::new()` tail).
+    if matches!(parent, ParentResolution::Empty) {
+        return Ok(ItemsResultDto {
+            items: Vec::new(),
+            total_record_count: 0,
+            start_index: q.start_index,
+        });
+    }
+
+    let is_random = sort_primary(q.sort_by.as_deref()) == SortPrimary::Random;
+    let mq = build_media_query(user_id, q, &parent, is_random);
+
+    if is_random {
+        // Byte-identical to the legacy in-memory Random path, where the
+        // shuffle ran in `filter_and_sort` (over the kind/search/residual-
+        // filtered set) BEFORE the tag + user-data filters and pagination.
+        // So: fetch that set (NO tag/user-data clauses in SQL), shuffle, then
+        // apply the tag + user-data filters over the shuffled order, then
+        // page. The SQL still does all the heavy filtering — no whole-library
+        // load.
+        let (mut items, _total) = state
+            .stores
+            .query(&mq)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let seed = effective_sort_seed(q, user_id);
+        shuffle_in_place(&mut items, seed);
+        let tagged = apply_tags_filter(state, items, q).await?;
+        let after_ud = apply_userdata_filter(state, user_id, tagged, q).await?;
+        let total = after_ud.len() as u32;
+        let start = q.start_index as usize;
+        let end = (start + q.limit as usize).min(after_ud.len());
+        let page: Vec<MediaItem> = if start >= after_ud.len() {
+            Vec::new()
+        } else {
+            after_ud[start..end].to_vec()
+        };
+        return build_items_page(state, user_id, &page, total, q.start_index).await;
+    }
+
+    let (items, total) = state
         .stores
-        .list()
+        .query(&mq)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let seed = effective_sort_seed(&q, user.0.id);
-    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
-    let filtered = filter_and_sort(scoped, &q, seed);
-    let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
-    let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
-    Ok(HttpResponse::Ok().json(dto))
+    let total = u32::try_from(total).unwrap_or(u32::MAX);
+    build_items_page(state, user_id, &items, total, q.start_index).await
+}
+
+/// How a `?ParentId=` resolved against the store / config.
+enum ParentResolution {
+    /// No parent restriction (absent / zero-guid placeholder).
+    All,
+    /// A typed [`pharos_core::ParentFilter`] for the SQL query.
+    Filter(pharos_core::ParentFilter),
+    /// A configured media root WITHOUT a typed-library entity row — scope by
+    /// component-boundary path prefix (test-only `with_media_roots` path).
+    PathPrefix(String),
+    /// LIB-C4 legacy fallback: the genre synth id matched no `item_genres`
+    /// row (un-backfilled), but a `probe.genre` token hashes to it. Scope by
+    /// the legacy probe-column genre name.
+    GenreProbe(String),
+    /// The id matched no known entity / synth key — render an empty library.
+    Empty,
+}
+
+/// LIB-B2 — resolve a `?ParentId=` to a [`ParentResolution`] WITHOUT loading
+/// the item set. Mirrors the branch order of the legacy `restrict_to_parent`:
+/// library → series → season → artist → album → genre → person → studio →
+/// collection → tag, falling to `Empty` for an unknown id. The synth
+/// series/season/artist/album ids are one-way hashes, so the matching
+/// folder/name is recovered by hashing the store's distinct candidate keys.
+async fn resolve_parent_filter(
+    state: &AppState,
+    parent_id: Option<&str>,
+) -> Result<ParentResolution, actix_web::Error> {
+    use crate::api::jellyfin::dto::{
+        album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
+    };
+    use pharos_core::{
+        CollectionStore, GenreStore, LibraryStore, ParentFilter, PersonStore, StudioStore, TagStore,
+    };
+    let Some(pid) = parent_id else {
+        return Ok(ParentResolution::All);
+    };
+    if pid.is_empty() || pid == "00000000000000000000000000000000" {
+        return Ok(ParentResolution::All);
+    }
+    let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+
+    // 1) Typed library entity by wire_id.
+    if let Some(lib) = state.libraries.iter().find(|l| l.wire_id == pid) {
+        if let Ok(ids) = state.stores.item_ids_for_library(&lib.wire_id).await {
+            if !ids.is_empty() {
+                return Ok(ParentResolution::Filter(ParentFilter::Library {
+                    wire_id: lib.wire_id.clone(),
+                }));
+            }
+        }
+        // No backfilled rows yet → path-prefix fallback against the root.
+        return Ok(ParentResolution::PathPrefix(lib.root_path.clone()));
+    }
+    // Legacy media-root (no typed-library entity) → path-prefix scope.
+    if let Some(root) = state
+        .media_roots
+        .iter()
+        .find(|r| library_id_for_root(r) == pid)
+    {
+        return Ok(ParentResolution::PathPrefix(
+            root.to_string_lossy().into_owned(),
+        ));
+    }
+
+    // 2) Series synth id → recover (folder, name) by hashing distinct keys.
+    let series_keys = state
+        .stores
+        .distinct_series_keys()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    for (folder, name) in &series_keys {
+        if series_id_for_key(folder.as_deref(), name) == pid {
+            return Ok(ParentResolution::Filter(ParentFilter::Series {
+                folder: folder.clone(),
+                name: name.clone(),
+            }));
+        }
+    }
+    // 3) Season synth id → recover (folder, name, season).
+    let season_keys = state
+        .stores
+        .distinct_season_keys()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    for (folder, name, season) in &season_keys {
+        if let Ok(season_u32) = u32::try_from(*season) {
+            if season_id_for_key(folder.as_deref(), name, season_u32) == pid {
+                return Ok(ParentResolution::Filter(ParentFilter::Season {
+                    folder: folder.clone(),
+                    name: name.clone(),
+                    season: season_u32,
+                }));
+            }
+        }
+    }
+    // 4) Artist synth id → recover the name.
+    let artists = state
+        .stores
+        .distinct_artist_names()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    for name in &artists {
+        if artist_id_for(name) == pid {
+            return Ok(ParentResolution::Filter(ParentFilter::Artist {
+                name: name.clone(),
+            }));
+        }
+    }
+    // 5) Album synth id → recover the name.
+    let albums = state
+        .stores
+        .distinct_album_names()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    for name in &albums {
+        if album_id_for(name) == pid {
+            return Ok(ParentResolution::Filter(ParentFilter::Album {
+                name: name.clone(),
+            }));
+        }
+    }
+
+    // 6-10) Entity wire-id pivots — the wire id IS the filter param, but we
+    // probe the join first so an id matching no row falls through to Empty
+    // (mirrors the legacy "non-empty ids" guard, except collections which
+    // resolve even when empty so a fresh box set browses cleanly).
+    if !state
+        .stores
+        .item_ids_for_genre(pid)
+        .await
+        .map_err(ise)?
+        .is_empty()
+    {
+        return Ok(ParentResolution::Filter(ParentFilter::Genre {
+            wire_id: pid.to_string(),
+        }));
+    }
+    // LIB-C4 legacy fallback: the entity join is empty (rows scanned before
+    // C4 + not backfilled), so resolve the genre NAME from the probe column
+    // by hashing each distinct `probe.genre` token and scope by it.
+    {
+        let fields = state
+            .stores
+            .distinct_genre_fields()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        for raw in &fields {
+            for token in pharos_core::split_genre_field(raw) {
+                if pharos_core::genre_wire_id(&token) == pid {
+                    return Ok(ParentResolution::GenreProbe(token));
+                }
+            }
+        }
+    }
+    if !state
+        .stores
+        .item_ids_for_person(pid)
+        .await
+        .map_err(ise)?
+        .is_empty()
+    {
+        return Ok(ParentResolution::Filter(ParentFilter::Person {
+            wire_id: pid.to_string(),
+        }));
+    }
+    if !state
+        .stores
+        .item_ids_for_studio(pid)
+        .await
+        .map_err(ise)?
+        .is_empty()
+    {
+        return Ok(ParentResolution::Filter(ParentFilter::Studio {
+            wire_id: pid.to_string(),
+        }));
+    }
+    // Collection resolves on existence (even when empty) so a freshly-created
+    // empty box set browses to an empty list rather than falling to Empty.
+    if state
+        .stores
+        .collection_by_wire_id(pid)
+        .await
+        .map_err(ise)?
+        .is_some()
+    {
+        return Ok(ParentResolution::Filter(ParentFilter::Collection {
+            wire_id: pid.to_string(),
+        }));
+    }
+    if !state
+        .stores
+        .item_ids_for_tag(pid)
+        .await
+        .map_err(ise)?
+        .is_empty()
+    {
+        return Ok(ParentResolution::Filter(ParentFilter::Tag {
+            wire_id: pid.to_string(),
+        }));
+    }
+
+    Ok(ParentResolution::Empty)
+}
+
+/// The sort key family the legacy `filter_and_sort` recognised. Anything not
+/// listed here falls to `SortName` (parity with the in-memory `_` arm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortPrimary {
+    None,
+    Random,
+    DateCreated,
+    Runtime,
+    AlbumArtist,
+    Album,
+    Name,
+}
+
+/// Map the raw `SortBy` to its [`SortPrimary`], replicating the legacy
+/// "first non-empty comma token, else SortName" rule and the exact set of
+/// tokens the in-memory `filter_and_sort` handled.
+fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
+    let raw = sort_by.unwrap_or("SortName");
+    let primary = raw
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("SortName");
+    match primary {
+        "None" | "Default" => SortPrimary::None,
+        "Random" => SortPrimary::Random,
+        "DateCreated" | "DateAdded" => SortPrimary::DateCreated,
+        "RuntimeTicks" | "Runtime" => SortPrimary::Runtime,
+        "AlbumArtist" => SortPrimary::AlbumArtist,
+        "Album" => SortPrimary::Album,
+        _ => SortPrimary::Name,
+    }
+}
+
+/// Translate the (already parent-resolved) `ListQuery` into a [`MediaQuery`].
+/// `force_unpaged` (the Random path) drops LIMIT/OFFSET so the caller can
+/// shuffle + page in memory. The sort chain reproduces the legacy
+/// stable-sort-then-conditional-reverse tiebreak semantics exactly (id is a
+/// unique final tiebreak, so the builder's appended `id ASC` is a harmless
+/// no-op after an explicit `Id DESC`).
+fn build_media_query(
+    user_id: UserId,
+    q: &ListQuery,
+    parent: &ParentResolution,
+    force_unpaged: bool,
+) -> pharos_core::MediaQuery {
+    use pharos_core::{MediaFilters, MediaQuery, SortDir, SortKey};
+
+    let mut mq = MediaQuery::default();
+
+    // Parent pivot. PathPrefix folds into the residual `MediaFilters` built
+    // below (see `path_prefix` there) — set the parent typed filter here.
+    if let ParentResolution::Filter(pf) = parent {
+        mq.parent = Some(pf.clone());
+    }
+
+    // IncludeItemTypes → kinds.
+    if let Some(types) = q.include_item_types.as_deref() {
+        let wanted: Vec<pharos_core::MediaKind> = types
+            .split(',')
+            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
+            .collect();
+        if !wanted.is_empty() {
+            mq.kinds = wanted;
+        }
+    }
+
+    // SearchTerm — case-insensitive substring on title.
+    if let Some(term) = q.search_term.as_deref() {
+        if !term.trim().is_empty() {
+            mq.search_term = Some(term.to_string());
+        }
+    }
+
+    // ?Tags= + user-data: applied in SQL on the normal (paged) path. On the
+    // Random path (`force_unpaged`) they are LEFT OUT here and applied in
+    // memory AFTER the shuffle, matching the legacy ordering (shuffle ran in
+    // `filter_and_sort` ahead of the tag + user-data filters).
+    if !force_unpaged {
+        // ?Tags= — entity-join AND across tags.
+        if let Some(raw) = q.tags.as_deref() {
+            let ids: Vec<String> = raw
+                .split(['|', ','])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(pharos_core::tag_wire_id)
+                .collect();
+            mq.tag_wire_ids = ids;
+        }
+
+        // User-data predicates (Filters + IsFavorite/IsPlayed shortcuts).
+        let mut udf = match q.filters.as_deref() {
+            Some(raw) => UserDataFilter::parse(raw),
+            None => UserDataFilter::default(),
+        };
+        if let Some(v) = q.is_favorite {
+            udf.is_favorite = Some(v);
+        }
+        if let Some(v) = q.is_played {
+            udf.is_played = Some(v);
+        }
+        if udf.is_active() {
+            mq.user_data = pharos_core::UserDataQuery {
+                user: Some(user_id),
+                is_favorite: udf.is_favorite,
+                is_played: udf.is_played,
+                is_resumable: udf.is_resumable,
+            };
+        }
+    }
+
+    // Residual chip filters.
+    let mut f = MediaFilters::default();
+    // Media-root ParentId without a typed-library entity → path-prefix scope.
+    if let ParentResolution::PathPrefix(p) = parent {
+        f.path_prefix = Some(p.clone());
+    }
+    // LIB-C4 legacy ParentId=genre fallback → token-membership in the
+    // probe.genre column (matches multi-genre strings like "Action, Sci-Fi").
+    if let ParentResolution::GenreProbe(token) = parent {
+        f.genre_probe_token = Some(token.clone());
+    }
+    if let Some(types) = q.exclude_item_types.as_deref() {
+        f.exclude_kinds = types
+            .split(',')
+            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
+            .collect();
+    }
+    if let Some(raw) = q.media_types.as_deref() {
+        let want_audio = raw
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("Audio"));
+        let want_video = raw
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("Video"));
+        let mut kinds: Vec<pharos_core::MediaKind> = Vec::new();
+        if want_audio {
+            kinds.push(pharos_core::MediaKind::Audio);
+        }
+        if want_video {
+            kinds.push(pharos_core::MediaKind::Movie);
+            kinds.push(pharos_core::MediaKind::Episode);
+        }
+        f.media_type_kinds = kinds;
+    }
+    f.has_subtitles = q.has_subtitles;
+    f.is_4k = q.is_4k;
+    f.is_hd = q.is_hd;
+    f.is_3d = q.is_3d;
+    f.min_width = q.min_width;
+    f.max_width = q.max_width;
+    f.min_index_number = q.min_index_number;
+    f.max_index_number = q.max_index_number;
+    f.name_starts_with = q
+        .name_starts_with
+        .clone()
+        .or_else(|| q.name_starts_with_or_greater.clone());
+    f.name_less_than = q.name_less_than.clone();
+    if let Some(raw) = q.ids.as_deref() {
+        f.ids_present = true;
+        f.ids = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| s.len() <= 20)
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+    }
+    if let Some(raw) = q.genres.as_deref() {
+        f.genre_probe_names = raw
+            .split(['|', ','])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    mq.filters = f;
+
+    // Sort chain — replicate the in-memory stable-sort + conditional reverse.
+    let primary = sort_primary(q.sort_by.as_deref());
+    let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
+    let collection_parent = matches!(
+        parent,
+        ParentResolution::Filter(pharos_core::ParentFilter::Collection { .. })
+    );
+    // A collection parent with no explicit SortBy keeps the curated order
+    // (the legacy `preserve_collection_order` set SortBy=None). The query
+    // builder already prepends the curated sort_order for a Collection pivot,
+    // so we leave `sort` empty in that case.
+    let effective_primary = if collection_parent && q.sort_by.is_none() {
+        SortPrimary::None
+    } else {
+        primary
+    };
+    mq.sort = match effective_primary {
+        SortPrimary::None | SortPrimary::Random => Vec::new(),
+        SortPrimary::Name => {
+            if descending {
+                vec![(SortKey::Name, SortDir::Desc), (SortKey::Id, SortDir::Desc)]
+            } else {
+                vec![(SortKey::Name, SortDir::Asc)]
+            }
+        }
+        SortPrimary::DateCreated => {
+            // Legacy baseline (ascending param) = created_at DESC, id DESC
+            // (newest-first); the Descending param reverses to ASC/ASC.
+            if descending {
+                vec![(SortKey::DateCreated, SortDir::Asc)]
+            } else {
+                vec![
+                    (SortKey::DateCreated, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            }
+        }
+        SortPrimary::Runtime => {
+            if descending {
+                vec![
+                    (SortKey::Runtime, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            } else {
+                vec![(SortKey::Runtime, SortDir::Asc)]
+            }
+        }
+        SortPrimary::AlbumArtist => {
+            if descending {
+                vec![
+                    (SortKey::AlbumArtist, SortDir::Desc),
+                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            } else {
+                vec![
+                    (SortKey::AlbumArtist, SortDir::Asc),
+                    (SortKey::Name, SortDir::Asc),
+                ]
+            }
+        }
+        SortPrimary::Album => {
+            if descending {
+                vec![
+                    (SortKey::Album, SortDir::Desc),
+                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            } else {
+                vec![
+                    (SortKey::Album, SortDir::Asc),
+                    (SortKey::Name, SortDir::Asc),
+                ]
+            }
+        }
+    };
+
+    // Pagination — SQL paginates unless the Random path needs the full set.
+    if force_unpaged {
+        mq.start_index = 0;
+        mq.limit = None;
+    } else {
+        mq.start_index = u64::from(q.start_index);
+        mq.limit = Some(q.limit);
+    }
+    mq
+}
+
+/// Build the `ItemsResultDto` for a resolved page of items: bulk user-data
+/// lookup, per-item DTO with trickplay, then parent-id fill. Mirrors the
+/// legacy `paginate` DTO assembly exactly (same field set, same order).
+async fn build_items_page(
+    state: &AppState,
+    user_id: UserId,
+    page: &[MediaItem],
+    total: u32,
+    start_index: u32,
+) -> Result<ItemsResultDto, actix_web::Error> {
+    let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user_id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut items: Vec<BaseItemDto> = page
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
+        })
+        .collect();
+    let refs: Vec<&MediaItem> = page.iter().collect();
+    fill_parent_ids(state, &mut items, &refs);
+    Ok(ItemsResultDto {
+        items,
+        total_record_count: total,
+        start_index,
+    })
 }
 
 /// Returns the seed used for `SortBy=Random`. When the client passes
@@ -2179,6 +2791,28 @@ async fn fetch_item_dto(
     // a series_index lands.
     if let Some(view) = synth_series_or_season(state, id_str).await? {
         return Ok(HttpResponse::Ok().json(view));
+    }
+    // LIB-C5 — a collection wire id (32-hex) resolves to its BoxSet
+    // BaseItemDto so `/Items/{id}` on a box set returns the folder item
+    // (jellyfin-web fetches the BoxSet before listing its members via
+    // ParentId). Checked before the numeric parse since the wire id isn't
+    // a media-item store id.
+    {
+        use pharos_core::CollectionStore;
+        if let Some(collection) = state
+            .stores
+            .collection_by_wire_id(id_str)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        {
+            let count = state
+                .stores
+                .collection_items(id_str)
+                .await
+                .map(|m| m.len() as u32)
+                .unwrap_or(0);
+            return Ok(HttpResponse::Ok().json(collection_dto(state, &collection, count)));
+        }
     }
     let id: u64 = id_str
         .parse()

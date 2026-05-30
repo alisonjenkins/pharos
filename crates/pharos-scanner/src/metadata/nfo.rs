@@ -242,6 +242,12 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
     // the first `<value>` inside `<ratings>` as community_rating if a flat
     // `<rating>` wasn't already seen.
     let mut in_ratings = false;
+    // LIB-C5 — Jellyfin/Kodi write box-set membership two ways: a flat
+    // `<set>Name</set>` (text on the element) or a nested
+    // `<set><name>Name</name></set>`. Track whether we're inside a <set>
+    // so the nested `<name>` routes to collections (outside <set> a bare
+    // `<name>` has no top-level meaning).
+    let mut in_set = false;
     let mut buf = Vec::new();
 
     loop {
