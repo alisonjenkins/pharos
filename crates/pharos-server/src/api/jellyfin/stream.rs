@@ -509,6 +509,7 @@ mod tests {
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         }
     }
 

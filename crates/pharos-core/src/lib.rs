@@ -24,7 +24,10 @@ pub type MediaId = u64;
 /// import-then-sweep churn. Persisted raw (no encoding) as a BLOB/BYTEA.
 pub type Fingerprint = [u8; 8];
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// Note: no `Eq` — `MediaMetadata` carries `f32` ratings (which are not
+// `Eq`). `MediaItem` is only ever a HashMap *value* (keyed by MediaId),
+// never a key, so `PartialEq` suffices for the round-trip assertions.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaItem {
     pub id: MediaId,
     pub path: PathBuf,

@@ -1118,6 +1118,7 @@ mod tests {
                 probe,
                 series: None,
                 created_at: None,
+                metadata: Default::default(),
             })
             .await
             .unwrap();
@@ -1272,6 +1273,7 @@ mod tests {
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         }
     }
 

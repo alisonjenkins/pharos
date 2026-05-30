@@ -49,6 +49,7 @@ async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();
@@ -157,6 +158,7 @@ async fn playback_info_emits_zero_when_no_user_data_row_exists() {
             probe: MediaProbe::default(),
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();

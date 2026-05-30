@@ -605,6 +605,10 @@ impl<P: Prober> FsScanner<P> {
                     // None preserves the original `created_at` on
                     // rescan via the COALESCE in put().
                     created_at: None,
+                    // LIB-C7/C8/C9 — descriptive metadata is enriched by
+                    // a later EPIC D pass; the scanner emits an empty
+                    // block today.
+                    metadata: Default::default(),
                 })
             }
             Err(err) => {
@@ -1167,7 +1171,10 @@ mod tests {
             };
             Ok(ProbeInfo {
                 kind,
-                probe: Default::default(),
+                probe: pharos_core::MediaProbe {
+                    genre: self.genre.clone(),
+                    ..Default::default()
+                },
             })
         }
     }
@@ -1234,6 +1241,7 @@ mod tests {
         let prober = FakeProber {
             calls: Arc::new(AtomicUsize::new(0)),
             force_fail_for: Some("bad".into()),
+            genre: None,
         };
         let s = FsScanner::new(prober.clone());
         let items = s.scan(td.path()).await.unwrap();
@@ -1680,6 +1688,7 @@ mod tests {
         let prober = FakeProber {
             calls: Arc::new(AtomicUsize::new(0)),
             force_fail_for: Some("bad".into()),
+            genre: None,
         };
         let s = FsScanner::new(prober.clone()).with_probe_concurrency(4);
         let store = MemStore::default();

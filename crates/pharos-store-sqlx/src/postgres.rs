@@ -28,7 +28,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     audio_channels, sample_rate, series_name, season_number, episode_number, \
     subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
-    audio_tracks_json";
+    audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
+    premiere_date, overview, tagline, provider_ids, series_folder, series_year";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -187,10 +188,14 @@ impl MediaStore for PostgresStore {
                 artist, album, album_artist, genre, created_at, chapters_json, \
                 video_profile, video_level, \
                 pixel_format, color_primaries, color_transfer, color_space, \
-                audio_tracks_json) \
+                audio_tracks_json, \
+                community_rating, critic_rating, official_rating, production_year, \
+                premiere_date, overview, tagline, provider_ids, \
+                series_folder, series_year) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
-                     $28, $29, $30, $31, $32)
+                     $28, $29, $30, $31, $32, \
+                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             kind = EXCLUDED.kind,
@@ -221,6 +226,16 @@ impl MediaStore for PostgresStore {
                                             color_transfer = EXCLUDED.color_transfer,
                                             color_space = EXCLUDED.color_space,
                                             audio_tracks_json = EXCLUDED.audio_tracks_json,
+                                            community_rating = EXCLUDED.community_rating,
+                                            critic_rating = EXCLUDED.critic_rating,
+                                            official_rating = EXCLUDED.official_rating,
+                                            production_year = EXCLUDED.production_year,
+                                            premiere_date = EXCLUDED.premiere_date,
+                                            overview = EXCLUDED.overview,
+                                            tagline = EXCLUDED.tagline,
+                                            provider_ids = EXCLUDED.provider_ids,
+                                            series_folder = EXCLUDED.series_folder,
+                                            series_year = EXCLUDED.series_year,
                                             created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
@@ -255,6 +270,16 @@ impl MediaStore for PostgresStore {
         .bind(p.color_transfer.as_deref())
         .bind(p.color_space.as_deref())
         .bind(crate::audio_track_json::encode(&p.audio_tracks))
+        .bind(m.community_rating)
+        .bind(m.critic_rating)
+        .bind(m.official_rating.as_deref())
+        .bind(m.production_year.map(|v| v as i32))
+        .bind(m.premiere_date)
+        .bind(m.overview.as_deref())
+        .bind(m.tagline.as_deref())
+        .bind(provider_ids_json)
+        .bind(series_folder)
+        .bind(series_year.map(|v| v as i32))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -742,6 +767,16 @@ struct MediaRow {
     color_transfer: Option<String>,
     color_space: Option<String>,
     audio_tracks_json: Option<String>,
+    community_rating: Option<f32>,
+    critic_rating: Option<f32>,
+    official_rating: Option<String>,
+    production_year: Option<i32>,
+    premiere_date: Option<i64>,
+    overview: Option<String>,
+    tagline: Option<String>,
+    provider_ids: Option<String>,
+    series_folder: Option<String>,
+    series_year: Option<i32>,
 }
 
 impl MediaRow {
@@ -784,7 +819,19 @@ impl MediaRow {
             series_name: name,
             season_number: self.season_number.and_then(|v| u32::try_from(v).ok()),
             episode_number: self.episode_number.and_then(|v| u32::try_from(v).ok()),
+            series_folder: self.series_folder,
+            series_year: self.series_year.and_then(|v| u32::try_from(v).ok()),
         });
+        let metadata = MediaMetadata {
+            community_rating: self.community_rating,
+            critic_rating: self.critic_rating,
+            official_rating: self.official_rating,
+            production_year: self.production_year.and_then(|v| u32::try_from(v).ok()),
+            premiere_date: self.premiere_date,
+            overview: self.overview,
+            tagline: self.tagline,
+            provider_ids: crate::provider_ids_json::decode(self.provider_ids.as_deref()),
+        };
         Ok(MediaItem {
             id,
             path: self.path.into(),
@@ -793,6 +840,7 @@ impl MediaRow {
             probe,
             series,
             created_at: self.created_at,
+            metadata,
         })
     }
 }

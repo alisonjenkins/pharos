@@ -291,6 +291,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
             probe,
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();
@@ -596,6 +597,7 @@ async fn episode_dto_carries_series_id_and_season_id() {
                 series_name: "My Show".into(),
                 season_number: Some(2),
                 episode_number: Some(7),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -646,6 +648,7 @@ async fn get_item_by_series_id_returns_series_dto() {
                 series_name: "Other Show".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -722,6 +725,7 @@ async fn list_items_filters_by_series_id() {
                     series_name: show.to_string(),
                     season_number: Some(1),
                     episode_number: Some(ep_num),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
@@ -845,6 +849,7 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
                     series_name: show.into(),
                     season_number: Some(season),
                     episode_number: Some(ep),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
@@ -1243,6 +1248,7 @@ async fn items_similar_scores_by_series_then_genre() {
                 series_name: "My Show".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -1259,6 +1265,7 @@ async fn items_similar_scores_by_series_then_genre() {
                 series_name: "My Show".into(),
                 season_number: Some(1),
                 episode_number: Some(2),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -1276,6 +1283,7 @@ async fn items_similar_scores_by_series_then_genre() {
                 series_name: "Other Show".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -1340,6 +1348,7 @@ async fn items_counts_aggregates_by_kind_and_distinct_names() {
                 series_name: "Show".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
+                ..Default::default()
             }),
             ..Default::default()
         })

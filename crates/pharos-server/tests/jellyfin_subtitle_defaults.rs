@@ -42,6 +42,7 @@ async fn seed(tracks: Vec<SubtitleTrack>) -> (web::Data<AppState>, String) {
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();

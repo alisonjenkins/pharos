@@ -257,6 +257,32 @@ pub struct BaseItemDto {
     /// playback paths on capable displays.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_range: Option<&'static str>,
+    // LIB-C7/C8/C9 — descriptive metadata projected from
+    // `MediaItem.metadata`. All `Option`/array fields are
+    // `skip_serializing_if`-guarded so the wire shape is unchanged when
+    // the data is absent (existing /Items golden shape stays intact).
+    /// C8 — long-form synopsis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    /// C8 — Jellyfin uses an array; carries the single tagline or stays
+    /// empty. Emitted only when non-empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub taglines: Vec<String>,
+    /// C7 — audience rating (0–10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_rating: Option<f32>,
+    /// C7 — critic rating (0–100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critic_rating: Option<f32>,
+    /// C7 — parental rating string, e.g. "PG-13".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_rating: Option<String>,
+    /// C7 — release year.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<u32>,
+    /// C7 — premiere/air date as ISO-8601 (from unix-secs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premiere_date: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -609,7 +635,7 @@ impl BaseItemDto {
             studios: vec![],
             people: vec![],
             production_locations: vec![],
-            provider_ids: serde_json::Map::new(),
+            provider_ids: provider_ids_map(&item.metadata.provider_ids),
             remote_trailers: vec![],
             chapters: item
                 .probe
@@ -661,8 +687,41 @@ impl BaseItemDto {
             } else {
                 None
             },
+            // LIB-C7/C8/C9 — descriptive metadata projection. Absent
+            // values stay None / empty so the wire shape is unchanged
+            // for un-enriched items.
+            overview: item.metadata.overview.clone(),
+            taglines: item.metadata.tagline.iter().cloned().collect(),
+            community_rating: item.metadata.community_rating,
+            critic_rating: item.metadata.critic_rating,
+            official_rating: item.metadata.official_rating.clone(),
+            // LIB-C11 — fall back to the series folder's parsed year so
+            // same-name shows (Cosmos 1980 vs 2014) are distinguishable
+            // even before per-episode metadata enrichment (EPIC D).
+            production_year: item
+                .metadata
+                .production_year
+                .or_else(|| item.series.as_ref().and_then(|s| s.series_year)),
+            premiere_date: item.metadata.premiere_date.map(format_iso8601),
         }
     }
+}
+
+/// LIB-C9 — project core [`ProviderIds`](pharos_core::ProviderIds) into
+/// the Jellyfin `ProviderIds` map under canonical provider keys. Absent
+/// ids are omitted so the map is empty when nothing is known.
+fn provider_ids_map(ids: &pharos_core::ProviderIds) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    let mut insert = |key: &str, val: &Option<String>| {
+        if let Some(v) = val {
+            map.insert(key.to_string(), serde_json::Value::String(v.clone()));
+        }
+    };
+    insert("Tmdb", &ids.tmdb);
+    insert("Tvdb", &ids.tvdb);
+    insert("Imdb", &ids.imdb);
+    insert("MusicBrainzTrack", &ids.mbid);
+    map
 }
 
 /// Advertise the image roles ImageCache can produce for this item.
@@ -1036,6 +1095,136 @@ pub fn build_media_streams_with_subtitles(
 mod tests {
     use super::*;
     use pharos_core::MediaProbe;
+
+    #[test]
+    fn metadata_fields_project_into_dto_when_set() {
+        // LIB-C7/C8/C9 — populated descriptive metadata must surface on
+        // the wire under the Jellyfin field names.
+        use pharos_core::{MediaItem, MediaKind, MediaMetadata, ProviderIds};
+        let item = MediaItem {
+            id: 1,
+            path: "/m/a.mkv".into(),
+            title: "A".into(),
+            kind: MediaKind::Movie,
+            metadata: MediaMetadata {
+                community_rating: Some(8.7),
+                critic_rating: Some(83.0),
+                official_rating: Some("R".into()),
+                production_year: Some(1999),
+                premiere_date: Some(922_060_800),
+                overview: Some("synopsis".into()),
+                tagline: Some("a tagline".into()),
+                provider_ids: ProviderIds {
+                    tmdb: Some("603".into()),
+                    imdb: Some("tt0133093".into()),
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        let dto = BaseItemDto::from_domain(&item, "srv");
+        let v = serde_json::to_value(&dto).unwrap();
+        assert_eq!(v["Overview"], "synopsis");
+        assert_eq!(v["Taglines"], serde_json::json!(["a tagline"]));
+        // f32 → JSON widens to f64; compare with tolerance.
+        assert!((v["CommunityRating"].as_f64().unwrap() - 8.7).abs() < 1e-4);
+        assert!((v["CriticRating"].as_f64().unwrap() - 83.0).abs() < 1e-4);
+        assert_eq!(v["OfficialRating"], "R");
+        assert_eq!(v["ProductionYear"], 1999);
+        assert!(v["PremiereDate"].as_str().unwrap().starts_with("1999-03-"));
+        assert_eq!(v["ProviderIds"]["Tmdb"], "603");
+        assert_eq!(v["ProviderIds"]["Imdb"], "tt0133093");
+        assert!(v["ProviderIds"].get("Tvdb").is_none());
+    }
+
+    #[test]
+    fn metadata_fields_absent_when_none() {
+        // The un-enriched path: every C7/C8 field is omitted from the
+        // wire (preserving the existing /Items golden shape). ProviderIds
+        // stays an empty object.
+        use pharos_core::{MediaItem, MediaKind};
+        let item = MediaItem {
+            id: 2,
+            path: "/m/b.mkv".into(),
+            title: "B".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        let dto = BaseItemDto::from_domain(&item, "srv");
+        let v = serde_json::to_value(&dto).unwrap();
+        for key in [
+            "Overview",
+            "Taglines",
+            "CommunityRating",
+            "CriticRating",
+            "OfficialRating",
+            "ProductionYear",
+            "PremiereDate",
+        ] {
+            assert!(v.get(key).is_none(), "{key} must be absent when None");
+        }
+        assert_eq!(v["ProviderIds"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn same_name_shows_in_distinct_folders_get_distinct_wire_ids() {
+        // LIB-C11 — two episodes of same-name shows in different folders
+        // must project to DIFFERENT SeriesId/SeasonId so jellyfin-web
+        // doesn't interleave them, and each carries its own year.
+        use pharos_core::{MediaItem, MediaKind, SeriesInfo};
+        let mk = |folder: &str, year: u32| MediaItem {
+            id: 1,
+            path: format!("{folder}/Season 01/S01E01.mkv").into(),
+            title: "Cosmos".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Cosmos".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some(folder.into()),
+                series_year: Some(year),
+            }),
+            ..Default::default()
+        };
+        let a = BaseItemDto::from_domain(&mk("/tv/Cosmos (1980)", 1980), "srv");
+        let b = BaseItemDto::from_domain(&mk("/tv/Cosmos (2014)", 2014), "srv");
+
+        // Same display name…
+        assert_eq!(a.series_name, b.series_name);
+        // …distinct folder-keyed Series/Season ids.
+        assert!(a.series_id.is_some());
+        assert_ne!(a.series_id, b.series_id);
+        assert_ne!(a.season_id, b.season_id);
+        assert_ne!(a.parent_id, b.parent_id); // ParentId = SeasonId here.
+
+        // The folder-keyed id equals the standalone helper output…
+        assert_eq!(
+            a.series_id.as_deref(),
+            Some(series_id_for_key(Some("/tv/Cosmos (1980)"), "Cosmos").as_str())
+        );
+        // …and differs from the legacy name-only id (proving the fix).
+        assert_ne!(
+            a.series_id.as_deref(),
+            Some(series_id_for("Cosmos").as_str())
+        );
+
+        // Year flows into ProductionYear so clients can disambiguate.
+        let av = serde_json::to_value(&a).unwrap();
+        let bv = serde_json::to_value(&b).unwrap();
+        assert_eq!(av["ProductionYear"], 1980);
+        assert_eq!(bv["ProductionYear"], 2014);
+    }
+
+    #[test]
+    fn legacy_series_id_helpers_unchanged_with_no_folder() {
+        // LIB-C11 — passing None must be byte-identical to the legacy
+        // name-only helpers so pre-backfill client URLs keep resolving.
+        assert_eq!(series_id_for_key(None, "Cosmos"), series_id_for("Cosmos"));
+        assert_eq!(
+            season_id_for_key(None, "Cosmos", 1),
+            season_id_for("Cosmos", 1)
+        );
+    }
 
     #[test]
     fn container_for_prefers_webm_alias_over_matroska() {
