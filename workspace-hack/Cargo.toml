@@ -34,7 +34,6 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 itertools = { version = "0.10" }
-libc = { version = "0.2" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -81,7 +80,6 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 itertools = { version = "0.10" }
-libc = { version = "0.2" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -115,6 +113,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -122,6 +121,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -130,6 +130,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -137,6 +138,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -145,6 +147,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -152,6 +155,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -160,6 +164,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
@@ -167,6 +172,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
