@@ -373,18 +373,24 @@ async fn send_outbound(session: &mut Session, msg: &Outbound) -> Result<(), acti
 /// jellyfin-web expects when it subscribes via Sessions/LibraryChanged.
 pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
     match b {
-        SocketBroadcast::LibraryChanged => Some(Outbound::new(
-            "LibraryChanged",
-            serde_json::json!({
-                "FoldersAddedTo": [],
-                "FoldersRemovedFrom": [],
-                "ItemsAdded": [],
-                "ItemsRemoved": [],
-                "ItemsUpdated": [],
-                "CollectionFolders": [],
-                "IsEmpty": false,
-            }),
-        )),
+        SocketBroadcast::LibraryChanged { added, removed } => {
+            // LIB-A4 — surface the scan deltas in the arrays jellyfin-web
+            // reads to refresh surgically. `IsEmpty` mirrors Jellyfin: true
+            // only when nothing at all changed (a bare cache-bust hint).
+            let is_empty = added.is_empty() && removed.is_empty();
+            Some(Outbound::new(
+                "LibraryChanged",
+                serde_json::json!({
+                    "FoldersAddedTo": [],
+                    "FoldersRemovedFrom": [],
+                    "ItemsAdded": added,
+                    "ItemsRemoved": removed,
+                    "ItemsUpdated": [],
+                    "CollectionFolders": [],
+                    "IsEmpty": is_empty,
+                }),
+            ))
+        }
         SocketBroadcast::UserDataChanged { user_id, item_id } => Some(Outbound::new(
             "UserDataChanged",
             serde_json::json!({
@@ -475,7 +481,11 @@ mod tests {
 
     #[test]
     fn translate_library_changed_emits_libchanged_outbound() {
-        let out = translate_broadcast(SocketBroadcast::LibraryChanged).unwrap();
+        let out = translate_broadcast(SocketBroadcast::LibraryChanged {
+            added: Vec::new(),
+            removed: Vec::new(),
+        })
+        .unwrap();
         assert_eq!(out.message_type, "LibraryChanged");
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
@@ -483,6 +493,24 @@ mod tests {
         // Jellyfin's LibraryChanged payload exposes these arrays even when empty.
         assert!(v["Data"]["ItemsUpdated"].is_array());
         assert!(v["Data"]["ItemsAdded"].is_array());
+        // A bare hint (no deltas) reports IsEmpty = true.
+        assert_eq!(v["Data"]["IsEmpty"], true);
+    }
+
+    #[test]
+    fn translate_library_changed_carries_scan_deltas() {
+        // LIB-A4 — a scan's added/removed ids land in the wire arrays
+        // jellyfin-web reads to refresh surgically.
+        let out = translate_broadcast(SocketBroadcast::LibraryChanged {
+            added: vec!["10".into(), "20".into()],
+            removed: vec!["30".into()],
+        })
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["ItemsAdded"], serde_json::json!(["10", "20"]));
+        assert_eq!(v["Data"]["ItemsRemoved"], serde_json::json!(["30"]));
+        assert_eq!(v["Data"]["IsEmpty"], false);
     }
 
     #[test]

@@ -390,13 +390,27 @@ async fn library_refresh(
     actix_web::rt::spawn(async move {
         let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
             .with_rate_limit_ms(state.scan_rate_limit_ms);
+        // LIB-A4 — accumulate the per-root deltas so the post-scan broadcast
+        // can hand connected clients the exact ItemsAdded / ItemsRemoved ids.
+        let mut added: Vec<pharos_core::MediaId> = Vec::new();
+        let mut removed: Vec<pharos_core::MediaId> = Vec::new();
         for root in &state.media_roots {
             match scanner.scan_into(root, &state.stores).await {
-                Ok(n) => tracing::info!(
-                    root = %root.display(),
-                    imported = n,
-                    "library refresh: root scanned"
-                ),
+                Ok(outcome) => {
+                    tracing::info!(
+                        root = %root.display(),
+                        added = outcome.added.len(),
+                        updated = outcome.updated.len(),
+                        removed = outcome.removed.len(),
+                        skipped = outcome.skipped,
+                        "library refresh: root scanned"
+                    );
+                    added.extend(outcome.added.iter().copied());
+                    // An in-place update also invalidates client caches; relay
+                    // it as an add so jellyfin-web re-fetches the changed item.
+                    added.extend(outcome.updated.iter().copied());
+                    removed.extend(outcome.removed.iter().copied());
+                }
                 Err(e) => tracing::warn!(
                     root = %root.display(),
                     error = %e,
@@ -404,7 +418,7 @@ async fn library_refresh(
                 ),
             }
         }
-        state.notify_library_changed();
+        state.notify_library_delta(&added, &removed);
     });
     Ok(HttpResponse::NoContent().finish())
 }

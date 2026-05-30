@@ -8,10 +8,16 @@ publish.workspace = true
 
 [dependencies]
 pharos-core = { path = "../pharos-core" }
+# LIB-A5 — bounded-concurrency probe stream (`buffer_unordered`).
+futures-util = "0.3"
 # P48 — optional in-process libav prober. Routes the per-file scan probe
 # through the persistent libav worker pool instead of forking ffprobe.
 # Enabled via the `libav-probe` feature (the server turns it on).
 pharos-transcode = { path = "../pharos-transcode", optional = true, default-features = false, features = ["backend-lib"] }
+# LIB-A8 — filesystem watcher (optional). Pure-Rust cross-platform fs
+# notification (inotify / kqueue / ReadDirectoryChangesW). Pulled in only
+# behind the `watch` feature so the default build stays lean.
+notify = { version = "8", optional = true }
 serde = { workspace = true }
 sonic-rs.workspace = true
 thiserror.workspace = true
@@ -21,9 +27,19 @@ walkdir.workspace = true
 xxhash-rust.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
+# LIB-A9 — `statfs(2)` the filesystem behind each media root to decide whether
+# native watching is viable (network/fuse mounts can't deliver events → poll
+# fallback). Linux-only syscall; the crate compiles everywhere (non-Linux
+# returns `Unknown`). libc is already in the workspace graph.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 # Route probing through the in-process libav worker pool.
 libav-probe = ["dep:pharos-transcode"]
+# LIB-A8 — filesystem watcher (incremental update on create/modify/remove).
+# Off by default; the server opts in (A9 wires it + the poll fallback).
+watch = ["dep:notify", "tokio/sync", "tokio/time"]
 
 [dev-dependencies]
 criterion = { workspace = true }

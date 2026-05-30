@@ -54,7 +54,6 @@ async fn main() -> Result<(), AppError> {
 }
 
 async fn scan(cfg: &Config) -> Result<(), AppError> {
-    use pharos_core::{MediaStore, Scanner};
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     use pharos_scanner::FfmpegProber;
     use pharos_scanner::FsScanner;
@@ -81,31 +80,37 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let mut total_imported: u64 = 0;
-    let mut total_skipped: u64 = 0;
+    // LIB-A4 — drive the incremental `scan_into` path so the CLI gets the
+    // structured outcome (added/updated/removed/skipped) plus the same
+    // skip-unchanged + deletion-reconciliation behaviour the admin refresh
+    // already uses, then print a per-run summary.
+    let mut total_added: usize = 0;
+    let mut total_updated: usize = 0;
+    let mut total_removed: usize = 0;
+    let mut total_skipped: usize = 0;
     for root in &cfg.media.roots {
         writeln!(lock, "scanning {}…", root.display())?;
-        match scanner.scan(root.as_path()).await {
-            Ok(items) => {
-                let n = items.len();
-                for item in items {
-                    let id = item.id;
-                    let path = item.path.clone();
-                    if let Err(e) = stores.put(item).await {
-                        writeln!(lock, "  put id={id} path={} err={e}", path.display())?;
-                        total_skipped += 1;
-                    } else {
-                        total_imported += 1;
-                    }
-                }
-                writeln!(lock, "  {n} items probed")?;
+        match scanner.scan_into(root.as_path(), &stores).await {
+            Ok(outcome) => {
+                writeln!(
+                    lock,
+                    "  added={} updated={} removed={} skipped={}",
+                    outcome.added.len(),
+                    outcome.updated.len(),
+                    outcome.removed.len(),
+                    outcome.skipped,
+                )?;
+                total_added += outcome.added.len();
+                total_updated += outcome.updated.len();
+                total_removed += outcome.removed.len();
+                total_skipped += outcome.skipped;
             }
             Err(e) => writeln!(lock, "  scan failed: {e}")?,
         }
     }
     writeln!(
         lock,
-        "scan complete: imported={total_imported} skipped(conflict)={total_skipped}",
+        "scan complete: added={total_added} updated={total_updated} removed={total_removed} skipped={total_skipped}",
     )?;
     Ok(())
 }
@@ -429,6 +434,39 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     let app_state = web::Data::new(state);
+
+    // LIB-A9 — tiered library change-detection. Each media root picks the best
+    // mode it can sustain (native watch on a local fs when the `watch` feature
+    // is built + enabled; periodic incremental rescan on network/fuse roots or
+    // when watch is off; manual /Library/Refresh as the floor). Deltas
+    // broadcast to /socket via the same A4 mechanism the manual refresh uses.
+    // The guards keep native watches alive for the process lifetime.
+    let _library_watch_guards = {
+        use pharos_server::library_watch::{spawn_for_roots, WatchConfig};
+        let watch_cfg = WatchConfig {
+            watch_enabled: cfg.server.library_watch_enabled,
+            poll_interval: std::time::Duration::from_secs(cfg.server.library_poll_interval_secs),
+            rate_limit_ms: cfg.server.scan_rate_limit_ms,
+        };
+        let rate_limit_ms = cfg.server.scan_rate_limit_ms;
+        // P48 — same prober selection as the CLI scan + admin refresh paths.
+        // The closure builds a fresh owned scanner per root (each spawned task
+        // owns its own — the prober isn't required to be Clone).
+        let make_scanner = move || {
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            {
+                pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+                    .with_rate_limit_ms(rate_limit_ms)
+            }
+            #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+            {
+                pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+                    .with_rate_limit_ms(rate_limit_ms)
+            }
+        };
+        spawn_for_roots(app_state.clone(), &cfg.media.roots, watch_cfg, make_scanner)
+    };
+
     let group_registry = web::Data::new(GroupRegistry::spawn());
     let token_resolver_data = web::Data::new(token_resolver);
 

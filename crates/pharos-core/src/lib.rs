@@ -15,6 +15,15 @@ use std::path::PathBuf;
 
 pub type MediaId = u64;
 
+/// LIB-A6 — content fingerprint: a raw 8-byte digest of a file's bytes
+/// (size + probed duration + head/tail content), computed by the scanner
+/// (the hash itself is IO and lives in `pharos-scanner`, never here — V12).
+/// Unlike the path-derived [`stable_id`](MediaItem::id), a fingerprint
+/// survives a rename/move because it depends only on content, so the
+/// scanner can recognise a moved file as the same item instead of
+/// import-then-sweep churn. Persisted raw (no encoding) as a BLOB/BYTEA.
+pub type Fingerprint = [u8; 8];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaItem {
     pub id: MediaId,
@@ -291,6 +300,33 @@ pub struct ScanState {
     pub last_seen_scan_id: i64,
 }
 
+/// LIB-A4 — structured result of an incremental scan. Replaces the bare
+/// `usize` probed-count `scan_into` used to return so callers can broadcast
+/// content deltas to connected clients and print richer CLI summaries.
+///
+/// `added` / `updated` / `removed` carry the affected [`MediaId`]s; `skipped`
+/// is the count of unchanged files whose probe was elided (no ids retained —
+/// they're noise for a delta broadcast). Invariants:
+/// - `added`   — files inserted for the first time this run.
+/// - `updated` — existing rows re-probed because their fs signature changed.
+/// - `removed` — rows swept because the backing file vanished from disk.
+/// - `skipped` — unchanged files (`mark_seen` only, probe skipped).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub added: Vec<MediaId>,
+    pub updated: Vec<MediaId>,
+    pub removed: Vec<MediaId>,
+    pub skipped: usize,
+}
+
+impl ScanOutcome {
+    /// Total rows touched (probed+stored) this run — the legacy `usize`
+    /// `scan_into` returned, i.e. `added + updated`. Skipped/removed excluded.
+    pub fn probed(&self) -> usize {
+        self.added.len() + self.updated.len()
+    }
+}
+
 pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
@@ -342,6 +378,40 @@ pub trait MediaStore: Send + Sync {
         scan_id: i64,
         items_seen: i64,
         items_swept: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// LIB-A6 — find the first `media_items` row whose stored content
+    /// [`Fingerprint`] equals `fp`, or `None` when no row carries that
+    /// fingerprint (including rows predating migration 0017 whose column
+    /// is NULL). "First" is by ascending id for determinism. Lets the
+    /// scanner recognise a moved/renamed file (whose path-derived id
+    /// changed) by its stable content digest.
+    fn find_by_fp(
+        &self,
+        fp: Fingerprint,
+    ) -> impl std::future::Future<Output = DomainResult<Option<MediaItem>>> + Send;
+
+    /// LIB-A6 — persist the content fingerprint for `id`. Dedicated
+    /// setter (rather than widening `put`) so the scanner can stamp the
+    /// fingerprint independently of the probe-write path. No-op (zero
+    /// rows) when the id is absent, mirroring [`mark_seen`](Self::mark_seen).
+    fn set_fingerprint(
+        &self,
+        id: MediaId,
+        fp: Fingerprint,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// LIB-A7 — rebind an existing row to a new `path`, keeping its `id`
+    /// (and therefore every `user_data` FK / watch-history row hung off
+    /// it). Used by the scanner's move/rename detection: a file recognised
+    /// by content [`Fingerprint`] under a new path has its row's `path`
+    /// column repointed in place rather than being swept + re-inserted
+    /// under a fresh path-derived id. No-op (zero rows) when the id is
+    /// absent, mirroring [`mark_seen`](Self::mark_seen).
+    fn rebind_path(
+        &self,
+        id: MediaId,
+        new_path: &std::path::Path,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 

@@ -58,6 +58,11 @@ ffmpeg-lib = [
     "pharos-cache/ffmpeg-lib",
     "pharos-scanner/libav-probe",
 ]
+# LIB-A9 — enable native filesystem watching for the library (the highest
+# change-detection tier). Off by default; turns on the scanner's `watch`
+# feature (pulls in `notify`). With it off, library change-detection still
+# works via the periodic incremental rescan + manual /Library/Refresh.
+watch = ["pharos-scanner/watch"]
 
 [dev-dependencies]
 actix-test = "0.1"

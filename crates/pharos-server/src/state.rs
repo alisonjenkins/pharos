@@ -26,7 +26,15 @@ pub enum SocketBroadcast {
     /// Library content changed (item added/updated/removed).
     /// jellyfin-web treats this as a hint to invalidate its item
     /// cache and refresh visible views.
-    LibraryChanged,
+    ///
+    /// LIB-A4 — carries the affected item ids (rendered as the decimal
+    /// strings clients use as Jellyfin item ids) so the wire payload can
+    /// populate `ItemsAdded` / `ItemsRemoved`. Both empty is still valid
+    /// (a generic "something changed" hint, e.g. an image upload).
+    LibraryChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
     /// Per-user item state changed (played, favourite, position).
     /// Carries the originating user + item so receivers can ignore
     /// updates that don't apply to them.
@@ -273,7 +281,27 @@ impl AppState {
     /// No-op when there are zero subscribers (broadcast::send returns
     /// Err but we don't care).
     pub fn notify_library_changed(&self) {
-        let _ = self.bus.send(SocketBroadcast::LibraryChanged);
+        let _ = self.bus.send(SocketBroadcast::LibraryChanged {
+            added: Vec::new(),
+            removed: Vec::new(),
+        });
+    }
+
+    /// LIB-A4 — fire a `LibraryChanged` event carrying the item-id deltas
+    /// from a scan so connected `/socket` clients can surgically refresh
+    /// (ItemsAdded / ItemsRemoved) rather than invalidating their whole
+    /// cache. `added` / `removed` are the [`pharos_core::MediaId`]s the
+    /// scan produced, rendered as the decimal strings clients use as
+    /// Jellyfin item ids. No-op when there are zero subscribers.
+    pub fn notify_library_delta(
+        &self,
+        added: &[pharos_core::MediaId],
+        removed: &[pharos_core::MediaId],
+    ) {
+        let _ = self.bus.send(SocketBroadcast::LibraryChanged {
+            added: added.iter().map(|id| id.to_string()).collect(),
+            removed: removed.iter().map(|id| id.to_string()).collect(),
+        });
     }
 
     /// Fire a `UserDataChanged` event scoped to one user + item.
