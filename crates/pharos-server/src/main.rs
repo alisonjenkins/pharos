@@ -349,10 +349,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let libav_pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
+        let image_cache =
+            ImageCache::new(cache_dir).with_seek_seconds(cfg.server.image_seek_seconds);
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
-        let image_cache = ImageCache::new(cache_dir).with_pool(libav_pool.clone());
-        #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
-        let image_cache = ImageCache::new(cache_dir);
+        let image_cache = image_cache.with_pool(libav_pool.clone());
         state = state.with_image_cache(image_cache);
     }
     // P14 — resolve `auto` against the live `ffmpeg -hwaccels` output

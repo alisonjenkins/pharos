@@ -350,6 +350,16 @@ fn build_args_for_device(
                 }
                 a.push("-c:v".into());
                 a.push(encoder.into());
+                // Force broadly-decodable 8-bit 4:2:0 output. A 10-bit
+                // (yuv420p10le) or 4:4:4 source would otherwise carry its
+                // pixel format into the H.264/HEVC stream, which most
+                // clients — and the headless test chromium — can't decode.
+                // ffmpeg inserts an auto-convert before the software /
+                // NVENC / QSV / VideoToolbox encoder. VAAPI handles this
+                // via the `format=nv12` filter above, so it's scoped to
+                // the non-VAAPI encoders here.
+                a.push("-pix_fmt".into());
+                a.push("yuv420p".into());
                 // NVENC GPU ordinal selection on a multi-GPU box.
                 if matches!(
                     device,
@@ -435,6 +445,8 @@ mod tests {
         assert!(joined.contains("-t 10.000"), "{joined}");
         assert!(joined.contains("-i /m/foo.mkv"), "{joined}");
         assert!(joined.contains("-c:v libx264"), "{joined}");
+        // Software encode forces broad-compat 8-bit 4:2:0.
+        assert!(joined.contains("-pix_fmt yuv420p"), "{joined}");
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-f mp4"), "{joined}");
         assert!(joined.contains("pipe:1"));
@@ -568,6 +580,9 @@ mod tests {
         );
         assert!(joined.contains("format=nv12,hwupload"), "{joined}");
         assert!(joined.contains("-c:v h264_vaapi"), "{joined}");
+        // VAAPI sets the format via the filter (nv12 in GPU memory), not a
+        // software `-pix_fmt` (which would clash with the hw frames).
+        assert!(!joined.contains("-pix_fmt"), "{joined}");
     }
 
     #[test]

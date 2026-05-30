@@ -303,6 +303,11 @@ impl TrickplayCache {
             .arg(layout.tile_count.to_string())
             .arg("-q:v")
             .arg("5")
+            // Full-range pixel format for the mjpeg (image2) encoder; the
+            // tile/scale filters emit limited-range yuv420p which ffmpeg
+            // 8.1's mjpeg encoder rejects.
+            .arg("-pix_fmt")
+            .arg("yuvj420p")
             .arg("-f")
             .arg("image2")
             .arg(&pattern)

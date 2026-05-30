@@ -287,7 +287,7 @@ impl ImageCache {
         let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let seek = format!("{}", start_ms as f64 / 1000.0);
-        let args: [&str; 15] = [
+        let args: [&str; 17] = [
             "-hide_banner",
             "-loglevel",
             "error",
@@ -303,6 +303,11 @@ impl ImageCache {
             "3",
             "-vf",
             "scale=480:-1",
+            // mjpeg requires a full-range (yuvj*) pixel format; the scale
+            // filter emits limited-range yuv420p, which ffmpeg 8.1's mjpeg
+            // encoder rejects ("Non full-range YUV is non-standard").
+            "-pix_fmt",
+            "yuvj420p",
         ];
         let output = Command::new(&self.ffmpeg_bin)
             .args(args)
@@ -393,6 +398,9 @@ impl ImageCache {
                 "3",
                 "-vf",
                 scale,
+                // Full-range pixel format the mjpeg encoder requires.
+                "-pix_fmt",
+                "yuvj420p",
                 "-f",
                 "mjpeg",
                 out_str,
@@ -411,6 +419,8 @@ impl ImageCache {
                 "1",
                 "-q:v",
                 "3",
+                "-pix_fmt",
+                "yuvj420p",
                 "-f",
                 "mjpeg",
                 out_str,

@@ -24,6 +24,12 @@ pub struct ServerConfig {
     /// /Items/{id}/Images/Primary returns 404.
     #[serde(default)]
     pub image_cache_dir: Option<PathBuf>,
+    /// Seek timestamp (seconds) for poster / thumb frame extraction from
+    /// video sources. Default 30 suits real movies; lower it for short
+    /// test fixtures so the seek lands inside the clip (a seek past EOF
+    /// yields no frame and the image 404s).
+    #[serde(default = "default_image_seek_seconds")]
+    pub image_seek_seconds: u32,
     /// Directory used to cache transcoded HLS segments (T42). When
     /// unset, segments stream live without persisting — every request
     /// spawns ffmpeg.
@@ -120,6 +126,10 @@ pub struct ServerConfig {
 
 fn default_played_threshold_pct() -> u32 {
     90
+}
+
+fn default_image_seek_seconds() -> u32 {
+    30
 }
 
 fn default_transcode_cache_bytes() -> u64 {
