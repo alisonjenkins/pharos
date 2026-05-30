@@ -148,12 +148,21 @@ compat-playwright-full:
     [server]
     bind = "127.0.0.1:8096"
     name = "pharos-playwright"
+    # Enable the on-disk image + trickplay caches so pharos actually
+    # extracts posters / Thumb / Backdrop frames from the seeded media
+    # (the strict-console spec asserts these resolve, not 404).
+    image_cache_dir = "$TMP/images"
+    trickplay_cache_dir = "$TMP/trickplay"
+    transcode_cache_dir = "$TMP/transcode"
+    # The seeded fixtures are short (~5 s); seek 1 s so poster/thumb
+    # extraction lands inside the clip (default 30 s would seek past EOF).
+    image_seek_seconds = 1
 
     [obs]
     log_level = "warn"
 
     [media]
-    roots = []
+    roots = ["$TMP/media"]
 
     [database]
     url = "sqlite://$TMP/pharos.db?mode=rwc"
