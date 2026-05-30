@@ -11,9 +11,10 @@ pub mod proc;
 pub use libav_pool::{LibavWorkerPool, PoolError};
 pub use proc::{ProcSpawner, ProcWorker};
 
-// `ffi.rs` holds the WIP in-process libav transcode pipeline. It is not
-// yet `mod`-included: it needs a few ffmpeg-the-third 3.0.2 API fixes
-// (AVChannelLayout accessors, encoder→stream `set_parameters`,
-// parameters pointer access) before it compiles. The `backend-lib`
-// worker uses the stub in `bin/transcode_worker.rs` until then; the
-// spawn worker already delivers full GPU + CPU balancing.
+// Video-segment / live transcode always runs through the spawn path
+// (`bin/transcode_worker.rs` shells to ffmpeg), even in the `backend-lib`
+// build — encode time dwarfs fork/exec and the spawn worker already
+// balances every GPU + CPU. `backend-lib` adds the in-process libav
+// *tiny ops* (probe/image/trickplay/subtitle/waveform) via the
+// `LibavWorkerPool`, not an in-process segment encoder. The parked
+// `ffi.rs` segment scaffold is intentionally not `mod`-included.
