@@ -871,21 +871,26 @@ fn merge_metadata_into_item(item: &mut MediaItem, meta: MetadataResult) -> Merge
         }
     }
 
-    // LIB-D7 — entities with no table yet: carried by the resolver, logged
-    // as dropped so the gap is observable, never fatal.
-    if !people.is_empty() || !studios.is_empty() || !tags.is_empty() || !collections.is_empty() {
-        tracing::debug!(
-            item_id = item.id,
-            path = %item.path.display(),
-            people = people.len(),
-            studios = studios.len(),
-            tags = tags.len(),
-            collections = collections.len(),
-            "resolved metadata entities with no store table this run; dropped (not persisted)"
-        );
+    // LIB-C6 — tags (NFO `<tag>` + filename quality/source tokens) are now
+    // a real join: normalise (trim + drop blanks + de-dup, preserving the
+    // resolver's source order) and hand them to the caller to link after
+    // `put`. The last entity that was logged-and-dropped now persists.
+    let mut merged_tags: Vec<String> = Vec::with_capacity(tags.len());
+    for t in tags {
+        let t = t.trim().to_string();
+        if !t.is_empty() && !merged_tags.iter().any(|e| e == &t) {
+            merged_tags.push(t);
+        }
     }
 
-    (genres, artwork)
+    MergedEntities {
+        genres,
+        artwork,
+        people,
+        studios,
+        collections,
+        tags: merged_tags,
+    }
 }
 
 /// Overwrite `slot` with `value` only when the resolver produced one. The

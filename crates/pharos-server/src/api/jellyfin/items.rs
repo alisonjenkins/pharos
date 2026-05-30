@@ -1669,6 +1669,12 @@ struct ListQuery {
     /// a genre tag are dropped when this filter is active.
     #[serde(default)]
     genres: Option<String>,
+    /// LIB-C6 — comma- or pipe-separated tag names. Jellyfin's `Tags`
+    /// filter is AND across the listed names: an item passes only when it
+    /// carries EVERY requested tag (resolved through the `item_tags`
+    /// join, not a probe column). Items without all the tags are dropped.
+    #[serde(default)]
+    tags: Option<String>,
     /// Letter-jump nav: jellyfin-web's A-Z chip strip sends
     /// `NameStartsWith=A`. Items whose `title` starts with the given
     /// prefix (case-insensitive) pass.
@@ -2505,6 +2511,50 @@ async fn apply_userdata_filter(
         })
         .collect();
     Ok(kept)
+}
+
+/// LIB-C6 — apply the `?Tags=a,b` filter (AND across the listed tags): an
+/// item passes only when it carries EVERY requested tag. Resolved through
+/// the `item_tags` join (tags have no probe column), so the filter lives
+/// here in the async path rather than in the sync `filter_and_sort`. A
+/// no-op when `Tags` is absent/empty — no extra IO. A tag name that
+/// matches no row contributes an empty id set, so the AND intersection
+/// collapses to nothing (the correct "no item has this tag" result).
+async fn apply_tags_filter(
+    state: &AppState,
+    items: Vec<MediaItem>,
+    q: &ListQuery,
+) -> Result<Vec<MediaItem>, actix_web::Error> {
+    use pharos_core::TagStore;
+    let Some(raw) = q.tags.as_deref() else {
+        return Ok(items);
+    };
+    let wanted: Vec<String> = raw
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if wanted.is_empty() {
+        return Ok(items);
+    }
+    // Intersect the tagged-item sets across every requested tag (AND).
+    let mut keep: Option<std::collections::HashSet<pharos_core::MediaId>> = None;
+    for name in &wanted {
+        let wire_id = pharos_core::tag_wire_id(name);
+        let ids = state
+            .stores
+            .item_ids_for_tag(&wire_id)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let set: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+        keep = Some(match keep {
+            None => set,
+            Some(acc) => acc.intersection(&set).copied().collect(),
+        });
+    }
+    let keep = keep.unwrap_or_default();
+    Ok(items.into_iter().filter(|i| keep.contains(&i.id)).collect())
 }
 
 /// Drop items that don't live under the configured root / series /
