@@ -58,6 +58,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-actix-web = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+# OTLP trace export (opt-in via [obs].otlp_endpoint → Tempo/any OTLP collector).
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"

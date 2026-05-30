@@ -45,6 +45,8 @@ config:
     libraryPollIntervalSecs: 30
   obs:
     logLevel: "debug"
+    # Export spans to the in-cluster Tempo (deploy/obs-dev.yaml) over OTLP/gRPC.
+    otlpEndpoint: "http://tempo:4317"
 
 jellyfinWeb:
   enabled: true

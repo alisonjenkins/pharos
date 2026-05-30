@@ -90,6 +90,16 @@ k8s_resource(
     resource_deps=['pharos'],
 )
 
+# ── Dev observability stack (deploy/obs-dev.yaml): Tempo (traces, fed by
+#    pharos OTLP), Prometheus (scrapes /metrics), Loki + Promtail (pod logs),
+#    Grafana wiring all three. Open Grafana at http://127.0.0.1:3000.
+k8s_yaml('deploy/obs-dev.yaml')
+k8s_resource('grafana', port_forwards=['3000:3000'], labels=['obs'], resource_deps=['pharos'])
+k8s_resource('tempo', labels=['obs'])
+k8s_resource('prometheus', labels=['obs'])
+k8s_resource('loki', labels=['obs'])
+k8s_resource('promtail', labels=['obs'])
+
 # ── Seed the playwright admin user once pharos is up. (Media is copied in by
 #    the mediaSeed initContainer; the server's poll tier indexes it ~30s after
 #    boot — the seed script waits for the library to populate and reports it.)

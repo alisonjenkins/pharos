@@ -119,7 +119,19 @@ tier scans normally. On a production cluster (real PVC, not kind's overlayfs)
 - Liveness `GET /healthz`, readiness `GET /readyz` (probes preconfigured).
 - Prometheus metrics `GET /metrics`. Enable a ServiceMonitor:
   `--set serviceMonitor.enabled=true --set serviceMonitor.labels.release=<prom-release>`.
-- OTLP traces: `--set config.obs.otlpEndpoint=http://otel-collector:4317`.
+- OTLP traces: set `config.obs.otlpEndpoint` to an OTLP/gRPC collector
+  (e.g. `http://tempo:4317`). pharos exports spans via a batch processor
+  (`pharos_server::obs`); when the endpoint is unset, no exporter is installed.
+
+### Dev observability stack (Tilt)
+
+`just tilt-up` also brings up a throwaway Grafana stack (`deploy/obs-dev.yaml`,
+dev-only — not part of the chart): **Tempo** (traces, fed by pharos OTLP →
+`http://tempo:4317`), **Prometheus** (scrapes pharos `/metrics`), **Loki** +
+**Promtail** (pharos's JSON stdout logs), and **Grafana** with all three wired
+as datasources (anonymous admin). Open `http://127.0.0.1:3000` — Explore →
+Tempo for traces, Prometheus for metrics, Loki (`{namespace="pharos"}`) for
+logs. Storage is ephemeral (emptyDir); images pull from docker.io.
 
 ## Ingress
 

@@ -38,7 +38,7 @@ mod tests {
 
     #[actix_web::test]
     async fn metrics_responds_200() {
-        let _ = crate::obs::init("info");
+        let _ = crate::obs::init("info", None);
         let app = test::init_service(App::new().configure(configure)).await;
         let req = test::TestRequest::get().uri("/metrics").to_request();
         let resp = test::call_service(&app, req).await;

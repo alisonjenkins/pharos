@@ -40,9 +40,9 @@ memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
-rand = { version = "0.9" }
+rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
+rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
-rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -51,13 +51,16 @@ serde_core = { version = "1", default-features = false, features = ["alloc", "rc
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
 slab = { version = "0.4" }
-smallvec = { version = "1", default-features = false, features = ["const_generics", "serde"] }
-socket2 = { version = "0.5", default-features = false, features = ["all"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+socket2-3b31131e45eafb45 = { package = "socket2", version = "0.6", default-features = false, features = ["all"] }
+socket2-d8f496e17d97b5cb = { package = "socket2", version = "0.5", default-features = false, features = ["all"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
+sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
@@ -88,7 +91,7 @@ mio = { version = "1", features = ["net", "os-ext"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-rand_core = { version = "0.6", default-features = false, features = ["std"] }
+rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -97,14 +100,15 @@ serde_core = { version = "1", default-features = false, features = ["alloc", "rc
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
 slab = { version = "0.4" }
-smallvec = { version = "1", default-features = false, features = ["const_generics", "serde"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-macros = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
 sqlx-macros-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
@@ -114,52 +118,56 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
 [target.x86_64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
 
 ### END HAKARI SECTION

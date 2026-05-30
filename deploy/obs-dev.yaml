@@ -1,0 +1,387 @@
+# Dev-only observability stack for the Tilt loop (namespace: pharos).
+# Deployed by the Tiltfile, NOT part of the production chart. Wires:
+#   - Tempo      ← pharos OTLP/gRPC spans   (config.obs.otlpEndpoint=http://tempo:4317)
+#   - Prometheus ← scrapes pharos /metrics
+#   - Loki       ← Promtail tails pod stdout (pharos logs JSON to stdout)
+#   - Grafana    → Tempo + Prometheus + Loki datasources (anonymous admin)
+# Images pull from docker.io (the local registry is only for our built images).
+# Storage is emptyDir (throwaway). Components run as root for writable
+# emptyDirs — fine for a throwaway dev cluster.
+---
+# ───────────────────────────── Tempo (traces) ─────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo
+  namespace: pharos
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+    ingester:
+      trace_idle_period: 10s
+      max_block_duration: 5m
+    compactor:
+      compaction:
+        block_retention: 1h
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/blocks
+        wal:
+          path: /var/tempo/wal
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: pharos
+  labels: { app: tempo, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tempo } }
+  template:
+    metadata:
+      labels: { app: tempo, app.kubernetes.io/part-of: pharos-obs }
+    spec:
+      securityContext: { runAsUser: 0, runAsNonRoot: false }
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.6.1
+          args: ["-config.file=/etc/tempo/tempo.yaml"]
+          ports:
+            - { name: http, containerPort: 3200 }
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: otlp-http, containerPort: 4318 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/tempo }
+            - { name: data, mountPath: /var/tempo }
+      volumes:
+        - { name: config, configMap: { name: tempo } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: pharos
+  labels: { app: tempo, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  selector: { app: tempo }
+  ports:
+    - { name: http, port: 3200, targetPort: 3200 }
+    - { name: otlp-grpc, port: 4317, targetPort: 4317 }
+    - { name: otlp-http, port: 4318, targetPort: 4318 }
+---
+# ────────────────────────── Prometheus (metrics) ──────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: pharos
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: pharos
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["pharos:8096"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: pharos
+  labels: { app: prometheus, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata:
+      labels: { app: prometheus, app.kubernetes.io/part-of: pharos-obs }
+    spec:
+      securityContext: { runAsUser: 0, runAsNonRoot: false }
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.0.1
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+          ports:
+            - { name: http, containerPort: 9090 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - { name: config, configMap: { name: prometheus } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: pharos
+  labels: { app: prometheus, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  selector: { app: prometheus }
+  ports:
+    - { name: http, port: 9090, targetPort: 9090 }
+---
+# ──────────────────────────── Loki (logs) ─────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki
+  namespace: pharos
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+    schema_config:
+      configs:
+        - from: 2020-10-24
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    limits_config:
+      allow_structured_metadata: true
+      volume_enabled: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: pharos
+  labels: { app: loki, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loki } }
+  template:
+    metadata:
+      labels: { app: loki, app.kubernetes.io/part-of: pharos-obs }
+    spec:
+      securityContext: { runAsUser: 0, runAsNonRoot: false }
+      containers:
+        - name: loki
+          image: grafana/loki:3.3.2
+          args: ["-config.file=/etc/loki/loki.yaml"]
+          ports:
+            - { name: http, containerPort: 3100 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/loki }
+            - { name: data, mountPath: /loki }
+      volumes:
+        - { name: config, configMap: { name: loki } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: pharos
+  labels: { app: loki, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  selector: { app: loki }
+  ports:
+    - { name: http, port: 3100, targetPort: 3100 }
+---
+# ──────────────────── Promtail (pod-log shipper → Loki) ────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: pharos
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pharos-promtail
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pharos-promtail
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pharos-promtail
+subjects:
+  - kind: ServiceAccount
+    name: promtail
+    namespace: pharos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail
+  namespace: pharos
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+    positions:
+      filename: /run/promtail/positions.yaml
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: kubernetes-pods
+        pipeline_stages:
+          - cri: {}
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Only the pharos namespace.
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: pharos
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            target_label: component
+          # Build the on-node log path: /var/log/pods/<uid>/<container>/*.log
+          - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+            separator: /
+            replacement: /var/log/pods/*$1/*.log
+            target_label: __path__
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: pharos
+  labels: { app: promtail, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  selector: { matchLabels: { app: promtail } }
+  template:
+    metadata:
+      labels: { app: promtail, app.kubernetes.io/part-of: pharos-obs }
+    spec:
+      serviceAccountName: promtail
+      securityContext: { runAsUser: 0, runAsNonRoot: false }
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.3.2
+          args: ["-config.file=/etc/promtail/promtail.yaml"]
+          env:
+            - { name: HOSTNAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/promtail }
+            - { name: run, mountPath: /run/promtail }
+            - { name: pods, mountPath: /var/log/pods, readOnly: true }
+            - { name: containers, mountPath: /var/log/containers, readOnly: true }
+      volumes:
+        - { name: config, configMap: { name: promtail } }
+        - { name: run, emptyDir: {} }
+        - { name: pods, hostPath: { path: /var/log/pods } }
+        - { name: containers, hostPath: { path: /var/log/containers } }
+---
+# ─────────────────────────── Grafana (UI) ─────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: pharos
+  labels: { app.kubernetes.io/part-of: pharos-obs }
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        access: proxy
+        url: http://tempo:3200
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki:3100
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: pharos
+  labels: { app: grafana, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata:
+      labels: { app: grafana, app.kubernetes.io/part-of: pharos-obs }
+    spec:
+      securityContext: { runAsUser: 0, runAsNonRoot: false }
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          env:
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Admin" }
+            - { name: GF_AUTH_DISABLE_LOGIN_FORM, value: "true" }
+            - { name: GF_FEATURE_TOGGLES_ENABLE, value: "traceqlEditor" }
+          ports:
+            - { name: http, containerPort: 3000 }
+          volumeMounts:
+            - { name: datasources, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: data, mountPath: /var/lib/grafana }
+      volumes:
+        - { name: datasources, configMap: { name: grafana-datasources } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: pharos
+  labels: { app: grafana, app.kubernetes.io/part-of: pharos-obs }
+spec:
+  selector: { app: grafana }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
