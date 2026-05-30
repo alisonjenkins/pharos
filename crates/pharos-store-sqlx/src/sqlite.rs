@@ -462,6 +462,47 @@ impl MediaStore for SqliteStore {
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(())
     }
+
+    #[tracing::instrument(skip(self, locator), fields(media.id = %item_id, artwork.role = %role))]
+    async fn set_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        source: &str,
+        locator: &str,
+    ) -> DomainResult<()> {
+        let id_i64 = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        // One row per (item, role): a re-scan that discovers the same/winning
+        // sidecar overwrites the locator + source rather than duplicating.
+        sqlx::query(
+            "INSERT INTO artwork (item_id, role, source, locator) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(item_id, role) DO UPDATE SET source = excluded.source, \
+                locator = excluded.locator",
+        )
+        .bind(id_i64)
+        .bind(role)
+        .bind(source)
+        .bind(locator)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %item_id))]
+    async fn artwork_for(&self, item_id: MediaId) -> DomainResult<Vec<(String, String, String)>> {
+        let id_i64 = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT role, source, locator FROM artwork WHERE item_id = ? ORDER BY role",
+        )
+        .bind(id_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows)
+    }
 }
 
 impl GenreStore for SqliteStore {

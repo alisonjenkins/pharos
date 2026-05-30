@@ -522,6 +522,25 @@ mod tests {
             }
             Ok(())
         }
+
+        // LIB-D4 — watcher tests don't assert on artwork; no-op stubs
+        // satisfy the MediaStore bound.
+        async fn set_artwork(
+            &self,
+            _item_id: MediaId,
+            _role: &str,
+            _source: &str,
+            _locator: &str,
+        ) -> DomainResult<()> {
+            Ok(())
+        }
+
+        async fn artwork_for(
+            &self,
+            _item_id: MediaId,
+        ) -> DomainResult<Vec<(String, String, String)>> {
+            Ok(Vec::new())
+        }
     }
 
     // LIB-C4 — watcher tests don't assert on the genre join, so this is a

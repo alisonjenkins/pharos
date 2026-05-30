@@ -911,6 +911,31 @@ pub trait MediaStore: Send + Sync {
         id: MediaId,
         new_path: &std::path::Path,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// LIB-D4 — upsert one artwork row for `(item_id, role)`. `role` is an
+    /// [`ArtworkRole::as_str`] token (`"Primary"` / `"Backdrop"` / …);
+    /// `source` is `"local"` or `"url"`; `locator` is the absolute sidecar
+    /// path (for `local`) or the remote URL (for `url`). One row per
+    /// `(item, role)` — re-`set`ing the same role overwrites the locator so
+    /// the highest-priority source wins (the resolver feeds rows in
+    /// priority order; the scanner writes the winner). IO-free signature —
+    /// the SQL lives in the store impls (V12).
+    fn set_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        source: &str,
+        locator: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// LIB-D4 — every artwork row for `item_id` as `(role, source,
+    /// locator)` triples, ordered by `role`. Empty Vec when the item has no
+    /// recorded artwork. The D5 image-serving branch reads this to serve a
+    /// recorded sidecar before falling back to ffmpeg frame-extraction.
+    fn artwork_for(
+        &self,
+        item_id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(String, String, String)>>> + Send;
 }
 
 /// Per-(user, item) state Jellyfin tracks: watched/unwatched, play

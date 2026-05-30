@@ -11,6 +11,7 @@ struct MemStore {
     states: Mutex<HashMap<MediaId, ScanState>>,
     fps: Mutex<HashMap<MediaId, Fingerprint>>,
     next_scan_id: std::sync::atomic::AtomicI64,
+    artwork: Mutex<HashMap<(MediaId, String), (String, String)>>,
 }
 
 impl MediaStore for MemStore {
@@ -155,6 +156,37 @@ impl MediaStore for MemStore {
             item.path = new_path.to_path_buf();
         }
         Ok(())
+    }
+
+    async fn set_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        source: &str,
+        locator: &str,
+    ) -> DomainResult<()> {
+        self.artwork
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .insert(
+                (item_id, role.to_string()),
+                (source.to_string(), locator.to_string()),
+            );
+        Ok(())
+    }
+
+    async fn artwork_for(&self, item_id: MediaId) -> DomainResult<Vec<(String, String, String)>> {
+        let map = self
+            .artwork
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut out: Vec<(String, String, String)> = map
+            .iter()
+            .filter(|((iid, _), _)| *iid == item_id)
+            .map(|((_, role), (source, locator))| (role.clone(), source.clone(), locator.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 }
 
