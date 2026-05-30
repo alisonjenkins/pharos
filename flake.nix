@@ -501,11 +501,14 @@
             pkgs.curl
             # Node + Playwright drive T29 phase 3. jellyfin-web is the
             # upstream prebuilt static bundle, referenced via
-            # JELLYFIN_WEB_DIR at runtime. Playwright manages its own
-            # chromium under ~/.cache/ms-playwright; nix's
-            # playwright-driver.browsers had a directory-layout mismatch
-            # with the npm package on darwin, so we let Playwright drive
-            # the download (`npx playwright install chromium` once).
+            # JELLYFIN_WEB_DIR at runtime. Browser binaries come from the
+            # nix-pinned `playwright-driver.browsers` (exported as
+            # PLAYWRIGHT_BROWSERS_PATH below) so the suite runs offline and
+            # identically on every machine — no `npx playwright install`.
+            # The npm `@playwright/test` version (compat-playwright/
+            # package.json) is pinned to match `playwright-driver.version`
+            # exactly, so the browser revision the npm package expects is
+            # the one present in the store path.
             pkgs.nodejs_22
             pkgs.jellyfin-web
             # schemathesis (Layer A of T29) — install separately via:
@@ -530,6 +533,16 @@
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
             export JELLYFIN_WEB_DIR=${pkgs.jellyfin-web}/share/jellyfin-web
+            # Pin Playwright's browsers to the nix store path so the compat
+            # suite needs no `npx playwright install` and behaves the same
+            # on every machine. The version matches package.json's
+            # @playwright/test, so chromium-<rev> is present here.
+            export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+            # nix-store browsers are prebuilt + immutable; skip Playwright's
+            # apt-style host-dependency probe (false-negatives on non-Debian
+            # distros) and any implicit download attempt.
+            export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+            export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
             # Test fixtures for `cargo nextest run -- --ignored
             # ffmpeg_integration`. Built once in /nix/store, cached
             # across CI + dev. Tests skip when env unset.
