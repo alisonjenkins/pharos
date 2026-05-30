@@ -8,3 +8,10 @@ pub mod exec;
 pub mod proc;
 
 pub use proc::{ProcSpawner, ProcWorker};
+
+// `ffi.rs` holds the WIP in-process libav transcode pipeline. It is not
+// yet `mod`-included: it needs a few ffmpeg-the-third 3.0.2 API fixes
+// (AVChannelLayout accessors, encoder→stream `set_parameters`,
+// parameters pointer access) before it compiles. The `backend-lib`
+// worker uses the stub in `bin/transcode_worker.rs` until then; the
+// spawn worker already delivers full GPU + CPU balancing.

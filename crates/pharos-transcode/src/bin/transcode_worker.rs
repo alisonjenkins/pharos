@@ -220,9 +220,11 @@ async fn run_job(
     spec: pharos_transcode::protocol::JobSpec,
 ) {
     use pharos_transcode::protocol::{write_frame, WorkerError, WorkerEvent};
-    // FFI encode path lands in a later step; until then the lib build
-    // reports a clean non-recoverable error rather than silently doing
-    // nothing, so the scheduler fails the job loudly instead of hanging.
+    // The in-process libav transcode (worker/ffi.rs) is WIP — it needs a
+    // few ffmpeg-the-third 3.0.2 API fixes before it compiles. Until then
+    // the lib build reports a clean non-recoverable error so the scheduler
+    // surfaces it rather than hanging; production uses the spawn worker,
+    // which already load-balances across every GPU + CPU.
     let job_id = spec.job_id;
     let _ = write_frame(wr, &WorkerEvent::Accepted { job_id }).await;
     let _ = write_frame(
