@@ -24,6 +24,19 @@ pub fn stable_id(path: &Path) -> u64 {
     xxh3_64(path.to_string_lossy().as_bytes()) & 0x7FFFFFFFFFFFFFFF
 }
 
+/// LIB-A2 — filesystem mtime as unix-seconds for the incremental
+/// scan-state signature. Falls back to `0` when the platform doesn't
+/// expose a modified time or it predates the unix epoch; `0` is the
+/// same "no signature yet, must re-probe" sentinel the store uses, so a
+/// degenerate mtime simply forces a probe rather than skipping wrongly.
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone)]
 pub struct FsScanner<P: Prober> {
     prober: P,
@@ -63,20 +76,95 @@ impl<P: Prober> FsScanner<P> {
 
     /// Scan and push items into the given store. Streaming variant — avoids
     /// holding the entire library in memory. V10 atomicity holds per `put`.
+    ///
+    /// LIB-A2 — incremental. Opens a `scan_runs` token via
+    /// [`MediaStore::begin_scan`], then for each primary stats the file
+    /// (cheap) and compares its `(mtime, size)` against the persisted
+    /// signature read with [`MediaStore::scan_state`]. When unchanged the
+    /// expensive probe is skipped — the row is only re-stamped via
+    /// [`MediaStore::mark_seen`] so the mark-and-sweep token stays current
+    /// (A3 consumes it). A first-ever scan (no stored signature) behaves
+    /// exactly as before: every file is probed + put. Returns the number of
+    /// items probed+stored this run (skipped-unchanged items are not
+    /// counted), preserving the existing `usize` contract for callers.
+    ///
+    /// LIB-A3 — deletion reconciliation. Every primary observed this run
+    /// (probed *or* skipped-unchanged) is `mark_seen`'d with the current
+    /// `scan_id`. After the walk completes, a single root-scoped
+    /// [`MediaStore::sweep_unseen`] deletes every row under this root whose
+    /// `last_seen_scan_id` is not this run's id — i.e. files that vanished
+    /// from disk since the previous scan. The sweep is keyed on the
+    /// canonical root prefix so scanning one root never deletes another
+    /// root's items (V10: the store performs a single atomic DELETE). The
+    /// swept count is threaded into [`MediaStore::finish_scan`] and the
+    /// deleted ids are logged at info (broadcasting deltas is A4).
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
     pub async fn scan_into<S: MediaStore>(&self, root: &Path, store: &S) -> DomainResult<usize> {
+        let scan_id = store.begin_scan(root).await?;
         let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
         let groups = group_editions(paths);
-        let mut n = 0;
+        let mut n = 0usize;
+        let mut seen = 0i64;
+        let mut skipped = 0usize;
         for (primary, alts) in groups {
+            // Cheap fs stat up front: lets us skip the expensive probe when
+            // the file is byte-for-byte unchanged since the last scan. A
+            // stat failure (file vanished mid-scan, permission flip) just
+            // falls through to the probe path, which logs + skips on error
+            // (V6) — we never abort the whole scan for one file.
+            let id = stable_id(&primary);
+            let stat = tokio::fs::metadata(&primary).await.ok();
+            let sig = stat.as_ref().map(|m| (mtime_secs(m), m.len()));
+
+            if let Some((mtime, size)) = sig {
+                if let Some(state) = store.scan_state(id).await? {
+                    // `last_scanned == 0` / absent signature means the row
+                    // predates migration 0016 or was never marked — treat
+                    // as changed and re-probe. A genuine unchanged hit
+                    // requires both stat fields to match the stored ones.
+                    if state.file_mtime == mtime && state.file_size == size {
+                        store.mark_seen(id, scan_id, mtime, size).await?;
+                        seen += 1;
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
                 store.put(item).await?;
+                // Persist the freshly-stat'd signature so the next scan can
+                // skip this file. mark_seen is an UPDATE — the put() above
+                // guarantees the row exists first.
+                if let Some((mtime, size)) = sig {
+                    store.mark_seen(id, scan_id, mtime, size).await?;
+                }
                 n += 1;
+                seen += 1;
             }
             if !self.rate_limit.is_zero() {
                 tokio::time::sleep(self.rate_limit).await;
             }
         }
+        // LIB-A3 — mark-and-sweep. Everything still on disk under `root`
+        // got mark_seen'd above; anything else with a row under this root
+        // prefix vanished and is deleted in one atomic, root-scoped pass.
+        // The prefix is the canonical root string the rows' `path` columns
+        // were stored under, so a sibling root is never touched.
+        let root_prefix = root.to_string_lossy();
+        let swept = store.sweep_unseen(scan_id, &root_prefix).await?;
+        let removed = swept.len();
+        if removed > 0 {
+            tracing::info!(scan_id, removed, ids = ?swept, "swept rows for files removed from disk");
+        }
+        tracing::debug!(
+            scan_id,
+            probed = n,
+            skipped,
+            removed,
+            "incremental scan complete"
+        );
+        store.finish_scan(scan_id, seen, removed as i64).await?;
         Ok(n)
     }
 
@@ -528,10 +616,125 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use pharos_core::{MediaKind, ProbeInfo};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use pharos_core::{MediaId, MediaKind, ProbeInfo, ScanState};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    /// In-memory `MediaStore` for scanner tests — mirrors the canonical
+    /// `MemStore` in `pharos-core/src/tests.rs` so the incremental
+    /// `scan_into` path (begin_scan / scan_state / mark_seen /
+    /// finish_scan) can be exercised without pulling in the sqlx store.
+    #[derive(Default)]
+    struct MemStore {
+        inner: Mutex<HashMap<MediaId, MediaItem>>,
+        states: Mutex<HashMap<MediaId, ScanState>>,
+        next_scan_id: AtomicI64,
+    }
+
+    impl MediaStore for MemStore {
+        async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
+            self.inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&id)
+                .cloned()
+                .ok_or(DomainError::NotFound(id))
+        }
+        async fn put(&self, item: MediaItem) -> DomainResult<()> {
+            self.inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(item.id, item);
+            Ok(())
+        }
+        async fn list(&self) -> DomainResult<Vec<MediaItem>> {
+            Ok(self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .cloned()
+                .collect())
+        }
+        async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
+            Ok(self
+                .states
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&id)
+                .copied())
+        }
+        async fn begin_scan(&self, _root: &Path) -> DomainResult<i64> {
+            Ok(self.next_scan_id.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        async fn mark_seen(
+            &self,
+            id: MediaId,
+            scan_id: i64,
+            mtime: i64,
+            size: u64,
+        ) -> DomainResult<()> {
+            // Mirror the store: mark_seen is an UPDATE — only stamp rows
+            // that already exist (the scanner put()s before marking).
+            if !self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .contains_key(&id)
+            {
+                return Ok(());
+            }
+            self.states
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(
+                    id,
+                    ScanState {
+                        last_scanned: scan_id, // non-zero so "seen" is observable
+                        file_mtime: mtime,
+                        file_size: size,
+                        last_seen_scan_id: scan_id,
+                    },
+                );
+            Ok(())
+        }
+        async fn sweep_unseen(
+            &self,
+            scan_id: i64,
+            root_prefix: &str,
+        ) -> DomainResult<Vec<MediaId>> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let states = self
+                .states
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let doomed: Vec<MediaId> = inner
+                .iter()
+                .filter(|(id, item)| {
+                    item.path.to_string_lossy().starts_with(root_prefix)
+                        && states.get(*id).map(|s| s.last_seen_scan_id) != Some(scan_id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &doomed {
+                inner.remove(id);
+            }
+            Ok(doomed)
+        }
+        async fn finish_scan(
+            &self,
+            _scan_id: i64,
+            _items_seen: i64,
+            _items_swept: i64,
+        ) -> DomainResult<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Clone, Default)]
     struct FakeProber {
@@ -565,6 +768,18 @@ mod tests {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
         tokio::fs::write(&p, b"").await.unwrap();
+    }
+
+    /// Write `bytes` to `dir/name`, creating parents. Used by the
+    /// incremental tests where the file *size* (and thus the scan-state
+    /// signature) must change deterministically without depending on
+    /// `filetime` (not a dep).
+    async fn write_file(dir: &Path, name: &str, bytes: &[u8]) {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&p, bytes).await.unwrap();
     }
 
     #[tokio::test]
@@ -615,6 +830,148 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_second_scan_probes_zero_unchanged_files() {
+        // LIB-A2 — first scan probes every file; a second scan with no
+        // filesystem change probes NONE of them. The probe counter is the
+        // load-bearing assertion (the backlog's "second scan probes 0
+        // unchanged" requirement).
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "movie.mkv", b"aaaa").await;
+        write_file(td.path(), "song.flac", b"bbbbbb").await;
+        write_file(td.path(), "show/s1/ep1.mkv", b"cc").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        let first = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(first, 3, "first scan stores all three");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            3,
+            "first scan probes all three"
+        );
+
+        // Second scan, nothing touched on disk.
+        let before = prober.calls.load(Ordering::SeqCst);
+        let second = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(second, 0, "nothing re-probed/stored on unchanged rescan");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst) - before,
+            0,
+            "unchanged files are not re-probed"
+        );
+        // Rows are still present (skipped != deleted).
+        assert_eq!(store.list().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn incremental_reprobes_only_the_changed_file() {
+        // LIB-A2 — change exactly one file (size delta via rewrite) and
+        // assert exactly one re-probe on the next scan.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.mkv", b"aaaa").await;
+        write_file(td.path(), "b.mkv", b"bbbb").await;
+        write_file(td.path(), "c.mkv", b"cccc").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 3);
+
+        // Mutate just b.mkv: different byte length => different stat size
+        // => signature mismatch => re-probe. a/c are byte-identical.
+        write_file(td.path(), "b.mkv", b"bbbbbbbb").await;
+
+        let before = prober.calls.load(Ordering::SeqCst);
+        let n = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(n, 1, "exactly one item re-stored");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst) - before,
+            1,
+            "exactly one file re-probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_reprobes_on_mtime_change_same_size() {
+        // LIB-A2 — same size but a newer mtime must still re-probe (a file
+        // overwritten in place with equal length). Uses the std
+        // `File::set_modified` API so no `filetime` dep is needed.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "x.mkv", b"hello").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 1);
+
+        // Bump mtime forward by an hour, keep the byte length identical.
+        let p = td.path().join("x.mkv");
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        f.set_modified(bumped).unwrap();
+        drop(f);
+
+        let before = prober.calls.load(Ordering::SeqCst);
+        let n = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(n, 1, "mtime-only change still re-stores");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst) - before,
+            1,
+            "mtime change re-probes even at equal size"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_reconciliation_sweeps_removed_files() {
+        // LIB-A3 — a file deleted from disk between scans has its row
+        // swept on the next scan; the surviving file's row remains; and a
+        // file under a DIFFERENT root is untouched by the first root's
+        // sweep (root-scoped delete).
+        let roota = TempDir::new().unwrap();
+        let rootb = TempDir::new().unwrap();
+        write_file(roota.path(), "keep.mkv", b"keep").await;
+        write_file(roota.path(), "gone.mkv", b"gone").await;
+        write_file(rootb.path(), "other.mkv", b"other").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        // First scan of each root: every file probed + stored.
+        s.scan_into(roota.path(), &store).await.unwrap();
+        s.scan_into(rootb.path(), &store).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 3);
+
+        let keep_id = stable_id(&roota.path().join("keep.mkv"));
+        let gone_id = stable_id(&roota.path().join("gone.mkv"));
+        let other_id = stable_id(&rootb.path().join("other.mkv"));
+
+        // Delete one file from rootA, then rescan rootA only.
+        tokio::fs::remove_file(roota.path().join("gone.mkv"))
+            .await
+            .unwrap();
+        s.scan_into(roota.path(), &store).await.unwrap();
+
+        // gone.mkv swept; keep.mkv survives; rootB's file untouched.
+        assert!(store.get(keep_id).await.is_ok(), "surviving file remains");
+        match store.get(gone_id).await {
+            Err(DomainError::NotFound(id)) if id == gone_id => {}
+            other => panic!("deleted file should be swept, got {other:?}"),
+        }
+        assert!(
+            store.get(other_id).await.is_ok(),
+            "sibling root must be untouched by rootA sweep"
+        );
+        assert_eq!(store.list().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
