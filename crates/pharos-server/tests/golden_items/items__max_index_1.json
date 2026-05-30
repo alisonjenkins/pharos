@@ -1,0 +1,182 @@
+{
+  "Items": [
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "54b73efc7dfff736"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:06:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "21f7fa80cd7e0cd921f7fa80cd7e0cd9",
+          "Name": "Comedy"
+        }
+      ],
+      "Genres": [
+        "Comedy"
+      ],
+      "Id": "20",
+      "ImageTags": {
+        "Backdrop": "54b73efc7dfff736",
+        "Primary": "5af85befd13715b8",
+        "Thumb": "512bf5096744f5d6"
+      },
+      "IndexNumber": 1,
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "20",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Delta E1",
+          "Protocol": "File",
+          "RunTimeTicks": 15000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Delta E1",
+      "ParentId": "204b67669cbeb72d204b67669cbeb72d",
+      "ParentIndexNumber": 1,
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProductionYear": 2020,
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 15000000000,
+      "ScreenshotImageTags": [],
+      "SeasonId": "204b67669cbeb72d204b67669cbeb72d",
+      "SeasonName": "Season 1",
+      "SeriesId": "594e475a729295c4594e475a729295c4",
+      "SeriesName": "Delta Show",
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Episode",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "20",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "697889336007608d"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:40:00.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "21f7fa80cd7e0cd921f7fa80cd7e0cd9",
+          "Name": "Comedy"
+        }
+      ],
+      "Genres": [
+        "Comedy"
+      ],
+      "Id": "22",
+      "ImageTags": {
+        "Backdrop": "697889336007608d",
+        "Primary": "0acc57a929d753ae",
+        "Thumb": "779c955a6420fdf1"
+      },
+      "IndexNumber": 1,
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "22",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Delta S2E1",
+          "Protocol": "File",
+          "RunTimeTicks": 15000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Delta S2E1",
+      "ParentId": "4b70c697645176bc4b70c697645176bc",
+      "ParentIndexNumber": 2,
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProductionYear": 2020,
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 15000000000,
+      "ScreenshotImageTags": [],
+      "SeasonId": "4b70c697645176bc4b70c697645176bc",
+      "SeasonName": "Season 2",
+      "SeriesId": "594e475a729295c4594e475a729295c4",
+      "SeriesName": "Delta Show",
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Episode",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "22",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    }
+  ],
+  "StartIndex": 0,
+  "TotalRecordCount": 2
+}

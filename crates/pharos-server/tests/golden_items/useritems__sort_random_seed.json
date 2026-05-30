@@ -1,0 +1,695 @@
+{
+  "Items": [
+    {
+      "Album": "Echo Album",
+      "AlbumArtists": [
+        {
+          "Id": "1743b84e4044fdd81743b84e4044fdd8",
+          "Name": "Echo Artist"
+        }
+      ],
+      "AlbumId": "080477e50c7a1f08080477e50c7a1f08",
+      "ArtistItems": [
+        {
+          "Id": "1743b84e4044fdd81743b84e4044fdd8",
+          "Name": "Echo Artist"
+        }
+      ],
+      "Artists": [
+        "Echo Artist"
+      ],
+      "BackdropImageTags": [
+        "0e827648890628b8"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T02:13:20.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "469379f6f37d13f3469379f6f37d13f3",
+          "Name": "Jazz"
+        }
+      ],
+      "Genres": [
+        "Jazz"
+      ],
+      "Id": "31",
+      "ImageTags": {
+        "Primary": "6620922965f75a27"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp3",
+          "DefaultAudioStreamIndex": 0,
+          "ETag": "0",
+          "Id": "31",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Audio"
+            }
+          ],
+          "Name": "Foxtrot Track",
+          "Protocol": "File",
+          "RunTimeTicks": 3000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Audio",
+      "Name": "Foxtrot Track",
+      "ParentId": "080477e50c7a1f08080477e50c7a1f08",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 3000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Audio",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "31",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "Album": "Echo Album",
+      "AlbumArtists": [
+        {
+          "Id": "1743b84e4044fdd81743b84e4044fdd8",
+          "Name": "Echo Artist"
+        }
+      ],
+      "AlbumId": "080477e50c7a1f08080477e50c7a1f08",
+      "ArtistItems": [
+        {
+          "Id": "1743b84e4044fdd81743b84e4044fdd8",
+          "Name": "Echo Artist"
+        }
+      ],
+      "Artists": [
+        "Echo Artist"
+      ],
+      "BackdropImageTags": [
+        "7e541ba1788485c9"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:56:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "469379f6f37d13f3469379f6f37d13f3",
+          "Name": "Jazz"
+        }
+      ],
+      "Genres": [
+        "Jazz"
+      ],
+      "Id": "30",
+      "ImageTags": {
+        "Primary": "4e869b5f937ba34b"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp3",
+          "DefaultAudioStreamIndex": 0,
+          "ETag": "0",
+          "Id": "30",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Audio"
+            }
+          ],
+          "Name": "Echo Track",
+          "Protocol": "File",
+          "RunTimeTicks": 2000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Audio",
+      "Name": "Echo Track",
+      "ParentId": "080477e50c7a1f08080477e50c7a1f08",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 2000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Audio",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "30",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "2de3a8c9b3e8d6f9"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:23:20.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "21f7fa80cd7e0cd921f7fa80cd7e0cd9",
+          "Name": "Comedy"
+        }
+      ],
+      "Genres": [
+        "Comedy"
+      ],
+      "Id": "21",
+      "ImageTags": {
+        "Backdrop": "2de3a8c9b3e8d6f9",
+        "Primary": "602404c01aafa6ef",
+        "Thumb": "3c06058789d1f602"
+      },
+      "IndexNumber": 2,
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "21",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Delta E2",
+          "Protocol": "File",
+          "RunTimeTicks": 15000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Delta E2",
+      "ParentId": "204b67669cbeb72d204b67669cbeb72d",
+      "ParentIndexNumber": 1,
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProductionYear": 2020,
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 15000000000,
+      "ScreenshotImageTags": [],
+      "SeasonId": "204b67669cbeb72d204b67669cbeb72d",
+      "SeasonName": "Season 1",
+      "SeriesId": "594e475a729295c4594e475a729295c4",
+      "SeriesName": "Delta Show",
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Episode",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "21",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "6ae7b8ea5e9f2861"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:33:20.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "48f42483c6faac5848f42483c6faac58",
+          "Name": "Action"
+        }
+      ],
+      "Genres": [
+        "Action"
+      ],
+      "Id": "12",
+      "ImageTags": {
+        "Backdrop": "6ae7b8ea5e9f2861",
+        "Primary": "31ff8654596e02f9",
+        "Thumb": "2e181965c740c190"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "12",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1280:720",
+              "Height": 720,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1280
+            }
+          ],
+          "Name": "Charlie",
+          "Protocol": "File",
+          "RunTimeTicks": 60000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Charlie",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 60000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "12",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 500,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "1ebcf8276a730a30"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:16:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "48f42483c6faac5848f42483c6faac58",
+          "Name": "Action"
+        }
+      ],
+      "Genres": [
+        "Action"
+      ],
+      "Id": "10",
+      "ImageTags": {
+        "Backdrop": "1ebcf8276a730a30",
+        "Primary": "72fc7e696b642f89",
+        "Thumb": "70bfe418e1888efd"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "10",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "3840:2160",
+              "Height": 2160,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 3840
+            }
+          ],
+          "Name": "Alpha",
+          "Protocol": "File",
+          "RunTimeTicks": 72000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Alpha",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 72000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": true,
+        "Key": "10",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "697889336007608d"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:40:00.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "21f7fa80cd7e0cd921f7fa80cd7e0cd9",
+          "Name": "Comedy"
+        }
+      ],
+      "Genres": [
+        "Comedy"
+      ],
+      "Id": "22",
+      "ImageTags": {
+        "Backdrop": "697889336007608d",
+        "Primary": "0acc57a929d753ae",
+        "Thumb": "779c955a6420fdf1"
+      },
+      "IndexNumber": 1,
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "22",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Delta S2E1",
+          "Protocol": "File",
+          "RunTimeTicks": 15000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Delta S2E1",
+      "ParentId": "4b70c697645176bc4b70c697645176bc",
+      "ParentIndexNumber": 2,
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProductionYear": 2020,
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 15000000000,
+      "ScreenshotImageTags": [],
+      "SeasonId": "4b70c697645176bc4b70c697645176bc",
+      "SeasonName": "Season 2",
+      "SeriesId": "594e475a729295c4594e475a729295c4",
+      "SeriesName": "Delta Show",
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Episode",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "22",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "54b73efc7dfff736"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:06:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "21f7fa80cd7e0cd921f7fa80cd7e0cd9",
+          "Name": "Comedy"
+        }
+      ],
+      "Genres": [
+        "Comedy"
+      ],
+      "Id": "20",
+      "ImageTags": {
+        "Backdrop": "54b73efc7dfff736",
+        "Primary": "5af85befd13715b8",
+        "Thumb": "512bf5096744f5d6"
+      },
+      "IndexNumber": 1,
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "20",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Delta E1",
+          "Protocol": "File",
+          "RunTimeTicks": 15000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Delta E1",
+      "ParentId": "204b67669cbeb72d204b67669cbeb72d",
+      "ParentIndexNumber": 1,
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProductionYear": 2020,
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 15000000000,
+      "ScreenshotImageTags": [],
+      "SeasonId": "204b67669cbeb72d204b67669cbeb72d",
+      "SeasonName": "Season 1",
+      "SeriesId": "594e475a729295c4594e475a729295c4",
+      "SeriesName": "Delta Show",
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Episode",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "20",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "7317969fd4e3c5d2"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:50:00.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "096da01eea9426a7096da01eea9426a7",
+          "Name": "Drama"
+        }
+      ],
+      "Genres": [
+        "Drama"
+      ],
+      "Id": "11",
+      "ImageTags": {
+        "Backdrop": "7317969fd4e3c5d2",
+        "Primary": "10272fd55aca58b4",
+        "Thumb": "0194bdcec771503a"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "11",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Bravo",
+          "Protocol": "File",
+          "RunTimeTicks": 54000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Bravo",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 54000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "11",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": true,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    }
+  ],
+  "StartIndex": 0,
+  "TotalRecordCount": 8
+}

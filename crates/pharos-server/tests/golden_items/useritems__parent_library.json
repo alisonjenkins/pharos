@@ -1,0 +1,249 @@
+{
+  "Items": [
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "1ebcf8276a730a30"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:16:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "48f42483c6faac5848f42483c6faac58",
+          "Name": "Action"
+        }
+      ],
+      "Genres": [
+        "Action"
+      ],
+      "Id": "10",
+      "ImageTags": {
+        "Backdrop": "1ebcf8276a730a30",
+        "Primary": "72fc7e696b642f89",
+        "Thumb": "70bfe418e1888efd"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "10",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "3840:2160",
+              "Height": 2160,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 3840
+            }
+          ],
+          "Name": "Alpha",
+          "Protocol": "File",
+          "RunTimeTicks": 72000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Alpha",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 72000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": true,
+        "Key": "10",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "7317969fd4e3c5d2"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:50:00.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "096da01eea9426a7096da01eea9426a7",
+          "Name": "Drama"
+        }
+      ],
+      "Genres": [
+        "Drama"
+      ],
+      "Id": "11",
+      "ImageTags": {
+        "Backdrop": "7317969fd4e3c5d2",
+        "Primary": "10272fd55aca58b4",
+        "Thumb": "0194bdcec771503a"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "11",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Bravo",
+          "Protocol": "File",
+          "RunTimeTicks": 54000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Bravo",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 54000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "11",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": true,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "6ae7b8ea5e9f2861"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:33:20.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "48f42483c6faac5848f42483c6faac58",
+          "Name": "Action"
+        }
+      ],
+      "Genres": [
+        "Action"
+      ],
+      "Id": "12",
+      "ImageTags": {
+        "Backdrop": "6ae7b8ea5e9f2861",
+        "Primary": "31ff8654596e02f9",
+        "Thumb": "2e181965c740c190"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "12",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1280:720",
+              "Height": 720,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1280
+            }
+          ],
+          "Name": "Charlie",
+          "Protocol": "File",
+          "RunTimeTicks": 60000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Charlie",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 60000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "12",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 500,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    }
+  ],
+  "StartIndex": 0,
+  "TotalRecordCount": 3
+}

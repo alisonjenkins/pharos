@@ -404,6 +404,64 @@ impl PostgresStore {
         .await?;
         Ok(())
     }
+
+    /// LIB-B2 — distinct `(series_folder, series_name)` keys (see the sqlite
+    /// twin). Used by the API to resolve a `?ParentId=<series synth id>`.
+    pub async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
+        let rows = sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT DISTINCT series_folder, series_name FROM media_items \
+             WHERE series_name IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys.
+    pub async fn distinct_season_keys(
+        &self,
+    ) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
+        let rows = sqlx::query_as::<_, (Option<String>, String, i64)>(
+            "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
+             WHERE series_name IS NOT NULL AND season_number IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// LIB-B2 — distinct non-empty artist + album_artist names.
+    pub async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT artist AS n FROM media_items WHERE artist IS NOT NULL AND artist <> '' \
+             UNION SELECT DISTINCT album_artist FROM media_items \
+             WHERE album_artist IS NOT NULL AND album_artist <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// LIB-B2 — distinct non-empty album names.
+    pub async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT album FROM media_items WHERE album IS NOT NULL AND album <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// LIB-B2 — distinct raw `genre` probe strings (legacy ParentId=genre
+    /// fallback; see the sqlite twin).
+    pub async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
 }
 
 impl MediaStore for PostgresStore {
@@ -552,6 +610,8 @@ impl MediaStore for PostgresStore {
         .bind(provider_ids_json)
         .bind(series_folder)
         .bind(series_year.map(|v| v as i32))
+        // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
+        .bind(item.title.to_lowercase())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;

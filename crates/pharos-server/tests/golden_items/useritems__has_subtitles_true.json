@@ -1,0 +1,256 @@
+{
+  "Items": [
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "1ebcf8276a730a30"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:16:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "48f42483c6faac5848f42483c6faac58",
+          "Name": "Action"
+        }
+      ],
+      "Genres": [
+        "Action"
+      ],
+      "Id": "10",
+      "ImageTags": {
+        "Backdrop": "1ebcf8276a730a30",
+        "Primary": "72fc7e696b642f89",
+        "Thumb": "70bfe418e1888efd"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "10",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "3840:2160",
+              "Height": 2160,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 3840
+            }
+          ],
+          "Name": "Alpha",
+          "Protocol": "File",
+          "RunTimeTicks": 72000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Alpha",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 72000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": true,
+        "Key": "10",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "6ae7b8ea5e9f2861"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T00:33:20.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "48f42483c6faac5848f42483c6faac58",
+          "Name": "Action"
+        }
+      ],
+      "Genres": [
+        "Action"
+      ],
+      "Id": "12",
+      "ImageTags": {
+        "Backdrop": "6ae7b8ea5e9f2861",
+        "Primary": "31ff8654596e02f9",
+        "Thumb": "2e181965c740c190"
+      },
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "12",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1280:720",
+              "Height": 720,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1280
+            }
+          ],
+          "Name": "Charlie",
+          "Protocol": "File",
+          "RunTimeTicks": 60000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Charlie",
+      "ParentId": "3400de651c2554863400de651c255486",
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 60000000000,
+      "ScreenshotImageTags": [],
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "12",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 500,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    },
+    {
+      "AlbumArtists": [],
+      "ArtistItems": [],
+      "Artists": [],
+      "BackdropImageTags": [
+        "54b73efc7dfff736"
+      ],
+      "CanPlay": true,
+      "Chapters": [],
+      "DateCreated": "1970-01-01T01:06:40.0000000Z",
+      "ExternalUrls": [],
+      "GenreItems": [
+        {
+          "Id": "21f7fa80cd7e0cd921f7fa80cd7e0cd9",
+          "Name": "Comedy"
+        }
+      ],
+      "Genres": [
+        "Comedy"
+      ],
+      "Id": "20",
+      "ImageTags": {
+        "Backdrop": "54b73efc7dfff736",
+        "Primary": "5af85befd13715b8",
+        "Thumb": "512bf5096744f5d6"
+      },
+      "IndexNumber": 1,
+      "IsFolder": false,
+      "LocationType": "FileSystem",
+      "MediaSources": [
+        {
+          "Container": "mp4",
+          "ETag": "0",
+          "Id": "20",
+          "IsRemote": false,
+          "MediaStreams": [
+            {
+              "AspectRatio": "1920:1080",
+              "Height": 1080,
+              "Index": 0,
+              "IsDefault": true,
+              "Type": "Video",
+              "Width": 1920
+            }
+          ],
+          "Name": "Delta E1",
+          "Protocol": "File",
+          "RunTimeTicks": 15000000000,
+          "SupportsDirectPlay": true,
+          "SupportsDirectStream": true,
+          "SupportsTranscoding": true,
+          "Type": "Default",
+          "VideoType": "VideoFile"
+        }
+      ],
+      "MediaType": "Video",
+      "Name": "Delta E1",
+      "ParentId": "204b67669cbeb72d204b67669cbeb72d",
+      "ParentIndexNumber": 1,
+      "People": [],
+      "PlayAccess": "Full",
+      "ProductionLocations": [],
+      "ProductionYear": 2020,
+      "ProviderIds": {},
+      "RemoteTrailers": [],
+      "RunTimeTicks": 15000000000,
+      "ScreenshotImageTags": [],
+      "SeasonId": "204b67669cbeb72d204b67669cbeb72d",
+      "SeasonName": "Season 1",
+      "SeriesId": "594e475a729295c4594e475a729295c4",
+      "SeriesName": "Delta Show",
+      "ServerId": "SERVERID",
+      "Studios": [],
+      "Tags": [],
+      "Trickplay": {},
+      "Type": "Episode",
+      "UserData": {
+        "IsFavorite": false,
+        "Key": "20",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
+    }
+  ],
+  "StartIndex": 0,
+  "TotalRecordCount": 3
+}
