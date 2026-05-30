@@ -514,11 +514,13 @@
             # top-level attr today. Layer B (`tests/client_compat.rs`)
             # is the hard CI gate; Layer A is best-effort, manual.
           ];
-          # ffmpeg-next's *-sys crate runs bindgen over the libav headers
-          # (only when building `--features backend-lib`); bindgen needs
-          # libclang + the libc / clang-builtin include paths (nix doesn't
-          # put them on the default search path). ffmpeg-headless already
-          # exposes the dev libs via pkg-config.
+          # ffmpeg-the-third's *-sys crate runs bindgen over the libav
+          # headers (only when building `--features backend-lib`); bindgen
+          # needs libclang + the libc / clang-builtin include paths (nix
+          # doesn't put them on the default search path). ffmpeg-headless
+          # (8.1) already exposes the dev libs via pkg-config, and
+          # ffmpeg-the-third v5 supports ffmpeg 8.1 — so the FFI build
+          # links the same ffmpeg the runtime uses (no version pin needed).
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           BINDGEN_EXTRA_CLANG_ARGS =
             "-isystem ${pkgs.llvmPackages.libclang.lib}/lib/clang/${
@@ -528,14 +530,6 @@
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
             export JELLYFIN_WEB_DIR=${pkgs.jellyfin-web}/share/jellyfin-web
-            # FFI backend (`--features backend-lib`) links libav via
-            # pkg-config. The Rust bindings (ffmpeg-the-third) top out at
-            # ffmpeg 7.1 and #include avfft.h (gone in ffmpeg 8), so the
-            # *runtime* ffmpeg binary stays 8.x but the FFI worker links
-            # ffmpeg 7.1.3 — prepend its pkgconfig so it wins, and put its
-            # libs on the runtime search path for the linked worker.
-            export PKG_CONFIG_PATH="${pkgs.ffmpeg_7.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-            export LD_LIBRARY_PATH="${pkgs.ffmpeg_7.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             # Test fixtures for `cargo nextest run -- --ignored
             # ffmpeg_integration`. Built once in /nix/store, cached
             # across CI + dev. Tests skip when env unset.
