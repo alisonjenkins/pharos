@@ -3,12 +3,18 @@
 
 use futures_util::stream::StreamExt;
 use pharos_core::{
-    AlternateMediaSource, DomainError, DomainResult, Fingerprint, GenreStore, MediaId, MediaItem,
-    MediaKind, MediaStore, Prober, ScanOutcome, Scanner, SeriesInfo,
+    AlternateMediaSource, ArtworkSource, DomainError, DomainResult, Fingerprint, GenreStore,
+    MediaId, MediaItem, MediaKind, MediaStore, MetadataRequest, MetadataResult, Prober,
+    ScanOutcome, Scanner, SeriesInfo,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
+
+use crate::metadata::{
+    filename::FilenameProvider, nfo::NfoProvider, sidecar::SidecarArtworkProvider, MetadataResolver,
+};
 
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "mov", "avi", "webm", "m4v", "flac", "mp3", "opus", "m4a", "ogg", "wav",
@@ -69,7 +75,7 @@ pub enum PathUpdate {
     Skipped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FsScanner<P: Prober> {
     prober: P,
     extensions: HashSet<String>,
@@ -81,6 +87,37 @@ pub struct FsScanner<P: Prober> {
     /// sqlite single-writer), but the per-file probe (the expensive,
     /// IO/CPU-bound step) runs concurrently with this degree.
     probe_concurrency: usize,
+    /// LIB-D7 — local-first metadata resolution. Consulted in the parallel
+    /// probe phase (its NFO read + sidecar `stat` are FS IO, off the async
+    /// reactor — V5) and the merged [`MetadataResult`] is written alongside
+    /// the item in the serial write phase. `Arc` so the scanner stays cheap
+    /// to `Clone` (the resolver's boxed providers aren't `Clone`). Defaults
+    /// to the local provider set (NFO ▸ sidecar ▸ filename); swappable via
+    /// [`with_resolver`](Self::with_resolver) for tests.
+    resolver: Arc<MetadataResolver>,
+}
+
+impl<P: Prober> std::fmt::Debug for FsScanner<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsScanner")
+            .field("extensions", &self.extensions.len())
+            .field("rate_limit", &self.rate_limit)
+            .field("probe_concurrency", &self.probe_concurrency)
+            .field("metadata_providers", &self.resolver.provider_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// LIB-D7 — the default local-first provider set wired into every
+/// production scanner: the Kodi NFO reader (highest priority — a
+/// user-curated `.nfo` wins), sidecar artwork detection, and filename /
+/// folder conventions (lowest — a last-resort title/year guess). Online
+/// providers slot in later at lower priority than NFO.
+fn default_resolver() -> MetadataResolver {
+    MetadataResolver::new()
+        .with_provider(NfoProvider::new())
+        .with_provider(SidecarArtworkProvider::new())
+        .with_provider(FilenameProvider::new())
 }
 
 impl<P: Prober> FsScanner<P> {
@@ -93,6 +130,7 @@ impl<P: Prober> FsScanner<P> {
                 .collect(),
             rate_limit: std::time::Duration::ZERO,
             probe_concurrency: default_probe_concurrency(),
+            resolver: Arc::new(default_resolver()),
         }
     }
 
@@ -102,7 +140,17 @@ impl<P: Prober> FsScanner<P> {
             extensions: exts.into_iter().collect(),
             rate_limit: std::time::Duration::ZERO,
             probe_concurrency: default_probe_concurrency(),
+            resolver: Arc::new(default_resolver()),
         }
+    }
+
+    /// LIB-D7 — override the metadata resolver. Production callers use the
+    /// default local provider set (NFO ▸ sidecar ▸ filename); this is a test
+    /// seam to inject a fixed/empty resolver, mirroring
+    /// [`with_probe_concurrency`](Self::with_probe_concurrency).
+    pub fn with_resolver(mut self, resolver: MetadataResolver) -> Self {
+        self.resolver = Arc::new(resolver);
+        self
     }
 
     /// LIB-A8 — snapshot of the recognised-extension set, for a watcher that
@@ -338,27 +386,42 @@ impl<P: Prober> FsScanner<P> {
                             .ok(),
                     };
                     let item = self.probe_with_alternates(p.primary, p.alts).await;
-                    (p.id, p.sig, p.existed, fp, item)
+                    // LIB-D7 — resolve local-first metadata in the SAME
+                    // off-reactor/parallel phase as the probe (its NFO read +
+                    // sidecar stat are FS IO — V5). A resolution failure on
+                    // one file never aborts the scan (V6); `resolve` returns
+                    // an empty result for a missing/partial source and logs +
+                    // skips a provider that errors. Only resolve for an item
+                    // we actually probed — a probe miss writes nothing.
+                    let meta = match &item {
+                        Some(it) => self.resolve_metadata(it).await,
+                        None => MetadataResult::default(),
+                    };
+                    (p.id, p.sig, p.existed, fp, item, meta)
                 }
             })
             .buffer_unordered(self.probe_concurrency);
 
-        while let Some((_id, sig, existed, fp, item)) = stream.next().await {
-            let Some(item) = item else { continue };
+        while let Some((_id, sig, existed, fp, item, meta)) = stream.next().await {
+            let Some(mut item) = item else { continue };
             let item_id = item.id;
-            // LIB-C4 — capture genre names before `put` consumes the item.
-            let genres = item
-                .probe
-                .genre
-                .as_deref()
-                .map(pharos_core::split_genre_field)
-                .unwrap_or_default();
+            // LIB-D7 — merge resolved metadata onto the probe-built item
+            // BEFORE `put` (which consumes it). `merge_metadata_into_item`
+            // also returns the UNION of probe + NFO genres and consumes the
+            // artwork refs, so we capture them here (genres + artwork are
+            // applied after the row exists — FK on item id).
+            let (genres, artwork) = merge_metadata_into_item(&mut item, meta);
             store.put(item).await?;
-            // LIB-C4 — populate the item_genres join from the probe's
-            // (possibly comma/pipe-separated) genre string. The DISTINCT
-            // probe.genre column stays for back-compat; this is the
-            // entity-backed path /Genres + ParentId=<genre> resolve against.
+            // LIB-C4 — populate the item_genres join. UNION of the probe's
+            // (possibly comma/pipe-separated) `genre` column with the NFO
+            // `<genre>` tags resolved above; `link_item_genres` is idempotent
+            // (de-dupes), so the union never double-inserts.
             store.link_item_genres(item_id, &genres).await?;
+            // LIB-D7 — persist discovered artwork (local sidecars from D4 +
+            // any NFO thumb/fanart URLs) keyed by item id + role. One row per
+            // role; the resolver fed refs in priority order so the first per
+            // role is the winner. `set_artwork` upserts.
+            persist_artwork(store, item_id, &artwork).await?;
             // Persist the freshly-stat'd signature so the next scan can
             // skip this file. mark_seen is an UPDATE — the put() above
             // guarantees the row exists first.
@@ -512,21 +575,23 @@ impl<P: Prober> FsScanner<P> {
             Some(fp) => Some(fp),
             None => crate::fingerprint::fingerprint_async(path, None).await.ok(),
         };
-        let Some(item) = self.probe_one(path.to_path_buf()).await else {
+        let Some(mut item) = self.probe_one(path.to_path_buf()).await else {
             // V6 — probe failed, already logged in `probe_one`. No write.
             return Ok(PathUpdate::Skipped);
         };
         let item_id = item.id;
-        // LIB-C4 — capture genres before `put` consumes the item.
-        let genres = item
-            .probe
-            .genre
-            .as_deref()
-            .map(pharos_core::split_genre_field)
-            .unwrap_or_default();
+        // LIB-D7 — resolve local-first metadata for the (re)probed file, off
+        // the reactor, and merge it onto the item before `put` (mirrors the
+        // batch scan_into path so a watched create/modify enriches the same
+        // way a full scan does). A bad NFO / sidecar is logged + skipped by
+        // the resolver (V6); the item still imports from probe data.
+        let meta = self.resolve_metadata(&item).await;
+        let (genres, artwork) = merge_metadata_into_item(&mut item, meta);
         store.put(item).await?;
-        // LIB-C4 — keep the item_genres join in step with the probe.
+        // LIB-C4 — keep the item_genres join in step (probe ∪ NFO genres).
         store.link_item_genres(item_id, &genres).await?;
+        // LIB-D7 — persist discovered artwork (FK on the row just put).
+        persist_artwork(store, item_id, &artwork).await?;
         if let Some((mtime, size)) = sig {
             store.mark_seen(item_id, scan_id, mtime, size).await?;
         }
@@ -587,6 +652,23 @@ impl<P: Prober> FsScanner<P> {
         Some(item)
     }
 
+    /// LIB-D7 — resolve local-first metadata for a freshly-probed `item`.
+    /// Builds a [`MetadataRequest`] borrowing the item's path / kind / probe
+    /// / series and runs the resolver (NFO ▸ sidecar ▸ filename). Runs in the
+    /// parallel probe phase so the NFO read + sidecar `stat` stay off the
+    /// async reactor (V5). The resolver never returns `Err` — a malformed
+    /// NFO / unreadable sidecar is logged + skipped inside `resolve` (V6) and
+    /// the item is still imported from probe data.
+    async fn resolve_metadata(&self, item: &MediaItem) -> MetadataResult {
+        let req = MetadataRequest {
+            path: &item.path,
+            kind: item.kind,
+            probe: &item.probe,
+            series: item.series.as_ref(),
+        };
+        self.resolver.resolve(&req).await
+    }
+
     async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
         match self.prober.probe(&path).await {
             Ok(info) => {
@@ -640,6 +722,137 @@ impl<P: Prober> FsScanner<P> {
     }
 }
 
+/// LIB-D7 — merge a resolved [`MetadataResult`] onto a probe-built
+/// [`MediaItem`] in place, then return the side-effects the caller must
+/// apply once the row exists: `(genres, artwork)`.
+///
+/// Scalars (`overview` / `tagline` / `production_year` / `premiere_date` /
+/// ratings / `official_rating` / each `provider_ids` slot) overwrite the
+/// item's `Default`-empty [`MediaMetadata`] when the resolver found a value
+/// (the resolver already applied priority — first `Some` wins — so anything
+/// present here is the winning source). The **title** prefers the
+/// NFO/clean resolver title over the raw filename stem the probe set.
+///
+/// Genres are the UNION of the probe's `genre` column (split on `|`/`,`) and
+/// the NFO `<genre>` tags, de-duped in that order (probe first for stable
+/// ordering). `people` / `studios` / `tags` / `collections` have no store
+/// table this run — they are logged at `debug` as dropped counts (visible
+/// but never fatal) and not persisted.
+fn merge_metadata_into_item(
+    item: &mut MediaItem,
+    meta: MetadataResult,
+) -> (Vec<String>, Vec<pharos_core::ArtworkRef>) {
+    let MetadataResult {
+        title,
+        overview,
+        tagline,
+        production_year,
+        premiere_date,
+        community_rating,
+        critic_rating,
+        official_rating,
+        genres: nfo_genres,
+        studios,
+        people,
+        tags,
+        collections,
+        provider_ids,
+        artwork,
+    } = meta;
+
+    // Title: prefer a non-empty resolved (NFO/clean) title over the raw
+    // filename stem the probe assigned. A blank NFO <title> is ignored.
+    if let Some(t) = title {
+        let t = t.trim();
+        if !t.is_empty() {
+            item.title = t.to_string();
+        }
+    }
+
+    let md = &mut item.metadata;
+    set_some(&mut md.overview, overview);
+    set_some(&mut md.tagline, tagline);
+    set_some(&mut md.production_year, production_year);
+    set_some(&mut md.premiere_date, premiere_date);
+    set_some(&mut md.community_rating, community_rating);
+    set_some(&mut md.critic_rating, critic_rating);
+    set_some(&mut md.official_rating, official_rating);
+    set_some(&mut md.provider_ids.tmdb, provider_ids.tmdb);
+    set_some(&mut md.provider_ids.tvdb, provider_ids.tvdb);
+    set_some(&mut md.provider_ids.imdb, provider_ids.imdb);
+    set_some(&mut md.provider_ids.mbid, provider_ids.mbid);
+
+    // Genre union: probe column first (stable order), then NFO tags.
+    let probe_genres = item
+        .probe
+        .genre
+        .as_deref()
+        .map(pharos_core::split_genre_field)
+        .unwrap_or_default();
+    let mut genres: Vec<String> = Vec::with_capacity(probe_genres.len() + nfo_genres.len());
+    for g in probe_genres.into_iter().chain(nfo_genres) {
+        let g = g.trim().to_string();
+        if !g.is_empty() && !genres.iter().any(|e| e == &g) {
+            genres.push(g);
+        }
+    }
+
+    // LIB-D7 — entities with no table yet: carried by the resolver, logged
+    // as dropped so the gap is observable, never fatal.
+    if !people.is_empty() || !studios.is_empty() || !tags.is_empty() || !collections.is_empty() {
+        tracing::debug!(
+            item_id = item.id,
+            path = %item.path.display(),
+            people = people.len(),
+            studios = studios.len(),
+            tags = tags.len(),
+            collections = collections.len(),
+            "resolved metadata entities with no store table this run; dropped (not persisted)"
+        );
+    }
+
+    (genres, artwork)
+}
+
+/// Overwrite `slot` with `value` only when the resolver produced one. The
+/// item's metadata starts `Default`-empty, so this is just "take the
+/// resolved value when present" — priority was already applied by the
+/// resolver's first-`Some`-wins merge.
+fn set_some<T>(slot: &mut Option<T>, value: Option<T>) {
+    if value.is_some() {
+        *slot = value;
+    }
+}
+
+/// LIB-D7 — persist resolved artwork refs via [`MediaStore::set_artwork`],
+/// one upsert per `(item, role)`. A [`ArtworkSource::LocalFile`] is recorded
+/// as `source="local"` with the absolute path; a [`ArtworkSource::Url`] as
+/// `source="url"` for a later download pass. The resolver fed refs in
+/// priority order and de-duped on `(role, source)`; the first per role wins,
+/// and `set_artwork`'s upsert keeps it.
+async fn persist_artwork<S: MediaStore>(
+    store: &S,
+    item_id: MediaId,
+    artwork: &[pharos_core::ArtworkRef],
+) -> DomainResult<()> {
+    let mut written: HashSet<&'static str> = HashSet::new();
+    for art in artwork {
+        let role = art.role.as_str();
+        // One row per role; the first ref for a role (highest priority,
+        // post-dedupe) is the winner — skip later refs for the same role so
+        // a lower-priority source can't clobber the upsert.
+        if !written.insert(role) {
+            continue;
+        }
+        let (source, locator) = match &art.source {
+            ArtworkSource::LocalFile(p) => ("local", p.to_string_lossy().into_owned()),
+            ArtworkSource::Url(u) => ("url", u.clone()),
+        };
+        store.set_artwork(item_id, role, source, &locator).await?;
+    }
+    Ok(())
+}
+
 impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
     #[tracing::instrument(skip(self), fields(root = %root.display()))]
     async fn scan(&self, root: &Path) -> DomainResult<Vec<MediaItem>> {
@@ -662,7 +875,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
 /// `AlternateMediaSource` of the matching primary instead of a
 /// standalone library item. Matched case-insensitively against the
 /// trailing ` - Edition` portion of the file stem.
-const KNOWN_EDITIONS: &[&str] = &[
+pub(crate) const KNOWN_EDITIONS: &[&str] = &[
     "director's cut",
     "directors cut",
     "extended",
@@ -700,7 +913,7 @@ pub fn split_edition_tag(stem: &str) -> Option<(&str, &str)> {
     Some((left.trim(), edition))
 }
 
-fn is_known_edition(s: &str) -> bool {
+pub(crate) fn is_known_edition(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     KNOWN_EDITIONS.iter().any(|e| *e == lower)
 }
@@ -922,7 +1135,7 @@ fn strip_trailing_year(name: &str) -> &str {
 /// (`Cosmos (1980)` → `1980`). Returns `None` when the folder carries no
 /// such marker. Restricted to a plausible 1800–2999 window so a
 /// parenthesised non-year (e.g. `(Uncut)`, `(1)`) doesn't masquerade.
-fn parse_folder_year(folder_name: &str) -> Option<u32> {
+pub(crate) fn parse_folder_year(folder_name: &str) -> Option<u32> {
     let trimmed = folder_name.trim_end();
     let close = trimmed.strip_suffix(')')?;
     let open = close.rfind('(')?;
@@ -1059,6 +1272,8 @@ mod tests {
         next_scan_id: AtomicI64,
         // LIB-C4 — item_genres mirror: item id → its linked genre names.
         item_genres: Mutex<HashMap<MediaId, Vec<String>>>,
+        // LIB-D4 — artwork mirror: (item id, role) → (source, locator).
+        artwork: Mutex<HashMap<(MediaId, String), (String, String)>>,
     }
 
     impl MediaStore for MemStore {
@@ -1219,6 +1434,42 @@ mod tests {
                 item.path = new_path.to_path_buf();
             }
             Ok(())
+        }
+
+        async fn set_artwork(
+            &self,
+            item_id: MediaId,
+            role: &str,
+            source: &str,
+            locator: &str,
+        ) -> DomainResult<()> {
+            self.artwork
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(
+                    (item_id, role.to_string()),
+                    (source.to_string(), locator.to_string()),
+                );
+            Ok(())
+        }
+
+        async fn artwork_for(
+            &self,
+            item_id: MediaId,
+        ) -> DomainResult<Vec<(String, String, String)>> {
+            let map = self
+                .artwork
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut out: Vec<(String, String, String)> = map
+                .iter()
+                .filter(|((iid, _), _)| *iid == item_id)
+                .map(|((_, role), (source, locator))| {
+                    (role.clone(), source.clone(), locator.clone())
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
         }
     }
 
@@ -2124,5 +2375,197 @@ mod tests {
         assert_eq!(edition_id_slug("Director's Cut"), "director-s-cut");
         assert_eq!(edition_id_slug("IMAX"), "imax");
         assert_eq!(edition_id_slug("Extended Edition"), "extended-edition");
+    }
+
+    // ---- LIB-D7: resolver wired into scan_into ------------------------
+
+    /// Read a single item out of the MemStore by its path-derived id.
+    fn item_by_path(store: &MemStore, path: &Path) -> MediaItem {
+        let id = stable_id(path);
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no item for {}", path.display()))
+    }
+
+    /// The genre names linked to the item at `path` (via the item_genres
+    /// mirror — the same join /Genres + ParentId resolve against).
+    fn genres_for(store: &MemStore, path: &Path) -> Vec<String> {
+        let id = stable_id(path);
+        store
+            .item_genres
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn scan_populates_metadata_genre_and_artwork_from_local_sources() {
+        // A movie with a sibling Kodi NFO (overview / year / rating / genre /
+        // tmdbid) and a poster.jpg sidecar. After a scan the EPIC C fields
+        // are populated from the NFO, the genre is linked, and a Primary
+        // artwork row points at the poster — the whole local-first pipeline.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Movie (2017).mkv", b"video-bytes").await;
+        write_file(
+            td.path(),
+            "Movie (2017).nfo",
+            br#"<?xml version="1.0"?>
+<movie>
+  <title>The Real Movie</title>
+  <plot>An epic synopsis.</plot>
+  <year>2017</year>
+  <rating>8.4</rating>
+  <genre>Science Fiction</genre>
+  <uniqueid type="tmdb">12345</uniqueid>
+</movie>"#,
+        )
+        .await;
+        write_file(td.path(), "poster.jpg", b"\xff\xd8\xff\xe0jpeg").await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 1, "the movie should be imported");
+
+        let movie_path = td.path().join("Movie (2017).mkv");
+        let item = item_by_path(&store, &movie_path);
+
+        // NFO scalars merged onto MediaMetadata.
+        assert_eq!(item.metadata.overview.as_deref(), Some("An epic synopsis."));
+        assert_eq!(item.metadata.production_year, Some(2017));
+        assert_eq!(item.metadata.community_rating, Some(8.4));
+        assert_eq!(item.metadata.provider_ids.tmdb.as_deref(), Some("12345"));
+        // NFO <title> wins over the filename stem.
+        assert_eq!(item.title, "The Real Movie");
+
+        // Genre linked into the item_genres join.
+        assert_eq!(genres_for(&store, &movie_path), vec!["Science Fiction"]);
+
+        // Primary artwork row points at the poster sidecar.
+        let id = stable_id(&movie_path);
+        let art = store.artwork_for(id).await.unwrap();
+        let primary = art
+            .iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("a Primary artwork row");
+        assert_eq!(primary.1, "local");
+        assert!(
+            primary.2.ends_with("poster.jpg"),
+            "Primary should point at poster.jpg, got {}",
+            primary.2
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_nfo_still_imports_from_probe_and_scan_completes() {
+        // V6 — a truncated / malformed NFO makes the NFO provider return Err;
+        // the resolver logs + skips it and the item is still imported from
+        // probe data with empty descriptive metadata. The scan never aborts.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Broken.mkv", b"video").await;
+        write_file(td.path(), "Broken.nfo", b"<movie><title>oops</tit").await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            outcome.added.len(),
+            1,
+            "scan completed and imported the file"
+        );
+
+        let item = item_by_path(&store, &td.path().join("Broken.mkv"));
+        // No metadata bled through from the broken NFO. (Filename provider
+        // may still set a title/year, but the NFO scalars must be absent.)
+        assert_eq!(item.metadata.overview, None);
+        assert_eq!(item.metadata.community_rating, None);
+        assert!(item.metadata.provider_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_with_no_sidecars_imports_with_empty_metadata() {
+        // No NFO, no sidecar art: the item imports from probe data with empty
+        // descriptive metadata and no artwork rows. (The filename provider
+        // derives a title/year but leaves overview/ratings/ids empty.)
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Lonely.mkv", b"video").await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let movie_path = td.path().join("Lonely.mkv");
+        let item = item_by_path(&store, &movie_path);
+        assert_eq!(item.metadata.overview, None);
+        assert_eq!(item.metadata.community_rating, None);
+        assert!(item.metadata.provider_ids.is_empty());
+
+        let art = store.artwork_for(stable_id(&movie_path)).await.unwrap();
+        assert!(
+            art.is_empty(),
+            "no sidecars => no artwork rows, got {art:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_genre_and_nfo_genre_union_without_duplicates() {
+        // The probe's embedded genre and the NFO <genre> tags are UNIONed
+        // (probe first), de-duped — an overlap is not double-linked.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Mix.mkv", b"video").await;
+        write_file(
+            td.path(),
+            "Mix.nfo",
+            br#"<movie><genre>Drama</genre><genre>Action</genre></movie>"#,
+        )
+        .await;
+
+        let prober = FakeProber {
+            genre: Some("Drama, Thriller".into()),
+            ..Default::default()
+        };
+        let s = FsScanner::new(prober);
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let mut g = genres_for(&store, &td.path().join("Mix.mkv"));
+        g.sort();
+        // Drama (probe ∩ NFO) appears once; union = {Drama, Thriller, Action}.
+        assert_eq!(g, vec!["Action", "Drama", "Thriller"]);
+    }
+
+    #[tokio::test]
+    async fn empty_resolver_keeps_probe_data_only() {
+        // with_resolver(empty) — no providers — leaves metadata/title/artwork
+        // exactly as the probe produced them (no NFO/sidecar/filename merge).
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Plain (2020).mkv", b"video").await;
+        write_file(
+            td.path(),
+            "Plain (2020).nfo",
+            br#"<movie><title>Ignored</title><plot>nope</plot></movie>"#,
+        )
+        .await;
+
+        let s = FsScanner::new(FakeProber::default()).with_resolver(MetadataResolver::new());
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let movie_path = td.path().join("Plain (2020).mkv");
+        let item = item_by_path(&store, &movie_path);
+        // Title stays the raw filename stem; NFO is never read.
+        assert_eq!(item.title, "Plain (2020)");
+        assert_eq!(item.metadata.overview, None);
+        assert!(store
+            .artwork_for(stable_id(&movie_path))
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
