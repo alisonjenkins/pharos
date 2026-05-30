@@ -114,6 +114,204 @@ impl ProviderIds {
     }
 }
 
+/// LIB-D1 — artwork image role. Mirrors `pharos_cache::ImageRole` but
+/// lives in core (V12: core must not depend on `pharos-cache`). The cache
+/// crate maps its `ImageRole` from this enum, the same pattern by which
+/// [`MediaKind`] is shared across crates. The Jellyfin image API serves
+/// each role under its canonical token (`Primary` / `Backdrop` / ...).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArtworkRole {
+    /// Poster / cover. `poster.jpg` / `folder.jpg` / `cover.jpg`.
+    #[default]
+    Primary,
+    /// Background art. `fanart.jpg` / `backdrop.jpg`.
+    Backdrop,
+    /// Wide thumbnail. `<name>-thumb.jpg`.
+    Thumb,
+    /// Transparent logo. `logo.png` / `clearlogo.png`.
+    Logo,
+    /// Banner strip. `banner.jpg`.
+    Banner,
+    /// Disc / CD art. `disc.png`.
+    Disc,
+    /// Clear-art. `clearart.png`.
+    Art,
+}
+
+impl ArtworkRole {
+    /// Canonical Jellyfin `ImageType` token for this role.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArtworkRole::Primary => "Primary",
+            ArtworkRole::Backdrop => "Backdrop",
+            ArtworkRole::Thumb => "Thumb",
+            ArtworkRole::Logo => "Logo",
+            ArtworkRole::Banner => "Banner",
+            ArtworkRole::Disc => "Disc",
+            ArtworkRole::Art => "Art",
+        }
+    }
+}
+
+/// LIB-D1 — where the bytes for an [`ArtworkRef`] come from. A local-first
+/// scan yields [`ArtworkSource::LocalFile`] (a sibling sidecar discovered
+/// on disk); a future online provider yields [`ArtworkSource::Url`] (to be
+/// fetched + cached lazily). The D5 image-serving branch reads
+/// `LocalFile` paths directly; `Url` is carried now and persisted later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtworkSource {
+    /// A sidecar image file already on the user's disk.
+    LocalFile(PathBuf),
+    /// A remote image URL (online providers, fetched + cached lazily).
+    Url(String),
+}
+
+/// LIB-D1 — one discovered/resolved artwork image for an item: its [role]
+/// plus where the bytes live ([source]). Produced by a
+/// [`MetadataProvider`] and merged (union + dedupe) by the resolver; D4
+/// persists `LocalFile` refs into the `artwork` table keyed by item id +
+/// role.
+///
+/// [role]: ArtworkRef::role
+/// [source]: ArtworkRef::source
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkRef {
+    pub role: ArtworkRole,
+    pub source: ArtworkSource,
+}
+
+/// LIB-D1 — the kind of credit a [`PersonRef`] carries. `Other` is the
+/// fallback for NFO `<type>` strings outside the common vocabulary so a
+/// malformed/unknown role never drops the person.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PersonKind {
+    #[default]
+    Actor,
+    Director,
+    Writer,
+    Producer,
+    Composer,
+    GuestStar,
+    Other,
+}
+
+impl PersonKind {
+    /// Canonical Jellyfin `PersonType` token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PersonKind::Actor => "Actor",
+            PersonKind::Director => "Director",
+            PersonKind::Writer => "Writer",
+            PersonKind::Producer => "Producer",
+            PersonKind::Composer => "Composer",
+            PersonKind::GuestStar => "GuestStar",
+            PersonKind::Other => "Other",
+        }
+    }
+}
+
+/// LIB-D1 — one person credit (cast / crew) carried by a
+/// [`MetadataResult`]. People have no store table yet (a later slice adds
+/// `people` + `item_people`); D7 carries these through the merge and logs
+/// them as not-yet-persisted. `role` is the free-form NFO `<role>` string
+/// (e.g. department) distinct from the structured [`kind`]; `character` is
+/// the played character for cast; `sort_order` preserves NFO ordering.
+///
+/// [kind]: PersonRef::kind
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonRef {
+    pub name: String,
+    pub role: Option<String>,
+    pub kind: PersonKind,
+    pub character: Option<String>,
+    pub sort_order: Option<u32>,
+}
+
+/// LIB-D1 — inputs a [`MetadataProvider`] resolves metadata from. Borrows
+/// everything (no owned allocation per request): the media `path` (for
+/// sidecar / NFO lookup), its [`MediaKind`] (so a provider can early-out
+/// via [`supports`](MetadataProvider::supports)), the already-computed
+/// [`MediaProbe`] (embedded tags a provider may fold in), and the
+/// `series` hierarchy when the item is an episode (for show-level NFO /
+/// season-level art). Lifetime `'a` ties the borrows to the scan closure.
+#[derive(Debug, Clone, Copy)]
+pub struct MetadataRequest<'a> {
+    pub path: &'a std::path::Path,
+    pub kind: MediaKind,
+    pub probe: &'a MediaProbe,
+    pub series: Option<&'a SeriesInfo>,
+}
+
+/// LIB-D1 — the merge-friendly result of one [`MetadataProvider::fetch`].
+/// Every scalar is `Option` so the [`MetadataResolver`] can priority-merge
+/// ("first `Some` by provider priority wins"); the `Vec` fields union +
+/// dedupe across providers. `Default` = wholly empty (a provider that
+/// found nothing returns this rather than erroring — V6 spirit).
+///
+/// Only a subset has a persistence home today: `overview` / `tagline` /
+/// ratings / years / `provider_ids` land on [`MediaMetadata`], `genres`
+/// on the genre join, and `artwork` (LocalFile refs) on the D4 artwork
+/// table. `studios` / `people` / `tags` / `collections` are CARRIED now
+/// even though their tables don't exist yet — D7 logs them as
+/// not-yet-persisted and a later slice adds the tables.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MetadataResult {
+    /// Canonical title override (NFO `<title>`); `None` keeps the
+    /// scanner's filename-derived title.
+    pub title: Option<String>,
+    pub overview: Option<String>,
+    pub tagline: Option<String>,
+    pub production_year: Option<u32>,
+    pub premiere_date: Option<i64>,
+    pub community_rating: Option<f32>,
+    pub critic_rating: Option<f32>,
+    pub official_rating: Option<String>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    pub people: Vec<PersonRef>,
+    pub tags: Vec<String>,
+    pub collections: Vec<String>,
+    pub provider_ids: ProviderIds,
+    pub artwork: Vec<ArtworkRef>,
+}
+
+/// LIB-D1 — a source of descriptive metadata for a scanned item (local
+/// NFO, sidecar art, filename convention, or a future online provider).
+/// Declared here (V12: IO-free) so the resolver and store live in core;
+/// the IO-bearing impls (NFO XML read, sidecar `stat`) live in
+/// `pharos-scanner` exactly as [`Prober`] is declared here but
+/// `FfmpegProber` is implemented there.
+///
+/// Providers are ordered by [`priority`](Self::priority) (highest first)
+/// when merged: a local NFO edit (high priority) wins a scalar field over
+/// an online provider (lower priority). `fetch` returns owned
+/// [`MetadataResult`] data — no IO type leaks into core. A provider that
+/// finds nothing returns an empty result; one that hits an IO/parse error
+/// returns `Err`, which the resolver logs + skips (V6) rather than
+/// aborting the whole merge.
+pub trait MetadataProvider: Send + Sync {
+    /// Stable identifier for logs/metrics (e.g. `"nfo"`, `"sidecar"`).
+    fn name(&self) -> &'static str;
+
+    /// Merge priority — higher wins a scalar field. Local sources
+    /// (NFO/sidecar) sit above online providers so user-curated local
+    /// edits take precedence.
+    fn priority(&self) -> i32;
+
+    /// Whether this provider can resolve metadata for `kind`. The
+    /// resolver skips providers that don't support the item's kind
+    /// before calling [`fetch`](Self::fetch).
+    fn supports(&self, kind: MediaKind) -> bool;
+
+    /// Resolve metadata for `req`. Owned-data return keeps core IO-free.
+    /// On a missing source return `Ok(MetadataResult::default())`; on an
+    /// IO/parse error return `Err` (the resolver logs + skips it).
+    fn fetch(
+        &self,
+        req: &MetadataRequest<'_>,
+    ) -> impl std::future::Future<Output = DomainResult<MetadataResult>> + Send;
+}
+
 /// LIB-C4 — stable 32-hex wire id for an aggregate entity (genre /
 /// artist / album / studio), keyed on a `kind` namespace + `name`. Pure
 /// arithmetic over the UTF-8 bytes — not IO, so it lives in core (V12
