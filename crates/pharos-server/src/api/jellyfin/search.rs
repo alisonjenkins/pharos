@@ -105,13 +105,48 @@ async fn search_hints(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
 
     let mut hints: Vec<SearchHint> = Vec::new();
-    // 1. Title matches on real items.
-    let filtered: Vec<&MediaItem> = all
-        .iter()
-        .filter(|i| kinds.as_ref().map_or(true, |k| k.contains(&i.kind)))
-        .filter(|i| needle.is_empty() || i.title.to_lowercase().contains(&needle))
-        .collect();
-    for i in &filtered {
+    // 1. Title (+ overview) matches on real items.
+    //
+    // With a term: LIB-B4 full-text search — the backend's FTS (sqlite
+    // fts5 / postgres tsvector) returns ranked, prefix-friendly hits over
+    // title + overview that are a strict SUPERSET of the legacy substring
+    // scan (mid-word substrings included), so results never shrink versus
+    // the old in-memory path.
+    //
+    // Without a term (the "browse everything" case jellyfin-web uses to
+    // pre-populate the search page): FTS matches nothing by contract, so
+    // fall back to listing every item, kind-filtered — preserving the
+    // legacy empty-term-returns-the-corpus behaviour.
+    let term_items: Vec<MediaItem> = if needle.is_empty() {
+        all.iter()
+            .filter(|i| kinds.as_ref().map_or(true, |k| k.contains(&i.kind)))
+            .cloned()
+            .collect()
+    } else {
+        use pharos_core::SearchQuery;
+        let item_kinds = kinds.clone().unwrap_or_default();
+        let term = q.search_term.clone().unwrap_or_default();
+        // Pull a generous window so aggregate hints + the result page can
+        // both draw from it; bounded so a one-letter query can't load the
+        // whole library. The handler re-paginates the combined hint list.
+        let fetch = q
+            .start_index
+            .saturating_add(q.limit)
+            .saturating_add(200)
+            .max(200);
+        let (items, _total) = state
+            .stores
+            .search(&SearchQuery {
+                term: term.trim().to_string(),
+                kinds: item_kinds,
+                limit: fetch,
+                offset: 0,
+            })
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        items
+    };
+    for i in &term_items {
         hints.push(SearchHint {
             item_id: i.id.to_string(),
             id: i.id.to_string(),

@@ -22,6 +22,19 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
+/// LIB-B4 — `MEDIA_COLUMNS` with each column qualified by a table alias,
+/// for the search join (`SELECT m.id, m.path, …` so the FromRow still maps
+/// `MediaRow`'s plain column names).
+fn media_columns_prefixed(alias: &str) -> String {
+    MEDIA_COLUMNS
+        .split(',')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{alias}.{c} AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

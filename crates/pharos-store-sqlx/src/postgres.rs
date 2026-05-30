@@ -39,6 +39,18 @@ use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
+/// LIB-B4 — `MEDIA_COLUMNS` with each column qualified by a table alias,
+/// for the search join (so the FromRow still maps the plain column names).
+fn media_columns_prefixed_pg(alias: &str) -> String {
+    MEDIA_COLUMNS
+        .split(',')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{alias}.{c} AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
