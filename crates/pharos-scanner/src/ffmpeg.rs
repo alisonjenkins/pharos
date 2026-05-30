@@ -94,6 +94,11 @@ struct FfprobeChapterTags {
 
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
+    // `#[serde(default)]` so a single stream lacking `codec_type`
+    // (attachment/data/unknown shapes, or a future ffprobe build) is
+    // ignored rather than failing the whole document's deserialization —
+    // which previously dropped the entire media file from the library.
+    #[serde(default)]
     codec_type: String,
     #[serde(default)]
     index: Option<u32>,

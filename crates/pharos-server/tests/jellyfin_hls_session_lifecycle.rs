@@ -18,6 +18,7 @@
 //! variant clients that bypass the master playlist).
 
 use actix_web::{test, web, App};
+use pharos_cache::HlsSegmentCache;
 use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
     UserRecord, UserStore,
@@ -25,7 +26,6 @@ use pharos_core::{
 use pharos_server::{
     api::jellyfin::{device_profile::Decision, hls},
     auth::BuiltinAuth,
-    hls_cache::HlsSegmentCache,
     state::AppState,
     transcode_sessions::TranscodeSession,
 };

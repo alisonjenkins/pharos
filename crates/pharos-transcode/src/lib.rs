@@ -12,8 +12,17 @@
 //! accelerated impl) happens at the wiring layer.
 
 pub mod backend;
+pub mod device;
 pub mod hwaccel;
+#[cfg(unix)]
+pub mod libav;
 pub mod options;
+#[cfg(unix)]
+pub mod probe;
+pub mod protocol;
+pub mod scheduler;
+#[cfg(unix)]
+pub mod worker;
 
 #[cfg(feature = "backend-lib")]
 pub use backend::LibBackend;
@@ -95,7 +104,8 @@ impl FfmpegTranscoder {
         opts: &TranscodeOptions,
     ) -> Result<TranscodeStream, TranscodeError> {
         let input_str = input.to_str().ok_or(TranscodeError::NonUtf8Path)?;
-        let args = build_args_with_hwaccel(input_str, opts, self.hwaccel);
+        let args =
+            build_args_for_device(input_str, opts, hwaccel_to_device(self.hwaccel), "pipe:1");
         let mut cmd = Command::new(&self.ffmpeg_bin);
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
@@ -176,42 +186,99 @@ where
     }
 }
 
-/// Escape a path for the ffmpeg `subtitles=` filter graph. Filter args
-/// are colon-separated key/value pairs, so the path must escape `\`,
-/// `'`, `:` and `,` to keep ffmpeg's parser from misreading the rest
-/// of the filter chain.
-fn escape_subtitles_path(p: &str) -> String {
+/// Quote + escape a path for the ffmpeg `subtitles=filename=…` filter
+/// argument. We wrap the whole filename in single quotes so the
+/// filtergraph metacharacters `: , [ ] ;` inside the path are taken
+/// literally (the previous char-by-char escaping missed `[ ] ;` and
+/// emitted the value unquoted — a real bug: any library path like
+/// `/m/[Group] Title [1080p].mkv` aborted the encode). Inside the
+/// quotes only `\` and `'` need handling; ffmpeg's quote syntax escapes
+/// an embedded single quote as `'\''`.
+fn escape_subtitles_filename(p: &str) -> String {
     let mut out = String::with_capacity(p.len() + 8);
+    out.push('\'');
     for c in p.chars() {
         match c {
+            '\'' => out.push_str("'\\''"),
             '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            ':' => out.push_str("\\:"),
-            ',' => out.push_str("\\,"),
             _ => out.push(c),
         }
     }
+    out.push('\'');
     out
 }
 
 #[cfg(test)]
 fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
-    build_args_with_hwaccel(input, opts, HwAccel::Off)
+    build_args_for_device(input, opts, crate::protocol::DeviceId::Cpu, "pipe:1")
 }
 
-fn build_args_with_hwaccel(input: &str, opts: &TranscodeOptions, hwaccel: HwAccel) -> Vec<String> {
+/// Map a legacy `HwAccel` selection to a concrete `DeviceId` (GPU
+/// ordinal 0). `Off`/`Auto` → CPU (software).
+fn hwaccel_to_device(h: HwAccel) -> crate::protocol::DeviceId {
+    match h {
+        HwAccel::Off | HwAccel::Auto => crate::protocol::DeviceId::Cpu,
+        a => crate::protocol::DeviceId::hw(a, 0),
+    }
+}
+
+/// Build the ffmpeg argv for a transcode whose output goes to `output`
+/// (`"pipe:1"` for streaming, or a file path for the worker's
+/// `FileDirect` sink) on a concrete `device`. Exposed so the
+/// out-of-process worker reuses the exact same negotiated argument logic
+/// as the in-process transcoder.
+pub fn ffmpeg_transcode_args(
+    input: &str,
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    output: &str,
+) -> Vec<String> {
+    build_args_for_device(input, opts, device, output)
+}
+
+fn build_args_for_device(
+    input: &str,
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    output: &str,
+) -> Vec<String> {
+    use crate::protocol::DeviceId;
+    let hwaccel = device.hwaccel();
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
         "-nostdin".into(),
     ];
-    if let Some(pos) = opts.start_position_seconds() {
-        a.push("-ss".into());
-        a.push(format!("{pos:.3}"));
+    // VAAPI: select the render node BEFORE `-i` so the `hwupload` filter
+    // resolves the default device. Each GPU is a distinct render node.
+    if let Some(node) = device.vaapi_render_node() {
+        a.push("-vaapi_device".into());
+        a.push(node);
+    }
+    // Seek placement: input seeking (`-ss` before `-i`) is fast but
+    // desyncs a burned-in subtitles filter (which demuxes the file from
+    // 0 with original PTS). When burning subtitles at a non-zero start,
+    // use output seeking (`-ss` after `-i`) to keep video + subs aligned.
+    let burning_subs = opts.video.is_some()
+        && !matches!(opts.video, Some(VideoCodec::Copy))
+        && opts.burn_subtitle_stream_index.is_some();
+    let start = opts.start_position_seconds();
+    if let Some(pos) = start {
+        if !burning_subs {
+            a.push("-ss".into());
+            a.push(format!("{pos:.3}"));
+        }
     }
     a.push("-i".into());
     a.push(input.to_string());
+    if let Some(pos) = start {
+        if burning_subs {
+            // Output-side seek keeps the subtitles filter in sync.
+            a.push("-ss".into());
+            a.push(format!("{pos:.3}"));
+        }
+    }
     if let Some(dur) = opts.duration_seconds() {
         a.push("-t".into());
         a.push(format!("{dur:.3}"));
@@ -233,29 +300,83 @@ fn build_args_with_hwaccel(input: &str, opts: &TranscodeOptions, hwaccel: HwAcce
             a.push("copy".into());
         }
         Some(c) => {
-            a.push("-c:v".into());
-            // P14 — swap libx264/libx265 for the platform hw encoder
-            // when the transcoder was wired with one. Other codecs
-            // (no hw mapping) fall through to the software default.
-            let encoder = match c {
-                VideoCodec::H264 => hwaccel.h264_encoder().unwrap_or(c.ffmpeg_codec()),
-                VideoCodec::H265 => hwaccel.hevc_encoder().unwrap_or(c.ffmpeg_codec()),
-                _ => c.ffmpeg_codec(),
-            };
-            a.push(encoder.into());
-            if let Some(b) = opts.video_bitrate_bps {
-                a.push("-b:v".into());
-                a.push(format!("{b}"));
-            }
-            // W2 — burn the chosen subtitle stream into the video
-            // frames via the `subtitles` filter. Skipped on `Copy`
-            // (filtering requires re-encode) and on `None` (no video).
+            // Compose the software filter prefix (subtitle burn-in) that
+            // must run before any hardware upload.
+            let mut vf_parts: Vec<String> = Vec::new();
             if let Some(sub_idx) = opts.burn_subtitle_stream_index {
-                a.push("-vf".into());
-                a.push(format!(
-                    "subtitles={}:si={sub_idx}",
-                    escape_subtitles_path(input)
+                vf_parts.push(format!(
+                    "subtitles=filename={}:si={sub_idx}",
+                    escape_subtitles_filename(input)
                 ));
+            }
+            let is_vaapi = matches!(
+                device,
+                DeviceId::Hw {
+                    accel: HwAccel::Vaapi,
+                    ..
+                }
+            );
+            if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
+                // VAAPI: upload frames to the GPU, then encode. The
+                // upload filter chains after any software filters.
+                vf_parts.push("format=nv12".into());
+                vf_parts.push("hwupload".into());
+                a.push("-vf".into());
+                a.push(vf_parts.join(","));
+                a.push("-c:v".into());
+                a.push(
+                    if matches!(c, VideoCodec::H265) {
+                        "hevc_vaapi"
+                    } else {
+                        "h264_vaapi"
+                    }
+                    .into(),
+                );
+                if let Some(b) = opts.video_bitrate_bps {
+                    a.push("-b:v".into());
+                    a.push(format!("{b}"));
+                }
+            } else {
+                // NVENC / QSV / VideoToolbox / software: pick the encoder
+                // name (hw-mapped or software default).
+                let encoder = match c {
+                    VideoCodec::H264 => hwaccel.h264_encoder().unwrap_or(c.ffmpeg_codec()),
+                    VideoCodec::H265 => hwaccel.hevc_encoder().unwrap_or(c.ffmpeg_codec()),
+                    _ => c.ffmpeg_codec(),
+                };
+                if !vf_parts.is_empty() {
+                    a.push("-vf".into());
+                    a.push(vf_parts.join(","));
+                }
+                a.push("-c:v".into());
+                a.push(encoder.into());
+                // Force broadly-decodable 8-bit 4:2:0 output. A 10-bit
+                // (yuv420p10le) or 4:4:4 source would otherwise carry its
+                // pixel format into the H.264/HEVC stream, which most
+                // clients — and the headless test chromium — can't decode.
+                // ffmpeg inserts an auto-convert before the software /
+                // NVENC / QSV / VideoToolbox encoder. VAAPI handles this
+                // via the `format=nv12` filter above, so it's scoped to
+                // the non-VAAPI encoders here.
+                a.push("-pix_fmt".into());
+                a.push("yuv420p".into());
+                // NVENC GPU ordinal selection on a multi-GPU box.
+                if matches!(
+                    device,
+                    DeviceId::Hw {
+                        accel: HwAccel::Nvenc,
+                        ..
+                    }
+                ) {
+                    if let Some(idx) = device.index() {
+                        a.push("-gpu".into());
+                        a.push(idx.to_string());
+                    }
+                }
+                if let Some(b) = opts.video_bitrate_bps {
+                    a.push("-b:v".into());
+                    a.push(format!("{b}"));
+                }
             }
         }
         None => {
@@ -283,7 +404,13 @@ fn build_args_with_hwaccel(input: &str, opts: &TranscodeOptions, hwaccel: HwAcce
     a.push(opts.container.ffmpeg_muxer().into());
     a.push("-movflags".into());
     a.push("+empty_moov+frag_keyframe+default_base_moof".into());
-    a.push("pipe:1".into());
+    // File-direct outputs are written by the worker; ffmpeg refuses to
+    // overwrite an existing file without `-y`, and the scheduler hands
+    // us a fresh `.tmp` path so clobbering is intended.
+    if output != "pipe:1" {
+        a.push("-y".into());
+    }
+    a.push(output.to_string());
     a
 }
 
@@ -318,6 +445,8 @@ mod tests {
         assert!(joined.contains("-t 10.000"), "{joined}");
         assert!(joined.contains("-i /m/foo.mkv"), "{joined}");
         assert!(joined.contains("-c:v libx264"), "{joined}");
+        // Software encode forces broad-compat 8-bit 4:2:0.
+        assert!(joined.contains("-pix_fmt yuv420p"), "{joined}");
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-f mp4"), "{joined}");
         assert!(joined.contains("pipe:1"));
@@ -387,16 +516,73 @@ mod tests {
         o.burn_subtitle_stream_index = Some(3);
         let a = build_args("/m/x.mkv", &o);
         let joined = a.join(" ");
-        assert!(joined.contains("-vf subtitles=/m/x.mkv:si=3"), "{joined}");
+        assert!(
+            joined.contains("-vf subtitles=filename='/m/x.mkv':si=3"),
+            "{joined}"
+        );
     }
 
     #[test]
-    fn escape_subtitles_path_protects_filter_metachars() {
-        assert_eq!(escape_subtitles_path("/m/a.mkv"), "/m/a.mkv");
-        assert_eq!(escape_subtitles_path("/m/it's.mkv"), "/m/it\\'s.mkv");
-        assert_eq!(escape_subtitles_path("/m/a:b.mkv"), "/m/a\\:b.mkv");
-        assert_eq!(escape_subtitles_path("a\\b"), "a\\\\b");
-        assert_eq!(escape_subtitles_path("a,b"), "a\\,b");
+    fn escape_subtitles_filename_quotes_and_protects_metachars() {
+        // Plain path → wrapped in single quotes.
+        assert_eq!(escape_subtitles_filename("/m/a.mkv"), "'/m/a.mkv'");
+        // Filtergraph metachars `[ ] ; : ,` are literal inside quotes —
+        // the old escaper missed `[ ] ;` entirely.
+        assert_eq!(
+            escape_subtitles_filename("/m/[Grp] T [1080p].mkv"),
+            "'/m/[Grp] T [1080p].mkv'"
+        );
+        assert_eq!(
+            escape_subtitles_filename("/m/a;b,c:d.mkv"),
+            "'/m/a;b,c:d.mkv'"
+        );
+        // Embedded single quote → ffmpeg `'\''` sequence.
+        assert_eq!(
+            escape_subtitles_filename("/m/it's.mkv"),
+            "'/m/it'\\''s.mkv'"
+        );
+        // Backslash doubled.
+        assert_eq!(escape_subtitles_filename("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn burn_subtitle_with_seek_uses_output_seek_for_sync() {
+        // Audit fix: burned subs must not desync under -ss. With a seek +
+        // subtitle burn, -ss must appear AFTER -i (output seeking).
+        let mut o = opts();
+        o.start_position_ticks = 50_000_000; // 5s
+        o.burn_subtitle_stream_index = Some(0);
+        let a = build_args("/m/x.mkv", &o);
+        let i_pos = a.iter().position(|x| x == "-i").unwrap();
+        let ss_pos = a.iter().position(|x| x == "-ss").unwrap();
+        assert!(ss_pos > i_pos, "expected output seek (-ss after -i): {a:?}");
+    }
+
+    #[test]
+    fn seek_without_subs_uses_input_seek() {
+        let mut o = opts();
+        o.start_position_ticks = 50_000_000;
+        let a = build_args("/m/x.mkv", &o);
+        let i_pos = a.iter().position(|x| x == "-i").unwrap();
+        let ss_pos = a.iter().position(|x| x == "-ss").unwrap();
+        assert!(ss_pos < i_pos, "expected input seek (-ss before -i): {a:?}");
+    }
+
+    #[test]
+    fn vaapi_device_emits_render_node_and_hwupload() {
+        use crate::protocol::DeviceId;
+        let o = opts(); // H264
+        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Vaapi, 1), "out.ts");
+        let joined = a.join(" ");
+        assert!(
+            joined.contains("-vaapi_device /dev/dri/renderD129"),
+            "{joined}"
+        );
+        assert!(joined.contains("format=nv12,hwupload"), "{joined}");
+        assert!(joined.contains("-c:v h264_vaapi"), "{joined}");
+        // VAAPI sets the format via the filter (nv12 in GPU memory), not a
+        // software `-pix_fmt` (which would clash with the hw frames).
+        assert!(!joined.contains("-pix_fmt"), "{joined}");
     }
 
     #[test]

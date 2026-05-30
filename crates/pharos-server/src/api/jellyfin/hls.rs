@@ -511,17 +511,14 @@ async fn master_playlist(
         .body(body))
 }
 
-/// P22 — Cache-Control header for HLS playlists. Master stays
-/// cacheable for an hour (PSID-bound decisions stable for the
-/// session lifetime); variant + subtitle playlists 5 minutes so a
-/// re-negotiated bitrate cap or sub set propagates quickly.
-fn playlist_cache_control(is_master: bool) -> (actix_web::http::header::HeaderName, &'static str) {
-    let value = if is_master {
-        "public, max-age=3600"
-    } else {
-        "public, max-age=300"
-    };
-    (actix_web::http::header::CACHE_CONTROL, value)
+/// Cache-Control for HLS playlists. The playlist *body* embeds the
+/// caller's bearer token (`api_key=…` on every segment/sub URL), so it
+/// is per-user secret and MUST NOT be stored by any shared cache/CDN/
+/// proxy — `public` previously let a shared cache serve user A's token
+/// to user B (token leak). `no-store` keeps the token out of all caches;
+/// playlists are cheap to regenerate per request.
+fn playlist_cache_control(_is_master: bool) -> (actix_web::http::header::HeaderName, &'static str) {
+    (actix_web::http::header::CACHE_CONTROL, "no-store")
 }
 
 /// P18 — query-string-only parser for `StartTimeTicks`, mirroring
@@ -831,6 +828,29 @@ async fn serve_segment(
                 "public, max-age=31536000, immutable",
             ))
             .body(bytes));
+    }
+
+    // Uncached live path. Prefer the load-balancing scheduler (spreads
+    // across every GPU + CPU, crash-isolated worker) when available;
+    // fall back to a direct inline ffmpeg otherwise.
+    if let Some(sched) = state.transcode_scheduler.as_ref() {
+        match sched.submit_live(item.path.clone(), opts.clone()).await {
+            Ok(stream) => {
+                return Ok(HttpResponse::Ok()
+                    .content_type(opts.container.content_type())
+                    .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+                    .insert_header((
+                        actix_web::http::header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable",
+                    ))
+                    .streaming(stream));
+            }
+            Err(e) => {
+                // Busy / worker error — fall through to inline ffmpeg so
+                // the request still succeeds.
+                tracing::warn!(error = %e, "scheduler live transcode failed; inline fallback");
+            }
+        }
     }
 
     let transcoder = FfmpegTranscoder::new();

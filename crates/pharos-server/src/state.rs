@@ -4,10 +4,10 @@
 //! Swap point: change the type aliases below — handlers are untouched.
 
 use crate::{
-    auth::BuiltinAuth, hls_cache::HlsSegmentCache, image_cache::ImageCache,
-    live_tv::M3uXmltvBackend, sessions::SessionRegistry, subtitle_cache::SubtitleCache,
-    transcode_sessions::TranscodeSessionRegistry, trickplay_cache::TrickplayCache,
+    auth::BuiltinAuth, sessions::SessionRegistry, transcode_sessions::TranscodeSessionRegistry,
 };
+use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
+use pharos_discovery::live_tv::M3uXmltvBackend;
 use pharos_store_sqlx::sqlite::SqliteStore;
 use pharos_transcode::FfmpegBackend;
 use std::path::PathBuf;
@@ -64,6 +64,10 @@ pub struct AppState {
     pub transcode_sessions: TranscodeSessionRegistry,
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
+    /// Load-balancing transcode scheduler (multi-GPU + all-CPU). When
+    /// present, the live/uncached HLS path streams through it; the cached
+    /// path uses its own clone held inside `HlsSegmentCache`.
+    pub transcode_scheduler: Option<pharos_transcode::scheduler::TranscodeScheduler>,
     pub trickplay: Option<TrickplayCache>,
     pub subtitles: Option<SubtitleCache>,
     /// Trickplay layout knobs surfaced to handlers + DTO emitter so
@@ -123,6 +127,7 @@ impl AppState {
             transcode_sessions,
             images: None,
             hls: None,
+            transcode_scheduler: None,
             trickplay: None,
             subtitles: None,
             trickplay_widths: Vec::new(),
@@ -175,6 +180,7 @@ impl AppState {
             transcode_sessions,
             images: None,
             hls: None,
+            transcode_scheduler: None,
             trickplay: None,
             subtitles: None,
             trickplay_widths: Vec::new(),
@@ -226,6 +232,14 @@ impl AppState {
 
     pub fn with_hls_cache(mut self, cache: HlsSegmentCache) -> Self {
         self.hls = Some(cache);
+        self
+    }
+
+    pub fn with_transcode_scheduler(
+        mut self,
+        sched: pharos_transcode::scheduler::TranscodeScheduler,
+    ) -> Self {
+        self.transcode_scheduler = Some(sched);
         self
     }
 

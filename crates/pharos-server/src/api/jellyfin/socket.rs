@@ -11,14 +11,14 @@ use super::socket_messages::{
     SyncPlaySeekData,
 };
 use crate::state::{AppState, SocketBroadcast};
-use crate::sync::{
+use actix_web::{web, HttpRequest, HttpResponse};
+use actix_ws::{AggregatedMessage, Session};
+use futures_util::StreamExt;
+use pharos_sync::{
     group::{GroupHandle, GroupMsg, Joined},
     messages::{GroupId, MemberId, ServerMsg},
     registry::GroupRegistry,
 };
-use actix_web::{web, HttpRequest, HttpResponse};
-use actix_ws::{AggregatedMessage, Session};
-use futures_util::StreamExt;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot};
 

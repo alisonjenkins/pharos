@@ -24,6 +24,12 @@ pub struct ServerConfig {
     /// /Items/{id}/Images/Primary returns 404.
     #[serde(default)]
     pub image_cache_dir: Option<PathBuf>,
+    /// Seek timestamp (seconds) for poster / thumb frame extraction from
+    /// video sources. Default 30 suits real movies; lower it for short
+    /// test fixtures so the seek lands inside the clip (a seek past EOF
+    /// yields no frame and the image 404s).
+    #[serde(default = "default_image_seek_seconds")]
+    pub image_seek_seconds: u32,
     /// Directory used to cache transcoded HLS segments (T42). When
     /// unset, segments stream live without persisting — every request
     /// spawns ffmpeg.
@@ -56,6 +62,21 @@ pub struct ServerConfig {
     /// software libx264 / libx265 path. Default `"auto"`.
     #[serde(default)]
     pub hwaccel: pharos_transcode::HwAccel,
+    /// Concurrent encode sessions to allow per hardware device (per GPU
+    /// / render node). The load-balancing transcode scheduler caps each
+    /// GPU at this many simultaneous segment encodes; the CPU device gets
+    /// one permit per logical core. Default 2 (a safe value for consumer
+    /// GPUs; raise for server-class cards). Set to 0 to disable the
+    /// scheduler and use the legacy single-ffmpeg path.
+    #[serde(default = "default_transcode_hw_session_cap")]
+    pub transcode_hw_session_cap: usize,
+    /// Auto-probe each hardware device's real concurrent-session cap at
+    /// boot (ramp trial encodes until one fails). When false, every GPU
+    /// uses `transcode_hw_session_cap`. Probing adds a few seconds to
+    /// startup but learns true caps (e.g. consumer NVENC's session limit)
+    /// instead of guessing. Default true.
+    #[serde(default = "default_true")]
+    pub transcode_probe_caps: bool,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.
@@ -107,8 +128,20 @@ fn default_played_threshold_pct() -> u32 {
     90
 }
 
+fn default_image_seek_seconds() -> u32 {
+    30
+}
+
 fn default_transcode_cache_bytes() -> u64 {
     1024 * 1024 * 1024
+}
+
+fn default_transcode_hw_session_cap() -> usize {
+    2
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_trickplay_cache_bytes() -> u64 {

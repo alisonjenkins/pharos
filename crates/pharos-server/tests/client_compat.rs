@@ -23,11 +23,9 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, UserId, UserPolicy, UserRecord, UserStore,
 };
 use pharos_jellyfin_test_client::{DeviceInfo, JellyfinClient};
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-    sync::GroupRegistry,
-};
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_sync::GroupRegistry;
 
 async fn boot_server() -> (TestServer, String) {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();

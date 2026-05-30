@@ -144,13 +144,11 @@ test.describe("strict console + response capture", () => {
     await connect(page);
     await signIn(page);
 
-    // Navigate directly via hash route — the menu UI varies version to
-    // version.
-    for (const route of [
-      "#/mypreferencesmenu.html",
-      "#/mypreferencesdisplay.html",
-    ]) {
-      await page.goto(`/web/${route}`, { waitUntil: "networkidle" });
+    // Navigate directly via hash route. The bundle is served at the
+    // origin root (no `/web/` prefix) and jellyfin-web resolves the
+    // SPA hash route without the `.html` suffix — matching crawl.spec.
+    for (const route of ["#/mypreferencesmenu", "#/mypreferencesdisplay"]) {
+      await page.goto(`/${route}`, { waitUntil: "networkidle" });
       assertClean(cap, `route ${route}`);
     }
   });

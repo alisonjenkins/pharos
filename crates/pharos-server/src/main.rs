@@ -1,19 +1,19 @@
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use clap::Parser;
+use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
+use pharos_discovery::live_tv::build_backend as build_live_tv_backend;
 use pharos_server::{
     cli::{AdminOp, Cli, Cmd},
     config::Config,
     health::{ReadinessError, ReadinessHandle},
-    hls_cache::HlsSegmentCache,
-    image_cache::ImageCache,
-    live_tv::build_backend as build_live_tv_backend,
     middleware::{LowercasePath, RedMetrics},
     obs, router,
     state::AppState,
-    sync::GroupRegistry,
+    sync_resolver,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
 
@@ -55,7 +55,9 @@ async fn main() -> Result<(), AppError> {
 
 async fn scan(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{MediaStore, Scanner};
-    use pharos_scanner::{FfmpegProber, FsScanner};
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+    use pharos_scanner::FfmpegProber;
+    use pharos_scanner::FsScanner;
 
     if cfg.media.roots.is_empty() {
         let stdout = std::io::stdout();
@@ -68,6 +70,12 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     }
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
+    // P48 — `ffmpeg-lib` build probes in-process via a resident libav
+    // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    let scanner = FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+        .with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner =
         FsScanner::new(FfmpegProber::new()).with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
 
@@ -264,43 +272,144 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Build the load-balancing transcode scheduler. Returns `None` (so the
+/// caller falls back to the inline ffmpeg path) when the worker binary
+/// can't be brought up — validated by spawning one probe worker + reading
+/// its handshake before committing.
+async fn build_transcode_scheduler(
+    detected: &[pharos_transcode::HwAccel],
+    hw_session_cap: usize,
+    probe_caps: bool,
+) -> Option<pharos_transcode::scheduler::TranscodeScheduler> {
+    use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
+    use pharos_transcode::probe::{probe_device_caps, ProbeConfig};
+    use pharos_transcode::protocol::{DeviceId, WorkerId};
+    use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler, WorkerSpawner};
+    use pharos_transcode::worker::ProcSpawner;
+
+    // Confirm a worker spawns + handshakes before wiring the scheduler.
+    // The probe worker is dropped (killed) immediately.
+    let probe = ProcSpawner::new();
+    if let Err(e) = probe.spawn(WorkerId(0)).await {
+        tracing::warn!(error = %e, worker = %probe.worker_bin().display(), "transcode worker probe failed");
+        return None;
+    }
+
+    let devices = enumerate(detected);
+    let caps: Vec<(DeviceId, usize)> = if probe_caps && !devices.is_empty() {
+        // Learn real session caps; fall back to the configured cap for
+        // any device the probe couldn't measure.
+        let probed = probe_device_caps(&devices, &ProbeConfig::default()).await;
+        let caps: Vec<(DeviceId, usize)> = devices
+            .iter()
+            .map(|d| {
+                let c = probed
+                    .caps
+                    .iter()
+                    .find(|(pd, _)| pd == d)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_else(|| hw_session_cap.max(1));
+                (*d, c)
+            })
+            .collect();
+        for (d, c) in &caps {
+            tracing::info!(device = %d, sessions = c, "probed device session cap");
+        }
+        caps
+    } else {
+        devices
+            .into_iter()
+            .map(|d| (d, hw_session_cap.max(1)))
+            .collect()
+    };
+    let table = DeviceTable::from_probe(&caps, default_cpu_permits());
+    tracing::info!(
+        devices = caps.len(),
+        cpu_permits = default_cpu_permits(),
+        "transcode scheduler device table built"
+    );
+    Some(TranscodeScheduler::spawn(
+        table,
+        std::sync::Arc::new(ProcSpawner::new()),
+        SchedConfig::default(),
+    ))
+}
+
 async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
     let mut state = AppState::load(stores, cfg.server.name.clone())
         .await?
         .with_media_roots(cfg.media.roots.clone());
+    // P48 — one resident libav worker pool shared by the image + trickplay
+    // caches (and the scanner prober) in the `ffmpeg-lib` build. Tiny ops
+    // run in-process in crash-isolated workers; the fork/exec is amortised.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    let libav_pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
-        state = state.with_image_cache(ImageCache::new(cache_dir));
+        let image_cache =
+            ImageCache::new(cache_dir).with_seek_seconds(cfg.server.image_seek_seconds);
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        let image_cache = image_cache.with_pool(libav_pool.clone());
+        state = state.with_image_cache(image_cache);
+    }
+    // P14 — resolve `auto` against the live `ffmpeg -hwaccels` output
+    // once. Logs the chosen encoder so admins see what's wired.
+    let detected = pharos_transcode::hwaccel::detect_available("ffmpeg").await;
+    let accel = cfg.server.hwaccel.resolve_auto(&detected);
+    tracing::info!(?accel, ?detected, "hardware encoder resolved");
+    // Bring up the load-balancing transcode scheduler (multi-GPU +
+    // all-CPU, crash-isolated workers) once, shared by the HLS cache
+    // (segment path) + the live/uncached path on AppState. Falls back to
+    // inline ffmpeg when disabled or when the worker can't be brought up.
+    let transcode_scheduler = if cfg.server.transcode_hw_session_cap > 0 {
+        match build_transcode_scheduler(
+            &detected,
+            cfg.server.transcode_hw_session_cap,
+            cfg.server.transcode_probe_caps,
+        )
+        .await
+        {
+            Some(sched) => {
+                tracing::info!("transcode scheduler enabled (load-balanced workers)");
+                Some(sched)
+            }
+            None => {
+                tracing::warn!("transcode worker unavailable; using the inline ffmpeg path");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(sched) = transcode_scheduler.as_ref() {
+        state = state.with_transcode_scheduler(sched.clone());
     }
     if let Some(cache_dir) = cfg.server.transcode_cache_dir.clone() {
-        // P14 — resolve `auto` against the live `ffmpeg -hwaccels`
-        // output once. Logs the chosen encoder so admins see what's
-        // wired without reading the source.
-        let detected = pharos_transcode::hwaccel::detect_available("ffmpeg").await;
-        let accel = cfg.server.hwaccel.resolve_auto(&detected);
-        tracing::info!(?accel, ?detected, "hardware encoder resolved");
-        state = state.with_hls_cache(
-            HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
-                .with_hwaccel(accel),
-        );
+        let mut hls = HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
+            .with_hwaccel(accel);
+        if let Some(sched) = transcode_scheduler.as_ref() {
+            hls = hls.with_scheduler(sched.clone());
+        }
+        state = state.with_hls_cache(hls);
     }
     // P5 — subtitle cache, always on. Pure in-process; the only
     // tunables are bytes + entry cap. Disabled by setting both to 0.
     if cfg.server.subtitle_cache_max_bytes > 0 && cfg.server.subtitle_cache_max_entries > 0 {
-        state = state.with_subtitle_cache(pharos_server::subtitle_cache::SubtitleCache::new(
+        state = state.with_subtitle_cache(SubtitleCache::new(
             cfg.server.subtitle_cache_max_bytes,
             cfg.server.subtitle_cache_max_entries,
         ));
     }
     if !cfg.server.trickplay_widths.is_empty() {
         if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
-            state =
-                state.with_trickplay_cache(pharos_server::trickplay_cache::TrickplayCache::new(
-                    cache_dir,
-                    cfg.server.trickplay_cache_max_bytes,
-                ));
+            let trickplay_cache =
+                TrickplayCache::new(cache_dir, cfg.server.trickplay_cache_max_bytes);
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            let trickplay_cache = trickplay_cache.with_pool(libav_pool.clone());
+            state = state.with_trickplay_cache(trickplay_cache);
         }
         state = state.with_trickplay_layout(
             cfg.server.trickplay_widths.clone(),
@@ -321,6 +430,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     let app_state = web::Data::new(state);
     let group_registry = web::Data::new(GroupRegistry::spawn());
+    let token_resolver_data = web::Data::new(token_resolver);
 
     // Probes whose readiness must flip true before /readyz returns 200.
     let readiness = ReadinessHandle::spawn(&["process", "store"]);
@@ -334,7 +444,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         let advertise = cfg.server.ssdp_advertise_url.clone().unwrap_or_else(|| {
             format!("http://{}", cfg.server.bind.replace("0.0.0.0", "127.0.0.1"))
         });
-        match pharos_server::ssdp::SsdpResponder::spawn(
+        match pharos_discovery::ssdp::SsdpResponder::spawn(
             app_state.server_id.clone(),
             app_state.server_name.clone(),
             advertise,
@@ -367,16 +477,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
-            .wrap(cors)
-            // Lowercase the URI path before metrics + tracing capture
-            // it, so RedMetrics labels and TracingLogger spans use the
-            // canonical lowercase form (and label cardinality stays
-            // bounded). actix runs wraps in registration order, so
-            // this needs to sit between cors (outermost) and the
-            // observability layers below.
-            .wrap(LowercasePath)
-            .wrap(RedMetrics)
+            .app_data(token_resolver_data.clone())
+            // actix runs `.wrap()` layers in REVERSE registration order
+            // (last registered = outermost = first on ingress). We want
+            // ingress order: cors -> LowercasePath -> RedMetrics ->
+            // TracingLogger -> router, so that the path is lowercased
+            // BEFORE RedMetrics/TracingLogger label it — otherwise
+            // jellyfin-web's PascalCase paths miss the (lowercase-only)
+            // route patterns and RedMetrics falls back to the concrete
+            // URI, exploding Prometheus label cardinality (one series per
+            // item id). To get that ingress order, register bottom-up.
             .wrap(TracingLogger::default())
+            .wrap(RedMetrics)
+            .wrap(LowercasePath)
+            .wrap(cors)
             .configure(router::configure);
         if let Some(path) = ui_dir.as_ref() {
             // Dioxus default-routes the SPA in hash mode unless configured

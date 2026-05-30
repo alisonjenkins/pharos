@@ -18,7 +18,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .configure(crate::health::configure)
         .configure(crate::api::jellyfin::configure)
         .configure(crate::dlna::register)
-        .configure(crate::sync::ws::register);
+        .configure(pharos_sync::ws::register);
 }
 
 #[cfg(test)]

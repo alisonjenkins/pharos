@@ -359,6 +359,24 @@ impl UserStore for PostgresStore {
         }
         Ok(())
     }
+
+    async fn set_password(
+        &self,
+        id: UserId,
+        password_hash: pharos_core::SecretString,
+    ) -> AuthResult<()> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        let res = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(password_hash.expose())
+            .bind(id_bytes)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
 }
 
 impl TokenStore for PostgresStore {

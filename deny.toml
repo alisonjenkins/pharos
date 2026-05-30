@@ -19,6 +19,14 @@ ignore = [
     # not reachable in our compiled binary. Re-evaluate when sqlx ships
     # a fix or moves to a non-affected RSA impl.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0141 — `bincode` 1.3.3 is "unmaintained", not
+    # vulnerable: the team ceased development after a harassment incident
+    # and consider 1.3.3 a complete, stable release. We use it only for
+    # the internal length-prefixed control-frame protocol between the
+    # transcode scheduler and its workers (never on untrusted external
+    # input). No safe upgrade exists (bincode 2.x is a different API).
+    # Re-evaluate if we migrate the framing to postcard.
+    "RUSTSEC-2025-0141",
 ]
 
 [licenses]
@@ -42,12 +50,27 @@ allow = [
     # the upstream Mozilla CCADB data is the actual licensed payload.
     "CDLA-Permissive-2.0",
 ]
+# Internal workspace crates (cargo-hakari's `workspace-hack`) carry no
+# license field and are never published; exempt publish = false crates.
+private = { ignore = true }
 
 [[licenses.exceptions]]
 # `ring` ships under a custom non-SPDX license that's a derivative of
 # ISC + BoringSSL + OpenSSL. cargo-deny matches it imperfectly.
 name = "ring"
 allow = ["ISC", "MIT", "OpenSSL"]
+
+[[licenses.exceptions]]
+# The `ffmpeg-the-third` libav bindings (P48 backend-lib FFI path) ship
+# under WTFPL — an FSF-recognised, maximally-permissive free licence.
+# Scoped exception rather than a global allow so adding WTFPL deps stays
+# a deliberate decision.
+name = "ffmpeg-the-third"
+allow = ["WTFPL"]
+
+[[licenses.exceptions]]
+name = "ffmpeg-sys-the-third"
+allow = ["WTFPL"]
 
 [bans]
 multiple-versions = "warn"

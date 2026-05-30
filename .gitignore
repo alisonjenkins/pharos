@@ -21,3 +21,4 @@ compat-playwright/.cache/
 /test-results/
 /playwright-report/
 compat-playwright/tests/_*.spec.ts
+docs/*.svg

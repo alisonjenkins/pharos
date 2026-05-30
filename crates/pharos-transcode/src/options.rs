@@ -1,9 +1,11 @@
 //! Transcode option types. Independent of ffmpeg specifics so callers
 //! reason in terms of containers/codecs the wire protocol exposes.
 
+use serde::{Deserialize, Serialize};
+
 const JELLYFIN_TICKS_PER_SECOND: f64 = 10_000_000.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Container {
     Mp4,
     Mkv,
@@ -80,7 +82,7 @@ impl Container {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCodec {
     H264,
     H265,
@@ -116,7 +118,7 @@ impl VideoCodec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioCodec {
     Aac,
     Mp3,
@@ -152,7 +154,7 @@ impl AudioCodec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodeOptions {
     pub container: Container,
     pub video: Option<VideoCodec>,

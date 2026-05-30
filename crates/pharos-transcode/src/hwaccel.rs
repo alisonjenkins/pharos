@@ -16,7 +16,9 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HwAccel {
     #[default]

@@ -111,6 +111,24 @@ impl UserStore for SqliteStore {
         }
         Ok(())
     }
+
+    async fn set_password(
+        &self,
+        id: UserId,
+        password_hash: pharos_core::SecretString,
+    ) -> AuthResult<()> {
+        let id_bytes = id.0.as_bytes().to_vec();
+        let res = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(password_hash.expose())
+            .bind(id_bytes)
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
 }
 
 fn record_from_row(row: (Vec<u8>, String, String, i64)) -> AuthResult<UserRecord> {

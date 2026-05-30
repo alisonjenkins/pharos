@@ -292,8 +292,15 @@ const LOCALIZATION_CULTURES: &[Culture] = &[
 struct Culture {
     name: &'static str,
     display_name: &'static str,
+    // Jellyfin uses an all-caps `ISO` in these keys
+    // (`TwoLetterISOLanguageName`), not the `Iso` that PascalCase would
+    // produce from the snake_case field. Real clients key off the exact
+    // casing, so rename explicitly.
+    #[serde(rename = "TwoLetterISOLanguageName")]
     two_letter_iso_language_name: &'static str,
+    #[serde(rename = "ThreeLetterISOLanguageName")]
     three_letter_iso_language_name: &'static str,
+    #[serde(rename = "ThreeLetterISOLanguageNames")]
     three_letter_iso_language_names: &'static [&'static str],
 }
 

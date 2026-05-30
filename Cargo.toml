@@ -1,11 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pharos-cache",
     "crates/pharos-core",
+    "crates/pharos-discovery",
+    "crates/pharos-jellyfin-api",
     "crates/pharos-jellyfin-test-client",
     "crates/pharos-scanner",
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
+    "crates/pharos-sync",
     "crates/pharos-transcode",
     "crates/pharos-ui",
     "workspace-hack",

@@ -3,13 +3,14 @@
   "version": "0.0.0",
   "private": true,
   "description": "T29 phase 3 — Playwright suite driving unmodified jellyfin-web against a running pharos instance.",
+  "//playwrightPin": "Keep @playwright/test in lockstep with nixpkgs playwright-driver.version (flake.nix); the nix-store browsers (PLAYWRIGHT_BROWSERS_PATH) provide exactly that revision. Bump both together.",
   "scripts": {
     "test": "playwright test",
     "test:headed": "playwright test --headed",
     "report": "playwright show-report"
   },
   "devDependencies": {
-    "@playwright/test": "1.56.1",
+    "@playwright/test": "1.59.1",
     "@types/node": "^22.0.0",
     "http-server": "^14.1.1",
     "typescript": "^5.6.0"

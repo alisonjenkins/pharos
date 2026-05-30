@@ -53,10 +53,14 @@ export default defineConfig({
   ],
 
   webServer: {
-    // Serve the nix-pinned jellyfin-web bundle so the browser loads it
-    // from a local origin. Keeps SOP simple; pharos serves the API
-    // origin separately at PHAROS_URL.
-    command: `npx http-server ${JELLYFIN_WEB_DIR} -p ${JELLYFIN_WEB_PORT} -s --cors`,
+    // Serve the nix-pinned jellyfin-web bundle, with `--proxy` forwarding
+    // every non-static request (all Jellyfin REST paths — e.g.
+    // /System/Info/Public, /Items/.../Images/...) to the running pharos
+    // instance. The browser thus sees one same-origin server, exactly how
+    // real Jellyfin hosts jellyfin-web. Without the proxy, jellyfin-web's
+    // boot-time same-origin probe (`/System/Info/Public`) 404s against the
+    // dumb static server.
+    command: `npx http-server ${JELLYFIN_WEB_DIR} -p ${JELLYFIN_WEB_PORT} -s --cors --proxy ${PHAROS_URL}?`,
     port: JELLYFIN_WEB_PORT,
     reuseExistingServer: true,
     timeout: 30_000,

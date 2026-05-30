@@ -10,6 +10,7 @@ pub use auth::{
 };
 pub use secret::SecretString;
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub type MediaId = u64;
@@ -56,7 +57,7 @@ pub struct SeriesInfo {
 /// `frame_rate_mille` stores frames-per-second × 1000 to keep MediaProbe
 /// `Eq` without leaking floats into the domain layer. Conversion helpers
 /// (`frame_rate_f32`) live in the DTO boundary.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaProbe {
     pub size_bytes: Option<u64>,
     pub duration_ms: Option<u64>,
@@ -122,7 +123,7 @@ pub struct MediaProbe {
 /// which file to mux. Fields not listed here fall back to the primary
 /// probe at PlaybackInfo build time (saves duplicating the entire
 /// codec stack for every edition).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlternateMediaSource {
     /// Stable id suffix appended to the parent item id when forming
     /// the wire `MediaSourceInfo.Id`. Real Jellyfin uses a free-form
@@ -147,7 +148,7 @@ pub struct AlternateMediaSource {
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
 /// reports no name (most BluRay rips).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaChapter {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -158,7 +159,7 @@ pub struct MediaChapter {
 /// containers (TV episodes with eng + jpn dubs, movies with director
 /// commentary) emit one entry per stream so the PlaybackInfo wire
 /// shape surfaces a track picker.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioTrack {
     pub stream_index: u32,
     pub codec: Option<String>,
@@ -178,7 +179,7 @@ pub struct AudioTrack {
 }
 
 /// One embedded subtitle stream from the source file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleTrack {
     /// ffprobe stream index — what we pass `ffmpeg -map 0:s:<n>`.
     pub stream_index: u32,
@@ -229,7 +230,7 @@ impl MediaProbe {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MediaKind {
     Movie,
     Episode,
@@ -368,7 +369,7 @@ pub trait Scanner: Send + Sync {
 
 /// Result of a single probe call. `kind` informs MediaItem classification;
 /// `probe` carries the full metadata block persisted on the item.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeInfo {
     pub kind: MediaKind,
     pub probe: MediaProbe,

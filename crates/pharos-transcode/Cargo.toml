@@ -8,20 +8,25 @@ publish.workspace = true
 
 [dependencies]
 pharos-core = { path = "../pharos-core" }
+bincode = "1"
 bytes.workspace = true
 futures-core = "0.3"
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+smallvec = { version = "1", features = ["serde"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs"] }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs", "time", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true
-# P48 — optional ffmpeg-next FFI backend. Enabled via the
-# `backend-lib` feature. Linker pulls in libavcodec / libavformat /
-# libavfilter / libswscale at build time, supplied by the nix
-# devShell. Maintenance-mode crate but supports ffmpeg 3.4–8.0 and
-# has the broadest doc coverage.
-ffmpeg-next = { version = "7", optional = true }
+# P48 — optional libav FFI backend, enabled via the `backend-lib`
+# feature. `ffmpeg-the-third` is the actively-maintained rust-ffmpeg
+# fork; v5 supports ffmpeg 8.1, so the FFI build links the SAME libav the
+# runtime ffmpeg binary uses (no version pin). The linker pulls in
+# libavcodec/format/filter/util via pkg-config from the nix devShell
+# (which supplies LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS for the sys
+# crate's bindgen pass).
+ffmpeg-the-third = { version = "5", optional = true }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
@@ -33,10 +38,20 @@ backend-spawn = []
 # P48 — FFI backend via ffmpeg-next. Hot-path operations (HLS
 # segment generation, trickplay tile burn) avoid the spawn cost
 # entirely. Mutually exclusive with `backend-spawn`.
-backend-lib = ["dep:ffmpeg-next"]
+backend-lib = ["dep:ffmpeg-the-third"]
+
+[[bin]]
+name = "transcode-worker"
+path = "src/bin/transcode_worker.rs"
+
+[[bin]]
+name = "transcode-tool"
+path = "src/bin/transcode_tool.rs"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+futures-util = "0.3"
 
 [lints]
 workspace = true
