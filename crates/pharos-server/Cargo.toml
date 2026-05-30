@@ -53,7 +53,11 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # `ffmpeg-lib` once P49-P51 ship the library implementations.
 default = ["ffmpeg-spawn"]
 ffmpeg-spawn = ["pharos-transcode/backend-spawn", "pharos-cache/ffmpeg-spawn"]
-ffmpeg-lib = ["pharos-transcode/backend-lib", "pharos-cache/ffmpeg-lib"]
+ffmpeg-lib = [
+    "pharos-transcode/backend-lib",
+    "pharos-cache/ffmpeg-lib",
+    "pharos-scanner/libav-probe",
+]
 
 [dev-dependencies]
 actix-test = "0.1"

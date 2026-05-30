@@ -55,7 +55,9 @@ async fn main() -> Result<(), AppError> {
 
 async fn scan(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{MediaStore, Scanner};
-    use pharos_scanner::{FfmpegProber, FsScanner};
+    use pharos_scanner::FsScanner;
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+    use pharos_scanner::FfmpegProber;
 
     if cfg.media.roots.is_empty() {
         let stdout = std::io::stdout();
@@ -68,6 +70,12 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     }
 
     let stores = SqliteStore::connect(&cfg.database.url).await?;
+    // P48 — `ffmpeg-lib` build probes in-process via a resident libav
+    // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    let scanner = FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+        .with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner =
         FsScanner::new(FfmpegProber::new()).with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
 
@@ -335,8 +343,17 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let mut state = AppState::load(stores, cfg.server.name.clone())
         .await?
         .with_media_roots(cfg.media.roots.clone());
+    // P48 — one resident libav worker pool shared by the image + trickplay
+    // caches (and the scanner prober) in the `ffmpeg-lib` build. Tiny ops
+    // run in-process in crash-isolated workers; the fork/exec is amortised.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    let libav_pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
-        state = state.with_image_cache(ImageCache::new(cache_dir));
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        let image_cache = ImageCache::new(cache_dir).with_pool(libav_pool.clone());
+        #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+        let image_cache = ImageCache::new(cache_dir);
+        state = state.with_image_cache(image_cache);
     }
     // P14 — resolve `auto` against the live `ffmpeg -hwaccels` output
     // once. Logs the chosen encoder so admins see what's wired.
@@ -388,10 +405,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     }
     if !cfg.server.trickplay_widths.is_empty() {
         if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
-            state = state.with_trickplay_cache(TrickplayCache::new(
-                cache_dir,
-                cfg.server.trickplay_cache_max_bytes,
-            ));
+            let trickplay_cache =
+                TrickplayCache::new(cache_dir, cfg.server.trickplay_cache_max_bytes);
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            let trickplay_cache = trickplay_cache.with_pool(libav_pool.clone());
+            state = state.with_trickplay_cache(trickplay_cache);
         }
         state = state.with_trickplay_layout(
             cfg.server.trickplay_widths.clone(),
