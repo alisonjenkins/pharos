@@ -1783,12 +1783,29 @@ async fn fetch_item_dto(
         .get_user_data(user_id, id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // LIB-D5 — advertise ImageTags for any role with a recorded local
+    // sidecar (D4) so clients request roles that are otherwise
+    // upload-only (Logo/Banner/Art/Disc). Best-effort: a store error
+    // just means no extra tags, never a 500.
+    let local_art_roles: Vec<String> = match state.stores.artwork_for(id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|(_, source, _)| source == "local")
+            .map(|(role, _, _)| role)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = id, "artwork lookup for image tags failed");
+            Vec::new()
+        }
+    };
     Ok(HttpResponse::Ok().json(
-        BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data).with_trickplay(
-            &item.probe,
-            &state.trickplay_widths,
-            state.trickplay_interval_ms,
-        ),
+        BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
+            .with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
+            .with_local_artwork_tags(id, &local_art_roles),
     ))
 }
 
