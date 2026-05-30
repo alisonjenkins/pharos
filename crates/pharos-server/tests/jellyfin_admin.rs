@@ -185,7 +185,7 @@ async fn library_refresh_admin_only_and_broadcasts() {
         .await
         .expect("broadcast timeout")
         .expect("recv");
-    assert!(matches!(msg, SocketBroadcast::LibraryChanged));
+    assert!(matches!(msg, SocketBroadcast::LibraryChanged { .. }));
 }
 
 #[actix_web::test]

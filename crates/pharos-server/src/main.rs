@@ -54,7 +54,6 @@ async fn main() -> Result<(), AppError> {
 }
 
 async fn scan(cfg: &Config) -> Result<(), AppError> {
-    use pharos_core::{MediaStore, Scanner};
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     use pharos_scanner::FfmpegProber;
     use pharos_scanner::FsScanner;
@@ -81,31 +80,37 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let mut total_imported: u64 = 0;
-    let mut total_skipped: u64 = 0;
+    // LIB-A4 — drive the incremental `scan_into` path so the CLI gets the
+    // structured outcome (added/updated/removed/skipped) plus the same
+    // skip-unchanged + deletion-reconciliation behaviour the admin refresh
+    // already uses, then print a per-run summary.
+    let mut total_added: usize = 0;
+    let mut total_updated: usize = 0;
+    let mut total_removed: usize = 0;
+    let mut total_skipped: usize = 0;
     for root in &cfg.media.roots {
         writeln!(lock, "scanning {}…", root.display())?;
-        match scanner.scan(root.as_path()).await {
-            Ok(items) => {
-                let n = items.len();
-                for item in items {
-                    let id = item.id;
-                    let path = item.path.clone();
-                    if let Err(e) = stores.put(item).await {
-                        writeln!(lock, "  put id={id} path={} err={e}", path.display())?;
-                        total_skipped += 1;
-                    } else {
-                        total_imported += 1;
-                    }
-                }
-                writeln!(lock, "  {n} items probed")?;
+        match scanner.scan_into(root.as_path(), &stores).await {
+            Ok(outcome) => {
+                writeln!(
+                    lock,
+                    "  added={} updated={} removed={} skipped={}",
+                    outcome.added.len(),
+                    outcome.updated.len(),
+                    outcome.removed.len(),
+                    outcome.skipped,
+                )?;
+                total_added += outcome.added.len();
+                total_updated += outcome.updated.len();
+                total_removed += outcome.removed.len();
+                total_skipped += outcome.skipped;
             }
             Err(e) => writeln!(lock, "  scan failed: {e}")?,
         }
     }
     writeln!(
         lock,
-        "scan complete: imported={total_imported} skipped(conflict)={total_skipped}",
+        "scan complete: added={total_added} updated={total_updated} removed={total_removed} skipped={total_skipped}",
     )?;
     Ok(())
 }

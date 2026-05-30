@@ -291,6 +291,33 @@ pub struct ScanState {
     pub last_seen_scan_id: i64,
 }
 
+/// LIB-A4 — structured result of an incremental scan. Replaces the bare
+/// `usize` probed-count `scan_into` used to return so callers can broadcast
+/// content deltas to connected clients and print richer CLI summaries.
+///
+/// `added` / `updated` / `removed` carry the affected [`MediaId`]s; `skipped`
+/// is the count of unchanged files whose probe was elided (no ids retained —
+/// they're noise for a delta broadcast). Invariants:
+/// - `added`   — files inserted for the first time this run.
+/// - `updated` — existing rows re-probed because their fs signature changed.
+/// - `removed` — rows swept because the backing file vanished from disk.
+/// - `skipped` — unchanged files (`mark_seen` only, probe skipped).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub added: Vec<MediaId>,
+    pub updated: Vec<MediaId>,
+    pub removed: Vec<MediaId>,
+    pub skipped: usize,
+}
+
+impl ScanOutcome {
+    /// Total rows touched (probed+stored) this run — the legacy `usize`
+    /// `scan_into` returned, i.e. `added + updated`. Skipped/removed excluded.
+    pub fn probed(&self) -> usize {
+        self.added.len() + self.updated.len()
+    }
+}
+
 pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
