@@ -413,101 +413,161 @@
           };
         };
 
-        # Sibling OCI image for jellyfin-web. nginx serves the pinned
-        # nixpkgs bundle AND reverse-proxies every non-static request to
-        # pharos (`$PHAROS_URL`, default the in-cluster service), so the
-        # browser sees ONE same-origin server: jellyfin-web auto-detects
-        # pharos via the boot `/System/Info/Public` probe and all REST +
-        # websocket traffic falls through. Mirrors the compat suite's
-        # `http-server --proxy PHAROS?` fixture (cross-origin doesn't work:
-        # the connect probe must resolve same-origin). `__PHAROS_URL__` is
-        # the only runtime knob; the entrypoint seds it into the config.
-        jellyfinWebNginxConf = pkgs.writeText "jellyfin-web.nginx.conf" ''
-          daemon off;
-          worker_processes 1;
-          pid /tmp/nginx/nginx.pid;
-          error_log /dev/stderr warn;
-          events { worker_connections 1024; }
-          http {
-            include ${pkgs.nginx}/conf/mime.types;
-            default_type application/octet-stream;
-            access_log /dev/stdout;
-            sendfile on;
-            client_body_temp_path /tmp/nginx/client_body;
-            proxy_temp_path        /tmp/nginx/proxy;
-            fastcgi_temp_path      /tmp/nginx/fastcgi;
-            uwsgi_temp_path        /tmp/nginx/uwsgi;
-            scgi_temp_path         /tmp/nginx/scgi;
-
-            # websocket upgrade plumbing for jellyfin's /socket.
-            map $http_upgrade $connection_upgrade {
-              default upgrade;
-              ""      close;
-            }
-
-            server {
-              listen 8097;
-
-              # jellyfin-web is an SPA served under /web/ (the same URL
-              # prefix a real Jellyfin server mounts it at); the bundle's
-              # files live at the dir root, so alias them in.
-              location = /     { return 302 /web/; }
-              location = /web   { return 302 /web/; }
-              location /web/ {
-                alias ${pkgs.jellyfin-web}/share/jellyfin-web/;
-                try_files $uri $uri/ /web/index.html;
-              }
-
-              # Everything else (the REST API + websocket) is proxied to
-              # pharos, so the browser sees one same-origin server: the boot
-              # /System/Info/Public probe and all traffic resolve here.
-              location / {
-                proxy_pass __PHAROS_URL__;
-                proxy_http_version 1.1;
-                proxy_set_header Host              $host;
-                proxy_set_header X-Real-IP         $remote_addr;
-                proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-                proxy_set_header X-Forwarded-Proto $scheme;
-                proxy_set_header Upgrade           $http_upgrade;
-                proxy_set_header Connection        $connection_upgrade;
-              }
-            }
-          }
-        '';
-
-        jellyfinWebEntrypoint = pkgs.writeShellApplication {
-          name = "jellyfin-web-entrypoint";
-          runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.nginx ];
-          text = ''
-            : "''${PHAROS_URL:=http://pharos:8096}"
-            mkdir -p /tmp/nginx
-            sed "s|__PHAROS_URL__|''${PHAROS_URL}|g" \
-              ${jellyfinWebNginxConf} > /tmp/nginx/nginx.conf
-            # -e overrides the compiled-in default error-log path
-            # (/var/log/nginx) which the non-root image cannot create.
-            exec nginx -e /dev/stderr -c /tmp/nginx/nginx.conf
+        # The pharos Dioxus UI compiled to a static WASM bundle via `dx`.
+        # Built reproducibly in the nix sandbox: cargo deps are vendored from
+        # Cargo.lock (offline), the wasm-bindgen-cli is the pinned 0.2.122,
+        # and binaryen supplies wasm-opt. Output is the `dx` web `public/`
+        # dir (index.html + /ui/assets/{wasm,js}); pharos.css is copied in
+        # (dx 0.7's legacy [web.resource].style no longer copies it). The
+        # app is built with base_path = "ui" so every asset URL is /ui/-
+        # rooted and the angie pod can serve it under /ui/ without colliding
+        # with the proxied REST API.
+        uiSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: _type:
+            let rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+            in !(pkgs.lib.hasPrefix "target" rel
+                  || pkgs.lib.hasPrefix "result" rel
+                  || pkgs.lib.hasPrefix ".git" rel);
+        };
+        pharosUiBundle = pkgs.stdenv.mkDerivation {
+          pname = "pharos-ui-bundle";
+          version = "0.0.0";
+          src = uiSrc;
+          nativeBuildInputs = [
+            rustToolchain
+            pkgs.dioxus-cli
+            wasmBindgenCli
+            pkgs.binaryen
+            pkgs.rustPlatform.cargoSetupHook
+          ];
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+          };
+          buildPhase = ''
+            runHook preBuild
+            export HOME=$TMPDIR
+            dx build --package pharos-ui --release
+            runHook postBuild
           '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r target/dx/pharos-ui-web/release/web/public/. $out/
+            install -Dm644 crates/pharos-ui/assets/pharos.css $out/assets/pharos.css
+            runHook postInstall
+          '';
+          dontFixup = true;
         };
 
-        jellyfinWebImage = pkgs.dockerTools.buildLayeredImage {
-          name = "pharos-jellyfin-web";
-          tag = "latest";
-          architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
-          contents = [
-            jellyfinWebEntrypoint
-            pkgs.jellyfin-web
-            pkgs.cacert
-          ];
-          # nginx writes its pid + temp dirs under /tmp; create a writable
-          # /tmp so the non-root (1000) container can boot.
-          extraCommands = "mkdir -p tmp && chmod 1777 tmp";
-          config = {
-            Entrypoint = [ "${jellyfinWebEntrypoint}/bin/jellyfin-web-entrypoint" ];
-            Env = [ "PHAROS_URL=http://pharos:8096" ];
-            ExposedPorts = {
-              "8097/tcp" = { };
+        # Both UIs are the same shape: an **angie** (nginx fork) pod that
+        # serves a static SPA bundle under a URL prefix and reverse-proxies
+        # every other request (the REST API + websocket) to pharos
+        # (`$PHAROS_URL`, default the in-cluster service). So the browser
+        # sees ONE same-origin server — the boot `/System/Info/Public` probe
+        # and all traffic resolve through angie — mirroring the compat
+        # suite's `http-server --proxy PHAROS?` fixture (cross-origin fails:
+        # the connect probe must be same-origin). `__PHAROS_URL__` is the
+        # only runtime knob; the entrypoint seds it into the config.
+        mkAngieUi = { pname, port, prefix, bundle }:
+          let
+            conf = pkgs.writeText "${pname}.angie.conf" ''
+              daemon off;
+              worker_processes 1;
+              pid /tmp/angie/angie.pid;
+              error_log /dev/stderr warn;
+              events { worker_connections 1024; }
+              http {
+                include ${pkgs.angie}/conf/mime.types;
+                default_type application/octet-stream;
+                access_log /dev/stdout;
+                sendfile on;
+                client_body_temp_path /tmp/angie/client_body;
+                proxy_temp_path        /tmp/angie/proxy;
+                fastcgi_temp_path      /tmp/angie/fastcgi;
+                uwsgi_temp_path        /tmp/angie/uwsgi;
+                scgi_temp_path         /tmp/angie/scgi;
+
+                # websocket upgrade plumbing (jellyfin /socket, dioxus ws).
+                map $http_upgrade $connection_upgrade {
+                  default upgrade;
+                  ""      close;
+                }
+
+                server {
+                  listen ${toString port};
+
+                  # SPA served under /${prefix}/; its files live at the
+                  # bundle dir root, aliased in. try_files falls back to the
+                  # SPA index for client-side routes.
+                  location = /         { return 302 /${prefix}/; }
+                  location = /${prefix} { return 302 /${prefix}/; }
+                  location /${prefix}/ {
+                    alias ${bundle}/;
+                    try_files $uri $uri/ /${prefix}/index.html;
+                  }
+
+                  # Everything else → pharos (same-origin REST + websocket).
+                  location / {
+                    proxy_pass __PHAROS_URL__;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host              $host;
+                    proxy_set_header X-Real-IP         $remote_addr;
+                    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_set_header Upgrade           $http_upgrade;
+                    proxy_set_header Connection        $connection_upgrade;
+                  }
+                }
+              }
+            '';
+            entrypoint = pkgs.writeShellApplication {
+              name = "${pname}-entrypoint";
+              runtimeInputs = [ pkgs.coreutils pkgs.gnused pkgs.angie ];
+              text = ''
+                : "''${PHAROS_URL:=http://pharos:8096}"
+                mkdir -p /tmp/angie
+                sed "s|__PHAROS_URL__|''${PHAROS_URL}|g" \
+                  ${conf} > /tmp/angie/angie.conf
+                # -e overrides the compiled-in default error-log path
+                # (/var/log/angie) which the non-root image cannot create.
+                exec angie -e /dev/stderr -c /tmp/angie/angie.conf
+              '';
+            };
+          in
+          pkgs.dockerTools.buildLayeredImage {
+            name = pname;
+            tag = "latest";
+            architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
+            contents = [ entrypoint pkgs.cacert ];
+            # angie writes its pid + temp dirs under /tmp (writable /tmp);
+            # and when the master runs as root it drops workers to `nobody`,
+            # so /etc/passwd must carry that entry (+ a pharos:1000 user for
+            # the k8s non-root securityContext).
+            extraCommands = ''
+              mkdir -p etc tmp
+              printf 'root:x:0:0::/root:/sbin/nologin\nnobody:x:65534:65534::/:/sbin/nologin\npharos:x:1000:1000::/var/lib/pharos:/sbin/nologin\n' > etc/passwd
+              printf 'root:x:0:\nnogroup:x:65534:\npharos:x:1000:\n' > etc/group
+              chmod 1777 tmp
+            '';
+            config = {
+              Entrypoint = [ "${entrypoint}/bin/${pname}-entrypoint" ];
+              Env = [ "PHAROS_URL=http://pharos:8096" ];
+              ExposedPorts = { "${toString port}/tcp" = { }; };
             };
           };
+
+        jellyfinWebImage = mkAngieUi {
+          pname = "pharos-jellyfin-web";
+          port = 8097;
+          prefix = "web";
+          bundle = "${pkgs.jellyfin-web}/share/jellyfin-web";
+        };
+        pharosUiImage = mkAngieUi {
+          pname = "pharos-ui";
+          port = 8098;
+          prefix = "ui";
+          bundle = pharosUiBundle;
         };
 
         # docker-compose manifest. Built as a nix store artefact so
@@ -555,6 +615,8 @@
           # packages.<arch>-linux.* and the linux-builder picks up.
           oci = ociImage;
           jellyfinWebOci = jellyfinWebImage;
+          pharosUiOci = pharosUiImage;
+          pharosUiBundle = pharosUiBundle;
           testMediaOci = testMediaImage;
           testMediaTree = pharosTestMedia;
           composeFile = composeFile;
