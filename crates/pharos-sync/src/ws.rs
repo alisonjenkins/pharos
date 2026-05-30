@@ -133,6 +133,8 @@ async fn handle_connection<S>(
 
     // 5) bidirectional pump: WS frames → group; group outbound → WS.
     let group_tx = group_handle.tx.clone();
+    // Per-connection pending NTP clock sample (T1,T2,T3) awaiting T4.
+    let mut clock_pending: Option<(u64, u64, u64)> = None;
     let mut closed = false;
     while !closed {
         tokio::select! {
@@ -146,7 +148,7 @@ async fn handle_connection<S>(
                 match frame {
                     Some(Ok(AggregatedMessage::Text(txt))) => {
                         match sonic_rs::from_str::<ClientMsg>(&txt) {
-                            Ok(msg) => dispatch_client_msg(msg, member_id, &group_tx, &mut session, &started).await,
+                            Ok(msg) => dispatch_client_msg(msg, member_id, &group_tx, &mut session, &started, &mut clock_pending).await,
                             Err(e) => {
                                 let _ = send(&mut session, ServerMsg::Error {
                                     code: ErrorCode::Internal,
@@ -252,6 +254,9 @@ async fn dispatch_client_msg(
     group_tx: &mpsc::Sender<GroupMsg>,
     session: &mut Session,
     started: &Instant,
+    // Pending NTP sample (T1, T2, T3) awaiting the client's T4 via
+    // `ClockReport`. One outstanding ping at a time per connection.
+    clock_pending: &mut Option<(u64, u64, u64)>,
 ) {
     let server_ms_recv = started.elapsed().as_millis() as u64;
     match msg {
@@ -267,6 +272,9 @@ async fn dispatch_client_msg(
         }
         ClientMsg::Ping { client_ms } => {
             let server_ms_send = started.elapsed().as_millis() as u64;
+            // Stash (T1, T2, T3); the real ObserveClock fires when the
+            // client reports T4 in a ClockReport.
+            *clock_pending = Some((client_ms, server_ms_recv, server_ms_send));
             let _ = send(
                 session,
                 ServerMsg::Pong {
@@ -275,16 +283,26 @@ async fn dispatch_client_msg(
                 },
             )
             .await;
-            // T1 we don't actually know; observe with what we have.
-            let _ = group_tx
-                .send(GroupMsg::ObserveClock {
-                    member_id,
-                    t1: client_ms,
-                    t2: server_ms_recv,
-                    t3: server_ms_send,
-                    t4: client_ms,
-                })
-                .await;
+        }
+        ClientMsg::ClockReport {
+            client_ms,
+            client_recv_ms,
+        } => {
+            // Match the report to the outstanding ping (by T1) and feed a
+            // complete NTP sample so RTT/offset are real.
+            if let Some((t1, t2, t3, t4)) = correlate_clock(*clock_pending, client_ms, client_recv_ms)
+            {
+                *clock_pending = None;
+                let _ = group_tx
+                    .send(GroupMsg::ObserveClock {
+                        member_id,
+                        t1,
+                        t2,
+                        t3,
+                        t4,
+                    })
+                    .await;
+            }
         }
         ClientMsg::LeaderPlay { position_ms } => {
             let _ = group_tx
@@ -325,6 +343,21 @@ async fn dispatch_client_msg(
     }
 }
 
+/// Correlate a `ClockReport` (echo of T1 + the client's T4) against the
+/// outstanding ping sample `(T1,T2,T3)`. Returns the complete NTP sample
+/// only when the echoed T1 matches the pending ping — guards against a
+/// stale/duplicate report polluting the offset estimator.
+fn correlate_clock(
+    pending: Option<(u64, u64, u64)>,
+    echo_t1: u64,
+    t4: u64,
+) -> Option<(u64, u64, u64, u64)> {
+    match pending {
+        Some((t1, t2, t3)) if t1 == echo_t1 => Some((t1, t2, t3, t4)),
+        _ => None,
+    }
+}
+
 async fn send(session: &mut Session, msg: ServerMsg) -> Result<(), actix_ws::Closed> {
     let txt = match sonic_rs::to_string(&msg) {
         Ok(s) => s,
@@ -343,4 +376,30 @@ async fn close_with_error(session: &mut Session, code: ErrorCode, detail: &str) 
     )
     .await;
     let _ = session.clone().close(None).await;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::correlate_clock;
+    use crate::clock::ClockOffset;
+
+    #[test]
+    fn correlate_matches_pending_ping() {
+        // T1=100 (client send), T2=150 (server recv), T3=160 (server
+        // send), T4=300 (client recv) → rtt = (300-100)-(160-150) = 190.
+        let s = correlate_clock(Some((100, 150, 160)), 100, 300).unwrap();
+        assert_eq!(s, (100, 150, 160, 300));
+        let mut c = ClockOffset::default();
+        c.observe(s.0, s.1, s.2, s.3);
+        assert_eq!(c.max_rtt_ms(), 190, "RTT must be the real round-trip, not 0");
+    }
+
+    #[test]
+    fn correlate_rejects_mismatched_or_absent() {
+        // Stale report (echoed T1 doesn't match the pending ping).
+        assert!(correlate_clock(Some((100, 150, 160)), 999, 300).is_none());
+        // No outstanding ping.
+        assert!(correlate_clock(None, 100, 300).is_none());
+    }
 }

@@ -78,6 +78,17 @@ pub enum ClientMsg {
     Ping {
         client_ms: u64,
     },
+    /// NTP step 2: after receiving the `Pong`, the client reports its
+    /// receive timestamp (T4) so the server can compute the real
+    /// round-trip time. Without this the server only knows T1/T2/T3 and
+    /// RTT collapses to 0 (defeating V3 lead-time enforcement). See
+    /// `docs/group-sync-protocol.md` §4.
+    ClockReport {
+        /// Echo of the `Ping.client_ms` (T1) this report corresponds to.
+        client_ms: u64,
+        /// Client's receive time of the matching `Pong` (T4).
+        client_recv_ms: u64,
+    },
     LeaderPlay {
         position_ms: u64,
     },
