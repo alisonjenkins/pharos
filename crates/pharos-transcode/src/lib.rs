@@ -14,6 +14,8 @@
 pub mod backend;
 pub mod device;
 pub mod hwaccel;
+#[cfg(unix)]
+pub mod libav;
 pub mod options;
 pub mod protocol;
 #[cfg(unix)]
