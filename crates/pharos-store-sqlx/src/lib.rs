@@ -31,6 +31,11 @@ pub mod audio_track_json;
 // JSON adapter for MediaMetadata.provider_ids (LIB-C9). Same pattern.
 pub mod provider_ids_json;
 
+// LIB-B1 — backend-agnostic SQL builder for MediaStore::query(). Shared by
+// both backends (only the placeholder token + null-limit token differ).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod media_query;
+
 /// LIB-A3 — build a root-scoped, path-boundary-safe SQL `LIKE` pattern for
 /// the scan sweep. Matches only items strictly *under* `root` (i.e. paths
 /// beginning `root` + path separator), never a sibling whose name merely

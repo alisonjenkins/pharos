@@ -40,6 +40,144 @@ impl MediaStore for MemStore {
             .collect())
     }
 
+    async fn query(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+        // In-memory test store: no entity-join tables, so the entity /
+        // parent / user-data pivots aren't modelled here (the SQL backends
+        // carry those). Honours the kind / search / sort / page surface the
+        // core round-trip tests exercise.
+        let mut items: Vec<MediaItem> = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .values()
+            .filter(|i| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+            .filter(|i| match q.search_term.as_deref() {
+                Some(t) if !t.trim().is_empty() => {
+                    i.title.to_lowercase().contains(&t.trim().to_lowercase())
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        let key = q.sort.first().map(|(k, _)| *k).unwrap_or(SortKey::Id);
+        let desc = matches!(q.sort.first().map(|(_, d)| *d), Some(SortDir::Desc));
+        match key {
+            SortKey::Name => items.sort_by(|a, b| {
+                a.title
+                    .to_lowercase()
+                    .cmp(&b.title.to_lowercase())
+                    .then(a.id.cmp(&b.id))
+            }),
+            SortKey::DateCreated => {
+                items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)))
+            }
+            _ => items.sort_by_key(|i| i.id),
+        }
+        if desc {
+            items.reverse();
+        }
+        let total = items.len() as u64;
+        let start = usize::try_from(q.start_index).unwrap_or(usize::MAX);
+        let mut page: Vec<MediaItem> = items.into_iter().skip(start).collect();
+        if let Some(limit) = q.limit {
+            page.truncate(limit as usize);
+        }
+        Ok((page, total))
+    }
+
+    async fn search(&self, q: &SearchQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+        // In-memory FTS analogue: token-prefix match on title+overview OR a
+        // whole-term substring (the SUPERSET arm), honouring the kind filter.
+        let tokens = search_tokens(&q.term);
+        if tokens.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let needle = q.term.trim().to_lowercase();
+        let mut hits: Vec<MediaItem> = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .values()
+            .filter(|i| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+            .filter(|i| {
+                let title = i.title.to_lowercase();
+                let overview = i.metadata.overview.as_deref().unwrap_or("").to_lowercase();
+                let prefix_hit = tokens.iter().all(|tok| {
+                    title
+                        .split(|c: char| !c.is_alphanumeric())
+                        .any(|w| w.starts_with(tok))
+                        || overview
+                            .split(|c: char| !c.is_alphanumeric())
+                            .any(|w| w.starts_with(tok))
+                });
+                prefix_hit || title.contains(&needle) || overview.contains(&needle)
+            })
+            .cloned()
+            .collect();
+        hits.sort_by_key(|i| i.id);
+        let total = hits.len() as u64;
+        let start = usize::try_from(q.offset).unwrap_or(usize::MAX);
+        let mut page: Vec<MediaItem> = hits.into_iter().skip(start).collect();
+        page.truncate(q.limit.max(1) as usize);
+        Ok((page, total))
+    }
+
+    async fn facets(&self, base: &MediaQuery, req: &FacetRequest) -> DomainResult<MediaFacets> {
+        // In-memory store has no entity-join tables; only the scalar facets
+        // (year / official_rating) are derivable. Honour the kind filter.
+        let mut out = MediaFacets::default();
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let matched: Vec<&MediaItem> = inner
+            .values()
+            .filter(|i| base.kinds.is_empty() || base.kinds.contains(&i.kind))
+            .collect();
+        if req.years {
+            let mut counts: std::collections::BTreeMap<u32, u32> =
+                std::collections::BTreeMap::new();
+            for i in &matched {
+                if let Some(y) = i.metadata.production_year {
+                    *counts.entry(y).or_default() += 1;
+                }
+            }
+            out.years = counts
+                .into_iter()
+                .rev()
+                .map(|(y, c)| FacetValue {
+                    value: y.to_string(),
+                    wire_id: y.to_string(),
+                    count: c,
+                })
+                .collect();
+        }
+        if req.official_ratings {
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            for i in &matched {
+                if let Some(r) = i
+                    .metadata
+                    .official_rating
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
+                    *counts.entry(r.to_string()).or_default() += 1;
+                }
+            }
+            let mut vals: Vec<FacetValue> = counts
+                .into_iter()
+                .map(|(value, count)| FacetValue {
+                    wire_id: value.clone(),
+                    value,
+                    count,
+                })
+                .collect();
+            vals.sort_by(|a, b| b.count.cmp(&a.count).then(a.value.cmp(&b.value)));
+            out.official_ratings = vals;
+        }
+        Ok(out)
+    }
+
     async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
         Ok(self
             .states

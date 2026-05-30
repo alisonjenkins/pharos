@@ -1338,11 +1338,438 @@ impl ScanOutcome {
     }
 }
 
+/// LIB-B1 — the entity / hierarchy a `/Items?ParentId=<id>` request pivots
+/// on. Every variant covers exactly one of the `restrict_to_parent`
+/// branches the API used to resolve in memory; the store turns each into a
+/// SQL `WHERE` predicate (an indexed `EXISTS`/join on the relevant
+/// `item_<entity>` table by `wire_id`, or an equality on a `media_items`
+/// column) so the page + total are computed entirely server-side.
+///
+/// The wire-id variants carry the 32-hex synthetic id a Jellyfin client
+/// sends back as `?ParentId=` — byte-identical to the `wire_id` column the
+/// entity tables stamp at upsert (see [`genre_wire_id`] & friends), so the
+/// store joins on it directly. [`ParentFilter::Library`] carries the
+/// library `wire_id`, resolved against the `media_items.library_id` column
+/// the C1 backfill stamped (the store maps wire_id → library row → id).
+///
+/// [`ParentFilter::Series`] / [`ParentFilter::Season`] match on the
+/// `series_folder` (folder-keyed show identity, LIB-C11) plus the season
+/// number — the same key `series_id_for_key` / `season_id_for_key` hash, so
+/// the API resolves the synthetic id to its `(folder, season)` and the
+/// store filters on the raw columns (an indexed `series_folder` lookup).
+/// [`ParentFilter::Artist`] / [`ParentFilter::Album`] match the
+/// `media_items.artist` / `album_artist` / `album` probe columns (the music
+/// path is probe-aggregate, not entity-backed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentFilter {
+    /// Library / root: items whose `library_id` is the library carrying
+    /// this `wire_id`. Resolved by the store (wire_id → libraries.id →
+    /// media_items.library_id).
+    Library { wire_id: String },
+    /// Series folder: every episode whose `series_folder` equals this
+    /// canonical show-folder path (falling back to `series_name` for legacy
+    /// rows that never recorded a folder).
+    Series {
+        folder: Option<String>,
+        name: String,
+    },
+    /// A `(series, season)` pair: episodes matching the series key AND the
+    /// season number.
+    Season {
+        folder: Option<String>,
+        name: String,
+        season: u32,
+    },
+    /// Music artist: tracks whose `artist` OR `album_artist` equals `name`.
+    Artist { name: String },
+    /// Music album: tracks whose `album` equals `name`.
+    Album { name: String },
+    /// Genre: items linked to the genre row carrying this `wire_id`
+    /// (indexed `item_genres` join).
+    Genre { wire_id: String },
+    /// Studio: items linked to the studio row carrying this `wire_id`
+    /// (indexed `item_studios` join).
+    Studio { wire_id: String },
+    /// Person: items crediting the person row carrying this `wire_id`
+    /// (indexed `item_people` join).
+    Person { wire_id: String },
+    /// Collection / box set: members of the collection carrying this
+    /// `wire_id`, in the join's curated `sort_order` (indexed
+    /// `collection_items` join). When this filter is active the store
+    /// orders by the membership `sort_order` ahead of any [`SortKey`].
+    Collection { wire_id: String },
+    /// Tag: items carrying the tag row with this `wire_id` (indexed
+    /// `item_tags` join).
+    Tag { wire_id: String },
+}
+
+/// LIB-B1 — an allowlisted sort column for [`MediaQuery::sort`]. The store
+/// maps each variant to a fixed SQL `ORDER BY` expression — user-supplied
+/// strings NEVER reach the SQL text (injection-safe: the variant is the
+/// only thing interpolated, and it comes from this closed set). Mirrors the
+/// in-memory `filter_and_sort` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// `SortName` — case-folded title. The default.
+    Name,
+    /// `DateCreated` / `DateAdded` — `created_at`.
+    DateCreated,
+    /// `RuntimeTicks` / `Runtime` — `duration_ms`.
+    Runtime,
+    /// `PremiereDate` — the metadata `premiere_date`.
+    PremiereDate,
+    /// `ProductionYear` — the metadata `production_year`.
+    ProductionYear,
+    /// `CommunityRating` — the metadata `community_rating`.
+    CommunityRating,
+    /// `Album` — case-folded `album` probe column.
+    Album,
+    /// `AlbumArtist` — case-folded `album_artist` probe column.
+    AlbumArtist,
+    /// `IndexNumber` — the episode number (`episode_number`).
+    IndexNumber,
+    /// Stable id order — the implicit final tiebreak on every sort, and the
+    /// key for "no explicit sort" callers.
+    Id,
+}
+
+/// LIB-B1 — sort direction for a [`SortKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// LIB-B1 — optional per-user-data predicate folded into [`MediaQuery`].
+/// When `user` is `Some`, the store LEFT JOINs `user_data` for that user
+/// and applies the active flags; a missing `user_data` row is treated as
+/// all-defaults (unplayed, not-favourite, position 0) so the predicates
+/// behave exactly like the in-memory `UserDataFilter`. When `user` is
+/// `None` every flag is ignored (the join is skipped entirely).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserDataQuery {
+    pub user: Option<UserId>,
+    /// `Some(true)` → only favourites; `Some(false)` → only non-favourites.
+    pub is_favorite: Option<bool>,
+    /// `Some(true)` → only played; `Some(false)` → only unplayed.
+    pub is_played: Option<bool>,
+    /// `true` → only resumable items (a non-zero resume position AND not
+    /// yet fully played).
+    pub is_resumable: bool,
+}
+
+impl UserDataQuery {
+    /// Whether any user-data predicate is active (so the store joins
+    /// `user_data`). A `user` without any flag set is inert.
+    pub fn is_active(&self) -> bool {
+        self.user.is_some()
+            && (self.is_favorite.is_some() || self.is_played.is_some() || self.is_resumable)
+    }
+}
+
+/// LIB-B1 — a fully-described media-list query, resolved by
+/// [`MediaStore::query`] as ONE parameterised SQL statement per backend
+/// (dynamic `WHERE` + allowlisted `ORDER BY` + `LIMIT`/`OFFSET`, total via a
+/// window count). Replaces the legacy `list()` + in-memory
+/// `filter_and_sort` + `restrict_to_parent` pipeline for large libraries;
+/// `list()` stays for small / test callers.
+///
+/// `Default` = "every item, id-ordered, unpaged" (equivalent to `list()`).
+/// All filters are conjunctive (`AND`). Every string field that reaches the
+/// SQL text does so ONLY as a bound parameter — the only interpolation is
+/// the allowlisted [`SortKey`] column map, so the query is injection-safe.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaQuery {
+    /// Restrict to these [`MediaKind`]s (`kind IN (…)`). Empty = no kind
+    /// filter.
+    pub kinds: Vec<MediaKind>,
+    /// The `?ParentId=` pivot, resolved to a typed [`ParentFilter`] by the
+    /// API. `None` = no parent restriction (the whole library / a view
+    /// root).
+    pub parent: Option<ParentFilter>,
+    /// Case-insensitive substring match on `title` (the `?SearchTerm=` /
+    /// `NameStartsWith` family is layered by the API; this is the raw
+    /// substring). `None` = no search.
+    pub search_term: Option<String>,
+    /// Items linked to the genre row carrying this `wire_id` (an `EXISTS`
+    /// on `item_genres`). Distinct from a [`ParentFilter::Genre`] pivot so a
+    /// `?Genres=` filter can stack on top of a different parent.
+    pub genre_wire_id: Option<String>,
+    /// Items linked to the studio row carrying this `wire_id`.
+    pub studio_wire_id: Option<String>,
+    /// Items crediting the person row carrying this `wire_id`.
+    pub person_wire_id: Option<String>,
+    /// Items carrying the tag row with this `wire_id`. `?Tags=` is an AND
+    /// across several tags; the API issues one wire-id per tag and the
+    /// store ANDs them (see [`MediaQuery::tag_wire_ids`]).
+    pub tag_wire_ids: Vec<String>,
+    /// Items belonging to the collection carrying this `wire_id`.
+    pub collection_wire_id: Option<String>,
+    /// Items assigned the library carrying this `wire_id` (distinct from a
+    /// [`ParentFilter::Library`] pivot so it can stack).
+    pub library_wire_id: Option<String>,
+    /// Per-user-data predicates (favourite / played / resumable).
+    pub user_data: UserDataQuery,
+    /// The sort chain. Empty = the implicit `(Id, Asc)` order. The store
+    /// always appends `Id` as the final tiebreak for a stable page.
+    pub sort: Vec<(SortKey, SortDir)>,
+    /// Zero-based page offset (`OFFSET`). `0` = first page.
+    pub start_index: u64,
+    /// Page size (`LIMIT`). `None` = no limit (every matching row).
+    pub limit: Option<u32>,
+    /// LIB-B2 — the residual `/Items` chip filters the legacy in-memory
+    /// `filter_and_sort` applied AFTER the parent/kind/entity scope. Folded
+    /// into the single `query()` statement so no whole-library load + filter
+    /// remains. All conjunctive (`AND`) with the rest of the query.
+    pub filters: MediaFilters,
+}
+
+/// LIB-B2 — the residual scalar / boolean `/Items` chip filters (the
+/// `ExcludeItemTypes` / `MediaTypes` / `HasSubtitles` / resolution / width /
+/// index-number / name-prefix / `Ids` / probe-`Genres` family). Every field
+/// reaches the SQL ONLY as a bound parameter; the predicates mirror the
+/// legacy in-memory `filter_and_sort` semantics byte-for-byte.
+///
+/// `Default` = no residual filter (every field inert).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaFilters {
+    /// `ExcludeItemTypes` — drop items of any listed kind (`kind NOT IN`).
+    pub exclude_kinds: Vec<MediaKind>,
+    /// Restrict to these kinds — the `MediaTypes=Audio|Video` projection,
+    /// pre-intersected with `MediaQuery.kinds` by the API. Empty = inert.
+    /// Distinct from `MediaQuery.kinds` so the two can stack without one
+    /// clobbering the other (both apply as `kind IN`).
+    pub media_type_kinds: Vec<MediaKind>,
+    /// `HasSubtitles` — `Some(true)` keeps only items with at least one
+    /// embedded subtitle track (`subtitle_tracks_json IS NOT NULL`);
+    /// `Some(false)` keeps only those without.
+    pub has_subtitles: Option<bool>,
+    /// `Is4K` — `Some(true)` keeps only `width >= 3840`; `Some(false)` keeps
+    /// only items whose width is present and `< 3840`. Items lacking a width
+    /// drop either way (mirrors `width.map(..) == Some(want)`).
+    pub is_4k: Option<bool>,
+    /// `IsHD` — `Some(true)` keeps only `1280 <= width < 3840`; `Some(false)`
+    /// keeps only items whose width is present and outside that band.
+    pub is_hd: Option<bool>,
+    /// `Is3D` — no detection yet, so `Some(true)` matches nothing and
+    /// `Some(false)` matches everything (parity with the in-memory stub).
+    pub is_3d: Option<bool>,
+    /// `MinWidth` — keep only items whose `width >= n`.
+    pub min_width: Option<u32>,
+    /// `MaxWidth` — keep only items whose `width <= n`.
+    pub max_width: Option<u32>,
+    /// `MinIndexNumber` — keep only items whose `episode_number >= n`.
+    pub min_index_number: Option<u32>,
+    /// `MaxIndexNumber` — keep only items whose `episode_number <= n`.
+    pub max_index_number: Option<u32>,
+    /// `NameStartsWith` / `NameStartsWithOrGreater` — case-insensitive title
+    /// prefix (`LOWER(title) LIKE 'prefix%'`).
+    pub name_starts_with: Option<String>,
+    /// `NameLessThan` — strict case-insensitive upper bound on the title
+    /// (`LOWER(title) < bound`). Used by the "0-9" letter chip.
+    pub name_less_than: Option<String>,
+    /// `Ids` — restrict to these numeric store ids (`id IN`). Empty Vec when
+    /// the param was absent. An EMPTY-but-PRESENT `Ids=` (the API signals
+    /// this via [`MediaFilters::ids_present`]) matches nothing.
+    pub ids: Vec<MediaId>,
+    /// Whether an `Ids=` param was present at all (even if it parsed to zero
+    /// numeric ids). When `true` with an empty [`MediaFilters::ids`] the
+    /// query matches nothing (Jellyfin's "you asked for nothing" semantics).
+    pub ids_present: bool,
+    /// `Genres=` — the LEGACY probe-column genre filter: keep items whose
+    /// whole `probe.genre` string (case-folded) is in this set. Distinct
+    /// from the entity-backed [`MediaQuery::genre_wire_id`] pivot; kept for
+    /// byte-identical parity with the in-memory `filter_and_sort` which
+    /// matched the raw probe column, not the join.
+    pub genre_probe_names: Vec<String>,
+    /// LIB-B2 — component-boundary path-prefix scope: keep items whose `path`
+    /// equals this prefix OR lives strictly under it (`path = p` OR
+    /// `path LIKE p || '/%'`). The fallback for a `ParentId` that names a
+    /// configured media root WITHOUT a typed-library entity row (the entity
+    /// path uses [`ParentFilter::Library`]). Boundary-safe: `/media/movies`
+    /// never claims `/media/movies-4k`, mirroring `Path::starts_with`.
+    pub path_prefix: Option<String>,
+    /// LIB-B2 — LEGACY `ParentId=<genre>` fallback: keep items whose
+    /// `probe.genre` field, SPLIT on `|`/`,` and trimmed (the
+    /// [`split_genre_field`] convention), CONTAINS this token (case-folded).
+    /// Distinct from [`MediaFilters::genre_probe_names`] (which matches the
+    /// WHOLE genre string — the `?Genres=` filter's semantics). Active only
+    /// when the `item_genres` entity join is empty (un-backfilled pre-LIB-C4
+    /// rows), preserving the legacy `restrict_to_parent` genre fallback.
+    pub genre_probe_token: Option<String>,
+}
+
+impl MediaFilters {
+    /// Whether any residual filter is active (so the builder emits clauses).
+    pub fn is_active(&self) -> bool {
+        !self.exclude_kinds.is_empty()
+            || !self.media_type_kinds.is_empty()
+            || self.has_subtitles.is_some()
+            || self.is_4k.is_some()
+            || self.is_hd.is_some()
+            || self.is_3d.is_some()
+            || self.min_width.is_some()
+            || self.max_width.is_some()
+            || self.min_index_number.is_some()
+            || self.max_index_number.is_some()
+            || self.name_starts_with.is_some()
+            || self.name_less_than.is_some()
+            || self.ids_present
+            || !self.genre_probe_names.is_empty()
+            || self.path_prefix.is_some()
+            || self.genre_probe_token.is_some()
+    }
+}
+
+/// LIB-B4 — a full-text search request resolved by [`MediaStore::search`].
+///
+/// The backend matches `term` against its native FTS index over
+/// `title` + `overview` (SQLite fts5 external-content vtable; postgres a
+/// GENERATED `tsvector` column + GIN), returning items ranked best-first.
+/// The result is a SUPERSET of the legacy case-insensitive substring match
+/// on `title`: the backend UNIONs the ranked FTS hits with a substring
+/// match so mid-word substrings the tokenizer can't reach (e.g. `kemon`
+/// inside `Pokemon`) are never dropped — the substring arm is part of the
+/// search CONTRACT on BOTH backends (not a per-backend fallback), so the
+/// two stay behaviourally identical.
+///
+/// `term` reaches the SQL ONLY as a bound parameter; the FTS query string
+/// is assembled from `term`'s whitespace-split tokens, each sanitised to
+/// `[A-Za-z0-9]` runs + a trailing prefix marker, so no operator syntax
+/// (`"`, `:`, `*`, `(`, `OR`, `NEAR`, …) leaks into the matcher.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SearchQuery {
+    /// The raw user search term. Empty / whitespace-only matches nothing.
+    pub term: String,
+    /// Restrict to these [`MediaKind`]s (`kind IN (…)`). Empty = no kind
+    /// filter (mirrors `/Search/Hints?IncludeItemTypes=`).
+    pub kinds: Vec<MediaKind>,
+    /// Max rows to return. The ranked page is sliced to `limit` AFTER the
+    /// FTS + substring union + de-dup.
+    pub limit: u32,
+    /// Zero-based offset into the ranked result (for paging hints).
+    pub offset: u32,
+}
+
+/// LIB-B5 — which facet dimensions [`MediaStore::facets`] should aggregate
+/// for a base [`MediaQuery`]. Each `true` dimension yields one
+/// `Vec<FacetValue>` ([`MediaFacets`]) of `(value, count)` over the items
+/// matching the base query — the data a client filter UI needs to show how
+/// many items each chip would leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FacetRequest {
+    pub genres: bool,
+    pub studios: bool,
+    pub tags: bool,
+    pub years: bool,
+    pub official_ratings: bool,
+    pub people: bool,
+}
+
+impl Default for FacetRequest {
+    /// The default `/Items/Filters2` set: the dimensions Jellyfin's filter
+    /// drawer renders. `people` is opt-in (large cardinality) and off by
+    /// default.
+    fn default() -> Self {
+        FacetRequest {
+            genres: true,
+            studios: true,
+            tags: true,
+            years: true,
+            official_ratings: true,
+            people: false,
+        }
+    }
+}
+
+impl FacetRequest {
+    /// Whether any facet dimension is requested.
+    pub fn is_any(&self) -> bool {
+        self.genres
+            || self.studios
+            || self.tags
+            || self.years
+            || self.official_ratings
+            || self.people
+    }
+}
+
+/// LIB-B5 — one facet bucket: a display value, its wire id (the 32-hex
+/// synth id for entity facets; the raw value for scalar facets like year /
+/// rating), and the number of base-query items in the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FacetValue {
+    /// The human display value (genre name, studio name, "2019", "PG-13").
+    pub value: String,
+    /// The wire id a `?Genres=` / `?Studios=` / `?Years=` chip would send.
+    /// For entity facets this is the entity's `wire_id`; for scalar facets
+    /// it equals `value`.
+    pub wire_id: String,
+    /// How many items in the base query fall in this bucket.
+    pub count: u32,
+}
+
+/// LIB-B5 — the aggregated facet counts for a base [`MediaQuery`]. Each
+/// field is the bucket list for one requested dimension (empty when the
+/// dimension wasn't requested or had no values). Counts reflect the base
+/// query's WHERE scope (parent / kind / entity / user-data filters).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaFacets {
+    pub genres: Vec<FacetValue>,
+    pub studios: Vec<FacetValue>,
+    pub tags: Vec<FacetValue>,
+    /// Production-year buckets, descending by year (newest first).
+    pub years: Vec<FacetValue>,
+    pub official_ratings: Vec<FacetValue>,
+    pub people: Vec<FacetValue>,
+}
+
 pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
     fn put(&self, item: MediaItem) -> impl std::future::Future<Output = DomainResult<()>> + Send;
     fn list(&self) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
+
+    /// LIB-B1 — resolve a [`MediaQuery`] as ONE parameterised statement,
+    /// returning the requested page of items plus the TOTAL number of rows
+    /// that matched the filters BEFORE `LIMIT`/`OFFSET` (the
+    /// `TotalRecordCount` Jellyfin reports). The page respects the
+    /// allowlisted [`SortKey`] order, `start_index` (OFFSET) and `limit`
+    /// (LIMIT). The total is computed in the same scan via a window count
+    /// (`COUNT(*) OVER ()`) so no second round-trip is needed for an empty
+    /// or partial page.
+    ///
+    /// Injection-safe: every value reaches the SQL as a bound parameter;
+    /// the only interpolated text is the closed-set [`SortKey`] column map.
+    fn query(
+        &self,
+        q: &MediaQuery,
+    ) -> impl std::future::Future<Output = DomainResult<(Vec<MediaItem>, u64)>> + Send;
+
+    /// LIB-B4 — full-text search over `title` + `overview` via the
+    /// backend's native FTS (SQLite fts5 external-content vtable; postgres
+    /// a GENERATED `tsvector` + GIN). Returns up to `limit` items ranked
+    /// best-first (FTS `rank` / `ts_rank`) PLUS the total number of distinct
+    /// matches BEFORE `limit`/`offset`. Prefix-friendly (each token matches
+    /// as a prefix) and a guaranteed SUPERSET of the legacy substring match
+    /// on `title` (see [`SearchQuery`]). An empty / whitespace term returns
+    /// `(vec![], 0)`.
+    fn search(
+        &self,
+        q: &SearchQuery,
+    ) -> impl std::future::Future<Output = DomainResult<(Vec<MediaItem>, u64)>> + Send;
+
+    /// LIB-B5 — aggregate per-facet counts for the items matching a base
+    /// [`MediaQuery`]'s WHERE scope (the parent / kind / entity / user-data
+    /// filters; `sort` / `limit` / `start_index` are ignored — facets
+    /// describe the WHOLE result set, not a page). Only the dimensions set
+    /// in `req` are computed. Powers the Jellyfin `/Items/Filters2` filter
+    /// drawer, letting a client show "Action (42)" before the user clicks.
+    fn facets(
+        &self,
+        base: &MediaQuery,
+        req: &FacetRequest,
+    ) -> impl std::future::Future<Output = DomainResult<MediaFacets>> + Send;
 
     /// LIB-A1 — read the stored fs-stat signature for one item, or
     /// `None` when the row is absent or predates migration 0016 (no
