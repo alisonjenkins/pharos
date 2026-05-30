@@ -434,6 +434,39 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     let app_state = web::Data::new(state);
+
+    // LIB-A9 — tiered library change-detection. Each media root picks the best
+    // mode it can sustain (native watch on a local fs when the `watch` feature
+    // is built + enabled; periodic incremental rescan on network/fuse roots or
+    // when watch is off; manual /Library/Refresh as the floor). Deltas
+    // broadcast to /socket via the same A4 mechanism the manual refresh uses.
+    // The guards keep native watches alive for the process lifetime.
+    let _library_watch_guards = {
+        use pharos_server::library_watch::{spawn_for_roots, WatchConfig};
+        let watch_cfg = WatchConfig {
+            watch_enabled: cfg.server.library_watch_enabled,
+            poll_interval: std::time::Duration::from_secs(cfg.server.library_poll_interval_secs),
+            rate_limit_ms: cfg.server.scan_rate_limit_ms,
+        };
+        let rate_limit_ms = cfg.server.scan_rate_limit_ms;
+        // P48 — same prober selection as the CLI scan + admin refresh paths.
+        // The closure builds a fresh owned scanner per root (each spawned task
+        // owns its own — the prober isn't required to be Clone).
+        let make_scanner = move || {
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            {
+                pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+                    .with_rate_limit_ms(rate_limit_ms)
+            }
+            #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+            {
+                pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+                    .with_rate_limit_ms(rate_limit_ms)
+            }
+        };
+        spawn_for_roots(app_state.clone(), &cfg.media.roots, watch_cfg, make_scanner)
+    };
+
     let group_registry = web::Data::new(GroupRegistry::spawn());
     let token_resolver_data = web::Data::new(token_resolver);
 

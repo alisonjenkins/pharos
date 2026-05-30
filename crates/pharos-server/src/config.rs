@@ -122,10 +122,33 @@ pub struct ServerConfig {
     /// catalog walk.
     #[serde(default)]
     pub scan_rate_limit_ms: u64,
+    /// LIB-A9 — enable native filesystem watching (inotify / kqueue /
+    /// ReadDirectoryChangesW) for media roots that support it, so the
+    /// library index stays live between full scans without polling.
+    /// Default `true`, but the watch tier only engages when the binary was
+    /// built with the `watch` feature *and* the root's filesystem can
+    /// deliver events (local fs — not NFS / SMB / FUSE, which always fall
+    /// back to the periodic rescan below). With the `watch` feature off this
+    /// flag is a no-op; periodic rescan still applies.
+    #[serde(default = "default_true")]
+    pub library_watch_enabled: bool,
+    /// LIB-A9 — interval, in seconds, for the periodic incremental rescan
+    /// that backstops every media root (and is the primary detector for
+    /// network / fuse roots, or when the `watch` feature is off). The rescan
+    /// reuses the cheap incremental `scan_into` path (unchanged files cost
+    /// only a stat). Default `300` (5 min). Set to `0` to disable periodic
+    /// rescans entirely — roots then rely solely on a native watch (if
+    /// eligible + built) or on manual `/Library/Refresh` (the floor tier).
+    #[serde(default = "default_library_poll_interval_secs")]
+    pub library_poll_interval_secs: u64,
 }
 
 fn default_played_threshold_pct() -> u32 {
     90
+}
+
+fn default_library_poll_interval_secs() -> u64 {
+    300
 }
 
 fn default_image_seek_seconds() -> u32 {
