@@ -30,8 +30,13 @@ app.kubernetes.io/name: {{ include "pharos.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
-{{- define "pharos.ui.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "pharos.name" . }}-ui
+{{- define "pharos.jellyfinWeb.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "pharos.name" . }}-jellyfin-web
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "pharos.pharosUi.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "pharos.name" . }}-pharos-ui
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 

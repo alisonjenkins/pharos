@@ -46,7 +46,9 @@ config:
   obs:
     logLevel: "debug"
 
-ui:
+jellyfinWeb:
+  enabled: true
+pharosUi:
   enabled: true
 
 ingress:

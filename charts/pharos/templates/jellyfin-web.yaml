@@ -1,0 +1,57 @@
+{{- if .Values.jellyfinWeb.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pharos.fullname" . }}-jellyfin-web
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pharos.jellyfinWeb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pharos.jellyfinWeb.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: jellyfin-web
+          image: "{{ .Values.jellyfinWeb.image.repository }}:{{ .Values.jellyfinWeb.image.tag }}"
+          imagePullPolicy: {{ .Values.jellyfinWeb.image.pullPolicy }}
+          # angie reverse-proxies all non-static requests here, so the
+          # browser reaches pharos same-origin (no manual server entry).
+          env:
+            - name: PHAROS_URL
+              value: "http://{{ include "pharos.fullname" . }}:{{ .Values.service.port }}"
+          ports:
+            - name: http
+              containerPort: 8097
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pharos.fullname" . }}-jellyfin-web
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-web
+spec:
+  type: {{ .Values.jellyfinWeb.service.type }}
+  selector:
+    {{- include "pharos.jellyfinWeb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.jellyfinWeb.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

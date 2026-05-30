@@ -149,15 +149,28 @@ scan:
     enabled: false
     schedule: "0 * * * *"
 
-# Optional UI: deploy the pinned jellyfin-web image as the web client.
-# (When config.server.uiDir is set to an in-image bundle, you can leave this off.)
-ui:
+# jellyfin-web: the pinned upstream Jellyfin web client. angie image serving
+# the bundle under /web/ + reverse-proxying the REST API to pharos so the
+# browser is same-origin.
+jellyfinWeb:
   enabled: true
   image:
     repository: pharos-jellyfin-web
     tag: "latest"
     pullPolicy: IfNotPresent
   port: 8097
+  service:
+    type: ClusterIP
+
+# pharos-ui: pharos's own Dioxus UI. angie image serving the WASM bundle
+# under /ui/ + reverse-proxying the REST API to pharos, same-origin.
+pharosUi:
+  enabled: true
+  image:
+    repository: pharos-ui
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  port: 8098
   service:
     type: ClusterIP
 

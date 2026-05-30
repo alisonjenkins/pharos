@@ -6,13 +6,17 @@
 # pulls it from there — Tilt auto-detects the registry from the cluster's
 # `local-registry-hosting` ConfigMap, so no `kind load`, no docker.io.
 #
-# Brings up pharos + the jellyfin-web UI via the Helm chart (charts/pharos).
+# Brings up pharos + TWO web UIs via the Helm chart (charts/pharos):
+#   pharos-ui    — pharos's own Dioxus UI (http://127.0.0.1:8098/ui/)
+#   jellyfin-web — the upstream Jellyfin client (http://127.0.0.1:8097/)
+# Each UI is an angie image serving its static bundle + reverse-proxying the
+# REST API to the pharos service, so the browser is same-origin (no manual
+# "add server" step).
+#
 # The library is populated in-pod: a `mediaSeed` initContainer copies the nix
 # CC test-media corpus into the media volume, then `serve` starts and its
-# library poll tier indexes it (~30s after boot — the dev poll interval). The
-# jellyfin-web image is nginx serving the bundle + reverse-proxying the REST
-# API to the pharos service, so the UI talks to pharos same-origin (no manual
-# server entry). Tilt then seeds the playwright admin user.
+# library poll tier indexes it (~30s after boot — the dev poll interval). Tilt
+# then seeds the playwright admin user.
 #
 # (A one-shot `scan` initContainer was tried first but its sqlite pool can't
 # establish under kind's containerd runtime; the running server's warm pool
@@ -44,6 +48,7 @@ def nix_oci(image_name, flake_attr):
     )
 
 nix_oci('pharos', 'oci')
+nix_oci('pharos-ui', 'pharosUiOci')
 nix_oci('pharos-jellyfin-web', 'jellyfinWebOci')
 nix_oci('pharos-test-media', 'testMediaOci')
 
@@ -68,8 +73,18 @@ k8s_resource(
     port_forwards=['8096:8096'],
     labels=['pharos'],
 )
+# pharos's own Dioxus UI (served under /ui/, proxies the API to pharos).
 k8s_resource(
-    'pharos-ui',
+    'pharos-pharos-ui',
+    new_name='pharos-ui',
+    port_forwards=['8098:8098'],
+    labels=['pharos'],
+    resource_deps=['pharos'],
+)
+# Upstream jellyfin-web client (served under /web/, proxies the API to pharos).
+k8s_resource(
+    'pharos-jellyfin-web',
+    new_name='jellyfin-web',
     port_forwards=['8097:8097'],
     labels=['pharos'],
     resource_deps=['pharos'],

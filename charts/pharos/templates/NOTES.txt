@@ -8,11 +8,17 @@ Reach the API:
   curl http://127.0.0.1:{{ .Values.service.port }}/healthz
   curl http://127.0.0.1:{{ .Values.service.port }}/System/Info/Public
 
-{{- if .Values.ui.enabled }}
+{{- if .Values.pharosUi.enabled }}
 
-Web UI (jellyfin-web):
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pharos.fullname" . }}-ui {{ .Values.ui.port }}:{{ .Values.ui.port }}
-  open http://127.0.0.1:{{ .Values.ui.port }}  (add server: http://<pharos-host>:{{ .Values.service.port }})
+pharos UI (Dioxus):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pharos.fullname" . }}-pharos-ui {{ .Values.pharosUi.port }}:{{ .Values.pharosUi.port }}
+  open http://127.0.0.1:{{ .Values.pharosUi.port }}/ui/  (proxies the REST API to pharos same-origin)
+{{- end }}
+{{- if .Values.jellyfinWeb.enabled }}
+
+jellyfin-web UI:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pharos.fullname" . }}-jellyfin-web {{ .Values.jellyfinWeb.port }}:{{ .Values.jellyfinWeb.port }}
+  open http://127.0.0.1:{{ .Values.jellyfinWeb.port }}/  (proxies the REST API to pharos same-origin)
 {{- end }}
 {{- if .Values.ingress.enabled }}
 
