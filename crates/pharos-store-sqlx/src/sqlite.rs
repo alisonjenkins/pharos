@@ -7,7 +7,7 @@ use pharos_core::{
     TagStore, UserId,
 };
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     SqlitePool,
 };
 use std::str::FromStr;
@@ -51,10 +51,22 @@ impl SqliteStore {
     /// Open a pool against the given sqlx connect URL (e.g. `sqlite::memory:`,
     /// `sqlite:///var/lib/pharos/data.db`). Runs migrations to latest.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        // WAL + busy_timeout for the file-backed (on-PVC) deployment: the
+        // server runs the periodic library rescan concurrently with read
+        // traffic, so the journal must let readers proceed against a live
+        // writer instead of serialising on the rollback journal's whole-db
+        // lock. busy_timeout(15s) absorbs the brief writer-lock windows the
+        // scan's sequential writes take (V10 keeps writes single-threaded,
+        // but a slow PVC can still stall a lock past the default 5s).
+        // NORMAL synchronous is the WAL-recommended durability/speed
+        // trade-off. All three no-op for `sqlite::memory:`.
         let opts = SqliteConnectOptions::from_str(url)
             .map_err(StoreError::Sqlx)?
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(15));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)

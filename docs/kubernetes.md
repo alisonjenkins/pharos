@@ -23,10 +23,13 @@ just tilt-down delete=1   # tilt down + delete the kind cluster
 ```
 
 What `tilt up` does:
-1. Builds `.#oci` + `.#jellyfinWebOci` via nix, loads them into kind.
-2. Deploys `charts/pharos` with `values-dev.yaml` (ephemeral storage, UI on).
-3. Copies the CC test-media corpus (`.#testMediaTree`) into the pod, runs
-   `pharos scan`, and seeds the `playwright` admin user (`scripts/tilt-seed.sh`).
+1. Builds `.#oci`, `.#jellyfinWebOci`, and `.#testMediaOci` via nix, loads them
+   into kind.
+2. Deploys `charts/pharos` with `values-dev.yaml` (ephemeral storage, UI on). A
+   `mediaSeed` initContainer copies the CC test-media corpus into the media
+   volume; the running server's poll tier then indexes it (~30s after boot).
+3. Seeds the `playwright` admin user, then waits for the library to populate and
+   reports the item count (`scripts/tilt-seed.sh`).
 4. Port-forwards `127.0.0.1:8096` (API) and `127.0.0.1:8097` (jellyfin-web UI).
 
 Verify: `curl 127.0.0.1:8096/healthz` → `ok`; `curl
@@ -78,13 +81,24 @@ helm install pharos charts/pharos -n pharos \
 
 `pharos serve` watches roots and periodically rescans
 (`libraryPollIntervalSecs`, default 300s) but **skips the first poll tick**, so a
-fresh deploy is empty until then. The chart runs `pharos scan` as an
-**initContainer** before `serve` (`scan.initContainer=true`, default) to populate
-the library on first boot — same pod + db volume, so it's SQLite-safe
-(sequential, no concurrent writer). A separate `scan.cron` CronJob is available
-but should only be enabled with Postgres or when you disable the in-process poll
-(`libraryPollIntervalSecs=0`); a concurrent scan pod would contend on the SQLite
-lock.
+fresh deploy is empty until the first interval elapses. The chart can also run
+`pharos scan` as an **initContainer** before `serve` (`scan.initContainer`,
+default `false`) to populate the library on first boot — same pod + db volume,
+so it's SQLite-safe (sequential, no concurrent writer). A separate `scan.cron`
+CronJob is available but should only be enabled with Postgres or when you disable
+the in-process poll (`libraryPollIntervalSecs=0`); a concurrent scan pod would
+contend on the SQLite lock.
+
+### kind dev caveat
+
+`values-dev.yaml` sets `scan.initContainer=false` and a short
+`libraryPollIntervalSecs` (30s) instead of the boot scan. The cold one-shot
+`scan` **process** cannot establish its SQLite connection pool under kind's
+containerd runtime (it times out on connection acquire — the same release binary
+populates fine locally and on a real cluster). The long-running server does not
+hit this: its pool is already warm from the `/readyz` store probe, so the poll
+tier scans normally. On a production cluster (real PVC, not kind's overlayfs)
+`scan.initContainer=true` works as intended.
 
 ## Observability
 

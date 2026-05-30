@@ -1,10 +1,16 @@
 # Tiltfile — local k8s inner-loop for pharos.
 #
-# Targets a Tilt-managed local *kind* cluster (context `kind-pharos`) and
-# loads the nix-built OCI images directly (no registry). Brings up pharos +
-# the jellyfin-web UI via the Helm chart in charts/pharos, then mirrors the
-# docker dev-stack: copies the CC test-media corpus into the pod, scans it,
-# and seeds the playwright admin user.
+# Targets a Tilt-managed local *kind* cluster (context `kind-pharos`, docker
+# driver) and loads the nix-built OCI images directly (no registry). Brings
+# up pharos + the jellyfin-web UI via the Helm chart (charts/pharos). The
+# library is populated in-pod: a `mediaSeed` initContainer copies the nix CC
+# test-media corpus into the media volume, then `serve` starts and its
+# library poll tier indexes the corpus (~30s after boot — the dev poll
+# interval). Tilt then seeds the playwright admin user.
+#
+# (A one-shot `scan` initContainer was tried first but its sqlite pool can't
+# establish under kind's containerd runtime; the running server's warm pool
+# scans fine. See docs/kubernetes.md "kind dev caveat".)
 #
 #   just tilt-up      # create the kind cluster (if absent) + `tilt up`
 #   just tilt-down    # `tilt down` (+ optionally delete the cluster)
@@ -32,6 +38,7 @@ def nix_oci(image_name, flake_attr):
 
 nix_oci('pharos', 'oci')
 nix_oci('pharos-jellyfin-web', 'jellyfinWebOci')
+nix_oci('pharos-test-media', 'testMediaOci')
 
 # ── Deploy the chart (dev values).
 k8s_yaml(helm(
@@ -53,9 +60,11 @@ k8s_resource(
     resource_deps=['pharos'],
 )
 
-# ── Populate media + scan + seed (mirrors scripts/dev-stack.sh).
+# ── Seed the playwright admin user once pharos is up. (Media is copied in by
+#    the mediaSeed initContainer; the server's poll tier indexes it ~30s after
+#    boot — the seed script waits for the library to populate and reports it.)
 local_resource(
-    'seed-media',
+    'seed-user',
     cmd='bash scripts/tilt-seed.sh',
     deps=['scripts/tilt-seed.sh'],
     resource_deps=['pharos'],

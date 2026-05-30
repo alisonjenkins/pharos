@@ -1,31 +1,47 @@
 # Tilt / local-kind dev overrides. Ephemeral storage, UI on, no ingress.
-# Media is empty at pod start and populated by the Tiltfile (kubectl cp of
-# the nix CC test-media corpus) + a scan — so the in-pod scan initContainer
-# is OFF (it would run before the media is copied).
+# Media is populated in-pod by a `mediaSeed` initContainer (the nix CC
+# test-media image), then the `scan` initContainer indexes it, then `serve`
+# starts. The Tiltfile only loads the images + seeds the playwright user.
 
 image:
   repository: pharos
   tag: latest
-  pullPolicy: IfNotPresent
+  # Image is loaded into kind directly (no registry) — never pull.
+  pullPolicy: Never
 
 # Ephemeral — kind throwaway cluster, no PVC churn.
 persistence:
   db:
     enabled: false        # emptyDir
+    # kind's node fs is overlayfs; SQLite locking needs tmpfs here.
+    medium: Memory
   cache:
     enabled: false        # emptyDir
   media:
     type: emptyDir
-    readOnly: false       # Tilt kubectl-cp's fixtures in, then scans
+    readOnly: false       # mediaSeed initContainer writes the corpus in
+
+# Populate media from the nix CC test-media image, then scan, before serve.
+mediaSeed:
+  enabled: true
+  image:
+    repository: pharos-test-media
+    tag: latest
+    pullPolicy: Never
+  mountPath: /media
 
 scan:
-  initContainer: false    # Tiltfile runs scan after copying media
+  # The cold one-shot `scan` process can't establish its sqlite pool under
+  # kind's containerd runtime (works on a real cluster / locally). The running
+  # server's poll tier populates the library instead — its pool is already warm
+  # from the /readyz store probe. See docs/kubernetes.md "kind dev caveat".
+  initContainer: false
 
 config:
   server:
     name: "pharos-dev"
-    # Faster feedback than the 5-min default while iterating.
-    libraryPollIntervalSecs: 60
+    # Server poll tier does the indexing on kind; first scan after one tick.
+    libraryPollIntervalSecs: 30
   obs:
     logLevel: "debug"
 

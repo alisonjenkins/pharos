@@ -339,16 +339,13 @@
                      $out/withcover.mp3
             '';
 
-        # Skeleton rootfs: passwd / group / writable /tmp + state
-        # directories. Distroless containers usually skip this, but
-        # ffmpeg + tokio's getrandom path are happier with a real
-        # /tmp + a passwd entry for the non-root user.
-        rootfsSkel = pkgs.runCommand "rootfs-skel" { } ''
-          mkdir -p $out/etc $out/var/lib/pharos/db $out/var/lib/pharos/media $out/var/lib/pharos/cache $out/tmp
-          printf 'root:x:0:0::/root:/sbin/nologin\npharos:x:1000:1000::/var/lib/pharos:/sbin/nologin\n' > $out/etc/passwd
-          printf 'root:x:0:\npharos:x:1000:\n' > $out/etc/group
-          chmod 1777 $out/tmp
-        '';
+        # Skeleton rootfs (passwd / group / writable /tmp + state dirs) is
+        # written as REAL files into the image layer via `extraCommands`
+        # below — NOT a separate store path added to `contents`. A
+        # store-path skeleton makes /etc/passwd a symlink into /nix/store,
+        # which kind's containerd snapshotter rejects when run under
+        # (rootless) podman: "openat etc/passwd: path escapes from parent".
+        # Real in-rootfs files load identically under docker + podman + kind.
 
         # OCI image — distroless layered image. Only defined for linux
         # systems; on darwin nothing useful runs in a container. The
@@ -366,8 +363,16 @@
             pkgs.ffmpeg-headless
             pkgs.cacert
             pkgs.tzdata
-            rootfsSkel
           ];
+          # Real /etc + state dirs in the rootfs (see note above). chmod 1777
+          # /tmp for ffmpeg + tokio getrandom; a passwd/group entry for the
+          # non-root pharos user.
+          extraCommands = ''
+            mkdir -p etc var/lib/pharos/db var/lib/pharos/media var/lib/pharos/cache tmp
+            printf 'root:x:0:0::/root:/sbin/nologin\npharos:x:1000:1000::/var/lib/pharos:/sbin/nologin\n' > etc/passwd
+            printf 'root:x:0:\npharos:x:1000:\n' > etc/group
+            chmod 1777 tmp
+          '';
           config = {
             Entrypoint = [ "${pharos}/bin/pharos" ];
             Cmd = [

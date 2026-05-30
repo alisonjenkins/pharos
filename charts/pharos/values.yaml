@@ -74,6 +74,10 @@ persistence:
     size: 1Gi
     storageClass: null          # null = cluster default
     accessMode: ReadWriteOnce
+    # When enabled=false (emptyDir), the medium for the db volume. Set
+    # "Memory" (tmpfs) on clusters whose ephemeral fs is overlayfs (e.g.
+    # kind), where SQLite POSIX locking otherwise fails. "" = node disk.
+    medium: ""
   cache:
     enabled: true               # false → emptyDir
     size: 5Gi
@@ -116,6 +120,18 @@ serviceMonitor:
   namespace: ""                 # default: release namespace
   interval: 30s
   labels: {}                    # e.g. release: kube-prometheus-stack
+
+# Dev convenience: populate an (emptyDir) media volume from a media-bearing
+# image before the scan/serve containers. The image's own entrypoint copies
+# its baked media into `mountPath`. Used by Tilt with the nix CC test-media
+# image; leave disabled in production (media comes from a PVC/NFS).
+mediaSeed:
+  enabled: false
+  image:
+    repository: pharos-test-media
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  mountPath: /media
 
 # Library scan.
 scan:

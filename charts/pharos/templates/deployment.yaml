@@ -33,8 +33,26 @@ spec:
       {{- if .Values.gpu.nvidia.enabled }}
       runtimeClassName: {{ .Values.gpu.nvidia.runtimeClassName }}
       {{- end }}
-      {{- if .Values.scan.initContainer }}
+      {{- if or .Values.mediaSeed.enabled .Values.scan.initContainer }}
       initContainers:
+        {{- if .Values.mediaSeed.enabled }}
+        # Dev: populate the (emptyDir) media volume from a media-bearing
+        # image (e.g. the nix CC test-media corpus). The image's own
+        # entrypoint copies its baked media into mediaSeed.mountPath.
+        - name: media-seed
+          image: "{{ .Values.mediaSeed.image.repository }}:{{ .Values.mediaSeed.image.tag }}"
+          imagePullPolicy: {{ .Values.mediaSeed.image.pullPolicy }}
+          # Runs as root: the seed image's entrypoint chmods the (root-owned)
+          # volume mount root, which a non-root uid can't. fsGroup keeps the
+          # copied files group-readable by the pharos uid.
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          volumeMounts:
+            - name: media
+              mountPath: {{ .Values.mediaSeed.mountPath }}
+        {{- end }}
+        {{- if .Values.scan.initContainer }}
         - name: scan
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -57,6 +75,7 @@ spec:
               readOnly: {{ .Values.persistence.media.readOnly }}
             - name: tmp
               mountPath: /tmp
+        {{- end }}
       {{- end }}
       containers:
         - name: pharos
@@ -130,7 +149,10 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "pharos.fullname" . }}-db
           {{- else }}
-          emptyDir: {}
+          emptyDir:
+            {{- if .Values.persistence.db.medium }}
+            medium: {{ .Values.persistence.db.medium | quote }}
+            {{- end }}
           {{- end }}
         {{- end }}
         - name: cache
