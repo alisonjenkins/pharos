@@ -1,9 +1,10 @@
 //! Recursive media filesystem scan. Generic over `Prober` (V12).
 //! Walk lives in `spawn_blocking` — never parks async runtime (V5).
 
+use futures_util::stream::StreamExt;
 use pharos_core::{
-    AlternateMediaSource, DomainError, DomainResult, MediaItem, MediaKind, MediaStore, Prober,
-    Scanner, SeriesInfo,
+    AlternateMediaSource, DomainError, DomainResult, Fingerprint, MediaId, MediaItem, MediaKind,
+    MediaStore, Prober, ScanOutcome, Scanner, SeriesInfo,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,12 +30,43 @@ pub fn stable_id(path: &Path) -> u64 {
 /// expose a modified time or it predates the unix epoch; `0` is the
 /// same "no signature yet, must re-probe" sentinel the store uses, so a
 /// degenerate mtime simply forces a probe rather than skipping wrongly.
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// LIB-A5 — hard ceiling on the parallel-probe fan-out. The default
+/// degree is `available_parallelism()` clamped to this; a single library
+/// scan shouldn't spawn dozens of concurrent ffprobe forks / libav jobs
+/// and starve the rest of the server (and disk seek thrash hurts past a
+/// point anyway). Callers can still override via [`FsScanner::with_probe_concurrency`].
+const MAX_PROBE_CONCURRENCY: usize = 8;
+
+/// LIB-A5 — default probe fan-out: available CPU parallelism, clamped to
+/// `[1, MAX_PROBE_CONCURRENCY]`. Falls back to 1 if the platform can't
+/// report parallelism.
+fn default_probe_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_PROBE_CONCURRENCY)
+}
+
+/// LIB-A8 — outcome of a single-path incremental update (one watch event).
+/// The watcher maps this onto the same `added`/`updated`/`removed` delta
+/// broadcast `scan_into` produces over a whole tree (A4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathUpdate {
+    /// A brand-new row was inserted for this path.
+    Added(MediaId),
+    /// An existing row was re-probed (signature changed) or rebound (move).
+    Updated(MediaId),
+    /// Nothing changed — unchanged signature, idempotent move, or a probe
+    /// failure that was logged + skipped (V6).
+    Skipped,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +76,11 @@ pub struct FsScanner<P: Prober> {
     /// P43 — inter-probe pause in milliseconds. Zero (default) keeps
     /// the original full-throttle behaviour the CLI scan ships with.
     rate_limit: std::time::Duration,
+    /// LIB-A5 — bounded probe fan-out. The directory walk stays in
+    /// `spawn_blocking` (V5) and store writes stay serialised (V10 —
+    /// sqlite single-writer), but the per-file probe (the expensive,
+    /// IO/CPU-bound step) runs concurrently with this degree.
+    probe_concurrency: usize,
 }
 
 impl<P: Prober> FsScanner<P> {
@@ -55,6 +92,7 @@ impl<P: Prober> FsScanner<P> {
                 .map(|s| (*s).to_string())
                 .collect(),
             rate_limit: std::time::Duration::ZERO,
+            probe_concurrency: default_probe_concurrency(),
         }
     }
 
@@ -63,7 +101,15 @@ impl<P: Prober> FsScanner<P> {
             prober,
             extensions: exts.into_iter().collect(),
             rate_limit: std::time::Duration::ZERO,
+            probe_concurrency: default_probe_concurrency(),
         }
+    }
+
+    /// LIB-A8 — snapshot of the recognised-extension set, for a watcher that
+    /// needs to filter raw fs events (which arrive for every file in the
+    /// tree, media or not) down to the files this scanner would index.
+    pub fn extensions_snapshot(&self) -> HashSet<String> {
+        self.extensions.clone()
     }
 
     /// P43 — apply a per-probe rate-limit. `0` disables. Used by the
@@ -71,6 +117,16 @@ impl<P: Prober> FsScanner<P> {
     /// library doesn't saturate ffmpeg + disk during active playback.
     pub fn with_rate_limit_ms(mut self, ms: u64) -> Self {
         self.rate_limit = std::time::Duration::from_millis(ms);
+        self
+    }
+
+    /// LIB-A5 — override the bounded probe fan-out. `0` is coerced to `1`
+    /// (a degree of zero would stall the stream forever). Values above
+    /// [`MAX_PROBE_CONCURRENCY`] are clamped down. Mainly a test seam —
+    /// the default (`available_parallelism`, clamped) is what production
+    /// callers use.
+    pub fn with_probe_concurrency(mut self, degree: usize) -> Self {
+        self.probe_concurrency = degree.clamp(1, MAX_PROBE_CONCURRENCY);
         self
     }
 
@@ -84,9 +140,14 @@ impl<P: Prober> FsScanner<P> {
     /// expensive probe is skipped — the row is only re-stamped via
     /// [`MediaStore::mark_seen`] so the mark-and-sweep token stays current
     /// (A3 consumes it). A first-ever scan (no stored signature) behaves
-    /// exactly as before: every file is probed + put. Returns the number of
-    /// items probed+stored this run (skipped-unchanged items are not
-    /// counted), preserving the existing `usize` contract for callers.
+    /// exactly as before: every file is probed + put.
+    ///
+    /// LIB-A4 — returns a structured [`ScanOutcome`] instead of a bare count:
+    /// `added` (newly inserted ids), `updated` (re-probed existing ids),
+    /// `removed` (swept ids), and `skipped` (unchanged-file count). Callers
+    /// broadcast the added/removed deltas to connected `/socket` clients and
+    /// print richer CLI summaries. The legacy probed+stored count is still
+    /// available via [`ScanOutcome::probed`].
     ///
     /// LIB-A3 — deletion reconciliation. Every primary observed this run
     /// (probed *or* skipped-unchanged) is `mark_seen`'d with the current
@@ -99,13 +160,41 @@ impl<P: Prober> FsScanner<P> {
     /// swept count is threaded into [`MediaStore::finish_scan`] and the
     /// deleted ids are logged at info (broadcasting deltas is A4).
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
-    pub async fn scan_into<S: MediaStore>(&self, root: &Path, store: &S) -> DomainResult<usize> {
+    pub async fn scan_into<S: MediaStore>(
+        &self,
+        root: &Path,
+        store: &S,
+    ) -> DomainResult<ScanOutcome> {
         let scan_id = store.begin_scan(root).await?;
         let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
         let groups = group_editions(paths);
-        let mut n = 0usize;
+        let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
-        let mut skipped = 0usize;
+
+        // LIB-A5 — three phases:
+        //   1. stat + skip  (sequential, cheap): unchanged files cost only a
+        //      stat + scan_state read, never a probe slot.
+        //   2. probe        (parallel, bounded): the expensive ffprobe/libav
+        //      step runs concurrently up to `probe_concurrency`.
+        //   3. write        (sequential): put/mark_seen are applied on this
+        //      single task so the sqlite single-writer invariant (V10) holds —
+        //      probing fans out, but the pool never sees concurrent writes.
+        //
+        // Phase 1 — collect the groups that actually need a probe.
+        struct Pending {
+            primary: PathBuf,
+            alts: Vec<(String, PathBuf)>,
+            id: MediaId,
+            sig: Option<(i64, u64)>,
+            /// Content fingerprint already computed for a path-miss group.
+            /// `Some` only when we had to read the file to disambiguate a
+            /// move from a fresh insert; reused so we don't hash twice.
+            fp: Option<Fingerprint>,
+            /// `true` when a row already existed before this run (drives the
+            /// added-vs-updated split once the probe lands).
+            existed: bool,
+        }
+        let mut pending: Vec<Pending> = Vec::new();
         for (primary, alts) in groups {
             // Cheap fs stat up front: lets us skip the expensive probe when
             // the file is byte-for-byte unchanged since the last scan. A
@@ -116,35 +205,167 @@ impl<P: Prober> FsScanner<P> {
             let stat = tokio::fs::metadata(&primary).await.ok();
             let sig = stat.as_ref().map(|m| (mtime_secs(m), m.len()));
 
-            if let Some((mtime, size)) = sig {
-                if let Some(state) = store.scan_state(id).await? {
-                    // `last_scanned == 0` / absent signature means the row
-                    // predates migration 0016 or was never marked — treat
-                    // as changed and re-probe. A genuine unchanged hit
-                    // requires both stat fields to match the stored ones.
+            // Did a row already exist for this id before this run? Drives the
+            // added-vs-updated split in the outcome. `scan_state` returns
+            // `None` for an absent row (genuinely new) or a pre-0016 row with
+            // no signature yet — both are re-probed below, but only the truly
+            // new ones count as `added`.
+            let existing_state = store.scan_state(id).await?;
+            if let Some(state) = existing_state {
+                // Existing-by-path: the row is keyed on this exact path
+                // (its id is stable_id(path)). Skip the probe iff the
+                // signature still matches; otherwise re-probe + put.
+                if let Some((mtime, size)) = sig {
                     if state.file_mtime == mtime && state.file_size == size {
                         store.mark_seen(id, scan_id, mtime, size).await?;
                         seen += 1;
-                        skipped += 1;
+                        outcome.skipped += 1;
                         continue;
                     }
                 }
+                pending.push(Pending {
+                    primary,
+                    alts,
+                    id,
+                    sig,
+                    fp: None,
+                    existed: true,
+                });
+                continue;
             }
 
-            if let Some(item) = self.probe_with_alternates(primary, alts).await {
-                store.put(item).await?;
-                // Persist the freshly-stat'd signature so the next scan can
-                // skip this file. mark_seen is an UPDATE — the put() above
-                // guarantees the row exists first.
-                if let Some((mtime, size)) = sig {
-                    store.mark_seen(id, scan_id, mtime, size).await?;
+            // LIB-A7 — no row keyed on this path. Before treating the file as
+            // new, fingerprint its content and look for an existing row under
+            // a *different* path: that distinguishes a move/rename (same
+            // bytes, old path gone) from a genuine new file or a duplicate.
+            // Fingerprinting is blocking IO marshalled off the reactor (V5);
+            // a hash failure (vanished/permission) just falls through to the
+            // probe path, which logs + skips on error (V6).
+            let fp = match crate::fingerprint::fingerprint_async(&primary, None).await {
+                Ok(fp) => Some(fp),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %primary.display(),
+                        error = %err,
+                        "fingerprint failed; treating as new (no move detection)",
+                    );
+                    None
                 }
-                n += 1;
-                seen += 1;
+            };
+            let cand = match fp {
+                Some(fp) => store.find_by_fp(fp).await?,
+                None => None,
+            };
+            match cand {
+                // Case b — a row already carries this fingerprint *and* it is
+                // this exact path (a previously-rebound / legacy-id row). The
+                // row's id != stable_id(path); re-binding again would be a
+                // no-op and re-inserting under `id` would duplicate it. Just
+                // re-stamp the signature + fingerprint. NO insert. Idempotent:
+                // this is the steady state reached after a move.
+                Some(c) if c.path == primary => {
+                    if let Some((mtime, size)) = sig {
+                        store.mark_seen(c.id, scan_id, mtime, size).await?;
+                    }
+                    if let Some(fp) = fp {
+                        store.set_fingerprint(c.id, fp).await?;
+                    }
+                    seen += 1;
+                    outcome.skipped += 1;
+                    continue;
+                }
+                // Case c vs d — the fingerprint match lives under a different
+                // path. If that old path is gone from disk it is a MOVE: keep
+                // the existing id (so user_data survives), rebind its path.
+                // If the old path still exists it is a genuine DUPLICATE and
+                // falls through to a fresh insert under `id`.
+                Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
+                    store.rebind_path(c.id, &primary).await?;
+                    if let Some((mtime, size)) = sig {
+                        store.mark_seen(c.id, scan_id, mtime, size).await?;
+                    }
+                    if let Some(fp) = fp {
+                        store.set_fingerprint(c.id, fp).await?;
+                    }
+                    seen += 1;
+                    outcome.updated.push(c.id);
+                    continue;
+                }
+                // Case a (cand None) or case d (cand present, old path still
+                // on disk → duplicate): probe + insert a new row under `id`.
+                _ => {
+                    pending.push(Pending {
+                        primary,
+                        alts,
+                        id,
+                        sig,
+                        fp,
+                        existed: false,
+                    });
+                }
             }
-            if !self.rate_limit.is_zero() {
-                tokio::time::sleep(self.rate_limit).await;
+        }
+
+        // Phase 2 + 3 — bounded-concurrency probe stream feeding a sequential
+        // write consumer. `buffer_unordered` keeps at most `probe_concurrency`
+        // probes in flight; results are awaited (in completion order) and the
+        // store writes applied one at a time on this task. A probe that
+        // returns `None` (failure / unrecognised) is logged inside
+        // `probe_with_alternates`/`probe_one` and simply produces no write
+        // (V6 — one bad file never aborts the batch).
+        let rate_limit = self.rate_limit;
+        let mut stream = futures_util::stream::iter(pending)
+            .map(|p| {
+                let rl = rate_limit;
+                async move {
+                    // P43 — preserve the inter-probe throttle. Under
+                    // parallelism this paces each probe task's start rather
+                    // than serialising the whole scan; at degree 1 it matches
+                    // the original sequential pause.
+                    if !rl.is_zero() {
+                        tokio::time::sleep(rl).await;
+                    }
+                    // LIB-A7 — ensure a content fingerprint is available for
+                    // the row we are about to write so a *future* scan can
+                    // recognise this file by content if it moves. Reuse the
+                    // one already computed during path-miss disambiguation;
+                    // otherwise (existing-by-path re-probe) compute it now.
+                    // Hashed with `None` duration to match Phase 1 lookups.
+                    let fp = match p.fp {
+                        Some(fp) => Some(fp),
+                        None => crate::fingerprint::fingerprint_async(&p.primary, None)
+                            .await
+                            .ok(),
+                    };
+                    let item = self.probe_with_alternates(p.primary, p.alts).await;
+                    (p.id, p.sig, p.existed, fp, item)
+                }
+            })
+            .buffer_unordered(self.probe_concurrency);
+
+        while let Some((_id, sig, existed, fp, item)) = stream.next().await {
+            let Some(item) = item else { continue };
+            let item_id = item.id;
+            store.put(item).await?;
+            // Persist the freshly-stat'd signature so the next scan can
+            // skip this file. mark_seen is an UPDATE — the put() above
+            // guarantees the row exists first.
+            if let Some((mtime, size)) = sig {
+                store.mark_seen(item_id, scan_id, mtime, size).await?;
             }
+            // LIB-A7 — stamp the content fingerprint so a later move of this
+            // file is recognised by content rather than swept + re-inserted.
+            if let Some(fp) = fp {
+                store.set_fingerprint(item_id, fp).await?;
+            }
+            // A pre-existing row (signature changed) is an update; a row
+            // with no prior state is a fresh insert.
+            if existed {
+                outcome.updated.push(item_id);
+            } else {
+                outcome.added.push(item_id);
+            }
+            seen += 1;
         }
         // LIB-A3 — mark-and-sweep. Everything still on disk under `root`
         // got mark_seen'd above; anything else with a row under this root
@@ -157,15 +378,145 @@ impl<P: Prober> FsScanner<P> {
         if removed > 0 {
             tracing::info!(scan_id, removed, ids = ?swept, "swept rows for files removed from disk");
         }
+        outcome.removed = swept;
         tracing::debug!(
             scan_id,
-            probed = n,
-            skipped,
+            added = outcome.added.len(),
+            updated = outcome.updated.len(),
+            skipped = outcome.skipped,
             removed,
             "incremental scan complete"
         );
         store.finish_scan(scan_id, seen, removed as i64).await?;
-        Ok(n)
+        Ok(outcome)
+    }
+
+    /// LIB-A8 — incremental update for a *single* path, the unit a
+    /// filesystem watcher delivers (one created/modified file at a time).
+    /// Mirrors the per-file branch of [`scan_into`] — stat, `scan_state`
+    /// skip-check, move-detect by fingerprint, probe, `put`, then `mark_seen`
+    /// and a fingerprint stamp — but operates on one path with no edition
+    /// grouping (a watch event names one file; the directory listing the
+    /// edition matcher needs isn't available without a fresh walk).
+    ///
+    /// `scan_id` is an open [`MediaStore::begin_scan`] token used only to
+    /// keep `mark_seen` stamps current; the watcher never sweeps off a
+    /// single event so the token isn't used to reconcile deletions here.
+    ///
+    /// Returns which kind of change landed so the caller can broadcast the
+    /// right delta. Errors only on a store failure — a probe / stat / hash
+    /// failure on the one file is logged and yields [`PathUpdate::Skipped`]
+    /// (V6: a bad file never aborts the watcher loop).
+    pub async fn update_path<S: MediaStore>(
+        &self,
+        path: &Path,
+        store: &S,
+        scan_id: i64,
+    ) -> DomainResult<PathUpdate> {
+        let id = stable_id(path);
+        let stat = tokio::fs::metadata(path).await.ok();
+        let sig = stat.as_ref().map(|m| (mtime_secs(m), m.len()));
+
+        // Existing-by-path row: skip when the signature still matches,
+        // else re-probe.
+        let existing_state = store.scan_state(id).await?;
+        if let Some(state) = existing_state {
+            if let Some((mtime, size)) = sig {
+                if state.file_mtime == mtime && state.file_size == size {
+                    store.mark_seen(id, scan_id, mtime, size).await?;
+                    return Ok(PathUpdate::Skipped);
+                }
+            }
+            // Signature changed (or unreadable) — re-probe + put.
+            return self
+                .probe_put_one(path, store, scan_id, sig, None, true)
+                .await;
+        }
+
+        // No row keyed on this path — fingerprint + move-detect, exactly
+        // like the path-miss branch of `scan_into`.
+        let fp = match crate::fingerprint::fingerprint_async(path, None).await {
+            Ok(fp) => Some(fp),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "watch: fingerprint failed; treating as new (no move detection)",
+                );
+                None
+            }
+        };
+        let cand = match fp {
+            Some(fp) => store.find_by_fp(fp).await?,
+            None => None,
+        };
+        match cand {
+            // Steady state after a move — fingerprint already bound to this
+            // exact path. Re-stamp only.
+            Some(c) if c.path == path => {
+                if let Some((mtime, size)) = sig {
+                    store.mark_seen(c.id, scan_id, mtime, size).await?;
+                }
+                if let Some(fp) = fp {
+                    store.set_fingerprint(c.id, fp).await?;
+                }
+                Ok(PathUpdate::Skipped)
+            }
+            // Move: same bytes, old path gone → rebind id (preserve user_data).
+            Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
+                store.rebind_path(c.id, path).await?;
+                if let Some((mtime, size)) = sig {
+                    store.mark_seen(c.id, scan_id, mtime, size).await?;
+                }
+                if let Some(fp) = fp {
+                    store.set_fingerprint(c.id, fp).await?;
+                }
+                Ok(PathUpdate::Updated(c.id))
+            }
+            // New file or genuine duplicate (old path still on disk) — probe + insert.
+            _ => {
+                self.probe_put_one(path, store, scan_id, sig, fp, false)
+                    .await
+            }
+        }
+    }
+
+    /// LIB-A8 — probe a single path and persist it (the create/modify tail
+    /// shared by [`update_path`]). `existed` drives the added-vs-updated
+    /// result; `fp` is reused when already computed during move-detect.
+    async fn probe_put_one<S: MediaStore>(
+        &self,
+        path: &Path,
+        store: &S,
+        scan_id: i64,
+        sig: Option<(i64, u64)>,
+        fp: Option<Fingerprint>,
+        existed: bool,
+    ) -> DomainResult<PathUpdate> {
+        if !self.rate_limit.is_zero() {
+            tokio::time::sleep(self.rate_limit).await;
+        }
+        let fp = match fp {
+            Some(fp) => Some(fp),
+            None => crate::fingerprint::fingerprint_async(path, None).await.ok(),
+        };
+        let Some(item) = self.probe_one(path.to_path_buf()).await else {
+            // V6 — probe failed, already logged in `probe_one`. No write.
+            return Ok(PathUpdate::Skipped);
+        };
+        let item_id = item.id;
+        store.put(item).await?;
+        if let Some((mtime, size)) = sig {
+            store.mark_seen(item_id, scan_id, mtime, size).await?;
+        }
+        if let Some(fp) = fp {
+            store.set_fingerprint(item_id, fp).await?;
+        }
+        if existed {
+            Ok(PathUpdate::Updated(item_id))
+        } else {
+            Ok(PathUpdate::Added(item_id))
+        }
     }
 
     /// P41 — probe primary + each alternate edition sibling, then
@@ -630,6 +981,7 @@ mod tests {
     struct MemStore {
         inner: Mutex<HashMap<MediaId, MediaItem>>,
         states: Mutex<HashMap<MediaId, ScanState>>,
+        fps: Mutex<HashMap<MediaId, pharos_core::Fingerprint>>,
         next_scan_id: AtomicI64,
     }
 
@@ -737,6 +1089,59 @@ mod tests {
             _items_seen: i64,
             _items_swept: i64,
         ) -> DomainResult<()> {
+            Ok(())
+        }
+        async fn find_by_fp(
+            &self,
+            fp: pharos_core::Fingerprint,
+        ) -> DomainResult<Option<MediaItem>> {
+            let fps = self
+                .fps
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut matches: Vec<MediaId> = fps
+                .iter()
+                .filter(|(_, v)| **v == fp)
+                .map(|(id, _)| *id)
+                .collect();
+            matches.sort_unstable();
+            Ok(matches.into_iter().find_map(|id| inner.get(&id).cloned()))
+        }
+        async fn set_fingerprint(
+            &self,
+            id: MediaId,
+            fp: pharos_core::Fingerprint,
+        ) -> DomainResult<()> {
+            // Mirror the store: UPDATE-only, no-op when the row is absent.
+            if !self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .contains_key(&id)
+            {
+                return Ok(());
+            }
+            self.fps
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(id, fp);
+            Ok(())
+        }
+        async fn rebind_path(&self, id: MediaId, new_path: &Path) -> DomainResult<()> {
+            // Mirror the store: UPDATE-only, no-op when the row is absent.
+            // Keeps the id (and any associated user_data) intact.
+            if let Some(item) = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get_mut(&id)
+            {
+                item.path = new_path.to_path_buf();
+            }
             Ok(())
         }
     }
@@ -853,7 +1258,12 @@ mod tests {
         let store = MemStore::default();
 
         let first = s.scan_into(td.path(), &store).await.unwrap();
-        assert_eq!(first, 3, "first scan stores all three");
+        assert_eq!(first.probed(), 3, "first scan stores all three");
+        // LIB-A4 — a fresh scan reports every file as added, nothing else.
+        assert_eq!(first.added.len(), 3, "all three are added on first scan");
+        assert!(first.updated.is_empty(), "nothing updated on first scan");
+        assert!(first.removed.is_empty(), "nothing removed on first scan");
+        assert_eq!(first.skipped, 0, "nothing skipped on first scan");
         assert_eq!(
             prober.calls.load(Ordering::SeqCst),
             3,
@@ -863,7 +1273,22 @@ mod tests {
         // Second scan, nothing touched on disk.
         let before = prober.calls.load(Ordering::SeqCst);
         let second = s.scan_into(td.path(), &store).await.unwrap();
-        assert_eq!(second, 0, "nothing re-probed/stored on unchanged rescan");
+        assert_eq!(
+            second.probed(),
+            0,
+            "nothing re-probed/stored on unchanged rescan"
+        );
+        // LIB-A4 — an unchanged rescan reports everything as skipped.
+        assert!(second.added.is_empty(), "nothing added on unchanged rescan");
+        assert!(
+            second.updated.is_empty(),
+            "nothing updated on unchanged rescan"
+        );
+        assert!(
+            second.removed.is_empty(),
+            "nothing removed on unchanged rescan"
+        );
+        assert_eq!(second.skipped, 3, "all three skipped on unchanged rescan");
         assert_eq!(
             prober.calls.load(Ordering::SeqCst) - before,
             0,
@@ -893,9 +1318,16 @@ mod tests {
         // => signature mismatch => re-probe. a/c are byte-identical.
         write_file(td.path(), "b.mkv", b"bbbbbbbb").await;
 
+        let changed_id = stable_id(&td.path().join("b.mkv"));
         let before = prober.calls.load(Ordering::SeqCst);
         let n = s.scan_into(td.path(), &store).await.unwrap();
-        assert_eq!(n, 1, "exactly one item re-stored");
+        assert_eq!(n.probed(), 1, "exactly one item re-stored");
+        // LIB-A4 — a content change is reported as an update (not an add),
+        // and the updated id is the file that actually changed.
+        assert!(n.added.is_empty(), "changed file is an update, not an add");
+        assert_eq!(n.updated, vec![changed_id], "the changed file is updated");
+        assert!(n.removed.is_empty(), "nothing removed");
+        assert_eq!(n.skipped, 2, "the two unchanged files are skipped");
         assert_eq!(
             prober.calls.load(Ordering::SeqCst) - before,
             1,
@@ -927,7 +1359,10 @@ mod tests {
 
         let before = prober.calls.load(Ordering::SeqCst);
         let n = s.scan_into(td.path(), &store).await.unwrap();
-        assert_eq!(n, 1, "mtime-only change still re-stores");
+        assert_eq!(n.probed(), 1, "mtime-only change still re-stores");
+        // LIB-A4 — an in-place mtime bump is an update of the existing row.
+        assert!(n.added.is_empty());
+        assert_eq!(n.updated.len(), 1, "mtime change reported as an update");
         assert_eq!(
             prober.calls.load(Ordering::SeqCst) - before,
             1,
@@ -964,7 +1399,22 @@ mod tests {
         tokio::fs::remove_file(roota.path().join("gone.mkv"))
             .await
             .unwrap();
-        s.scan_into(roota.path(), &store).await.unwrap();
+        let outcome = s.scan_into(roota.path(), &store).await.unwrap();
+
+        // LIB-A4 — the swept file surfaces in the outcome's `removed` delta
+        // (the id the broadcast layer relays as ItemsRemoved); keep.mkv is
+        // unchanged so it's skipped, not removed.
+        assert_eq!(
+            outcome.removed,
+            vec![gone_id],
+            "deleted file reported removed"
+        );
+        assert!(outcome.added.is_empty(), "nothing added on a delete rescan");
+        assert!(
+            outcome.updated.is_empty(),
+            "nothing updated on a delete rescan"
+        );
+        assert_eq!(outcome.skipped, 1, "the surviving file is skipped");
 
         // gone.mkv swept; keep.mkv survives; rootB's file untouched.
         assert!(store.get(keep_id).await.is_ok(), "surviving file remains");
@@ -977,6 +1427,323 @@ mod tests {
             "sibling root must be untouched by rootA sweep"
         );
         assert_eq!(store.list().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn move_preserves_id() {
+        // LIB-A7 — a file moved/renamed on disk keeps its existing
+        // media_items.id (so user_data / watch history survives) rather than
+        // being swept + re-inserted under the new path's id.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "old/movie.mkv", b"unique-content-aaaa").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        let first = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(first.added.len(), 1, "the file imports once");
+        let old_id = stable_id(&td.path().join("old/movie.mkv"));
+        assert!(store.get(old_id).await.is_ok(), "row under old path id");
+        let probes_after_first = prober.calls.load(Ordering::SeqCst);
+
+        // Move the file to a new path (same bytes => same fingerprint, new
+        // path => new stable_id). Remove old, write identical content at new.
+        tokio::fs::remove_file(td.path().join("old/movie.mkv"))
+            .await
+            .unwrap();
+        write_file(td.path(), "new/film.mkv", b"unique-content-aaaa").await;
+        let new_path = td.path().join("new/film.mkv");
+        let new_id = stable_id(&new_path);
+        assert_ne!(old_id, new_id, "the path-derived id changed");
+
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+
+        // Exactly one row, still under the ORIGINAL id, path repointed.
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 1, "no duplicate row created by the move");
+        let row = store.get(old_id).await.expect("id preserved across move");
+        assert_eq!(row.path, new_path, "path rebound to the new location");
+        match store.get(new_id).await {
+            Err(DomainError::NotFound(_)) => {}
+            other => panic!("no new-id row should exist, got {other:?}"),
+        }
+        // The move is recognised by content — no fresh insert, no probe of
+        // the moved file, and nothing left orphaned for the sweep.
+        assert!(outcome.added.is_empty(), "a move is not an add");
+        assert_eq!(outcome.updated, vec![old_id], "move reported as an update");
+        assert!(outcome.removed.is_empty(), "the old path is NOT swept");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            probes_after_first,
+            "a move re-binds without re-probing"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_idempotent_on_rescan() {
+        // LIB-A7 — after a move+rebind, a SUBSEQUENT scan must NOT create a
+        // duplicate. The fingerprint now matches a row whose path is this
+        // exact path (case b) => mark_seen only.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "old/movie.mkv", b"idempotent-bytes-zz").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        let old_id = stable_id(&td.path().join("old/movie.mkv"));
+
+        tokio::fs::remove_file(td.path().join("old/movie.mkv"))
+            .await
+            .unwrap();
+        write_file(td.path(), "new/film.mkv", b"idempotent-bytes-zz").await;
+
+        // First rescan: the move.
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 1);
+
+        // Second rescan, nothing changed on disk: still exactly one row, same
+        // id, no new insert (the bug this guards against is a duplicate that
+        // only appears on the scan AFTER a move).
+        let again = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            1,
+            "no duplicate on the post-move rescan"
+        );
+        assert!(store.get(old_id).await.is_ok(), "id still preserved");
+        assert!(again.added.is_empty(), "idempotent rescan adds nothing");
+        assert!(
+            again.removed.is_empty(),
+            "idempotent rescan removes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_creates_second_item() {
+        // LIB-A7 — when the original file is STILL present and an identical
+        // copy appears under a new path, that is a genuine duplicate: a new
+        // row is inserted (not a rebind), so both files are tracked.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a/movie.mkv", b"dup-content-12345").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        let id_a = stable_id(&td.path().join("a/movie.mkv"));
+
+        // Copy (original kept on disk) — identical bytes, different path.
+        write_file(td.path(), "b/movie.mkv", b"dup-content-12345").await;
+        let id_b = stable_id(&td.path().join("b/movie.mkv"));
+        assert_ne!(id_a, id_b);
+
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 2, "duplicate copy creates a second row");
+        assert!(store.get(id_a).await.is_ok(), "original row remains");
+        assert!(store.get(id_b).await.is_ok(), "copy gets its own row");
+        assert_eq!(outcome.added, vec![id_b], "the copy is reported as added");
+    }
+
+    #[tokio::test]
+    async fn genuine_new_still_inserts() {
+        // LIB-A7 — a file whose content matches NOTHING in the store (no
+        // fingerprint hit) is a plain new import: probe + insert under its
+        // own path id, exactly as before A7.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "first.mkv", b"first-unique-aaa").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        // Add a second, content-distinct file and rescan.
+        write_file(td.path(), "second.mkv", b"second-unique-bbb").await;
+        let second_id = stable_id(&td.path().join("second.mkv"));
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+
+        assert_eq!(outcome.added, vec![second_id], "new file imported as added");
+        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert!(store.get(second_id).await.is_ok());
+    }
+
+    /// LIB-A5 — prober that records peak concurrent in-flight probes. Each
+    /// probe bumps an `in_flight` counter, sleeps briefly so overlap is
+    /// observable, tracks the running max, then decrements. Lets a test
+    /// assert the bounded-concurrency stream actually overlaps probes (and
+    /// never exceeds the configured degree).
+    #[derive(Clone, Default)]
+    struct ConcurrencyProber {
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl Prober for ConcurrencyProber {
+        async fn probe(&self, _path: &Path) -> DomainResult<ProbeInfo> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            // Lift the recorded peak to `now` if higher (CAS loop).
+            let mut cur = self.peak.load(Ordering::SeqCst);
+            while now > cur {
+                match self
+                    .peak
+                    .compare_exchange(cur, now, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
+            // Hold the slot long enough for siblings to overlap.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(ProbeInfo {
+                kind: MediaKind::Movie,
+                probe: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_scan_imports_same_item_set_as_sequential() {
+        // LIB-A5 — the parallel probe path must import exactly the same set
+        // of items as a single-degree scan. Ordering of the ScanOutcome vecs
+        // may differ under concurrency, so compare as sets of ids.
+        let names = [
+            "a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv", "f.mkv", "g.mkv", "h.mkv",
+        ];
+
+        // Sequential baseline (degree 1).
+        let seq_td = TempDir::new().unwrap();
+        for (i, n) in names.iter().enumerate() {
+            write_file(seq_td.path(), n, &vec![b'x'; i + 1]).await;
+        }
+        let seq_store = MemStore::default();
+        let seq_scanner = FsScanner::new(FakeProber::default()).with_probe_concurrency(1);
+        let seq = seq_scanner
+            .scan_into(seq_td.path(), &seq_store)
+            .await
+            .unwrap();
+        let seq_ids: HashSet<MediaId> = seq.added.iter().copied().collect();
+
+        // Parallel (degree 8) over an identically-named tree.
+        let par_td = TempDir::new().unwrap();
+        for (i, n) in names.iter().enumerate() {
+            write_file(par_td.path(), n, &vec![b'x'; i + 1]).await;
+        }
+        let par_store = MemStore::default();
+        let par_scanner = FsScanner::new(FakeProber::default()).with_probe_concurrency(8);
+        let par = par_scanner
+            .scan_into(par_td.path(), &par_store)
+            .await
+            .unwrap();
+        let par_ids: HashSet<MediaId> = par.added.iter().copied().collect();
+
+        // Same count + same per-file stable ids (ids are path-derived; the
+        // two roots differ, so compare counts + the stored item *paths*' base
+        // names instead of raw ids).
+        assert_eq!(seq.added.len(), names.len());
+        assert_eq!(par.added.len(), names.len());
+        assert_eq!(seq_ids.len(), names.len(), "no duplicate adds, sequential");
+        assert_eq!(par_ids.len(), names.len(), "no duplicate adds, parallel");
+
+        let basename_set = |items: Vec<MediaItem>| -> HashSet<String> {
+            items
+                .into_iter()
+                .map(|i| {
+                    i.path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+        let seq_set = basename_set(seq_store.list().await.unwrap());
+        let par_set = basename_set(par_store.list().await.unwrap());
+        assert_eq!(seq_set, par_set, "parallel scan imports the same file set");
+        assert_eq!(seq_set.len(), names.len());
+    }
+
+    #[tokio::test]
+    async fn parallel_scan_isolates_a_single_probe_failure() {
+        // LIB-A5 + V6 — under concurrency, one failing probe must not abort
+        // the batch: every other file is still imported. Reuses the
+        // FakeProber's `force_fail_for` path-needle.
+        let td = TempDir::new().unwrap();
+        for n in ["one.mkv", "two.mkv", "bad.mkv", "four.mkv", "five.mkv"] {
+            write_file(td.path(), n, n.as_bytes()).await;
+        }
+        let prober = FakeProber {
+            calls: Arc::new(AtomicUsize::new(0)),
+            force_fail_for: Some("bad".into()),
+        };
+        let s = FsScanner::new(prober.clone()).with_probe_concurrency(4);
+        let store = MemStore::default();
+
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        // 5 probed, 1 failed => 4 imported.
+        assert_eq!(outcome.added.len(), 4, "all non-failing files imported");
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 5, "every file probed");
+
+        let names: HashSet<String> = store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|i| i.path.file_name()?.to_str().map(str::to_string))
+            .collect();
+        assert!(
+            !names.contains("bad.mkv"),
+            "the failing file is not imported"
+        );
+        for ok in ["one.mkv", "two.mkv", "four.mkv", "five.mkv"] {
+            assert!(names.contains(ok), "{ok} should be imported");
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_scan_respects_concurrency_cap() {
+        // LIB-A5 — the bounded stream must (a) overlap probes when degree > 1
+        // and (b) never exceed the configured degree. With degree 3 over 9
+        // files the observed peak must land in [2, 3].
+        let td = TempDir::new().unwrap();
+        for i in 0..9 {
+            write_file(td.path(), &format!("f{i}.mkv"), &[b'x'; 1]).await;
+        }
+        let prober = ConcurrencyProber::default();
+        let s = FsScanner::new(prober.clone()).with_probe_concurrency(3);
+        let store = MemStore::default();
+
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 9, "all nine imported");
+
+        let peak = prober.peak.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "probes should overlap under concurrency (peak {peak})"
+        );
+        assert!(
+            peak <= 3,
+            "concurrency cap of 3 must be respected (peak {peak})"
+        );
+        // The in-flight counter must have drained back to zero.
+        assert_eq!(prober.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_concurrency_zero_is_coerced_to_one() {
+        // LIB-A5 — a degree of 0 would stall buffer_unordered forever; the
+        // builder clamps it to 1. The scan must still complete.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "solo.mkv", b"x").await;
+        let s = FsScanner::new(FakeProber::default()).with_probe_concurrency(0);
+        let store = MemStore::default();
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 1);
     }
 
     #[tokio::test]
