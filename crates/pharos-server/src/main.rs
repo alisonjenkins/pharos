@@ -271,24 +271,49 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
 async fn build_transcode_scheduler(
     detected: &[pharos_transcode::HwAccel],
     hw_session_cap: usize,
+    probe_caps: bool,
 ) -> Option<pharos_transcode::scheduler::TranscodeScheduler> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
+    use pharos_transcode::probe::{probe_device_caps, ProbeConfig};
     use pharos_transcode::protocol::{DeviceId, WorkerId};
     use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler, WorkerSpawner};
     use pharos_transcode::worker::ProcSpawner;
 
-    // Probe: confirm a worker spawns + handshakes before wiring the
-    // scheduler. The probe worker is dropped (killed) immediately.
+    // Confirm a worker spawns + handshakes before wiring the scheduler.
+    // The probe worker is dropped (killed) immediately.
     let probe = ProcSpawner::new();
     if let Err(e) = probe.spawn(WorkerId(0)).await {
         tracing::warn!(error = %e, worker = %probe.worker_bin().display(), "transcode worker probe failed");
         return None;
     }
 
-    let caps: Vec<(DeviceId, usize)> = enumerate(detected)
-        .into_iter()
-        .map(|d| (d, hw_session_cap.max(1)))
-        .collect();
+    let devices = enumerate(detected);
+    let caps: Vec<(DeviceId, usize)> = if probe_caps && !devices.is_empty() {
+        // Learn real session caps; fall back to the configured cap for
+        // any device the probe couldn't measure.
+        let probed = probe_device_caps(&devices, &ProbeConfig::default()).await;
+        let caps: Vec<(DeviceId, usize)> = devices
+            .iter()
+            .map(|d| {
+                let c = probed
+                    .caps
+                    .iter()
+                    .find(|(pd, _)| pd == d)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_else(|| hw_session_cap.max(1));
+                (*d, c)
+            })
+            .collect();
+        for (d, c) in &caps {
+            tracing::info!(device = %d, sessions = c, "probed device session cap");
+        }
+        caps
+    } else {
+        devices
+            .into_iter()
+            .map(|d| (d, hw_session_cap.max(1)))
+            .collect()
+    };
     let table = DeviceTable::from_probe(&caps, default_cpu_permits());
     tracing::info!(
         devices = caps.len(),
@@ -323,7 +348,13 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // (segment path) + the live/uncached path on AppState. Falls back to
     // inline ffmpeg when disabled or when the worker can't be brought up.
     let transcode_scheduler = if cfg.server.transcode_hw_session_cap > 0 {
-        match build_transcode_scheduler(&detected, cfg.server.transcode_hw_session_cap).await {
+        match build_transcode_scheduler(
+            &detected,
+            cfg.server.transcode_hw_session_cap,
+            cfg.server.transcode_probe_caps,
+        )
+        .await
+        {
             Some(sched) => {
                 tracing::info!("transcode scheduler enabled (load-balanced workers)");
                 Some(sched)

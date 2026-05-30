@@ -16,6 +16,8 @@ pub mod device;
 pub mod hwaccel;
 pub mod options;
 pub mod protocol;
+#[cfg(unix)]
+pub mod probe;
 pub mod scheduler;
 #[cfg(unix)]
 pub mod worker;
