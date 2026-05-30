@@ -8,4 +8,9 @@ ignore = [
     # of features). Pharos never enables sqlx's mysql feature and never
     # uses RSA, so the timing side-channel is unreachable in our binary.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0141 — bincode 1.3.3 unmaintained (not a vuln). Used
+    # only for the internal scheduler<->worker control-frame protocol; the
+    # team consider 1.3.3 complete and there's no safe upgrade. Matches
+    # the rationale in deny.toml.
+    "RUSTSEC-2025-0141",
 ]
