@@ -41,6 +41,11 @@ const ALLOWED_404_PATTERNS: RegExp[] = [
   // Items/{0000…0000} appears when jellyfin-web fetches a placeholder
   // before populating the real id.
   /\/Items\/0{32}\b/,
+  // The seeded playwright items are synthetic — they have no real media
+  // file on disk, so pharos can't extract the *derived* Thumb / Backdrop
+  // frames and 404s those requests. Primary (the placeholder poster)
+  // still resolves, so a Primary 404 would still fail the test.
+  /\/Items\/\d+\/Images\/(Thumb|Backdrop)\b/,
 ];
 
 type Capture = {
@@ -65,6 +70,18 @@ function start(page: Page): Capture {
     if (status < 400) return;
     const url = resp.url();
     if (ALLOWED_404_PATTERNS.some((re) => re.test(url))) return;
+    // jellyfin-web auto-probes its *own* serving origin for a co-hosted
+    // server at boot (`/System/Info/Public`); served standalone via
+    // http-server that 404s before the client falls back to the
+    // manually-added pharos origin. Tolerate it only on the non-pharos
+    // (static-bundle) origin, so a real 404 from pharos still fails.
+    if (
+      status === 404 &&
+      !url.startsWith(PHAROS_URL) &&
+      /\/System\/Info\/Public\b/.test(url)
+    ) {
+      return;
+    }
     cap.badResponses.push(`${status} ${url}`);
   });
   return cap;
@@ -144,13 +161,11 @@ test.describe("strict console + response capture", () => {
     await connect(page);
     await signIn(page);
 
-    // Navigate directly via hash route — the menu UI varies version to
-    // version.
-    for (const route of [
-      "#/mypreferencesmenu.html",
-      "#/mypreferencesdisplay.html",
-    ]) {
-      await page.goto(`/web/${route}`, { waitUntil: "networkidle" });
+    // Navigate directly via hash route. The bundle is served at the
+    // origin root (no `/web/` prefix) and jellyfin-web resolves the
+    // SPA hash route without the `.html` suffix — matching crawl.spec.
+    for (const route of ["#/mypreferencesmenu", "#/mypreferencesdisplay"]) {
+      await page.goto(`/${route}`, { waitUntil: "networkidle" });
       assertClean(cap, `route ${route}`);
     }
   });
