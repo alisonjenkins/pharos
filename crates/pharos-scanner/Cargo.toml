@@ -8,6 +8,10 @@ publish.workspace = true
 
 [dependencies]
 pharos-core = { path = "../pharos-core" }
+# P48 — optional in-process libav prober. Routes the per-file scan probe
+# through the persistent libav worker pool instead of forking ffprobe.
+# Enabled via the `libav-probe` feature (the server turns it on).
+pharos-transcode = { path = "../pharos-transcode", optional = true, default-features = false, features = ["backend-lib"] }
 serde = { workspace = true }
 sonic-rs.workspace = true
 thiserror.workspace = true
@@ -16,6 +20,10 @@ tracing.workspace = true
 walkdir.workspace = true
 xxhash-rust.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[features]
+# Route probing through the in-process libav worker pool.
+libav-probe = ["dep:pharos-transcode"]
 
 [dev-dependencies]
 criterion = { workspace = true }
