@@ -13,7 +13,9 @@
   - `just test-changed [from=main]` — `cargo-guppy` enumerates packages touched vs `from`, then `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'` runs only the transitively-affected tests.
   - `just test` — full workspace (strips macOS Gatekeeper quarantine attr first).
   - `just test-thorough` — full workspace with `PROPTEST_CASES=512` for nightly / pre-release.
-- After a dep change in any crate's `Cargo.toml`, run `just hakari-regen` to refresh `workspace-hack`. CI runs `just hakari-check` so a stale hack crate fails before merge.
+- After a dep change in any crate's `Cargo.toml`, run **two** regens or CI breaks:
+  - `just hakari-regen` — refresh `workspace-hack` (CI's `just hakari-check` fails on a stale hack crate).
+  - `nix develop --command crate2nix generate` — regenerate `Cargo.nix` from `Cargo.lock`. The `nix build .#pharos` / `.#oci` jobs build each crate as its own derivation with explicit `--extern`s read from `Cargo.nix`; a stale `Cargo.nix` fails with `unresolved import <newdep>` even though `cargo build` in the devShell passes. Commit the regenerated `Cargo.nix`.
 
 Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) requires clippy from the pinned toolchain. Host system may not have it.
 
