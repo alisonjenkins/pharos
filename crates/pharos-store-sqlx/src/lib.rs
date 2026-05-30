@@ -28,6 +28,9 @@ pub mod chapter_json;
 // JSON adapter for MediaProbe.audio_tracks (P16). Same pattern.
 pub mod audio_track_json;
 
+// JSON adapter for MediaMetadata.provider_ids (LIB-C9). Same pattern.
+pub mod provider_ids_json;
+
 /// LIB-A3 — build a root-scoped, path-boundary-safe SQL `LIKE` pattern for
 /// the scan sweep. Matches only items strictly *under* `root` (i.e. paths
 /// beginning `root` + path separator), never a sibling whose name merely

@@ -123,6 +123,7 @@ fn arb_series() -> impl Strategy<Value = Option<SeriesInfo>> {
                 series_name: name,
                 season_number: season,
                 episode_number: ep,
+                ..Default::default()
             }),
     )
 }
@@ -146,6 +147,10 @@ fn arb_item() -> impl Strategy<Value = MediaItem> {
             // `created_at = None` so the store backfills — compared
             // out below.
             created_at: None,
+            // Descriptive metadata round-trip is covered by dedicated
+            // fixtures in sqlite_store.rs; the probe proptest keeps it
+            // at default.
+            metadata: Default::default(),
         })
 }
 

@@ -91,6 +91,7 @@ async fn silent_video_emits_no_audio_stream_in_playback_info() {
         probe,
         series: None,
         created_at: None,
+        metadata: Default::default(),
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -126,6 +127,7 @@ async fn container_alias_is_a_single_known_token() {
         probe,
         series: None,
         created_at: None,
+        metadata: Default::default(),
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -168,6 +170,7 @@ async fn direct_play_omits_transcoding_sub_protocol() {
         probe,
         series: None,
         created_at: None,
+        metadata: Default::default(),
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -215,8 +218,10 @@ async fn synth_ids_route_via_items_endpoint() {
             series_name: "Show".into(),
             season_number: Some(1),
             episode_number: Some(1),
+            ..Default::default()
         }),
         created_at: None,
+        metadata: Default::default(),
     }];
     let (state, token) = seed_with_items(items).await;
     // Add a configured root so library ids exist.
@@ -274,6 +279,7 @@ async fn item_dto_keys_are_pascal_case() {
         probe,
         series: None,
         created_at: None,
+        metadata: Default::default(),
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -335,6 +341,7 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
         probe,
         series: None,
         created_at: None,
+        metadata: Default::default(),
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -438,6 +445,7 @@ async fn every_item_has_a_parent_id() {
                 series_name: "Show".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -490,6 +498,7 @@ async fn episode_classification_survives_store_roundtrip() {
                 series_name: "Show".into(),
                 season_number: Some(1),
                 episode_number: Some(3),
+                ..Default::default()
             }),
             ..Default::default()
         })

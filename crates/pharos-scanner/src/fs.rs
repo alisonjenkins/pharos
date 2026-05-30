@@ -3,8 +3,8 @@
 
 use futures_util::stream::StreamExt;
 use pharos_core::{
-    AlternateMediaSource, DomainError, DomainResult, Fingerprint, MediaId, MediaItem, MediaKind,
-    MediaStore, Prober, ScanOutcome, Scanner, SeriesInfo,
+    AlternateMediaSource, DomainError, DomainResult, Fingerprint, GenreStore, MediaId, MediaItem,
+    MediaKind, MediaStore, Prober, ScanOutcome, Scanner, SeriesInfo,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -160,7 +160,7 @@ impl<P: Prober> FsScanner<P> {
     /// swept count is threaded into [`MediaStore::finish_scan`] and the
     /// deleted ids are logged at info (broadcasting deltas is A4).
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
-    pub async fn scan_into<S: MediaStore>(
+    pub async fn scan_into<S: MediaStore + GenreStore>(
         &self,
         root: &Path,
         store: &S,
@@ -346,7 +346,19 @@ impl<P: Prober> FsScanner<P> {
         while let Some((_id, sig, existed, fp, item)) = stream.next().await {
             let Some(item) = item else { continue };
             let item_id = item.id;
+            // LIB-C4 — capture genre names before `put` consumes the item.
+            let genres = item
+                .probe
+                .genre
+                .as_deref()
+                .map(pharos_core::split_genre_field)
+                .unwrap_or_default();
             store.put(item).await?;
+            // LIB-C4 — populate the item_genres join from the probe's
+            // (possibly comma/pipe-separated) genre string. The DISTINCT
+            // probe.genre column stays for back-compat; this is the
+            // entity-backed path /Genres + ParentId=<genre> resolve against.
+            store.link_item_genres(item_id, &genres).await?;
             // Persist the freshly-stat'd signature so the next scan can
             // skip this file. mark_seen is an UPDATE — the put() above
             // guarantees the row exists first.
@@ -407,7 +419,7 @@ impl<P: Prober> FsScanner<P> {
     /// right delta. Errors only on a store failure — a probe / stat / hash
     /// failure on the one file is logged and yields [`PathUpdate::Skipped`]
     /// (V6: a bad file never aborts the watcher loop).
-    pub async fn update_path<S: MediaStore>(
+    pub async fn update_path<S: MediaStore + GenreStore>(
         &self,
         path: &Path,
         store: &S,
@@ -484,7 +496,7 @@ impl<P: Prober> FsScanner<P> {
     /// LIB-A8 — probe a single path and persist it (the create/modify tail
     /// shared by [`update_path`]). `existed` drives the added-vs-updated
     /// result; `fp` is reused when already computed during move-detect.
-    async fn probe_put_one<S: MediaStore>(
+    async fn probe_put_one<S: MediaStore + GenreStore>(
         &self,
         path: &Path,
         store: &S,
@@ -505,7 +517,16 @@ impl<P: Prober> FsScanner<P> {
             return Ok(PathUpdate::Skipped);
         };
         let item_id = item.id;
+        // LIB-C4 — capture genres before `put` consumes the item.
+        let genres = item
+            .probe
+            .genre
+            .as_deref()
+            .map(pharos_core::split_genre_field)
+            .unwrap_or_default();
         store.put(item).await?;
+        // LIB-C4 — keep the item_genres join in step with the probe.
+        store.link_item_genres(item_id, &genres).await?;
         if let Some((mtime, size)) = sig {
             store.mark_seen(item_id, scan_id, mtime, size).await?;
         }
@@ -605,6 +626,10 @@ impl<P: Prober> FsScanner<P> {
                     // None preserves the original `created_at` on
                     // rescan via the COALESCE in put().
                     created_at: None,
+                    // LIB-C7/C8/C9 — descriptive metadata is enriched by
+                    // a later EPIC D pass; the scanner emits an empty
+                    // block today.
+                    metadata: Default::default(),
                 })
             }
             Err(err) => {
@@ -825,39 +850,88 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let (filename_season, episode) = parse_sxxeyy(name);
 
-    // Walk parents from closest to farthest.
-    let mut parents: Vec<&str> = path
-        .ancestors()
-        .skip(1)
-        .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
-        .collect();
+    // Walk parents from closest to farthest, retaining the &Path so the
+    // first non-season ancestor's FULL path becomes the C11 folder key.
+    let parents: Vec<&Path> = path.ancestors().skip(1).collect();
 
     let mut season_from_dir: Option<u32> = None;
     let mut series_name: Option<String> = None;
+    let mut series_folder: Option<PathBuf> = None;
 
-    for parent in parents.drain(..) {
-        if let Some(n) = parse_season_dir(parent) {
+    for parent in parents {
+        let Some(component) = parent.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(n) = parse_season_dir(component) {
             season_from_dir = season_from_dir.or(Some(n));
             continue;
         }
-        if parent.eq_ignore_ascii_case("specials") {
+        if component.eq_ignore_ascii_case("specials") {
             season_from_dir = season_from_dir.or(Some(0));
             continue;
         }
-        // First non-season ancestor wins as the series name.
-        if series_name.is_none() {
-            series_name = Some(parent.to_string());
-            break;
-        }
+        // First non-season ancestor wins as the series. LIB-C11: capture
+        // both the display name AND the canonical folder path (the show
+        // root that holds the season dirs / episodes) for identity.
+        series_name = Some(component.to_string());
+        series_folder = Some(parent.to_path_buf());
+        break;
     }
 
-    let series_name = series_name?;
+    let mut series_name = series_name?;
     let season_number = season_from_dir.or(filename_season);
+    // LIB-C11: parse a `Show Name (YYYY)` year from the folder component.
+    let series_year = series_folder
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .and_then(parse_folder_year);
+    // When a year was parsed, strip the trailing `(YYYY)` from the display
+    // name so the title stays clean ("Cosmos", not "Cosmos (1980)") while
+    // identity stays keyed on the full folder path.
+    if series_year.is_some() {
+        series_name = strip_trailing_year(&series_name).to_string();
+    }
+    let series_folder = series_folder.map(|p| p.to_string_lossy().into_owned());
     Some(SeriesInfo {
         series_name,
         season_number,
         episode_number: episode,
+        series_folder,
+        series_year,
     })
+}
+
+/// LIB-C11 — drop a trailing `(YYYY)` marker from a show display name so
+/// the clean title surfaces while identity stays keyed on the folder
+/// path. Only strips when [`parse_folder_year`] would match, so a name
+/// without a year marker is returned untouched.
+fn strip_trailing_year(name: &str) -> &str {
+    if parse_folder_year(name).is_none() {
+        return name;
+    }
+    let trimmed = name.trim_end();
+    match trimmed.rfind('(') {
+        Some(open) => trimmed[..open].trim_end(),
+        None => name,
+    }
+}
+
+/// LIB-C11 — extract the release year from a `Show Name (YYYY)` folder
+/// convention. Matches a 4-digit year in trailing parentheses
+/// (`Cosmos (1980)` → `1980`). Returns `None` when the folder carries no
+/// such marker. Restricted to a plausible 1800–2999 window so a
+/// parenthesised non-year (e.g. `(Uncut)`, `(1)`) doesn't masquerade.
+fn parse_folder_year(folder_name: &str) -> Option<u32> {
+    let trimmed = folder_name.trim_end();
+    let close = trimmed.strip_suffix(')')?;
+    let open = close.rfind('(')?;
+    let inner = close[open + 1..].trim();
+    if inner.len() != 4 || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: u32 = inner.parse().ok()?;
+    (1800..3000).contains(&year).then_some(year)
 }
 
 /// Return the (season, episode) numbers when `name` carries an
@@ -983,6 +1057,8 @@ mod tests {
         states: Mutex<HashMap<MediaId, ScanState>>,
         fps: Mutex<HashMap<MediaId, pharos_core::Fingerprint>>,
         next_scan_id: AtomicI64,
+        // LIB-C4 — item_genres mirror: item id → its linked genre names.
+        item_genres: Mutex<HashMap<MediaId, Vec<String>>>,
     }
 
     impl MediaStore for MemStore {
@@ -1146,10 +1222,107 @@ mod tests {
         }
     }
 
+    // LIB-C4 — minimal in-memory GenreStore so the scanner's
+    // link-on-write path can be exercised without the sqlx store.
+    impl GenreStore for MemStore {
+        async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
+            // Deterministic surrogate id from the wire id's prefix.
+            let wid = pharos_core::genre_wire_id(name);
+            let id = i64::from_str_radix(&wid[..15], 16).unwrap_or(0);
+            Ok(id)
+        }
+        async fn link_item_genres(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+            let mut wanted: Vec<String> = Vec::new();
+            for n in names {
+                let t = n.trim();
+                if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                    wanted.push(t.to_string());
+                }
+            }
+            self.item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .insert(item, wanted);
+            Ok(())
+        }
+        async fn genres_with_counts(&self) -> DomainResult<Vec<pharos_core::GenreCount>> {
+            use std::collections::BTreeMap;
+            let links = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+            for names in links.values() {
+                for n in names {
+                    *counts.entry(n.clone()).or_insert(0) += 1;
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .map(|(name, item_count)| pharos_core::GenreCount {
+                    genre: pharos_core::Genre {
+                        id: 0,
+                        wire_id: pharos_core::genre_wire_id(&name),
+                        name,
+                    },
+                    item_count,
+                })
+                .collect())
+        }
+        async fn item_ids_for_genre(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            let links = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut ids: Vec<MediaId> = links
+                .iter()
+                .filter(|(_, names)| {
+                    names
+                        .iter()
+                        .any(|n| pharos_core::genre_wire_id(n) == wire_id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        }
+        async fn backfill_genres(&self) -> DomainResult<u64> {
+            let items: Vec<(MediaId, Option<String>)> = {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|e| DomainError::Backend(e.to_string()))?;
+                inner
+                    .iter()
+                    .map(|(id, item)| (*id, item.probe.genre.clone()))
+                    .collect()
+            };
+            for (id, genre) in items {
+                if let Some(raw) = genre {
+                    let names = pharos_core::split_genre_field(&raw);
+                    if !names.is_empty() {
+                        self.link_item_genres(id, &names).await?;
+                    }
+                }
+            }
+            let total: usize = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .map(Vec::len)
+                .sum();
+            Ok(total as u64)
+        }
+    }
+
     #[derive(Clone, Default)]
     struct FakeProber {
         calls: Arc<AtomicUsize>,
         force_fail_for: Option<String>,
+        // LIB-C4 — when set, every probed item carries this genre string
+        // so the scanner's link-on-write path can be asserted.
+        genre: Option<String>,
     }
 
     impl Prober for FakeProber {
@@ -1167,7 +1340,10 @@ mod tests {
             };
             Ok(ProbeInfo {
                 kind,
-                probe: Default::default(),
+                probe: pharos_core::MediaProbe {
+                    genre: self.genre.clone(),
+                    ..Default::default()
+                },
             })
         }
     }
@@ -1234,12 +1410,40 @@ mod tests {
         let prober = FakeProber {
             calls: Arc::new(AtomicUsize::new(0)),
             force_fail_for: Some("bad".into()),
+            genre: None,
         };
         let s = FsScanner::new(prober.clone());
         let items = s.scan(td.path()).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_populates_item_genres_join_from_probe_genre() {
+        // LIB-C4 — scanning a file whose probe carries a comma/pipe
+        // separated genre string links it into the item_genres join, and
+        // the genre's wire id resolves the item back.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "movie.mkv", b"aaaa").await;
+        let prober = FakeProber {
+            genre: Some("Action, Sci-Fi".into()),
+            ..Default::default()
+        };
+        let s = FsScanner::new(prober);
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+        let item_id = store.list().await.unwrap()[0].id;
+
+        use pharos_core::{genre_wire_id, GenreStore};
+        let rows = store.genres_with_counts().await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|g| g.genre.name.as_str()).collect();
+        assert_eq!(names, vec!["Action", "Sci-Fi"]);
+        let ids = store
+            .item_ids_for_genre(&genre_wire_id("Action"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![item_id]);
     }
 
     #[tokio::test]
@@ -1680,6 +1884,7 @@ mod tests {
         let prober = FakeProber {
             calls: Arc::new(AtomicUsize::new(0)),
             force_fail_for: Some("bad".into()),
+            genre: None,
         };
         let s = FsScanner::new(prober.clone()).with_probe_concurrency(4);
         let store = MemStore::default();
@@ -1808,6 +2013,45 @@ mod tests {
         assert_eq!(info.series_name, "Show Without Season Dir");
         assert_eq!(info.season_number, Some(5));
         assert_eq!(info.episode_number, Some(11));
+    }
+
+    // LIB-C11 — two distinct shows sharing a name must yield the SAME
+    // series_name but DIFFERENT series_folder + year so their synthesised
+    // wire ids diverge and their episodes don't interleave.
+    #[test]
+    fn same_name_shows_get_distinct_folders_and_years() {
+        let p80 = Path::new("/tv/Cosmos (1980)/Season 01/S01E01.mkv");
+        let p14 = Path::new("/tv/Cosmos (2014)/Season 01/S01E01.mkv");
+        let i80 = parse_series_info(p80).expect("series info 1980");
+        let i14 = parse_series_info(p14).expect("series info 2014");
+
+        // Display name is identical (the bare show name)…
+        assert_eq!(i80.series_name, "Cosmos");
+        assert_eq!(i14.series_name, "Cosmos");
+        // …but the folder identity + parsed year differ.
+        assert_eq!(i80.series_folder.as_deref(), Some("/tv/Cosmos (1980)"));
+        assert_eq!(i14.series_folder.as_deref(), Some("/tv/Cosmos (2014)"));
+        assert_eq!(i80.series_year, Some(1980));
+        assert_eq!(i14.series_year, Some(2014));
+        assert_ne!(i80.series_key(), i14.series_key());
+    }
+
+    #[test]
+    fn folder_year_only_parsed_from_trailing_parenthesised_4digit() {
+        // No year marker → None.
+        let p = Path::new("/tv/Firefly/Season 01/S01E01.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Firefly");
+        assert_eq!(info.series_folder.as_deref(), Some("/tv/Firefly"));
+        assert_eq!(info.series_year, None);
+        // Falls back to the bare name as identity key when no folder year.
+        assert_eq!(info.series_key(), "/tv/Firefly");
+
+        // Parenthesised non-year doesn't masquerade as a year.
+        assert_eq!(parse_folder_year("Show (Uncut)"), None);
+        assert_eq!(parse_folder_year("Show (1)"), None);
+        assert_eq!(parse_folder_year("Cosmos (1980)"), Some(1980));
+        assert_eq!(parse_folder_year("The Office (US) (2005)"), Some(2005));
     }
 
     #[test]

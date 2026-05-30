@@ -138,7 +138,7 @@ pub fn spawn_watch<P, S>(
 ) -> Result<WatchHandle, WatchError>
 where
     P: Prober + Send + Sync + 'static,
-    S: MediaStore + Send + Sync + 'static,
+    S: MediaStore + pharos_core::GenreStore + Send + Sync + 'static,
 {
     // Bridge the notify OS thread → async task. notify's callback runs on
     // its own thread; `try_send` never blocks it (a full channel drops the
@@ -184,7 +184,7 @@ async fn watch_loop<P, S>(
     out_tx: mpsc::Sender<ScanOutcome>,
 ) where
     P: Prober + Send + Sync + 'static,
-    S: MediaStore + Send + Sync + 'static,
+    S: MediaStore + pharos_core::GenreStore + Send + Sync + 'static,
 {
     let exts = scanner.extensions_snapshot();
     loop {
@@ -274,7 +274,7 @@ async fn process_batch<P, S>(
 ) -> pharos_core::DomainResult<Option<ScanOutcome>>
 where
     P: Prober + Send + Sync + 'static,
-    S: MediaStore + Send + Sync + 'static,
+    S: MediaStore + pharos_core::GenreStore + Send + Sync + 'static,
 {
     // Remove/rename in the batch → defer to a full incremental scan of the
     // root. It performs the atomic root-scoped sweep + move detection and
@@ -366,6 +366,8 @@ mod tests {
         states: Mutex<HashMap<MediaId, ScanState>>,
         fps: Mutex<HashMap<MediaId, Fingerprint>>,
         next_scan_id: AtomicI64,
+        // LIB-C4 — item_genres mirror (unused by assertions, satisfies the bound).
+        item_genres: Mutex<HashMap<MediaId, Vec<String>>>,
     }
 
     impl MediaStore for MemStore {
@@ -519,6 +521,40 @@ mod tests {
                 item.path = new_path.to_path_buf();
             }
             Ok(())
+        }
+    }
+
+    // LIB-C4 — watcher tests don't assert on the genre join, so this is a
+    // lightweight in-memory mirror sufficient to satisfy the scan_into /
+    // update_path bound.
+    impl pharos_core::GenreStore for MemStore {
+        async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
+            Ok(i64::from_str_radix(&pharos_core::genre_wire_id(name)[..15], 16).unwrap_or(0))
+        }
+        async fn link_item_genres(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
+            let mut g = self
+                .0
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            g.insert(
+                item,
+                names
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
+            Ok(())
+        }
+        async fn genres_with_counts(&self) -> DomainResult<Vec<pharos_core::GenreCount>> {
+            Ok(Vec::new())
+        }
+        async fn item_ids_for_genre(&self, _wire_id: &str) -> DomainResult<Vec<MediaId>> {
+            Ok(Vec::new())
+        }
+        async fn backfill_genres(&self) -> DomainResult<u64> {
+            Ok(0)
         }
     }
 

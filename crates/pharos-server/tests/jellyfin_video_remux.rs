@@ -151,6 +151,7 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();

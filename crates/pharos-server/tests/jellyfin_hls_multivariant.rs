@@ -80,6 +80,7 @@ async fn seed_with_fixture(
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();

@@ -112,7 +112,9 @@ async fn items_counts(
             MediaKind::Episode => {
                 episodes += 1;
                 if let Some(s) = i.series.as_ref() {
-                    series.insert(s.series_name.as_str());
+                    // LIB-C11 — count distinct shows by folder identity so
+                    // same-name shows aren't undercounted.
+                    series.insert(s.series_key());
                 }
             }
             MediaKind::Audio => audio += 1,
@@ -241,9 +243,11 @@ async fn items_similar(
 /// similar. Zero excludes.
 fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
     let mut s = 0u32;
-    // Same Series (Episode) is the strongest signal.
+    // Same Series (Episode) is the strongest signal. LIB-C11 — compare
+    // on the folder-keyed identity so two same-name shows in distinct
+    // folders aren't treated as one. Falls back to name for legacy rows.
     if let (Some(t), Some(c)) = (target.series.as_ref(), candidate.series.as_ref()) {
-        if t.series_name.eq_ignore_ascii_case(&c.series_name) {
+        if t.series_key().eq_ignore_ascii_case(c.series_key()) {
             s += 100;
         }
     }
@@ -290,30 +294,34 @@ async fn list_genres(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    use crate::api::jellyfin::dto::genre_id_for;
-    use std::collections::HashSet;
-    let all = state
+    use pharos_core::GenreStore;
+    // LIB-C4 — genres are now entity rows. Lazily backfill the join from
+    // the legacy probe.genre strings on first read after upgrade so rows
+    // scanned before C4 still surface (idempotent; later scans keep the
+    // join current). Then list the rows with their item counts; the `Id`
+    // stays the 32-hex genre_id_for(name) wire id (= genres.wire_id) so
+    // existing client URLs + the /Items?ParentId pivot keep resolving.
+    state
         .stores
-        .list()
+        .backfill_genres()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut genres: Vec<&str> = all
+    let rows = state
+        .stores
+        .genres_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let items: Vec<serde_json::Value> = rows
         .iter()
-        .filter_map(|i| i.probe.genre.as_deref())
-        .filter(|g| !g.is_empty() && seen.insert(g.to_string()))
-        .collect();
-    genres.sort_unstable();
-    let items: Vec<serde_json::Value> = genres
-        .iter()
-        .map(|g| {
+        .map(|gc| {
             serde_json::json!({
-                "Id": genre_id_for(g),
-                "Name": g,
+                "Id": gc.genre.wire_id,
+                "Name": gc.genre.name,
                 "ServerId": state.server_id,
                 "Type": "Genre",
                 "MediaType": "Unknown",
                 "IsFolder": true,
+                "ChildCount": gc.item_count,
             })
         })
         .collect();
@@ -528,8 +536,11 @@ async fn shows_next_up(
         if user_data.get(idx).copied().unwrap_or_default().played {
             continue;
         }
+        // LIB-C11 — bucket by the folder-keyed identity, not the bare
+        // name, so two same-name shows in distinct folders stay separate
+        // and don't interleave into one NextUp pick.
         buckets
-            .entry(series.series_name.clone())
+            .entry(series.series_key().to_string())
             .or_default()
             .push((idx, item));
     }
@@ -867,7 +878,7 @@ async fn list_user_items_latest(
     // Honour ParentId so home-page "Latest" rows match the library
     // the user clicked into. Library / series / season ids all
     // resolve via the shared restrict_to_parent helper.
-    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref());
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
     // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
     // row filters to Type=Movie.
     let typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
@@ -951,9 +962,33 @@ fn synth_views_body(state: &AppState) -> serde_json::Value {
 }
 
 fn library_views(state: &AppState) -> Vec<serde_json::Value> {
+    // LIB-C1 — prefer the typed libraries reconciled from config (each
+    // carries its own CollectionType). The wire_id is the same
+    // library_id_for_root hash a plain root would yield, so client URLs
+    // are stable whether or not a library is typed.
+    if !state.libraries.is_empty() {
+        return state
+            .libraries
+            .iter()
+            .map(|lib| {
+                serde_json::json!({
+                    "Id": lib.wire_id,
+                    "Name": lib.name,
+                    "ServerId": state.server_id,
+                    "Type": "CollectionFolder",
+                    "CollectionType": lib.kind.collection_type(),
+                    "MediaType": "Unknown",
+                    "IsFolder": true,
+                    "UserData": { "Played": false, "PlayCount": 0 },
+                })
+            })
+            .collect();
+    }
     if state.media_roots.is_empty() {
         return vec![all_media_placeholder(&state.server_id)];
     }
+    // Fallback: synthesise one `mixed` library per configured root (the
+    // legacy shape — used by tests that only call `with_media_roots`).
     state
         .media_roots
         .iter()
@@ -995,7 +1030,7 @@ fn all_media_placeholder(server_id: &str) -> serde_json::Value {
 /// same id across restarts. Two roots only collide if their xxh3 hashes
 /// collide (cryptographically unlikely for any realistic library
 /// count).
-pub(crate) fn library_id_for_root(path: &std::path::Path) -> String {
+pub fn library_id_for_root(path: &std::path::Path) -> String {
     let h = pharos_scanner::stable_id(path);
     // Pad to 32 hex chars so jellyfin-web's uuid-shaped id regex
     // accepts it (some downstream code assumes 32-hex shapes).
@@ -1199,11 +1234,8 @@ async fn list_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let seed = effective_sort_seed(&q, user.0.id);
-    let filtered = filter_and_sort(
-        restrict_to_parent(&state, all, q.parent_id.as_deref()),
-        &q,
-        seed,
-    );
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
+    let filtered = filter_and_sort(scoped, &q, seed);
     let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
@@ -1227,11 +1259,8 @@ async fn list_user_items(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let seed = effective_sort_seed(&q, user.0.id);
-    let filtered = filter_and_sort(
-        restrict_to_parent(&state, all, q.parent_id.as_deref()),
-        &q,
-        seed,
-    );
+    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
+    let filtered = filter_and_sort(scoped, &q, seed);
     let after_ud = apply_userdata_filter(&state, user.0.id, filtered, &q).await?;
     let dto = paginate(&state, user.0.id, after_ud, q.start_index, q.limit).await?;
     Ok(HttpResponse::Ok().json(dto))
@@ -1301,21 +1330,42 @@ async fn apply_userdata_filter(
 /// Drop items that don't live under the configured root / series /
 /// season mapped to `parent_id`. Unknown `parent_id` → empty list.
 /// The All-Media placeholder + `None` pass everything through.
-fn restrict_to_parent(
+async fn restrict_to_parent(
     state: &AppState,
     items: Vec<MediaItem>,
     parent_id: Option<&str>,
 ) -> Vec<MediaItem> {
     use crate::api::jellyfin::dto::{
-        album_id_for, artist_id_for, genre_id_for, season_id_for, series_id_for,
+        album_id_for, artist_id_for, genre_id_for, season_id_for_key, series_id_for_key,
     };
+    use pharos_core::{GenreStore, LibraryStore};
     let Some(pid) = parent_id else {
         return items;
     };
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return items;
     }
-    // 1) Library / root match (per-root collections).
+    // 1) Library / root match. LIB-C1 — prefer the typed `libraries` table:
+    //    resolve the ParentId by wire_id to the set of item ids assigned
+    //    that library (backfilled by path-prefix at boot, kept current by
+    //    the scanner). Fall back to the legacy path-prefix scan over
+    //    `media_roots` for libraries not yet backfilled (or test states
+    //    wired only with `with_media_roots`).
+    if let Some(lib) = state.libraries.iter().find(|l| l.wire_id == pid) {
+        if let Ok(ids) = state.stores.item_ids_for_library(&lib.wire_id).await {
+            if !ids.is_empty() {
+                let want: std::collections::HashSet<u64> = ids.into_iter().collect();
+                return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+            }
+        }
+        // No backfilled rows yet → fall back to the path-prefix scan
+        // against this library's root so the view still resolves.
+        let root = std::path::PathBuf::from(&lib.root_path);
+        return items
+            .into_iter()
+            .filter(|i| i.path.starts_with(&root))
+            .collect();
+    }
     if let Some(root) = state
         .media_roots
         .iter()
@@ -1326,34 +1376,39 @@ fn restrict_to_parent(
             .filter(|i| i.path.starts_with(root))
             .collect();
     }
-    // 2) Series id → every episode whose series_name hashes to pid.
+    // 2) Series id → every episode whose folder-keyed series id matches
+    //    pid. LIB-C11: resolves via the show FOLDER (falling back to the
+    //    bare name for legacy rows), so a same-name show in another folder
+    //    isn't pulled in under the wrong series.
     if items.iter().any(|i| {
         i.series
             .as_ref()
-            .is_some_and(|s| series_id_for(&s.series_name) == pid)
+            .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
     }) {
         return items
             .into_iter()
             .filter(|i| {
-                i.series
-                    .as_ref()
-                    .is_some_and(|s| series_id_for(&s.series_name) == pid)
+                i.series.as_ref().is_some_and(|s| {
+                    series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
+                })
             })
             .collect();
     }
-    // 3) Season id → every episode in that (series, season) pair.
+    // 3) Season id → every episode in that (folder, season) pair.
     if items.iter().any(|i| {
         i.series.as_ref().is_some_and(|s| {
-            s.season_number
-                .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
+            s.season_number.is_some_and(|n| {
+                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+            })
         })
     }) {
         return items
             .into_iter()
             .filter(|i| {
                 i.series.as_ref().is_some_and(|s| {
-                    s.season_number
-                        .is_some_and(|n| season_id_for(&s.series_name, n) == pid)
+                    s.season_number.is_some_and(|n| {
+                        season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+                    })
                 })
             })
             .collect();
@@ -1400,12 +1455,23 @@ fn restrict_to_parent(
             })
             .collect();
     }
-    // 6) Genre id → every item tagged with that genre.
+    // 6) Genre id → every item tagged with that genre. LIB-C4: resolve
+    //    via the genres.wire_id → item_genres → items indexed join when
+    //    the genre is a real row (the entity-backed exact pivot). If the
+    //    wire id matches no genre row yet (rows scanned before C4 and not
+    //    backfilled), fall back to the legacy in-memory probe.genre scan.
+    if let Ok(ids) = state.stores.item_ids_for_genre(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+        }
+    }
     if items.iter().any(|i| {
         i.probe
             .genre
             .as_deref()
-            .is_some_and(|g| genre_id_for(g) == pid)
+            .map(pharos_core::split_genre_field)
+            .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
     }) {
         return items
             .into_iter()
@@ -1413,7 +1479,8 @@ fn restrict_to_parent(
                 i.probe
                     .genre
                     .as_deref()
-                    .is_some_and(|g| genre_id_for(g) == pid)
+                    .map(pharos_core::split_genre_field)
+                    .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
             })
             .collect();
     }
@@ -1761,22 +1828,24 @@ async fn synth_series_or_season(
     state: &AppState,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, season_id_for, series_id_for};
+    use crate::api::jellyfin::dto::{season_display_name, season_id_for_key, series_id_for_key};
     let all = state
         .stores
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // First: series match.
+    // First: series match. LIB-C11 — resolve via the folder-keyed id so
+    // the synth DTO matches the ids minted on episodes, and same-name
+    // shows in distinct folders surface as distinct Series.
     for item in all.iter() {
         let Some(series) = item.series.as_ref() else {
             continue;
         };
-        if series_id_for(&series.series_name) == id_str {
-            return Ok(Some(series_dto(&state.server_id, &series.series_name)));
+        if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
+            return Ok(Some(series_dto(&state.server_id, series)));
         }
     }
-    // Then: season match. We need (series_name, season_number) so
+    // Then: season match. We need (folder/series, season_number) so
     // walk every Episode again.
     for item in all.iter() {
         let Some(series) = item.series.as_ref() else {
@@ -1785,10 +1854,15 @@ async fn synth_series_or_season(
         let Some(season_n) = series.season_number else {
             continue;
         };
-        if season_id_for(&series.series_name, season_n) == id_str {
+        if season_id_for_key(
+            series.series_folder.as_deref(),
+            &series.series_name,
+            season_n,
+        ) == id_str
+        {
             return Ok(Some(season_dto(
                 &state.server_id,
-                &series.series_name,
+                series,
                 season_n,
                 &season_display_name(season_n),
             )));
@@ -1797,11 +1871,11 @@ async fn synth_series_or_season(
     Ok(None)
 }
 
-fn series_dto(server_id: &str, series_name: &str) -> serde_json::Value {
-    use crate::api::jellyfin::dto::series_id_for;
-    serde_json::json!({
-        "Id": series_id_for(series_name),
-        "Name": series_name,
+fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::Value {
+    use crate::api::jellyfin::dto::series_id_for_key;
+    let mut dto = serde_json::json!({
+        "Id": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
+        "Name": series.series_name,
         "ServerId": server_id,
         "Type": "Series",
         "MediaType": "Unknown",
@@ -1812,26 +1886,32 @@ fn series_dto(server_id: &str, series_name: &str) -> serde_json::Value {
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
         "ProductionLocations": [], "RemoteTrailers": [], "Chapters": [],
         "ImageTags": {}, "BackdropImageTags": [], "ProviderIds": {},
-    })
+    });
+    // LIB-C11 — surface the folder-parsed year so jellyfin-web can tell
+    // same-name shows apart in the Series view.
+    if let (Some(obj), Some(year)) = (dto.as_object_mut(), series.series_year) {
+        obj.insert("ProductionYear".into(), serde_json::json!(year));
+    }
+    dto
 }
 
 fn season_dto(
     server_id: &str,
-    series_name: &str,
+    series: &pharos_core::SeriesInfo,
     season_number: u32,
     season_name: &str,
 ) -> serde_json::Value {
-    use crate::api::jellyfin::dto::{season_id_for, series_id_for};
+    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
     serde_json::json!({
-        "Id": season_id_for(series_name, season_number),
+        "Id": season_id_for_key(series.series_folder.as_deref(), &series.series_name, season_number),
         "Name": season_name,
         "ServerId": server_id,
         "Type": "Season",
         "MediaType": "Unknown",
         "IsFolder": true,
         "CanPlay": false,
-        "SeriesName": series_name,
-        "SeriesId": series_id_for(series_name),
+        "SeriesName": series.series_name,
+        "SeriesId": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
         "IndexNumber": season_number,
         "UserData": { "Played": false, "PlayCount": 0 },
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
@@ -1888,17 +1968,51 @@ async fn virtual_folders(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    // Phase 1: report a single synthesized "All Media" library covering the
-    // entire store. Real per-root libraries land with media-roots wiring.
-    let folder = VirtualFolderInfoDto {
-        name: "All Media".into(),
-        locations: vec![],
-        collection_type: "mixed",
-        item_id: "00000000000000000000000000000000".into(),
-        library_options: VirtualFolderOptionsDto::default(),
+    // LIB-C1 — one VirtualFolderInfoDto per real typed library, with its
+    // root path as the single `Locations` entry and the per-kind
+    // CollectionType. Item id = the stable library wire id so client URLs
+    // survive. Falls back to synthesising one `mixed` folder per
+    // configured `media_roots` entry, then to the legacy "All Media" stub
+    // when neither is configured (keeps the wire shape jellyfin-web
+    // accepts).
+    let folders: Vec<VirtualFolderInfoDto> = if !state.libraries.is_empty() {
+        state
+            .libraries
+            .iter()
+            .map(|lib| VirtualFolderInfoDto {
+                name: lib.name.clone(),
+                locations: vec![lib.root_path.clone()],
+                collection_type: lib.kind.collection_type(),
+                item_id: lib.wire_id.clone(),
+                library_options: VirtualFolderOptionsDto::default(),
+            })
+            .collect()
+    } else if !state.media_roots.is_empty() {
+        state
+            .media_roots
+            .iter()
+            .map(|root| VirtualFolderInfoDto {
+                name: root
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Media")
+                    .to_string(),
+                locations: vec![root.to_string_lossy().into_owned()],
+                collection_type: "mixed",
+                item_id: library_id_for_root(root),
+                library_options: VirtualFolderOptionsDto::default(),
+            })
+            .collect()
+    } else {
+        vec![VirtualFolderInfoDto {
+            name: "All Media".into(),
+            locations: vec![],
+            collection_type: "mixed",
+            item_id: "00000000000000000000000000000000".into(),
+            library_options: VirtualFolderOptionsDto::default(),
+        }]
     };
-    let _ = &state.stores;
-    Ok(HttpResponse::Ok().json(vec![folder]))
+    Ok(HttpResponse::Ok().json(folders))
 }
 
 async fn paginate(

@@ -90,6 +90,16 @@ pub struct AppState {
     /// walks. Held here so admin endpoints (`/Library/Refresh`) can
     /// spawn a real background scan without re-parsing config.
     pub media_roots: Vec<PathBuf>,
+    /// LIB-C1 — typed libraries reconciled from `[media]` config at boot
+    /// (one per configured root, with its kind + stable wire id). Drives
+    /// `/Library/VirtualFolders` + `/Library/MediaFolders` +
+    /// `/Users/{u}/Views` so they advertise the real per-root
+    /// CollectionType instead of the legacy single "All Media / mixed"
+    /// stub. Empty → the views fall back to synthesising one `mixed`
+    /// library per `media_roots` entry (tests that only call
+    /// `with_media_roots`), and to the all-zeros placeholder when there
+    /// are no roots either.
+    pub libraries: Vec<pharos_core::Library>,
     /// Directory pharos surfaces log files from for the
     /// `/System/Logs` admin endpoint. None disables the surface.
     pub log_dir: Option<PathBuf>,
@@ -142,6 +152,7 @@ impl AppState {
             trickplay_interval_ms: 10_000,
             live_tv: None,
             media_roots: Vec::new(),
+            libraries: Vec::new(),
             log_dir: None,
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
@@ -195,6 +206,7 @@ impl AppState {
             trickplay_interval_ms: 10_000,
             live_tv: None,
             media_roots: Vec::new(),
+            libraries: Vec::new(),
             log_dir: None,
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
@@ -274,6 +286,15 @@ impl AppState {
 
     pub fn with_media_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.media_roots = roots;
+        self
+    }
+
+    /// LIB-C1 builder — install the typed libraries reconciled from
+    /// config. When set, `/Library/VirtualFolders` + `/Library/MediaFolders`
+    /// and the view list advertise these (with per-kind CollectionType)
+    /// instead of synthesising `mixed` libraries from `media_roots`.
+    pub fn with_libraries(mut self, libraries: Vec<pharos_core::Library>) -> Self {
+        self.libraries = libraries;
         self
     }
 

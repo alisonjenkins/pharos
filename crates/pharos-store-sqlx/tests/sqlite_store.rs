@@ -295,3 +295,294 @@ async fn rebind_path_on_absent_row_is_noop() {
         .unwrap();
     assert!(s.list().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn metadata_roundtrips_through_store() {
+    // LIB-C7/C8/C9 — descriptive metadata must survive put → get.
+    use pharos_core::{MediaMetadata, ProviderIds};
+    let s = fresh().await;
+    let mut it = item(7, "/m/matrix.mkv", "The Matrix", MediaKind::Movie);
+    it.metadata = MediaMetadata {
+        community_rating: Some(8.7),
+        critic_rating: Some(83.0),
+        official_rating: Some("R".into()),
+        production_year: Some(1999),
+        premiere_date: Some(922_060_800), // 1999-03-31
+        overview: Some("A hacker learns the truth.".into()),
+        tagline: Some("Free your mind.".into()),
+        provider_ids: ProviderIds {
+            tmdb: Some("603".into()),
+            imdb: Some("tt0133093".into()),
+            ..Default::default()
+        },
+    };
+    s.put(it.clone()).await.unwrap();
+    let got = s.get(7).await.unwrap();
+    assert_eq!(got.metadata, it.metadata);
+}
+
+#[tokio::test]
+async fn default_metadata_roundtrips_as_all_none() {
+    // The un-enriched path: every metadata field is None / empty and
+    // round-trips through NULL columns unchanged.
+    let s = fresh().await;
+    let it = item(8, "/m/plain.mkv", "Plain", MediaKind::Movie);
+    s.put(it.clone()).await.unwrap();
+    let got = s.get(8).await.unwrap();
+    assert_eq!(got.metadata, pharos_core::MediaMetadata::default());
+    assert!(got.metadata.provider_ids.is_empty());
+}
+
+#[tokio::test]
+async fn series_folder_and_year_round_trip_through_store() {
+    // LIB-C11 — the folder-keyed identity + parsed year must survive
+    // put → get so the synth Series/Season wire ids stay stable across
+    // restarts and same-name shows don't merge.
+    use pharos_core::SeriesInfo;
+    let s = fresh().await;
+    let mut it = item(
+        9,
+        "/tv/Cosmos (1980)/Season 01/S01E01.mkv",
+        "Cosmos E1",
+        MediaKind::Episode,
+    );
+    it.series = Some(SeriesInfo {
+        series_name: "Cosmos".into(),
+        season_number: Some(1),
+        episode_number: Some(1),
+        series_folder: Some("/tv/Cosmos (1980)".into()),
+        series_year: Some(1980),
+    });
+    s.put(it.clone()).await.unwrap();
+    let got = s.get(9).await.unwrap();
+    assert_eq!(got.series, it.series);
+    let series = got.series.unwrap();
+    assert_eq!(series.series_folder.as_deref(), Some("/tv/Cosmos (1980)"));
+    assert_eq!(series.series_year, Some(1980));
+    assert_eq!(series.series_key(), "/tv/Cosmos (1980)");
+}
+
+#[tokio::test]
+async fn legacy_series_without_folder_round_trips_as_none() {
+    // Rows scanned before C11 (no folder/year) decode with None and fall
+    // back to the name-keyed identity.
+    use pharos_core::SeriesInfo;
+    let s = fresh().await;
+    let mut it = item(
+        10,
+        "/tv/Firefly/S01E01.mkv",
+        "Firefly E1",
+        MediaKind::Episode,
+    );
+    it.series = Some(SeriesInfo {
+        series_name: "Firefly".into(),
+        season_number: Some(1),
+        episode_number: Some(1),
+        ..Default::default()
+    });
+    s.put(it.clone()).await.unwrap();
+    let got = s.get(10).await.unwrap();
+    let series = got.series.unwrap();
+    assert_eq!(series.series_folder, None);
+    assert_eq!(series.series_year, None);
+    assert_eq!(series.series_key(), "Firefly");
+}
+
+// ---- LIB-C4: genres as entities -------------------------------------
+
+fn item_with_genre(id: u64, path: &str, genre: &str) -> MediaItem {
+    let mut it = item(id, path, "T", MediaKind::Movie);
+    it.probe.genre = Some(genre.into());
+    it
+}
+
+#[tokio::test]
+async fn backfill_splits_genre_string_into_rows_and_links() {
+    // LIB-C4 — a seeded item with "Action, Sci-Fi" yields two genre rows
+    // and two item_genres links after backfill.
+    use pharos_core::GenreStore;
+    let s = fresh().await;
+    s.put(item_with_genre(1, "/m/a.mkv", "Action, Sci-Fi"))
+        .await
+        .unwrap();
+    let links = s.backfill_genres().await.unwrap();
+    assert_eq!(links, 2, "two item_genres links");
+    let rows = s.genres_with_counts().await.unwrap();
+    let names: Vec<&str> = rows.iter().map(|g| g.genre.name.as_str()).collect();
+    assert_eq!(names, vec!["Action", "Sci-Fi"], "ordered by name");
+    assert!(rows.iter().all(|g| g.item_count == 1));
+}
+
+#[tokio::test]
+async fn genre_wire_id_matches_dto_helper_and_resolves_items() {
+    // LIB-C4 — /Items?ParentId=genre_id_for("Action") resolves to the
+    // tagged item via the wire_id index (exact pivot).
+    use pharos_core::{genre_wire_id, GenreStore};
+    let s = fresh().await;
+    s.put(item_with_genre(1, "/m/a.mkv", "Action, Sci-Fi"))
+        .await
+        .unwrap();
+    s.backfill_genres().await.unwrap();
+    let rows = s.genres_with_counts().await.unwrap();
+    let action = rows.iter().find(|g| g.genre.name == "Action").unwrap();
+    assert_eq!(action.genre.wire_id, genre_wire_id("Action"));
+    let ids = s
+        .item_ids_for_genre(&genre_wire_id("Action"))
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1]);
+    // An unknown wire id resolves to no items.
+    assert!(s
+        .item_ids_for_genre("ffffffffffffffffffffffffffffffff")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn shared_genre_increments_count_across_items() {
+    // LIB-C4 — a second item sharing a genre bumps that genre's count and
+    // both items resolve under the shared genre id.
+    use pharos_core::{genre_wire_id, GenreStore};
+    let s = fresh().await;
+    s.put(item_with_genre(1, "/m/a.mkv", "Action, Sci-Fi"))
+        .await
+        .unwrap();
+    s.put(item_with_genre(2, "/m/b.mkv", "Action"))
+        .await
+        .unwrap();
+    s.backfill_genres().await.unwrap();
+    let rows = s.genres_with_counts().await.unwrap();
+    let action = rows.iter().find(|g| g.genre.name == "Action").unwrap();
+    let scifi = rows.iter().find(|g| g.genre.name == "Sci-Fi").unwrap();
+    assert_eq!(action.item_count, 2, "Action shared by both items");
+    assert_eq!(scifi.item_count, 1, "Sci-Fi on one item");
+    let mut ids = s
+        .item_ids_for_genre(&genre_wire_id("Action"))
+        .await
+        .unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn backfill_is_idempotent() {
+    // Running backfill twice does not duplicate rows or links.
+    use pharos_core::GenreStore;
+    let s = fresh().await;
+    s.put(item_with_genre(1, "/m/a.mkv", "Action|Drama"))
+        .await
+        .unwrap();
+    let first = s.backfill_genres().await.unwrap();
+    let second = s.backfill_genres().await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first, 2);
+    assert_eq!(s.genres_with_counts().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn link_item_genres_replaces_stale_links() {
+    // A rescan that drops a genre clears the stale join row.
+    use pharos_core::{genre_wire_id, GenreStore};
+    let s = fresh().await;
+    s.put(item_with_genre(1, "/m/a.mkv", "Action, Sci-Fi"))
+        .await
+        .unwrap();
+    s.link_item_genres(1, &["Action".into(), "Sci-Fi".into()])
+        .await
+        .unwrap();
+    // Re-link with only Drama: Action/Sci-Fi should no longer resolve item 1.
+    s.link_item_genres(1, &["Drama".into()]).await.unwrap();
+    assert!(s
+        .item_ids_for_genre(&genre_wire_id("Action"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        s.item_ids_for_genre(&genre_wire_id("Drama")).await.unwrap(),
+        vec![1]
+    );
+}
+
+// ---- LIB-C1: typed libraries ----------------------------------------
+
+#[tokio::test]
+async fn libraries_upsert_list_and_backfill_by_path_prefix() {
+    use pharos_core::{LibraryKind, LibraryStore};
+    let s = fresh().await;
+    // Two typed libraries + a path-boundary sibling that must NOT be
+    // claimed by the /media/movies library.
+    let movies_wire = "aaaa0000aaaa0000aaaa0000aaaa0000";
+    let tv_wire = "bbbb1111bbbb1111bbbb1111bbbb1111";
+    s.upsert_library("Movies", "/media/movies", LibraryKind::Movies, movies_wire)
+        .await
+        .unwrap();
+    s.upsert_library("TV", "/media/tv", LibraryKind::TvShows, tv_wire)
+        .await
+        .unwrap();
+    // item 1 under movies, item 2 under tv, item 3 under the sibling
+    // /media/movies-4k (string-prefix of /media/movies but a different dir).
+    s.put(item(1, "/media/movies/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(
+        2,
+        "/media/tv/Show/S01E01.mkv",
+        "B",
+        MediaKind::Episode,
+    ))
+    .await
+    .unwrap();
+    s.put(item(3, "/media/movies-4k/c.mkv", "C", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    let libs = s.libraries().await.unwrap();
+    assert_eq!(libs.len(), 2);
+    // Ordered by name: Movies, TV.
+    assert_eq!(libs[0].name, "Movies");
+    assert_eq!(libs[0].kind, LibraryKind::Movies);
+    assert_eq!(libs[0].wire_id, movies_wire);
+    assert_eq!(libs[1].kind, LibraryKind::TvShows);
+
+    let assigned = s.backfill_library_ids().await.unwrap();
+    // items 1 + 2 assigned; item 3 (movies-4k) untouched by the boundary.
+    assert_eq!(assigned, 2);
+
+    let movies_items = s.item_ids_for_library(movies_wire).await.unwrap();
+    assert_eq!(movies_items, vec![1], "only the strictly-under item");
+    let tv_items = s.item_ids_for_library(tv_wire).await.unwrap();
+    assert_eq!(tv_items, vec![2]);
+}
+
+#[tokio::test]
+async fn upsert_library_is_idempotent_and_updates_kind() {
+    use pharos_core::{LibraryKind, LibraryStore};
+    let s = fresh().await;
+    let wire = "cccc2222cccc2222cccc2222cccc2222";
+    let id1 = s
+        .upsert_library("Lib", "/media/x", LibraryKind::Mixed, wire)
+        .await
+        .unwrap();
+    // Re-upsert the same root with a new name + kind: same row, updated.
+    let id2 = s
+        .upsert_library("Movies", "/media/x", LibraryKind::Movies, wire)
+        .await
+        .unwrap();
+    assert_eq!(id1, id2, "same root → same PK");
+    let libs = s.libraries().await.unwrap();
+    assert_eq!(libs.len(), 1);
+    assert_eq!(libs[0].name, "Movies");
+    assert_eq!(libs[0].kind, LibraryKind::Movies);
+}
+
+#[tokio::test]
+async fn item_ids_for_unknown_library_wire_is_empty() {
+    use pharos_core::LibraryStore;
+    let s = fresh().await;
+    assert!(s
+        .item_ids_for_library("deadbeefdeadbeefdeadbeefdeadbeef")
+        .await
+        .unwrap()
+        .is_empty());
+}

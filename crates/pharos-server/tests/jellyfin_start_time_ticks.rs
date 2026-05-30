@@ -63,6 +63,7 @@ async fn seed(
             },
             series: None,
             created_at: None,
+            metadata: Default::default(),
         })
         .await
         .unwrap();
