@@ -103,6 +103,76 @@ async fn concurrent_puts_do_not_lose_data() {
 }
 
 #[tokio::test]
+async fn scan_state_round_trips_through_mark_seen() {
+    let s = fresh().await;
+    s.put(item(1, "/a/x.mkv", "X", MediaKind::Movie))
+        .await
+        .unwrap();
+    // No signature recorded yet (predates first scan).
+    let st = s.scan_state(1).await.unwrap().expect("row present");
+    assert_eq!(st.file_mtime, 0);
+    assert_eq!(st.file_size, 0);
+    assert_eq!(st.last_seen_scan_id, 0);
+
+    let scan = s.begin_scan(std::path::Path::new("/a")).await.unwrap();
+    s.mark_seen(1, scan, 1_700_000_000, 4242).await.unwrap();
+    let st = s.scan_state(1).await.unwrap().expect("row present");
+    assert_eq!(st.file_mtime, 1_700_000_000);
+    assert_eq!(st.file_size, 4242);
+    assert_eq!(st.last_seen_scan_id, scan);
+    assert!(st.last_scanned > 0, "mark_seen stamps last_scanned");
+
+    // Absent row -> None.
+    assert!(s.scan_state(999).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sweep_unseen_deletes_only_unseen_under_root() {
+    let s = fresh().await;
+    s.put(item(1, "/a/keep.mkv", "Keep", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(2, "/a/gone.mkv", "Gone", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    let scan = s.begin_scan(std::path::Path::new("/a")).await.unwrap();
+    // Only item 1 is seen this run; item 2 was deleted on disk.
+    s.mark_seen(1, scan, 100, 10).await.unwrap();
+
+    let swept = s.sweep_unseen(scan, "/a").await.unwrap();
+    assert_eq!(swept, vec![2]);
+    assert!(s.get(1).await.is_ok(), "seen item survives");
+    match s.get(2).await {
+        Err(DomainError::NotFound(2)) => {}
+        other => panic!("unseen item should be gone, got {other:?}"),
+    }
+    s.finish_scan(scan, 1, swept.len() as i64).await.unwrap();
+}
+
+#[tokio::test]
+async fn sweep_is_root_scoped_and_never_touches_sibling_root() {
+    // V10 / brief: sweeping root A must not delete a root-B item even
+    // though B's row was never marked by A's scan.
+    let s = fresh().await;
+    s.put(item(1, "/rootA/a.mkv", "A", MediaKind::Movie))
+        .await
+        .unwrap();
+    s.put(item(2, "/rootB/b.mkv", "B", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    // Scan rootA, mark nothing under it (simulate everything deleted).
+    let scan = s.begin_scan(std::path::Path::new("/rootA")).await.unwrap();
+    let swept = s.sweep_unseen(scan, "/rootA").await.unwrap();
+    assert_eq!(swept, vec![1], "only rootA item swept");
+    assert!(
+        s.get(2).await.is_ok(),
+        "sibling root B item must be untouched"
+    );
+}
+
+#[tokio::test]
 async fn store_usable_via_generic_bound() {
     async fn drive<S: MediaStore>(s: &S, it: MediaItem) -> MediaItem {
         s.put(it.clone()).await.unwrap();
