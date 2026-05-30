@@ -18,6 +18,12 @@ pharos-transcode = { path = "../pharos-transcode", optional = true, default-feat
 # notification (inotify / kqueue / ReadDirectoryChangesW). Pulled in only
 # behind the `watch` feature so the default build stays lean.
 notify = { version = "8", optional = true }
+# LIB-D2 — Kodi NFO XML reader (high-priority local MetadataProvider).
+# Manual event-reader API (no serde feature): Kodi NFOs carry repeated
+# `<genre>`/`<actor>`/`<uniqueid>` elements and tolerate extra/unknown
+# tags, which the streaming event reader handles cleanly without a rigid
+# derive.
+quick-xml = { workspace = true }
 serde = { workspace = true }
 sonic-rs.workspace = true
 thiserror.workspace = true
