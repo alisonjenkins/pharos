@@ -49,6 +49,9 @@ allow = [
     # webpki-roots ships its bundled CA list under CDLA-Permissive-2.0;
     # the upstream Mozilla CCADB data is the actual licensed payload.
     "CDLA-Permissive-2.0",
+    # `notify` (the FS-watcher crate, P48/LIB-A8) is licensed CC0-1.0 —
+    # a public-domain dedication, FSF Free/Libre, maximally permissive.
+    "CC0-1.0",
 ]
 # Internal workspace crates (cargo-hakari's `workspace-hack`) carry no
 # license field and are never published; exempt publish = false crates.
