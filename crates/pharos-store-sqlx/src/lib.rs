@@ -28,6 +28,45 @@ pub mod chapter_json;
 // JSON adapter for MediaProbe.audio_tracks (P16). Same pattern.
 pub mod audio_track_json;
 
+/// LIB-A3 — build a root-scoped, path-boundary-safe SQL `LIKE` pattern for
+/// the scan sweep. Matches only items strictly *under* `root` (i.e. paths
+/// beginning `root` + path separator), never a sibling whose name merely
+/// shares a string prefix (`/media/movies` must not match
+/// `/media/movies-4k`). `%`/`_`/`\` in the root are escaped, so the query
+/// MUST use `ESCAPE '\'`. The trailing `root/` is appended after escaping.
+pub(crate) fn root_like_pattern(root: &str) -> String {
+    let base = root.strip_suffix('/').unwrap_or(root);
+    let mut out = String::with_capacity(base.len() + 2);
+    for c in base.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push_str("/%");
+    out
+}
+
+#[cfg(test)]
+mod root_like_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::root_like_pattern;
+
+    #[test]
+    fn boundary_excludes_sibling_prefix() {
+        // The classic bug: sweeping /media/movies must not match
+        // /media/movies-4k. The pattern ends in "/%", so the separator is
+        // mandatory.
+        assert_eq!(root_like_pattern("/media/movies"), "/media/movies/%");
+        assert_eq!(root_like_pattern("/media/movies/"), "/media/movies/%");
+    }
+
+    #[test]
+    fn escapes_like_wildcards_in_root() {
+        assert_eq!(root_like_pattern("/m_edia/50%off"), "/m\\_edia/50\\%off/%");
+    }
+}
+
 /// T-fix-RC1 — single-row mutable branding/config snapshot persisted
 /// in the `runtime_config` table by both sqlite + postgres backends.
 /// None for any field means "no override; fall back to config.toml".

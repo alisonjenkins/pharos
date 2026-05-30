@@ -1,6 +1,7 @@
 use crate::StoreError;
 use pharos_core::{
-    DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore, SeriesInfo,
+    DomainError, DomainResult, MediaId, MediaItem, MediaKind, MediaProbe, MediaStore, ScanState,
+    SeriesInfo,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -16,6 +17,13 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     audio_tracks_json";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -264,6 +272,118 @@ impl MediaStore for SqliteStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %id))]
+    async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
+            "SELECT last_scanned, file_mtime, file_size_seen, last_seen_scan_id \
+             FROM media_items WHERE id = ?",
+        )
+        .bind(id_i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(
+            |(last_scanned, file_mtime, file_size, last_seen)| ScanState {
+                last_scanned: last_scanned.unwrap_or(0),
+                file_mtime: file_mtime.unwrap_or(0),
+                file_size: file_size.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+                last_seen_scan_id: last_seen.unwrap_or(0),
+            },
+        ))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
+        let root_str = root.to_str();
+        let now = now_unix_secs();
+        let row = sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO scan_runs (root, started_at) VALUES (?, ?) RETURNING id",
+        )
+        .bind(root_str)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.0)
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %id, scan.id = scan_id))]
+    async fn mark_seen(
+        &self,
+        id: MediaId,
+        scan_id: i64,
+        mtime: i64,
+        size: u64,
+    ) -> DomainResult<()> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let size_i64 =
+            i64::try_from(size).map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
+        let now = now_unix_secs();
+        sqlx::query(
+            "UPDATE media_items SET file_mtime = ?, file_size_seen = ?, \
+             last_scanned = ?, last_seen_scan_id = ? WHERE id = ?",
+        )
+        .bind(mtime)
+        .bind(size_i64)
+        .bind(now)
+        .bind(scan_id)
+        .bind(id_i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(scan.id = scan_id))]
+    async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
+        // Root-scoped, single atomic DELETE (V10). The pattern matches only
+        // items strictly under `root_prefix` (path-separator boundary), so a
+        // sibling root sharing a string prefix (/media/movies vs
+        // /media/movies-4k) is never swept; wildcards in the root are escaped.
+        let like = crate::root_like_pattern(root_prefix);
+        let rows = sqlx::query_as::<_, (i64,)>(
+            "DELETE FROM media_items \
+             WHERE (last_seen_scan_id IS NULL OR last_seen_scan_id != ?) \
+               AND path LIKE ? ESCAPE '\\' \
+             RETURNING id",
+        )
+        .bind(scan_id)
+        .bind(like)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(id,)| {
+                u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+            })
+            .collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(scan.id = scan_id))]
+    async fn finish_scan(
+        &self,
+        scan_id: i64,
+        items_seen: i64,
+        items_swept: i64,
+    ) -> DomainResult<()> {
+        let now = now_unix_secs();
+        sqlx::query(
+            "UPDATE scan_runs SET finished_at = ?, items_seen = ?, items_swept = ? \
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(items_seen)
+        .bind(items_swept)
+        .bind(scan_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
     }
 }
 

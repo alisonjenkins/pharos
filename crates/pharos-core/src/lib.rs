@@ -272,11 +272,77 @@ pub enum DomainError {
 
 pub type DomainResult<T> = Result<T, DomainError>;
 
+/// LIB-A1 — per-row scan-state signature used for incremental rescans.
+/// `file_mtime` / `file_size` are the filesystem stat values seen on the
+/// last scan (distinct from `MediaProbe::size_bytes`, which is the
+/// ffprobe-reported format size). The A2 skip-unchanged path compares a
+/// fresh stat against this signature to decide whether re-probing is
+/// needed; `last_seen_scan_id` ties the row to the most recent scan run
+/// that observed it (the A3 mark-and-sweep token).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanState {
+    /// Unix-seconds timestamp of the scan that last touched this row.
+    pub last_scanned: i64,
+    /// Filesystem mtime (unix seconds) recorded at last scan.
+    pub file_mtime: i64,
+    /// Filesystem size in bytes recorded at last scan.
+    pub file_size: u64,
+    /// Id of the most recent `scan_runs` entry that saw this row.
+    pub last_seen_scan_id: i64,
+}
+
 pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
     fn put(&self, item: MediaItem) -> impl std::future::Future<Output = DomainResult<()>> + Send;
     fn list(&self) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
+
+    /// LIB-A1 — read the stored fs-stat signature for one item, or
+    /// `None` when the row is absent or predates migration 0016 (no
+    /// signature recorded yet, so the caller must re-probe).
+    fn scan_state(
+        &self,
+        id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<ScanState>>> + Send;
+
+    /// LIB-A1 — open a scan run against `root`, recording the start
+    /// time. Returns the new `scan_runs.id` used as the mark-and-sweep
+    /// token for `mark_seen` / `sweep_unseen` / `finish_scan`.
+    fn begin_scan(
+        &self,
+        root: &std::path::Path,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send;
+
+    /// LIB-A1 — stamp `id` as seen by scan run `scan_id`, persisting the
+    /// freshly-stat'd `mtime` / `size`. No-op (zero rows) when the id is
+    /// absent — the caller `put`s before marking on a fresh insert.
+    fn mark_seen(
+        &self,
+        id: MediaId,
+        scan_id: i64,
+        mtime: i64,
+        size: u64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// LIB-A1 — root-scoped mark-and-sweep delete. Removes
+    /// `media_items` rows under `root_prefix` whose `last_seen_scan_id`
+    /// is NULL or != `scan_id` (i.e. not observed by the current run),
+    /// returning the deleted ids. Root-scoped so sweeping one root never
+    /// deletes another root's items (V10: a single atomic DELETE).
+    fn sweep_unseen(
+        &self,
+        scan_id: i64,
+        root_prefix: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// LIB-A1 — close the scan run, recording the finish time and the
+    /// seen/swept counts for observability.
+    fn finish_scan(
+        &self,
+        scan_id: i64,
+        items_seen: i64,
+        items_swept: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
 /// Per-(user, item) state Jellyfin tracks: watched/unwatched, play

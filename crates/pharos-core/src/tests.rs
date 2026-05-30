@@ -8,6 +8,8 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct MemStore {
     inner: Mutex<HashMap<MediaId, MediaItem>>,
+    states: Mutex<HashMap<MediaId, ScanState>>,
+    next_scan_id: std::sync::atomic::AtomicI64,
 }
 
 impl MediaStore for MemStore {
@@ -34,6 +36,76 @@ impl MediaStore for MemStore {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
+        Ok(self
+            .states
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .get(&id)
+            .copied())
+    }
+
+    async fn begin_scan(&self, _root: &Path) -> DomainResult<i64> {
+        Ok(self
+            .next_scan_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1)
+    }
+
+    async fn mark_seen(
+        &self,
+        id: MediaId,
+        scan_id: i64,
+        mtime: i64,
+        size: u64,
+    ) -> DomainResult<()> {
+        self.states
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .insert(
+                id,
+                ScanState {
+                    last_scanned: 0,
+                    file_mtime: mtime,
+                    file_size: size,
+                    last_seen_scan_id: scan_id,
+                },
+            );
+        Ok(())
+    }
+
+    async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let states = self
+            .states
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let doomed: Vec<MediaId> = inner
+            .iter()
+            .filter(|(id, item)| {
+                item.path.to_string_lossy().starts_with(root_prefix)
+                    && states.get(*id).map(|s| s.last_seen_scan_id) != Some(scan_id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &doomed {
+            inner.remove(id);
+        }
+        Ok(doomed)
+    }
+
+    async fn finish_scan(
+        &self,
+        _scan_id: i64,
+        _items_seen: i64,
+        _items_swept: i64,
+    ) -> DomainResult<()> {
+        Ok(())
     }
 }
 
