@@ -12,11 +12,9 @@ use actix_test::TestServer;
 use actix_web::{web, App};
 use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_jellyfin_test_client::{DeviceInfo, JellyfinClient};
-use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
-};
-use pharos_sync::GroupRegistry;
+use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_sync::GroupRegistry;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
 

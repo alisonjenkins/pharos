@@ -114,7 +114,11 @@ impl LibavWorkerPool {
 
     /// Probe a media file in-process. The standout scan hotspot.
     pub async fn probe(&self, input: impl Into<PathBuf>) -> Result<ProbeInfo, PoolError> {
-        let ev = self.run(TinyOp::Probe { input: input.into() }).await?;
+        let ev = self
+            .run(TinyOp::Probe {
+                input: input.into(),
+            })
+            .await?;
         match ev {
             WorkerEvent::ProbeResult { info, .. } => Ok(*info),
             other => Err(unexpected(other)),

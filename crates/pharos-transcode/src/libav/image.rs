@@ -26,6 +26,7 @@ pub fn extract_image(
         Ok(false)
     })?;
     let bytes = jpeg.ok_or_else(|| FrameError::BadInput("no frame decoded".into()))?;
-    std::fs::write(out, &bytes).map_err(|e| FrameError::Other(format!("write {}: {e}", out.display())))?;
+    std::fs::write(out, &bytes)
+        .map_err(|e| FrameError::Other(format!("write {}: {e}", out.display())))?;
     Ok(())
 }

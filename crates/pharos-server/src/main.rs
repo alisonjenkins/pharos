@@ -12,8 +12,8 @@ use pharos_server::{
     state::AppState,
     sync_resolver,
 };
-use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
 
@@ -55,9 +55,9 @@ async fn main() -> Result<(), AppError> {
 
 async fn scan(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{MediaStore, Scanner};
-    use pharos_scanner::FsScanner;
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     use pharos_scanner::FfmpegProber;
+    use pharos_scanner::FsScanner;
 
     if cfg.media.roots.is_empty() {
         let stdout = std::io::stdout();

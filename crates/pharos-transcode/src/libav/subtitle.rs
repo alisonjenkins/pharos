@@ -87,12 +87,21 @@ mod tests {
         let srt = "1\n00:00:01,000 --> 00:00:04,000\nHello, world\n\n2\n00:00:05,500 --> 00:00:06,000\nSecond line\n";
         let vtt = convert_srt_to_webvtt(srt);
         assert!(vtt.starts_with("WEBVTT\n\n"), "missing header: {vtt:?}");
-        assert!(vtt.contains("00:00:01.000 --> 00:00:04.000"), "ts1: {vtt:?}");
-        assert!(vtt.contains("00:00:05.500 --> 00:00:06.000"), "ts2: {vtt:?}");
+        assert!(
+            vtt.contains("00:00:01.000 --> 00:00:04.000"),
+            "ts1: {vtt:?}"
+        );
+        assert!(
+            vtt.contains("00:00:05.500 --> 00:00:06.000"),
+            "ts2: {vtt:?}"
+        );
         // The comma in "Hello, world" must survive.
         assert!(vtt.contains("Hello, world"), "text comma lost: {vtt:?}");
         // SRT indices dropped.
-        assert!(!vtt.contains("\n1\n") && !vtt.lines().any(|l| l == "2"), "index leaked: {vtt:?}");
+        assert!(
+            !vtt.contains("\n1\n") && !vtt.lines().any(|l| l == "2"),
+            "index leaked: {vtt:?}"
+        );
     }
 
     #[test]

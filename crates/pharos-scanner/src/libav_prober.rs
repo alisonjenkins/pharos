@@ -37,15 +37,18 @@ impl LibavProber {
 
 impl Prober for LibavProber {
     async fn probe(&self, path: &Path) -> DomainResult<ProbeInfo> {
-        self.pool.probe(path.to_path_buf()).await.map_err(|e| match e {
-            // Malformed source — the scanner treats this like ffprobe
-            // exiting non-zero on a bad file.
-            PoolError::Op(_) => DomainError::Backend(format!("libav probe: {e}")),
-            // Worker infra problem (spawn/death) — also a backend error;
-            // the caller may retry the file.
-            PoolError::Spawn(_) | PoolError::Dead(_) => {
-                DomainError::Backend(format!("libav worker: {e}"))
-            }
-        })
+        self.pool
+            .probe(path.to_path_buf())
+            .await
+            .map_err(|e| match e {
+                // Malformed source — the scanner treats this like ffprobe
+                // exiting non-zero on a bad file.
+                PoolError::Op(_) => DomainError::Backend(format!("libav probe: {e}")),
+                // Worker infra problem (spawn/death) — also a backend error;
+                // the caller may retry the file.
+                PoolError::Spawn(_) | PoolError::Dead(_) => {
+                    DomainError::Backend(format!("libav worker: {e}"))
+                }
+            })
     }
 }

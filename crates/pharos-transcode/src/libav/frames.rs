@@ -141,32 +141,39 @@ where
     let mut stop = false;
 
     // Pull every ready frame out of the sink, applying on_frame.
-    let mut drain_sink =
-        |graph: &mut filter::Graph, delivered: &mut usize, stop: &mut bool| -> Result<(), FrameError> {
-            let mut filtered = frame::Video::empty();
-            loop {
-                let mut ctx = match graph.get("out") {
-                    Some(c) => c,
-                    None => return Ok(()),
-                };
-                match ctx.sink().frame(&mut filtered) {
-                    Ok(()) => {
-                        *delivered += 1;
-                        if !on_frame(&filtered)? {
-                            *stop = true;
-                            return Ok(());
-                        }
+    let mut drain_sink = |graph: &mut filter::Graph,
+                          delivered: &mut usize,
+                          stop: &mut bool|
+     -> Result<(), FrameError> {
+        let mut filtered = frame::Video::empty();
+        loop {
+            let mut ctx = match graph.get("out") {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+            match ctx.sink().frame(&mut filtered) {
+                Ok(()) => {
+                    *delivered += 1;
+                    if !on_frame(&filtered)? {
+                        *stop = true;
+                        return Ok(());
                     }
-                    Err(e) if is_eagain(&e) => return Ok(()),
-                    Err(ffmpeg::Error::Eof) => return Ok(()),
-                    Err(e) => return Err(FrameError::Other(format!("sink: {e}"))),
                 }
+                Err(e) if is_eagain(&e) => return Ok(()),
+                Err(ffmpeg::Error::Eof) => return Ok(()),
+                Err(e) => return Err(FrameError::Other(format!("sink: {e}"))),
             }
-        };
+        }
+    };
 
     // Feed decoded frames through the graph.
     let mut decoded = frame::Video::empty();
-    let mut feed = |graph: &mut filter::Graph, dec: &mut ffmpeg::decoder::Video, delivered: &mut usize, stop: &mut bool, decoded: &mut frame::Video| -> Result<(), FrameError> {
+    let mut feed = |graph: &mut filter::Graph,
+                    dec: &mut ffmpeg::decoder::Video,
+                    delivered: &mut usize,
+                    stop: &mut bool,
+                    decoded: &mut frame::Video|
+     -> Result<(), FrameError> {
         loop {
             match dec.receive_frame(decoded) {
                 Ok(()) => {
@@ -197,7 +204,13 @@ where
         decoder
             .send_packet(&packet)
             .map_err(|e| FrameError::Other(format!("send packet: {e}")))?;
-        feed(&mut graph, &mut decoder, &mut delivered, &mut stop, &mut decoded)?;
+        feed(
+            &mut graph,
+            &mut decoder,
+            &mut delivered,
+            &mut stop,
+            &mut decoded,
+        )?;
         if stop {
             break;
         }
@@ -206,7 +219,13 @@ where
     if !stop {
         // Flush decoder, then the filter graph.
         let _ = decoder.send_eof();
-        feed(&mut graph, &mut decoder, &mut delivered, &mut stop, &mut decoded)?;
+        feed(
+            &mut graph,
+            &mut decoder,
+            &mut delivered,
+            &mut stop,
+            &mut decoded,
+        )?;
         if !stop {
             if let Some(mut src) = graph.get("in") {
                 let _ = src.source().flush();

@@ -666,7 +666,10 @@ mod tests {
             }
         }
         assert!(saw_pause, "late joiner should receive Pause");
-        assert!(!saw_play, "late joiner must NOT receive Play during buffer pause");
+        assert!(
+            !saw_play,
+            "late joiner must NOT receive Play during buffer pause"
+        );
     }
 
     #[tokio::test]

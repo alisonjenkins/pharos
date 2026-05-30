@@ -807,10 +807,7 @@ impl SubtitleStreamCtx {
     }
 }
 
-pub fn build_media_streams(
-    probe: &pharos_core::MediaProbe,
-    is_video: bool,
-) -> Vec<MediaStreamDto> {
+pub fn build_media_streams(probe: &pharos_core::MediaProbe, is_video: bool) -> Vec<MediaStreamDto> {
     build_media_streams_with_subtitles(probe, is_video, None)
 }
 

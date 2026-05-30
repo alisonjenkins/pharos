@@ -10,8 +10,8 @@
 //! existing groups before the user joins one.
 
 use crate::api::jellyfin::auth_extractor::AuthUser;
-use pharos_sync::GroupRegistry;
 use actix_web::{web, HttpResponse, Responder};
+use pharos_sync::GroupRegistry;
 use serde::Serialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {

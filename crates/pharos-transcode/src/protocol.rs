@@ -181,8 +181,13 @@ pub enum TinyOp {
 pub enum WorkerCmd {
     Job(JobSpec),
     /// A persistent libav-worker request/reply op (probe, image, …).
-    Tiny { job_id: JobId, op: TinyOp },
-    Cancel { job_id: JobId },
+    Tiny {
+        job_id: JobId,
+        op: TinyOp,
+    },
+    Cancel {
+        job_id: JobId,
+    },
     Shutdown,
 }
 
@@ -378,7 +383,10 @@ mod tests {
         let events = vec![
             WorkerEvent::Hello(Handshake {
                 backend: "spawn-stub".into(),
-                openable_devices: smallvec::smallvec![DeviceId::Cpu, DeviceId::hw(HwAccel::Vaapi, 0)],
+                openable_devices: smallvec::smallvec![
+                    DeviceId::Cpu,
+                    DeviceId::hw(HwAccel::Vaapi, 0)
+                ],
             }),
             WorkerEvent::Accepted { job_id: JobId(1) },
             WorkerEvent::Progress {

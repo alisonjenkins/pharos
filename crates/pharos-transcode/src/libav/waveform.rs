@@ -67,60 +67,52 @@ pub fn waveform_rms(
         *acc_n += 1;
         if *acc_n >= samples_per_bin {
             let rms = (*acc_sq / *acc_n as f64).sqrt();
-            let db = if rms > 0.0 {
-                20.0 * rms.log10()
-            } else {
-                0.0
-            };
+            let db = if rms > 0.0 { 20.0 * rms.log10() } else { 0.0 };
             bins.push(db as f32);
             *acc_sq = 0.0;
             *acc_n = 0;
         }
     };
 
-    let drain_decoder =
-        |decoder: &mut ffmpeg::decoder::Audio,
-         resampler: &mut software::resampling::Context,
-         bins: &mut Vec<f32>,
-         acc_sq: &mut f64,
-         acc_n: &mut u64|
-         -> Result<(), FrameError> {
-            let mut decoded = frame::Audio::empty();
-            loop {
-                if bins.len() >= target_bins as usize {
-                    return Ok(());
-                }
-                match decoder.receive_frame(&mut decoded) {
-                    Ok(()) => {
-                        // Force the frame's channel layout to the native
-                        // mask order the resampler was built with, so
-                        // `swr_convert_frame` doesn't reject it as
-                        // "Input changed" on unspecified-order layouts.
-                        // SAFETY: `decoded` owns a valid AVFrame.
-                        unsafe {
-                            let p = decoded.as_mut_ptr();
-                            ffi::av_channel_layout_uninit(&mut (*p).ch_layout);
-                            ffi::av_channel_layout_default(
-                                &mut (*p).ch_layout,
-                                src_channels as i32,
-                            );
-                        }
-                        let mut mono = frame::Audio::empty();
-                        resampler
-                            .run(&decoded, &mut mono)
-                            .map_err(|e| FrameError::Other(format!("resample: {e}")))?;
-                        let n = mono.samples();
-                        let data: &[f32] = mono.plane(0);
-                        for &s in &data[..n.min(data.len())] {
-                            push_sample(s, bins, acc_sq, acc_n);
-                        }
-                    }
-                    Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(()),
-                    Err(ffmpeg::Error::Eof) => return Ok(()),
-                    Err(e) => return Err(FrameError::Other(format!("decode: {e}"))),
-                }
+    let drain_decoder = |decoder: &mut ffmpeg::decoder::Audio,
+                         resampler: &mut software::resampling::Context,
+                         bins: &mut Vec<f32>,
+                         acc_sq: &mut f64,
+                         acc_n: &mut u64|
+     -> Result<(), FrameError> {
+        let mut decoded = frame::Audio::empty();
+        loop {
+            if bins.len() >= target_bins as usize {
+                return Ok(());
             }
-        };
+            match decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    // Force the frame's channel layout to the native
+                    // mask order the resampler was built with, so
+                    // `swr_convert_frame` doesn't reject it as
+                    // "Input changed" on unspecified-order layouts.
+                    // SAFETY: `decoded` owns a valid AVFrame.
+                    unsafe {
+                        let p = decoded.as_mut_ptr();
+                        ffi::av_channel_layout_uninit(&mut (*p).ch_layout);
+                        ffi::av_channel_layout_default(&mut (*p).ch_layout, src_channels as i32);
+                    }
+                    let mut mono = frame::Audio::empty();
+                    resampler
+                        .run(&decoded, &mut mono)
+                        .map_err(|e| FrameError::Other(format!("resample: {e}")))?;
+                    let n = mono.samples();
+                    let data: &[f32] = mono.plane(0);
+                    for &s in &data[..n.min(data.len())] {
+                        push_sample(s, bins, acc_sq, acc_n);
+                    }
+                }
+                Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(()),
+                Err(ffmpeg::Error::Eof) => return Ok(()),
+                Err(e) => return Err(FrameError::Other(format!("decode: {e}"))),
+            }
+        }
+    };
 
     let packets: Vec<_> = ictx
         .packets()
@@ -135,11 +127,23 @@ pub fn waveform_rms(
         decoder
             .send_packet(&packet)
             .map_err(|e| FrameError::Other(format!("send packet: {e}")))?;
-        drain_decoder(&mut decoder, &mut resampler, &mut bins, &mut acc_sq, &mut acc_n)?;
+        drain_decoder(
+            &mut decoder,
+            &mut resampler,
+            &mut bins,
+            &mut acc_sq,
+            &mut acc_n,
+        )?;
     }
     if bins.len() < target_bins as usize {
         let _ = decoder.send_eof();
-        drain_decoder(&mut decoder, &mut resampler, &mut bins, &mut acc_sq, &mut acc_n)?;
+        drain_decoder(
+            &mut decoder,
+            &mut resampler,
+            &mut bins,
+            &mut acc_sq,
+            &mut acc_n,
+        )?;
     }
 
     bins.resize(target_bins as usize, 0.0);

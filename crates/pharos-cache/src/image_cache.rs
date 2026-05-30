@@ -274,7 +274,13 @@ impl ImageCache {
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
         if let Some(pool) = &self.pool {
             return pool
-                .extract_image(source.to_path_buf(), Some(start_ms), 480, 3, out.to_path_buf())
+                .extract_image(
+                    source.to_path_buf(),
+                    Some(start_ms),
+                    480,
+                    3,
+                    out.to_path_buf(),
+                )
                 .await
                 .map_err(|e| ImageCacheError::Ffmpeg(None, format!("libav: {e}")));
         }

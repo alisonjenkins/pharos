@@ -297,9 +297,8 @@ fn parse_xmltv_time_ms(s: &str) -> Option<u64> {
     // straddles a fixed index returns None instead of panicking on a
     // non-char-boundary slice.
     let b = s.as_bytes();
-    let field = |range: std::ops::Range<usize>| -> Option<&str> {
-        s.get(range).filter(|x| x.is_ascii())
-    };
+    let field =
+        |range: std::ops::Range<usize>| -> Option<&str> { s.get(range).filter(|x| x.is_ascii()) };
     let year: i64 = field(0..4)?.parse().ok()?;
     let month: u32 = field(4..6)?.parse().ok()?;
     let day: u32 = field(6..8)?.parse().ok()?;

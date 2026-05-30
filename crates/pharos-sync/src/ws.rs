@@ -290,7 +290,8 @@ async fn dispatch_client_msg(
         } => {
             // Match the report to the outstanding ping (by T1) and feed a
             // complete NTP sample so RTT/offset are real.
-            if let Some((t1, t2, t3, t4)) = correlate_clock(*clock_pending, client_ms, client_recv_ms)
+            if let Some((t1, t2, t3, t4)) =
+                correlate_clock(*clock_pending, client_ms, client_recv_ms)
             {
                 *clock_pending = None;
                 let _ = group_tx
@@ -392,7 +393,11 @@ mod tests {
         assert_eq!(s, (100, 150, 160, 300));
         let mut c = ClockOffset::default();
         c.observe(s.0, s.1, s.2, s.3);
-        assert_eq!(c.max_rtt_ms(), 190, "RTT must be the real round-trip, not 0");
+        assert_eq!(
+            c.max_rtt_ms(),
+            190,
+            "RTT must be the real round-trip, not 0"
+        );
     }
 
     #[test]

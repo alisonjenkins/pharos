@@ -170,12 +170,19 @@ async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
 
     let detected = detect_available(&exec::ffmpeg_bin()).await;
     let table = build_table(&detected, 2);
-    let sched = TranscodeScheduler::spawn(table, Arc::new(ProcSpawner::new()), SchedConfig::default());
+    let sched =
+        TranscodeScheduler::spawn(table, Arc::new(ProcSpawner::new()), SchedConfig::default());
 
     let opts = tool_opts(&output);
     let t0 = Instant::now();
     let res = sched
-        .submit(input, opts, SinkRequest::FileDirect { out_path: output.clone() })
+        .submit(
+            input,
+            opts,
+            SinkRequest::FileDirect {
+                out_path: output.clone(),
+            },
+        )
         .await;
     let elapsed = t0.elapsed();
     match res {
@@ -299,7 +306,10 @@ async fn bench(input: std::path::PathBuf) -> i32 {
     devices.push(DeviceId::Cpu);
 
     let tmp = std::env::temp_dir();
-    println!("{:<14} {:>10} {:>10} {:>12}", "device", "elapsed", "MB", "MB/s");
+    println!(
+        "{:<14} {:>10} {:>10} {:>12}",
+        "device", "elapsed", "MB", "MB/s"
+    );
     for dev in devices {
         // Single-device table so the job lands exactly there. cpu_permits=0
         // (clamped to 1) keeps a CPU fallback present but best-first picks
@@ -308,16 +318,17 @@ async fn bench(input: std::path::PathBuf) -> i32 {
             DeviceId::Cpu => DeviceTable::from_probe(&[], cpu_permits()),
             hw => DeviceTable::from_probe(&[(hw, 1)], 0),
         };
-        let sched = TranscodeScheduler::spawn(
-            table,
-            Arc::new(ProcSpawner::new()),
-            SchedConfig::default(),
-        );
+        let sched =
+            TranscodeScheduler::spawn(table, Arc::new(ProcSpawner::new()), SchedConfig::default());
         let out = tmp.join(format!("transcode-bench-{dev}.ts"));
         let opts = tool_opts(&out);
         let t0 = Instant::now();
         let res = sched
-            .submit(input.clone(), opts, SinkRequest::FileDirect { out_path: out })
+            .submit(
+                input.clone(),
+                opts,
+                SinkRequest::FileDirect { out_path: out },
+            )
             .await;
         let el = t0.elapsed().as_secs_f64();
         match res {

@@ -277,7 +277,10 @@ impl Worker for ProcWorker {
 
     fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
         Box::pin(async move {
-            if write_frame(&mut self.wr, &WorkerCmd::Job(job)).await.is_err() {
+            if write_frame(&mut self.wr, &WorkerCmd::Job(job))
+                .await
+                .is_err()
+            {
                 return WorkerRunResult::Died;
             }
             loop {
@@ -303,9 +306,7 @@ impl Worker for ProcWorker {
                         WorkerEvent::Done { out_bytes, .. } => {
                             return WorkerRunResult::Done { out_bytes }
                         }
-                        WorkerEvent::Failed { error, .. } => {
-                            return WorkerRunResult::Failed(error)
-                        }
+                        WorkerEvent::Failed { error, .. } => return WorkerRunResult::Failed(error),
                         // Unexpected mid-job Hello or stray tiny-op reply
                         // (those belong to the LibavWorkerPool, not the
                         // segment scheduler) — ignore.

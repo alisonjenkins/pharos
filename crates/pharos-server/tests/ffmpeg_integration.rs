@@ -13,9 +13,9 @@
 //! var isn't set — keeps the suite hermetic against ffmpeg version
 //! drift on the host.
 
+use pharos_cache::ImageCache;
 use pharos_core::{MediaKind, Prober};
 use pharos_scanner::FfmpegProber;
-use pharos_cache::ImageCache;
 use pharos_transcode::{FfmpegTranscoder, TranscodeOptions};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;

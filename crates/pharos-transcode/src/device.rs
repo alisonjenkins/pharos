@@ -291,7 +291,10 @@ mod tests {
     fn cooldown_excludes_device_until_expiry() {
         let mut t = table();
         let now = Instant::now();
-        t.set_cooldown(DeviceId::hw(HwAccel::Nvenc, 0), now + Duration::from_secs(2));
+        t.set_cooldown(
+            DeviceId::hw(HwAccel::Nvenc, 0),
+            now + Duration::from_secs(2),
+        );
         // Mid-cooldown: nvenc gone, vaapi + cpu remain.
         let elig = t.eligible_for(&h264_opts(), now);
         assert_eq!(

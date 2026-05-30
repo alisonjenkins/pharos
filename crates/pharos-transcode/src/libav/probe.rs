@@ -9,11 +9,9 @@
 //! `av_get_pix_fmt_name`) so the strings match ffprobe's output exactly
 //! (codec negotiation + HLS CODECS tokens depend on this parity).
 
-use ffmpeg_the_third as ffmpeg;
 use ffmpeg::ffi;
-use pharos_core::{
-    AudioTrack, MediaChapter, MediaKind, MediaProbe, ProbeInfo, SubtitleTrack,
-};
+use ffmpeg_the_third as ffmpeg;
+use pharos_core::{AudioTrack, MediaChapter, MediaKind, MediaProbe, ProbeInfo, SubtitleTrack};
 use std::ffi::CStr;
 use std::path::Path;
 
@@ -37,8 +35,8 @@ impl std::fmt::Display for ProbeError {
 /// Probe `path` entirely in-process. Blocking.
 pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
     ffmpeg::init().map_err(|e| ProbeError::Other(format!("libav init: {e}")))?;
-    let ictx = ffmpeg::format::input(path)
-        .map_err(|e| ProbeError::BadInput(format!("open: {e}")))?;
+    let ictx =
+        ffmpeg::format::input(path).map_err(|e| ProbeError::BadInput(format!("open: {e}")))?;
 
     // SAFETY: `ictx` owns a valid AVFormatContext for the call's lifetime.
     let fmt = unsafe { &*ictx.as_ptr() };

@@ -8,6 +8,6 @@ pub mod fs;
 pub mod libav_prober;
 
 pub use ffmpeg::{parse_ffprobe_output, FfmpegProber};
+pub use fs::{is_episode_path, parse_series_info, stable_id, FsScanner, DEFAULT_EXTENSIONS};
 #[cfg(feature = "libav-probe")]
 pub use libav_prober::LibavProber;
-pub use fs::{is_episode_path, parse_series_info, stable_id, FsScanner, DEFAULT_EXTENSIONS};

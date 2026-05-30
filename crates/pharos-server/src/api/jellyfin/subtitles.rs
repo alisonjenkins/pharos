@@ -19,8 +19,8 @@
 //! real ffprobe stream indices.
 
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
-use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
+use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
 use pharos_core::MediaStore;
 use tokio::process::Command;
 

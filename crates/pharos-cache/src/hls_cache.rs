@@ -194,7 +194,8 @@ impl HlsSegmentCache {
             self.touch(key).await;
             match tokio::fs::read(&path).await {
                 Ok(b) => return Ok(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */ }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -214,7 +215,8 @@ impl HlsSegmentCache {
             self.touch(key).await;
             match tokio::fs::read(&path).await {
                 Ok(b) => return Ok(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */ }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
+                }
                 Err(e) => return Err(e.into()),
             }
         }

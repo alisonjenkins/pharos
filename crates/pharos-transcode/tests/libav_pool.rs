@@ -6,8 +6,8 @@
 #![cfg(all(unix, feature = "backend-lib"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_transcode::worker::{LibavWorkerPool, PoolError};
 use pharos_transcode::protocol::WorkerError;
+use pharos_transcode::worker::{LibavWorkerPool, PoolError};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -29,10 +29,29 @@ fn ffmpeg_available() -> bool {
 fn synth_fixture(path: &Path) {
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-            "testsrc=duration=2:size=320x240:rate=10", "-f", "lavfi", "-i",
-            "sine=frequency=440:duration=2", "-c:v", "libvpx-vp9", "-deadline", "realtime",
-            "-cpu-used", "8", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-shortest",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=320x240:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-shortest",
         ])
         .arg(path)
         .status()
@@ -67,7 +86,10 @@ async fn pool_probes_and_reuses_worker() {
         .await
         .expect("image");
     let bytes = std::fs::read(&out).unwrap();
-    assert!(bytes.len() > 4 && bytes[0] == 0xFF && bytes[1] == 0xD8, "not a JPEG");
+    assert!(
+        bytes.len() > 4 && bytes[0] == 0xFF && bytes[1] == 0xD8,
+        "not a JPEG"
+    );
 }
 
 #[tokio::test]
@@ -110,8 +132,16 @@ async fn pool_waveform_and_subtitle() {
     let wav = dir.path().join("tone.wav");
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-            "sine=frequency=440:duration=2:sample_rate=8000", "-ac", "1",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2:sample_rate=8000",
+            "-ac",
+            "1",
         ])
         .arg(&wav)
         .status()

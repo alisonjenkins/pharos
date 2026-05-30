@@ -306,7 +306,13 @@ fn handle_tiny(
             quality,
             out_dir,
         } => match libav::trickplay::trickplay_sprite(
-            &input, interval_ms, width, grid, max_sheets, quality, &out_dir,
+            &input,
+            interval_ms,
+            width,
+            grid,
+            max_sheets,
+            quality,
+            &out_dir,
         ) {
             // out_bytes carries the produced sheet count for this op.
             Ok(produced) => WorkerEvent::Done {
@@ -359,7 +365,9 @@ async fn run_tiny(
         wr,
         &WorkerEvent::Failed {
             job_id,
-            error: WorkerError::Other("libav backend not built (build with --features backend-lib)".into()),
+            error: WorkerError::Other(
+                "libav backend not built (build with --features backend-lib)".into(),
+            ),
         },
     )
     .await;

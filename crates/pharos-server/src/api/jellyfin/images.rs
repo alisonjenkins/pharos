@@ -8,8 +8,8 @@
 //! (admin uploads) **do** require an admin bearer (V8/V9).
 
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
-use pharos_cache::image_cache::{ImageCacheError, ImageRole};
 use actix_web::{error, web, HttpRequest, HttpResponse};
+use pharos_cache::image_cache::{ImageCacheError, ImageRole};
 use pharos_core::MediaStore;
 use serde::Deserialize;
 

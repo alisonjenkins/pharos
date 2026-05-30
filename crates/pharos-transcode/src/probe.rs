@@ -53,11 +53,7 @@ pub struct ProbedCaps {
 /// Ramp concurrent attempts per device until a level fails. `attempt`
 /// runs one trial encode on a device and reports success. Returns the
 /// highest concurrency where *every* simultaneous attempt succeeded.
-pub async fn probe_caps<F, Fut>(
-    devices: &[DeviceId],
-    cfg: &ProbeConfig,
-    attempt: F,
-) -> ProbedCaps
+pub async fn probe_caps<F, Fut>(devices: &[DeviceId], cfg: &ProbeConfig, attempt: F) -> ProbedCaps
 where
     F: Fn(DeviceId) -> Fut,
     Fut: Future<Output = bool>,
@@ -115,7 +111,12 @@ async fn futures_join_all<Fut: Future<Output = bool>>(futs: Vec<Fut>) -> Vec<boo
             }
         }
         if all_done {
-            Poll::Ready(pinned.iter_mut().map(|(_, o)| o.take().unwrap_or(false)).collect())
+            Poll::Ready(
+                pinned
+                    .iter_mut()
+                    .map(|(_, o)| o.take().unwrap_or(false))
+                    .collect(),
+            )
         } else {
             Poll::Pending
         }
@@ -181,7 +182,10 @@ fn probe_args(device: DeviceId) -> Vec<String> {
     a.push("-i".into());
     a.push("testsrc=size=128x128:rate=5:duration=1".into());
     match device {
-        DeviceId::Hw { accel: HwAccel::Vaapi, .. } => {
+        DeviceId::Hw {
+            accel: HwAccel::Vaapi,
+            ..
+        } => {
             a.push("-vf".into());
             a.push("format=nv12,hwupload".into());
             a.push("-c:v".into());

@@ -21,8 +21,22 @@ fn synth_fixture(path: &Path, secs: u32) {
     let dur = format!("testsrc=duration={secs}:size=320x240:rate=10");
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &dur, "-c:v",
-            "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &dur,
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-pix_fmt",
+            "yuv420p",
         ])
         .arg(path)
         .status()
@@ -72,7 +86,10 @@ fn extract_image_rejects_garbage() {
     let err = pharos_transcode::libav::image::extract_image(&bad, None, 480, 3, &out)
         .expect_err("should fail");
     assert!(
-        matches!(err, pharos_transcode::libav::frames::FrameError::BadInput(_)),
+        matches!(
+            err,
+            pharos_transcode::libav::frames::FrameError::BadInput(_)
+        ),
         "expected BadInput, got {err:?}"
     );
 }
@@ -89,10 +106,9 @@ fn trickplay_emits_expected_sheets() {
     synth_fixture(&input, 20);
     let out_dir = dir.path().join("sprites");
 
-    let produced = pharos_transcode::libav::trickplay::trickplay_sprite(
-        &input, 1000, 160, 2, 8, 5, &out_dir,
-    )
-    .expect("trickplay ok");
+    let produced =
+        pharos_transcode::libav::trickplay::trickplay_sprite(&input, 1000, 160, 2, 8, 5, &out_dir)
+            .expect("trickplay ok");
 
     assert!(produced >= 1, "produced = {produced}");
     // Each produced sheet exists, is a valid JPEG, 0-based.
@@ -116,8 +132,18 @@ fn waveform_emits_target_bins() {
     // 2s mono 8kHz sine at 0.5 amplitude → known, non-silent level.
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-            "sine=frequency=440:duration=2:sample_rate=8000", "-af", "volume=0.5", "-ac", "1",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2:sample_rate=8000",
+            "-af",
+            "volume=0.5",
+            "-ac",
+            "1",
         ])
         .arg(&wav)
         .status()
@@ -133,12 +159,18 @@ fn waveform_emits_target_bins() {
     let nonzero: Vec<f32> = bins.iter().copied().filter(|b| *b != 0.0).collect();
     assert!(!nonzero.is_empty(), "all silent: {bins:?}");
     for b in &nonzero {
-        assert!(b.is_finite() && (-60.0..0.0).contains(b), "dB out of range: {b} ({bins:?})");
+        assert!(
+            b.is_finite() && (-60.0..0.0).contains(b),
+            "dB out of range: {b} ({bins:?})"
+        );
     }
     // Steady tone → all bins within ~1 dB of each other.
     let min = nonzero.iter().copied().fold(f32::INFINITY, f32::min);
     let max = nonzero.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    assert!((max - min) < 1.0, "tone not steady: {min}..{max} ({bins:?})");
+    assert!(
+        (max - min) < 1.0,
+        "tone not steady: {min}..{max} ({bins:?})"
+    );
 }
 
 /// Minimal JPEG SOF parser → (width, height). Scans for the SOF0/2 marker.

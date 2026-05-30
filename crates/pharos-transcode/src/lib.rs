@@ -17,9 +17,9 @@ pub mod hwaccel;
 #[cfg(unix)]
 pub mod libav;
 pub mod options;
-pub mod protocol;
 #[cfg(unix)]
 pub mod probe;
+pub mod protocol;
 pub mod scheduler;
 #[cfg(unix)]
 pub mod worker;
@@ -104,7 +104,8 @@ impl FfmpegTranscoder {
         opts: &TranscodeOptions,
     ) -> Result<TranscodeStream, TranscodeError> {
         let input_str = input.to_str().ok_or(TranscodeError::NonUtf8Path)?;
-        let args = build_args_for_device(input_str, opts, hwaccel_to_device(self.hwaccel), "pipe:1");
+        let args =
+            build_args_for_device(input_str, opts, hwaccel_to_device(self.hwaccel), "pipe:1");
         let mut cmd = Command::new(&self.ffmpeg_bin);
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
@@ -308,7 +309,13 @@ fn build_args_for_device(
                     escape_subtitles_filename(input)
                 ));
             }
-            let is_vaapi = matches!(device, DeviceId::Hw { accel: HwAccel::Vaapi, .. });
+            let is_vaapi = matches!(
+                device,
+                DeviceId::Hw {
+                    accel: HwAccel::Vaapi,
+                    ..
+                }
+            );
             if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
                 // VAAPI: upload frames to the GPU, then encode. The
                 // upload filter chains after any software filters.
@@ -344,7 +351,13 @@ fn build_args_for_device(
                 a.push("-c:v".into());
                 a.push(encoder.into());
                 // NVENC GPU ordinal selection on a multi-GPU box.
-                if matches!(device, DeviceId::Hw { accel: HwAccel::Nvenc, .. }) {
+                if matches!(
+                    device,
+                    DeviceId::Hw {
+                        accel: HwAccel::Nvenc,
+                        ..
+                    }
+                ) {
                     if let Some(idx) = device.index() {
                         a.push("-gpu".into());
                         a.push(idx.to_string());
@@ -507,9 +520,15 @@ mod tests {
             escape_subtitles_filename("/m/[Grp] T [1080p].mkv"),
             "'/m/[Grp] T [1080p].mkv'"
         );
-        assert_eq!(escape_subtitles_filename("/m/a;b,c:d.mkv"), "'/m/a;b,c:d.mkv'");
+        assert_eq!(
+            escape_subtitles_filename("/m/a;b,c:d.mkv"),
+            "'/m/a;b,c:d.mkv'"
+        );
         // Embedded single quote → ffmpeg `'\''` sequence.
-        assert_eq!(escape_subtitles_filename("/m/it's.mkv"), "'/m/it'\\''s.mkv'");
+        assert_eq!(
+            escape_subtitles_filename("/m/it's.mkv"),
+            "'/m/it'\\''s.mkv'"
+        );
         // Backslash doubled.
         assert_eq!(escape_subtitles_filename("a\\b"), "'a\\\\b'");
     }
@@ -543,7 +562,10 @@ mod tests {
         let o = opts(); // H264
         let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Vaapi, 1), "out.ts");
         let joined = a.join(" ");
-        assert!(joined.contains("-vaapi_device /dev/dri/renderD129"), "{joined}");
+        assert!(
+            joined.contains("-vaapi_device /dev/dri/renderD129"),
+            "{joined}"
+        );
         assert!(joined.contains("format=nv12,hwupload"), "{joined}");
         assert!(joined.contains("-c:v h264_vaapi"), "{joined}");
     }

@@ -213,10 +213,14 @@ pub fn codec_profile_passes(
                     source_audio_channels.map(|n| n as i64),
                     &cond.value,
                 ),
-                "Width" => compare_numeric(&cond.condition, source.width.map(|n| n as i64), &cond.value),
-                "Height" => {
-                    compare_numeric(&cond.condition, source.height.map(|n| n as i64), &cond.value)
+                "Width" => {
+                    compare_numeric(&cond.condition, source.width.map(|n| n as i64), &cond.value)
                 }
+                "Height" => compare_numeric(
+                    &cond.condition,
+                    source.height.map(|n| n as i64),
+                    &cond.value,
+                ),
                 "VideoProfile" => compare_string(
                     &cond.condition,
                     source_video_profile,
@@ -436,9 +440,17 @@ mod tests {
             Some("high|main|baseline")
         ));
         assert!(compare_string("EqualsAny", Some("MAIN"), Some("high|main")));
-        assert!(!compare_string("EqualsAny", Some("high10"), Some("high|main")));
+        assert!(!compare_string(
+            "EqualsAny",
+            Some("high10"),
+            Some("high|main")
+        ));
         // A comma value is a single token (not a delimiter) — no false match.
-        assert!(!compare_string("EqualsAny", Some("high"), Some("high,main")));
+        assert!(!compare_string(
+            "EqualsAny",
+            Some("high"),
+            Some("high,main")
+        ));
     }
 
     #[test]

@@ -162,7 +162,10 @@ async fn worker_streams_live_to_stdout() {
         sink: OutputSink::Stdout,
     };
 
-    let mut stream = spawner.spawn_streaming(spec).await.expect("spawn streaming");
+    let mut stream = spawner
+        .spawn_streaming(spec)
+        .await
+        .expect("spawn streaming");
     let mut total = 0usize;
     let mut first_byte = None;
     loop {

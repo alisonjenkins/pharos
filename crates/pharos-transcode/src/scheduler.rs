@@ -46,7 +46,9 @@ pub type LiveByteStream = Pin<Box<dyn futures_core::Stream<Item = std::io::Resul
 /// Terminal result of one worker running one job.
 #[derive(Debug)]
 pub enum WorkerRunResult {
-    Done { out_bytes: u64 },
+    Done {
+        out_bytes: u64,
+    },
     Failed(WorkerError),
     /// The worker process vanished mid-job (segfault / closed pipe /
     /// heartbeat timeout). The `Box<dyn Worker>` is unusable and dropped.
@@ -759,16 +761,13 @@ mod tests {
     }
 
     impl WorkerSpawner for ScriptedSpawner {
-        fn spawn(
-            &self,
-            id: WorkerId,
-        ) -> SpawnFuture {
+        fn spawn(&self, id: WorkerId) -> SpawnFuture {
             self.spawned.fetch_add(1, Ordering::SeqCst);
             let f = self.f.clone();
             let delay = self.delay;
-            Box::pin(async move {
-                Ok(Box::new(ScriptedWorker { id, f, delay }) as Box<dyn Worker>)
-            })
+            Box::pin(
+                async move { Ok(Box::new(ScriptedWorker { id, f, delay }) as Box<dyn Worker>) },
+            )
         }
     }
 
@@ -807,10 +806,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_completes_on_best_device() {
-        let (spawner, _) =
-            ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done { out_bytes: 42 });
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 42,
+        });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
-        let done = s.submit(PathBuf::from("/m/x"), h264(), file_sink()).await.unwrap();
+        let done = s
+            .submit(PathBuf::from("/m/x"), h264(), file_sink())
+            .await
+            .unwrap();
         assert_eq!(done.device, DeviceId::hw(HwAccel::Nvenc, 0)); // best-first
         assert_eq!(done.out_bytes, 42);
     }
@@ -823,19 +826,24 @@ mod tests {
         // CPU always supports, so Unsupported only happens if eligible is
         // empty. With Vp9 → CPU still supports. There is no real
         // "unsupported" with CPU present; assert Vp9 lands on CPU instead.
-        let (spawner, _) =
-            ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done { out_bytes: 1 });
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let mut o = h264();
         o.video = Some(VideoCodec::Vp9);
-        let done = s.submit(PathBuf::from("/m/x"), o, file_sink()).await.unwrap();
+        let done = s
+            .submit(PathBuf::from("/m/x"), o, file_sink())
+            .await
+            .unwrap();
         assert_eq!(done.device, DeviceId::Cpu);
     }
 
     #[tokio::test]
     async fn live_stream_unsupported_for_now() {
-        let (spawner, _) =
-            ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done { out_bytes: 1 });
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let r = s
             .submit(PathBuf::from("/m/x"), h264(), SinkRequest::LiveStream)
@@ -872,7 +880,10 @@ mod tests {
                 Err(e) => panic!("unexpected {e:?}"),
             }
         }
-        assert!(busy >= 1, "expected at least one Busy under saturation, ok={ok} busy={busy}");
+        assert!(
+            busy >= 1,
+            "expected at least one Busy under saturation, ok={ok} busy={busy}"
+        );
     }
 
     #[tokio::test]
@@ -912,7 +923,10 @@ mod tests {
             }
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
-        let done = s.submit(PathBuf::from("/m/x"), h264(), file_sink()).await.unwrap();
+        let done = s
+            .submit(PathBuf::from("/m/x"), h264(), file_sink())
+            .await
+            .unwrap();
         assert_ne!(done.device, DeviceId::hw(HwAccel::Nvenc, 0));
         assert_eq!(done.out_bytes, 7);
     }
@@ -943,10 +957,16 @@ mod tests {
             }
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
-        let done = s.submit(PathBuf::from("/m/x"), h264(), file_sink()).await.unwrap();
+        let done = s
+            .submit(PathBuf::from("/m/x"), h264(), file_sink())
+            .await
+            .unwrap();
         assert_eq!(done.out_bytes, 9);
         // A second job still works → scheduler alive after a worker death.
-        let done2 = s.submit(PathBuf::from("/m/y"), h264(), file_sink()).await.unwrap();
+        let done2 = s
+            .submit(PathBuf::from("/m/y"), h264(), file_sink())
+            .await
+            .unwrap();
         assert_eq!(done2.out_bytes, 9);
         // At least two spawns happened (the dead one + a replacement).
         assert!(spawned.load(Ordering::SeqCst) >= 2);
@@ -1008,8 +1028,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_reports_capacity() {
-        let (spawner, _) =
-            ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done { out_bytes: 1 });
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let snap = s.snapshot().await.unwrap();
         // 2 hw + cpu.
