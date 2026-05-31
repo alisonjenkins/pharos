@@ -52,10 +52,11 @@ xxhash-rust.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
-# P48 — ffmpeg backend selection. Mutually exclusive — pick one.
-# Default mirrors pharos-transcode's default (spawn). Flip to
-# `ffmpeg-lib` once P49-P51 ship the library implementations.
-default = ["ffmpeg-spawn"]
+# P48 — ffmpeg backend selection. Mutually exclusive — pick one. Default is
+# the in-process libav backend (the hybrid: libav tiny-op worker pool +
+# spawn for video-segment/live transcode). `--no-default-features --features
+# ffmpeg-spawn` builds the pure-spawn backend.
+default = ["ffmpeg-lib"]
 ffmpeg-spawn = ["pharos-transcode/backend-spawn", "pharos-cache/ffmpeg-spawn"]
 ffmpeg-lib = [
     "pharos-transcode/backend-lib",

@@ -30,10 +30,12 @@ ffmpeg-the-third = { version = "5", optional = true }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
-default = ["backend-spawn"]
-# P48 — current behaviour: tokio::process::Command spawning a real
-# ffmpeg binary on PATH. Crash-isolated (V6); pays ~30-100ms/spawn
-# on macOS dyld + fork.
+# Default is the in-process libav (FFI) backend — the hybrid: tiny ops run
+# in-process via the worker pool; video-segment/live transcode still spawns
+# ffmpeg. `--no-default-features --features backend-spawn` for pure spawn.
+default = ["backend-lib"]
+# P48 — tokio::process::Command spawning a real ffmpeg binary on PATH.
+# Crash-isolated (V6); pays ~30-100ms/spawn on macOS dyld + fork.
 backend-spawn = []
 # P48 — FFI backend via ffmpeg-next. Hot-path operations (HLS
 # segment generation, trickplay tile burn) avoid the spawn cost
