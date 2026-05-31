@@ -46,16 +46,23 @@ Dioxus UI lives in `crates/pharos-ui` and compiles to WASM via the
 ## Transcode / ffmpeg backends (P48)
 
 Two interchangeable ffmpeg backends, selected by Cargo feature:
-- **`ffmpeg-spawn`** (default) — forks the `ffmpeg`/`ffprobe` binaries.
-- **`ffmpeg-lib`** — runs the high-frequency "tiny ops" (probe, image
-  extract, trickplay tiles, srt→webvtt, waveform) **in-process** via
+- **`ffmpeg-lib`** (default) — runs the high-frequency "tiny ops" (probe,
+  image extract, trickplay tiles, srt→webvtt, waveform) **in-process** via
   `ffmpeg-the-third` (libav), serviced by a persistent, crash-isolated
   `transcode-worker` pool (`pharos-transcode::worker::LibavWorkerPool`).
   Video-segment / live transcode **always** stays on the spawn worker
   (encode time dwarfs fork/exec; the scheduler already load-balances every
-  GPU + CPU). A libav fault kills only a worker, never the server (V6).
-  Build/test it with `--no-default-features --features
-  backend-lib`/`ffmpeg-lib`; the server feature is `ffmpeg-lib`.
+  GPU + CPU). A libav fault kills only a worker, never the server (V6). This
+  is the hybrid the deployment runs.
+- **`ffmpeg-spawn`** — forks the `ffmpeg`/`ffprobe` binaries. Build it with
+  `--no-default-features --features backend-spawn`/`ffmpeg-spawn`.
+
+Because libav is the default, the FFI crate (`ffmpeg-the-third`) builds by
+default and needs the libav headers + bindgen — the devShell exports
+`LIBCLANG_PATH` + ffmpeg dev libs, so plain `cargo`/`nextest` work. The
+`.#oci` image builds the server + worker via **`buildRustPackage`** (cargo),
+NOT crate2nix: the pinned nixpkgs `buildRustCrate` mishandles the crate's
+modern `cargo::`-syntax version cfgs and compiles the wrong libav API.
 
 **Pixel formats are encoder-specific — always set them explicitly:**
 - mjpeg (posters / thumbs / trickplay) needs full-range `yuvj420p`; the

@@ -60,31 +60,51 @@
           doCheck = false;
         };
 
-        # crate2nix's per-crate package set. `Cargo.nix` is generated
-        # by running `crate2nix generate` at the workspace root (see
-        # the `just regen-cargo-nix` recipe). The generated file
-        # exposes a `buildRustCrateForPkgs` builder per workspace
-        # member + per dep in Cargo.lock — each dep is its own nix
-        # derivation, cached in /nix/store and shared across any
-        # project that resolves the same crate+version.
-        cargoNix = import ./Cargo.nix {
-          inherit pkgs;
-          buildRustCrateForPkgs = pkgs: pkgs.buildRustCrate.override {
-            rustc = rustToolchain;
-            cargo = rustToolchain;
-          };
+
+        # Source for the cargo-based binary build (exclude build outputs).
+        repoSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: _type:
+            let rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+            in !(pkgs.lib.hasPrefix "target" rel
+                  || pkgs.lib.hasPrefix "result" rel
+                  || pkgs.lib.hasPrefix ".git" rel);
         };
 
-        pharos = cargoNix.workspaceMembers."pharos-server".build;
-
-        # The out-of-process transcode worker (crash-isolated HLS/segment
-        # encoder + libav tiny-op pool). Same build graph as the server.
+        # The server + the out-of-process transcode worker (crash-isolated
+        # HLS/segment encoder + libav tiny-op pool), built together with the
+        # default ffmpeg backend (now libav/ffmpeg-lib — the hybrid).
+        #
+        # Built via cargo (buildRustPackage) rather than crate2nix: the libav
+        # FFI crate (ffmpeg-the-third) emits its API-version cfgs through a
+        # build script in the modern `cargo::` form + a large cfg set that the
+        # pinned nixpkgs `buildRustCrate` mis-handles, so crate2nix compiled
+        # the pre-5.1 libswresample API and failed against ffmpeg 8.1. Real
+        # cargo applies the build-script cfgs correctly. pkg-config + the
+        # ffmpeg dev libs + bindgenHook mirror the devShell's backend-lib env.
+        pharosBins =
+          (pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          }).buildRustPackage {
+            pname = "pharos";
+            version = "0.0.0";
+            src = repoSrc;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+            # Only the two server-side binaries; the wasm UI crate is built
+            # separately by `dx` (pharosUiBundle).
+            cargoBuildFlags = [ "-p" "pharos-server" "-p" "pharos-transcode" ];
+            doCheck = false;
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+            buildInputs = [ pkgs.ffmpeg-headless.dev ];
+          };
+        pharos = pharosBins;
         # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
-        # so the scheduler uses the worker pool instead of the inline-ffmpeg
-        # fallback (the two binaries live in distinct store paths, so the
-        # server's sibling-of-exe discovery can't find it — the env var is
-        # the explicit first-choice lookup in worker/proc.rs).
-        transcodeWorker = cargoNix.workspaceMembers."pharos-transcode".build;
+        # (the two binaries share one store path here, but the env var is the
+        # explicit first-choice lookup in worker/proc.rs regardless).
+        transcodeWorker = pharosBins;
 
         # ─── Creative-Commons test media ──────────────────────────
         # Pinned URLs + sha256 so the corpus is bit-identical across
