@@ -1,0 +1,50 @@
+{{- if and (eq (include "pharos.usesSqlite" .) "true") .Values.persistence.db.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pharos.fullname" . }}-db
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.persistence.db.accessMode | quote }}]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.db.size | quote }}
+  {{- if .Values.persistence.db.storageClass }}
+  storageClassName: {{ .Values.persistence.db.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{- if .Values.persistence.cache.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pharos.fullname" . }}-cache
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.persistence.cache.accessMode | quote }}]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.cache.size | quote }}
+  {{- if .Values.persistence.cache.storageClass }}
+  storageClassName: {{ .Values.persistence.cache.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{- if eq .Values.persistence.media.type "pvc" }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pharos.fullname" . }}-media
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.persistence.media.pvc.accessMode | quote }}]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.media.pvc.size | quote }}
+  {{- if .Values.persistence.media.pvc.storageClass }}
+  storageClassName: {{ .Values.persistence.media.pvc.storageClass | quote }}
+  {{- end }}
+{{- end }}

@@ -98,7 +98,7 @@ mod tests {
 
     #[actix_web::test]
     async fn middleware_records_counter_and_histogram() {
-        let _ = crate::obs::init("info");
+        let _ = crate::obs::init("info", None);
         let app = test::init_service(App::new().wrap(RedMetrics).route(
             "/ping",
             web::get().to(|| async { HttpResponse::Ok().body("pong") }),
@@ -129,7 +129,7 @@ mod tests {
 
     #[actix_web::test]
     async fn middleware_labels_use_route_pattern_not_concrete_uri() {
-        let _ = crate::obs::init("info");
+        let _ = crate::obs::init("info", None);
         let app = test::init_service(App::new().wrap(RedMetrics).route(
             "/Items/{id}",
             web::get().to(|| async { HttpResponse::Ok().finish() }),

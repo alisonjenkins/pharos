@@ -158,7 +158,7 @@ async fn full_login_then_me_with_token_returns_user() {
 async fn router_mounts_jellyfin_scope_alongside_metrics_and_health() {
     // Sanity: the master router boots and serves Jellyfin endpoints next to
     // /metrics, /healthz, etc.
-    let _ = pharos_server::obs::init("info");
+    let _ = pharos_server::obs::init("info", None);
     let state = seed_state().await;
     let readiness = pharos_server::health::ReadinessHandle::spawn(&["process"]);
     readiness.mark("process").await.unwrap();

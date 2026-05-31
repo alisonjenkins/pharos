@@ -64,7 +64,7 @@ async fn reconcile_libraries(
 async fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
     let cfg = Config::from_path(&cli.config)?.apply_env();
-    obs::init(&cfg.obs.log_level)?;
+    obs::init(&cfg.obs.log_level, cfg.obs.otlp_endpoint.as_deref())?;
 
     match cli.cmd {
         Cmd::Serve => serve(cfg).await?,

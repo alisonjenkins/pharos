@@ -1,0 +1,23 @@
+# Declarative local-dev cluster for `just kind-up` / `just tilt-up`.
+#
+# ctlptl (tilt-dev) creates a local OCI registry + a kind cluster wired to it:
+# the kind node's containerd is configured to resolve the registry, and the
+# cluster is annotated with a `local-registry-hosting` ConfigMap that Tilt
+# auto-detects — so `tilt up` pushes built images to this registry and the node
+# pulls them from it (no `kind load`, no docker.io). Apply is idempotent:
+#
+#   ctlptl apply  -f ctlptl-cluster.yaml   # create / reconcile
+#   ctlptl delete -f ctlptl-cluster.yaml   # tear down cluster + registry
+#
+# `name: kind-pharos` is the kube context (kind cluster "pharos"); it matches
+# KIND_CLUSTER in the justfile and allow_k8s_contexts() in the Tiltfile.
+apiVersion: ctlptl.dev/v1alpha1
+kind: Registry
+name: pharos-registry
+port: 5005
+---
+apiVersion: ctlptl.dev/v1alpha1
+kind: Cluster
+product: kind
+name: kind-pharos
+registry: pharos-registry

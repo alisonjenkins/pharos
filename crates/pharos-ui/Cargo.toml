@@ -18,6 +18,7 @@ web = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
+    "dep:getrandom",
 ]
 
 [[bin]]
@@ -47,17 +48,23 @@ web-sys = { version = "0.3", optional = true, features = [
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
+# wasm32 has no default getrandom backend; dioxus 0.7's dep graph pulls
+# getrandom 0.2 transitively, so force its `js` feature for the web build.
+getrandom = { version = "0.2", features = ["js"], optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
-workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+# NOTE: pharos-ui deliberately does NOT depend on workspace-hack — it builds
+# for wasm32 and the hack pulls the native-only stack (sqlx/tokio/mio). It is
+# listed under [final-excludes] in .config/hakari.toml so CI's hakari-check
+# does not try to re-add the dependency.
 
 [dev-dependencies]
 # T51 phase 1: dioxus-ssr renders components to HTML strings inside
 # `#[test]`s so we can assert structural landmarks (input #ids,
 # button text, expected error branches) without a browser. Lives at
 # the same major version as the main `dioxus` workspace dep.
-dioxus-ssr = "0.6"
+dioxus-ssr = "0.7"
 
 [lints]
 workspace = true

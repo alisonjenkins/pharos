@@ -5,7 +5,7 @@ use pharos_server::{config::Config, obs, router};
 
 #[actix_web::test]
 async fn server_boots_and_serves_root() {
-    let _ = obs::init("info");
+    let _ = obs::init("info", None);
     let app = actix_web::test::init_service(App::new().configure(router::configure)).await;
     let req = actix_web::test::TestRequest::get().uri("/").to_request();
     let resp = actix_web::test::call_service(&app, req).await;
@@ -14,7 +14,7 @@ async fn server_boots_and_serves_root() {
 
 #[actix_web::test]
 async fn metrics_endpoint_serves() {
-    let _ = obs::init("info");
+    let _ = obs::init("info", None);
     let app = actix_web::test::init_service(App::new().configure(router::configure)).await;
     let req = actix_web::test::TestRequest::get()
         .uri("/metrics")

@@ -1,0 +1,58 @@
+{{- if .Values.pharosUi.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pharos.fullname" . }}-pharos-ui
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pharos-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pharos.pharosUi.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pharos.pharosUi.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: pharos-ui
+          image: "{{ .Values.pharosUi.image.repository }}:{{ .Values.pharosUi.image.tag }}"
+          imagePullPolicy: {{ .Values.pharosUi.image.pullPolicy }}
+          # angie serves the Dioxus WASM bundle under /ui/ and reverse-
+          # proxies the REST API to pharos, so the SPA talks to pharos
+          # same-origin.
+          env:
+            - name: PHAROS_URL
+              value: "http://{{ include "pharos.fullname" . }}:{{ .Values.service.port }}"
+          ports:
+            - name: http
+              containerPort: 8098
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pharos.fullname" . }}-pharos-ui
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pharos-ui
+spec:
+  type: {{ .Values.pharosUi.service.type }}
+  selector:
+    {{- include "pharos.pharosUi.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.pharosUi.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

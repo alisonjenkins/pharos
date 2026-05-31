@@ -23,5 +23,13 @@ platforms = [
     "x86_64-apple-darwin",
 ]
 
+# pharos-ui builds for wasm (the `pharos-ui-web` bin). workspace-hack pulls
+# the whole native stack (sqlx → tokio → mio), which cannot compile for
+# wasm32, so the UI crate must not depend on the hack. final-excludes both
+# drops it from the unified set AND stops `manage-deps` from re-adding the
+# workspace-hack dependency to it (keeping `hakari-check` green in CI).
+[final-excludes]
+workspace-members = ["pharos-ui"]
+
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true

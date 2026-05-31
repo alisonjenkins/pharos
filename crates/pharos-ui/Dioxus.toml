@@ -2,16 +2,24 @@
 name = "pharos-ui"
 
 [web.app]
-title = "pharos"
+# title lives in index.html (setting it here too double-renders it).
 default_platform = "web"
+# Served under /ui/ (matches the pharos server's own ui_dir mount and keeps
+# the SPA's assets from colliding with the reverse-proxied REST API when the
+# angie UI pod fronts pharos). dx rewrites the injected js/wasm URLs to /ui/.
+base_path = "ui"
 
 [web.watcher]
 reload_html = true
 watch_path = ["src", "index.html", "assets"]
 
 [web.resource]
-style = ["/assets/pharos.css"]
+# Stylesheet is linked directly in index.html (relative, so it resolves
+# under the /ui/ base); listing it here too would double-inject the link.
+style = []
 script = []
+# dev-only resources (required field; empty in release).
+dev = []
 
 [bundle.web]
 out_dir = "target/dx/pharos-ui/release/web"

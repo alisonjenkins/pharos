@@ -771,7 +771,9 @@ fn server_picker_renders_empty_state_with_status() {
     assert!(html.contains("No saved servers"), "{html}");
     assert!(html.contains("pharos-server-picker-status"), "{html}");
     assert!(
-        html.contains("Couldn&#x27;t reach") || html.contains("Couldn't reach"),
+        html.contains("Couldn&#x27;t reach")
+            || html.contains("Couldn&#39;t reach")
+            || html.contains("Couldn't reach"),
         "{html}"
     );
     assert!(html.contains(r#"value="https://pharos.local""#), "{html}");
@@ -1156,7 +1158,9 @@ fn live_tv_view_renders_channel_grid_with_epg_and_logo() {
     // EPG entry rendered + HH:MM time extracted.
     assert!(html.contains("18:00"), "{html}");
     assert!(
-        html.contains("Six O&#x27;Clock News") || html.contains("Six O'Clock News"),
+        html.contains("Six O&#x27;Clock News")
+            || html.contains("Six O&#39;Clock News")
+            || html.contains("Six O'Clock News"),
         "{html}"
     );
     // Logo substitution: c1 has logo → has rendered <img> with /Primary path,

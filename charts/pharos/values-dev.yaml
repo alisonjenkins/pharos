@@ -1,0 +1,67 @@
+# Tilt / local-kind dev overrides. Ephemeral storage, UI on, no ingress.
+# Images are built by nix, pushed to the ctlptl-managed local registry, and
+# pulled by the kind node from there (Tilt rewrites the refs). Media is
+# populated in-pod by a `mediaSeed` initContainer (the nix CC test-media
+# image); the running server's poll tier then indexes it (~30s after boot).
+
+image:
+  repository: pharos
+  tag: latest
+  # Tilt pushes a unique per-build tag to the local registry; pull it once.
+  pullPolicy: IfNotPresent
+
+# Ephemeral — kind throwaway cluster, no PVC churn.
+persistence:
+  db:
+    enabled: false        # emptyDir
+    # kind's node fs is overlayfs; SQLite locking needs tmpfs here.
+    medium: Memory
+  cache:
+    enabled: false        # emptyDir
+  media:
+    type: emptyDir
+    readOnly: false       # mediaSeed initContainer writes the corpus in
+
+# Populate media from the nix CC test-media image, then scan, before serve.
+mediaSeed:
+  enabled: true
+  image:
+    repository: pharos-test-media
+    tag: latest
+    pullPolicy: IfNotPresent
+  mountPath: /media
+
+scan:
+  # The cold one-shot `scan` process can't establish its sqlite pool under
+  # kind's containerd runtime (works on a real cluster / locally). The running
+  # server's poll tier populates the library instead — its pool is already warm
+  # from the /readyz store probe. See docs/kubernetes.md "kind dev caveat".
+  initContainer: false
+
+config:
+  server:
+    name: "pharos-dev"
+    # Server poll tier does the indexing on kind; first scan after one tick.
+    libraryPollIntervalSecs: 30
+  obs:
+    logLevel: "debug"
+    # Export spans to the in-cluster Tempo (deploy/obs-dev.yaml) over OTLP/gRPC.
+    otlpEndpoint: "http://tempo:4317"
+
+jellyfinWeb:
+  enabled: true
+pharosUi:
+  enabled: true
+
+ingress:
+  enabled: false
+serviceMonitor:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi

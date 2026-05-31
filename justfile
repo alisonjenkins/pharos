@@ -194,3 +194,37 @@ diagrams:
       echo "no docs/*.d2 sources found"
       exit 1
     fi
+
+# ── Kubernetes / Tilt (charts/pharos + Tiltfile) ──────────────────
+# ctlptl/kind/tilt/helm/kubectl come from the nix devShell. ctlptl-cluster.yaml
+# declares a kind cluster wired to a local OCI registry; nix builds the images,
+# Tilt pushes them to the registry, the node pulls from it (no docker.io).
+KIND_CLUSTER := "pharos"
+
+# Stand up the kind cluster + local registry (idempotent; no Tilt). Run this
+# on its own to (re)create the dev cluster; `tilt-up` calls it for you.
+kind-up:
+    nix develop --command ctlptl apply -f ctlptl-cluster.yaml
+
+# Create the kind cluster + registry (if absent), then start the Tilt loop.
+tilt-up: kind-up
+    nix develop --command bash -c 'kubectl config use-context "kind-{{KIND_CLUSTER}}" && tilt up'
+
+# Stop Tilt (tears down the deployed resources). Pass `delete=1` to also
+# delete the kind cluster *and* its local registry.
+tilt-down delete="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nix develop --command tilt down || true
+    if [ "{{delete}}" = "1" ]; then
+      nix develop --command ctlptl delete -f ctlptl-cluster.yaml || true
+    fi
+
+# Lint the Helm chart.
+helm-lint:
+    nix develop --command helm lint charts/pharos
+
+# Render the chart to stdout (override values with `args`, e.g.
+# `just helm-template '--set ui.enabled=false'`).
+helm-template *args:
+    nix develop --command helm template pharos charts/pharos {{args}}
