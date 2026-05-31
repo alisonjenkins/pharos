@@ -43,6 +43,12 @@ config:
     name: "pharos-dev"
     # Server poll tier does the indexing on kind; first scan after one tick.
     libraryPollIntervalSecs: 30
+    # The CC test clips are ~10s. The production defaults (poster seek at 30s,
+    # trickplay tile every 10s) fall past/at EOF on them → empty posters +
+    # single-tile trickplay. Shrink both so the short clips produce real
+    # artwork + a multi-tile trickplay strip for testing.
+    imageSeekSeconds: 3
+    trickplayIntervalMs: 1000
   obs:
     logLevel: "debug"
     # Export spans to the in-cluster Tempo (deploy/obs-dev.yaml) over OTLP/gRPC.
