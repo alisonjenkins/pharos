@@ -297,10 +297,15 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                 }
             }
             Ok(Event::Text(t)) => {
-                let text = match t.unescape() {
-                    Ok(c) => c.trim().to_string(),
-                    Err(_) => continue, // tolerate a bad entity in one node
+                // quick-xml 0.41 split the old `BytesText::unescape` into two
+                // steps: `decode` (charset → str) then `escape::unescape`
+                // (resolve XML entities). Tolerate a bad entity/encoding in
+                // one node by skipping it.
+                let Ok(decoded) = t.decode() else { continue };
+                let Ok(unescaped) = quick_xml::escape::unescape(&decoded) else {
+                    continue;
                 };
+                let text = unescaped.trim().to_string();
                 if text.is_empty() {
                     continue;
                 }
@@ -625,8 +630,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.local_name().as_ref().eq_ignore_ascii_case(key) {
+            // quick-xml 0.41 deprecated `unescape_value` in favour of
+            // `normalized_value`, which decodes + resolves predefined
+            // entities + normalizes per the XML spec. NFO sidecars have no
+            // (or a 1.0) XML declaration → the spec-assumed 1.0 rules.
             return a
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .ok()
                 .map(|c| c.trim().to_string())
                 .filter(|s| !s.is_empty());
