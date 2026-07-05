@@ -2082,15 +2082,21 @@ impl UserStore for PostgresStore {
 impl TokenStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(user.id = %user_id, device = %device_id))]
     async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
+        // The raw token is returned to the client but never stored — only
+        // its SHA-256 hash is persisted (a DB leak must not yield usable
+        // tokens). `expires_at` bounds the token's lifetime.
         let token = Uuid::new_v4().simple().to_string();
+        let now = now_unix_secs();
         let user_bytes = user_id.0.as_bytes().to_vec();
         sqlx::query(
-            "INSERT INTO auth_tokens (token, user_id, device_id, created_at) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
-        .bind(&token)
+        .bind(crate::auth_token::hash(&token))
         .bind(user_bytes)
         .bind(device_id)
-        .bind(now_unix_secs())
+        .bind(now)
+        .bind(now + crate::auth_token::TTL_SECS)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -2099,12 +2105,16 @@ impl TokenStore for PostgresStore {
 
     #[tracing::instrument(skip(self, token))]
     async fn resolve(&self, token: &str) -> AuthResult<UserId> {
-        let row: Option<(Vec<u8>,)> =
-            sqlx::query_as("SELECT user_id FROM auth_tokens WHERE token = $1")
-                .bind(token)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        // Look up by hash and reject expired tokens (expires_at NULL = never).
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT user_id FROM auth_tokens \
+             WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > $2)",
+        )
+        .bind(crate::auth_token::hash(token))
+        .bind(now_unix_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         let (bytes,) = row.ok_or(AuthError::InvalidToken)?;
         let uuid =
             Uuid::from_slice(&bytes).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
@@ -2113,8 +2123,8 @@ impl TokenStore for PostgresStore {
 
     #[tracing::instrument(skip(self, token))]
     async fn revoke(&self, token: &str) -> AuthResult<()> {
-        sqlx::query("DELETE FROM auth_tokens WHERE token = $1")
-            .bind(token)
+        sqlx::query("DELETE FROM auth_tokens WHERE token_hash = $1")
+            .bind(crate::auth_token::hash(token))
             .execute(&self.pool)
             .await
             .map_err(map_sqlx)?;
