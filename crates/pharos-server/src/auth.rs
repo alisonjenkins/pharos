@@ -6,7 +6,18 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use pharos_core::{AuthBackend, AuthError, AuthResult, SecretString, User, UserStore};
+use pharos_core::{
+    AuthBackend, AuthError, AuthResult, SecretString, User, UserId, UserPolicy, UserRecord,
+    UserStore,
+};
+
+/// Result of [`BuiltinAuth::create_user`] — distinguishes a fresh create
+/// from an idempotent no-op so the caller can report accurately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateUserOutcome {
+    Created,
+    AlreadyExists,
+}
 
 pub struct BuiltinAuth<U: UserStore> {
     users: U,
@@ -39,6 +50,31 @@ impl<U: UserStore> BuiltinAuth<U> {
             .map_err(|e| AuthError::Backend(format!("hash: {e}")))?
             .to_string();
         Ok(SecretString::new(hash))
+    }
+
+    /// Create a user with the given plaintext password, hashing it first.
+    /// Idempotent: a name collision yields [`CreateUserOutcome::AlreadyExists`]
+    /// rather than an error, so re-running a bootstrap command is safe.
+    /// This is the supported way to bootstrap the first admin
+    /// (`pharos admin create-user --name … --password … --admin`).
+    pub async fn create_user(
+        &self,
+        name: &str,
+        password: &SecretString,
+        admin: bool,
+    ) -> AuthResult<CreateUserOutcome> {
+        let hash = self.hash_password(password)?;
+        let record = UserRecord {
+            id: UserId::new(),
+            name: name.to_string(),
+            password_hash: hash,
+            policy: UserPolicy { admin },
+        };
+        match self.users.create(record).await {
+            Ok(()) => Ok(CreateUserOutcome::Created),
+            Err(AuthError::Conflict) => Ok(CreateUserOutcome::AlreadyExists),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -189,5 +225,52 @@ mod tests {
         let h = auth.hash_password(&SecretString::new("hunter2")).unwrap();
         assert!(h.expose().starts_with("$argon2"));
         assert!(!h.expose().contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn create_user_creates_admin_that_can_authenticate() {
+        let auth = fresh().await;
+        let outcome = auth
+            .create_user("ali", &SecretString::new("hunter2"), true)
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreateUserOutcome::Created);
+        // The created user can log in and is an admin.
+        let user = auth
+            .authenticate("ali", &SecretString::new("hunter2"))
+            .await
+            .unwrap();
+        assert_eq!(user.name, "ali");
+        let rec = auth.users().lookup_by_name("ali").await.unwrap();
+        assert!(rec.policy.admin);
+    }
+
+    #[tokio::test]
+    async fn create_user_defaults_to_non_admin() {
+        let auth = fresh().await;
+        auth.create_user("bob", &SecretString::new("pw"), false)
+            .await
+            .unwrap();
+        let rec = auth.users().lookup_by_name("bob").await.unwrap();
+        assert!(!rec.policy.admin);
+    }
+
+    #[tokio::test]
+    async fn create_user_is_idempotent_on_name_collision() {
+        let auth = fresh().await;
+        auth.create_user("ali", &SecretString::new("hunter2"), true)
+            .await
+            .unwrap();
+        let again = auth
+            .create_user("ali", &SecretString::new("different"), false)
+            .await
+            .unwrap();
+        assert_eq!(again, CreateUserOutcome::AlreadyExists);
+        // The original password + admin flag are left untouched.
+        let user = auth
+            .authenticate("ali", &SecretString::new("hunter2"))
+            .await
+            .unwrap();
+        assert_eq!(user.name, "ali");
     }
 }

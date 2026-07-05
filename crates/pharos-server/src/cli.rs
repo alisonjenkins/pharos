@@ -29,14 +29,39 @@ pub enum Cmd {
 pub enum AdminOp {
     /// Print resolved config.
     PrintConfig,
+    /// Create a user. This is the supported way to bootstrap the first
+    /// admin on a fresh deployment. The password is read from `--password`
+    /// or the `PHAROS_ADMIN_PASSWORD` env var (prefer the env var — a flag
+    /// is visible in the process list and shell history). Idempotent: a
+    /// name collision is reported and left as-is.
+    CreateUser {
+        /// Username.
+        #[arg(long)]
+        name: String,
+        /// Password. Prefer the `PHAROS_ADMIN_PASSWORD` env var over the
+        /// flag so the secret stays out of the process list / shell history.
+        #[arg(long, env = "PHAROS_ADMIN_PASSWORD", hide_env_values = true)]
+        password: String,
+        /// Grant admin privileges. Needed for the first bootstrap user.
+        #[arg(long)]
+        admin: bool,
+    },
     /// Seed the known Playwright compat user (`playwright` /
     /// `playwright-test-pw`) plus a handful of placeholder items.
     /// Idempotent — re-running is a no-op for existing rows.
+    ///
+    /// Test tooling only — compiled out of release builds (the hardcoded
+    /// credential must never ship). Use `create-user` in production.
+    #[cfg(debug_assertions)]
     SeedPlaywrightUser,
     /// Just create the `playwright` admin user without generating
     /// any media fixtures. Useful when media is pre-populated by
     /// another process (e.g. the test-media OCI image dev-stack
     /// ships) and `pharos scan` registers the items separately.
+    ///
+    /// Test tooling only — compiled out of release builds. Use
+    /// `create-user` in production.
+    #[cfg(debug_assertions)]
     CreatePlaywrightUser,
 }
 
@@ -61,6 +86,56 @@ mod tests {
             cli.cmd,
             Cmd::Admin {
                 op: AdminOp::PrintConfig
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_admin_create_user_with_admin_flag() {
+        let cli = Cli::try_parse_from([
+            "pharos",
+            "admin",
+            "create-user",
+            "--name",
+            "ali",
+            "--password",
+            "s3cret",
+            "--admin",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Admin {
+                op:
+                    AdminOp::CreateUser {
+                        name,
+                        password,
+                        admin,
+                    },
+            } => {
+                assert_eq!(name, "ali");
+                assert_eq!(password, "s3cret");
+                assert!(admin);
+            }
+            other => panic!("expected create-user, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_user_defaults_admin_false() {
+        let cli = Cli::try_parse_from([
+            "pharos",
+            "admin",
+            "create-user",
+            "--name",
+            "bob",
+            "--password",
+            "pw",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Admin {
+                op: AdminOp::CreateUser { admin: false, .. }
             }
         ));
     }

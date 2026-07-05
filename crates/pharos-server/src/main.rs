@@ -75,7 +75,14 @@ async fn main() -> Result<(), AppError> {
                 let mut lock = stdout.lock();
                 writeln!(lock, "{cfg:#?}")?;
             }
+            AdminOp::CreateUser {
+                name,
+                password,
+                admin,
+            } => create_user(&cfg, &name, &password, admin).await?,
+            #[cfg(debug_assertions)]
             AdminOp::SeedPlaywrightUser => seed_playwright_user(&cfg).await?,
+            #[cfg(debug_assertions)]
             AdminOp::CreatePlaywrightUser => create_playwright_user(&cfg).await?,
         },
     }
@@ -147,6 +154,7 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{
         MediaItem, MediaKind, MediaStore, SecretString, UserId, UserPolicy, UserRecord, UserStore,
@@ -270,10 +278,46 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Bootstrap a user (the supported way to create the first admin on a
+/// fresh deployment). Idempotent — a name collision is reported and left
+/// as-is. Password comes from the CLI arg / `PHAROS_ADMIN_PASSWORD` env
+/// (see `cli::AdminOp::CreateUser`).
+async fn create_user(
+    cfg: &Config,
+    name: &str,
+    password: &str,
+    admin: bool,
+) -> Result<(), AppError> {
+    use pharos_core::SecretString;
+    use pharos_server::auth::{BuiltinAuth, CreateUserOutcome};
+
+    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let auth = BuiltinAuth::new(stores.clone());
+
+    let outcome = auth
+        .create_user(name, &SecretString::new(password.to_string()), admin)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    match outcome {
+        CreateUserOutcome::Created => {
+            let role = if admin { " (admin)" } else { "" };
+            writeln!(lock, "created user '{name}'{role}")?;
+        }
+        CreateUserOutcome::AlreadyExists => {
+            writeln!(lock, "user '{name}' already exists; leaving as-is")?;
+        }
+    }
+    Ok(())
+}
+
 /// Like `seed_playwright_user` but stops after creating the user.
 /// Used by dev-stack's CC-test-media flow where the media files are
 /// populated by a separate one-shot container + `pharos scan`
 /// registers them.
+#[cfg(debug_assertions)]
 async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
