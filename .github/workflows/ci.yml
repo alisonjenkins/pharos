@@ -77,6 +77,45 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  publish:
+    name: publish images (ghcr)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [test, oci]
+    # Only on a push that landed on main — PRs build the image (oci job)
+    # but must not publish. Uses the built-in GITHUB_TOKEN (packages:
+    # write) as the GHCR credential; no external secret needed.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build OCI archives
+        run: |
+          nix build .#oci --out-link result-oci --print-out-paths
+          nix build .#jellyfinWebOci --out-link result-jfweb --print-out-paths
+      - name: Push to GHCR (latest + immutable sha tag)
+        env:
+          # GHCR accepts the workflow token as the password for any
+          # username; use the actor for readability.
+          GHCR_CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          publish() {
+            archive="$1"; repo="$2"
+            for tag in latest "$GITHUB_SHA"; do
+              nix develop --command skopeo copy \
+                --dest-creds "$GHCR_CREDS" \
+                "docker-archive:$archive" \
+                "docker://$repo:$tag"
+            done
+          }
+          publish result-oci    ghcr.io/alisonjenkins/pharos
+          publish result-jfweb  ghcr.io/alisonjenkins/pharos-jellyfin-web
+
   compat-playwright:
     name: jellyfin-web crawl
     runs-on: ubuntu-latest
