@@ -14,9 +14,11 @@
   - `just test` — full workspace (strips macOS Gatekeeper quarantine attr first).
   - `just test-thorough` — full workspace with `PROPTEST_CASES=512` for nightly / pre-release.
   - **Workflow**: iterate with `test-fast` / `test-changed` (blast-radius only) for tight loops; always run the full `just test` before a commit.
-- After a dep change in any crate's `Cargo.toml`, run **two** regens or CI breaks:
-  - `just hakari-regen` — refresh `workspace-hack` (CI's `just hakari-check` fails on a stale hack crate).
-  - `nix develop --command crate2nix generate` — regenerate `Cargo.nix` from `Cargo.lock`. The `nix build .#pharos` / `.#oci` jobs build each crate as its own derivation with explicit `--extern`s read from `Cargo.nix`; a stale `Cargo.nix` fails with `unresolved import <newdep>` even though `cargo build` in the devShell passes. Commit the regenerated `Cargo.nix`.
+- After a dep change in any crate's `Cargo.toml`, run `just hakari-regen` to
+  refresh `workspace-hack` (CI's `just hakari-check` fails on a stale hack
+  crate). The `nix build .#pharos` / `.#oci` jobs build via `buildRustPackage`
+  straight from `Cargo.lock` (see §Transcode), so no separate Nix regen step —
+  a bumped `Cargo.lock` is all Nix needs.
 
 Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) requires clippy from the pinned toolchain. Host system may not have it.
 
