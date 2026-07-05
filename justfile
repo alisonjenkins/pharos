@@ -89,13 +89,6 @@ hakari-check:
 audit:
     nix develop --command bash -c 'cargo audit && cargo deny check'
 
-# Regenerate Cargo.nix from Cargo.lock. crate2nix turns every
-# Cargo.lock entry into its own nix derivation, so the /nix/store
-# becomes the dep cache + dedupes shared deps across projects. Run
-# after any change to `Cargo.toml` / `Cargo.lock`; commit the result.
-regen-cargo-nix:
-    nix develop --command crate2nix generate
-
 # Boot pharos + jellyfin-web as containers for manual testing. Uses
 # `nix build .#oci` (pharos) + nginx:alpine + the pinned nixpkgs
 # jellyfin-web bundle bind-mounted in. Requires docker or podman on
