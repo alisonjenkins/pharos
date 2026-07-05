@@ -8,16 +8,6 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    # Per-crate-derivation rust build. cargo2nix (the obvious pick)
-    # fails to bootstrap on darwin — its own globwalk dep trips
-    # macOS linker semantics. crate2nix offers the same per-crate
-    # semantics (each Cargo.lock entry → its own derivation, dedup'd
-    # via /nix/store across projects), runs darwin-native (it's in
-    # nixpkgs as `pkgs.crate2nix`), and is what we actually use.
-    # Generates `Cargo.nix` from `Cargo.lock`; the flake imports it
-    # to build each crate.
-    #
-    # No new flake input: crate2nix comes from the pinned nixpkgs.
   };
 
   outputs =
@@ -36,8 +26,8 @@
         };
 
         # Pinned toolchain (rust + clippy + rustfmt + wasm target).
-        # Used by the devShell + injected into crate2nix's generated
-        # workspace below so dep builds use the same compiler that
+        # Used by the devShell + the buildRustPackage builds below so
+        # the server/worker binaries compile with the same compiler that
         # `cargo nextest` does.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
@@ -681,9 +671,6 @@
             pkgs.cargo-guppy
             pkgs.cargo-hakari
             pkgs.cargo-audit
-            # crate2nix regenerates Cargo.nix when Cargo.lock changes.
-            # Run `just regen-cargo-nix` after touching dependencies.
-            pkgs.crate2nix
             pkgs.dioxus-cli
             wasmBindgenCli
             pkgs.ffmpeg-headless
