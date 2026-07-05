@@ -62,10 +62,7 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
 /// over the subscriber `S` so it composes onto the layered registry.
 fn build_otel_layer<S>(
     endpoint: &str,
-) -> Result<
-    tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>,
-    ObsError,
->
+) -> Result<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>, ObsError>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
