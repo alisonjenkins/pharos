@@ -689,6 +689,11 @@
             pkgs.tilt
             pkgs.ctlptl
             pkgs.docker-client
+            # skopeo pushes the nix-built OCI archives (`.#oci`,
+            # `.#jellyfinWebOci`) straight to GHCR from CI — no docker
+            # daemon / load step. `skopeo copy docker-archive:result
+            # docker://ghcr.io/...`. Also handy for local publish.
+            pkgs.skopeo
             # `dx build --release` runs wasm-opt (binaryen) over the wasm.
             pkgs.binaryen
             # Node + Playwright drive T29 phase 3. jellyfin-web is the
