@@ -36,6 +36,47 @@ pub mod provider_ids_json;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod media_query;
 
+// Session-token hashing + lifetime, shared by both backends' TokenStore.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod auth_token {
+    use sha2::{Digest, Sha256};
+
+    /// Default session-token lifetime: 90 days. Tokens are stored hashed
+    /// with `created_at + this` as `expires_at`; `resolve` rejects any
+    /// token past its expiry. Long enough that TV / mobile clients aren't
+    /// forced to re-log frequently, short enough to bound a leaked token.
+    pub(crate) const TTL_SECS: i64 = 90 * 24 * 60 * 60;
+
+    /// Hash a raw session token for at-rest storage / lookup. Tokens are
+    /// 122-bit random UUIDv4s, so a single SHA-256 (not a slow password
+    /// KDF) is sufficient — there is nothing to brute-force. Returns
+    /// lowercase hex.
+    pub(crate) fn hash(token: &str) -> String {
+        let digest = Sha256::digest(token.as_bytes());
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn hash_is_stable_hex_and_not_the_input() {
+            let h = hash("abc123");
+            assert_eq!(h.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_ne!(h, "abc123");
+            assert_eq!(h, hash("abc123")); // deterministic
+            assert_ne!(h, hash("abc124")); // sensitive to input
+        }
+    }
+}
+
 /// LIB-A3 — build a root-scoped, path-boundary-safe SQL `LIKE` pattern for
 /// the scan sweep. Matches only items strictly *under* `root` (i.e. paths
 /// beginning `root` + path separator), never a sibling whose name merely

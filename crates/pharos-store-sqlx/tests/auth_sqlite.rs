@@ -82,6 +82,44 @@ async fn revoke_removes_token() {
 }
 
 #[tokio::test]
+async fn token_is_stored_hashed_not_plaintext() {
+    // A DB/backup leak must not yield usable tokens: the row holds only a
+    // SHA-256 hash (64 hex chars), never the raw token handed to the client.
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let token = s.issue(uid, "dev").await.unwrap();
+    let (stored,): (String,) = sqlx::query_as("SELECT token_hash FROM auth_tokens")
+        .fetch_one(s.pool())
+        .await
+        .unwrap();
+    assert_ne!(stored, token.0.expose(), "raw token must not be persisted");
+    assert_eq!(stored.len(), 64);
+    assert!(stored.chars().all(|c| c.is_ascii_hexdigit()));
+    // The raw token still resolves (hash lookup round-trips).
+    assert_eq!(s.resolve(token.0.expose()).await.unwrap(), uid);
+}
+
+#[tokio::test]
+async fn expired_token_is_invalid() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let token = s.issue(uid, "dev").await.unwrap();
+    // Force the token into the past.
+    sqlx::query("UPDATE auth_tokens SET expires_at = 1")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    match s.resolve(token.0.expose()).await {
+        Err(AuthError::InvalidToken) => {}
+        other => panic!("expected InvalidToken for expired token, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn cascade_delete_on_user_drop() {
     // FK ON DELETE CASCADE: deleting user wipes its tokens. Verified at
     // schema level by attempting to resolve afterwards.
