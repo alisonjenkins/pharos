@@ -14,12 +14,14 @@
 //!   that later errors / closes downgrades to the poll tier at runtime (never
 //!   crashes — V6 spirit).
 //!
-//! - **Periodic rescan** (fallback tier): a timer task that re-runs the cheap
-//!   incremental [`pharos_scanner::FsScanner::scan_into`] every
-//!   `library_poll_interval_secs`. This backstops *every* root (it also runs
-//!   alongside a native watch as a safety net for missed events) and is the
-//!   primary detector for network/fuse roots or when the `watch` feature is
-//!   off. `library_poll_interval_secs = 0` disables it.
+//! - **Periodic rescan** (fallback tier): a timer task that runs one immediate
+//!   scan on boot (so a fresh deploy is populated at once, not a poll interval
+//!   later) and then re-runs the cheap incremental
+//!   [`pharos_scanner::FsScanner::scan_into`] every `library_poll_interval_secs`.
+//!   This backstops *every* root (it also runs alongside a native watch as a
+//!   safety net for missed events) and is the primary detector for network/fuse
+//!   roots or when the `watch` feature is off. `library_poll_interval_secs = 0`
+//!   disables it (and with it the boot scan — use a `scan` CronJob instead).
 //!
 //! - **Manual refresh** (floor tier): if both the watch and the poll tiers are
 //!   disabled for a root, it only updates on an admin `POST /Library/Refresh`.
@@ -188,9 +190,11 @@ fn spawn_one<P, F>(
     }
 }
 
-/// Spawn the periodic incremental-rescan timer for one root. Each tick runs
-/// `scan_into` and broadcasts any delta. Errors are logged and the loop
-/// continues (V6) — a transient scan failure never kills the schedule.
+/// Spawn the boot + periodic incremental-rescan task for one root. Runs one
+/// immediate scan on startup (so the library is populated without waiting a
+/// poll interval), then rescans every `interval`. Each scan runs `scan_into`
+/// and broadcasts any delta. Errors are logged and the loop continues (V6) —
+/// a transient scan failure never kills the schedule.
 fn spawn_periodic<P>(
     state: web::Data<AppState>,
     root: PathBuf,
@@ -200,9 +204,17 @@ fn spawn_periodic<P>(
     P: Prober + Send + Sync + 'static,
 {
     actix_web::rt::spawn(async move {
+        // Boot scan: populate the library immediately rather than leaving a
+        // fresh deploy empty until the first poll interval elapses. This is
+        // what previously forced a chart `scan` initContainer to gate server
+        // readiness on a full media scan — the server owns it now, in-process
+        // and non-blocking (it runs on the tokio pool while `serve` finishes
+        // binding; SQLite stays single-writer since this is that writer).
+        run_scan_and_broadcast(&state, &root, &scanner, "startup").await;
         let mut ticker = tokio::time::interval(interval);
-        // Skip the immediate first tick: startup already implies a fresh
-        // state, and an instant rescan would race the rest of `serve` boot.
+        // Consume the immediate first tick — the boot scan above already
+        // covered t=0, so the next *periodic* rescan is due one full interval
+        // later.
         ticker.tick().await;
         loop {
             ticker.tick().await;
