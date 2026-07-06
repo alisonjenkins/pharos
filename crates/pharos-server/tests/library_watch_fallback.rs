@@ -83,9 +83,11 @@ async fn forced_unsupported_root_uses_periodic_and_picks_up_new_file() {
         FsScanner::new(FakeProber)
     });
 
-    // Create a media file after the watcher/poller is up. The first poll tick
-    // is skipped at startup, so the file lands well before the tick that picks
-    // it up — proving the *poll* (not a startup scan) is what indexes it.
+    // Create a media file *after* the poller is up. The boot scan already ran
+    // (on the then-empty dir), and the first periodic tick is one interval
+    // away, so this file is indexed by the *periodic* rescan — the fallback
+    // tier this test exists to prove. (The boot scan itself is covered by
+    // `boot_scan_indexes_preexisting_file_before_first_poll`.)
     tokio::fs::write(root.join("movie.mkv"), b"fallback-bytes")
         .await
         .unwrap();
@@ -121,5 +123,68 @@ async fn forced_unsupported_root_uses_periodic_and_picks_up_new_file() {
     assert!(
         state.stores.get(expected_id).await.is_ok(),
         "the new file should be persisted by the periodic rescan"
+    );
+}
+
+/// The boot scan: a file that already exists when `serve` starts must be
+/// indexed immediately, not one poll interval later. Uses a deliberately long
+/// poll interval so that a fast pickup can *only* be the startup scan — this is
+/// the behaviour that lets a fresh deploy drop the chart `scan` initContainer.
+#[actix_web::test]
+async fn boot_scan_indexes_preexisting_file_before_first_poll() {
+    let cfg = WatchConfig {
+        watch_enabled: false,
+        // Long enough that the periodic tier cannot be what indexes the file
+        // within the assertion timeout — only the boot scan can.
+        poll_interval: Duration::from_secs(3600),
+        rate_limit_ms: 0,
+    };
+
+    let td = tempfile::TempDir::new().unwrap();
+    let root = td.path().to_path_buf();
+
+    // The file exists on disk *before* the poller is spawned.
+    tokio::fs::write(root.join("movie.mkv"), b"preexisting-bytes")
+        .await
+        .unwrap();
+    let expected_id = pharos_scanner::stable_id(&root.join("movie.mkv"));
+
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let state = AppState::new(stores, "boot-scan".into()).with_media_roots(vec![root.clone()]);
+    let state = web::Data::new(state);
+    let mut bus_rx = state.bus.subscribe();
+
+    let _guards = spawn_for_roots(state.clone(), std::slice::from_ref(&root), cfg, || {
+        FsScanner::new(FakeProber)
+    });
+
+    // Well under the 3600s poll interval: only the boot scan can index it here.
+    let got_delta = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match bus_rx.recv().await {
+                Ok(SocketBroadcast::LibraryChanged { added, .. }) => {
+                    if added.contains(&expected_id.to_string()) {
+                        return true;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        got_delta,
+        "the boot scan should index a pre-existing file and broadcast its id \
+         without waiting for the first poll tick"
+    );
+
+    use pharos_core::MediaStore;
+    assert!(
+        state.stores.get(expected_id).await.is_ok(),
+        "the pre-existing file should be persisted by the boot scan"
     );
 }
