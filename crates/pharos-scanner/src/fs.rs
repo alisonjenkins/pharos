@@ -216,7 +216,10 @@ impl<P: Prober> FsScanner<P> {
         store: &S,
     ) -> DomainResult<ScanOutcome> {
         let scan_id = store.begin_scan(root).await?;
-        let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
+        let WalkOutcome {
+            files: paths,
+            errors: walk_errors,
+        } = walk(root.to_path_buf(), self.extensions.clone()).await?;
         let groups = group_editions(paths);
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
@@ -478,8 +481,26 @@ impl<P: Prober> FsScanner<P> {
         // prefix vanished and is deleted in one atomic, root-scoped pass.
         // The prefix is the canonical root string the rows' `path` columns
         // were stored under, so a sibling root is never touched.
+        //
+        // BUT only sweep when the walk was COMPLETE. If any entry was
+        // unreadable this pass (an *arr import mid-move, a momentary NFS
+        // EPERM, a transiently-unlistable subdir) the listing is a subset of
+        // what's really on disk — a still-present file could be missing from
+        // it. Sweeping then would delete its row and make it vanish from the
+        // library until the next scan re-adds it (the "disappearing media"
+        // symptom). Skip the sweep this pass; a later clean scan reconciles
+        // genuine deletions. (Deletion is merely delayed, never wrong.)
         let root_prefix = root.to_string_lossy();
-        let swept = store.sweep_unseen(scan_id, &root_prefix).await?;
+        let swept = if walk_errors == 0 {
+            store.sweep_unseen(scan_id, &root_prefix).await?
+        } else {
+            tracing::warn!(
+                scan_id,
+                walk_errors,
+                "walk incomplete ({walk_errors} unreadable entries); skipping deletion sweep this pass to avoid pruning transiently-unreadable files",
+            );
+            Vec::new()
+        };
         let removed = swept.len();
         if removed > 0 {
             tracing::info!(scan_id, removed, ids = ?swept, "swept rows for files removed from disk");
@@ -935,7 +956,12 @@ async fn persist_artwork<S: MediaStore>(
 impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
     #[tracing::instrument(skip(self), fields(root = %root.display()))]
     async fn scan(&self, root: &Path) -> DomainResult<Vec<MediaItem>> {
-        let paths = walk(root.to_path_buf(), self.extensions.clone()).await?;
+        // The bare `scan` (no incremental sweep) only needs the file list; a
+        // partial walk (unreadable entries logged inside `walk`) still yields
+        // every readable file.
+        let paths = walk(root.to_path_buf(), self.extensions.clone())
+            .await?
+            .files;
         let groups = group_editions(paths);
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
@@ -1301,13 +1327,41 @@ fn looks_like_season_dir(name: &str) -> bool {
     false
 }
 
+/// Result of a filesystem [`walk`]: the recognised media file paths, plus a
+/// count of entries walkdir could not read this pass. A non-zero `errors`
+/// means the listing is *incomplete* — the caller must not treat a missing
+/// path as a deletion (see the mark-and-sweep gate in `scan_into`).
+struct WalkOutcome {
+    files: Vec<PathBuf>,
+    errors: usize,
+}
+
 /// Recursive walk inside `spawn_blocking`. Returns paths of files whose
-/// lowercased extension is in `exts`.
-async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<Vec<PathBuf>> {
-    tokio::task::spawn_blocking(move || -> DomainResult<Vec<PathBuf>> {
+/// lowercased extension is in `exts`, plus how many entries were unreadable.
+async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome> {
+    tokio::task::spawn_blocking(move || -> DomainResult<WalkOutcome> {
         let mut out = Vec::new();
+        let mut errors = 0usize;
         for entry in walkdir::WalkDir::new(&root).follow_links(false) {
-            let e = entry.map_err(|err| DomainError::Backend(err.to_string()))?;
+            // V6 — a per-entry walk error (a file an *arr import is moving
+            // mid-scan → EPERM/ENOENT on one path, or a subtree we lack
+            // permission to descend into) must never abort the whole library
+            // scan. walkdir keeps iterating after an errored entry, so log it
+            // and skip just that one; every readable file still gets indexed.
+            // NFS readdir returns DT_UNKNOWN, so walkdir stats each entry —
+            // a file being replaced mid-scan surfaces here, not just at probe.
+            let e = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    errors += 1;
+                    tracing::warn!(
+                        path = ?err.path(),
+                        error = %err,
+                        "walk: skipping unreadable entry",
+                    );
+                    continue;
+                }
+            };
             if !e.file_type().is_file() {
                 continue;
             }
@@ -1322,7 +1376,7 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<Vec<PathBuf>
                 }
             }
         }
-        Ok(out)
+        Ok(WalkOutcome { files: out, errors })
     })
     .await
     .map_err(|e| DomainError::Backend(format!("walk join: {e}")))?
@@ -2310,6 +2364,92 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn walk_skips_unreadable_entry_and_indexes_the_rest() {
+        // A transient per-entry walk error (an *arr import moving a file
+        // mid-scan → EPERM/ENOENT on one path, or a subtree we can't read)
+        // must NOT abort the whole library scan (V6). Reproduce it with a
+        // mode-000 subdirectory: walkdir can't descend, yielding an Err entry
+        // exactly like the churning-file case seen on the live NFS mount.
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "good.mkv", b"aaaa").await;
+        let locked = td.path().join("locked");
+        tokio::fs::create_dir(&locked).await.unwrap();
+        write_file(&locked, "hidden.mkv", b"bbbb").await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root ignores the perms, so the walk error can't be
+        // provoked — skip rather than assert a false pass.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        let result = s.scan_into(td.path(), &store).await;
+        // Restore perms before asserting so TempDir cleanup works even if the
+        // assertions below fail.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = result.expect("one unreadable entry must not fail the scan");
+        assert_eq!(
+            outcome.added.len(),
+            1,
+            "the readable file should be indexed"
+        );
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        assert_eq!(store.list().await.unwrap()[0].title, "good");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incomplete_walk_does_not_prune_transiently_unreadable_files() {
+        // A file indexed on a clean scan must NOT be swept on a later scan
+        // whose walk is incomplete (an unreadable subtree hides it). Otherwise
+        // a momentary NFS EPERM / an *arr import in flight makes present media
+        // vanish from the library until the next scan re-adds it.
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "show/ep.mkv", b"aaaa").await;
+
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+
+        // Scan 1 (clean): ep.mkv is indexed.
+        let first = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(first.added.len(), 1);
+        assert_eq!(store.list().await.unwrap().len(), 1);
+
+        // Make the containing dir unreadable so scan 2's walk can't list
+        // ep.mkv — an incomplete listing, not a real deletion.
+        let show = td.path().join("show");
+        std::fs::set_permissions(&show, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&show).is_ok() {
+            // Running as root — perms ignored, can't provoke; skip.
+            std::fs::set_permissions(&show, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        // Scan 2 (incomplete walk): the sweep must be skipped, so ep.mkv's row
+        // survives even though it wasn't seen this pass.
+        let second = s.scan_into(td.path(), &store).await;
+        std::fs::set_permissions(&show, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let second = second.expect("incomplete walk must not error");
+        assert!(
+            second.removed.is_empty(),
+            "must not sweep on an incomplete walk"
+        );
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            1,
+            "the still-present file must not be pruned by an incomplete walk"
+        );
     }
 
     #[tokio::test]
