@@ -507,6 +507,16 @@
                 server {
                   listen ${toString port};
 
+                  # Keep internally-generated redirects (the /→/prefix/ ones
+                  # below) RELATIVE. With the default `absolute_redirect on`,
+                  # angie rebuilds the Location as `$scheme://$host:$port/...`
+                  # using this listen port (8097) + the backend's http scheme —
+                  # so behind the HTTPS gateway `/` 302'd to
+                  # `http://host:8097/web/`, leaking the internal port + wrong
+                  # scheme. Off → `Location: /${prefix}/`, resolved by the
+                  # browser against the real external URL.
+                  absolute_redirect off;
+
                   # SPA served under /${prefix}/; its files live at the
                   # bundle dir root, aliased in. try_files falls back to the
                   # SPA index for client-side routes.
