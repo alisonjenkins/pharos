@@ -892,6 +892,95 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
     assert_eq!(by_show.get("Show B"), Some(&1));
 }
 
+// /Shows/{id}/Episodes + /Shows/{id}/Seasons must return ONLY the requested
+// series (jellyfin-web's series page + play-next drive off these), and
+// /Shows/NextUp?SeriesId=<id> must scope to that one series rather than
+// returning the library-wide next-up.
+#[actix_web::test]
+async fn shows_hierarchy_and_next_up_scope_to_one_series() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    // Show A: S01E02, S01E01 (inserted out of order to prove sorting); Show B: S01E01.
+    for (id, show, ep) in [(1u64, "Show A", 2u32), (2, "Show A", 1), (3, "Show B", 1)] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/TV/{show}/Season 1/s01e0{ep}.mkv").into(),
+                title: format!("{show} E{ep}"),
+                kind: MediaKind::Episode,
+                series: Some(pharos_core::SeriesInfo {
+                    series_name: show.to_string(),
+                    season_number: Some(1),
+                    episode_number: Some(ep),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let get = |uri: String| {
+        let tok = token.0.expose().to_string();
+        let app = &app;
+        async move {
+            let body = test::call_and_read_body(
+                app,
+                test::TestRequest::get()
+                    .uri(&uri)
+                    .insert_header(("X-Emby-Token", tok))
+                    .to_request(),
+            )
+            .await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+    // Fish Show A's SeriesId off one of its episodes.
+    let ep = get("/Items/2".into()).await;
+    let show_a = ep["SeriesId"].as_str().unwrap().to_string();
+
+    // Episodes: only Show A, ascending by episode.
+    let v = get(format!("/Shows/{show_a}/Episodes")).await;
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "expected 2 Show A episodes: {v:?}");
+    let nums: Vec<u64> = items
+        .iter()
+        .map(|i| i["IndexNumber"].as_u64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![1, 2], "episodes must be season/episode ordered");
+    for it in items {
+        assert!(it["Name"].as_str().unwrap().starts_with("Show A"), "{it:?}");
+    }
+
+    // Seasons: exactly one season for Show A.
+    let v = get(format!("/Shows/{show_a}/Seasons")).await;
+    assert_eq!(v["Items"].as_array().unwrap().len(), 1, "{v:?}");
+    assert_eq!(v["Items"][0]["Type"], "Season");
+
+    // NextUp scoped by SeriesId → only Show A (not Show B).
+    let v = get(format!("/Shows/NextUp?SeriesId={show_a}")).await;
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "scoped NextUp must return only Show A: {v:?}"
+    );
+    assert_eq!(items[0]["SeriesName"], "Show A");
+}
+
 // LIB-C11 — two same-name shows in DISTINCT folders must stay two
 // separate series in /Shows/NextUp with distinct, non-interleaved
 // episode picks and distinct SeriesIds carrying their own years. Before

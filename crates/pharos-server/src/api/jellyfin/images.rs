@@ -246,6 +246,17 @@ async fn serve_image(
             return serve_local_artwork(&local, head_only, format, state).await;
         }
     }
+    // An audio track has no video frames, so Backdrop / Thumb can only ever
+    // come from a local sidecar (served just above). Don't spawn the ffmpeg
+    // frame-extract fallback for them: it always fails ("Output file does not
+    // contain any stream") and needlessly loads the libav worker pool — a
+    // storm of these was starving real ops into timeouts. Primary still falls
+    // through so embedded cover art extracts.
+    if matches!(item.kind, pharos_core::MediaKind::Audio)
+        && matches!(role, ImageRole::Backdrop | ImageRole::Thumb)
+    {
+        return Ok(HttpResponse::NotFound().body(""));
+    }
     let jpeg_path = match cache.fetch(id, role, item.kind, &item.path, index).await {
         Ok(p) => p,
         // Upload-only roles (Logo/Banner/Art/Disc) report

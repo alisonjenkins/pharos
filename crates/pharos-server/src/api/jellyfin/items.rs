@@ -113,6 +113,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // exists. Keep it after the empty-stub loop so the route is
     // registered with our handler.
     cfg.route("/shows/nextup", web::get().to(shows_next_up));
+    // Series-page hierarchy: jellyfin-web fetches a show's seasons and a
+    // season's / series' episodes from these, not /Items?ParentId=.
+    cfg.route("/shows/{id}/seasons", web::get().to(shows_seasons));
+    cfg.route("/shows/{id}/episodes", web::get().to(shows_episodes));
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
@@ -1066,6 +1070,11 @@ fn collection_dto(
 struct NextUpQuery {
     #[serde(default)]
     user_id: Option<String>,
+    /// When a Series detail page requests Next Up it passes `SeriesId`;
+    /// scope the result to that one series. Absent on the home-screen
+    /// "Next Up" row, which wants one pick across the whole library.
+    #[serde(default)]
+    series_id: Option<String>,
     #[serde(default = "default_limit")]
     limit: u32,
 }
@@ -1091,6 +1100,7 @@ async fn shows_next_up(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // Group episodes by series; pick the lowest unwatched per series.
+    use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::HashMap;
     let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
     for (idx, item) in all.iter().enumerate() {
@@ -1100,6 +1110,15 @@ async fn shows_next_up(
         let Some(series) = item.series.as_ref() else {
             continue;
         };
+        // A Series-page request scopes to that series (`SeriesId`); the
+        // home-screen row leaves it unset and gets one pick per series.
+        if let Some(want) = q.series_id.as_deref() {
+            if series_id_for_key(series.series_folder.as_deref(), &series.series_name).as_str()
+                != want
+            {
+                continue;
+            }
+        }
         // Skip already-played episodes.
         if user_data.get(idx).copied().unwrap_or_default().played {
             continue;
@@ -1159,6 +1178,135 @@ async fn shows_next_up(
     let _ = q.user_id; // kept for future per-user scoping
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "Items": dtos,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct ShowsEpisodesQuery {
+    /// Scope to a single season (jellyfin-web passes this when a season is
+    /// selected). Absent → every episode of the series.
+    season_id: Option<String>,
+    user_id: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /Shows/{id}/Episodes` — the episodes of a series (optionally one
+/// season), ordered by (season, episode). jellyfin-web's series/season pages
+/// and its "play next episode" resolution both drive off this; without it the
+/// series page 404s and playback can't pick an episode.
+async fn shows_episodes(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+    q: web::Query<ShowsEpisodesQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
+    let series_id = path.into_inner();
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.0.id, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut eps: Vec<(usize, &MediaItem)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item.kind, MediaKind::Episode))
+        .filter(|(_, item)| {
+            item.series.as_ref().is_some_and(|s| {
+                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+            })
+        })
+        .filter(|(_, item)| {
+            let Some(want) = q.season_id.as_deref() else {
+                return true;
+            };
+            item.series.as_ref().is_some_and(|s| {
+                s.season_number.is_some_and(|n| {
+                    season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == want
+                })
+            })
+        })
+        .collect();
+    eps.sort_by_key(|(_, e)| {
+        let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
+        let n = e
+            .series
+            .as_ref()
+            .and_then(|s| s.episode_number)
+            .unwrap_or(0);
+        (s, n)
+    });
+    if let Some(limit) = q.limit {
+        eps.truncate(limit.max(1) as usize);
+    }
+    let dtos: Vec<BaseItemDto> = eps
+        .iter()
+        .map(|(idx, item)| {
+            let ud = user_data.get(*idx).copied().unwrap_or_default();
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+                &item.probe,
+                &state.trickplay_widths,
+                state.trickplay_interval_ms,
+            )
+        })
+        .collect();
+    let total = dtos.len() as u32;
+    let _ = q.user_id.as_deref();
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": dtos,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
+
+/// `GET /Shows/{id}/Seasons` — the distinct seasons of a series as synthetic
+/// Season folder items, ordered by season number.
+async fn shows_seasons(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use std::collections::BTreeMap;
+    let series_id = path.into_inner();
+    let all = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // One representative SeriesInfo per season number (BTreeMap → ascending).
+    let mut seasons: BTreeMap<u32, &pharos_core::SeriesInfo> = BTreeMap::new();
+    for item in all.iter() {
+        if !matches!(item.kind, MediaKind::Episode) {
+            continue;
+        }
+        let Some(series) = item.series.as_ref() else {
+            continue;
+        };
+        if series_id_for_key(series.series_folder.as_deref(), &series.series_name) != series_id {
+            continue;
+        }
+        let Some(n) = series.season_number else {
+            continue;
+        };
+        seasons.entry(n).or_insert(series);
+    }
+    let items: Vec<serde_json::Value> = seasons
+        .iter()
+        .map(|(n, series)| season_dto(&state.server_id, series, *n, &season_display_name(*n)))
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
     })))
