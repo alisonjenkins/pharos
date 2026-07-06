@@ -135,16 +135,18 @@ mediaSeed:
 
 # Library scan.
 scan:
-  # Run `pharos scan` as an initContainer before `serve` starts. This
-  # populates the library on first boot (the server's poll tier skips its
-  # first tick, so without this a fresh deploy is empty until the first
-  # poll interval). Same pod + db volume → sqlite-safe (sequential, no
-  # concurrent writer). On large libraries an incremental rescan is cheap.
-  initContainer: true
+  # Run `pharos scan` as an initContainer before `serve` starts. NO LONGER
+  # NEEDED with the in-process poll on: the server runs a boot scan itself on
+  # startup (non-blocking, single-writer safe), so a fresh deploy populates
+  # without gating readiness on a full media scan. Leave false; enable only
+  # for an odd setup where the server's boot scan is off (e.g.
+  # libraryPollIntervalSecs=0 and no CronJob).
+  initContainer: false
   # Optional separate CronJob running `pharos scan`. Intended for Postgres
   # (multi-writer) or when you set config.server.libraryPollIntervalSecs=0
-  # to disable the in-process poll. With SQLite + the in-process poll on,
-  # leave this off (a concurrent scan pod would contend on the db lock).
+  # to disable the in-process poll (which also disables the boot scan). With
+  # SQLite + the in-process poll on, leave this off (a concurrent scan pod
+  # would contend on the db lock).
   cron:
     enabled: false
     schedule: "0 * * * *"
