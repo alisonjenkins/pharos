@@ -946,12 +946,29 @@ fn build_segment_opts(
                 target_audio_codec,
                 max_video_bitrate_bps,
             } => {
-                let container =
-                    Container::from_name(&target_container).unwrap_or(Container::Mpegts);
-                let video = target_video_codec
-                    .as_deref()
-                    .and_then(VideoCodec::from_name)
-                    .or(Some(VideoCodec::H264));
+                // The /hls1/*.ts segment route always serves mpegts H.264 for
+                // a video item — pharos has no VP9/AV1 encoder and the segment
+                // Content-Type (video/mp2t) + master-playlist codecs assume
+                // mpegts H.264. A client profile that nominally asked for e.g.
+                // mp4/vp9 is ignored here (hls.js demuxes mpegts regardless);
+                // honouring it would emit fMP4/VP9 the .ts surface can't carry.
+                let is_video = matches!(
+                    item.kind,
+                    pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
+                );
+                let container = if is_video {
+                    Container::Mpegts
+                } else {
+                    Container::from_name(&target_container).unwrap_or(Container::Mpegts)
+                };
+                let video = if is_video {
+                    Some(VideoCodec::H264)
+                } else {
+                    target_video_codec
+                        .as_deref()
+                        .and_then(VideoCodec::from_name)
+                        .or(Some(VideoCodec::H264))
+                };
                 let audio = target_audio_codec
                     .as_deref()
                     .and_then(AudioCodec::from_name)

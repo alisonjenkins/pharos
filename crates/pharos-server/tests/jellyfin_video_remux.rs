@@ -197,3 +197,82 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
         "{v}"
     );
 }
+
+// A legacy mpeg4/AVI source can't direct-play or remux → it must transcode.
+// A client whose HLS transcoding profile requests container "mp4"
+// (jellyfin-web's Firefox profile) must STILL get a TranscodingUrl — pharos
+// serves mpegts H.264 HLS regardless. Gating the URL on
+// target_container=="ts" returned SupportsTranscoding:true with a null URL and
+// broke jellyfin-web with "error processing the request".
+#[actix_web::test]
+async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 12,
+            path: "/legacy.avi".into(),
+            title: "AVI Movie".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                width: Some(624),
+                height: Some(352),
+                bitrate_bps: Some(1_000_000),
+                container: Some("avi".into()),
+                video_codec: Some("mpeg4".into()),
+                audio_codec: Some("mp3".into()),
+                ..Default::default()
+            },
+            series: None,
+            created_at: None,
+            metadata: Default::default(),
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri("/Items/12/PlaybackInfo")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(
+            r#"{"DeviceProfile":{
+              "DirectPlayProfiles":[],
+              "TranscodingProfiles":[{
+                "Container":"mp4","Type":"Video","Protocol":"hls",
+                "VideoCodec":"h264","AudioCodec":"aac"
+              }]
+            }}"#,
+        )
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ms = &v["MediaSources"][0];
+    assert_eq!(ms["SupportsTranscoding"].as_bool(), Some(true), "{v}");
+    let url = ms["TranscodingUrl"].as_str();
+    assert!(
+        url.is_some_and(|u| u.contains("master.m3u8")),
+        "video transcode must emit an HLS master URL, got {v}"
+    );
+    assert_eq!(ms["TranscodingSubProtocol"].as_str(), Some("hls"), "{v}");
+}
