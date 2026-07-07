@@ -106,7 +106,7 @@ jobs:
           publish() {
             archive="$1"; repo="$2"
             for tag in latest "$GITHUB_SHA"; do
-              nix develop --command skopeo copy \
+              nix develop --command skopeo --insecure-policy copy \
                 --dest-creds "$GHCR_CREDS" \
                 "docker-archive:$archive" \
                 "docker://$repo:$tag"
