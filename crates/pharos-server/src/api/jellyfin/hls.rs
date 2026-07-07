@@ -255,6 +255,33 @@ fn codecs_string(
     }
 }
 
+/// The codecs the HLS **segments** actually carry — the transcode OUTPUT,
+/// which is what the master playlist's `CODECS` attribute must advertise.
+/// `/master.m3u8` is always a transcode: an h264/hevc source is stream-copied
+/// (advertise it verbatim), anything else is re-encoded to H.264, and audio is
+/// (re-)encoded to AAC (see `build_segment_opts`). Advertising the *source*
+/// codec (e.g. `mpeg4` for a legacy AVI/DivX/Xvid rip) makes the browser's
+/// `MediaSource.isTypeSupported` reject the stream as unplayable *before* it
+/// fetches a single segment — surfacing as jellyfin-web's "Playback Error".
+fn hls_output_codecs_string(
+    src_video: Option<&str>,
+    src_profile: Option<&str>,
+    src_level: Option<u32>,
+) -> String {
+    let copied = matches!(
+        src_video.map(str::to_ascii_lowercase).as_deref(),
+        Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hvc1" | "hev1")
+    );
+    if copied {
+        // Stream-copied → segments carry the source codec + its real profile.
+        codecs_string(src_video, src_profile, src_level, Some("aac"))
+    } else {
+        // Re-encoded to H.264 (libx264 defaults). Advertise a conservative
+        // avc1 token; the source profile/level describe the discarded input.
+        codecs_string(Some("h264"), None, None, Some("aac"))
+    }
+}
+
 fn video_codec_token(codec: &str, profile: Option<&str>, level: Option<u32>) -> String {
     match codec.to_ascii_lowercase().as_str() {
         "h264" | "avc" | "avc1" => {
@@ -403,13 +430,14 @@ async fn master_playlist(
     let qs = playback_qs(&req);
     let bitrate_cap = extract_session_bitrate_cap(&state, &req).await;
 
-    // P1 — real CODECS from probe, falling back to the hardcoded
-    // string only when no probe data is available.
-    let codecs = codecs_string(
+    // Advertise the codecs the transcoded segments actually carry (H.264 +
+    // AAC, or a stream-copied h264/hevc source) — NOT the raw source codec.
+    // A legacy mpeg4/DivX source re-encodes to H.264, so advertising `mpeg4`
+    // made the browser reject the stream before fetching a segment.
+    let codecs = hls_output_codecs_string(
         item.video_codec.as_deref(),
         item.video_profile.as_deref(),
         item.video_level,
-        item.audio_codec.as_deref(),
     );
 
     let mut body = String::new();
@@ -1246,6 +1274,32 @@ mod tests {
         assert_eq!(
             codecs_string(None, None, None, None),
             "avc1.640028,mp4a.40.2"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn hls_output_codecs_advertise_transcode_target_not_source() {
+        // A legacy AVI/DivX (mpeg4) source is re-encoded to H.264 + AAC:
+        // the master playlist must NOT advertise `mpeg4` (which the browser
+        // rejects), but an avc1 token. This is the "Playback Error" fix.
+        let s = hls_output_codecs_string(Some("mpeg4"), Some("Simple Profile"), Some(1));
+        assert!(s.starts_with("avc1."), "mpeg4 must advertise avc1, got {s}");
+        assert!(s.ends_with(",mp4a.40.2"), "audio must be AAC, got {s}");
+        assert!(!s.contains("mpeg4"), "must not leak the source codec: {s}");
+
+        // vp9 / mpeg2 likewise re-encode to H.264.
+        assert!(hls_output_codecs_string(Some("vp9"), None, None).starts_with("avc1."));
+        assert!(hls_output_codecs_string(Some("mpeg2video"), None, None).starts_with("avc1."));
+
+        // An h264 source is stream-copied → advertise it verbatim (with its
+        // real profile/level) + AAC audio.
+        assert_eq!(
+            hls_output_codecs_string(Some("h264"), Some("High"), Some(40)),
+            "avc1.640028,mp4a.40.2"
+        );
+        // hevc source is copied → hvc1.
+        assert!(
+            hls_output_codecs_string(Some("hevc"), Some("Main"), Some(120)).starts_with("hvc1.")
         );
     }
 
