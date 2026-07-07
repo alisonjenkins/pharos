@@ -201,3 +201,75 @@ async fn search_hints_lowercase_alias_also_works() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["TotalRecordCount"], 2);
 }
+
+// Searching a SHOW name must find its episodes even when episode titles don't
+// contain the show name (episode titles are like "The C's World"). Both
+// /Search/Hints and /Items?SearchTerm search series_name now.
+#[actix_web::test]
+async fn search_matches_series_name_not_just_title() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy { admin: true },
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 900,
+            path: "/m/TV/Code Geass/Season 1/e01.mkv".into(),
+            title: "The C's World".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Code Geass".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "test".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let get = |uri: String| {
+        let tok = token.0.expose().to_string();
+        let app = &app;
+        async move {
+            let body = test::call_and_read_body(
+                app,
+                test::TestRequest::get()
+                    .uri(&uri)
+                    .insert_header(("X-Emby-Token", tok))
+                    .to_request(),
+            )
+            .await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+    let hints = get("/Search/Hints?searchTerm=Code%20Geass&limit=20".into()).await;
+    assert_eq!(
+        hints["TotalRecordCount"].as_u64(),
+        Some(1),
+        "Search/Hints must match series_name: {hints}"
+    );
+    let items = get("/Items?SearchTerm=Code%20Geass&Recursive=true".into()).await;
+    assert_eq!(
+        items["TotalRecordCount"].as_u64(),
+        Some(1),
+        "/Items search must match series_name: {items}"
+    );
+}
