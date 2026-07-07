@@ -13,16 +13,17 @@ concurrency:
 jobs:
   test:
     name: build + test + lint
-    runs-on: ubuntu-latest
+    # Self-hosted home nix builder (host daemon + warm store). Other jobs stay
+    # on ubuntu-latest.
+    runs-on: home-nix-builder-amd64
     timeout-minutes: 120
+    # Never run fork-PR code on the self-hosted runner (the enforcer's fork-PR
+    # approval gate is the primary control; this is a backstop).
+    if: ${{ github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Cache nix store
-        uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: alisonjenkins/setup-host-nix@v1
 
       - name: Validate flake
         run: nix flake check --no-build
