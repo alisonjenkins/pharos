@@ -275,10 +275,19 @@ fn handle_tiny(
                 job_id,
                 info: Box::new(info),
             },
-            Err(ProbeError::BadInput(_)) => WorkerEvent::Failed {
-                job_id,
-                error: WorkerError::BadInput,
-            },
+            Err(ProbeError::BadInput(detail)) => {
+                // Surface the real libav error (stderr → parent/pod logs); the
+                // wire contract collapses it to a bare `BadInput`, which hid
+                // *why* valid files (e.g. large mkvs over NFS) failed to demux.
+                eprintln!(
+                    "transcode-worker: probe bad-input for {}: {detail}",
+                    input.display()
+                );
+                WorkerEvent::Failed {
+                    job_id,
+                    error: WorkerError::BadInput,
+                }
+            }
             Err(ProbeError::Other(s)) => WorkerEvent::Failed {
                 job_id,
                 error: WorkerError::Other(s),

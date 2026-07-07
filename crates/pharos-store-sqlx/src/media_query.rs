@@ -92,14 +92,24 @@ pub(crate) fn build(
     if let Some(term) = q.search_term.as_deref() {
         let trimmed = term.trim();
         if !trimmed.is_empty() {
-            params.push(Param::Text(format!(
-                "%{}%",
-                like_escape(&trimmed.to_lowercase())
-            )));
-            let p = ph(params.len());
-            clauses.push(format!(
-                "COALESCE(title_fold, LOWER(title)) LIKE {p} ESCAPE '\\'"
-            ));
+            let needle = format!("%{}%", like_escape(&trimmed.to_lowercase()));
+            // Match the item title, the SERIES name (so searching a show name
+            // like "Code Geass" finds its episodes — episode titles rarely
+            // contain the series name), and artist/album for music. Each
+            // column needs its own positional placeholder (`ph` is `?`).
+            let cols = [
+                "COALESCE(title_fold, LOWER(title))",
+                "LOWER(COALESCE(series_name, ''))",
+                "LOWER(COALESCE(artist, ''))",
+                "LOWER(COALESCE(album, ''))",
+            ];
+            let mut ors = Vec::with_capacity(cols.len());
+            for col in cols {
+                params.push(Param::Text(needle.clone()));
+                let p = ph(params.len());
+                ors.push(format!("{col} LIKE {p} ESCAPE '\\'"));
+            }
+            clauses.push(format!("({})", ors.join(" OR ")));
         }
     }
 

@@ -126,7 +126,8 @@ impl SqliteStore {
     /// `score` is the bm25 rank for FTS hits (lower = better) and a large
     /// sentinel for substring-only hits so the FTS hits sort first. The
     /// `MIN(score)` GROUP collapses a row that matched both arms to its best
-    /// (FTS) score. Param order: match_expr, needle, needle.
+    /// (FTS) score. Param order: match_expr, then one needle per LIKE column
+    /// (title, overview, series_name, artist, album).
     fn search_hit_subquery() -> &'static str {
         "SELECT rid, MIN(score) AS score FROM ( \
              SELECT f.rowid AS rid, bm25(media_fts) AS score \
@@ -134,7 +135,10 @@ impl SqliteStore {
              UNION ALL \
              SELECT m2.id AS rid, 1e18 AS score FROM media_items m2 \
              WHERE (COALESCE(m2.title_fold, LOWER(m2.title)) LIKE ? ESCAPE '\\' \
-                    OR LOWER(COALESCE(m2.overview, '')) LIKE ? ESCAPE '\\') \
+                    OR LOWER(COALESCE(m2.overview, '')) LIKE ? ESCAPE '\\' \
+                    OR LOWER(COALESCE(m2.series_name, '')) LIKE ? ESCAPE '\\' \
+                    OR LOWER(COALESCE(m2.artist, '')) LIKE ? ESCAPE '\\' \
+                    OR LOWER(COALESCE(m2.album, '')) LIKE ? ESCAPE '\\') \
          ) GROUP BY rid"
     }
 
@@ -163,6 +167,9 @@ impl SqliteStore {
         );
         let mut query = sqlx::query_as::<_, MediaRow>(&sql)
             .bind(match_expr)
+            .bind(needle)
+            .bind(needle)
+            .bind(needle)
             .bind(needle)
             .bind(needle);
         for k in kinds {
@@ -197,6 +204,9 @@ impl SqliteStore {
         );
         let mut query = sqlx::query_as::<_, (i64,)>(&sql)
             .bind(match_expr)
+            .bind(needle)
+            .bind(needle)
+            .bind(needle)
             .bind(needle)
             .bind(needle);
         for k in kinds {
