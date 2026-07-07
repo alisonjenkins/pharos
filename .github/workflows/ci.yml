@@ -98,9 +98,11 @@ jobs:
           nix build .#jellyfinWebOci --out-link result-jfweb --print-out-paths
       - name: Push to GHCR (latest + immutable sha tag)
         env:
-          # GHCR accepts the workflow token as the password for any
-          # username; use the actor for readability.
-          GHCR_CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          # A PAT with write:packages, NOT the workflow GITHUB_TOKEN: these
+          # GHCR packages are user-owned + were created out-of-band, so the
+          # repo's GITHUB_TOKEN has no write grant on them (permission_denied:
+          # write_package). The PAT sidesteps GHCR's user-package Actions-access.
+          GHCR_CREDS: alisonjenkins:${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
           publish() {
