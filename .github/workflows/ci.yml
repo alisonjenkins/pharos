@@ -64,8 +64,7 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: alisonjenkins/setup-host-nix@v1
       - name: nix build .#pharos
         run: nix build .#pharos --print-out-paths
       - name: nix build .#oci
@@ -92,8 +91,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: alisonjenkins/setup-host-nix@v1
       - name: Build OCI archives
         run: |
           nix build .#oci --out-link result-oci --print-out-paths
@@ -124,8 +122,7 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: alisonjenkins/setup-host-nix@v1
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       # Browser binaries come from the nix-pinned playwright-driver
