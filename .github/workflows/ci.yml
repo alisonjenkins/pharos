@@ -59,7 +59,7 @@ jobs:
 
   oci:
     name: package + oci image
-    runs-on: ubuntu-latest
+    runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [test]
     steps:
@@ -80,7 +80,7 @@ jobs:
 
   publish:
     name: publish images (ghcr)
-    runs-on: ubuntu-latest
+    runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [test, oci]
     # Only on a push that landed on main — PRs build the image (oci job)
@@ -119,7 +119,7 @@ jobs:
 
   compat-playwright:
     name: jellyfin-web crawl
-    runs-on: ubuntu-latest
+    runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [test]
     steps:
