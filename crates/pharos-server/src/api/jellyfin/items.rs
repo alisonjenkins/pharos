@@ -1382,16 +1382,24 @@ async fn playback_info(
         || matches!(decision, Decision::AudioRemux { .. })
         || matches!(decision, Decision::VideoRemux { .. });
     let transcoding_url = match &decision {
-        Decision::Transcode {
-            target_container, ..
-        } if target_container == "ts" => {
-            // PlaySessionId rides on the URL so the HLS handlers can
-            // look up the cached Decision (T-fix-2 part 2) instead of
-            // re-running the negotiator per segment.
-            Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
-            ))
-        }
+        // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
+        // pipeline always emits mpegts H.264/AAC segments regardless of the
+        // container the client's profile nominally requested (hls.js demuxes
+        // mpegts fine), so the URL must be emitted for every video transcode —
+        // not only when the negotiated target_container happened to be "ts".
+        // Gating on `== "ts"` left `SupportsTranscoding: true` with a null
+        // TranscodingUrl whenever a client profile requested e.g. an mp4/hls
+        // transcode, and jellyfin-web then failed with "error processing the
+        // request" before ever fetching a segment.
+        // PlaySessionId rides on the URL so the HLS handlers look up the cached
+        // Decision instead of re-running the negotiator per segment.
+        Decision::Transcode { .. } if is_video => Some(format!(
+            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
+        )),
+        // Audio transcode → the universal audio endpoint.
+        Decision::Transcode { .. } => Some(format!(
+            "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key="
+        )),
         // P9 — VideoRemux drives the same HLS surface as Transcode;
         // the segment handler reads `Decision::VideoRemux` from the
         // registered session and emits `-c:v copy`.
