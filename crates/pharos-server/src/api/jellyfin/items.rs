@@ -57,10 +57,16 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/items/{id}/playbackinfo", web::get().to(playback_info))
         .route("/items/{id}/playbackinfo", web::post().to(playback_info));
 
+    // NB: thememedia/themesongs/themevideos are deliberately NOT here — the
+    // `stubs` module registers them with the correct jellyfin shapes
+    // (`thememedia` → an AllThemeMediaResult with ThemeVideosResult/
+    // ThemeSongsResult/SoundtrackSongsResult, each carrying an OwnerId).
+    // Registering them here to `empty_items_result` (a bare {Items,…} list)
+    // shadowed the stubs handler (actix matches the first-registered route),
+    // so jellyfin-web's ThemeMediaPlayer hit `ThemeSongsResult.OwnerId` on
+    // undefined and threw — an unhandled TypeError on the detail page that
+    // broke the play flow.
     for path in [
-        "/items/{id}/thememedia",
-        "/items/{id}/themesongs",
-        "/items/{id}/themevideos",
         "/items/{id}/specialfeatures",
         "/users/{user_id}/items/{item_id}/intros",
         "/shows/upcoming",

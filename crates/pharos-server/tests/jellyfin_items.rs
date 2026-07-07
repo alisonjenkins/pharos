@@ -1559,3 +1559,39 @@ async fn items_counts_aggregates_by_kind_and_distinct_names() {
     assert_eq!(v["AlbumCount"], 1);
     assert_eq!(v["ItemCount"], 3);
 }
+
+// `/Items/{id}/ThemeMedia` must return jellyfin's AllThemeMediaResult shape
+// (ThemeVideosResult/ThemeSongsResult/SoundtrackSongsResult, each with an
+// OwnerId), NOT a bare {Items,…} list. jellyfin-web's ThemeMediaPlayer reads
+// `ThemeSongsResult.OwnerId`; when items::register shadowed the stubs handler
+// with empty_items_result, that access threw and broke the detail page's play
+// flow.
+#[actix_web::test]
+async fn theme_media_has_all_theme_media_result_shape() {
+    let (state, token, _u) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/100/ThemeMedia")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v.get("Items").is_none(),
+        "must not be the bare empty-list shape: {v}"
+    );
+    for key in [
+        "ThemeVideosResult",
+        "ThemeSongsResult",
+        "SoundtrackSongsResult",
+    ] {
+        assert!(v.get(key).is_some(), "missing {key}: {v}");
+        assert!(
+            v[key].get("OwnerId").is_some(),
+            "{key} must carry OwnerId (jellyfin-web reads it): {v}"
+        );
+    }
+}
