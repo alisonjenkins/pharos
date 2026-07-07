@@ -15,7 +15,7 @@ jobs:
     name: build + test + lint
     # Self-hosted home nix builder (host daemon + warm store). Other jobs stay
     # on ubuntu-latest.
-    runs-on: home-nix-builder-amd64
+    runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     # Never run fork-PR code on the self-hosted runner (the enforcer's fork-PR
     # approval gate is the primary control; this is a backstop).
