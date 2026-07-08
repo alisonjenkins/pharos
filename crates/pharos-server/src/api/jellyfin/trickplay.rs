@@ -45,14 +45,26 @@ async fn tile(
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
 
+    // Validate the tile index against the layout (cheap; probe-derived).
     let layout = build_layout(&item.probe, width, state.trickplay_interval_ms)
         .ok_or_else(|| error::ErrorNotFound("no trickplay layout (missing probe data)"))?;
+    if tile_index >= layout.tile_count {
+        return Err(error::ErrorNotFound("tile index out of range"));
+    }
 
-    let bytes = cache
-        .tile_bytes(id_num, layout, tile_index, &item.path)
+    // Serve only what the background pre-generator has already produced —
+    // never generate on the request path. Whole-video sprite generation is
+    // slow (tens of seconds) + CPU-heavy, so doing it inline blocked the
+    // request past the ingress timeout (504) and stole CPU from playback. A
+    // 404 here just means "no preview yet"; jellyfin-web degrades gracefully.
+    match cache
+        .tile_bytes_cached(id_num, width, tile_index)
         .await
-        .map_err(map_cache_err)?;
-    Ok(HttpResponse::Ok().content_type("image/jpeg").body(bytes))
+        .map_err(map_cache_err)?
+    {
+        Some(bytes) => Ok(HttpResponse::Ok().content_type("image/jpeg").body(bytes)),
+        None => Err(error::ErrorNotFound("trickplay not generated yet")),
+    }
 }
 
 fn map_cache_err(e: TrickplayCacheError) -> actix_web::Error {

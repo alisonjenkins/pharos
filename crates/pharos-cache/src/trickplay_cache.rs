@@ -227,6 +227,73 @@ impl TrickplayCache {
         tokio::fs::read(&path).await.map_err(Into::into)
     }
 
+    /// Fetch one tile's bytes ONLY if the sprite set is already cached — never
+    /// generates. Returns `Ok(None)` on a miss so the HTTP handler can 404
+    /// instantly instead of blocking a request on a minute-long whole-video
+    /// generation (which also OOM-risked the process). Trickplay is populated
+    /// out-of-band by the background pre-generator; the client simply shows no
+    /// scrub preview until a sheet exists.
+    pub async fn tile_bytes_cached(
+        &self,
+        media_id: u64,
+        width: u32,
+        tile_index: u32,
+    ) -> Result<Option<Vec<u8>>, TrickplayCacheError> {
+        let key: CacheKey = (media_id, width);
+        let path = self.tile_path(key, tile_index);
+        match tokio::fs::read(&path).await {
+            Ok(b) => {
+                self.touch(key).await;
+                Ok(Some(b))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// True when tile 0 for `(media_id, width)` is already on disk — the cheap
+    /// "already generated?" probe the background pre-generator uses to skip
+    /// finished items without re-deriving the layout.
+    pub async fn is_generated(&self, media_id: u64, width: u32) -> bool {
+        let path = self.tile_path((media_id, width), 0);
+        tokio::fs::try_exists(&path).await.unwrap_or(false)
+    }
+
+    /// Generate the full sprite set for `(media_id, width)` if it isn't already
+    /// cached. Used by the background pre-generator so playback never triggers
+    /// on-demand generation. Deduplicated + LRU-recorded exactly like
+    /// [`Self::tile_bytes`]; a no-op (`Ok(false)`) when already present.
+    pub async fn ensure_generated(
+        &self,
+        media_id: u64,
+        layout: Layout,
+        source: &Path,
+    ) -> Result<bool, TrickplayCacheError> {
+        let key: CacheKey = (media_id, layout.width);
+        if self.is_generated(media_id, layout.width).await {
+            return Ok(false);
+        }
+        let lock = {
+            let mut state = self.state.lock().await;
+            state
+                .fetch_locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        // Re-check under the lock — a peer may have generated while we waited.
+        if self.is_generated(media_id, layout.width).await {
+            return Ok(false);
+        }
+        let bytes_written = self.generate(key, layout, source).await?;
+        self.record(key, bytes_written).await;
+        self.maybe_evict().await;
+        let mut state = self.state.lock().await;
+        state.fetch_locks.remove(&key);
+        Ok(true)
+    }
+
     /// Run ffmpeg to populate every tile under `{root}/{media}/{width}/`.
     /// Stages into a sibling `.tmp/` dir and atomic-renames each file
     /// into place so a torn write never serves a partial sprite.
@@ -510,6 +577,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn cached_only_fetch_never_generates() {
+        // The request-path helper must serve a cached tile but return None (not
+        // generate) on a miss — with a bogus ffmpeg so any generation attempt
+        // would surface as an error rather than silently succeeding.
+        let td = TempDir::new().unwrap();
+        let cache = TrickplayCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+
+        // Miss → None, and no sprite dir gets created.
+        assert!(!cache.is_generated(11, 320).await);
+        assert_eq!(cache.tile_bytes_cached(11, 320, 0).await.unwrap(), None);
+        let layout = Layout::compute(90_000, 1920, 1080, 320, 10_000).unwrap();
+        // ensure_generated with a broken ffmpeg + real miss must error (proving
+        // it actually tried to generate), not silently no-op.
+        assert!(cache
+            .ensure_generated(11, layout, std::path::Path::new("/n"))
+            .await
+            .is_err());
+
+        // Seed a tile → hit returns it, and is_generated / ensure_generated
+        // both see it as present (ensure_generated is a no-op → Ok(false)).
+        let dir = cache.key_dir((11, 320));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let payload = b"\xFF\xD8\xFF\xE0fakejpeg";
+        tokio::fs::write(dir.join("0.jpg"), payload).await.unwrap();
+        assert!(cache.is_generated(11, 320).await);
+        assert_eq!(
+            cache
+                .tile_bytes_cached(11, 320, 0)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&payload[..])
+        );
+        assert!(!cache
+            .ensure_generated(11, layout, std::path::Path::new("/n"))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

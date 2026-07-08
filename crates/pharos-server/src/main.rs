@@ -503,6 +503,17 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             cfg.server.trickplay_widths.clone(),
             cfg.server.trickplay_interval_ms,
         );
+        // Pre-generate sprite sheets in the background so the request path only
+        // ever serves cached tiles (the handler 404s on a miss). Keeps the slow,
+        // CPU-heavy whole-video generation off the playback path.
+        if let Some(tp) = state.trickplay.clone() {
+            pharos_server::trickplay_backfill::spawn(
+                state.stores.clone(),
+                tp,
+                cfg.server.trickplay_widths.clone(),
+                cfg.server.trickplay_interval_ms,
+            );
+        }
     }
     if let Some(backend) = build_live_tv_backend(
         cfg.server.live_tv_m3u.clone(),

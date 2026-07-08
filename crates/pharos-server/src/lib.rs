@@ -13,3 +13,4 @@ pub mod sessions;
 pub mod state;
 pub mod sync_resolver;
 pub mod transcode_sessions;
+pub mod trickplay_backfill;
