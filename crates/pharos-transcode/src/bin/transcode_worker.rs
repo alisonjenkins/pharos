@@ -202,7 +202,15 @@ async fn run_job(
             };
             let _ = write_frame(wr, &WorkerEvent::Done { job_id, out_bytes }).await;
         }
-        Ok(_) => {
+        Ok(s) => {
+            // The streaming (Stdout) parent never drains the control socket,
+            // so a Failed frame here is invisible — the request just sees a
+            // 0-byte stream. Echo ffmpeg's stderr to the worker's own stderr
+            // (inherited → server logs) so a broken encode is diagnosable.
+            eprintln!(
+                "transcode-worker: ffmpeg exited {s} for job {job_id:?}; stderr: {}",
+                stderr_text.trim()
+            );
             let _ = write_frame(
                 wr,
                 &WorkerEvent::Failed {
