@@ -130,9 +130,32 @@ pub struct AppState {
     /// Default at `AppState::new` is the spawn backend so tests get
     /// the production behaviour without extra wiring.
     pub ffmpeg: Arc<dyn FfmpegBackend>,
+    /// Memoises a synthesised Series/Season/Artist/Album wire id → the
+    /// representative member item id whose frame/cover is its poster. Without
+    /// this, every synth-item image request would re-scan the whole library
+    /// (`list()`), and a TV-library grid fires one per visible tile. `None`
+    /// caches a negative (id matched no group) so misses don't rescan either.
+    pub synth_image_ids: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>>,
 }
 
 impl AppState {
+    /// Look up a memoised synth-id → representative item id, if present.
+    pub fn synth_image_cached(&self, id: &str) -> Option<Option<u64>> {
+        self.synth_image_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .copied()
+    }
+
+    /// Record a synth-id → representative item id resolution.
+    pub fn synth_image_remember(&self, id: &str, item_id: Option<u64>) {
+        self.synth_image_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string(), item_id);
+    }
+
     /// Construct with a fresh random `server_id`. Reserved for tests that
     /// don't care about identity persistence — production callers should
     /// use [`AppState::load`] so jellyfin clients don't re-pair across
@@ -166,6 +189,7 @@ impl AppState {
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
             ffmpeg: default_ffmpeg_backend(),
+            synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -220,6 +244,7 @@ impl AppState {
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
             ffmpeg: default_ffmpeg_backend(),
+            synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 

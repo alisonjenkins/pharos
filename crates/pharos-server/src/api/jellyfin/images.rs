@@ -219,14 +219,22 @@ async fn serve_image(
     let Some(cache) = state.images.as_ref() else {
         return Ok(HttpResponse::NotFound().body(""));
     };
-    let id: u64 = match id_str.parse() {
-        Ok(id) => id,
-        Err(_) => return Ok(HttpResponse::NotFound().body("")),
+    // A numeric id is a real media row. A 32-hex id is a SYNTHESISED
+    // Series/Season (pharos stores no row for those — they're grouped from
+    // episodes), so resolve it to a representative episode and serve that
+    // episode's frame as the show/season poster. Without this every series
+    // tile in the library 404'd its image.
+    let item = match id_str.parse::<u64>() {
+        Ok(id) => match state.stores.get(id).await {
+            Ok(it) => it,
+            Err(_) => return Ok(HttpResponse::NotFound().body("")),
+        },
+        Err(_) => match resolve_synth_image_item(state, id_str).await {
+            Some(it) => it,
+            None => return Ok(HttpResponse::NotFound().body("")),
+        },
     };
-    let item = match state.stores.get(id).await {
-        Ok(it) => it,
-        Err(_) => return Ok(HttpResponse::NotFound().body("")),
-    };
+    let id = item.id;
     // LIB-D5 — local-sidecar-first resolution. D4 records artwork
     // discovered at scan time (poster.jpg / fanart.jpg / logo.png /…
     // beside the media, or under the series folder for episodes) as
@@ -298,6 +306,73 @@ async fn serve_image(
         Err(_) => return Ok(HttpResponse::NotFound().body("")),
     };
     Ok(HttpResponse::Ok().content_type(content_type).body(bytes))
+}
+
+/// Resolve a synthesised Series/Season/Artist/Album wire id (a 32-hex hash,
+/// no stored row) to a representative member item whose frame / cover stands
+/// in as the group's poster. Series/Season pick the lowest `(season, episode)`
+/// so the poster is stable (usually S01E01); Artist/Album pick the first track.
+/// Returns `None` for an id matching no group (→ 404).
+async fn resolve_synth_image_item(
+    state: &AppState,
+    id_str: &str,
+) -> Option<pharos_core::MediaItem> {
+    use crate::api::jellyfin::dto::{
+        album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
+    };
+    // Memoised resolution: a TV-library grid fires one image request per tile,
+    // and each full `list()` scans the whole library. Cache the synth-id →
+    // item-id mapping (including negatives) so only the first request per group
+    // pays the scan.
+    if let Some(cached) = state.synth_image_cached(id_str) {
+        return match cached {
+            Some(item_id) => state.stores.get(item_id).await.ok(),
+            None => None,
+        };
+    }
+    let all = state.stores.list().await.ok()?;
+
+    // Series / Season: lowest (season, episode) episode in the group.
+    let mut best: Option<(&pharos_core::MediaItem, (u32, u32))> = None;
+    for it in &all {
+        let Some(s) = it.series.as_ref() else {
+            continue;
+        };
+        let is_series = series_id_for_key(s.series_folder.as_deref(), &s.series_name) == id_str;
+        let is_season = s.season_number.is_some_and(|n| {
+            season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == id_str
+        });
+        if is_series || is_season {
+            let ord = (s.season_number.unwrap_or(0), s.episode_number.unwrap_or(0));
+            if best.map_or(true, |(_, b)| ord < b) {
+                best = Some((it, ord));
+            }
+        }
+    }
+    if let Some((it, _)) = best {
+        state.synth_image_remember(id_str, Some(it.id));
+        return Some(it.clone());
+    }
+
+    // Artist / Album: first track (by title) in the group.
+    let mut tracks: Vec<&pharos_core::MediaItem> = all
+        .iter()
+        .filter(|it| {
+            it.probe
+                .artist
+                .as_deref()
+                .is_some_and(|a| artist_id_for(a) == id_str)
+                || it
+                    .probe
+                    .album
+                    .as_deref()
+                    .is_some_and(|a| album_id_for(a) == id_str)
+        })
+        .collect();
+    tracks.sort_by(|a, b| a.title.cmp(&b.title));
+    let resolved = tracks.first().map(|it| (*it).clone());
+    state.synth_image_remember(id_str, resolved.as_ref().map(|it| it.id));
+    resolved
 }
 
 /// The `ArtworkRole::as_str` token (D4 stores these in `artwork.role`)
