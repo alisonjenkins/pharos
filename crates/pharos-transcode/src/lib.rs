@@ -413,6 +413,15 @@ fn build_args_for_device(
                 a.push("-b:a".into());
                 a.push(format!("{b}"));
             }
+            // libopus rejects a 5.1(side) source under the default mapping
+            // family (-1) — "Invalid channel layout … for specified mapping
+            // family -1" aborts the whole encode. Downmix to stereo: it's the
+            // browser-safe layout for a progressive VP9/WebM stream anyway, and
+            // avoids opus's finicky multichannel mapping entirely.
+            if matches!(c, AudioCodec::Opus) {
+                a.push("-ac".into());
+                a.push("2".into());
+            }
         }
         None => {
             a.push("-an".into());
@@ -491,6 +500,9 @@ mod tests {
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
         assert!(joined.contains("-c:a libopus"), "{joined}");
+        // Opus downmixes to stereo — a 5.1(side) source otherwise aborts the
+        // encode ("Invalid channel layout for mapping family -1").
+        assert!(joined.contains("-ac 2"), "{joined}");
         assert!(joined.contains("-f webm"), "{joined}");
         // Realtime pacing is mandatory for a live libvpx encode.
         assert!(joined.contains("-deadline realtime"), "{joined}");
