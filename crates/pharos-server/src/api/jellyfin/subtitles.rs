@@ -575,8 +575,53 @@ async fn scan_all_subs(dir: &std::path::Path, found: &mut Vec<(std::path::PathBu
     }
 }
 
+/// Cache of discovered sidecars keyed by media path, validated by the parent
+/// directory's mtime. Sidecar discovery walks the filesystem (multiple
+/// `read_dir`s across `Subs/`/`Subtitles/`/per-episode folders) and runs live
+/// on every PlaybackInfo + subtitle fetch — expensive over NFS (this cluster
+/// mounts with `lookupcache=none`). The parent mtime changes whenever a sub is
+/// added/removed directly beside the media (the common case), so a match means
+/// "nothing to re-scan". Caveat: a file added *inside* an existing
+/// `Subs/<stem>/` subfolder doesn't bump the parent mtime, so that rare case is
+/// picked up on the next server restart / library refresh.
+type SidecarList = Vec<(std::path::PathBuf, SidecarKind)>;
+type SidecarCache = std::collections::HashMap<std::path::PathBuf, (u64, SidecarList)>;
+static SIDECAR_CACHE: std::sync::LazyLock<std::sync::Mutex<SidecarCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Discover sidecar subtitle files for `media_path`, "no matter where they
-/// live". Covers, in a stable order:
+/// live" (see [`discover_sidecars_uncached`]). Memoised per media path +
+/// parent-dir mtime so repeated playback requests don't re-walk the folder.
+pub async fn discover_sidecars(
+    media_path: &std::path::Path,
+) -> Vec<(std::path::PathBuf, SidecarKind)> {
+    let Some(parent) = media_path.parent() else {
+        return Vec::new();
+    };
+    let mtime = tokio::fs::metadata(parent)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = media_path.to_path_buf();
+    if let Ok(cache) = SIDECAR_CACHE.lock() {
+        if let Some((cached_mtime, subs)) = cache.get(&key) {
+            if *cached_mtime == mtime {
+                return subs.clone();
+            }
+        }
+    }
+    let result = discover_sidecars_uncached(media_path).await;
+    if let Ok(mut cache) = SIDECAR_CACHE.lock() {
+        cache.insert(key, (mtime, result.clone()));
+    }
+    result
+}
+
+/// The actual filesystem walk (see [`discover_sidecars`] for the memoised
+/// entry point). Covers, in a stable order:
 /// - the same directory, `<stem>[.<lang>…].{srt,vtt,ass,ssa}`;
 /// - `Subs/` and `Subtitles/` folders next to the media (case-insensitive),
 ///   both stem-matched files and a per-episode `Subs/<stem>/` subfolder;
@@ -585,7 +630,7 @@ async fn scan_all_subs(dir: &std::path::Path, found: &mut Vec<(std::path::PathBu
 /// Returns `(sidecar_path, kind)` in ascending-path order so the numeric
 /// `stream_index` offsets stay consistent between PlaybackInfo and Stream.vtt
 /// fetches.
-pub async fn discover_sidecars(
+async fn discover_sidecars_uncached(
     media_path: &std::path::Path,
 ) -> Vec<(std::path::PathBuf, SidecarKind)> {
     let Some(parent) = media_path.parent() else {
