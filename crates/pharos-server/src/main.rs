@@ -511,6 +511,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             let prio = pharos_server::trickplay_backfill::spawn(
                 state.stores.clone(),
                 tp,
+                state.subtitles.clone(),
                 cfg.server.trickplay_widths.clone(),
                 cfg.server.trickplay_interval_ms,
             );

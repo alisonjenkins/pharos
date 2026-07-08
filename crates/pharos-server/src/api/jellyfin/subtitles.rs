@@ -161,6 +161,62 @@ async fn deliver_ass(
     Ok(ass_body(out))
 }
 
+/// Pre-extract every text subtitle track of `item` into the subtitle cache so
+/// playback serves them instantly instead of stalling on a whole-file demux.
+/// Image subs (PGS/VOBSUB) are skipped — they burn into the transcode, not a
+/// separate file. Best-effort: a failed track logs + is skipped. Runs off the
+/// request path (background pre-generator), so a multi-GB source's slow extract
+/// never blocks a viewer.
+pub(crate) async fn pre_extract_subtitles(
+    cache: &pharos_cache::SubtitleCache,
+    item: &pharos_core::MediaItem,
+) {
+    let Some(input) = item.path.to_str() else {
+        return;
+    };
+    let mtime = mtime_secs(&item.path).await;
+    for t in &item.probe.subtitle_tracks {
+        let codec_lc = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
+        if is_image_subtitle_codec(&codec_lc) {
+            continue; // burned into the transcode, never a sidecar file
+        }
+        let is_ass = matches!(
+            codec_lc.as_str(),
+            "ass" | "ssa" | "advanced substation alpha"
+        );
+        let kind = if is_ass {
+            SubtitleKind::EmbeddedAss
+        } else {
+            SubtitleKind::Embedded
+        };
+        if cache
+            .get(&item.path, mtime, t.stream_index, kind)
+            .await
+            .is_some()
+        {
+            continue;
+        }
+        // Map the actix `Error` (not `Send`) to a `String` before the
+        // `store().await` below, so this future stays `Send` for `tokio::spawn`.
+        let extracted = if is_ass {
+            run_ffmpeg_embedded_ass(input, t.stream_index).await
+        } else {
+            run_ffmpeg_embedded(input, t.stream_index).await
+        }
+        .map_err(|e| e.to_string());
+        match extracted {
+            Ok(bytes) => {
+                cache
+                    .store(&item.path, mtime, t.stream_index, kind, bytes)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, media.id = item.id, idx = t.stream_index, "subtitle pre-extract failed");
+            }
+        }
+    }
+}
+
 /// Extract one embedded subtitle stream verbatim as ASS.
 async fn run_ffmpeg_embedded_ass(
     input: &str,

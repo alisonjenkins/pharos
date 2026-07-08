@@ -21,6 +21,7 @@
 
 use crate::state::Stores;
 use pharos_cache::trickplay_cache::TrickplayCache;
+use pharos_cache::SubtitleCache;
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_jellyfin_api::dto::{build_layout, series_id_for_key};
 use std::time::Duration;
@@ -40,12 +41,15 @@ pub type PriorityTx = mpsc::UnboundedSender<u64>;
 pub fn spawn(
     stores: Stores,
     cache: TrickplayCache,
+    subtitles: Option<SubtitleCache>,
     widths: Vec<u32>,
     interval_ms: u32,
 ) -> PriorityTx {
     let (tx, rx) = mpsc::unbounded_channel();
-    if !widths.is_empty() {
-        tokio::spawn(run(stores, cache, widths, interval_ms, rx));
+    // Run whenever there's *some* asset to pre-build: trickplay widths or a
+    // subtitle cache to warm.
+    if !widths.is_empty() || subtitles.is_some() {
+        tokio::spawn(run(stores, cache, subtitles, widths, interval_ms, rx));
     }
     tx
 }
@@ -53,18 +57,20 @@ pub fn spawn(
 async fn run(
     stores: Stores,
     cache: TrickplayCache,
+    subtitles: Option<SubtitleCache>,
     widths: Vec<u32>,
     interval_ms: u32,
     mut prio_rx: mpsc::UnboundedReceiver<u64>,
 ) {
     tokio::time::sleep(WARMUP).await;
+    let subs = subtitles.as_ref();
     let mut pending: Vec<u64> = Vec::new();
     loop {
         drain_into(&mut prio_rx, &mut pending);
         let items = match stores.list().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "trickplay backfill: item list failed");
+                tracing::warn!(error = %e, "asset backfill: item list failed");
                 tokio::time::sleep(PASS_INTERVAL).await;
                 continue;
             }
@@ -72,7 +78,7 @@ async fn run(
 
         // 1. Priority: actively-watched items, expanded to their whole series.
         for id in pending.drain(..) {
-            generate_priority(id, &items, &cache, &widths, interval_ms).await;
+            generate_priority(id, &items, &cache, subs, &widths, interval_ms).await;
         }
 
         // 2. General sweep, newest-first.
@@ -82,9 +88,9 @@ async fn run(
             // A show that starts playing mid-sweep preempts the rest.
             drain_into(&mut prio_rx, &mut pending);
             for id in pending.drain(..) {
-                generate_priority(id, &items, &cache, &widths, interval_ms).await;
+                generate_priority(id, &items, &cache, subs, &widths, interval_ms).await;
             }
-            generate_item(item, &cache, &widths, interval_ms).await;
+            generate_item(item, &cache, subs, &widths, interval_ms).await;
         }
 
         // 3. Sweep done — sleep until the next pass, but wake immediately if a
@@ -115,6 +121,7 @@ async fn generate_priority(
     id: u64,
     items: &[MediaItem],
     cache: &TrickplayCache,
+    subs: Option<&SubtitleCache>,
     widths: &[u32],
     interval_ms: u32,
 ) {
@@ -130,15 +137,22 @@ async fn generate_priority(
                         series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
                     })
             }) {
-                generate_item(item, cache, widths, interval_ms).await;
+                generate_item(item, cache, subs, widths, interval_ms).await;
             }
         }
-        None => generate_item(seed, cache, widths, interval_ms).await,
+        None => generate_item(seed, cache, subs, widths, interval_ms).await,
     }
 }
 
-/// Generate every configured width for one item, skipping already-cached sets.
-async fn generate_item(item: &MediaItem, cache: &TrickplayCache, widths: &[u32], interval_ms: u32) {
+/// Pre-build one item's derived assets, skipping anything already cached:
+/// trickplay sprites for each configured width, then its text subtitles.
+async fn generate_item(
+    item: &MediaItem,
+    cache: &TrickplayCache,
+    subs: Option<&SubtitleCache>,
+    widths: &[u32],
+    interval_ms: u32,
+) {
     if !is_video(item) {
         return;
     }
@@ -159,6 +173,14 @@ async fn generate_item(item: &MediaItem, cache: &TrickplayCache, widths: &[u32],
             Err(e) => {
                 tracing::warn!(error = %e, media.id = item.id, width, "trickplay generation failed");
             }
+        }
+    }
+    // Warm subtitle extractions so first-scrub playback doesn't stall on a
+    // whole-file demux (esp. multi-GB lossless-audio anime).
+    if let Some(sc) = subs {
+        if !item.probe.subtitle_tracks.is_empty() {
+            crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
+            tokio::time::sleep(COOLDOWN).await;
         }
     }
 }
