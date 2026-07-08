@@ -517,6 +517,22 @@
                   # browser against the real external URL.
                   absolute_redirect off;
 
+                  # A handful of SERVER APIs live under the web prefix
+                  # (jellyfin serves /web/ConfigurationPages from the server,
+                  # not the static bundle). This regex beats the /${prefix}/
+                  # static prefix-match below, so proxy them to pharos —
+                  # otherwise the SPA-index fallback returns HTML and
+                  # jellyfin-web's dashboard crashes ("r.map is not a
+                  # function", mapping HTML instead of the JSON array).
+                  location ~* ^/${prefix}/configurationpages?(/|$) {
+                    proxy_pass __PHAROS_URL__;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host              $host;
+                    proxy_set_header X-Real-IP         $remote_addr;
+                    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
                   # SPA served under /${prefix}/; its files live at the
                   # bundle dir root, aliased in. try_files falls back to the
                   # SPA index for client-side routes.
