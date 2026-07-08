@@ -309,12 +309,35 @@ async fn stream_transcoded_webm(
     id_str: &str,
 ) -> Result<HttpResponse, actix_web::Error> {
     let item = load_item(state, id_str).await?;
-    let start_ticks = parse_start_time_ticks(req.query_string());
+    let qs = req.query_string();
+    let start_ticks = parse_start_time_ticks(qs);
     // Cap the encode bitrate: VP9 realtime software encoding is CPU-heavy, so
     // keep it modest. Honour the client's MaxStreamingBitrate when lower.
-    let cap = parse_max_streaming_bitrate(req.query_string())
+    let cap = parse_max_streaming_bitrate(qs)
         .unwrap_or(3_000_000)
         .clamp(500_000, 6_000_000);
+    // `AudioStreamIndex` / `SubtitleStreamIndex` are ABSOLUTE ffprobe stream
+    // indices (as jellyfin-web sends them), but the encoder args select by
+    // per-CODEC index (`-map 0:a:N`, subtitle-filter `si=N`). Convert by the
+    // track's position among its own codec's streams.
+    let audio_abs: Vec<u32> = item
+        .probe
+        .audio_tracks
+        .iter()
+        .map(|t| t.stream_index)
+        .collect();
+    let sub_abs: Vec<u32> = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .map(|t| t.stream_index)
+        .collect();
+    let audio_rel = parse_query_u32(qs, "AudioStreamIndex")
+        .and_then(|abs| codec_relative_index(&audio_abs, abs));
+    // A progressive `<video src>` has no soft-subtitle selection, so the picked
+    // subtitle is BURNED IN (only possible because VP9 re-encodes the frames).
+    let sub_rel = parse_query_u32(qs, "SubtitleStreamIndex")
+        .and_then(|abs| codec_relative_index(&sub_abs, abs));
     let opts = TranscodeOptions {
         container: Container::WebM,
         video: Some(VideoCodec::Vp9),
@@ -323,8 +346,8 @@ async fn stream_transcoded_webm(
         audio_bitrate_bps: Some(128_000),
         start_position_ticks: start_ticks,
         duration_ticks: None,
-        audio_source_stream_index: None,
-        burn_subtitle_stream_index: None,
+        audio_source_stream_index: audio_rel,
+        burn_subtitle_stream_index: sub_rel,
     };
     // Route through the load-balancing scheduler (crash-isolated worker,
     // spread across every GPU + CPU). Inline ffmpeg is only a last-resort
@@ -349,6 +372,20 @@ async fn stream_transcoded_webm(
     Ok(HttpResponse::Ok()
         .content_type("video/webm")
         .streaming(stream.into_stream()))
+}
+
+/// Parse an unsigned integer query param (case-insensitive key).
+fn parse_query_u32(qs: &str, name: &str) -> Option<u32> {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| v.parse().ok())
+}
+
+/// Map an absolute ffprobe stream index to its position among the streams of
+/// one codec kind (what ffmpeg's `0:a:N` / `subtitles=si=N` expect).
+fn codec_relative_index(abs_indices: &[u32], abs: u32) -> Option<u32> {
+    abs_indices.iter().position(|&i| i == abs).map(|p| p as u32)
 }
 
 /// True when `name=true` (case-insensitive) appears in the query string.

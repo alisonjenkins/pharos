@@ -564,3 +564,79 @@ async fn firefox_webm_h264_source_forced_to_transcode_not_directplay() {
         "vp9 source should still direct-play on Firefox: {v}"
     );
 }
+
+// Switching audio/subtitle tracks on the progressive WebM path: jellyfin-web
+// re-requests PlaybackInfo with AudioStreamIndex/SubtitleStreamIndex; pharos
+// must forward them into the stream.webm URL so the handler selects the audio
+// track + burns the chosen subtitle.
+#[actix_web::test]
+async fn firefox_webm_url_forwards_audio_and_subtitle_index() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 30,
+            path: "/hevc.mkv".into(),
+            title: "V".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                container: Some("matroska".into()),
+                video_codec: Some("hevc".into()),
+                audio_codec: Some("aac".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let body = r#"{"DeviceProfile":{"DirectPlayProfiles":[],"TranscodingProfiles":[
+        {"Container":"webm","Type":"Video","Protocol":"http","VideoCodec":"vp9","AudioCodec":"opus"}]}}"#;
+    let v: serde_json::Value = serde_json::from_slice(
+        &test::call_and_read_body(
+            &app,
+            test::TestRequest::post()
+                .uri("/Items/30/PlaybackInfo?AudioStreamIndex=6&SubtitleStreamIndex=3")
+                .insert_header(("X-Emby-Token", token.0.expose()))
+                .insert_header(("User-Agent", "Gecko/20100101 Firefox/152.0"))
+                .insert_header(("content-type", "application/json"))
+                .set_payload(body)
+                .to_request(),
+        )
+        .await,
+    )
+    .unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or("");
+    assert!(url.contains("/stream.webm"), "{v}");
+    assert!(
+        url.contains("AudioStreamIndex=6"),
+        "audio index not forwarded: {url}"
+    );
+    assert!(
+        url.contains("SubtitleStreamIndex=3"),
+        "subtitle index not forwarded: {url}"
+    );
+}
