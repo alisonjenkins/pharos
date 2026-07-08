@@ -123,7 +123,11 @@ fn track_timescales(data: &[u8], moov: &Box) -> Result<Vec<u32>, Fmp4Error> {
                 let version = data.get(body).copied().unwrap_or(0);
                 // mdhd: version(1) flags(3) then either 32-bit (v0) or 64-bit
                 // (v1) creation/modification times before the timescale.
-                let ts_off = if version == 1 { body + 4 + 16 } else { body + 4 + 8 };
+                let ts_off = if version == 1 {
+                    body + 4 + 16
+                } else {
+                    body + 4 + 8
+                };
                 if ts_off + 4 <= mdhd.end {
                     out.push(u32::from_be_bytes(
                         data[ts_off..ts_off + 4].try_into().unwrap_or([0; 4]),
@@ -138,17 +142,9 @@ fn track_timescales(data: &[u8], moov: &Box) -> Result<Vec<u32>, Fmp4Error> {
 /// Shift every `tfdt` inside one `moof` by `base_ticks[k]` for the K-th
 /// `traf`, in place. Adds to the existing value so multi-fragment segments
 /// keep their intra-segment offsets.
-fn shift_moof_tfdt(
-    data: &mut [u8],
-    moof: &Box,
-    base_ticks: &[u64],
-) -> Result<(), Fmp4Error> {
+fn shift_moof_tfdt(data: &mut [u8], moof: &Box, base_ticks: &[u64]) -> Result<(), Fmp4Error> {
     let trafs = walk(data, moof.start + moof.header..moof.end)?;
-    for (traf_k, traf) in trafs
-        .iter()
-        .filter(|b| &b.kind == b"traf")
-        .enumerate()
-    {
+    for (traf_k, traf) in trafs.iter().filter(|b| &b.kind == b"traf").enumerate() {
         let children = walk(data, traf.start + traf.header..traf.end)?;
         for tfdt in children.iter().filter(|b| &b.kind == b"tfdt") {
             let body = tfdt.start + tfdt.header;
@@ -156,11 +152,14 @@ fn shift_moof_tfdt(
             let base = base_ticks.get(traf_k).copied().unwrap_or(0);
             if version == 1 {
                 if body + 12 <= tfdt.end {
-                    let cur = u64::from_be_bytes(data[body + 4..body + 12].try_into().unwrap_or([0; 8]));
-                    data[body + 4..body + 12].copy_from_slice(&cur.saturating_add(base).to_be_bytes());
+                    let cur =
+                        u64::from_be_bytes(data[body + 4..body + 12].try_into().unwrap_or([0; 8]));
+                    data[body + 4..body + 12]
+                        .copy_from_slice(&cur.saturating_add(base).to_be_bytes());
                 }
             } else if body + 8 <= tfdt.end {
-                let cur = u32::from_be_bytes(data[body + 4..body + 8].try_into().unwrap_or([0; 4])) as u64;
+                let cur = u32::from_be_bytes(data[body + 4..body + 8].try_into().unwrap_or([0; 4]))
+                    as u64;
                 // A 32-bit tfdt can overflow once the base decode time exceeds
                 // ~2^32 ticks; clamp defensively (ffmpeg emits v1 for long
                 // media, so this is the short-media fast path).
@@ -183,14 +182,20 @@ pub fn process_segment(
     seg_seconds: f64,
 ) -> Result<Processed, Fmp4Error> {
     let top = walk(raw, 0..raw.len())?;
-    let moov = top.iter().find(|b| &b.kind == b"moov").ok_or(Fmp4Error::NoMoov)?;
+    let moov = top
+        .iter()
+        .find(|b| &b.kind == b"moov")
+        .ok_or(Fmp4Error::NoMoov)?;
     if !top.iter().any(|b| &b.kind == b"moof") {
         return Err(Fmp4Error::NoMoof);
     }
 
     // Init = ftyp (if present) + moov, verbatim.
     let mut init = Vec::new();
-    for b in top.iter().filter(|b| &b.kind == b"ftyp" || &b.kind == b"moov") {
+    for b in top
+        .iter()
+        .filter(|b| &b.kind == b"ftyp" || &b.kind == b"moov")
+    {
         init.extend_from_slice(&raw[b.start..b.end]);
     }
 
@@ -225,7 +230,11 @@ pub fn process_segment(
                 media[span.start + 2],
                 media[span.start + 3],
             ]);
-            if size32 == 1 { 16 } else { 8 }
+            if size32 == 1 {
+                16
+            } else {
+                8
+            }
         };
         let moof = Box {
             kind: *b"moof",

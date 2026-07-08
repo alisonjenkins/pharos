@@ -151,7 +151,10 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
     )
     .await;
     let master = std::str::from_utf8(&master).unwrap();
-    assert!(master.contains("vp09"), "master must advertise vp09:\n{master}");
+    assert!(
+        master.contains("vp09"),
+        "master must advertise vp09:\n{master}"
+    );
     assert!(
         master.contains("/videos/42/vp9/main.m3u8"),
         "master must route to the VP9 variant:\n{master}"
@@ -172,7 +175,10 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
         "variant must declare the fMP4 init:\n{variant}"
     );
     assert!(variant.contains("/videos/42/vp9/0.m4s"), "{variant}");
-    assert!(variant.contains("/videos/42/vp9/2.m4s"), "15s/6s ⇒ ≥3 segs:\n{variant}");
+    assert!(
+        variant.contains("/videos/42/vp9/2.m4s"),
+        "15s/6s ⇒ ≥3 segs:\n{variant}"
+    );
 
     // 3. init.mp4 is ftyp+moov, no moof.
     let init = test::call_and_read_body(
@@ -182,7 +188,10 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
             .to_request(),
     )
     .await;
-    assert!(has_box(&init, b"ftyp") && has_box(&init, b"moov"), "init needs ftyp+moov");
+    assert!(
+        has_box(&init, b"ftyp") && has_box(&init, b"moov"),
+        "init needs ftyp+moov"
+    );
     assert!(!has_box(&init, b"moof"), "init must not contain moof");
 
     // 4. Segment 0 is moof-only media (no moov/ftyp), tfdt at 0.
@@ -193,13 +202,22 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
             .to_request(),
     )
     .await;
-    assert!(has_box(&seg0, b"moof") && has_box(&seg0, b"mdat"), "seg0 needs moof+mdat");
-    assert!(!has_box(&seg0, b"moov"), "media segment must not carry moov");
+    assert!(
+        has_box(&seg0, b"moof") && has_box(&seg0, b"mdat"),
+        "seg0 needs moof+mdat"
+    );
+    assert!(
+        !has_box(&seg0, b"moov"),
+        "media segment must not carry moov"
+    );
     assert!(!has_box(&seg0, b"mfra"), "stale mfra must be stripped");
     // A 6 s segment can hold >1 fragment; tfdts interleave [video, audio, …]
     // per fragment (moov track order). The FIRST fragment sits at the origin.
     let seg0_tfdts = tfdt_values(&seg0);
-    assert!(seg0_tfdts.len() >= 2, "seg0 needs ≥1 fragment: {seg0_tfdts:?}");
+    assert!(
+        seg0_tfdts.len() >= 2,
+        "seg0 needs ≥1 fragment: {seg0_tfdts:?}"
+    );
     assert_eq!(
         (seg0_tfdts[0], seg0_tfdts[1]),
         (0, 0),
@@ -218,7 +236,10 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
     )
     .await;
     let seg2_tfdts = tfdt_values(&seg2);
-    assert!(seg2_tfdts.len() >= 2, "seg2 needs ≥1 fragment: {seg2_tfdts:?}");
+    assert!(
+        seg2_tfdts.len() >= 2,
+        "seg2 needs ≥1 fragment: {seg2_tfdts:?}"
+    );
     assert_eq!(
         seg2_tfdts[1],
         12 * 48_000,

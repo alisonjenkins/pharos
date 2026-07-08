@@ -1191,9 +1191,14 @@ async fn vp9_variant(
     let mut body = String::with_capacity(256 + segment_count as usize * 48);
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    body.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", SEGMENT_SECONDS as u32));
+    body.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        SEGMENT_SECONDS as u32
+    ));
     // fMP4 requires the init segment be declared before any media.
-    body.push_str(&format!("#EXT-X-MAP:URI=\"/videos/{id}/vp9/init.mp4?{qs}\"\n"));
+    body.push_str(&format!(
+        "#EXT-X-MAP:URI=\"/videos/{id}/vp9/init.mp4?{qs}\"\n"
+    ));
     let start_ticks = parse_start_time_ticks_qs(req.query_string());
     if start_ticks > 0 {
         let secs = start_ticks as f64 / TICKS_PER_SECOND as f64;
@@ -1229,7 +1234,15 @@ async fn vp9_init(
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
-    let opts = vp9_segment_opts(&state, &req, &item, 0, q.audio_stream_index, q.subtitle_stream_index).await;
+    let opts = vp9_segment_opts(
+        &state,
+        &req,
+        &item,
+        0,
+        q.audio_stream_index,
+        q.subtitle_stream_index,
+    )
+    .await;
     let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
     let processed = fmp4::process_segment(&raw, 0, SEGMENT_SECONDS)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
@@ -1256,9 +1269,15 @@ async fn vp9_segment(
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
-    let opts =
-        vp9_segment_opts(&state, &req, &item, seg, q.audio_stream_index, q.subtitle_stream_index)
-            .await;
+    let opts = vp9_segment_opts(
+        &state,
+        &req,
+        &item,
+        seg,
+        q.audio_stream_index,
+        q.subtitle_stream_index,
+    )
+    .await;
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
     let processed = fmp4::process_segment(&raw, seg, SEGMENT_SECONDS)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
@@ -1271,10 +1290,7 @@ async fn vp9_segment(
         .body(processed.media))
 }
 
-async fn fetch_item(
-    state: &AppState,
-    id: u64,
-) -> Result<pharos_core::MediaItem, actix_web::Error> {
+async fn fetch_item(state: &AppState, id: u64) -> Result<pharos_core::MediaItem, actix_web::Error> {
     state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -1283,10 +1299,7 @@ async fn fetch_item(
 
 /// W4 — enforce the PlaySessionId (if supplied) is still live, matching the
 /// `.ts` segment handler: a GC'd/stopped session must not keep serving bytes.
-async fn check_session(
-    state: &AppState,
-    psid: Option<&str>,
-) -> Result<(), actix_web::Error> {
+async fn check_session(state: &AppState, psid: Option<&str>) -> Result<(), actix_web::Error> {
     if let Some(psid) = psid {
         match state.transcode_sessions.get(psid).await {
             Ok(Some(_)) => {}
@@ -1405,7 +1418,8 @@ where
     use futures_util::StreamExt;
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
+        let chunk =
+            chunk.map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
