@@ -86,8 +86,29 @@
             # Only the two server-side binaries; the wasm UI crate is built
             # separately by `dx` (pharosUiBundle).
             cargoBuildFlags = [ "-p" "pharos-server" "-p" "pharos-transcode" ];
-            doCheck = false;
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+            # Build + test + lint in ONE derivation so `.#oci` (which has this
+            # store path in `contents`) reuses the compiled result instead of
+            # the CI pipeline compiling the workspace a second time. checks run
+            # in `--release` to share the release artifacts the buildPhase just
+            # produced. The fixture-gated real-ffmpeg tests are `#[ignore]`d, so
+            # nextest skips them here (no network / fixture corpus needed in the
+            # sandbox); ffmpeg-headless is still on PATH for any test that shells
+            # out defensively.
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              cargo nextest run --workspace --release --profile ci
+              cargo test --doc --workspace --release
+              cargo clippy --workspace --all-targets --release -- -D warnings
+              cargo fmt --all -- --check
+              runHook postCheck
+            '';
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.rustPlatform.bindgenHook
+              pkgs.cargo-nextest
+              pkgs.ffmpeg-headless
+            ];
             buildInputs = [ pkgs.ffmpeg-headless.dev ];
           };
         pharos = pharosBins;
