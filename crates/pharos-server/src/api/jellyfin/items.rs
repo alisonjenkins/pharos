@@ -3025,28 +3025,28 @@ async fn fetch_item_dto(
     id_str: &str,
     user_id: UserId,
 ) -> Result<HttpResponse, actix_web::Error> {
-    // T-fix-7 follow-up: when the id is one of the synthesised
-    // library CollectionFolder ids (32-hex, derived from
-    // [media].roots), short-circuit with a CollectionFolder DTO.
-    if let Some(view) = library_view_for_id(state, id_str) {
-        return Ok(HttpResponse::Ok().json(view));
-    }
-    if id_str == "00000000000000000000000000000000" {
-        return Ok(HttpResponse::Ok().json(all_media_placeholder(&state.server_id)));
-    }
-    // T-fix-18: synth Series + Season DTOs derived from any Episode
-    // item whose series_id / season_id matches. Each requires one
-    // store.list() — fine at phase-1 scale; once libraries grow
-    // a series_index lands.
-    if let Some(view) = synth_series_or_season(state, id_str).await? {
-        return Ok(HttpResponse::Ok().json(view));
-    }
-    // LIB-C5 — a collection wire id (32-hex) resolves to its BoxSet
-    // BaseItemDto so `/Items/{id}` on a box set returns the folder item
-    // (jellyfin-web fetches the BoxSet before listing its members via
-    // ParentId). Checked before the numeric parse since the wire id isn't
-    // a media-item store id.
-    {
+    // A real media item id is numeric; every synthesised / entity wire id
+    // (library CollectionFolder, Series/Season, BoxSet collection) is 32-hex
+    // and never parses as u64. Some of those resolutions scan the whole library
+    // (`synth_series_or_season` → `store.list()`), so gate them behind a
+    // non-numeric id — otherwise EVERY item-detail + poster fetch paid a full
+    // ~13k-row scan before reaching the cheap `get(id)` below.
+    let numeric_id: Option<u64> = id_str.parse::<u64>().ok();
+    if numeric_id.is_none() {
+        // T-fix-7 follow-up: synthesised library CollectionFolder ids.
+        if let Some(view) = library_view_for_id(state, id_str) {
+            return Ok(HttpResponse::Ok().json(view));
+        }
+        if id_str == "00000000000000000000000000000000" {
+            return Ok(HttpResponse::Ok().json(all_media_placeholder(&state.server_id)));
+        }
+        // T-fix-18: synth Series + Season DTOs derived from any Episode item
+        // whose series_id / season_id matches (one `store.list()`).
+        if let Some(view) = synth_series_or_season(state, id_str).await? {
+            return Ok(HttpResponse::Ok().json(view));
+        }
+        // LIB-C5 — a collection wire id resolves to its BoxSet BaseItemDto so
+        // `/Items/{id}` on a box set returns the folder item.
         use pharos_core::CollectionStore;
         if let Some(collection) = state
             .stores
@@ -3063,9 +3063,7 @@ async fn fetch_item_dto(
             return Ok(HttpResponse::Ok().json(collection_dto(state, &collection, count)));
         }
     }
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
