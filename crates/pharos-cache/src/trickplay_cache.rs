@@ -294,6 +294,12 @@ impl TrickplayCache {
             .arg("-loglevel")
             .arg("error")
             .arg("-nostdin")
+            // Keyframe-only decode (before -i): trickplay throws away >99% of
+            // frames, so decoding only keyframes is an order of magnitude less
+            // work; preview placement snaps to the nearest keyframe. Mirrors
+            // the libav path's `skip_frame(NonKey)`.
+            .arg("-skip_frame")
+            .arg("nokey")
             .arg("-i")
             .arg(source)
             .arg("-vf")

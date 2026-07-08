@@ -20,7 +20,9 @@ pub fn extract_image(
 ) -> Result<(), FrameError> {
     let spec = format!("scale={width}:-2");
     let mut jpeg: Option<Vec<u8>> = None;
-    frames::filter_video(src, seek_ms, &spec, Pixel::YUVJ420P, |f| {
+    // Not keyframe-only: a poster/thumbnail wants the exact frame at the seek
+    // point, so decode forward to it rather than snapping to a keyframe.
+    frames::filter_video(src, seek_ms, &spec, Pixel::YUVJ420P, false, |f| {
         jpeg = Some(frames::encode_jpeg(f, quality)?);
         // One frame is enough for a thumbnail.
         Ok(false)

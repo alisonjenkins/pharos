@@ -62,6 +62,7 @@ pub fn filter_video<F>(
     seek_ms: Option<u64>,
     filter_spec: &str,
     sink_format: format::Pixel,
+    keyframe_only: bool,
     mut on_frame: F,
 ) -> Result<usize, FrameError>
 where
@@ -84,6 +85,14 @@ where
         .decoder()
         .video()
         .map_err(|e| FrameError::BadInput(format!("video decoder: {e}")))?;
+    // Keyframe-only decode: for interval-sampled work (trickplay) we throw
+    // away >99% of decoded frames, so skip non-keyframes in the decoder
+    // entirely — an order-of-magnitude less decode work. Preview placement
+    // snaps to the nearest keyframe, which is imperceptible in a scrub strip.
+    // (Jellyfin's `EnableKeyFrameOnlyExtraction`, but on by default here.)
+    if keyframe_only {
+        decoder.skip_frame(ffmpeg::Discard::NonKey);
+    }
 
     // Input seek in AV_TIME_BASE (1e6) units, mirroring ffmpeg's `-ss`
     // before `-i`. Seek to <= target so the first decoded frame covers it.

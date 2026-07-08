@@ -38,7 +38,7 @@ pub fn trickplay_sprite(
 
     let mut produced: u32 = 0;
     let mut write_err: Option<FrameError> = None;
-    frames::filter_video(src, None, &spec, Pixel::YUVJ420P, |f| {
+    frames::filter_video(src, None, &spec, Pixel::YUVJ420P, true, |f| {
         let bytes = frames::encode_jpeg(f, quality)?;
         let p = out_dir.join(format!("{produced}.jpg"));
         if let Err(e) = std::fs::write(&p, &bytes) {
