@@ -45,13 +45,18 @@ jobs:
 
   audit:
     name: supply-chain
-    runs-on: ubuntu-latest
+    # Self-hosted home nix builder (host daemon + warm store), same as the
+    # other jobs — no Azure-hosted runner + no DeterminateSystems installer /
+    # magic-nix-cache round-trip.
+    runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     continue-on-error: false
+    # Never run fork-PR code on the self-hosted runner (backstop to the
+    # enforcer's fork-PR approval gate; matches the `test` job).
+    if: ${{ github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: alisonjenkins/setup-host-nix@v1
       - name: cargo-audit (RustSec)
         run: nix develop --command cargo audit
       - name: cargo-deny (licenses + bans)
