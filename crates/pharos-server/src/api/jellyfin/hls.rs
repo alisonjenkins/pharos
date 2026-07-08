@@ -822,6 +822,7 @@ async fn serve_segment(
         opts.audio_source_stream_index,
         opts.burn_subtitle_stream_index,
         opts.video_bitrate_bps,
+        opts.video.map(|c| c.ffmpeg_codec()).unwrap_or("none"),
     );
 
     // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
@@ -912,10 +913,11 @@ fn segment_etag(
     audio_idx: Option<u32>,
     sub_idx: Option<u32>,
     bitrate: Option<u64>,
+    video_codec: &str,
 ) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let key = format!(
-        "{media_id}-{seg}-{audio}-{sub}-{br}",
+        "{media_id}-{seg}-{audio}-{sub}-{br}-{video_codec}",
         audio = audio_idx.map_or_else(|| "d".to_string(), |n| n.to_string()),
         sub = sub_idx.map_or_else(|| "off".to_string(), |n| n.to_string()),
         br = bitrate.map_or_else(|| "auto".to_string(), |b| b.to_string()),
@@ -1027,12 +1029,17 @@ fn build_segment_opts(
     }
 
     // Fallback path: no session registered → conservative defaults.
-    // P6 — copy the video bitstream when the source codec is already
-    // mpegts-compatible (h264 / hevc). Saves a full re-encode for
-    // clients that bypass PlaybackInfo (rare but real). Other codecs
-    // (vp9 / av1 / mpeg2) still re-encode to H.264 for safety.
+    // ONLY h264 may be stream-copied. The master playlist advertises `avc1`
+    // for every source EXCEPT a copied h264 (see `hls_output_codecs_string`),
+    // so the segments must be H.264 to match — copying an HEVC source here
+    // (as an earlier "mpegts-compatible" optimization did) produced HEVC
+    // segments under an avc1 manifest. Firefox/Safari can't decode HEVC and
+    // the codec mismatch broke hls.js with a fatal manifestParsingError; the
+    // codec-blind segment cache then served that HEVC segment to every client
+    // (including ones that DID transcode to h264). Re-encode anything but
+    // h264 to H.264.
     let (video, video_bitrate_bps) = match item.probe.video_codec.as_deref() {
-        Some(c) if matches!(c.to_ascii_lowercase().as_str(), "h264" | "hevc" | "h265") => {
+        Some(c) if c.eq_ignore_ascii_case("h264") || c.eq_ignore_ascii_case("avc1") => {
             // Copy + no -b:v cap (bitstream copies passthrough source bitrate).
             // Subtitle burn-in is incompatible with `-c:v copy`, so the
             // burn-in arg gets stripped in `build_args` already; we just
@@ -1386,13 +1393,22 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn fallback_emits_copy_for_hevc_source() {
+    fn fallback_reencodes_hevc_to_h264() {
+        // HEVC must be RE-ENCODED, never copied: the master playlist advertises
+        // avc1 for an HEVC source, so copying HEVC bytes under that manifest
+        // breaks h264-only clients (Firefox/Safari) with a manifestParsingError
+        // and poisons the segment cache with an undecodable segment.
         for codec in ["hevc", "h265", "HEVC", "Hevc"] {
             let item = item_with_video_codec(Some(codec));
             let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
             assert!(
-                matches!(opts.video, Some(pharos_transcode::VideoCodec::Copy)),
-                "codec {codec} did not copy",
+                matches!(opts.video, Some(pharos_transcode::VideoCodec::H264)),
+                "codec {codec} must re-encode to H264, got {:?}",
+                opts.video,
+            );
+            assert!(
+                opts.video_bitrate_bps.is_some(),
+                "re-encode needs a -b:v cap"
             );
         }
     }
@@ -1400,7 +1416,8 @@ mod tests {
     #[::core::prelude::v1::test]
     fn fallback_strips_subtitle_burn_in_when_copying_video() {
         // Burn-in needs re-encode; with `-c:v copy` it has to be a no-op.
-        let item = item_with_video_codec(Some("hevc"));
+        // h264 is the codec that still copies in the fallback.
+        let item = item_with_video_codec(Some("h264"));
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
         assert!(opts.burn_subtitle_stream_index.is_none());
     }

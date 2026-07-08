@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use pharos_transcode::{FfmpegTranscoder, TranscodeOptions};
+use pharos_transcode::{FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,9 +51,27 @@ struct EntryMeta {
 /// is rounded to nearest kbps so floating-point negotiation jitter
 /// doesn't produce phantom variant files. `0` means "no override"
 /// (negotiator-supplied default).
-type CacheKey = (u64, u32, u32, i32, u32);
+// Trailing `u32` is the video-codec tag (see `codec_tag`). Without it a
+// stream-COPIED segment (e.g. an HEVC source direct-remuxed) and a
+// RE-ENCODED H.264 segment for the same (media, seg, audio, sub, bitrate)
+// collided in the cache — the first writer won and served its codec to every
+// client, so an HEVC copy could be handed to an h264-only browser.
+type CacheKey = (u64, u32, u32, i32, u32, u32);
 
 const NO_SUBTITLE: i32 = -1;
+
+/// Stable small tag distinguishing the output video codec so copy vs
+/// re-encode never share a cache entry.
+fn codec_tag(video: Option<VideoCodec>) -> u32 {
+    match video {
+        None => 0,
+        Some(VideoCodec::Copy) => 1,
+        Some(VideoCodec::H264) => 2,
+        Some(VideoCodec::H265) => 3,
+        Some(VideoCodec::Vp9) => 4,
+        Some(VideoCodec::Av1) => 5,
+    }
+}
 
 fn make_key(
     media_id: u64,
@@ -61,6 +79,7 @@ fn make_key(
     audio_index: Option<u32>,
     subtitle_index: Option<u32>,
     video_bitrate_bps: Option<u64>,
+    video_codec_tag: u32,
 ) -> CacheKey {
     (
         media_id,
@@ -70,6 +89,7 @@ fn make_key(
         video_bitrate_bps
             .map(|b| (b / 1000).min(u32::MAX as u64) as u32)
             .unwrap_or(0),
+        video_codec_tag,
     )
 }
 
@@ -183,6 +203,7 @@ impl HlsSegmentCache {
             audio_index,
             subtitle_index,
             opts.video_bitrate_bps,
+            codec_tag(opts.video),
         );
         let path = self.segment_path_keyed(key);
 
@@ -243,7 +264,7 @@ impl HlsSegmentCache {
 
     #[cfg(test)]
     fn segment_path(&self, media_id: u64, seg_index: u32) -> PathBuf {
-        self.segment_path_keyed((media_id, seg_index, 0, NO_SUBTITLE, 0))
+        self.segment_path_keyed((media_id, seg_index, 0, NO_SUBTITLE, 0, 0))
     }
 
     /// Compose `{root}/{media_id}/{seg}.ts` for the default case
@@ -252,22 +273,25 @@ impl HlsSegmentCache {
     /// dimension diverges. Keeps the existing on-disk layout intact
     /// for warm caches that pre-date per-track + per-variant keys.
     fn segment_path_keyed(&self, key: CacheKey) -> PathBuf {
-        let (media_id, seg_index, audio_index, subtitle_index, bitrate_k) = key;
-        let filename = if audio_index == 0 && subtitle_index == NO_SUBTITLE && bitrate_k == 0 {
-            format!("{seg_index}.ts")
+        let (media_id, seg_index, audio_index, subtitle_index, bitrate_k, codec_k) = key;
+        // The codec tag is ALWAYS in the filename now. This deliberately
+        // orphans any pre-existing codec-blind `{seg}.ts` files: some were
+        // written by the old fallback that stream-copied HEVC into an avc1
+        // manifest, and there's no way to tell a poisoned HEVC `{seg}.ts` from
+        // a correct h264 one on disk — so bypass them all and let LRU reclaim
+        // the space. New files carry `-c{tag}` and never collide across codecs.
+        let sub_part = if subtitle_index == NO_SUBTITLE {
+            "off".to_string()
         } else {
-            let sub_part = if subtitle_index == NO_SUBTITLE {
-                "off".to_string()
-            } else {
-                subtitle_index.to_string()
-            };
-            let bitrate_part = if bitrate_k == 0 {
-                "auto".to_string()
-            } else {
-                format!("{bitrate_k}")
-            };
-            format!("{seg_index}-a{audio_index}-s{sub_part}-b{bitrate_part}.ts")
+            subtitle_index.to_string()
         };
+        let bitrate_part = if bitrate_k == 0 {
+            "auto".to_string()
+        } else {
+            format!("{bitrate_k}")
+        };
+        let filename =
+            format!("{seg_index}-a{audio_index}-s{sub_part}-b{bitrate_part}-c{codec_k}.ts");
         self.root.join(media_id.to_string()).join(filename)
     }
 
@@ -402,7 +426,7 @@ mod tests {
         }
         tokio::fs::write(&path, body).await.unwrap();
         cache
-            .record((media_id, seg, 0, NO_SUBTITLE, 0), body.len() as u64)
+            .record((media_id, seg, 0, NO_SUBTITLE, 0, 0), body.len() as u64)
             .await;
         cache.maybe_evict().await;
     }
