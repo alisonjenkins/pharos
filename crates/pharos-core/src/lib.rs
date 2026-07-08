@@ -1013,6 +1013,15 @@ pub trait LibraryStore: Send + Sync {
     /// `/Library/VirtualFolders` + `/Library/MediaFolders` + the view list.
     fn libraries(&self) -> impl std::future::Future<Output = DomainResult<Vec<Library>>> + Send;
 
+    /// Delete the library identified by its unique `root_path`. Idempotent
+    /// (deleting an absent root is a no-op). The `media_items` under that
+    /// path keep their rows — only the typed grouping is removed; their
+    /// `library_id` is cleared on the next `backfill_library_ids`.
+    fn delete_library(
+        &self,
+        root_path: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
     /// Path-boundary-safe backfill: assign `media_items.library_id` for
     /// every item whose path is strictly under the library's `root_path`
     /// (so `/media/movies` never claims `/media/movies-4k`). Idempotent —

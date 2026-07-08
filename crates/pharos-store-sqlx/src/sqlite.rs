@@ -1990,6 +1990,16 @@ impl LibraryStore for SqliteStore {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn delete_library(&self, root_path: &str) -> DomainResult<()> {
+        sqlx::query("DELETE FROM libraries WHERE root_path = ?")
+            .bind(root_path)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn libraries(&self) -> DomainResult<Vec<Library>> {
         let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
             "SELECT id, name, root_path, kind, wire_id FROM libraries ORDER BY name",
