@@ -1327,10 +1327,17 @@ struct PlaybackInfoBody {
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
+    req: actix_web::HttpRequest,
     path: web::Path<String>,
     body: Option<web::Json<PlaybackInfoBody>>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
+    // The HLS master/variant playlists and every segment authenticate via an
+    // `api_key` query param — hls.js fetches them with no auth header, so the
+    // TranscodingUrl handed to the client MUST carry the caller's token or the
+    // very first `master.m3u8` request 401s and playback dies with a fatal
+    // `manifestLoadError`. Recover the bearer that authenticated THIS request.
+    let api_key = crate::api::jellyfin::auth_extractor::extract_token(&req).unwrap_or_default();
     let id: u64 = id_str
         .parse()
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
@@ -1394,17 +1401,17 @@ async fn playback_info(
         // PlaySessionId rides on the URL so the HLS handlers look up the cached
         // Decision instead of re-running the negotiator per segment.
         Decision::Transcode { .. } if is_video => Some(format!(
-            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
+            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
         )),
         // Audio transcode → the universal audio endpoint.
         Decision::Transcode { .. } => Some(format!(
-            "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key="
+            "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}"
         )),
         // P9 — VideoRemux drives the same HLS surface as Transcode;
         // the segment handler reads `Decision::VideoRemux` from the
         // registered session and emits `-c:v copy`.
         Decision::VideoRemux { .. } => Some(format!(
-            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}"
+            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
         )),
         _ => None,
     };

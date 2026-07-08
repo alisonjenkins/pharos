@@ -110,6 +110,12 @@ async fn no_endpoint_echoes_bearer_token_in_response_body() {
     let app = test::init_service(build_app(state)).await;
     let mut leaks: Vec<String> = Vec::new();
 
+    // The ONE legitimate place the token may appear: as the value of an
+    // `api_key=` query param inside a URL the client must fetch without an
+    // auth header (the HLS `TranscodingUrl` for hls.js, which can't inject
+    // headers — the same token the server already embeds in every variant
+    // line of the master playlist). Every OTHER occurrence is a leak.
+    let api_key_prefix = format!("api_key={token}");
     for path in SCAN_ROUTES {
         let body = test::call_and_read_body(
             &app,
@@ -119,8 +125,20 @@ async fn no_endpoint_echoes_bearer_token_in_response_body() {
                 .to_request(),
         )
         .await;
-        if body.windows(token.len()).any(|w| w == token.as_bytes()) {
-            leaks.push((*path).to_string());
+        let hay = body.as_ref();
+        let needle = token.as_bytes();
+        let legit = api_key_prefix.as_bytes();
+        let mut i = 0;
+        while let Some(off) = hay[i..].windows(needle.len()).position(|w| w == needle) {
+            let at = i + off;
+            // Is this occurrence the value right after `api_key=`?
+            let ok = at >= (legit.len() - needle.len())
+                && &hay[at - (legit.len() - needle.len())..at + needle.len()] == legit;
+            if !ok {
+                leaks.push((*path).to_string());
+                break;
+            }
+            i = at + needle.len();
         }
     }
 

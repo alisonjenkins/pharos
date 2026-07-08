@@ -274,5 +274,12 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
         url.is_some_and(|u| u.contains("master.m3u8")),
         "video transcode must emit an HLS master URL, got {v}"
     );
+    // hls.js fetches the master playlist with NO auth header, so the token
+    // MUST ride in the URL as `api_key` — otherwise the first manifest load
+    // 401s and playback dies with a fatal manifestLoadError.
+    assert!(
+        url.is_some_and(|u| u.contains(&format!("api_key={}", token.0.expose()))),
+        "TranscodingUrl must embed the caller's token as api_key, got {v}"
+    );
     assert_eq!(ms["TranscodingSubProtocol"].as_str(), Some("hls"), "{v}");
 }
