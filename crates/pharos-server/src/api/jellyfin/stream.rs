@@ -21,6 +21,7 @@ use actix_web::{
     web, HttpRequest, HttpResponse,
 };
 use pharos_core::{MediaItem, MediaStore};
+use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 /// Jellyfin 100-ns ticks per second.
@@ -288,7 +289,72 @@ async fn stream_video(
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // A `.webm` extension WITHOUT `Static=true` is a progressive transcode
+    // request. jellyfin-web routes browsers whose MSE can't decode H.264
+    // (e.g. some Firefox/Zen builds) here, since pharos's HLS surface only
+    // emits H.264/mpegts. `Static=true` is direct-play → serve the file as-is.
+    let ext = path.ext.as_deref().unwrap_or("");
+    if ext.eq_ignore_ascii_case("webm") && !qs_flag(req.query_string(), "Static") {
+        return stream_transcoded_webm(&state, &req, path.id_str()).await;
+    }
     deliver_stream(&state, &req, path.id_str()).await
+}
+
+/// Live progressive VP9/WebM transcode. VP9 + Opus in a WebM container is
+/// decodable by every modern browser (Firefox included) without any system
+/// H.264 codec. Streamed straight from ffmpeg's stdout — no segmenting.
+async fn stream_transcoded_webm(
+    state: &AppState,
+    req: &HttpRequest,
+    id_str: &str,
+) -> Result<HttpResponse, actix_web::Error> {
+    let item = load_item(state, id_str).await?;
+    let start_ticks = parse_start_time_ticks(req.query_string());
+    // Cap the encode bitrate: VP9 realtime software encoding is CPU-heavy, so
+    // keep it modest. Honour the client's MaxStreamingBitrate when lower.
+    let cap = parse_max_streaming_bitrate(req.query_string())
+        .unwrap_or(3_000_000)
+        .clamp(500_000, 6_000_000);
+    let opts = TranscodeOptions {
+        container: Container::WebM,
+        video: Some(VideoCodec::Vp9),
+        audio: Some(AudioCodec::Opus),
+        video_bitrate_bps: Some(cap),
+        audio_bitrate_bps: Some(128_000),
+        start_position_ticks: start_ticks,
+        duration_ticks: None,
+        audio_source_stream_index: None,
+        burn_subtitle_stream_index: None,
+    };
+    // Prefer the load-balancing scheduler (crash-isolated worker); fall back to
+    // an inline ffmpeg so the request still succeeds if the pool is busy.
+    if let Some(sched) = state.transcode_scheduler.as_ref() {
+        match sched.submit_live(item.path.clone(), opts.clone()).await {
+            Ok(stream) => {
+                return Ok(HttpResponse::Ok()
+                    .content_type("video/webm")
+                    .streaming(stream));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "scheduler webm transcode failed; inline fallback");
+            }
+        }
+    }
+    let transcoder = FfmpegTranscoder::new();
+    let stream = transcoder
+        .transcode(&item.path, &opts)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("webm transcode: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type("video/webm")
+        .streaming(stream.into_stream()))
+}
+
+/// True when `name=true` (case-insensitive) appears in the query string.
+fn qs_flag(qs: &str, name: &str) -> bool {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .any(|(k, v)| k.eq_ignore_ascii_case(name) && v.eq_ignore_ascii_case("true"))
 }
 
 async fn stream_audio(

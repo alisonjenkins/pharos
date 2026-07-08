@@ -1408,6 +1408,25 @@ async fn playback_info(
         // request" before ever fetching a segment.
         // PlaySessionId rides on the URL so the HLS handlers look up the cached
         // Decision instead of re-running the negotiator per segment.
+        // A client whose transcoding profile asks for VP9/VP8 (a browser whose
+        // MSE can't decode H.264 — e.g. some Firefox/Zen builds) gets a
+        // progressive VP9/WebM stream instead of the H.264/mpegts HLS surface,
+        // which it could not play. Everything else takes the HLS master.
+        Decision::Transcode {
+            target_video_codec,
+            ..
+        } if is_video
+            && target_video_codec.as_deref().is_some_and(|c| {
+                matches!(
+                    c.to_ascii_lowercase().as_str(),
+                    "vp9" | "vp8" | "vp09" | "vp08"
+                )
+            }) =>
+        {
+            Some(format!(
+                "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus"
+            ))
+        }
         Decision::Transcode { .. } if is_video => Some(format!(
             "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
         )),
@@ -1495,10 +1514,14 @@ async fn playback_info(
     // jellyfin-web's htmlVideoPlayer route the direct-play webm URL
     // through hls.js — which then errored with manifestParsingError
     // when it tried to parse the webm bytes as an HLS manifest.
-    let transcoding_sub_protocol = if transcoding_url.is_some() {
-        Some("hls")
-    } else {
-        None
+    // A progressive `.webm` transcode is played via a plain `<video src>`
+    // (SubProtocol "http"); the `.m3u8` surface is driven by hls.js
+    // (SubProtocol "hls"). Emitting "hls" for the webm URL would make
+    // jellyfin-web feed webm bytes to hls.js → manifestParsingError.
+    let transcoding_sub_protocol = match transcoding_url.as_deref() {
+        Some(u) if u.contains(".webm") => Some("http"),
+        Some(_) => Some("hls"),
+        None => None,
     };
 
     let primary_source = serde_json::json!({

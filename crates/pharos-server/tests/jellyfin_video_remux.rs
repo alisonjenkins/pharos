@@ -283,3 +283,84 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
     );
     assert_eq!(ms["TranscodingSubProtocol"].as_str(), Some("hls"), "{v}");
 }
+
+// A browser whose MSE can't decode H.264 (some Firefox/Zen builds) advertises
+// a VP9 transcoding profile. pharos must route it to a progressive VP9/WebM
+// stream (SubProtocol "http", played via <video src>), NOT the H.264 HLS
+// surface it can't decode.
+#[actix_web::test]
+async fn playback_info_vp9_profile_gets_progressive_webm() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 13,
+            path: "/hevc.mkv".into(),
+            title: "HEVC".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                width: Some(1920),
+                height: Some(1080),
+                container: Some("matroska".into()),
+                video_codec: Some("hevc".into()),
+                audio_codec: Some("aac".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri("/Items/13/PlaybackInfo")
+        .insert_header(("X-Emby-Token", token.0.expose()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(
+            r#"{"DeviceProfile":{
+              "DirectPlayProfiles":[],
+              "TranscodingProfiles":[{
+                "Container":"webm","Type":"Video","Protocol":"http",
+                "VideoCodec":"vp9","AudioCodec":"opus"
+              }]
+            }}"#,
+        )
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ms = &v["MediaSources"][0];
+    let url = ms["TranscodingUrl"].as_str().unwrap_or("");
+    assert!(
+        url.contains("/stream.webm"),
+        "expected progressive webm, got {v}"
+    );
+    assert!(
+        url.contains(&format!("api_key={}", token.0.expose())),
+        "webm URL needs api_key: {v}"
+    );
+    assert_eq!(
+        ms["TranscodingSubProtocol"].as_str(),
+        Some("http"),
+        "webm progressive must be http not hls: {v}"
+    );
+}
