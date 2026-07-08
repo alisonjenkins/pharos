@@ -246,6 +246,11 @@ impl HlsSegmentCache {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp = path.with_extension("ts.tmp");
+        // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
+        // if this exceeds that wall-clock the encoder is below realtime and the
+        // client will stall. Logged per miss so Loki/Tempo show exactly which
+        // segments are slow and why (codec + subtitle burn are the usual cost).
+        let started = std::time::Instant::now();
         if let Err(e) = self.write_segment(source, opts, &tmp).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
@@ -253,6 +258,17 @@ impl HlsSegmentCache {
         tokio::fs::rename(&tmp, &path).await?;
 
         let bytes = tokio::fs::read(&path).await?;
+        let transcode_ms = started.elapsed().as_millis();
+        tracing::info!(
+            media.id = media_id,
+            seg = seg_index,
+            transcode_ms = transcode_ms as u64,
+            bytes = bytes.len(),
+            codec = codec_tag(opts.video),
+            burn = opts.burn_subtitle_stream_index.is_some(),
+            audio_idx = opts.audio_source_stream_index,
+            "hls segment transcoded (cache miss)"
+        );
         self.record(key, bytes.len() as u64).await;
         self.maybe_evict().await;
         // Release the per-key fetch lock so future calls don't keep it

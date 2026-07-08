@@ -308,6 +308,9 @@ async fn stream_transcoded_webm(
     req: &HttpRequest,
     id_str: &str,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Progressive playback is live too — keep the background backfill parked
+    // (the segment handlers do this; this path was missing it).
+    state.note_playback_activity();
     let item = load_item(state, id_str).await?;
     let qs = req.query_string();
     let start_ticks = parse_start_time_ticks(qs);
@@ -349,6 +352,15 @@ async fn stream_transcoded_webm(
         audio_source_stream_index: audio_rel,
         burn_subtitle_stream_index: sub_rel,
     };
+    tracing::info!(
+        media.id = item.id,
+        start_ticks,
+        bitrate_cap = cap,
+        audio_rel,
+        sub_rel,
+        burn = sub_rel.is_some(),
+        "progressive webm transcode starting"
+    );
     // Route through the load-balancing scheduler (crash-isolated worker,
     // spread across every GPU + CPU). Inline ffmpeg is only a last-resort
     // fallback when the scheduler genuinely declines (pool saturated).
