@@ -790,6 +790,13 @@ async fn get_item_by_series_id_returns_series_dto() {
     assert_eq!(v["Name"], "Other Show");
     assert_eq!(v["Type"], "Series");
     assert_eq!(v["IsFolder"], true);
+    // The Series must advertise a Primary image tag so jellyfin-web requests
+    // the poster (resolved from a representative episode's frame). An empty
+    // ImageTags left every series tile blank in the library grid.
+    assert!(
+        v["ImageTags"]["Primary"].is_string(),
+        "Series needs a Primary ImageTag: {v}"
+    );
     // Resolve the synth Season DTO.
     let body = test::call_and_read_body(
         &app,

@@ -3360,8 +3360,14 @@ async fn synth_series_or_season(
 
 fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::Value {
     use crate::api::jellyfin::dto::series_id_for_key;
+    let id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+    // Advertise a Primary + Thumb tag so jellyfin-web requests the poster.
+    // pharos has no stored Series row, so `/Items/{id}/Images/Primary` resolves
+    // the synth id to a representative episode's frame (see images.rs). The tag
+    // value is only a cache-buster; the stable id keeps client URLs constant.
+    let tag = &id;
     let mut dto = serde_json::json!({
-        "Id": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
+        "Id": id,
         "Name": series.series_name,
         "ServerId": server_id,
         "Type": "Series",
@@ -3372,7 +3378,8 @@ fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::
         // Empty array fields jellyfin-web spreads over.
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
         "ProductionLocations": [], "RemoteTrailers": [], "Chapters": [],
-        "ImageTags": {}, "BackdropImageTags": [], "ProviderIds": {},
+        "ImageTags": { "Primary": tag, "Thumb": tag },
+        "BackdropImageTags": [tag], "ProviderIds": {},
     });
     // LIB-C11 — surface the folder-parsed year so jellyfin-web can tell
     // same-name shows apart in the Series view.
@@ -3389,8 +3396,14 @@ fn season_dto(
     season_name: &str,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
+    let id = season_id_for_key(
+        series.series_folder.as_deref(),
+        &series.series_name,
+        season_number,
+    );
+    let tag = &id;
     serde_json::json!({
-        "Id": season_id_for_key(series.series_folder.as_deref(), &series.series_name, season_number),
+        "Id": id,
         "Name": season_name,
         "ServerId": server_id,
         "Type": "Season",
@@ -3402,7 +3415,7 @@ fn season_dto(
         "IndexNumber": season_number,
         "UserData": { "Played": false, "PlayCount": 0 },
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
-        "ImageTags": {}, "BackdropImageTags": [], "ProviderIds": {},
+        "ImageTags": { "Primary": tag }, "BackdropImageTags": [], "ProviderIds": {},
     })
 }
 
