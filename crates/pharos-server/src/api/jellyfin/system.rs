@@ -11,6 +11,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // PascalCase requests jellyfin-web sends onto these.
     cfg.route("/system/info", web::get().to(system_info))
         .route("/system/info/public", web::get().to(system_info))
+        // Dashboard landing page's storage panel. pharos doesn't track disk
+        // usage; an empty `Folders` list renders the panel cleanly (a 404 left
+        // it blank + logged an error).
+        .route("/system/info/storage", web::get().to(system_storage))
         .route("/system/configuration", web::get().to(system_configuration))
         // Named config sub-sections the dashboard fetches (Networking →
         // `network`, Live TV → `livetv`, …). Without a GET these 404'd and the
@@ -157,6 +161,13 @@ async fn system_configuration_named(path: web::Path<String>) -> impl Responder {
 
 async fn empty_backup_list() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!([]))
+}
+
+async fn system_storage() -> impl Responder {
+    // `SystemStorageInfo` shape — jellyfin-web maps over `.Folders`. Empty is
+    // valid (renders "no data" rather than throwing). pharos doesn't surface
+    // per-folder free/used space yet.
+    HttpResponse::Ok().json(serde_json::json!({ "Folders": [] }))
 }
 
 async fn system_endpoint() -> impl Responder {

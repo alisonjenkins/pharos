@@ -499,4 +499,19 @@ async fn dashboard_named_config_and_backup_sections_render() {
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.is_array(), "/Backup must be an array, got {v}");
+
+    // Dashboard landing page storage panel maps over `.Folders`.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/System/Info/Storage")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v["Folders"].is_array(),
+        "/System/Info/Storage needs Folders[]: {v}"
+    );
 }
