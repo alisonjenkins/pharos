@@ -377,6 +377,19 @@ fn build_args_for_device(
                     a.push("-b:v".into());
                     a.push(format!("{b}"));
                 }
+                // libvpx (VP9) defaults to a glacial good-quality multi-pass
+                // encode — unusable for a live progressive transcode. Force
+                // realtime + multithreaded row encoding so it keeps pace with
+                // playback. Only the software libvpx encoder needs this (the
+                // H.264/HEVC hw + x264 paths pace fine).
+                if matches!(c, VideoCodec::Vp9) && encoder == "libvpx-vp9" {
+                    a.push("-deadline".into());
+                    a.push("realtime".into());
+                    a.push("-cpu-used".into());
+                    a.push("8".into());
+                    a.push("-row-mt".into());
+                    a.push("1".into());
+                }
             }
         }
         None => {
@@ -402,8 +415,13 @@ fn build_args_for_device(
     }
     a.push("-f".into());
     a.push(opts.container.ffmpeg_muxer().into());
-    a.push("-movflags".into());
-    a.push("+empty_moov+frag_keyframe+default_base_moof".into());
+    // `-movflags` is an mp4/mov-muxer option — fragmented MP4 for progressive
+    // streaming. The webm/mpegts muxers reject it ("Unrecognized option"), so
+    // scope it to MP4. WebM is inherently streamable (live cluster writing).
+    if matches!(opts.container, Container::Mp4) {
+        a.push("-movflags".into());
+        a.push("+empty_moov+frag_keyframe+default_base_moof".into());
+    }
     // File-direct outputs are written by the worker; ffmpeg refuses to
     // overwrite an existing file without `-y`, and the scheduler hands
     // us a fresh `.tmp` path so clobbering is intended.
@@ -450,6 +468,31 @@ mod tests {
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-f mp4"), "{joined}");
         assert!(joined.contains("pipe:1"));
+    }
+
+    #[test]
+    fn vp9_webm_args_are_realtime_and_skip_movflags() {
+        let o = TranscodeOptions {
+            container: Container::WebM,
+            video: Some(VideoCodec::Vp9),
+            audio: Some(AudioCodec::Opus),
+            video_bitrate_bps: Some(2_000_000),
+            audio_bitrate_bps: Some(128_000),
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+        };
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
+        assert!(joined.contains("-c:a libopus"), "{joined}");
+        assert!(joined.contains("-f webm"), "{joined}");
+        // Realtime pacing is mandatory for a live libvpx encode.
+        assert!(joined.contains("-deadline realtime"), "{joined}");
+        assert!(joined.contains("-cpu-used 8"), "{joined}");
+        assert!(joined.contains("-row-mt 1"), "{joined}");
+        // `-movflags` is mp4-only; the webm muxer rejects it.
+        assert!(!joined.contains("-movflags"), "{joined}");
     }
 
     #[test]
