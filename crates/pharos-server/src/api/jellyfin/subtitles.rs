@@ -66,6 +66,22 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/videos/{id}/subtitles/{stream_index}/stream.ass",
         web::get().to(stream_ass_short),
+    )
+    // jellyfin-web's JS subtitle renderer fetches `Stream.js` — a JSON list
+    // of cue events it draws itself (rather than a native <track>). Without
+    // this route selecting a text subtitle 404s and shows nothing. Some
+    // client versions insert a `{startPositionTicks}` path segment.
+    .route(
+        "/videos/{id}/{media_source_id}/subtitles/{stream_index}/stream.js",
+        web::get().to(stream_js),
+    )
+    .route(
+        "/videos/{id}/subtitles/{stream_index}/stream.js",
+        web::get().to(stream_js_short),
+    )
+    .route(
+        "/videos/{id}/{media_source_id}/subtitles/{stream_index}/{start_ticks}/stream.js",
+        web::get().to(stream_js_ticks),
     );
 }
 
@@ -491,6 +507,193 @@ async fn deliver_vtt(
     // fires for tests / minimal deployments.)
     let out = run_ffmpeg_embedded(input, stream_index).await?;
     Ok(vtt_response(out, style_lossy, &style))
+}
+
+async fn stream_js(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<(String, String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, _msid, stream_index) = path.into_inner();
+    deliver_js(&state, &id, stream_index).await
+}
+
+async fn stream_js_short(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, stream_index) = path.into_inner();
+    deliver_js(&state, &id, stream_index).await
+}
+
+async fn stream_js_ticks(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<(String, String, u32, i64)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, _msid, stream_index, _start_ticks) = path.into_inner();
+    deliver_js(&state, &id, stream_index).await
+}
+
+/// Serve a text subtitle track as jellyfin-web's JSON cue format
+/// (`Stream.js`). The client renders these events itself. Reuses the same
+/// WebVTT extraction as `Stream.vtt` (sidecar or embedded, cached) then
+/// converts the cues to the `{ "TrackEvents": [...] }` shape jellyfin
+/// expects. Image-codec tracks are rejected (they burn, never render here).
+async fn deliver_js(
+    state: &AppState,
+    id_str: &str,
+    stream_index: u32,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+
+    // Image subtitles can't become cue text — they burn into the transcode.
+    if let Some(codec) = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .find(|t| t.stream_index == stream_index)
+        .and_then(|t| t.codec.as_deref())
+    {
+        if is_image_subtitle_codec(&codec.to_ascii_lowercase()) {
+            return Err(error::ErrorUnsupportedMediaType(
+                "image subtitles render via burn-in, not Stream.js",
+            ));
+        }
+    }
+
+    let vtt = resolve_vtt_bytes(state, &item, stream_index).await?;
+    let body = webvtt_to_track_events_json(&vtt);
+    Ok(HttpResponse::Ok()
+        .content_type("application/json; charset=utf-8")
+        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+        .body(body))
+}
+
+/// Resolve a text subtitle track to raw WebVTT bytes (the cue source for
+/// both `Stream.vtt` and `Stream.js`): sidecar file (read or SRT→VTT
+/// converted) for indices at/above `SIDECAR_BASE_INDEX`, else the embedded
+/// stream extracted via ffmpeg. Cached like the `.vtt` path.
+async fn resolve_vtt_bytes(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+) -> Result<Vec<u8>, actix_web::Error> {
+    if stream_index >= SIDECAR_BASE_INDEX {
+        let offset = (stream_index - SIDECAR_BASE_INDEX) as usize;
+        let sidecars = discover_sidecars(&item.path).await;
+        let Some((path, kind)) = sidecars.into_iter().nth(offset) else {
+            return Err(error::ErrorNotFound("no sidecar at that index"));
+        };
+        return match kind {
+            SidecarKind::Vtt => tokio::fs::read(&path)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(format!("read: {e}"))),
+            SidecarKind::Convert => {
+                let input = path
+                    .to_str()
+                    .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+                let out = run_ffmpeg_srt_to_vtt(input).await?;
+                Ok(out)
+            }
+        };
+    }
+
+    let input = item
+        .path
+        .to_str()
+        .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+    let mtime = mtime_secs(&item.path).await;
+    if let Some(cache) = state.subtitles.as_ref() {
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+            .await
+        {
+            return Ok((*bytes).clone());
+        }
+        let lock = cache
+            .lock(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+            .await;
+        let _guard = lock.lock().await;
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+            .await
+        {
+            return Ok((*bytes).clone());
+        }
+        let out = run_ffmpeg_embedded(input, stream_index).await?;
+        let stored = cache
+            .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
+            .await;
+        return Ok((*stored).clone());
+    }
+    run_ffmpeg_embedded(input, stream_index).await
+}
+
+/// Parse a WebVTT document into jellyfin's `{ "TrackEvents": [...] }` JSON.
+/// Each cue becomes `{ Id, Text, StartPositionTicks, EndPositionTicks }`
+/// (ticks = 100 ns units). Tolerant of an optional leading cue-id line and
+/// `HH:MM:SS.mmm` or `MM:SS.mmm` timestamps.
+fn webvtt_to_track_events_json(vtt: &[u8]) -> String {
+    let text = String::from_utf8_lossy(vtt);
+    let mut events = Vec::new();
+    for block in text.split("\n\n").flat_map(|b| b.split("\r\n\r\n")) {
+        let block = block.trim_matches(['\r', '\n', ' ']);
+        if block.is_empty() || block.starts_with("WEBVTT") || block.starts_with("NOTE") {
+            continue;
+        }
+        // Find the `-->` timing line; everything after it is cue text.
+        let mut lines = block.lines();
+        let mut timing: Option<(i64, i64)> = None;
+        let mut cue_lines: Vec<&str> = Vec::new();
+        for line in lines.by_ref() {
+            if let Some((a, b)) = line.split_once("-->") {
+                timing = parse_vtt_ts(a.trim())
+                    .zip(parse_vtt_ts(b.trim().split(' ').next().unwrap_or("")));
+            } else if timing.is_some() {
+                cue_lines.push(line);
+            }
+            // Lines before the timing (a numeric/id line) are ignored.
+        }
+        let Some((start, end)) = timing else { continue };
+        let text = cue_lines.join("\n");
+        if text.trim().is_empty() {
+            continue;
+        }
+        events.push(serde_json::json!({
+            "Id": events.len().to_string(),
+            "Text": text,
+            "StartPositionTicks": start,
+            "EndPositionTicks": end,
+        }));
+    }
+    serde_json::json!({ "TrackEvents": events }).to_string()
+}
+
+/// Parse a WebVTT timestamp (`HH:MM:SS.mmm` or `MM:SS.mmm`) to ticks
+/// (100 ns units). Returns `None` on a malformed stamp.
+fn parse_vtt_ts(s: &str) -> Option<i64> {
+    let (hms, millis) = s.split_once('.').or_else(|| s.split_once(','))?;
+    let ms: i64 = millis.get(..3).unwrap_or(millis).parse().ok()?;
+    let parts: Vec<&str> = hms.split(':').collect();
+    let (h, m, sec) = match parts.as_slice() {
+        [h, m, s] => (
+            h.parse::<i64>().ok()?,
+            m.parse::<i64>().ok()?,
+            s.parse::<i64>().ok()?,
+        ),
+        [m, s] => (0, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
+        _ => return None,
+    };
+    let total_ms = ((h * 3600 + m * 60 + sec) * 1000) + ms;
+    Some(total_ms * 10_000) // 1 ms = 10,000 ticks
 }
 
 /// P33 — per-user subtitle styling. Resolved from the user's
@@ -954,6 +1157,32 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn vtt_ts_parses_to_ticks() {
+        // 1s = 10,000,000 ticks.
+        assert_eq!(parse_vtt_ts("00:00:01.000"), Some(10_000_000));
+        assert_eq!(parse_vtt_ts("01:02:03.500"), Some(37_235_000_000)); // 3723.5s
+        assert_eq!(parse_vtt_ts("00:05.250"), Some(52_500_000)); // MM:SS form
+        assert_eq!(parse_vtt_ts("garbage"), None);
+    }
+
+    #[test]
+    fn webvtt_converts_to_trackevents_json() {
+        let vtt = b"WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\nHello world\n\n\
+                    00:00:05.000 --> 00:00:06.500 line:90%\nSecond\ncue\n";
+        let json = webvtt_to_track_events_json(vtt);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let events = v["TrackEvents"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["Text"], "Hello world");
+        assert_eq!(events[0]["StartPositionTicks"], 10_000_000);
+        assert_eq!(events[0]["EndPositionTicks"], 40_000_000);
+        // Multi-line cue joins with \n; trailing cue settings on the timing
+        // line (`line:90%`) are ignored.
+        assert_eq!(events[1]["Text"], "Second\ncue");
+        assert_eq!(events[1]["StartPositionTicks"], 50_000_000);
+    }
 
     #[test]
     fn empty_style_renders_no_block() {
