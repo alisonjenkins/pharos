@@ -458,3 +458,45 @@ async fn api_key_create_rejects_empty_app() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 400);
 }
+
+#[actix_web::test]
+async fn dashboard_named_config_and_backup_sections_render() {
+    // The dashboard's Networking / Live TV / Backups pages fetch these; a 404
+    // made the section throw instead of rendering its (default) form.
+    let (state, token, _) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+
+    for (uri, key_field) in [
+        ("/System/Configuration/network", "InternalHttpPort"),
+        ("/System/Configuration/livetv", "TunerHosts"),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "{uri} should 200");
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get(key_field).is_some(), "{uri} missing {key_field}: {v}");
+    }
+
+    // /Backup lists backups; empty array renders the "no backups" state.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Backup")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v.is_array(), "/Backup must be an array, got {v}");
+}

@@ -2,8 +2,23 @@
 //! V18 — handlers send mpsc messages; no `Mutex` on the request path.
 
 use pharos_core::UserId;
+use pharos_jellyfin_api::dto::format_iso8601;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
+
+/// Current time as ISO8601 UTC. Stamped on every session event so the
+/// serialized `LastActivityDate` / `LastPlaybackCheckIn` are always valid
+/// dates — jellyfin-web's dashboard "Active Devices" panel formats them with
+/// date-fns, and a missing value yields `new Date(undefined)` → a fatal
+/// "Invalid time value" that crashes the whole dashboard landing page.
+fn iso_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_iso8601(secs)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -29,6 +44,9 @@ pub struct SessionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_streaming_bitrate: Option<u64>,
     pub supports_media_control: bool,
+    /// ISO8601 UTC, stamped on every event. Never empty — see [`iso_now`].
+    pub last_activity_date: String,
+    pub last_playback_check_in: String,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +158,8 @@ impl SessionRegistry {
                                     .as_ref()
                                     .map(|c| c.3)
                                     .unwrap_or(false),
+                                last_activity_date: iso_now(),
+                                last_playback_check_in: iso_now(),
                             },
                         );
                     }
@@ -153,6 +173,8 @@ impl SessionRegistry {
                             s.now_playing_item_id = Some(item_id);
                             s.position_ticks = position_ticks;
                             s.is_paused = is_paused;
+                            s.last_activity_date = iso_now();
+                            s.last_playback_check_in = s.last_activity_date.clone();
                         }
                     }
                     Msg::Apply(SessionEvent::Stopped { session_id }) => {
@@ -186,7 +208,11 @@ impl SessionRegistry {
                                     supported_commands: Vec::new(),
                                     max_streaming_bitrate: None,
                                     supports_media_control: false,
+                                    last_activity_date: iso_now(),
+                                    last_playback_check_in: iso_now(),
                                 });
+                        entry.last_activity_date = iso_now();
+                        entry.last_playback_check_in = entry.last_activity_date.clone();
                         entry.playable_media_types = playable_media_types;
                         entry.supported_commands = supported_commands;
                         entry.max_streaming_bitrate = max_streaming_bitrate;

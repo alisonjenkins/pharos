@@ -12,6 +12,16 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/system/info", web::get().to(system_info))
         .route("/system/info/public", web::get().to(system_info))
         .route("/system/configuration", web::get().to(system_configuration))
+        // Named config sub-sections the dashboard fetches (Networking →
+        // `network`, Live TV → `livetv`, …). Without a GET these 404'd and the
+        // section threw instead of rendering its (default) form.
+        .route(
+            "/system/configuration/{key}",
+            web::get().to(system_configuration_named),
+        )
+        // 10.11 Backups dashboard page lists backups; pharos has no backup
+        // feature, so an empty list renders the "no backups" state cleanly.
+        .route("/backup", web::get().to(empty_backup_list))
         .route("/system/endpoint", web::get().to(system_endpoint))
         .route(
             "/displaypreferences/{id}",
@@ -89,6 +99,64 @@ async fn system_configuration() -> impl Responder {
         "QuickConnectAvailable": true,
         "StartupWizardCompleted": true,
     }))
+}
+
+/// Default objects for the dashboard's named config sub-sections. pharos
+/// doesn't persist these (its config is the toml file), but returning a
+/// well-shaped default lets each dashboard page render its form fields with
+/// sensible values instead of throwing on a 404 / undefined access.
+async fn system_configuration_named(path: web::Path<String>) -> impl Responder {
+    let key = path.into_inner().to_ascii_lowercase();
+    let body = match key.as_str() {
+        "network" => serde_json::json!({
+            "BaseUrl": "",
+            "EnableHttps": false,
+            "RequireHttps": false,
+            "InternalHttpPort": 8096,
+            "InternalHttpsPort": 8920,
+            "PublicHttpPort": 8096,
+            "PublicHttpsPort": 8920,
+            "AutoDiscovery": false,
+            "EnableUPnP": false,
+            "EnableRemoteAccess": true,
+            "EnableIPv4": true,
+            "EnableIPv6": false,
+            "IgnoreVirtualInterfaces": true,
+            "EnablePublishedServerUriByRequest": false,
+            "LocalNetworkSubnets": [],
+            "LocalNetworkAddresses": [],
+            "KnownProxies": [],
+            "RemoteIPFilter": [],
+            "IsRemoteIPFilterBlacklist": false,
+            "PublishedServerUriBySubnet": [],
+            "VirtualInterfaceNames": ["veth"],
+        }),
+        "livetv" => serde_json::json!({
+            "GuideDays": null,
+            "EnableMovieProviders": true,
+            "RecordingPath": "",
+            "MovieRecordingPath": "",
+            "SeriesRecordingPath": "",
+            "EnableRecordingSubfolders": false,
+            "EnableOriginalAudioWithEncodedRecordings": false,
+            "TunerHosts": [],
+            "ListingProviders": [],
+        }),
+        "encoding" => serde_json::json!({
+            "EncodingThreadCount": -1,
+            "HardwareAccelerationType": "none",
+            "EnableThrottling": false,
+            "TranscodingTempPath": "",
+            "AllowHevcEncoding": true,
+        }),
+        // Unknown key → an empty object (still valid JSON the form can read).
+        _ => serde_json::json!({}),
+    };
+    HttpResponse::Ok().json(body)
+}
+
+async fn empty_backup_list() -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!([]))
 }
 
 async fn system_endpoint() -> impl Responder {

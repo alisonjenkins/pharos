@@ -80,6 +80,21 @@ async fn playing_then_sessions_lists_active() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["NowPlayingItemId"], "100");
     assert_eq!(arr[0]["Id"], "sess-1");
+    // The dashboard "Active Devices" panel formats these with date-fns; a
+    // missing value → `new Date(undefined)` → a fatal "Invalid time value"
+    // that crashes the whole dashboard landing page. Must be a non-empty
+    // ISO8601 string.
+    let last = arr[0]["LastActivityDate"].as_str().unwrap_or("");
+    assert!(
+        last.starts_with("20") && last.contains('T'),
+        "LastActivityDate must be ISO8601, got {last:?}"
+    );
+    assert!(
+        arr[0]["LastPlaybackCheckIn"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "LastPlaybackCheckIn must be present"
+    );
 }
 
 #[actix_web::test]
