@@ -46,6 +46,20 @@ pub enum AdminOp {
         #[arg(long)]
         admin: bool,
     },
+    /// Reset an existing user's password out-of-band. The recovery path when
+    /// a password is lost — works even when every admin is locked out, since
+    /// it writes the store directly rather than going through the admin API.
+    /// Password is read from `--password` or `PHAROS_ADMIN_PASSWORD` (prefer
+    /// the env var — a flag is visible in the process list + shell history).
+    ResetPassword {
+        /// Username whose password to reset.
+        #[arg(long)]
+        name: String,
+        /// New password. Prefer the `PHAROS_ADMIN_PASSWORD` env var over the
+        /// flag so the secret stays out of the process list / shell history.
+        #[arg(long, env = "PHAROS_ADMIN_PASSWORD", hide_env_values = true)]
+        password: String,
+    },
     /// Seed the known Playwright compat user (`playwright` /
     /// `playwright-test-pw`) plus a handful of placeholder items.
     /// Idempotent — re-running is a no-op for existing rows.

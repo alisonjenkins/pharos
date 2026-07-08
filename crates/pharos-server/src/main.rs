@@ -80,6 +80,9 @@ async fn main() -> Result<(), AppError> {
                 password,
                 admin,
             } => create_user(&cfg, &name, &password, admin).await?,
+            AdminOp::ResetPassword { name, password } => {
+                reset_password(&cfg, &name, &password).await?
+            }
             #[cfg(debug_assertions)]
             AdminOp::SeedPlaywrightUser => seed_playwright_user(&cfg).await?,
             #[cfg(debug_assertions)]
@@ -310,6 +313,34 @@ async fn create_user(
             writeln!(lock, "user '{name}' already exists; leaving as-is")?;
         }
     }
+    Ok(())
+}
+
+/// Reset an existing user's password (recovery path — see
+/// `cli::AdminOp::ResetPassword`). Writes the store directly (Argon2id hash +
+/// atomic `set_password`), so it works even when every admin is locked out.
+async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), AppError> {
+    use pharos_core::{SecretString, UserStore};
+    use pharos_server::auth::BuiltinAuth;
+
+    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let auth = BuiltinAuth::new(stores.clone());
+
+    let record = stores
+        .lookup_by_name(name)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(format!("look up user '{name}': {e}"))))?;
+    let hash = auth
+        .hash_password(&SecretString::new(password.to_string()))
+        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+    stores
+        .set_password(record.id, hash)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
+
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    writeln!(lock, "reset password for user '{name}'")?;
     Ok(())
 }
 
