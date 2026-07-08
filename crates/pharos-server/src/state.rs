@@ -99,7 +99,11 @@ pub struct AppState {
     /// library per `media_roots` entry (tests that only call
     /// `with_media_roots`), and to the all-zeros placeholder when there
     /// are no roots either.
-    pub libraries: Vec<pharos_core::Library>,
+    /// Wrapped in an `RwLock` so the dashboard's Add/Remove-library
+    /// endpoints (`POST`/`DELETE /Library/VirtualFolders`) can reconcile the
+    /// set at runtime without a restart. Read via [`AppState::libraries`];
+    /// replaced via [`AppState::set_libraries`].
+    pub library_set: Arc<std::sync::RwLock<Vec<pharos_core::Library>>>,
     /// Directory pharos surfaces log files from for the
     /// `/System/Logs` admin endpoint. None disables the surface.
     pub log_dir: Option<PathBuf>,
@@ -152,7 +156,7 @@ impl AppState {
             trickplay_interval_ms: 10_000,
             live_tv: None,
             media_roots: Vec::new(),
-            libraries: Vec::new(),
+            library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
@@ -206,7 +210,7 @@ impl AppState {
             trickplay_interval_ms: 10_000,
             live_tv: None,
             media_roots: Vec::new(),
-            libraries: Vec::new(),
+            library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
@@ -293,9 +297,26 @@ impl AppState {
     /// config. When set, `/Library/VirtualFolders` + `/Library/MediaFolders`
     /// and the view list advertise these (with per-kind CollectionType)
     /// instead of synthesising `mixed` libraries from `media_roots`.
-    pub fn with_libraries(mut self, libraries: Vec<pharos_core::Library>) -> Self {
-        self.libraries = libraries;
+    pub fn with_libraries(self, libraries: Vec<pharos_core::Library>) -> Self {
+        self.set_libraries(libraries);
         self
+    }
+
+    /// Read snapshot of the typed libraries. Poison-safe (a panicked writer
+    /// leaves the data intact; we read through the poison rather than
+    /// propagating a panic into request handling).
+    pub fn libraries(&self) -> std::sync::RwLockReadGuard<'_, Vec<pharos_core::Library>> {
+        self.library_set
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Replace the typed-library set at runtime (dashboard Add/Remove).
+    pub fn set_libraries(&self, libraries: Vec<pharos_core::Library>) {
+        *self
+            .library_set
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = libraries;
     }
 
     /// Fire a `LibraryChanged` event to every connected `/socket`.

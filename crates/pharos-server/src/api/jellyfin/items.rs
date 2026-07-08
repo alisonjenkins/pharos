@@ -53,6 +53,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/users/{user_id}/views", web::get().to(user_views))
         .route("/userviews", web::get().to(user_views_query))
         .route("/library/virtualfolders", web::get().to(virtual_folders))
+        .route(
+            "/library/virtualfolders",
+            web::post().to(add_virtual_folder),
+        )
+        .route(
+            "/library/virtualfolders",
+            web::delete().to(remove_virtual_folder),
+        )
         .route("/library/mediafolders", web::get().to(media_folders))
         .route("/items/{id}/playbackinfo", web::get().to(playback_info))
         .route("/items/{id}/playbackinfo", web::post().to(playback_info));
@@ -1703,9 +1711,9 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
     // carries its own CollectionType). The wire_id is the same
     // library_id_for_root hash a plain root would yield, so client URLs
     // are stable whether or not a library is typed.
-    if !state.libraries.is_empty() {
-        return state
-            .libraries
+    let libraries = state.libraries();
+    if !libraries.is_empty() {
+        return libraries
             .iter()
             .map(|lib| {
                 serde_json::json!({
@@ -1721,6 +1729,7 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
             })
             .collect();
     }
+    drop(libraries);
     if state.media_roots.is_empty() {
         return vec![all_media_placeholder(&state.server_id)];
     }
@@ -2168,17 +2177,21 @@ async fn resolve_parent_filter(
     }
     let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
 
-    // 1) Typed library entity by wire_id.
-    if let Some(lib) = state.libraries.iter().find(|l| l.wire_id == pid) {
-        if let Ok(ids) = state.stores.item_ids_for_library(&lib.wire_id).await {
+    // 1) Typed library entity by wire_id. Clone the (wire_id, root) out of the
+    // read guard first so it isn't held across the `await` below.
+    let matched_lib = state
+        .libraries()
+        .iter()
+        .find(|l| l.wire_id == pid)
+        .map(|l| (l.wire_id.clone(), l.root_path.clone()));
+    if let Some((wire_id, root_path)) = matched_lib {
+        if let Ok(ids) = state.stores.item_ids_for_library(&wire_id).await {
             if !ids.is_empty() {
-                return Ok(ParentResolution::Filter(ParentFilter::Library {
-                    wire_id: lib.wire_id.clone(),
-                }));
+                return Ok(ParentResolution::Filter(ParentFilter::Library { wire_id }));
             }
         }
         // No backfilled rows yet → path-prefix fallback against the root.
-        return Ok(ParentResolution::PathPrefix(lib.root_path.clone()));
+        return Ok(ParentResolution::PathPrefix(root_path));
     }
     // Legacy media-root (no typed-library entity) → path-prefix scope.
     if let Some(root) = state
@@ -2764,8 +2777,13 @@ async fn restrict_to_parent(
     //    the scanner). Fall back to the legacy path-prefix scan over
     //    `media_roots` for libraries not yet backfilled (or test states
     //    wired only with `with_media_roots`).
-    if let Some(lib) = state.libraries.iter().find(|l| l.wire_id == pid) {
-        if let Ok(ids) = state.stores.item_ids_for_library(&lib.wire_id).await {
+    let matched_lib = state
+        .libraries()
+        .iter()
+        .find(|l| l.wire_id == pid)
+        .map(|l| (l.wire_id.clone(), l.root_path.clone()));
+    if let Some((wire_id, root_path)) = matched_lib {
+        if let Ok(ids) = state.stores.item_ids_for_library(&wire_id).await {
             if !ids.is_empty() {
                 let want: std::collections::HashSet<u64> = ids.into_iter().collect();
                 return items.into_iter().filter(|i| want.contains(&i.id)).collect();
@@ -2773,7 +2791,7 @@ async fn restrict_to_parent(
         }
         // No backfilled rows yet → fall back to the path-prefix scan
         // against this library's root so the view still resolves.
-        let root = std::path::PathBuf::from(&lib.root_path);
+        let root = std::path::PathBuf::from(&root_path);
         return items
             .into_iter()
             .filter(|i| i.path.starts_with(&root))
@@ -3444,9 +3462,9 @@ async fn virtual_folders(
     // configured `media_roots` entry, then to the legacy "All Media" stub
     // when neither is configured (keeps the wire shape jellyfin-web
     // accepts).
-    let folders: Vec<VirtualFolderInfoDto> = if !state.libraries.is_empty() {
-        state
-            .libraries
+    let libraries = state.libraries();
+    let folders: Vec<VirtualFolderInfoDto> = if !libraries.is_empty() {
+        libraries
             .iter()
             .map(|lib| VirtualFolderInfoDto {
                 name: lib.name.clone(),
@@ -3482,4 +3500,220 @@ async fn virtual_folders(
         }]
     };
     Ok(HttpResponse::Ok().json(folders))
+}
+
+/// `POST /Library/VirtualFolders` — the dashboard "Add Media Library" wizard.
+/// jellyfin-web sends `?name=&collectionType=&refreshLibrary=` with the path in
+/// the body (`LibraryOptions.PathInfos[].Path`); some flows also pass `?paths=`.
+/// We create one typed library per path (the store keys a library by its root
+/// path), reload the runtime set, backfill `library_id` on the already-scanned
+/// items under that path, and — only when the path is not already under a
+/// configured media root — kick a background scan to import fresh content.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct AddVirtualFolderQuery {
+    name: Option<String>,
+    collection_type: Option<String>,
+    /// `?paths=` (repeatable in Jellyfin; actix hands us the last, so the body
+    /// is the primary source). A single `?path=` is also accepted.
+    path: Option<String>,
+    #[allow(dead_code)]
+    refresh_library: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct AddVirtualFolderBody {
+    library_options: LibraryOptionsBody,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct LibraryOptionsBody {
+    path_infos: Vec<PathInfoBody>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct PathInfoBody {
+    path: String,
+}
+
+async fn add_virtual_folder(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<AddVirtualFolderQuery>,
+    body: Option<web::Json<AddVirtualFolderBody>>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    use pharos_core::LibraryStore;
+
+    // Gather the paths: body PathInfos first, then a `?path=` fallback.
+    let mut paths: Vec<String> = body
+        .map(|b| {
+            b.into_inner()
+                .library_options
+                .path_infos
+                .into_iter()
+                .map(|p| p.path)
+                .filter(|p| !p.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if paths.is_empty() {
+        if let Some(p) = q.path.as_deref() {
+            if !p.trim().is_empty() {
+                paths.push(p.to_string());
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Err(error::ErrorBadRequest(
+            "no library path supplied (LibraryOptions.PathInfos[].Path)",
+        ));
+    }
+
+    let kind = pharos_core::LibraryKind::parse(q.collection_type.as_deref().unwrap_or("mixed"));
+
+    for (i, path) in paths.iter().enumerate() {
+        let root = std::path::PathBuf::from(path);
+        // One library per path — name the extras after the folder so they
+        // stay distinct rows (the store keys on root_path anyway).
+        let name = match (&q.name, i) {
+            (Some(n), 0) => n.clone(),
+            (Some(n), _) => format!(
+                "{n} ({})",
+                root.file_name().and_then(|s| s.to_str()).unwrap_or("extra")
+            ),
+            (None, _) => root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Media")
+                .to_string(),
+        };
+        let wire_id = library_id_for_root(&root);
+        state
+            .stores
+            .upsert_library(&name, path, kind, &wire_id)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    }
+
+    // Stamp library_id on items already indexed under the new path(s), then
+    // publish the reloaded set so the views/virtualfolders reflect it now.
+    reload_libraries_and_backfill(&state).await?;
+
+    // Kick a background scan for any path that isn't already under a scanned
+    // media root (paths under an existing root are already indexed → backfill
+    // above is enough; avoid a redundant full walk).
+    let new_roots: Vec<std::path::PathBuf> = paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .filter(|p| !state.media_roots.iter().any(|r| p.starts_with(r)))
+        .collect();
+    if !new_roots.is_empty() {
+        spawn_scan(state.clone().into_inner(), new_roots);
+    }
+
+    // Echo the created folder set back (jellyfin-web ignores the body but
+    // expects 2xx). 204 keeps it simple.
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `DELETE /Library/VirtualFolders?name=<display name>` — drop a library by
+/// its display name. The items stay indexed (they still live under a media
+/// root); only the typed grouping is removed.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RemoveVirtualFolderQuery {
+    name: Option<String>,
+}
+
+async fn remove_virtual_folder(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<RemoveVirtualFolderQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    use pharos_core::LibraryStore;
+    let Some(name) = q.name.as_deref().filter(|n| !n.trim().is_empty()) else {
+        return Err(error::ErrorBadRequest("missing ?name="));
+    };
+    // Resolve the root_path from the current set, then delete by root.
+    let root = state
+        .libraries()
+        .iter()
+        .find(|l| l.name == name)
+        .map(|l| l.root_path.clone());
+    let Some(root) = root else {
+        return Err(error::ErrorNotFound("no such library"));
+    };
+    state
+        .stores
+        .delete_library(&root)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    reload_libraries_and_backfill(&state).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// Reload the typed-library set from the store into `AppState`, re-stamping
+/// `media_items.library_id` by path-prefix, and broadcast a `LibraryChanged`
+/// so connected clients refresh their view list.
+async fn reload_libraries_and_backfill(state: &AppState) -> Result<(), actix_web::Error> {
+    use pharos_core::LibraryStore;
+    state
+        .stores
+        .backfill_library_ids()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let libraries = state
+        .stores
+        .libraries()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    state.set_libraries(libraries);
+    state.notify_library_changed();
+    Ok(())
+}
+
+/// Spawn a background incremental scan of `roots` on the actix runtime, mirroring
+/// `/Library/Refresh`. Returns immediately; the `LibraryChanged` broadcast on
+/// completion lets connected clients invalidate their caches.
+fn spawn_scan(state: std::sync::Arc<AppState>, roots: Vec<std::path::PathBuf>) {
+    actix_web::rt::spawn(async move {
+        let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+            .with_rate_limit_ms(state.scan_rate_limit_ms);
+        let mut added: Vec<pharos_core::MediaId> = Vec::new();
+        let mut removed: Vec<pharos_core::MediaId> = Vec::new();
+        for root in &roots {
+            match scanner.scan_into(root, &state.stores).await {
+                Ok(outcome) => {
+                    tracing::info!(
+                        root = %root.display(),
+                        added = outcome.added.len(),
+                        updated = outcome.updated.len(),
+                        removed = outcome.removed.len(),
+                        skipped = outcome.skipped,
+                        "add-library: root scanned"
+                    );
+                    added.extend(outcome.added.iter().copied());
+                    added.extend(outcome.updated.iter().copied());
+                    removed.extend(outcome.removed.iter().copied());
+                }
+                Err(e) => {
+                    tracing::warn!(root = %root.display(), error = %e, "add-library: scan failed")
+                }
+            }
+        }
+        use pharos_core::LibraryStore;
+        if let Err(e) = state.stores.backfill_library_ids().await {
+            tracing::warn!(error = %e, "add-library: post-scan backfill failed");
+        }
+        // Reload the runtime set so newly-scanned items resolve under the lib.
+        if let Ok(libs) = state.stores.libraries().await {
+            state.set_libraries(libs);
+        }
+        state.notify_library_delta(&added, &removed);
+    });
 }
