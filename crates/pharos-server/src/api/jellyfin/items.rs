@@ -2018,6 +2018,9 @@ async fn list_items(
     if boxset_only_request(&q) {
         return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
     }
+    if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &q).await? {
+        return Ok(resp);
+    }
     let dto = run_items_list(&state, user.0.id, &q).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
@@ -2037,6 +2040,15 @@ async fn list_user_items(
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
         return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+    }
+    // Virtual Series/Season listing — pharos stores no Series/Season row, so a
+    // `IncludeItemTypes=Series` (or `Season`) browse collapses the scoped
+    // episodes into synthetic folder tiles. jellyfin-web's TV-library grid and
+    // its "Shows" view both issue this; without the collapse they'd render one
+    // tile per episode instead of one per show, so a series like Code Geass
+    // never appears as a browsable entry.
+    if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &q).await? {
+        return Ok(resp);
     }
     let dto = run_items_list(&state, user.0.id, &q).await?;
     Ok(HttpResponse::Ok().json(dto))
@@ -3138,6 +3150,142 @@ fn fill_parent_ids(state: &AppState, dtos: &mut [BaseItemDto], items: &[&MediaIt
 /// Look up `id_str` against the synthesised Series + Season ids
 /// derived from every Episode in the store. Returns a Jellyfin-shaped
 /// Series / Season BaseItem DTO when matched. `None` otherwise.
+/// Which synthetic show-folder kind a `IncludeItemTypes=` browse asked for.
+/// `None` unless the requested types are drawn EXCLUSIVELY from the virtual
+/// show folders — a mixed request (e.g. `Series,Movie`) falls through to the
+/// normal media query so real kinds still page from SQL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShowFolderKind {
+    Series,
+    Season,
+}
+
+fn virtual_show_kind(include_item_types: Option<&str>) -> Option<ShowFolderKind> {
+    let raw = include_item_types?;
+    let types: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if types.is_empty() {
+        return None;
+    }
+    // Every requested type must be a virtual show folder for us to intercept.
+    if !types.iter().all(|t| t == "series" || t == "season") {
+        return None;
+    }
+    // Season wins when present (a Season browse is always scoped to a series).
+    if types.iter().any(|t| t == "season") {
+        Some(ShowFolderKind::Season)
+    } else {
+        Some(ShowFolderKind::Series)
+    }
+}
+
+/// Collapse the scoped episodes into synthetic Series (or Season) folder tiles.
+/// Returns `None` when the request is not an exclusively-virtual show browse,
+/// so the caller falls through to the normal media query.
+async fn maybe_list_virtual_shows(
+    state: &AppState,
+    user_id: UserId,
+    q: &ListQuery,
+) -> Result<Option<HttpResponse>, actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use std::collections::BTreeMap;
+
+    let Some(mode) = virtual_show_kind(q.include_item_types.as_deref()) else {
+        return Ok(None);
+    };
+
+    // Reuse the full parent/search scoping the media query already implements:
+    // fetch the matching EPISODES unpaged, then collapse them in memory. The
+    // SearchTerm→series_name match means a `SearchTerm=Code Geass` browse
+    // narrows to that show before collapsing.
+    let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
+    if matches!(parent, ParentResolution::Empty) {
+        return Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+            "Items": [],
+            "TotalRecordCount": 0,
+            "StartIndex": q.start_index,
+        }))));
+    }
+    let mut mq = build_media_query(user_id, q, &parent, true);
+    mq.kinds = vec![MediaKind::Episode];
+    mq.limit = None;
+    mq.start_index = 0;
+    mq.sort = Vec::new();
+    let (episodes, _total) = state
+        .stores
+        .query(&mq)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+
+    let descending = q
+        .sort_order
+        .as_deref()
+        .is_some_and(|o| o.eq_ignore_ascii_case("Descending"));
+
+    // Build one representative DTO per distinct key, name-sorted.
+    let mut reps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    match mode {
+        ShowFolderKind::Series => {
+            for ep in &episodes {
+                let Some(series) = ep.series.as_ref() else {
+                    continue;
+                };
+                // Sort key: lowercase name for a stable case-insensitive order,
+                // with the folder-keyed id appended so same-name shows in
+                // distinct folders stay separate tiles.
+                let sort_key = format!(
+                    "{}\u{0}{}",
+                    series.series_name.to_ascii_lowercase(),
+                    series_id_for_key(series.series_folder.as_deref(), &series.series_name),
+                );
+                reps.entry(sort_key)
+                    .or_insert_with(|| series_dto(&state.server_id, series));
+            }
+        }
+        ShowFolderKind::Season => {
+            for ep in &episodes {
+                let Some(series) = ep.series.as_ref() else {
+                    continue;
+                };
+                let Some(season_n) = series.season_number else {
+                    continue;
+                };
+                // Zero-padded season number → ascending numeric order.
+                let sort_key = format!("{season_n:06}");
+                reps.entry(sort_key).or_insert_with(|| {
+                    season_dto(
+                        &state.server_id,
+                        series,
+                        season_n,
+                        &season_display_name(season_n),
+                    )
+                });
+            }
+        }
+    }
+
+    let mut items: Vec<serde_json::Value> = reps.into_values().collect();
+    if descending {
+        items.reverse();
+    }
+    let total = items.len() as u32;
+    let start = q.start_index as usize;
+    let end = start.saturating_add(q.limit as usize).min(items.len());
+    let page: Vec<serde_json::Value> = if start >= items.len() {
+        Vec::new()
+    } else {
+        items.drain(start..end).collect()
+    };
+    Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+        "Items": page,
+        "TotalRecordCount": total,
+        "StartIndex": q.start_index,
+    }))))
+}
+
 async fn synth_series_or_season(
     state: &AppState,
     id_str: &str,
