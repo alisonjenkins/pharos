@@ -1447,56 +1447,76 @@ async fn playback_info(
         && (direct_play
             || matches!(decision, Decision::AudioRemux { .. })
             || matches!(decision, Decision::VideoRemux { .. }));
+    // Forward the client's audio/subtitle track selection into the progressive
+    // webm URL — jellyfin-web re-requests PlaybackInfo with these when the user
+    // switches tracks. The webm handler maps them to per-codec indices (audio
+    // select) + burns the chosen subtitle in.
+    let stream_selection = {
+        let q = req.query_string();
+        let mut s = String::new();
+        for key in ["AudioStreamIndex", "SubtitleStreamIndex"] {
+            if let Some(v) = q
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v)
+                .filter(|v| !v.is_empty())
+            {
+                s.push('&');
+                s.push_str(key);
+                s.push('=');
+                s.push_str(v);
+            }
+        }
+        s
+    };
     let webm_transcode_url = format!(
-        "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus"
+        "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus{stream_selection}"
     );
     let transcoding_url = if force_webm {
         Some(webm_transcode_url.clone())
     } else {
         match &decision {
-        // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
-        // pipeline always emits mpegts H.264/AAC segments regardless of the
-        // container the client's profile nominally requested (hls.js demuxes
-        // mpegts fine), so the URL must be emitted for every video transcode —
-        // not only when the negotiated target_container happened to be "ts".
-        // Gating on `== "ts"` left `SupportsTranscoding: true` with a null
-        // TranscodingUrl whenever a client profile requested e.g. an mp4/hls
-        // transcode, and jellyfin-web then failed with "error processing the
-        // request" before ever fetching a segment.
-        // PlaySessionId rides on the URL so the HLS handlers look up the cached
-        // Decision instead of re-running the negotiator per segment.
-        // A client whose transcoding profile asks for VP9/VP8 (a browser whose
-        // MSE can't decode H.264 — e.g. some Firefox/Zen builds) gets a
-        // progressive VP9/WebM stream instead of the H.264/mpegts HLS surface,
-        // which it could not play. Everything else takes the HLS master.
-        Decision::Transcode {
-            target_video_codec,
-            ..
-        } if is_video
-            && target_video_codec.as_deref().is_some_and(|c| {
-                matches!(
-                    c.to_ascii_lowercase().as_str(),
-                    "vp9" | "vp8" | "vp09" | "vp08"
-                )
-            }) =>
-        {
-            Some(format!(
-                "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus"
-            ))
-        }
-        Decision::Transcode { .. } if is_video => Some(format!(
-            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
-        )),
-        // Audio transcode → the universal audio endpoint.
-        Decision::Transcode { .. } => Some(format!(
-            "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}"
-        )),
-        // P9 — VideoRemux drives the same HLS surface as Transcode;
-        // the segment handler reads `Decision::VideoRemux` from the
-        // registered session and emits `-c:v copy`.
-        Decision::VideoRemux { .. } => Some(format!(
-            "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
-        )),
+            // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
+            // pipeline always emits mpegts H.264/AAC segments regardless of the
+            // container the client's profile nominally requested (hls.js demuxes
+            // mpegts fine), so the URL must be emitted for every video transcode —
+            // not only when the negotiated target_container happened to be "ts".
+            // Gating on `== "ts"` left `SupportsTranscoding: true` with a null
+            // TranscodingUrl whenever a client profile requested e.g. an mp4/hls
+            // transcode, and jellyfin-web then failed with "error processing the
+            // request" before ever fetching a segment.
+            // PlaySessionId rides on the URL so the HLS handlers look up the cached
+            // Decision instead of re-running the negotiator per segment.
+            // A client whose transcoding profile asks for VP9/VP8 (a browser whose
+            // MSE can't decode H.264 — e.g. some Firefox/Zen builds) gets a
+            // progressive VP9/WebM stream instead of the H.264/mpegts HLS surface,
+            // which it could not play. Everything else takes the HLS master.
+            Decision::Transcode {
+                target_video_codec, ..
+            } if is_video
+                && target_video_codec.as_deref().is_some_and(|c| {
+                    matches!(
+                        c.to_ascii_lowercase().as_str(),
+                        "vp9" | "vp8" | "vp09" | "vp08"
+                    )
+                }) =>
+            {
+                Some(webm_transcode_url.clone())
+            }
+            Decision::Transcode { .. } if is_video => Some(format!(
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
+            )),
+            // Audio transcode → the universal audio endpoint.
+            Decision::Transcode { .. } => Some(format!(
+                "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}"
+            )),
+            // P9 — VideoRemux drives the same HLS surface as Transcode;
+            // the segment handler reads `Decision::VideoRemux` from the
+            // registered session and emits `-c:v copy`.
+            Decision::VideoRemux { .. } => Some(format!(
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
+            )),
             _ => None,
         }
     };
