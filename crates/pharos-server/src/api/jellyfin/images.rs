@@ -251,7 +251,7 @@ async fn serve_image(
     // public image route on a stale row).
     if index == 0 {
         if let Some(local) = local_artwork_path(state, id, role).await {
-            return serve_local_artwork(&local, head_only, format, state).await;
+            return serve_local_artwork(&local, role, head_only, format, state).await;
         }
     }
     // An audio track has no video frames, so Backdrop / Thumb can only ever
@@ -488,10 +488,30 @@ fn content_type_for_ext(path: &std::path::Path) -> &'static str {
 /// cache to write into — falls back to the original sidecar bytes.
 async fn serve_local_artwork(
     path: &std::path::Path,
+    role: ImageRole,
     head_only: bool,
     format: ImageFormat,
     state: &AppState,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Downscale big poster/fanart sidecars to a display-appropriate width and
+    // serve the cached copy — a full-res multi-MB sidecar read off NFS was
+    // costing 1-4s per tile in a library grid. Only opaque photographic roles
+    // are scaled; Logo/Banner/Art/Disc are usually small PNGs with alpha that
+    // a JPEG re-encode would wreck, so they pass through untouched.
+    let target_width: Option<u32> = match role {
+        ImageRole::Primary => Some(480),
+        ImageRole::Thumb => Some(640),
+        ImageRole::Backdrop => Some(1280),
+        _ => None,
+    };
+    let scaled;
+    let path = match (target_width, state.images.as_ref()) {
+        (Some(width), Some(cache)) => {
+            scaled = cache.scaled_artwork(path, width).await;
+            scaled.as_path()
+        }
+        _ => path,
+    };
     let ext = match format {
         ImageFormat::Jpeg => None,
         ImageFormat::Webp => Some("webp"),

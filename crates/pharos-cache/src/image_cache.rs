@@ -198,6 +198,107 @@ impl ImageCache {
         Ok(out_path)
     }
 
+    /// Scale a local artwork file (a downloaded `poster.jpg` / `fanart.jpg`
+    /// sidecar) down to `width` and cache the result, returning the cached
+    /// path. Original sidecars are frequently multi-MB full-resolution art;
+    /// serving them verbatim over NFS cost seconds per poster in a library
+    /// grid, while jellyfin-web only ever displays a small thumbnail. The
+    /// scaled JPEG is a few tens of KB → near-instant reads on repeat views.
+    ///
+    /// Cached under `{root}/scaled/{hash(path,mtime)}-w{width}.jpg`, keyed on
+    /// the source path + mtime so re-downloaded art invalidates. Falls back to
+    /// the original path on any scale failure (never fails a public image).
+    pub async fn scaled_artwork(&self, source: &Path, width: u32) -> PathBuf {
+        let Ok(meta) = tokio::fs::metadata(source).await else {
+            return source.to_path_buf();
+        };
+        // Only large sidecars are worth scaling. A ~480px JPEG is tens of KB;
+        // a full-res poster/fanart is hundreds of KB to several MB. Below this
+        // threshold the file already reads fast and re-encoding would only add
+        // latency + risk upscaling a small image, so serve it verbatim.
+        const SCALE_THRESHOLD_BYTES: u64 = 256 * 1024;
+        if meta.len() < SCALE_THRESHOLD_BYTES {
+            return source.to_path_buf();
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut h);
+        mtime.hash(&mut h);
+        let key = h.finish();
+        let dir = self.root.join("scaled");
+        let out = dir.join(format!("{key:016x}-w{width}.jpg"));
+        if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+            return out;
+        }
+        if tokio::fs::create_dir_all(&dir).await.is_err() {
+            return source.to_path_buf();
+        }
+        let tmp = out.with_extension("jpg.tmp");
+        match self.scale_to(source, width, &tmp).await {
+            Ok(()) => match tokio::fs::rename(&tmp, &out).await {
+                Ok(()) => out,
+                Err(_) => source.to_path_buf(),
+            },
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                tracing::warn!(error = %e, source = %source.display(), "artwork scale failed; serving original");
+                source.to_path_buf()
+            }
+        }
+    }
+
+    /// Decode an image file, scale it to `width` (aspect preserved), and write
+    /// a JPEG to `out`. Uses the resident libav worker when available (prod),
+    /// else forks ffmpeg — `extract_image` opens a still image the same way it
+    /// opens a video (single frame), so this reuses that path.
+    async fn scale_to(&self, source: &Path, width: u32, out: &Path) -> Result<(), ImageCacheError> {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            return pool
+                .extract_image(source.to_path_buf(), None, width, 3, out.to_path_buf())
+                .await
+                .map_err(|e| ImageCacheError::Ffmpeg(None, format!("libav scale: {e}")));
+        }
+        let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        let scale = format!("scale={width}:-1");
+        let status = Command::new(&self.ffmpeg_bin)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-i",
+                source_str,
+                "-vf",
+                &scale,
+                "-frames:v",
+                "1",
+                "-f",
+                "mjpeg",
+                "-q:v",
+                "3",
+                "-y",
+                out_str,
+            ])
+            .status()
+            .await
+            .map_err(|e| ImageCacheError::Ffmpeg(None, format!("spawn: {e}")))?;
+        if !status.success() {
+            return Err(ImageCacheError::Ffmpeg(
+                status.code(),
+                "ffmpeg scale failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Atomically persist a client-uploaded image at the given role +
     /// index slot. Used by `POST /Items/{id}/Images/{type}`.
     #[instrument(skip(self, body), fields(media.id = %id, role = ?role, bytes = body.len()))]
@@ -447,6 +548,26 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn small_sidecar_is_served_verbatim_not_scaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache"));
+        // A small sidecar (< 256 KiB) must be returned as-is: no re-encode,
+        // no scaled copy — it already reads fast.
+        let small = dir.path().join("poster.jpg");
+        tokio::fs::write(&small, vec![0u8; 4096]).await.unwrap();
+        let out = cache.scaled_artwork(&small, 480).await;
+        assert_eq!(out, small, "small art must pass through unscaled");
+    }
+
+    #[tokio::test]
+    async fn missing_source_returns_input_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache"));
+        let missing = dir.path().join("nope.jpg");
+        assert_eq!(cache.scaled_artwork(&missing, 480).await, missing);
+    }
 
     #[test]
     fn primary_path_layout_per_kind() {
