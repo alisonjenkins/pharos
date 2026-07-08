@@ -364,3 +364,106 @@ async fn playback_info_vp9_profile_gets_progressive_webm() {
         "webm progressive must be http not hls: {v}"
     );
 }
+
+// The real-world case: a Firefox/Zen client lists H.264 FIRST (canPlayType
+// says "probably") but its MSE can't actually decode H.264. When it also
+// advertises VP9, the Firefox-UA quirk must override the H.264-first pick and
+// serve progressive WebM. A non-Firefox UA with the same profile keeps HLS.
+#[actix_web::test]
+async fn firefox_ua_with_h264_first_still_gets_webm() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 14,
+            path: "/hevc.mkv".into(),
+            title: "HEVC".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                width: Some(1920),
+                height: Some(1080),
+                container: Some("matroska".into()),
+                video_codec: Some("hevc".into()),
+                audio_codec: Some("aac".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    // H.264/HLS listed FIRST, VP9/WebM second — as jellyfin-web on Firefox does.
+    let body = r#"{"DeviceProfile":{"DirectPlayProfiles":[],"TranscodingProfiles":[
+        {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"},
+        {"Container":"webm","Type":"Video","Protocol":"http","VideoCodec":"vp9","AudioCodec":"opus"}
+    ]}}"#;
+
+    // Firefox UA → WebM despite h264 being first.
+    let ff = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/14/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .insert_header(("content-type", "application/json"))
+            .insert_header((
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+            ))
+            .set_payload(body)
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&ff).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        url.contains("/stream.webm"),
+        "Firefox must get webm, got {v}"
+    );
+
+    // Chromium UA → keeps HLS.
+    let cr = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/14/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .insert_header(("content-type", "application/json"))
+            .insert_header((
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            ))
+            .set_payload(body)
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&cr).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        url.contains("master.m3u8"),
+        "Chromium must keep HLS, got {v}"
+    );
+}

@@ -1389,6 +1389,33 @@ async fn playback_info(
         .unwrap_or_default();
     let decision = negotiate(&profile, &source);
 
+    // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
+    // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
+    // their Media Source Extensions frequently CANNOT decode H.264
+    // (`isTypeSupported` → false). hls.js then aborts our H.264 HLS with a
+    // fatal manifestParsingError ("no level with compatible codecs"). pharos
+    // can't see that canPlayType/MSE mismatch from the profile, so use a
+    // targeted client quirk: when a Firefox-family UA ALSO advertises a VP9
+    // transcode target, serve the progressive VP9/WebM stream (which its MSE
+    // decodes reliably) instead. Chromium/Safari keep the efficient H.264 HLS.
+    let prefer_webm = is_video
+        && req
+            .headers()
+            .get(actix_web::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            // Match "Firefox" only — Chrome's UA contains "like Gecko" so a
+            // bare "Gecko" check would wrongly capture Chromium.
+            .is_some_and(|ua| ua.contains("Firefox"))
+        && profile.transcoding_profiles.iter().any(|t| {
+            (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
+                && t.video_codec.split(',').any(|c| {
+                    matches!(
+                        c.trim().to_ascii_lowercase().as_str(),
+                        "vp9" | "vp8" | "vp09" | "vp08"
+                    )
+                })
+        });
+
     let direct_play = decision.is_direct();
     // P9 — VideoRemux supports DirectStream too: video copies + audio
     // remuxes, so the client gets a fast-mux container without a full
@@ -1397,6 +1424,11 @@ async fn playback_info(
         || matches!(decision, Decision::AudioRemux { .. })
         || matches!(decision, Decision::VideoRemux { .. });
     let transcoding_url = match &decision {
+        // Firefox VP9-preference quirk (see `prefer_webm` above): any video
+        // transcode/remux for such a client goes to the progressive WebM path.
+        Decision::Transcode { .. } | Decision::VideoRemux { .. } if prefer_webm => Some(format!(
+            "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus"
+        )),
         // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
         // pipeline always emits mpegts H.264/AAC segments regardless of the
         // container the client's profile nominally requested (hls.js demuxes
