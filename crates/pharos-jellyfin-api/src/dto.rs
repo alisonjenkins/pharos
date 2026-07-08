@@ -1785,10 +1785,19 @@ mod trickplay_helper_tests {
             ..Default::default()
         };
         let dto = super::BaseItemDto::from_domain(&audio, "srv");
-        assert!(dto.backdrop_image_tags.is_empty(), "audio: no backdrop list");
-        assert!(!dto.image_tags.contains_key("Backdrop"), "audio: no Backdrop tag");
+        assert!(
+            dto.backdrop_image_tags.is_empty(),
+            "audio: no backdrop list"
+        );
+        assert!(
+            !dto.image_tags.contains_key("Backdrop"),
+            "audio: no Backdrop tag"
+        );
         assert!(!dto.image_tags.contains_key("Thumb"), "audio: no Thumb tag");
-        assert!(dto.image_tags.contains_key("Primary"), "audio keeps Primary (cover art)");
+        assert!(
+            dto.image_tags.contains_key("Primary"),
+            "audio keeps Primary (cover art)"
+        );
 
         // A video item still advertises a backdrop.
         let movie = MediaItem {
