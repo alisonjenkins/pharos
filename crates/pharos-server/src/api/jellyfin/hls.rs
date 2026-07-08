@@ -268,12 +268,19 @@ fn hls_output_codecs_string(
     src_profile: Option<&str>,
     src_level: Option<u32>,
 ) -> String {
-    let copied = matches!(
+    // The segment generator (`build_segment_opts`) forces H.264 output for
+    // every video HLS transcode — there is no HEVC/VP9/AV1 output encoder in
+    // this pipeline — so the ONLY source that appears verbatim in the segments
+    // is h264 (either stream-copied on the remux path or re-encoded h264→h264).
+    // An HEVC source is re-encoded to H.264, so advertising `hvc1` (as if it
+    // were copied) makes the browser reject the stream as un-decodable HEVC
+    // even though the bytes are H.264. Advertise avc1 for anything but h264.
+    let copied_h264 = matches!(
         src_video.map(str::to_ascii_lowercase).as_deref(),
-        Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hvc1" | "hev1")
+        Some("h264" | "avc" | "avc1")
     );
-    if copied {
-        // Stream-copied → segments carry the source codec + its real profile.
+    if copied_h264 {
+        // h264 in the segments → advertise avc1 with the source profile/level.
         codecs_string(src_video, src_profile, src_level, Some("aac"))
     } else {
         // Re-encoded to H.264 (libx264 defaults). Advertise a conservative
@@ -1308,16 +1315,21 @@ mod tests {
         assert!(hls_output_codecs_string(Some("vp9"), None, None).starts_with("avc1."));
         assert!(hls_output_codecs_string(Some("mpeg2video"), None, None).starts_with("avc1."));
 
-        // An h264 source is stream-copied → advertise it verbatim (with its
-        // real profile/level) + AAC audio.
+        // An h264 source stays h264 in the segments → advertise avc1 with its
+        // real profile/level + AAC audio.
         assert_eq!(
             hls_output_codecs_string(Some("h264"), Some("High"), Some(40)),
             "avc1.640028,mp4a.40.2"
         );
-        // hevc source is copied → hvc1.
+        // hevc source is RE-ENCODED to H.264 by this pipeline (no HEVC output
+        // encoder), so the master must advertise avc1 — NOT hvc1, which browsers
+        // reject as undecodable HEVC even though the segments are H.264.
+        let hevc = hls_output_codecs_string(Some("hevc"), Some("Main"), Some(120));
         assert!(
-            hls_output_codecs_string(Some("hevc"), Some("Main"), Some(120)).starts_with("hvc1.")
+            hevc.starts_with("avc1."),
+            "hevc must advertise avc1, got {hevc}"
         );
+        assert!(!hevc.contains("hvc1"), "must not leak hvc1: {hevc}");
     }
 
     #[::core::prelude::v1::test]
