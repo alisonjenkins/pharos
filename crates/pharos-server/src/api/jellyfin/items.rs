@@ -1428,10 +1428,16 @@ async fn playback_info(
     );
     // Firefox client-quirk: jellyfin-web advertises H.264 (canPlayType says
     // "probably") and will DirectPlay / remux / HLS-transcode it, but the
-    // browser's decoder rejects it. When a Firefox UA that advertises VP9
-    // plays a non-VP source, override EVERY decision (including DirectPlay)
-    // and serve a progressive VP9/WebM transcode it can actually decode.
-    let force_webm = is_video && is_firefox && client_offers_vp9 && !source_firefox_native;
+    // browser's decoder rejects it. Force a progressive VP9/WebM transcode
+    // UNLESS the negotiated outcome is already a direct-play of a codec Firefox
+    // natively decodes (VP8/VP9/AV1). This also covers an AV1/VP9 source in a
+    // container the client's profile doesn't direct-play (e.g. av1-in-mp4 when
+    // the profile only lists av1-in-webm) — that would otherwise transcode to
+    // H.264, which Firefox can't play.
+    let force_webm = is_video
+        && is_firefox
+        && client_offers_vp9
+        && !(decision.is_direct() && source_firefox_native);
 
     let direct_play = decision.is_direct() && !force_webm;
     // P9 — VideoRemux supports DirectStream too: video copies + audio
