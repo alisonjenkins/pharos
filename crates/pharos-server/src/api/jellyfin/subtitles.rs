@@ -487,19 +487,104 @@ fn is_image_subtitle_codec(codec: &str) -> bool {
     )
 }
 
-/// Sidecar kind — `.vtt` ships as-is, `.srt` runs through ffmpeg to
-/// WebVTT (browsers consume `<track>` as WebVTT only).
+/// Sidecar kind — `.vtt` ships as-is; every other text format
+/// (`.srt`/`.ass`/`.ssa`) runs through ffmpeg to WebVTT (browsers consume
+/// `<track>` as WebVTT only). ffmpeg's `-f webvtt` auto-detects the input
+/// format, so one convert path covers them all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarKind {
     Vtt,
-    Srt,
+    Convert,
 }
 
-/// Discover sidecar subtitle files alongside `media_path`.
+/// Classify a lowercased filename by its subtitle extension. `None` for
+/// non-subtitle / image formats (`.sup`, VobSub `.idx`/`.sub`) that can't
+/// become WebVTT.
+fn sidecar_kind_for_name(lower_name: &str) -> Option<SidecarKind> {
+    if lower_name.ends_with(".vtt") {
+        Some(SidecarKind::Vtt)
+    } else if lower_name.ends_with(".srt")
+        || lower_name.ends_with(".ass")
+        || lower_name.ends_with(".ssa")
+    {
+        Some(SidecarKind::Convert)
+    } else {
+        None
+    }
+}
+
+/// Find a direct sub-directory of `dir` whose name case-insensitively equals
+/// `name_lower`. Returns its path. Used to locate `Subs/`/`Subtitles/` and
+/// per-episode folders regardless of casing.
+async fn find_subdir_ci(dir: &std::path::Path, name_lower: &str) -> Option<std::path::PathBuf> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(n) = entry.file_name().to_str() {
+                if n.to_ascii_lowercase() == name_lower {
+                    return Some(entry.path());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Push every subtitle file in `dir` whose name begins `<stem_lower>.` (the
+/// classic `Episode 01.eng.srt` layout). Silent no-op when `dir` is absent.
+async fn scan_stem_matched(
+    dir: &std::path::Path,
+    stem_lower: &str,
+    found: &mut Vec<(std::path::PathBuf, SidecarKind)>,
+) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        // Require `<stem>.` so `<stem>extra.srt` doesn't match, but any
+        // trailing `.lang`/`.forced` segments are allowed.
+        if !lower.starts_with(stem_lower) || !lower[stem_lower.len()..].starts_with('.') {
+            continue;
+        }
+        if let Some(kind) = sidecar_kind_for_name(&lower) {
+            found.push((p, kind));
+        }
+    }
+}
+
+/// Push EVERY subtitle file in `dir` regardless of name — for a per-episode
+/// subtitle folder whose files are named by language (`English.srt`,
+/// `eng.ass`) rather than after the video.
+async fn scan_all_subs(dir: &std::path::Path, found: &mut Vec<(std::path::PathBuf, SidecarKind)>) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(kind) = sidecar_kind_for_name(&name.to_ascii_lowercase()) {
+            found.push((p, kind));
+        }
+    }
+}
+
+/// Discover sidecar subtitle files for `media_path`, "no matter where they
+/// live". Covers, in a stable order:
+/// - the same directory, `<stem>[.<lang>…].{srt,vtt,ass,ssa}`;
+/// - `Subs/` and `Subtitles/` folders next to the media (case-insensitive),
+///   both stem-matched files and a per-episode `Subs/<stem>/` subfolder;
+/// - a per-episode `<stem>/` folder next to the media.
 ///
-/// Returns `(sidecar_path, kind)` pairs in a stable order so the
-/// numeric `stream_index` offsets stay consistent between PlaybackInfo
-/// and Stream.vtt fetches. Order: ascending file name.
+/// Returns `(sidecar_path, kind)` in ascending-path order so the numeric
+/// `stream_index` offsets stay consistent between PlaybackInfo and Stream.vtt
+/// fetches.
 pub async fn discover_sidecars(
     media_path: &std::path::Path,
 ) -> Vec<(std::path::PathBuf, SidecarKind)> {
@@ -509,37 +594,30 @@ pub async fn discover_sidecars(
     let Some(stem) = media_path.file_stem().and_then(|s| s.to_str()) else {
         return Vec::new();
     };
+    let stem_lower = stem.to_ascii_lowercase();
     let mut found: Vec<(std::path::PathBuf, SidecarKind)> = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
-        return Vec::new();
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let p = entry.path();
-        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let lower = name.to_ascii_lowercase();
-        let stem_lower = stem.to_ascii_lowercase();
-        // Accept `<stem>.vtt`, `<stem>.<lang>.vtt`, plus same for srt.
-        if !lower.starts_with(&stem_lower) {
-            continue;
+
+    // (a) same directory, stem-matched.
+    scan_stem_matched(parent, &stem_lower, &mut found).await;
+
+    // (b) dedicated subtitle folders next to the media.
+    for sub in ["subs", "subtitles"] {
+        if let Some(dir) = find_subdir_ci(parent, sub).await {
+            scan_stem_matched(&dir, &stem_lower, &mut found).await;
+            // Per-episode folder inside, e.g. `Subs/<stem>/English.srt`.
+            if let Some(epdir) = find_subdir_ci(&dir, &stem_lower).await {
+                scan_all_subs(&epdir, &mut found).await;
+            }
         }
-        // Ensure the next char after stem is a separator (`.`) so we
-        // don't match `<stem>extra.vtt`.
-        let rest = &lower[stem_lower.len()..];
-        if !rest.starts_with('.') {
-            continue;
-        }
-        let kind = if lower.ends_with(".vtt") {
-            SidecarKind::Vtt
-        } else if lower.ends_with(".srt") {
-            SidecarKind::Srt
-        } else {
-            continue;
-        };
-        found.push((p, kind));
     }
+
+    // (c) per-episode folder directly beside the media, `<stem>/English.srt`.
+    if let Some(epdir) = find_subdir_ci(parent, &stem_lower).await {
+        scan_all_subs(&epdir, &mut found).await;
+    }
+
     found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.dedup_by(|a, b| a.0 == b.0);
     found
 }
 
@@ -561,7 +639,7 @@ async fn serve_sidecar(
                 .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
                 .body(bytes))
         }
-        SidecarKind::Srt => {
+        SidecarKind::Convert => {
             let input = path
                 .to_str()
                 .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
@@ -715,7 +793,54 @@ mod tests {
         assert!(found[0].0.to_string_lossy().ends_with("show.eng.vtt"));
         assert_eq!(found[0].1, SidecarKind::Vtt);
         assert!(found[2].0.to_string_lossy().ends_with("show.srt"));
-        assert_eq!(found[2].1, SidecarKind::Srt);
+        assert_eq!(found[2].1, SidecarKind::Convert);
+    }
+
+    #[tokio::test]
+    async fn discover_sidecars_finds_ass_and_subfolders() {
+        // "Find them no matter what": .ass next to the file, a Subs/ folder,
+        // and a per-episode folder — all common anime layouts.
+        let td = TempDir::new().unwrap();
+        let media = td.path().join("Episode 01.mkv");
+        tokio::fs::write(&media, b"x").await.unwrap();
+        // (a) same-dir .ass (converts to VTT).
+        tokio::fs::write(td.path().join("Episode 01.eng.ass"), b"[Script Info]")
+            .await
+            .unwrap();
+        // (b) Subs/ folder with a per-episode subfolder named by language.
+        let subs_ep = td.path().join("Subs").join("Episode 01");
+        tokio::fs::create_dir_all(&subs_ep).await.unwrap();
+        tokio::fs::write(subs_ep.join("English.srt"), b"1\n")
+            .await
+            .unwrap();
+        // (c) per-episode folder directly beside the media.
+        let epdir = td.path().join("Episode 01");
+        tokio::fs::create_dir_all(&epdir).await.unwrap();
+        tokio::fs::write(epdir.join("eng.ssa"), b"[Script Info]")
+            .await
+            .unwrap();
+        // A .sup image sub must be ignored (can't become WebVTT).
+        tokio::fs::write(td.path().join("Episode 01.sup"), b"")
+            .await
+            .unwrap();
+
+        let found = discover_sidecars(&media).await;
+        let names: Vec<String> = found
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"Episode 01.eng.ass".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"English.srt".to_string()), "{names:?}");
+        assert!(names.contains(&"eng.ssa".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with(".sup")),
+            "image sub leaked: {names:?}"
+        );
+        // All three text sidecars, none is passthrough-VTT.
+        assert!(found.iter().all(|(_, k)| *k == SidecarKind::Convert));
     }
 
     #[tokio::test]
