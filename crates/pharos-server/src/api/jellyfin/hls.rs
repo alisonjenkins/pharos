@@ -750,6 +750,9 @@ async fn serve_segment(
     let id_num: u64 = id
         .parse()
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    // A client is actively pulling segments → tell the background backfill to
+    // stand down so its whole-file decodes don't starve live transcoding.
+    state.note_playback_activity();
     let item = state.stores.get(id_num).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -1267,6 +1270,8 @@ async fn vp9_segment(
     let id_num: u64 = id
         .parse()
         .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    // Active playback → background backfill yields (see serve_segment).
+    state.note_playback_activity();
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     let opts = vp9_segment_opts(

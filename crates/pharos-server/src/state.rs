@@ -147,6 +147,20 @@ pub struct AppState {
     /// this lock, builds the whole synth-id → representative map in one scan,
     /// and every other request then hits the memo.
     pub synth_image_warm: Arc<tokio::sync::Mutex<()>>,
+    /// Unix-seconds of the last live-playback segment request. The
+    /// background asset backfill (trickplay / subtitles) reads this and
+    /// stands down while a client is actively streaming, so a whole-file
+    /// decode never contends with live segment transcoding and makes
+    /// playback buffer. Bumped by the HLS + VP9 segment handlers.
+    pub playback_activity: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// Unix time in whole seconds (0 if the clock is before the epoch).
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl AppState {
@@ -165,6 +179,25 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id.to_string(), item_id);
+    }
+
+    /// Stamp "a client just pulled a live segment" — called from the segment
+    /// handlers so the background backfill can yield to active playback.
+    pub fn note_playback_activity(&self) {
+        self.playback_activity
+            .store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Seconds since the last live-segment request (saturating; large when
+    /// nobody has streamed recently). The backfill uses this as its
+    /// yield-to-playback gate.
+    pub fn seconds_since_playback(&self) -> i64 {
+        unix_now_secs()
+            .saturating_sub(
+                self.playback_activity
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .max(0)
     }
 
     /// Construct with a fresh random `server_id`. Reserved for tests that
@@ -203,6 +236,7 @@ impl AppState {
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
+            playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -260,6 +294,7 @@ impl AppState {
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
+            playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         })
     }
 

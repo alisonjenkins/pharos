@@ -24,12 +24,43 @@ use pharos_cache::trickplay_cache::TrickplayCache;
 use pharos_cache::SubtitleCache;
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_jellyfin_api::dto::{build_layout, series_id_for_key};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 const WARMUP: Duration = Duration::from_secs(45);
 const PASS_INTERVAL: Duration = Duration::from_secs(600);
 const COOLDOWN: Duration = Duration::from_secs(3);
+/// A whole-file decode contends with live segment transcoding, so we never
+/// start one while a client is streaming. "Streaming" = a segment was pulled
+/// within this window; playback must be quiet this long before background
+/// work resumes. Larger than a client's read-ahead gap so a buffered player
+/// doesn't repeatedly wave the backfill through between segment bursts.
+const PLAYBACK_QUIET: Duration = Duration::from_secs(30);
+/// How often to re-check the playback gate while parked.
+const GATE_POLL: Duration = Duration::from_secs(3);
+
+/// Unix seconds, mirroring `AppState`'s clock, for the playback-quiet gate.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Block until live playback has been quiet for `PLAYBACK_QUIET`. This is the
+/// yield-to-playback gate: the backfill parks here rather than launching a
+/// CPU/IO-heavy decode that would make an active stream buffer.
+async fn await_playback_quiet(playback: &AtomicI64) {
+    loop {
+        let idle = unix_now_secs().saturating_sub(playback.load(Ordering::Relaxed));
+        if idle >= PLAYBACK_QUIET.as_secs() as i64 {
+            return;
+        }
+        tokio::time::sleep(GATE_POLL).await;
+    }
+}
 
 /// Handle for nudging the pre-generator to prioritise an item (and its series).
 pub type PriorityTx = mpsc::UnboundedSender<u64>;
@@ -42,6 +73,7 @@ pub fn spawn(
     stores: Stores,
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
+    playback: Arc<AtomicI64>,
     widths: Vec<u32>,
     interval_ms: u32,
 ) -> PriorityTx {
@@ -49,7 +81,15 @@ pub fn spawn(
     // Run whenever there's *some* asset to pre-build: trickplay widths or a
     // subtitle cache to warm.
     if !widths.is_empty() || subtitles.is_some() {
-        tokio::spawn(run(stores, cache, subtitles, widths, interval_ms, rx));
+        tokio::spawn(run(
+            stores,
+            cache,
+            subtitles,
+            playback,
+            widths,
+            interval_ms,
+            rx,
+        ));
     }
     tx
 }
@@ -58,6 +98,7 @@ async fn run(
     stores: Stores,
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
+    playback: Arc<AtomicI64>,
     widths: Vec<u32>,
     interval_ms: u32,
     mut prio_rx: mpsc::UnboundedReceiver<u64>,
@@ -78,7 +119,7 @@ async fn run(
 
         // 1. Priority: actively-watched items, expanded to their whole series.
         for id in pending.drain(..) {
-            generate_priority(id, &items, &cache, subs, &widths, interval_ms).await;
+            generate_priority(id, &items, &cache, subs, &playback, &widths, interval_ms).await;
         }
 
         // 2. General sweep, newest-first.
@@ -88,9 +129,9 @@ async fn run(
             // A show that starts playing mid-sweep preempts the rest.
             drain_into(&mut prio_rx, &mut pending);
             for id in pending.drain(..) {
-                generate_priority(id, &items, &cache, subs, &widths, interval_ms).await;
+                generate_priority(id, &items, &cache, subs, &playback, &widths, interval_ms).await;
             }
-            generate_item(item, &cache, subs, &widths, interval_ms).await;
+            generate_item(item, &cache, subs, &playback, &widths, interval_ms).await;
         }
 
         // 3. Sweep done — sleep until the next pass, but wake immediately if a
@@ -122,6 +163,7 @@ async fn generate_priority(
     items: &[MediaItem],
     cache: &TrickplayCache,
     subs: Option<&SubtitleCache>,
+    playback: &AtomicI64,
     widths: &[u32],
     interval_ms: u32,
 ) {
@@ -137,10 +179,10 @@ async fn generate_priority(
                         series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
                     })
             }) {
-                generate_item(item, cache, subs, widths, interval_ms).await;
+                generate_item(item, cache, subs, playback, widths, interval_ms).await;
             }
         }
-        None => generate_item(seed, cache, subs, widths, interval_ms).await,
+        None => generate_item(seed, cache, subs, playback, widths, interval_ms).await,
     }
 }
 
@@ -150,6 +192,7 @@ async fn generate_item(
     item: &MediaItem,
     cache: &TrickplayCache,
     subs: Option<&SubtitleCache>,
+    playback: &AtomicI64,
     widths: &[u32],
     interval_ms: u32,
 ) {
@@ -163,6 +206,9 @@ async fn generate_item(
         let Some(layout) = build_layout(&item.probe, width, interval_ms) else {
             continue;
         };
+        // Yield to live playback: park here (not mid-decode) until streaming
+        // has been quiet, so this whole-file decode never makes a viewer buffer.
+        await_playback_quiet(playback).await;
         match cache.ensure_generated(item.id, layout, &item.path).await {
             Ok(true) => {
                 tracing::debug!(media.id = item.id, width, "trickplay pre-generated");
@@ -179,6 +225,7 @@ async fn generate_item(
     // whole-file demux (esp. multi-GB lossless-audio anime).
     if let Some(sc) = subs {
         if !item.probe.subtitle_tracks.is_empty() {
+            await_playback_quiet(playback).await;
             crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
             tokio::time::sleep(COOLDOWN).await;
         }
