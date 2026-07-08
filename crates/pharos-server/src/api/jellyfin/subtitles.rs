@@ -56,7 +56,142 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/videos/{id}/subtitles/{stream_index}/subtitles.srt",
         web::get().to(stream_srt_short),
+    )
+    // Raw ASS/SSA delivery for jellyfin-web's SubtitlesOctopus (libass needs
+    // the real ASS body, not a VTT conversion).
+    .route(
+        "/videos/{id}/{media_source_id}/subtitles/{stream_index}/stream.ass",
+        web::get().to(stream_ass),
+    )
+    .route(
+        "/videos/{id}/subtitles/{stream_index}/stream.ass",
+        web::get().to(stream_ass_short),
     );
+}
+
+async fn stream_ass(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<(String, String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, _media_source_id, stream_index) = path.into_inner();
+    deliver_ass(&state, &id, stream_index).await
+}
+
+async fn stream_ass_short(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, stream_index) = path.into_inner();
+    deliver_ass(&state, &id, stream_index).await
+}
+
+/// Serve a subtitle track as RAW ASS/SSA (for SubtitlesOctopus). Sidecars pass
+/// through verbatim; embedded streams are extracted with `-c:s ass -f ass` and
+/// cached (distinct `EmbeddedAss` key from the VTT form).
+async fn deliver_ass(
+    state: &AppState,
+    id_str: &str,
+    stream_index: u32,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+
+    let ass_body = |bytes: Vec<u8>| {
+        HttpResponse::Ok()
+            .content_type("text/x-ssa; charset=utf-8")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .body(bytes)
+    };
+
+    // Sidecar → raw passthrough (it's already an .ass/.ssa file on disk).
+    if stream_index >= SIDECAR_BASE_INDEX {
+        let offset = (stream_index - SIDECAR_BASE_INDEX) as usize;
+        let sidecars = discover_sidecars(&item.path).await;
+        let Some((sidecar_path, _)) = sidecars.into_iter().nth(offset) else {
+            return Err(error::ErrorNotFound("no sidecar at that index"));
+        };
+        let bytes = tokio::fs::read(&sidecar_path)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
+        return Ok(ass_body(bytes));
+    }
+
+    let input = item
+        .path
+        .to_str()
+        .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+    let mtime = mtime_secs(&item.path).await;
+    if let Some(cache) = state.subtitles.as_ref() {
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+            .await
+        {
+            return Ok(ass_body((*bytes).clone()));
+        }
+        let lock = cache
+            .lock(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+            .await;
+        let _guard = lock.lock().await;
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+            .await
+        {
+            return Ok(ass_body((*bytes).clone()));
+        }
+        let out = run_ffmpeg_embedded_ass(input, stream_index).await?;
+        let stored = cache
+            .store(
+                &item.path,
+                mtime,
+                stream_index,
+                SubtitleKind::EmbeddedAss,
+                out,
+            )
+            .await;
+        return Ok(ass_body((*stored).clone()));
+    }
+    let out = run_ffmpeg_embedded_ass(input, stream_index).await?;
+    Ok(ass_body(out))
+}
+
+/// Extract one embedded subtitle stream verbatim as ASS.
+async fn run_ffmpeg_embedded_ass(
+    input: &str,
+    stream_index: u32,
+) -> Result<Vec<u8>, actix_web::Error> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            input,
+            "-map",
+            &format!("0:{stream_index}"),
+            "-c:s",
+            "ass",
+            "-f",
+            "ass",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("ffmpeg spawn: {e}")))?;
+    if !out.status.success() {
+        return Err(error::ErrorNotFound(format!(
+            "ffmpeg ass extract: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
 }
 
 async fn stream_srt(

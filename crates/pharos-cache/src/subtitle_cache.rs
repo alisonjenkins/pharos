@@ -24,6 +24,10 @@ pub enum SubtitleKind {
     Embedded,
     /// External `.srt` sidecar converted to WebVTT.
     Sidecar,
+    /// Embedded ASS/SSA stream extracted verbatim (`-c:s ass -f ass`) for
+    /// SubtitlesOctopus, which needs the raw ASS body — distinct cache key
+    /// from `Embedded` (same index, different bytes).
+    EmbeddedAss,
 }
 
 /// Cache key: source file + mtime stamps the input so any later edit

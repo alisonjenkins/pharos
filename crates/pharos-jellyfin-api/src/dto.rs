@@ -448,6 +448,15 @@ fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
     )
 }
 
+/// True for ASS/SSA subtitle codecs — jellyfin-web renders these via
+/// SubtitlesOctopus and must receive the RAW ASS at the DeliveryUrl.
+fn is_ass_subtitle_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.unwrap_or("").to_ascii_lowercase().as_str(),
+        "ass" | "ssa" | "advanced substation alpha"
+    )
+}
+
 /// Channel-count → common layout label (Jellyfin picker convention).
 fn channel_layout_label(ch: u32) -> &'static str {
     match ch {
@@ -1315,11 +1324,17 @@ pub fn build_media_streams_with_subtitles(
                         Some(s)
                     }
                 };
-                // Text subs extract to WebVTT + deliver External (client-side
-                // render); image subs (PGS/VOBSUB) can't be VTT, so they burn
-                // into the transcode (Encode) — jellyfin-web then passes the
-                // index to the video transcode instead of fetching a .vtt.
+                // Text subs deliver External (client-side render); image subs
+                // (PGS/VOBSUB) can't be text, so they burn into the transcode
+                // (Encode). ASS/SSA render via jellyfin-web's SubtitlesOctopus,
+                // which routes purely on Codec=="ass"/"ssa" and fetches the
+                // DeliveryUrl byte-for-byte — so it must be the RAW .ass, NOT
+                // a converted .vtt (libass can't parse a VTT body → "failed to
+                // start a track"). subrip/other text stay .vtt for a native
+                // <track>.
                 let is_text = is_text_subtitle_codec(t.codec.as_deref());
+                let is_ass = is_ass_subtitle_codec(t.codec.as_deref());
+                let ext = if is_ass { "ass" } else { "vtt" };
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
                     index: t.stream_index,
@@ -1340,7 +1355,7 @@ pub fn build_media_streams_with_subtitles(
                     is_hearing_impaired: Some(t.is_hearing_impaired),
                     delivery_url: is_text.then(|| {
                         format!(
-                            "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
+                            "/Videos/{id}/{id}/Subtitles/{idx}/Stream.{ext}",
                             id = ctx.item_id,
                             idx = t.stream_index,
                         )
@@ -1498,22 +1513,37 @@ mod tests {
                     language: Some("eng".into()),
                     ..Default::default()
                 },
+                pharos_core::SubtitleTrack {
+                    stream_index: 4,
+                    codec: Some("ass".into()),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
         let ctx = SubtitleStreamCtx::new(42);
         let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
+        // subrip → External VTT (native <track>).
         let text = streams.iter().find(|s| s.index == 2).unwrap();
         assert_eq!(text.delivery_method, Some("External"));
         assert_eq!(
             text.delivery_url.as_deref(),
             Some("/Videos/42/42/Subtitles/2/Stream.vtt")
         );
+        // PGS → Encode (burn), no URL.
         let image = streams.iter().find(|s| s.index == 3).unwrap();
         assert_eq!(image.delivery_method, Some("Encode"));
         assert!(
             image.delivery_url.is_none(),
             "image subs burn in, no .vtt URL"
+        );
+        // ASS → External but RAW .ass URL (SubtitlesOctopus, not a VTT track).
+        let ass = streams.iter().find(|s| s.index == 4).unwrap();
+        assert_eq!(ass.delivery_method, Some("External"));
+        assert_eq!(
+            ass.delivery_url.as_deref(),
+            Some("/Videos/42/42/Subtitles/4/Stream.ass")
         );
     }
 
