@@ -12,6 +12,7 @@
 
 use crate::{
     api::jellyfin::auth_extractor::{extract_token, AuthUser},
+    api::jellyfin::fmp4,
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
@@ -55,7 +56,17 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/videos/{id}/subtitles/{idx}.m3u8",
             web::get().to(subtitle_playlist),
-        );
+        )
+        // VP9-in-fMP4 HLS. The H.264/MPEG-TS ladder above cannot serve
+        // Firefox/Zen (no H.264 in MSE), so those clients get a VP9 fMP4
+        // HLS stream instead of a progressive WebM — HLS restores seeking,
+        // resume, and track-switching. Segments are self-contained
+        // fragmented mp4 the `fmp4` module splits into a shared init +
+        // tfdt-corrected media (see that module + `serve_vp9_segment`).
+        .route("/videos/{id}/vp9/master.m3u8", web::get().to(vp9_master))
+        .route("/videos/{id}/vp9/main.m3u8", web::get().to(vp9_variant))
+        .route("/videos/{id}/vp9/init.mp4", web::get().to(vp9_init))
+        .route("/videos/{id}/vp9/{seg}.m4s", web::get().to(vp9_segment));
 }
 
 async fn subtitle_playlist(
@@ -1098,6 +1109,306 @@ fn playback_qs(req: &HttpRequest) -> String {
         }
     }
     parts.join("&")
+}
+
+// ── VP9-in-fMP4 HLS ─────────────────────────────────────────────────────
+//
+// Firefox/Zen cannot decode H.264 in MSE, so the H.264/MPEG-TS ladder is
+// useless to them; they get VP9 instead. Progressive WebM plays but cannot
+// seek or report a resume position — so, like Jellyfin, pharos serves VP9 as
+// fMP4 HLS. Each `.m4s` is generated on demand exactly like a `.ts` segment
+// (independent `ffmpeg -ss/-t` run, codec-keyed cache), then post-processed
+// by `fmp4::process_segment` into moof-only media with a corrected `tfdt`.
+
+/// RFC 7741 CODECS token for the VP9 fMP4 output. Profile 0 (8-bit 4:2:0),
+/// level 4.0 (covers ≤ 1080p30), which is what the encoder emits. Firefox is
+/// lenient about the exact VP9 level in `isTypeSupported`, but the profile +
+/// bit-depth must be right for MSE to accept the stream.
+const VP9_HLS_CODECS: &str = "vp09.00.40.08,opus";
+
+/// Master playlist for the VP9 fMP4 path. One variant (the source-capped
+/// bitrate); subtitle tracks surface as soft `EXT-X-MEDIA` selectors, matching
+/// the H.264 master. jellyfin-web loads this as the negotiated TranscodingUrl.
+async fn vp9_master(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = path.into_inner();
+    let item = load_hls_item(&state, &id).await?;
+    let qs = playback_qs(&req);
+    let bitrate = target_video_bitrate(item.source_bitrate_bps) + 128_000;
+    let has_subs =
+        !item.subtitle_tracks.is_empty() && !matches!(item.kind, pharos_core::MediaKind::Audio);
+
+    let mut body = String::new();
+    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    if has_subs {
+        for (i, track) in item.subtitle_tracks.iter().enumerate() {
+            let name = subtitle_display_name(track, i);
+            let lang = track.language.as_deref().unwrap_or("und");
+            let default = if track.is_default { "YES" } else { "NO" };
+            let forced = if track.is_forced { "YES" } else { "NO" };
+            body.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",\
+                 LANGUAGE=\"{lang}\",DEFAULT={default},FORCED={forced},AUTOSELECT=YES,\
+                 URI=\"/videos/{id}/subtitles/{idx}.m3u8?{qs}\"\n",
+                idx = track.stream_index,
+            ));
+        }
+    }
+    let resolution = match (item.width, item.height) {
+        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
+        _ => String::new(),
+    };
+    let sub_attr = if has_subs { ",SUBTITLES=\"subs\"" } else { "" };
+    body.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\"{resolution}{sub_attr}\n\
+         /videos/{id}/vp9/main.m3u8?{qs}\n"
+    ));
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(true))
+        .body(body))
+}
+
+/// VOD variant playlist for the VP9 fMP4 path: an `EXT-X-MAP` init segment
+/// followed by `.m4s` media segments. Segment count comes from the source
+/// duration, identical to the H.264 variant.
+async fn vp9_variant(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = path.into_inner();
+    let item = load_hls_item(&state, &id).await?;
+    let duration = item.duration_seconds;
+    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
+    let qs = playback_qs(&req);
+
+    let mut body = String::with_capacity(256 + segment_count as usize * 48);
+    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    body.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", SEGMENT_SECONDS as u32));
+    // fMP4 requires the init segment be declared before any media.
+    body.push_str(&format!("#EXT-X-MAP:URI=\"/videos/{id}/vp9/init.mp4?{qs}\"\n"));
+    let start_ticks = parse_start_time_ticks_qs(req.query_string());
+    if start_ticks > 0 {
+        let secs = start_ticks as f64 / TICKS_PER_SECOND as f64;
+        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    }
+    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    for seg in 0..segment_count {
+        let remaining = duration - (seg as f64 * SEGMENT_SECONDS);
+        let len = remaining.clamp(0.01, SEGMENT_SECONDS);
+        body.push_str(&format!("#EXTINF:{len:.3},\n"));
+        body.push_str(&format!("/videos/{id}/vp9/{seg}.m4s?{qs}\n"));
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
+        .body(body))
+}
+
+/// Serve the shared fMP4 init segment (`ftyp`+`moov`). Generated by
+/// transcoding segment 0 and splitting off its moov — the init is byte-
+/// identical across a source's segments, so segment 0 is representative.
+async fn vp9_init(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+    q: web::Query<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id_num: u64 = path
+        .into_inner()
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = fetch_item(&state, id_num).await?;
+    check_session(&state, q.play_session_id.as_deref()).await?;
+    let opts = vp9_segment_opts(&state, &req, &item, 0, q.audio_stream_index, q.subtitle_stream_index).await;
+    let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    let processed = fmp4::process_segment(&raw, 0, SEGMENT_SECONDS)
+        .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type("video/mp4")
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(processed.init))
+}
+
+/// Serve one VP9 fMP4 media segment (`moof`+`mdat`, `tfdt`-corrected).
+async fn vp9_segment(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+    q: web::Query<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, seg) = path.into_inner();
+    let id_num: u64 = id
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = fetch_item(&state, id_num).await?;
+    check_session(&state, q.play_session_id.as_deref()).await?;
+    let opts =
+        vp9_segment_opts(&state, &req, &item, seg, q.audio_stream_index, q.subtitle_stream_index)
+            .await;
+    let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    let processed = fmp4::process_segment(&raw, seg, SEGMENT_SECONDS)
+        .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type(Container::Fmp4.content_type())
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(processed.media))
+}
+
+async fn fetch_item(
+    state: &AppState,
+    id: u64,
+) -> Result<pharos_core::MediaItem, actix_web::Error> {
+    state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })
+}
+
+/// W4 — enforce the PlaySessionId (if supplied) is still live, matching the
+/// `.ts` segment handler: a GC'd/stopped session must not keep serving bytes.
+async fn check_session(
+    state: &AppState,
+    psid: Option<&str>,
+) -> Result<(), actix_web::Error> {
+    if let Some(psid) = psid {
+        match state.transcode_sessions.get(psid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(error::ErrorGone("play session expired")),
+            Err(e) => {
+                return Err(error::ErrorInternalServerError(format!(
+                    "transcode session lookup: {e}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the per-segment VP9/fMP4 `TranscodeOptions`. Always VP9 + Opus in a
+/// fragmented-mp4 container; the bitrate cap follows the negotiated session
+/// (if any) then the source-derived clamp.
+async fn vp9_segment_opts(
+    state: &AppState,
+    req: &HttpRequest,
+    item: &pharos_core::MediaItem,
+    seg: u32,
+    audio_stream_index: Option<u32>,
+    subtitle_stream_index: Option<u32>,
+) -> TranscodeOptions {
+    let start_ticks = (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
+    let duration_ticks = (SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64;
+    let cap = extract_session_bitrate_cap(state, req).await;
+    let bitrate = cap
+        .map(|c| c.min(HLS_MAX_BITRATE_BPS))
+        .unwrap_or_else(|| target_video_bitrate(item.probe.bitrate_bps));
+    // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
+    // stream indices (jellyfin-web's convention), but the encoder args select
+    // by per-CODEC index (`-map 0:a:N`, subtitle-filter `si=N`). Convert via
+    // each track's position among its own codec's streams — matching the
+    // progressive-webm handler so multi-audio selection + subtitle burn-in
+    // pick the right track.
+    let audio_rel = audio_stream_index.and_then(|abs| {
+        codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
+    });
+    let sub_rel = subtitle_stream_index.and_then(|abs| {
+        codec_relative_index(
+            item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
+            abs,
+        )
+    });
+    TranscodeOptions {
+        container: Container::Fmp4,
+        video: Some(VideoCodec::Vp9),
+        audio: Some(AudioCodec::Opus),
+        video_bitrate_bps: Some(bitrate),
+        audio_bitrate_bps: Some(128_000),
+        start_position_ticks: start_ticks,
+        duration_ticks: Some(duration_ticks),
+        audio_source_stream_index: audio_rel,
+        burn_subtitle_stream_index: sub_rel,
+    }
+}
+
+/// Map an absolute ffprobe stream index to its position among the streams of
+/// one codec kind (what ffmpeg's `0:a:N` / `subtitles=si=N` expect). Returns
+/// `None` when the absolute index isn't in the list (unknown track → let
+/// ffmpeg default-select rather than mis-map).
+fn codec_relative_index(abs_indices: impl Iterator<Item = u32>, abs: u32) -> Option<u32> {
+    abs_indices
+        .enumerate()
+        .find(|(_, i)| *i == abs)
+        .map(|(pos, _)| pos as u32)
+}
+
+/// Produce the raw bytes of one self-contained fragmented-mp4 segment, using
+/// the same three tiers as the `.ts` path: codec-keyed disk cache first
+/// (production), then the load-balancing scheduler, then an inline ffmpeg
+/// fallback. fMP4 surgery needs the whole segment in memory, so the streaming
+/// tiers are collected to a `Vec`.
+async fn vp9_segment_raw(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    seg: u32,
+    opts: &TranscodeOptions,
+) -> Result<Vec<u8>, actix_web::Error> {
+    if let Some(cache) = state.hls.as_ref() {
+        return cache
+            .segment_bytes_keyed(
+                item.id,
+                seg,
+                opts.audio_source_stream_index,
+                opts.burn_subtitle_stream_index,
+                &item.path,
+                opts,
+            )
+            .await
+            .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));
+    }
+    if let Some(sched) = state.transcode_scheduler.as_ref() {
+        match sched.submit_live(item.path.clone(), opts.clone()).await {
+            Ok(stream) => return collect_stream(stream).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "vp9 scheduler live transcode failed; inline fallback")
+            }
+        }
+    }
+    let transcoder = FfmpegTranscoder::new();
+    let stream = transcoder
+        .transcode(&item.path, opts)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
+    collect_stream(stream.into_stream()).await
+}
+
+/// Drain a byte stream (`io::Result<Bytes>` items) into a single `Vec<u8>`.
+async fn collect_stream<S>(mut stream: S) -> Result<Vec<u8>, actix_web::Error>
+where
+    S: futures_util::Stream<Item = std::io::Result<actix_web::web::Bytes>> + Unpin,
+{
+    use futures_util::StreamExt;
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]
