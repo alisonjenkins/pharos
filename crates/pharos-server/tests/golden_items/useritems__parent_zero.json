@@ -525,9 +525,7 @@
       "Artists": [
         "Echo Artist"
       ],
-      "BackdropImageTags": [
-        "7e541ba1788485c9"
-      ],
+      "BackdropImageTags": [],
       "CanPlay": true,
       "Chapters": [],
       "DateCreated": "1970-01-01T01:56:40.0000000Z",
@@ -616,9 +614,7 @@
       "Artists": [
         "Echo Artist"
       ],
-      "BackdropImageTags": [
-        "0e827648890628b8"
-      ],
+      "BackdropImageTags": [],
       "CanPlay": true,
       "Chapters": [],
       "DateCreated": "1970-01-01T02:13:20.0000000Z",
