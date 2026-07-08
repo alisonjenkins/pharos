@@ -431,8 +431,12 @@ fn build_args_for_device(
     a.push(opts.container.ffmpeg_muxer().into());
     // `-movflags` is an mp4/mov-muxer option — fragmented MP4 for progressive
     // streaming. The webm/mpegts muxers reject it ("Unrecognized option"), so
-    // scope it to MP4. WebM is inherently streamable (live cluster writing).
-    if matches!(opts.container, Container::Mp4) {
+    // scope it to the mp4-family muxers. WebM is inherently streamable (live
+    // cluster writing). `Fmp4` needs the SAME fragmentation flags: the VP9-in-
+    // HLS path (see api::jellyfin::fmp4) generates each segment as a self-
+    // contained fragmented mp4 (`ftyp moov moof mdat`), then splits off the
+    // init and rewrites `tfdt` so per-segment output concatenates in hls.js.
+    if matches!(opts.container, Container::Mp4 | Container::Fmp4) {
         a.push("-movflags".into());
         a.push("+empty_moov+frag_keyframe+default_base_moof".into());
     }
