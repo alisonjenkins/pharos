@@ -194,13 +194,21 @@ where
         }
     };
 
-    let packets: Vec<_> = ictx
-        .packets()
-        .filter_map(|r| r.ok())
-        .filter(|(s, _)| s.index() == stream_index)
-        .map(|(_, p)| p)
-        .collect();
-    for packet in packets {
+    // Stream packets one at a time — do NOT collect the whole compressed
+    // stream first. A previous `.collect()` here loaded every packet of the
+    // source into a Vec before decoding, so trickplay/thumbnail generation
+    // over a full-length episode buffered the entire ~1-2 GB compressed video
+    // in RAM at once (× per width / concurrent op → OOM-killed the pod). The
+    // decoder + filter graph are independent of `ictx`, so borrowing it for
+    // the packet iterator here is fine.
+    for res in ictx.packets() {
+        let (stream, packet) = match res {
+            Ok(sp) => sp,
+            Err(_) => continue,
+        };
+        if stream.index() != stream_index {
+            continue;
+        }
         decoder
             .send_packet(&packet)
             .map_err(|e| FrameError::Other(format!("send packet: {e}")))?;
