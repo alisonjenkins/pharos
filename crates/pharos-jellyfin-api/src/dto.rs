@@ -829,7 +829,16 @@ impl BaseItemDto {
             trickplay: serde_json::Map::new(),
             external_urls: vec![],
             image_tags: image_tags_for(item),
-            backdrop_image_tags: vec![image_tag_for(item.id, "backdrop")],
+            // Audio items have no video frames, so the image handler 404s a
+            // Backdrop request for them (api::jellyfin::images). Keep this list
+            // consistent with `image_tags_for` (which already omits Backdrop
+            // for Audio) — otherwise jellyfin-web requests a backdrop that can
+            // only 404, tripping the strict-console compat spec.
+            backdrop_image_tags: if matches!(item.kind, pharos_core::MediaKind::Audio) {
+                vec![]
+            } else {
+                vec![image_tag_for(item.id, "backdrop")]
+            },
             screenshot_image_tags: vec![],
             date_created: item.created_at.map(format_iso8601),
             // ParentId default: SeasonId for episodes, AlbumId for
@@ -1757,6 +1766,39 @@ mod trickplay_helper_tests {
         assert_eq!(
             dto.backdrop_image_tags[0],
             super::image_tag_for(5, "backdrop")
+        );
+    }
+
+    #[test]
+    fn audio_item_advertises_no_backdrop() {
+        use pharos_core::{MediaItem, MediaKind};
+        // The image handler 404s Backdrop/Thumb for Audio (no video frames);
+        // the DTO must not advertise one, or jellyfin-web requests a backdrop
+        // that only 404s (tripped the strict-console compat spec on a music
+        // item). Both the ImageTags map AND the BackdropImageTags list must
+        // omit it.
+        let audio = MediaItem {
+            id: 4,
+            path: "/m/a.webm".into(),
+            title: "A".into(),
+            kind: MediaKind::Audio,
+            ..Default::default()
+        };
+        let dto = super::BaseItemDto::from_domain(&audio, "srv");
+        assert!(dto.backdrop_image_tags.is_empty(), "audio: no backdrop list");
+        assert!(!dto.image_tags.contains_key("Backdrop"), "audio: no Backdrop tag");
+        assert!(!dto.image_tags.contains_key("Thumb"), "audio: no Thumb tag");
+        assert!(dto.image_tags.contains_key("Primary"), "audio keeps Primary (cover art)");
+
+        // A video item still advertises a backdrop.
+        let movie = MediaItem {
+            id: 1,
+            kind: MediaKind::Movie,
+            ..audio.clone()
+        };
+        assert_eq!(
+            super::BaseItemDto::from_domain(&movie, "srv").backdrop_image_tags,
+            vec![super::image_tag_for(1, "backdrop")]
         );
     }
 }
