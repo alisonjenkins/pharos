@@ -140,6 +140,13 @@ pub struct AppState {
     /// (`list()`), and a TV-library grid fires one per visible tile. `None`
     /// caches a negative (id matched no group) so misses don't rescan either.
     pub synth_image_ids: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>>,
+    /// Serialises the one-time synth-image-map warm (see
+    /// `resolve_synth_image_item`). A library grid fires many poster requests
+    /// at once for distinct synth ids; without this each would run its own
+    /// full-library `list()` (seconds each, 13k rows). The first miss takes
+    /// this lock, builds the whole synth-id → representative map in one scan,
+    /// and every other request then hits the memo.
+    pub synth_image_warm: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -195,6 +202,7 @@ impl AppState {
             scan_rate_limit_ms: 0,
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -251,6 +259,7 @@ impl AppState {
             scan_rate_limit_ms: 0,
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 

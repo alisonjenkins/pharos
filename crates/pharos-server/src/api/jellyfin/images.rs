@@ -317,9 +317,6 @@ async fn resolve_synth_image_item(
     state: &AppState,
     id_str: &str,
 ) -> Option<pharos_core::MediaItem> {
-    use crate::api::jellyfin::dto::{
-        album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
-    };
     // Memoised resolution: a TV-library grid fires one image request per tile,
     // and each full `list()` scans the whole library. Cache the synth-id →
     // item-id mapping (including negatives) so only the first request per group
@@ -330,49 +327,85 @@ async fn resolve_synth_image_item(
             None => None,
         };
     }
-    let all = state.stores.list().await.ok()?;
-
-    // Series / Season: lowest (season, episode) episode in the group.
-    let mut best: Option<(&pharos_core::MediaItem, (u32, u32))> = None;
-    for it in &all {
-        let Some(s) = it.series.as_ref() else {
-            continue;
+    // Cold miss: warm the ENTIRE synth-id → representative map in one scan,
+    // serialised so a grid's burst of concurrent poster requests doesn't each
+    // run its own multi-second `list()`. Peers wait here, then hit the memo.
+    let _guard = state.synth_image_warm.lock().await;
+    if let Some(cached) = state.synth_image_cached(id_str) {
+        return match cached {
+            Some(item_id) => state.stores.get(item_id).await.ok(),
+            None => None,
         };
-        let is_series = series_id_for_key(s.series_folder.as_deref(), &s.series_name) == id_str;
-        let is_season = s.season_number.is_some_and(|n| {
-            season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == id_str
-        });
-        if is_series || is_season {
-            let ord = (s.season_number.unwrap_or(0), s.episode_number.unwrap_or(0));
-            if best.map_or(true, |(_, b)| ord < b) {
-                best = Some((it, ord));
-            }
+    }
+    let all = state.stores.list().await.ok()?;
+    build_synth_image_map(state, &all);
+    // The requested id is now memoised if it names a real group; otherwise
+    // record a negative so we don't rescan for it.
+    match state.synth_image_cached(id_str) {
+        Some(Some(item_id)) => all.into_iter().find(|it| it.id == item_id),
+        _ => {
+            state.synth_image_remember(id_str, None);
+            None
         }
     }
-    if let Some((it, _)) = best {
-        state.synth_image_remember(id_str, Some(it.id));
-        return Some(it.clone());
-    }
+}
 
-    // Artist / Album: first track (by title) in the group.
-    let mut tracks: Vec<&pharos_core::MediaItem> = all
-        .iter()
-        .filter(|it| {
-            it.probe
-                .artist
-                .as_deref()
-                .is_some_and(|a| artist_id_for(a) == id_str)
-                || it
-                    .probe
-                    .album
-                    .as_deref()
-                    .is_some_and(|a| album_id_for(a) == id_str)
-        })
-        .collect();
-    tracks.sort_by(|a, b| a.title.cmp(&b.title));
-    let resolved = tracks.first().map(|it| (*it).clone());
-    state.synth_image_remember(id_str, resolved.as_ref().map(|it| it.id));
-    resolved
+/// Build the full synth-id → representative-item map from one library scan and
+/// store it in `state.synth_image_ids`. Representative choice matches the old
+/// per-id resolution: the lowest (season, episode) for a Series/Season, the
+/// first track by title for an Artist/Album. A uniform sortable string key
+/// expresses both orderings — `S{season}E{episode}` zero-padded for episodes,
+/// the raw title for tracks — so one min-by-key pass covers every group.
+fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
+    use crate::api::jellyfin::dto::{
+        album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
+    };
+    use std::collections::HashMap;
+    // synth id -> (representative item id, sort key). Lowest key wins.
+    let mut best: HashMap<String, (u64, String)> = HashMap::new();
+    let mut consider = |id: String, item_id: u64, key: String| {
+        best.entry(id)
+            .and_modify(|e| {
+                if key < e.1 {
+                    *e = (item_id, key.clone());
+                }
+            })
+            .or_insert((item_id, key));
+    };
+    for it in all {
+        if let Some(s) = it.series.as_ref() {
+            let key = format!(
+                "{:010}{:010}",
+                s.season_number.unwrap_or(0),
+                s.episode_number.unwrap_or(0)
+            );
+            consider(
+                series_id_for_key(s.series_folder.as_deref(), &s.series_name),
+                it.id,
+                key.clone(),
+            );
+            if let Some(n) = s.season_number {
+                consider(
+                    season_id_for_key(s.series_folder.as_deref(), &s.series_name, n),
+                    it.id,
+                    key,
+                );
+            }
+        }
+        if let Some(a) = it.probe.artist.as_deref() {
+            consider(artist_id_for(a), it.id, it.title.clone());
+        }
+        if let Some(a) = it.probe.album.as_deref() {
+            consider(album_id_for(a), it.id, it.title.clone());
+        }
+    }
+    let mut cache = state
+        .synth_image_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (id, (item_id, _)) in best {
+        cache.entry(id).or_insert(Some(item_id));
+    }
 }
 
 /// The `ArtworkRole::as_str` token (D4 stores these in `artwork.role`)
