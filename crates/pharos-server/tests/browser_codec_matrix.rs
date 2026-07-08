@@ -8,7 +8,9 @@
 //!
 //! - `DirectPlay`  — SupportsDirectPlay=true (browser plays the file as-is).
 //! - `HlsH264`     — H.264/mpegts HLS master (SubProtocol "hls").
-//! - `WebmVp9`     — progressive VP9/WebM (SubProtocol "http").
+//! - `WebmVp9`     — VP9-in-fMP4 HLS master at `/vp9/master.m3u8` (SubProtocol
+//!   "hls"). The Firefox path; named for the VP9 codec it carries, no longer a
+//!   progressive WebM stream.
 //!
 //! Ground-truth capabilities (researched against MDN "Web video codec guide" +
 //! "Media container formats", caniuse.com, and Apple/Chromium docs — NOT the
@@ -270,7 +272,9 @@ async fn browser_codec_routing_matrix() {
                 .to_string();
             let got = if direct {
                 DirectPlay
-            } else if url.contains("stream.webm") {
+            } else if url.contains("/vp9/master.m3u8") {
+                // VP9-in-fMP4 HLS (Firefox path). Checked BEFORE the generic
+                // master.m3u8 arm since both end in master.m3u8.
                 WebmVp9
             } else if url.contains("master.m3u8") {
                 HlsH264

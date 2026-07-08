@@ -351,17 +351,17 @@ async fn playback_info_vp9_profile_gets_progressive_webm() {
     let ms = &v["MediaSources"][0];
     let url = ms["TranscodingUrl"].as_str().unwrap_or("");
     assert!(
-        url.contains("/stream.webm"),
-        "expected progressive webm, got {v}"
+        url.contains("/vp9/master.m3u8"),
+        "expected VP9 fMP4 HLS, got {v}"
     );
     assert!(
         url.contains(&format!("api_key={}", token.0.expose())),
-        "webm URL needs api_key: {v}"
+        "VP9 HLS URL needs api_key: {v}"
     );
     assert_eq!(
         ms["TranscodingSubProtocol"].as_str(),
-        Some("http"),
-        "webm progressive must be http not hls: {v}"
+        Some("hls"),
+        "VP9 fMP4 HLS uses the hls sub-protocol: {v}"
     );
 }
 
@@ -439,8 +439,8 @@ async fn firefox_ua_with_h264_first_still_gets_webm() {
         .as_str()
         .unwrap_or("");
     assert!(
-        url.contains("/stream.webm"),
-        "Firefox must get webm, got {v}"
+        url.contains("/vp9/master.m3u8"),
+        "Firefox must get VP9 fMP4 HLS, got {v}"
     );
 
     // Chromium UA → keeps HLS.
@@ -551,8 +551,8 @@ async fn firefox_webm_h264_source_forced_to_transcode_not_directplay() {
         ms["TranscodingUrl"]
             .as_str()
             .unwrap_or("")
-            .contains("/stream.webm"),
-        "h264 must transcode to webm: {v}"
+            .contains("/vp9/master.m3u8"),
+        "h264 must transcode to VP9 fMP4 HLS on Firefox: {v}"
     );
 
     // vp9 source → Firefox can decode it → left to direct-play.
@@ -630,7 +630,13 @@ async fn firefox_webm_url_forwards_audio_and_subtitle_index() {
     let url = v["MediaSources"][0]["TranscodingUrl"]
         .as_str()
         .unwrap_or("");
-    assert!(url.contains("/stream.webm"), "{v}");
+    // Firefox VP9 now rides fMP4 HLS (seekable), not progressive WebM.
+    assert!(url.contains("/vp9/master.m3u8"), "{v}");
+    assert_eq!(
+        v["MediaSources"][0]["TranscodingSubProtocol"].as_str(),
+        Some("hls"),
+        "VP9 fMP4 HLS uses the hls sub-protocol: {v}"
+    );
     assert!(
         url.contains("AudioStreamIndex=6"),
         "audio index not forwarded: {url}"

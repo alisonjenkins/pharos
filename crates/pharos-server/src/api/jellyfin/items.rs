@@ -1447,9 +1447,9 @@ async fn playback_info(
         && (direct_play
             || matches!(decision, Decision::AudioRemux { .. })
             || matches!(decision, Decision::VideoRemux { .. }));
-    // Forward the client's audio/subtitle track selection into the progressive
-    // webm URL — jellyfin-web re-requests PlaybackInfo with these when the user
-    // switches tracks. The webm handler maps them to per-codec indices (audio
+    // Forward the client's audio/subtitle track selection into the VP9 HLS
+    // URL — jellyfin-web re-requests PlaybackInfo with these when the user
+    // switches tracks. The VP9 segment handler maps them into ffmpeg (audio
     // select) + burns the chosen subtitle in.
     let stream_selection = {
         let q = req.query_string();
@@ -1470,11 +1470,16 @@ async fn playback_info(
         }
         s
     };
-    let webm_transcode_url = format!(
-        "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus{stream_selection}"
+    // VP9-in-fMP4 HLS, NOT progressive WebM. A progressive `<video src>` VP9
+    // stream plays in Firefox but cannot seek to an unbuffered position and
+    // reports no reliable position for resume. Serving VP9 as fMP4 HLS (like
+    // Jellyfin) gives hls.js a seekable VOD playlist — restoring seeking,
+    // resume, and mid-playback track switching. SubProtocol resolves to "hls".
+    let vp9_hls_url = format!(
+        "/videos/{id_str}/vp9/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
     );
     let transcoding_url = if force_webm {
-        Some(webm_transcode_url.clone())
+        Some(vp9_hls_url.clone())
     } else {
         match &decision {
             // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
@@ -1490,8 +1495,8 @@ async fn playback_info(
             // Decision instead of re-running the negotiator per segment.
             // A client whose transcoding profile asks for VP9/VP8 (a browser whose
             // MSE can't decode H.264 — e.g. some Firefox/Zen builds) gets a
-            // progressive VP9/WebM stream instead of the H.264/mpegts HLS surface,
-            // which it could not play. Everything else takes the HLS master.
+            // VP9-in-fMP4 HLS stream instead of the H.264/mpegts HLS surface,
+            // which it could not play. Everything else takes the H.264 HLS master.
             Decision::Transcode {
                 target_video_codec, ..
             } if is_video
@@ -1502,7 +1507,7 @@ async fn playback_info(
                     )
                 }) =>
             {
-                Some(webm_transcode_url.clone())
+                Some(vp9_hls_url.clone())
             }
             Decision::Transcode { .. } if is_video => Some(format!(
                 "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
@@ -1587,15 +1592,12 @@ async fn playback_info(
                 .map(|s| s.index)
         });
 
-    // TranscodingSubProtocol only makes sense alongside a real
-    // TranscodingUrl. Emitting `"hls"` unconditionally made
-    // jellyfin-web's htmlVideoPlayer route the direct-play webm URL
-    // through hls.js — which then errored with manifestParsingError
-    // when it tried to parse the webm bytes as an HLS manifest.
-    // A progressive `.webm` transcode is played via a plain `<video src>`
-    // (SubProtocol "http"); the `.m3u8` surface is driven by hls.js
-    // (SubProtocol "hls"). Emitting "hls" for the webm URL would make
-    // jellyfin-web feed webm bytes to hls.js → manifestParsingError.
+    // TranscodingSubProtocol only makes sense alongside a real TranscodingUrl.
+    // Every video transcode pharos emits is now an HLS `.m3u8` surface (H.264
+    // mpegts OR VP9 fMP4), driven by hls.js → SubProtocol "hls". The `.webm`
+    // guard remains defensive: a progressive `<video src>` `.webm` transcode
+    // must be "http" (feeding its bytes to hls.js yields manifestParsingError),
+    // in case any path is re-pointed at the legacy progressive handler.
     let transcoding_sub_protocol = match transcoding_url.as_deref() {
         Some(u) if u.contains(".webm") => Some("http"),
         Some(_) => Some("hls"),
