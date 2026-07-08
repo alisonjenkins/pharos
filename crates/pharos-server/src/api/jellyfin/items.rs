@@ -150,8 +150,7 @@ async fn items_counts(
 ) -> Result<impl Responder, actix_web::Error> {
     use std::collections::HashSet;
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut movies = 0u32;
@@ -161,7 +160,7 @@ async fn items_counts(
     let mut artists: HashSet<&str> = HashSet::new();
     let mut albums: HashSet<&str> = HashSet::new();
     let mut genres: HashSet<&str> = HashSet::new();
-    for i in &all {
+    for i in all.iter() {
         match i.kind {
             MediaKind::Movie => movies += 1,
             MediaKind::Episode => {
@@ -409,8 +408,7 @@ async fn items_similar(
         }
     };
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let Some(target) = all.iter().find(|i| i.id == id) else {
@@ -562,13 +560,12 @@ async fn list_artists(
     use crate::api::jellyfin::dto::artist_id_for;
     use std::collections::HashSet;
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut names: Vec<String> = Vec::new();
-    for i in &all {
+    for i in all.iter() {
         for src in [i.probe.album_artist.as_deref(), i.probe.artist.as_deref()] {
             if let Some(n) = src.filter(|s| !s.is_empty()) {
                 if seen.insert(n.to_string()) {
@@ -612,14 +609,13 @@ async fn list_albums(
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     use std::collections::HashMap;
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // Map album_name → (album_artist, sample track id) so a click
     // into the album renders with the right artist on the tile.
     let mut albums: HashMap<String, Option<String>> = HashMap::new();
-    for i in &all {
+    for i in all.iter() {
         let Some(name) = i.probe.album.as_deref() else {
             continue;
         };
@@ -1103,8 +1099,7 @@ async fn shows_next_up(
     q: web::Query<NextUpQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
@@ -1220,8 +1215,7 @@ async fn shows_episodes(
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
     let series_id = path.into_inner();
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
@@ -1293,8 +1287,7 @@ async fn shows_seasons(
     use std::collections::BTreeMap;
     let series_id = path.into_inner();
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // One representative SeriesInfo per season number (BTreeMap → ascending).
@@ -1725,14 +1718,13 @@ async fn list_user_items_latest(
         return Err(error::ErrorForbidden("user mismatch"));
     }
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // Honour ParentId so home-page "Latest" rows match the library
     // the user clicked into. Library / series / season ids all
     // resolve via the shared restrict_to_parent helper.
-    let scoped = restrict_to_parent(&state, all, q.parent_id.as_deref()).await;
+    let scoped = restrict_to_parent(&state, &all, q.parent_id.as_deref()).await;
     // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
     // row filters to Type=Movie.
     let typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
@@ -2865,7 +2857,7 @@ async fn apply_tags_filter(
 /// The All-Media placeholder + `None` pass everything through.
 async fn restrict_to_parent(
     state: &AppState,
-    items: Vec<MediaItem>,
+    items: &[MediaItem],
     parent_id: Option<&str>,
 ) -> Vec<MediaItem> {
     use crate::api::jellyfin::dto::{
@@ -2875,10 +2867,10 @@ async fn restrict_to_parent(
         CollectionStore, GenreStore, LibraryStore, PersonStore, StudioStore, TagStore,
     };
     let Some(pid) = parent_id else {
-        return items;
+        return items.to_vec();
     };
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
-        return items;
+        return items.to_vec();
     }
     // 1) Library / root match. LIB-C1 — prefer the typed `libraries` table:
     //    resolve the ParentId by wire_id to the set of item ids assigned
@@ -2895,15 +2887,20 @@ async fn restrict_to_parent(
         if let Ok(ids) = state.stores.item_ids_for_library(&wire_id).await {
             if !ids.is_empty() {
                 let want: std::collections::HashSet<u64> = ids.into_iter().collect();
-                return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+                return items
+                    .iter()
+                    .filter(|i| want.contains(&i.id))
+                    .cloned()
+                    .collect();
             }
         }
         // No backfilled rows yet → fall back to the path-prefix scan
         // against this library's root so the view still resolves.
         let root = std::path::PathBuf::from(&root_path);
         return items
-            .into_iter()
+            .iter()
             .filter(|i| i.path.starts_with(&root))
+            .cloned()
             .collect();
     }
     if let Some(root) = state
@@ -2912,8 +2909,9 @@ async fn restrict_to_parent(
         .find(|r| library_id_for_root(r) == pid)
     {
         return items
-            .into_iter()
+            .iter()
             .filter(|i| i.path.starts_with(root))
+            .cloned()
             .collect();
     }
     // 2) Series id → every episode whose folder-keyed series id matches
@@ -2926,12 +2924,13 @@ async fn restrict_to_parent(
             .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
     }) {
         return items
-            .into_iter()
+            .iter()
             .filter(|i| {
                 i.series.as_ref().is_some_and(|s| {
                     series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
                 })
             })
+            .cloned()
             .collect();
     }
     // 3) Season id → every episode in that (folder, season) pair.
@@ -2943,7 +2942,7 @@ async fn restrict_to_parent(
         })
     }) {
         return items
-            .into_iter()
+            .iter()
             .filter(|i| {
                 i.series.as_ref().is_some_and(|s| {
                     s.season_number.is_some_and(|n| {
@@ -2951,6 +2950,7 @@ async fn restrict_to_parent(
                     })
                 })
             })
+            .cloned()
             .collect();
     }
     // 4) Artist id → every track whose artist or album_artist matches.
@@ -2965,7 +2965,7 @@ async fn restrict_to_parent(
                 .is_some_and(|a| artist_id_for(a) == pid)
     }) {
         return items
-            .into_iter()
+            .iter()
             .filter(|i| {
                 i.probe
                     .artist
@@ -2976,6 +2976,7 @@ async fn restrict_to_parent(
                         .as_deref()
                         .is_some_and(|a| artist_id_for(a) == pid)
             })
+            .cloned()
             .collect();
     }
     // 5) Album id → every track whose album hashes to pid.
@@ -2986,13 +2987,14 @@ async fn restrict_to_parent(
             .is_some_and(|a| album_id_for(a) == pid)
     }) {
         return items
-            .into_iter()
+            .iter()
             .filter(|i| {
                 i.probe
                     .album
                     .as_deref()
                     .is_some_and(|a| album_id_for(a) == pid)
             })
+            .cloned()
             .collect();
     }
     // 6) Genre id → every item tagged with that genre. LIB-C4: resolve
@@ -3003,7 +3005,11 @@ async fn restrict_to_parent(
     if let Ok(ids) = state.stores.item_ids_for_genre(pid).await {
         if !ids.is_empty() {
             let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
         }
     }
     if items.iter().any(|i| {
@@ -3014,7 +3020,7 @@ async fn restrict_to_parent(
             .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
     }) {
         return items
-            .into_iter()
+            .iter()
             .filter(|i| {
                 i.probe
                     .genre
@@ -3022,6 +3028,7 @@ async fn restrict_to_parent(
                     .map(pharos_core::split_genre_field)
                     .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
             })
+            .cloned()
             .collect();
     }
     // 7) Person id → every item crediting that person. LIB-C2: resolve
@@ -3031,7 +3038,11 @@ async fn restrict_to_parent(
     if let Ok(ids) = state.stores.item_ids_for_person(pid).await {
         if !ids.is_empty() {
             let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
         }
     }
     // 8) Studio id → every item tagged with that studio. LIB-C3: resolve
@@ -3042,7 +3053,11 @@ async fn restrict_to_parent(
     if let Ok(ids) = state.stores.item_ids_for_studio(pid).await {
         if !ids.is_empty() {
             let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
         }
     }
     // 9) Collection / box set id → its members in curated sort_order.
@@ -3058,10 +3073,10 @@ async fn restrict_to_parent(
         if collection.is_some() {
             let member_ids = state.stores.collection_items(pid).await.unwrap_or_default();
             let mut by_id: std::collections::HashMap<pharos_core::MediaId, MediaItem> =
-                items.into_iter().map(|i| (i.id, i)).collect();
+                items.iter().map(|i| (i.id, i.clone())).collect();
             return member_ids
-                .into_iter()
-                .filter_map(|id| by_id.remove(&id))
+                .iter()
+                .filter_map(|id| by_id.remove(id))
                 .collect();
         }
     }
@@ -3072,7 +3087,11 @@ async fn restrict_to_parent(
     if let Ok(ids) = state.stores.item_ids_for_tag(pid).await {
         if !ids.is_empty() {
             let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items.into_iter().filter(|i| want.contains(&i.id)).collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
         }
     }
     // Unknown id — render an empty library.
@@ -3424,8 +3443,7 @@ async fn synth_series_or_season(
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, season_id_for_key, series_id_for_key};
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // First: series match. LIB-C11 — resolve via the folder-keyed id so

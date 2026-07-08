@@ -153,6 +153,20 @@ pub struct AppState {
     /// decode never contends with live segment transcoding and makes
     /// playback buffer. Bumped by the HLS + VP9 segment handlers.
     pub playback_activity: Arc<std::sync::atomic::AtomicI64>,
+    /// Monotonic library version, bumped on every library-mutating notify
+    /// (`notify_library_changed` / `notify_library_delta`). The full-item-list
+    /// cache below keys on this so any add/remove instantly invalidates it.
+    pub library_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Single-flight cache of the whole `media_items` list. Home-screen +
+    /// synth-id endpoints each did a full ~13k-row `store.list()` (1-4s) per
+    /// request, and browsing fired several at once. Holds
+    /// `(generation, built_at, items)` — a hit requires the generation to
+    /// still match AND the entry to be under `LIST_CACHE_MAX_AGE` (a backstop
+    /// so a missed invalidation self-heals). See `list_items_cached`.
+    #[allow(clippy::type_complexity)]
+    pub item_list_cache: Arc<
+        tokio::sync::Mutex<Option<(u64, std::time::Instant, Arc<Vec<pharos_core::MediaItem>>)>>,
+    >,
 }
 
 /// Unix time in whole seconds (0 if the clock is before the epoch).
@@ -237,6 +251,8 @@ impl AppState {
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -295,6 +311,8 @@ impl AppState {
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -403,10 +421,40 @@ impl AppState {
     /// No-op when there are zero subscribers (broadcast::send returns
     /// Err but we don't care).
     pub fn notify_library_changed(&self) {
+        self.library_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self.bus.send(SocketBroadcast::LibraryChanged {
             added: Vec::new(),
             removed: Vec::new(),
         });
+    }
+
+    /// Full `media_items` list, cached until the library changes (see
+    /// `item_list_cache`). Callers that only read/filter the list (home-screen
+    /// rows, synth Series/Season resolution) should use this instead of
+    /// `stores.list()` to avoid a full-table scan on every request. Returns an
+    /// `Arc` so the large Vec is shared, not cloned, across concurrent readers.
+    pub async fn list_items_cached(
+        &self,
+    ) -> Result<Arc<Vec<pharos_core::MediaItem>>, pharos_core::DomainError> {
+        use pharos_core::MediaStore;
+        /// Backstop: even if some mutation path forgets to bump the generation,
+        /// the cache refreshes at least this often.
+        const LIST_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+        let gen = self
+            .library_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut guard = self.item_list_cache.lock().await;
+        if let Some((cached_gen, at, items)) = guard.as_ref() {
+            if *cached_gen == gen && at.elapsed() < LIST_CACHE_MAX_AGE {
+                return Ok(items.clone());
+            }
+        }
+        // Miss (stale generation / expired / cold). The mutex makes this
+        // single-flight: a burst of home-screen requests shares one scan.
+        let items = Arc::new(self.stores.list().await?);
+        *guard = Some((gen, std::time::Instant::now(), items.clone()));
+        Ok(items)
     }
 
     /// LIB-A4 — fire a `LibraryChanged` event carrying the item-id deltas
@@ -420,6 +468,8 @@ impl AppState {
         added: &[pharos_core::MediaId],
         removed: &[pharos_core::MediaId],
     ) {
+        self.library_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self.bus.send(SocketBroadcast::LibraryChanged {
             added: added.iter().map(|id| id.to_string()).collect(),
             removed: removed.iter().map(|id| id.to_string()).collect(),
