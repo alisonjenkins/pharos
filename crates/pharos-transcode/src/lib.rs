@@ -394,6 +394,20 @@ fn build_args_for_device(
                     a.push("8".into());
                     a.push("-row-mt".into());
                     a.push("1".into());
+                    // libvpx with only row-mt pins to ~2 cores, so a 1080p
+                    // realtime encode falls below playback speed and the client
+                    // stutters even while the node sits mostly idle. Split the
+                    // frame into tile columns and hand libvpx a real thread pool
+                    // so it parallelises across the spare cores. `-tile-columns`
+                    // is a log2 count (4 → up to 16 cols, auto-clamped to what
+                    // the width allows); pair it with enough threads to fill the
+                    // tiles + row workers.
+                    a.push("-tile-columns".into());
+                    a.push("4".into());
+                    a.push("-frame-parallel".into());
+                    a.push("1".into());
+                    a.push("-threads".into());
+                    a.push(vp9_encode_threads().to_string());
                 }
             }
         }
@@ -448,6 +462,17 @@ fn build_args_for_device(
     }
     a.push(output.to_string());
     a
+}
+
+/// Thread budget for a live libvpx-vp9 encode. Enough to keep a 1080p
+/// realtime encode above playback speed, but capped so two concurrent
+/// streams on a typical box don't oversubscribe every core (leaving none
+/// for muxing / the other stream / the OS).
+fn vp9_encode_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+        .clamp(4, 8)
 }
 
 #[cfg(test)]
@@ -512,6 +537,10 @@ mod tests {
         assert!(joined.contains("-deadline realtime"), "{joined}");
         assert!(joined.contains("-cpu-used 8"), "{joined}");
         assert!(joined.contains("-row-mt 1"), "{joined}");
+        // Multithreading across tile columns keeps the 1080p realtime encode
+        // above playback speed instead of pinning to ~2 cores.
+        assert!(joined.contains("-tile-columns 4"), "{joined}");
+        assert!(joined.contains("-threads "), "{joined}");
         // `-movflags` is mp4-only; the webm muxer rejects it.
         assert!(!joined.contains("-movflags"), "{joined}");
     }
