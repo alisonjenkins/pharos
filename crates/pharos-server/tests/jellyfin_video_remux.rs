@@ -467,3 +467,100 @@ async fn firefox_ua_with_h264_first_still_gets_webm() {
         "Chromium must keep HLS, got {v}"
     );
 }
+
+// The direct-play trap: a webm-container H.264 source that jellyfin-web's
+// Firefox profile would DIRECT-PLAY (webm DirectPlayProfile matches) — but the
+// browser can't decode H.264. pharos must override direct-play and force a
+// VP9/WebM transcode. A genuine VP9 source is left to direct-play.
+#[actix_web::test]
+async fn firefox_webm_h264_source_forced_to_transcode_not_directplay() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let put = |id: u64, vcodec: &'static str| {
+        let stores = stores.clone();
+        async move {
+            stores
+                .put(MediaItem {
+                    id,
+                    path: format!("/x{id}.webm").into(),
+                    title: "Ep".into(),
+                    kind: MediaKind::Movie,
+                    probe: MediaProbe {
+                        duration_ms: Some(60_000),
+                        width: Some(1920),
+                        height: Some(1080),
+                        container: Some("webm".into()),
+                        video_codec: Some(vcodec.into()),
+                        audio_codec: Some("aac".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    };
+    put(20, "h264").await;
+    put(21, "vp9").await;
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    // jellyfin-web Firefox profile: webm direct-play (h264 + vp9) + vp9 transcode.
+    let body = r#"{"DeviceProfile":{
+        "DirectPlayProfiles":[{"Container":"webm","Type":"Video","VideoCodec":"h264,vp9","AudioCodec":"aac,opus"}],
+        "TranscodingProfiles":[{"Container":"webm","Type":"Video","Protocol":"http","VideoCodec":"vp9","AudioCodec":"opus"}]
+    }}"#;
+    let ff = |id: u64| {
+        test::TestRequest::post()
+            .uri(&format!("/Items/{id}/PlaybackInfo"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .insert_header(("content-type", "application/json"))
+            .insert_header(("User-Agent", "Gecko/20100101 Firefox/152.0"))
+            .set_payload(body)
+            .to_request()
+    };
+
+    // h264 source → forced webm transcode, NOT direct play.
+    let v: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, ff(20)).await).unwrap();
+    let ms = &v["MediaSources"][0];
+    assert_eq!(
+        ms["SupportsDirectPlay"].as_bool(),
+        Some(false),
+        "h264 must not direct-play on Firefox: {v}"
+    );
+    assert!(
+        ms["TranscodingUrl"]
+            .as_str()
+            .unwrap_or("")
+            .contains("/stream.webm"),
+        "h264 must transcode to webm: {v}"
+    );
+
+    // vp9 source → Firefox can decode it → left to direct-play.
+    let v: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, ff(21)).await).unwrap();
+    assert_eq!(
+        v["MediaSources"][0]["SupportsDirectPlay"].as_bool(),
+        Some(true),
+        "vp9 source should still direct-play on Firefox: {v}"
+    );
+}

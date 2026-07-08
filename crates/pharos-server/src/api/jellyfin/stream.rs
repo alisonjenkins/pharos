@@ -394,6 +394,35 @@ async fn deliver_stream(
         .use_etag(true)
         .use_last_modified(true);
     let mut resp = file.into_response(req);
+    // A Matroska file carrying only WebM-legal codecs (VP8/VP9/AV1 + Opus/
+    // Vorbis) is playable by browsers as `video/webm`, but `mime_guess` maps
+    // the `.mkv` extension to `video/x-matroska`, which Firefox rejects
+    // outright ("Content-Type video/matroska is not supported"). Re-label such
+    // a direct-play stream as `video/webm` so the browser accepts it.
+    let webm_video = matches!(
+        item.probe
+            .video_codec
+            .as_deref()
+            .map(|c| c.to_ascii_lowercase())
+            .as_deref(),
+        Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
+    );
+    let matroska = matches!(
+        item.probe
+            .container
+            .as_deref()
+            .map(|c| c.to_ascii_lowercase())
+            .as_deref(),
+        Some("webm" | "matroska" | "mkv")
+    ) || item
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("webm"));
+    if webm_video && matroska {
+        resp.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/webm"));
+    }
     // P24 — echo the auth as a cookie so a follow-up `<video>`-style
     // fetch can drop the `?api_key=` and still authenticate.
     if let Some(token) = api_key_query_value(req.query_string()) {

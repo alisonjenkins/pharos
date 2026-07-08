@@ -1398,37 +1398,56 @@ async fn playback_info(
     // targeted client quirk: when a Firefox-family UA ALSO advertises a VP9
     // transcode target, serve the progressive VP9/WebM stream (which its MSE
     // decodes reliably) instead. Chromium/Safari keep the efficient H.264 HLS.
-    let prefer_webm = is_video
-        && req
-            .headers()
-            .get(actix_web::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            // Match "Firefox" only — Chrome's UA contains "like Gecko" so a
-            // bare "Gecko" check would wrongly capture Chromium.
-            .is_some_and(|ua| ua.contains("Firefox"))
-        && profile.transcoding_profiles.iter().any(|t| {
-            (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
-                && t.video_codec.split(',').any(|c| {
-                    matches!(
-                        c.trim().to_ascii_lowercase().as_str(),
-                        "vp9" | "vp8" | "vp09" | "vp08"
-                    )
-                })
-        });
+    let is_firefox = req
+        .headers()
+        .get(actix_web::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        // Match "Firefox" only — Chrome's UA contains "like Gecko" so a
+        // bare "Gecko" check would wrongly capture Chromium.
+        .is_some_and(|ua| ua.contains("Firefox"));
+    let client_offers_vp9 = profile.transcoding_profiles.iter().any(|t| {
+        (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
+            && t.video_codec.split(',').any(|c| {
+                matches!(
+                    c.trim().to_ascii_lowercase().as_str(),
+                    "vp9" | "vp8" | "vp09" | "vp08"
+                )
+            })
+    });
+    // The video codecs a modern Firefox reliably decodes in ANY context
+    // (MSE or a plain <video>): the VP/AV1 family. THIS user's Firefox can't
+    // do H.264 at all, so treat h264/hevc/mpeg4/… as un-decodable and force a
+    // VP9 transcode. A genuine VP9/VP8/AV1 source is left to direct-play.
+    let source_firefox_native = matches!(
+        source
+            .video_codec
+            .as_deref()
+            .map(|c| c.to_ascii_lowercase())
+            .as_deref(),
+        Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
+    );
+    // Firefox client-quirk: jellyfin-web advertises H.264 (canPlayType says
+    // "probably") and will DirectPlay / remux / HLS-transcode it, but the
+    // browser's decoder rejects it. When a Firefox UA that advertises VP9
+    // plays a non-VP source, override EVERY decision (including DirectPlay)
+    // and serve a progressive VP9/WebM transcode it can actually decode.
+    let force_webm = is_video && is_firefox && client_offers_vp9 && !source_firefox_native;
 
-    let direct_play = decision.is_direct();
+    let direct_play = decision.is_direct() && !force_webm;
     // P9 — VideoRemux supports DirectStream too: video copies + audio
     // remuxes, so the client gets a fast-mux container without a full
-    // re-encode.
-    let supports_direct_stream = direct_play
-        || matches!(decision, Decision::AudioRemux { .. })
-        || matches!(decision, Decision::VideoRemux { .. });
-    let transcoding_url = match &decision {
-        // Firefox VP9-preference quirk (see `prefer_webm` above): any video
-        // transcode/remux for such a client goes to the progressive WebM path.
-        Decision::Transcode { .. } | Decision::VideoRemux { .. } if prefer_webm => Some(format!(
-            "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus"
-        )),
+    // re-encode. Suppressed when we force a Firefox WebM transcode.
+    let supports_direct_stream = !force_webm
+        && (direct_play
+            || matches!(decision, Decision::AudioRemux { .. })
+            || matches!(decision, Decision::VideoRemux { .. }));
+    let webm_transcode_url = format!(
+        "/videos/{id_str}/stream.webm?PlaySessionId={play_session_id}&api_key={api_key}&VideoCodec=vp9&AudioCodec=opus"
+    );
+    let transcoding_url = if force_webm {
+        Some(webm_transcode_url.clone())
+    } else {
+        match &decision {
         // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
         // pipeline always emits mpegts H.264/AAC segments regardless of the
         // container the client's profile nominally requested (hls.js demuxes
@@ -1472,7 +1491,8 @@ async fn playback_info(
         Decision::VideoRemux { .. } => Some(format!(
             "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
         )),
-        _ => None,
+            _ => None,
+        }
     };
     // P9 — emitted container reflects the negotiated target when remuxing.
     let advertised_container = match &decision {
