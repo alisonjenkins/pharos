@@ -1,0 +1,21 @@
+# Pre-commit hooks, run by `prek` (the fast Rust pre-commit; in the devShell).
+#
+# Install the git hook once per clone:
+#     nix develop --command prek install
+#
+# After that, `git commit` runs these gates and refuses to commit code that
+# would fail CI's format check. Run manually across the tree with
+# `nix develop --command prek run --all-files`.
+repos:
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt (cargo fmt --check)
+        # Self-bootstrapping: `nix develop --command` so the hook works even
+        # when `git commit` runs outside the devShell. The whole workspace is
+        # checked (pass_filenames: false) — matches CI's `cargo fmt --all
+        # --check`, so a green hook guarantees a green CI format step.
+        entry: nix develop --command cargo fmt --all --check --
+        language: system
+        types: [rust]
+        pass_filenames: false

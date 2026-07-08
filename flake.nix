@@ -711,6 +711,10 @@
             pkgs.git
             pkgs.just
             pkgs.curl
+            # prek — fast Rust reimplementation of pre-commit. Runs the hooks
+            # in `.pre-commit-config.yaml` (rustfmt gate) so unformatted code
+            # can't be committed. Install once per clone with `prek install`.
+            pkgs.prek
             # k8s deploy + Tilt inner-loop (charts/pharos + Tiltfile).
             # `just tilt-up` uses ctlptl to stand up a kind cluster + a local
             # OCI registry (wired together); nix builds the images, Tilt
