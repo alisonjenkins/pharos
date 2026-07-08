@@ -86,29 +86,15 @@
             # Only the two server-side binaries; the wasm UI crate is built
             # separately by `dx` (pharosUiBundle).
             cargoBuildFlags = [ "-p" "pharos-server" "-p" "pharos-transcode" ];
-            # Build + test + lint in ONE derivation so `.#oci` (which has this
-            # store path in `contents`) reuses the compiled result instead of
-            # the CI pipeline compiling the workspace a second time. checks run
-            # in `--release` to share the release artifacts the buildPhase just
-            # produced. The fixture-gated real-ffmpeg tests are `#[ignore]`d, so
-            # nextest skips them here (no network / fixture corpus needed in the
-            # sandbox); ffmpeg-headless is still on PATH for any test that shells
-            # out defensively.
-            doCheck = true;
-            checkPhase = ''
-              runHook preCheck
-              cargo nextest run --workspace --release --profile ci
-              cargo test --doc --workspace --release
-              cargo clippy --workspace --all-targets --release -- -D warnings
-              cargo fmt --all -- --check
-              runHook postCheck
-            '';
-            nativeBuildInputs = [
-              pkgs.pkg-config
-              pkgs.rustPlatform.bindgenHook
-              pkgs.cargo-nextest
-              pkgs.ffmpeg-headless
-            ];
+            # Build only — tests + clippy + fmt run in the CI `test` job via
+            # cargo. Running the full workspace suite inside this derivation's
+            # checkPhase (so `.#oci` could reuse one compile) proved too fragile:
+            # heavy/timing-sensitive tests (e.g. the 20k-row pagination test)
+            # that pass under plain `cargo nextest` hit the constrained nix
+            # sandbox's slow-timeout and failed the *image build*. Keeping the
+            # binary build free of the test gate is worth the second compile.
+            doCheck = false;
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
             buildInputs = [ pkgs.ffmpeg-headless.dev ];
           };
         pharos = pharosBins;
