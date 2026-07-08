@@ -360,14 +360,19 @@ fn build_args_for_device(
                 // the non-VAAPI encoders here.
                 a.push("-pix_fmt".into());
                 a.push("yuv420p".into());
-                // NVENC GPU ordinal selection on a multi-GPU box.
-                if matches!(
-                    device,
-                    DeviceId::Hw {
-                        accel: HwAccel::Nvenc,
-                        ..
-                    }
-                ) {
+                // NVENC GPU ordinal selection on a multi-GPU box. Only the
+                // NVENC h264/hevc encoders accept `-gpu`; appending it for a
+                // software codec (libvpx-vp9, which never runs on NVENC)
+                // aborts ffmpeg with "Option gpu not found" → a 0-byte stream.
+                if matches!(c, VideoCodec::H264 | VideoCodec::H265)
+                    && matches!(
+                        device,
+                        DeviceId::Hw {
+                            accel: HwAccel::Nvenc,
+                            ..
+                        }
+                    )
+                {
                     if let Some(idx) = device.index() {
                         a.push("-gpu".into());
                         a.push(idx.to_string());

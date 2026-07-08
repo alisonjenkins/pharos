@@ -326,8 +326,9 @@ async fn stream_transcoded_webm(
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
     };
-    // Prefer the load-balancing scheduler (crash-isolated worker); fall back to
-    // an inline ffmpeg so the request still succeeds if the pool is busy.
+    // Route through the load-balancing scheduler (crash-isolated worker,
+    // spread across every GPU + CPU). Inline ffmpeg is only a last-resort
+    // fallback when the scheduler genuinely declines (pool saturated).
     if let Some(sched) = state.transcode_scheduler.as_ref() {
         match sched.submit_live(item.path.clone(), opts.clone()).await {
             Ok(stream) => {
@@ -336,7 +337,7 @@ async fn stream_transcoded_webm(
                     .streaming(stream));
             }
             Err(e) => {
-                tracing::warn!(error = %e, "scheduler webm transcode failed; inline fallback");
+                tracing::warn!(error = %e, "scheduler webm live transcode declined; inline fallback");
             }
         }
     }
