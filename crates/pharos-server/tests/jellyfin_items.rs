@@ -247,6 +247,114 @@ async fn list_items_sorts_descending_when_requested() {
     assert_eq!(names.first().map(|s| s.as_str()), Some("title-3"));
 }
 
+/// Seed 3 episodes of "Alpha Show" (2 seasons) + 2 of "Beta Show" (1 season)
+/// plus a stray movie, returning an admin token for browsing.
+async fn seed_shows() -> (web::Data<AppState>, String, UserId) {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy { admin: true },
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+
+    let ep = |id: u64, show: &str, folder: &str, season: u32, epn: u32| MediaItem {
+        id,
+        path: format!("/tv/{folder}/S{season:02}E{epn:02}.mkv").into(),
+        title: format!("{show} S{season:02}E{epn:02}"),
+        kind: MediaKind::Episode,
+        series: Some(pharos_core::SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(season),
+            episode_number: Some(epn),
+            series_folder: Some(format!("/tv/{folder}")),
+            series_year: None,
+        }),
+        ..Default::default()
+    };
+    for it in [
+        ep(1, "Alpha Show", "Alpha", 1, 1),
+        ep(2, "Alpha Show", "Alpha", 1, 2),
+        ep(3, "Alpha Show", "Alpha", 2, 1),
+        ep(4, "Beta Show", "Beta", 1, 1),
+        ep(5, "Beta Show", "Beta", 1, 2),
+        MediaItem {
+            id: 6,
+            path: "/movies/x.mkv".into(),
+            title: "Standalone Movie".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        },
+    ] {
+        stores.put(it).await.unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "test".into()));
+    (state, token.0.expose().to_string(), uid)
+}
+
+#[actix_web::test]
+async fn include_item_types_series_collapses_episodes_into_series_tiles() {
+    let (state, token, _u) = seed_shows().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Series")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // 5 episodes across 2 shows collapse to exactly 2 Series tiles.
+    assert_eq!(v["TotalRecordCount"], 2, "body={v}");
+    let names: Vec<&str> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Alpha Show", "Beta Show"]);
+    for i in v["Items"].as_array().unwrap() {
+        assert_eq!(i["Type"], "Series");
+        assert_eq!(i["IsFolder"], true);
+    }
+}
+
+#[actix_web::test]
+async fn include_item_types_series_honours_search_term() {
+    let (state, token, _u) = seed_shows().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Series&SearchTerm=Beta")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1, "body={v}");
+    assert_eq!(v["Items"][0]["Name"], "Beta Show");
+}
+
+#[actix_web::test]
+async fn include_item_types_season_collapses_into_season_tiles() {
+    let (state, token, _u) = seed_shows().await;
+    let app = test::init_service(build_app(state)).await;
+    // Scope to Alpha Show (2 seasons) via SearchTerm → 2 Season tiles.
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Season&SearchTerm=Alpha")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 2, "body={v}");
+    for i in v["Items"].as_array().unwrap() {
+        assert_eq!(i["Type"], "Season");
+    }
+}
+
 #[actix_web::test]
 async fn virtual_folders_returns_synth_library() {
     let (state, token, _u) = seed().await;
