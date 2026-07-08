@@ -384,6 +384,99 @@ pub struct MediaStreamDto {
     /// keys leave the player at unity gain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_gain: Option<ReplayGainDto>,
+    /// Human-readable label jellyfin-web's audio/subtitle pickers render.
+    /// WITHOUT this every entry shows "undefined". Composed from language +
+    /// title + codec + channel layout (see `stream_display_title`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
+}
+
+/// Map a 2/3-letter ISO-639 language code to an English display name, falling
+/// back to the upper-cased code. Covers the languages common in a home library.
+fn language_display_name(code: &str) -> String {
+    match code.trim().to_ascii_lowercase().as_str() {
+        "en" | "eng" => "English",
+        "ja" | "jpn" => "Japanese",
+        "es" | "spa" => "Spanish",
+        "fr" | "fre" | "fra" => "French",
+        "de" | "ger" | "deu" => "German",
+        "it" | "ita" => "Italian",
+        "pt" | "por" => "Portuguese",
+        "ru" | "rus" => "Russian",
+        "zh" | "chi" | "zho" => "Chinese",
+        "ko" | "kor" => "Korean",
+        "ar" | "ara" => "Arabic",
+        "nl" | "dut" | "nld" => "Dutch",
+        "pl" | "pol" => "Polish",
+        "sv" | "swe" => "Swedish",
+        "tr" | "tur" => "Turkish",
+        "hi" | "hin" => "Hindi",
+        "und" => return "Undetermined".to_string(),
+        other => return other.to_ascii_uppercase(),
+    }
+    .to_string()
+}
+
+/// Channel-count → common layout label (Jellyfin picker convention).
+fn channel_layout_label(ch: u32) -> &'static str {
+    match ch {
+        1 => "Mono",
+        2 => "Stereo",
+        6 => "5.1",
+        7 => "6.1",
+        8 => "7.1",
+        _ => "",
+    }
+}
+
+/// Compose a jellyfin-web picker label: "Language - Title" (or, when there's no
+/// track title, "Language - CODEC Layout"). Any part may be absent; returns
+/// `None` only when nothing is known.
+fn stream_display_title(
+    language: Option<&str>,
+    title: Option<&str>,
+    codec: Option<&str>,
+    channels: Option<u32>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(l) = language.map(str::trim).filter(|l| !l.is_empty()) {
+        parts.push(language_display_name(l));
+    }
+    if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        parts.push(t.to_string());
+    } else {
+        // No embedded track title → describe by codec + channel layout.
+        let mut desc = String::new();
+        if let Some(c) = codec.map(str::trim).filter(|c| !c.is_empty()) {
+            desc.push_str(&c.to_ascii_uppercase());
+        }
+        if let Some(layout) = channels.map(channel_layout_label).filter(|s| !s.is_empty()) {
+            if !desc.is_empty() {
+                desc.push(' ');
+            }
+            desc.push_str(layout);
+        }
+        if !desc.is_empty() {
+            parts.push(desc);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" - "))
+}
+
+/// Fill in `display_title` for every stream that lacks one. Called once after a
+/// stream list is built so each construction site stays terse.
+fn fill_display_titles(streams: &mut [MediaStreamDto]) {
+    for s in streams.iter_mut() {
+        if s.display_title.is_some() || s.kind == "Video" {
+            continue;
+        }
+        s.display_title = stream_display_title(
+            s.language.as_deref(),
+            s.title.as_deref(),
+            s.codec.as_deref(),
+            s.channels,
+        );
+    }
 }
 
 /// P37 — wire shape for `MediaStream.ReplayGain`. Floats are in dB
@@ -1086,6 +1179,7 @@ pub fn build_media_streams_with_subtitles(
             is_hearing_impaired: None,
             delivery_url: None,
             replay_gain: None,
+            display_title: None,
         });
         // P16 — multi-track audio when the probe carries the new
         // audio_tracks Vec. Falls through to the scalar
@@ -1115,6 +1209,7 @@ pub fn build_media_streams_with_subtitles(
                     is_hearing_impaired: None,
                     delivery_url: None,
                     replay_gain: build_replay_gain(t),
+                    display_title: None,
                 });
             }
         } else if let Some(codec) = probe.audio_codec.clone() {
@@ -1142,6 +1237,7 @@ pub fn build_media_streams_with_subtitles(
                 is_hearing_impaired: None,
                 delivery_url: None,
                 replay_gain: None,
+                display_title: None,
             });
         }
         // Subtitle tracks — embedded first, then sidecars.
@@ -1200,6 +1296,7 @@ pub fn build_media_streams_with_subtitles(
                         idx = t.stream_index,
                     )),
                     replay_gain: None,
+                    display_title: None,
                 });
             }
             // Sidecars: stream_index = SIDECAR_BASE + offset.
@@ -1228,6 +1325,7 @@ pub fn build_media_streams_with_subtitles(
                         id = ctx.item_id,
                     )),
                     replay_gain: None,
+                    display_title: None,
                 });
             }
         }
@@ -1252,8 +1350,10 @@ pub fn build_media_streams_with_subtitles(
             is_hearing_impaired: None,
             delivery_url: None,
             replay_gain: None,
+            display_title: None,
         });
     }
+    fill_display_titles(&mut streams);
     streams
 }
 
@@ -1262,6 +1362,67 @@ pub fn build_media_streams_with_subtitles(
 mod tests {
     use super::*;
     use pharos_core::MediaProbe;
+
+    #[test]
+    fn stream_display_title_composes_language_title_codec_channels() {
+        // Track with a title → "Language - Title" (the Code Geass case that
+        // rendered "undefined").
+        assert_eq!(
+            stream_display_title(Some("jpn"), Some("TrueHD 5.1"), Some("truehd"), Some(6))
+                .as_deref(),
+            Some("Japanese - TrueHD 5.1")
+        );
+        assert_eq!(
+            stream_display_title(Some("eng"), Some("CBM (5.1 Surround)"), Some("ass"), None)
+                .as_deref(),
+            Some("English - CBM (5.1 Surround)")
+        );
+        // No title → "Language - CODEC Layout".
+        assert_eq!(
+            stream_display_title(Some("eng"), None, Some("aac"), Some(2)).as_deref(),
+            Some("English - AAC Stereo")
+        );
+        // No language → codec/layout only.
+        assert_eq!(
+            stream_display_title(None, None, Some("flac"), Some(6)).as_deref(),
+            Some("FLAC 5.1")
+        );
+        // Nothing known → None (jellyfin-web omits the entry rather than
+        // showing "undefined").
+        assert_eq!(stream_display_title(None, None, None, None), None);
+    }
+
+    #[test]
+    fn build_streams_fills_display_title_for_audio_and_subtitle() {
+        let mut probe = MediaProbe {
+            video_codec: Some("hevc".into()),
+            audio_tracks: vec![pharos_core::AudioTrack {
+                stream_index: 1,
+                codec: Some("aac".into()),
+                language: Some("eng".into()),
+                title: None,
+                channels: Some(2),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        probe.subtitle_tracks = vec![pharos_core::SubtitleTrack {
+            stream_index: 2,
+            codec: Some("ass".into()),
+            language: Some("eng".into()),
+            title: Some("Signs/Songs".into()),
+            ..Default::default()
+        }];
+        let ctx = SubtitleStreamCtx::new(1);
+        let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
+        let audio = streams.iter().find(|s| s.kind == "Audio").unwrap();
+        assert_eq!(audio.display_title.as_deref(), Some("English - AAC Stereo"));
+        let sub = streams.iter().find(|s| s.kind == "Subtitle").unwrap();
+        assert_eq!(sub.display_title.as_deref(), Some("English - Signs/Songs"));
+        // Video never gets a DisplayTitle.
+        let video = streams.iter().find(|s| s.kind == "Video").unwrap();
+        assert!(video.display_title.is_none());
+    }
 
     #[test]
     fn metadata_fields_project_into_dto_when_set() {
