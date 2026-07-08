@@ -32,7 +32,18 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tiny ops are bounded work (decode a header / one frame / a few seconds
 /// of audio). A worker that misses this is assumed hung → dropped.
 const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Whole-file ops (trickplay sprite decode, waveform) walk the *entire*
+/// source: on a long episode or a big remux over NFS that legitimately runs
+/// for minutes, far past the tiny-op cap. The worker emits no interim
+/// progress for these (single synchronous libav pass), so this is a total
+/// wall-clock ceiling, sized to still catch a genuinely hung decode.
+const DEFAULT_HEAVY_OP_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_MAX_WORKERS: usize = 4;
+
+/// Whole-file ops that need `heavy_op_timeout` rather than the tiny-op cap.
+fn is_heavy_op(op: &TinyOp) -> bool {
+    matches!(op, TinyOp::Trickplay { .. } | TinyOp::Waveform { .. })
+}
 
 /// Errors surfaced to callers of the pool.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +75,7 @@ struct Inner {
     worker_bin: PathBuf,
     handshake_timeout: Duration,
     op_timeout: Duration,
+    heavy_op_timeout: Duration,
     idle: Mutex<Vec<PooledWorker>>,
     permits: Semaphore,
     next_job: AtomicU64,
@@ -86,6 +98,7 @@ impl LibavWorkerPool {
                 worker_bin: worker_bin.into(),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
                 op_timeout: DEFAULT_OP_TIMEOUT,
+                heavy_op_timeout: DEFAULT_HEAVY_OP_TIMEOUT,
                 idle: Mutex::new(Vec::new()),
                 permits: Semaphore::new(max),
                 next_job: AtomicU64::new(1),
@@ -219,9 +232,14 @@ impl LibavWorkerPool {
             .map_err(|e| PoolError::Dead(format!("pool closed: {e}")))?;
 
         let job_id = JobId(self.inner.next_job.fetch_add(1, Ordering::Relaxed));
+        let op_timeout = if is_heavy_op(&op) {
+            self.inner.heavy_op_timeout
+        } else {
+            self.inner.op_timeout
+        };
         let mut worker = self.checkout().await?;
 
-        match self.exchange(&mut worker, job_id, op).await {
+        match self.exchange(&mut worker, job_id, op, op_timeout).await {
             Ok(ev) => {
                 // Healthy → reuse.
                 self.inner.idle.lock().await.push(worker);
@@ -262,12 +280,13 @@ impl LibavWorkerPool {
         worker: &mut PooledWorker,
         job_id: JobId,
         op: TinyOp,
+        op_timeout: Duration,
     ) -> Result<WorkerEvent, PoolError> {
         write_frame(&mut worker.wr, &WorkerCmd::Tiny { job_id, op })
             .await
             .map_err(|e| PoolError::Dead(format!("send op: {e}")))?;
 
-        let deadline = tokio::time::Instant::now() + self.inner.op_timeout;
+        let deadline = tokio::time::Instant::now() + op_timeout;
         loop {
             let frame =
                 tokio::time::timeout_at(deadline, read_frame::<_, WorkerEvent>(&mut worker.rd))
