@@ -88,12 +88,20 @@ async fn quick_connect_initiate(
     let entry = reply_rx
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    // DateAdded MUST be a real ISO8601 timestamp: the Jellyfin Android TV app
+    // (jellyfin-sdk-kotlin) deserializes it as a DateTime, and an empty string
+    // fails to parse — which makes the app treat Quick Connect as unavailable
+    // and grey out the button. An empty/omitted value silently breaks it.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "Code": entry.code,
         "Secret": entry.secret,
         "DeviceId": entry.device_id,
         "Authenticated": false,
-        "DateAdded": "",
+        "DateAdded": pharos_jellyfin_api::dto::format_iso8601(now_secs),
     })))
 }
 
