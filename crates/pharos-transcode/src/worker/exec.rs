@@ -50,19 +50,20 @@ pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
         || s.contains("decoder not found")
         || s.contains("no such file")
         || s.contains("unable to find a suitable output format");
-    if hard_bad_input {
-        return WorkerError::BadInput;
-    }
-    if is_hw {
-        return WorkerError::DeviceBusy;
-    }
-    // CPU failure that isn't a source error — keep the stderr tail for
-    // the log without unbounded size.
+    // The stderr tail is the actual ffmpeg reason — carry it on every
+    // classification so the log names the cause, never a bare class.
     let tail: String = {
         let chars: Vec<char> = stderr.trim_end().chars().collect();
         let start = chars.len().saturating_sub(400);
         chars[start..].iter().collect()
     };
+    if hard_bad_input {
+        return WorkerError::BadInput(tail);
+    }
+    if is_hw {
+        return WorkerError::DeviceBusy;
+    }
+    // CPU failure that isn't a source error — non-recoverable encode error.
     WorkerError::Other(tail)
 }
 
@@ -77,10 +78,15 @@ pub enum SpawnTarget {
 /// Build the ffmpeg argv + resolve the output target for a spawn job.
 /// Errors map to the appropriate non-transient class.
 pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), WorkerError> {
-    let input = spec.input.to_str().ok_or(WorkerError::BadInput)?;
+    let input = spec
+        .input
+        .to_str()
+        .ok_or_else(|| WorkerError::BadInput(format!("non-utf8 input path: {:?}", spec.input)))?;
     match &spec.sink {
         OutputSink::FileDirect { path } => {
-            let out_str = path.to_str().ok_or(WorkerError::BadInput)?;
+            let out_str = path
+                .to_str()
+                .ok_or_else(|| WorkerError::BadInput(format!("non-utf8 output path: {path:?}")))?;
             let args = ffmpeg_transcode_args(input, &spec.opts, spec.device, out_str);
             Ok((args, SpawnTarget::File(path.clone())))
         }
@@ -115,14 +121,14 @@ mod tests {
 
     #[test]
     fn hard_source_error_is_bad_input_on_any_device() {
-        assert_eq!(
+        assert!(matches!(
             classify_failure("Invalid data found when processing input", true),
-            WorkerError::BadInput
-        );
-        assert_eq!(
+            WorkerError::BadInput(s) if s.contains("Invalid data found")
+        ));
+        assert!(matches!(
             classify_failure("x.mkv: No such file or directory", false),
-            WorkerError::BadInput
-        );
+            WorkerError::BadInput(s) if s.contains("No such file")
+        ));
     }
 
     #[test]

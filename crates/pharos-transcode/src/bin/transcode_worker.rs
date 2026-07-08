@@ -268,7 +268,7 @@ fn handle_tiny(
 
     fn frame_err(job_id: pharos_transcode::protocol::JobId, e: FrameError) -> WorkerEvent {
         let error = match e {
-            FrameError::BadInput(_) => WorkerError::BadInput,
+            FrameError::BadInput(s) => WorkerError::BadInput(s),
             FrameError::Other(s) => WorkerError::Other(s),
         };
         WorkerEvent::Failed { job_id, error }
@@ -284,16 +284,12 @@ fn handle_tiny(
                 info: Box::new(info),
             },
             Err(ProbeError::BadInput(detail)) => {
-                // Surface the real libav error (stderr → parent/pod logs); the
-                // wire contract collapses it to a bare `BadInput`, which hid
-                // *why* valid files (e.g. large mkvs over NFS) failed to demux.
-                eprintln!(
-                    "transcode-worker: probe bad-input for {}: {detail}",
-                    input.display()
-                );
+                // The wire error now carries the real libav reason (e.g.
+                // `open: Invalid data found`), so the caller's log says *why*
+                // a file failed to demux instead of a bare "bad input".
                 WorkerEvent::Failed {
                     job_id,
-                    error: WorkerError::BadInput,
+                    error: WorkerError::BadInput(format!("{}: {detail}", input.display())),
                 }
             }
             Err(ProbeError::Other(s)) => WorkerEvent::Failed {

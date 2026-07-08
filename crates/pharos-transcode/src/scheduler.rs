@@ -934,11 +934,16 @@ mod tests {
     #[tokio::test]
     async fn non_recoverable_failure_returns_error() {
         let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| {
-            WorkerRunResult::Failed(WorkerError::BadInput)
+            WorkerRunResult::Failed(WorkerError::BadInput("scripted bad input".into()))
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let r = s.submit(PathBuf::from("/m/x"), h264(), file_sink()).await;
-        assert_eq!(r, Err(SchedError::Failed(WorkerError::BadInput)));
+        assert_eq!(
+            r,
+            Err(SchedError::Failed(WorkerError::BadInput(
+                "scripted bad input".into()
+            )))
+        );
     }
 
     #[tokio::test]

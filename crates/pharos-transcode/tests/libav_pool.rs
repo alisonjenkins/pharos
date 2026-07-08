@@ -107,7 +107,7 @@ async fn pool_reports_bad_input_then_recovers() {
     // Malformed input → clean BadInput, NOT a hang.
     let err = pool.probe(bad).await.expect_err("should fail");
     assert!(
-        matches!(err, PoolError::Op(WorkerError::BadInput)),
+        matches!(err, PoolError::Op(WorkerError::BadInput(_))),
         "expected Op(BadInput), got {err:?}"
     );
 

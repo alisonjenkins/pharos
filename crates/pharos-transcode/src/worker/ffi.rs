@@ -41,11 +41,13 @@ pub fn transcode(spec: &JobSpec) -> Result<u64, WorkerError> {
     let input_path = spec
         .input
         .to_str()
-        .ok_or(WorkerError::BadInput)?
+        .ok_or_else(|| WorkerError::BadInput(format!("non-utf8 input path: {:?}", spec.input)))?
         .to_string();
     let (out_url, is_file, out_path) = match &spec.sink {
         OutputSink::FileDirect { path } => (
-            path.to_str().ok_or(WorkerError::BadInput)?.to_string(),
+            path.to_str()
+                .ok_or_else(|| WorkerError::BadInput(format!("non-utf8 output path: {path:?}")))?
+                .to_string(),
             true,
             Some(path.clone()),
         ),
@@ -240,8 +242,9 @@ fn build_stream_plan(
                 VideoCodec::H265 => codec::Id::HEVC,
                 _ => codec::Id::H264,
             };
-            let enc_codec = encoder::find(codec_id)
-                .ok_or_else(|| WorkerError::UnsupportedCodec)?;
+            let enc_codec = encoder::find(codec_id).ok_or_else(|| {
+                WorkerError::UnsupportedCodec(format!("no {codec_id:?} video encoder in this build"))
+            })?;
             let mut enc = codec::context::Context::new_with_codec(enc_codec)
                 .encoder()
                 .video()
@@ -282,8 +285,9 @@ fn build_stream_plan(
                 AudioCodec::Vorbis => codec::Id::VORBIS,
                 _ => codec::Id::AAC,
             };
-            let enc_codec = encoder::find(codec_id)
-                .ok_or_else(|| WorkerError::UnsupportedCodec)?;
+            let enc_codec = encoder::find(codec_id).ok_or_else(|| {
+                WorkerError::UnsupportedCodec(format!("no {codec_id:?} audio encoder in this build"))
+            })?;
             let mut enc = codec::context::Context::new_with_codec(enc_codec)
                 .encoder()
                 .audio()
@@ -383,15 +387,8 @@ fn enc_packets_a<'a>(
 }
 
 fn map_open_err(e: ffmpeg::Error) -> WorkerError {
-    // Couldn't open/demux the input → treat as bad input.
-    WorkerError::BadInput.tag(e)
-}
-
-trait TagErr {
-    fn tag(self, _e: ffmpeg::Error) -> WorkerError;
-}
-impl TagErr for WorkerError {
-    fn tag(self, _e: ffmpeg::Error) -> WorkerError {
-        self
-    }
+    // Couldn't open/demux the input → bad input, carrying the libav reason
+    // (e.g. "Invalid data found when processing input") so the log is
+    // actionable instead of a bare "bad input".
+    WorkerError::BadInput(format!("open/demux: {e}"))
 }

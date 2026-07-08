@@ -246,10 +246,13 @@ pub enum WorkerError {
     /// Transient: device out of encode sessions / `EAGAIN` opening the
     /// hw context. Retry elsewhere.
     DeviceBusy,
-    /// Non-recoverable: target codec not encodable by this build.
-    UnsupportedCodec,
-    /// Non-recoverable: source is malformed / undecodable.
-    BadInput,
+    /// Non-recoverable: target codec not encodable by this build. Carries
+    /// the underlying reason (which codec / why) so the log is actionable.
+    UnsupportedCodec(String),
+    /// Non-recoverable: source is malformed / undecodable. Carries the
+    /// underlying libav/IO reason (e.g. `open: Invalid data found`) rather
+    /// than collapsing every distinct cause to a bare "bad input".
+    BadInput(String),
     /// I/O against the sink or input failed.
     Io(String),
     /// Anything else, carrying a human string for the log.
@@ -267,8 +270,8 @@ impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkerError::DeviceBusy => write!(f, "device busy (out of encode sessions)"),
-            WorkerError::UnsupportedCodec => write!(f, "unsupported codec"),
-            WorkerError::BadInput => write!(f, "bad input"),
+            WorkerError::UnsupportedCodec(s) => write!(f, "unsupported codec: {s}"),
+            WorkerError::BadInput(s) => write!(f, "bad input: {s}"),
             WorkerError::Io(s) => write!(f, "io: {s}"),
             WorkerError::Other(s) => write!(f, "{s}"),
         }
@@ -435,7 +438,7 @@ mod tests {
     #[test]
     fn transient_classification() {
         assert!(WorkerError::DeviceBusy.is_transient());
-        assert!(!WorkerError::UnsupportedCodec.is_transient());
-        assert!(!WorkerError::BadInput.is_transient());
+        assert!(!WorkerError::UnsupportedCodec(String::new()).is_transient());
+        assert!(!WorkerError::BadInput(String::new()).is_transient());
     }
 }
