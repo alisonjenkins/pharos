@@ -1353,6 +1353,12 @@ async fn playback_info(
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
+    // Bump this show to the front of the background trickplay pre-generator —
+    // it (and the rest of its series) is about to be watched, so its scrub
+    // previews should be built first. Best-effort; a full queue never blocks.
+    if let Some(tx) = &state.trickplay_priority {
+        let _ = tx.send(id);
+    }
     // P4 — defensive resume offset. Clients that drive playback
     // purely from PlaybackInfo (Finamp, Jellyfin-Android-TV) never
     // see UserData.PlaybackPositionTicks via /Items/{id}; emit it

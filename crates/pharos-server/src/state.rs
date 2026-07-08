@@ -82,6 +82,10 @@ pub struct AppState {
     /// the wire shape matches what was actually generated.
     pub trickplay_widths: Vec<u32>,
     pub trickplay_interval_ms: u32,
+    /// Nudge the background trickplay pre-generator to prioritise an item's
+    /// whole series (PlaybackInfo sends the played item id). None when
+    /// trickplay is disabled.
+    pub trickplay_priority: Option<crate::trickplay_backfill::PriorityTx>,
     pub live_tv: Option<M3uXmltvBackend>,
     pub server_id: String,
     pub server_name: String,
@@ -177,6 +181,7 @@ impl AppState {
             subtitles: None,
             trickplay_widths: Vec::new(),
             trickplay_interval_ms: 10_000,
+            trickplay_priority: None,
             live_tv: None,
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -232,6 +237,7 @@ impl AppState {
             subtitles: None,
             trickplay_widths: Vec::new(),
             trickplay_interval_ms: 10_000,
+            trickplay_priority: None,
             live_tv: None,
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -305,6 +311,11 @@ impl AppState {
     pub fn with_trickplay_layout(mut self, widths: Vec<u32>, interval_ms: u32) -> Self {
         self.trickplay_widths = widths;
         self.trickplay_interval_ms = interval_ms.max(1_000);
+        self
+    }
+
+    pub fn with_trickplay_priority(mut self, tx: crate::trickplay_backfill::PriorityTx) -> Self {
+        self.trickplay_priority = Some(tx);
         self
     }
 
