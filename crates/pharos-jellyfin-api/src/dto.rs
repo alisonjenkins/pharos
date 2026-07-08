@@ -379,6 +379,13 @@ pub struct MediaStreamDto {
     /// Jellyfin's URL the player fetches the rendered .vtt from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_url: Option<String>,
+    /// Subtitle-only. How the client obtains the track: `"External"` (fetch the
+    /// `DeliveryUrl` .vtt + render client-side — text subs) or `"Encode"` (burn
+    /// into the transcoded video — image subs like PGS/VOBSUB that can't be
+    /// VTT). jellyfin-web keys off this; WITHOUT it the subtitle picker can't
+    /// deliver the track and nothing renders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_method: Option<&'static str>,
     /// P37 — Audio-only. `{ "TrackGain": …, "AlbumGain": … }` in dB.
     /// Finamp reads this and applies loudness normalisation; absent
     /// keys leave the player at unity gain.
@@ -415,6 +422,30 @@ fn language_display_name(code: &str) -> String {
         other => return other.to_ascii_uppercase(),
     }
     .to_string()
+}
+
+/// True when a subtitle codec is a TEXT format (extractable to WebVTT and
+/// served as an `External` track the client renders), vs an IMAGE format
+/// (PGS/VOBSUB/DVB — bitmap, can't be VTT, so it must be burned into the
+/// transcode via `Encode`).
+fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.unwrap_or("").to_ascii_lowercase().as_str(),
+        "subrip"
+            | "srt"
+            | "ass"
+            | "ssa"
+            | "webvtt"
+            | "vtt"
+            | "mov_text"
+            | "text"
+            | "subviewer"
+            | "subviewer1"
+            | "microdvd"
+            | "stl"
+            | "pjs"
+            | "vplayer"
+    )
 }
 
 /// Channel-count → common layout label (Jellyfin picker convention).
@@ -1187,6 +1218,7 @@ pub fn build_media_streams_with_subtitles(
             is_forced: None,
             is_hearing_impaired: None,
             delivery_url: None,
+            delivery_method: None,
             replay_gain: None,
             display_title: None,
         });
@@ -1217,6 +1249,7 @@ pub fn build_media_streams_with_subtitles(
                     is_forced: None,
                     is_hearing_impaired: None,
                     delivery_url: None,
+                    delivery_method: None,
                     replay_gain: build_replay_gain(t),
                     display_title: None,
                 });
@@ -1245,6 +1278,7 @@ pub fn build_media_streams_with_subtitles(
                 is_forced: None,
                 is_hearing_impaired: None,
                 delivery_url: None,
+                delivery_method: None,
                 replay_gain: None,
                 display_title: None,
             });
@@ -1281,6 +1315,11 @@ pub fn build_media_streams_with_subtitles(
                         Some(s)
                     }
                 };
+                // Text subs extract to WebVTT + deliver External (client-side
+                // render); image subs (PGS/VOBSUB) can't be VTT, so they burn
+                // into the transcode (Encode) — jellyfin-web then passes the
+                // index to the video transcode instead of fetching a .vtt.
+                let is_text = is_text_subtitle_codec(t.codec.as_deref());
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
                     index: t.stream_index,
@@ -1299,11 +1338,14 @@ pub fn build_media_streams_with_subtitles(
                     is_external: Some(false),
                     is_forced: Some(t.is_forced),
                     is_hearing_impaired: Some(t.is_hearing_impaired),
-                    delivery_url: Some(format!(
-                        "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
-                        id = ctx.item_id,
-                        idx = t.stream_index,
-                    )),
+                    delivery_url: is_text.then(|| {
+                        format!(
+                            "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
+                            id = ctx.item_id,
+                            idx = t.stream_index,
+                        )
+                    }),
+                    delivery_method: Some(if is_text { "External" } else { "Encode" }),
                     replay_gain: None,
                     display_title: None,
                 });
@@ -1333,6 +1375,8 @@ pub fn build_media_streams_with_subtitles(
                         "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
                         id = ctx.item_id,
                     )),
+                    // Sidecars are already WebVTT — always External.
+                    delivery_method: Some("External"),
                     replay_gain: None,
                     display_title: None,
                 });
@@ -1358,6 +1402,7 @@ pub fn build_media_streams_with_subtitles(
             is_forced: None,
             is_hearing_impaired: None,
             delivery_url: None,
+            delivery_method: None,
             replay_gain: None,
             display_title: None,
         });
@@ -1431,6 +1476,45 @@ mod tests {
         // Video never gets a DisplayTitle.
         let video = streams.iter().find(|s| s.kind == "Video").unwrap();
         assert!(video.display_title.is_none());
+    }
+
+    #[test]
+    fn subtitle_delivery_method_by_codec() {
+        // Text subs (subrip) → External + a .vtt DeliveryUrl the client fetches;
+        // image subs (PGS) → Encode (burn into the transcode) with no URL.
+        // Without a DeliveryMethod jellyfin-web can't render subs at all.
+        let probe = MediaProbe {
+            video_codec: Some("h264".into()),
+            subtitle_tracks: vec![
+                pharos_core::SubtitleTrack {
+                    stream_index: 2,
+                    codec: Some("subrip".into()),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
+                pharos_core::SubtitleTrack {
+                    stream_index: 3,
+                    codec: Some("hdmv_pgs_subtitle".into()),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let ctx = SubtitleStreamCtx::new(42);
+        let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
+        let text = streams.iter().find(|s| s.index == 2).unwrap();
+        assert_eq!(text.delivery_method, Some("External"));
+        assert_eq!(
+            text.delivery_url.as_deref(),
+            Some("/Videos/42/42/Subtitles/2/Stream.vtt")
+        );
+        let image = streams.iter().find(|s| s.index == 3).unwrap();
+        assert_eq!(image.delivery_method, Some("Encode"));
+        assert!(
+            image.delivery_url.is_none(),
+            "image subs burn in, no .vtt URL"
+        );
     }
 
     #[test]
