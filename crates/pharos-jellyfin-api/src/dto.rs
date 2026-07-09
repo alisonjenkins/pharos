@@ -664,7 +664,20 @@ impl BaseItemDto {
         if widths.is_empty() {
             return self;
         }
-        self.trickplay = build_dto_layout_map(probe, widths, interval_ms);
+        let inner = build_dto_layout_map(probe, widths, interval_ms);
+        if inner.is_empty() {
+            return self;
+        }
+        // Jellyfin's `Trickplay` is a double-nested map keyed first by
+        // media-source id, then by width. jellyfin-web looks up
+        // `item.Trickplay[mediaSourceId]` and requests no tiles when that
+        // key is missing, so a flat `{ width → TileInfo }` map (which is
+        // what `build_dto_layout_map` returns) silently disables previews.
+        // For pharos single-file items the media-source id is the item id
+        // string (see `build`: `media_sources[0].id == item.id.to_string()`).
+        let mut outer = serde_json::Map::new();
+        outer.insert(self.id.clone(), serde_json::Value::Object(inner));
+        self.trickplay = outer;
         self
     }
 
@@ -1915,6 +1928,44 @@ mod trickplay_helper_tests {
         let probe = probe_1080p_10min();
         let map = build_dto_layout_map(&probe, &[], 10_000);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn with_trickplay_nests_layout_under_media_source_id() {
+        // Jellyfin's BaseItemDto.Trickplay is a *double-nested* map:
+        // `{ "<mediaSourceId>": { "<width>": TileInfo } }`. jellyfin-web
+        // looks up `item.Trickplay[mediaSourceId]` and never requests tiles
+        // if that key is absent. For pharos single-file items the media
+        // source id equals the item id string.
+        use pharos_core::{MediaItem, MediaKind, MediaProbe};
+        let item = MediaItem {
+            id: 42,
+            path: "/m/a.mkv".into(),
+            title: "A".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(10 * 60 * 1000),
+                width: Some(1920),
+                height: Some(1080),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dto = super::BaseItemDto::from_domain(&item, "srv").with_trickplay(
+            &item.probe,
+            &[320, 640],
+            10_000,
+        );
+        let v = serde_json::to_value(&dto).unwrap();
+        // Outer key is the media-source id (== item id "42"); inner keyed by width.
+        assert_eq!(v["Trickplay"]["42"]["320"]["Width"].as_u64().unwrap(), 320);
+        assert_eq!(v["Trickplay"]["42"]["640"]["Width"].as_u64().unwrap(), 640);
+        // The old (wrong) flat shape put the width at the top level.
+        assert!(
+            v["Trickplay"].get("320").is_none(),
+            "width must not sit at the top level: {}",
+            v["Trickplay"]
+        );
     }
 
     #[test]
