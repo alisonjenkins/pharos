@@ -178,12 +178,14 @@ impl LibavWorkerPool {
 
     /// Generate trickplay sprite sheets; returns the sheet count produced.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn trickplay(
         &self,
         input: impl Into<PathBuf>,
         interval_ms: u64,
         width: u32,
         grid: u32,
+        thumb_count: u32,
         max_sheets: u32,
         quality: i32,
         out_dir: impl Into<PathBuf>,
@@ -194,6 +196,7 @@ impl LibavWorkerPool {
                 interval_ms,
                 width,
                 grid,
+                thumb_count,
                 max_sheets,
                 quality,
                 out_dir: out_dir.into(),

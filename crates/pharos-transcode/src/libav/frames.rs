@@ -52,6 +52,197 @@ fn pix_name(p: format::Pixel) -> String {
     }
 }
 
+/// Build the `buffer -> <filter_spec> -> buffersink` graph for a decoded
+/// video stream. Shared by the full-stream [`filter_video`] and the
+/// seek-sampling [`filter_video_seeked`] drivers.
+fn build_video_filter_graph(
+    decoder: &ffmpeg::decoder::Video,
+    time_base: Rational,
+    filter_spec: &str,
+    sink_format: format::Pixel,
+) -> Result<filter::Graph, FrameError> {
+    let mut graph = filter::Graph::new();
+    let sar = decoder.aspect_ratio();
+    let sar = if sar.numerator() == 0 {
+        Rational(1, 1)
+    } else {
+        sar
+    };
+    let args = format!(
+        "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
+        decoder.width(),
+        decoder.height(),
+        pix_name(decoder.format()),
+        time_base.numerator(),
+        time_base.denominator(),
+        sar.numerator(),
+        sar.denominator(),
+    );
+    graph
+        .add(
+            &filter::find("buffer").ok_or_else(|| FrameError::Other("no buffer filter".into()))?,
+            "in",
+            &args,
+        )
+        .map_err(|e| FrameError::Other(format!("buffer: {e}")))?;
+    graph
+        .add(
+            &filter::find("buffersink")
+                .ok_or_else(|| FrameError::Other("no buffersink filter".into()))?,
+            "out",
+            "",
+        )
+        .map_err(|e| FrameError::Other(format!("buffersink: {e}")))?;
+    if let Some(mut out) = graph.get("out") {
+        out.set_pixel_format(sink_format);
+    }
+    graph
+        .output("in", 0)
+        .and_then(|p| p.input("out", 0))
+        .and_then(|p| p.parse(filter_spec))
+        .map_err(|e| FrameError::Other(format!("parse filter '{filter_spec}': {e}")))?;
+    graph
+        .validate()
+        .map_err(|e| FrameError::Other(format!("graph validate: {e}")))?;
+    Ok(graph)
+}
+
+/// Seek-sampling counterpart to [`filter_video`]. Rather than demuxing the
+/// whole file, seek to each timestamp in `seek_targets_ms` and decode a
+/// single keyframe there, pushing it through `filter_spec` (typically a
+/// `scale,tile` graph with NO `fps` — the sampling is done here by seeking).
+///
+/// This is the trickplay path: a whole-file walk reads every byte of a
+/// multi-GB episode over NFS and, under scan + playback contention, blew past
+/// the worker's heavy-op timeout (`worker died mid-op: op timeout`) so no
+/// sprite was ever produced. Seeking reads only the region around each sample
+/// point — an order of magnitude less I/O — so the op finishes well inside the
+/// cap. Fed frames get a synthetic monotonic PTS (the sample index) so the
+/// downstream `tile` filter groups them deterministically even when adjacent
+/// seeks land on the same keyframe.
+///
+/// Returns the number of filtered output frames delivered (sprite sheets).
+pub fn filter_video_seeked<I, F>(
+    path: &Path,
+    seek_targets_ms: I,
+    filter_spec: &str,
+    sink_format: format::Pixel,
+    mut on_frame: F,
+) -> Result<usize, FrameError>
+where
+    I: IntoIterator<Item = u64>,
+    F: FnMut(&frame::Video) -> Result<bool, FrameError>,
+{
+    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    let mut ictx = format::input(path).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
+
+    let stream = ictx
+        .streams()
+        .best(media::Type::Video)
+        .ok_or_else(|| FrameError::BadInput("no video stream".into()))?;
+    let stream_index = stream.index();
+    let time_base = stream.time_base();
+    let params = stream.parameters();
+
+    let ctx = codec::context::Context::from_parameters(params)
+        .map_err(|e| FrameError::Other(format!("codec ctx: {e}")))?;
+    let mut decoder = ctx
+        .decoder()
+        .video()
+        .map_err(|e| FrameError::BadInput(format!("video decoder: {e}")))?;
+    // Each sample lands on the nearest keyframe anyway, so decode keyframes
+    // only — the seek target's keyframe is the first (and only) frame we need.
+    decoder.skip_frame(ffmpeg::Discard::NonKey);
+
+    let mut graph = build_video_filter_graph(&decoder, time_base, filter_spec, sink_format)?;
+
+    let mut delivered = 0usize;
+    let mut stop = false;
+    let mut decoded = frame::Video::empty();
+    let mut sample_idx: i64 = 0;
+
+    // Pull every ready sheet out of the sink.
+    let mut drain_sink = |graph: &mut filter::Graph,
+                          delivered: &mut usize,
+                          stop: &mut bool|
+     -> Result<(), FrameError> {
+        let mut filtered = frame::Video::empty();
+        loop {
+            let mut ctx = match graph.get("out") {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+            match ctx.sink().frame(&mut filtered) {
+                Ok(()) => {
+                    *delivered += 1;
+                    if !on_frame(&filtered)? {
+                        *stop = true;
+                        return Ok(());
+                    }
+                }
+                Err(e) if is_eagain(&e) => return Ok(()),
+                Err(ffmpeg::Error::Eof) => return Ok(()),
+                Err(e) => return Err(FrameError::Other(format!("sink: {e}"))),
+            }
+        }
+    };
+
+    for target_ms in seek_targets_ms {
+        // Seek to the keyframe at/<= target (AV_TIME_BASE units, like `-ss`).
+        let ts = (target_ms as i128 * ffi::AV_TIME_BASE as i128 / 1000) as i64;
+        if ictx.seek(ts, ..=ts).is_err() {
+            break; // unseekable / past end — stop cleanly, keep what we have
+        }
+        decoder.flush(); // drop pre-seek decoder state
+
+        // Decode the first frame at the new position.
+        let mut got = false;
+        for res in ictx.packets() {
+            let (stream, packet) = match res {
+                Ok(sp) => sp,
+                Err(_) => continue,
+            };
+            if stream.index() != stream_index {
+                continue;
+            }
+            decoder
+                .send_packet(&packet)
+                .map_err(|e| FrameError::Other(format!("send packet: {e}")))?;
+            match decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    // Synthetic monotonic PTS so `tile` groups deterministically.
+                    decoded.set_pts(Some(sample_idx));
+                    sample_idx += 1;
+                    if let Some(mut src) = graph.get("in") {
+                        src.source()
+                            .add(&decoded)
+                            .map_err(|e| FrameError::Other(format!("src add: {e}")))?;
+                    }
+                    drain_sink(&mut graph, &mut delivered, &mut stop)?;
+                    got = true;
+                    break;
+                }
+                Err(e) if is_eagain(&e) => continue, // need another packet
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => return Err(FrameError::Other(format!("decode: {e}"))),
+            }
+        }
+        if stop || !got {
+            break; // stop requested, or no frame at this seek (EOF)
+        }
+    }
+
+    // Flush the graph so the final partial sheet is padded + emitted.
+    if !stop {
+        if let Some(mut src) = graph.get("in") {
+            let _ = src.source().flush();
+        }
+        drain_sink(&mut graph, &mut delivered, &mut stop)?;
+    }
+
+    Ok(delivered)
+}
+
 /// Open `path`, seek to `seek_ms` (input seek; `None`/0 = start), and run
 /// the best video stream through `filter_spec`. `on_frame` is called for
 /// every filtered output frame; return `Ok(false)` from it to stop early
@@ -101,50 +292,7 @@ where
         let _ = ictx.seek(ts, ..=ts);
     }
 
-    // --- filter graph: buffer -> <spec> -> buffersink ---
-    let mut graph = filter::Graph::new();
-    let sar = decoder.aspect_ratio();
-    let sar = if sar.numerator() == 0 {
-        Rational(1, 1)
-    } else {
-        sar
-    };
-    let args = format!(
-        "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
-        decoder.width(),
-        decoder.height(),
-        pix_name(decoder.format()),
-        time_base.numerator(),
-        time_base.denominator(),
-        sar.numerator(),
-        sar.denominator(),
-    );
-    graph
-        .add(
-            &filter::find("buffer").ok_or_else(|| FrameError::Other("no buffer filter".into()))?,
-            "in",
-            &args,
-        )
-        .map_err(|e| FrameError::Other(format!("buffer: {e}")))?;
-    graph
-        .add(
-            &filter::find("buffersink")
-                .ok_or_else(|| FrameError::Other("no buffersink filter".into()))?,
-            "out",
-            "",
-        )
-        .map_err(|e| FrameError::Other(format!("buffersink: {e}")))?;
-    if let Some(mut out) = graph.get("out") {
-        out.set_pixel_format(sink_format);
-    }
-    graph
-        .output("in", 0)
-        .and_then(|p| p.input("out", 0))
-        .and_then(|p| p.parse(filter_spec))
-        .map_err(|e| FrameError::Other(format!("parse filter '{filter_spec}': {e}")))?;
-    graph
-        .validate()
-        .map_err(|e| FrameError::Other(format!("graph validate: {e}")))?;
+    let mut graph = build_video_filter_graph(&decoder, time_base, filter_spec, sink_format)?;
 
     let mut delivered = 0usize;
     let mut stop = false;

@@ -168,6 +168,9 @@ pub enum TinyOp {
         interval_ms: u64,
         width: u32,
         grid: u32,
+        /// Total thumbnails to sample (`ceil(duration/interval)`). The worker
+        /// seeks to `i·interval_ms` for `i in 0..thumb_count`.
+        thumb_count: u32,
         max_sheets: u32,
         quality: i32,
         out_dir: PathBuf,

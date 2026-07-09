@@ -102,13 +102,15 @@ fn trickplay_emits_expected_sheets() {
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let input = dir.path().join("fixture.webm");
-    // 20s @ 1 sample/sec, 2x2 grid → 4 thumbs/sheet → 5 sheets max.
+    // 20s @ 1 sample/sec, 2x2 grid → 4 thumbs/sheet → 5 sheets.
     synth_fixture(&input, 20);
     let out_dir = dir.path().join("sprites");
 
-    let produced =
-        pharos_transcode::libav::trickplay::trickplay_sprite(&input, 1000, 160, 2, 8, 5, &out_dir)
-            .expect("trickplay ok");
+    // interval 1000ms, width 160, grid 2, thumb_count 20 (20s/1s), max 8 sheets.
+    let produced = pharos_transcode::libav::trickplay::trickplay_sprite(
+        &input, 1000, 160, 2, 20, 8, 5, &out_dir,
+    )
+    .expect("trickplay ok");
 
     assert!(produced >= 1, "produced = {produced}");
     // Each produced sheet exists, is a valid JPEG, 0-based.
@@ -117,8 +119,40 @@ fn trickplay_emits_expected_sheets() {
         let bytes = std::fs::read(&p).unwrap_or_else(|_| panic!("read sheet {i}"));
         assert!(is_jpeg(&bytes), "sheet {i} not a JPEG");
     }
-    // 20 samples / 4 per sheet = 5 sheets.
+    // 20 seek-sampled thumbs / 4 per sheet = 5 sheets — the seek driver must
+    // match the old fps-filter count exactly (bounded by thumb_count, not EOF).
     assert_eq!(produced, 5, "expected 5 sheets, got {produced}");
+}
+
+#[test]
+fn trickplay_seek_is_bounded_by_thumb_count() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("fixture.webm");
+    // 20s source, but only sample the first 6 thumbs (0..6s). The seek driver
+    // must stop at thumb_count — NOT walk to EOF — so a whole-file decode's
+    // extra thumbs never appear. 6 thumbs / 4 per 2x2 sheet = 2 sheets, the
+    // last one partial (padded on flush).
+    synth_fixture(&input, 20);
+    let out_dir = dir.path().join("sprites");
+
+    let produced = pharos_transcode::libav::trickplay::trickplay_sprite(
+        &input, 1000, 160, 2, 6, 8, 5, &out_dir,
+    )
+    .expect("trickplay ok");
+
+    assert_eq!(
+        produced, 2,
+        "6 thumbs @ 2x2 must yield exactly 2 sheets, got {produced}"
+    );
+    for i in 0..produced {
+        let bytes = std::fs::read(out_dir.join(format!("{i}.jpg")))
+            .unwrap_or_else(|_| panic!("read sheet {i}"));
+        assert!(is_jpeg(&bytes), "sheet {i} not a JPEG");
+    }
 }
 
 #[test]

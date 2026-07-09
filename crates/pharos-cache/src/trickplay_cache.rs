@@ -317,6 +317,7 @@ impl TrickplayCache {
                     layout.interval_ms as u64,
                     layout.width,
                     TILE_GRID,
+                    layout.thumb_count,
                     layout.tile_count,
                     5,
                     dir.clone(),
