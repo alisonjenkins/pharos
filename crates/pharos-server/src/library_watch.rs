@@ -254,11 +254,72 @@ where
                 }
                 broadcast_outcome(state, &outcome);
             }
+            // Extract text subtitles for new/changed items NOW, at scan time,
+            // so the first playback never eats a ~30 s cold whole-file demux
+            // over NFS (a subtitle stream is sparse across the whole container,
+            // so extraction reads the entire multi-GB file). Bounded
+            // concurrency keeps this under the NFS I/O ceiling — a lesson from
+            // the scan crash-loop where unbounded whole-file reads starved live
+            // playback. The persistent subtitle cache is mtime-keyed, so each
+            // file version is extracted at most once ever.
+            warm_scanned_subtitles(state, &outcome).await;
         }
         Err(e) => {
             tracing::warn!(root = %root.display(), why, error = %e, "library rescan failed");
         }
     }
+}
+
+/// Concurrency ceiling for scan-time subtitle extraction. Small on purpose:
+/// each task does a whole-file NFS read, and the crash-loop taught us that
+/// fanning those out unbounded starves live segment transcoding.
+const SUBTITLE_WARM_CONCURRENCY: usize = 3;
+
+/// Pre-extract the text subtitles of the freshly added/updated items into the
+/// (persistent) subtitle cache, so a viewer's first Stream.vtt / Stream.js /
+/// Stream.ass fetch is a warm-cache hit instead of a cold ~30 s demux.
+async fn warm_scanned_subtitles(state: &AppState, outcome: &pharos_core::ScanOutcome) {
+    use pharos_core::MediaStore;
+    let Some(cache) = state.subtitles.clone() else {
+        return;
+    };
+    let ids: Vec<u64> = outcome
+        .added
+        .iter()
+        .chain(outcome.updated.iter())
+        .copied()
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SUBTITLE_WARM_CONCURRENCY));
+    let mut tasks = Vec::with_capacity(ids.len());
+    for id in ids {
+        let cache = cache.clone();
+        let stores = state.stores.clone();
+        let sem = sem.clone();
+        tasks.push(tokio::spawn(async move {
+            // Hold a permit for the whole extraction so at most N whole-file
+            // reads run at once.
+            let _permit = sem.acquire().await;
+            match stores.get(id).await {
+                Ok(item) if !item.probe.subtitle_tracks.is_empty() => {
+                    crate::api::jellyfin::subtitles::pre_extract_subtitles(&cache, &item).await;
+                }
+                _ => {}
+            }
+        }));
+    }
+    let n = tasks.len();
+    for t in tasks {
+        let _ = t.await;
+    }
+    tracing::info!(
+        items = n,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "scan-time subtitle warm complete"
+    );
 }
 
 /// Relay a [`pharos_core::ScanOutcome`] to connected `/socket` clients. An
@@ -364,6 +425,113 @@ mod tests {
             poll_interval: Duration::from_secs(poll_secs),
             rate_limit_ms: 0,
         }
+    }
+
+    /// Scan-time subtitle warm must populate the cache so the first playback
+    /// fetch is warm, not a ~30 s cold demux. ffmpeg-gated: muxes a real subrip
+    /// MKV + extracts it.
+    #[tokio::test]
+    #[ignore = "spawns ffmpeg to mux + extract a subtitle"]
+    async fn scan_time_warm_populates_subtitle_cache() {
+        use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
+        use pharos_cache::SubtitleCache;
+        use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore, SubtitleTrack};
+        use pharos_store_sqlx::sqlite::SqliteStore;
+
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skip: ffmpeg not on PATH");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        // A subrip sidecar muxed as embedded stream 2 (video 0, audio 1, sub 2).
+        let srt = dir.path().join("s.srt");
+        std::fs::write(&srt, "1\n00:00:00,500 --> 00:00:02,000\nwarm me\n").unwrap();
+        let mkv = dir.path().join("clip.mkv");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", "testsrc=d=3:s=64x64:r=5"])
+            .args(["-f", "lavfi", "-i", "sine=d=3"])
+            .arg("-i")
+            .arg(&srt)
+            .args(["-map", "0:v", "-map", "1:a", "-map", "2"])
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "copy",
+            ])
+            .arg(&mkv)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "ffmpeg mux failed");
+
+        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        stores
+            .put(MediaItem {
+                id: 5,
+                path: mkv.clone(),
+                title: "c".into(),
+                kind: MediaKind::Movie,
+                probe: MediaProbe {
+                    subtitle_tracks: vec![SubtitleTrack {
+                        stream_index: 2,
+                        codec: Some("subrip".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let cache =
+            SubtitleCache::new(64 * 1024 * 1024, 1024).with_disk(dir.path().join("subcache"));
+        let state = AppState::new(stores, "t".into()).with_subtitle_cache(cache);
+
+        // Cold before the warm.
+        let mtime = mtime_secs(&mkv).await;
+        assert!(
+            state
+                .subtitles
+                .as_ref()
+                .unwrap()
+                .get(&mkv, mtime, 2, SubtitleKind::Embedded)
+                .await
+                .is_none(),
+            "cache must start cold"
+        );
+
+        let outcome = pharos_core::ScanOutcome {
+            added: vec![5],
+            updated: vec![],
+            removed: vec![],
+            skipped: 0,
+        };
+        warm_scanned_subtitles(&state, &outcome).await;
+
+        // Warm after: the first real Stream.vtt/js fetch is now a cache hit.
+        assert!(
+            state
+                .subtitles
+                .as_ref()
+                .unwrap()
+                .get(&mkv, mtime, 2, SubtitleKind::Embedded)
+                .await
+                .is_some(),
+            "scan-time warm must populate the subtitle cache"
+        );
     }
 
     #[test]
