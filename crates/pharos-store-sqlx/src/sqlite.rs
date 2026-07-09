@@ -15,7 +15,7 @@ use std::str::FromStr;
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
+    subtitle_tracks_json, attachments_json, artist, album, album_artist, genre, created_at, chapters_json, \
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, series_folder, series_year";
@@ -537,6 +537,7 @@ impl MediaStore for SqliteStore {
             .and_then(|s| s.series_folder.as_deref());
         let series_year = item.series.as_ref().and_then(|s| s.series_year);
         let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
+        let attachments_json = crate::attachment_json::encode(&p.attachments);
         let chapters_json = crate::chapter_json::encode(&p.chapters);
         let m = &item.metadata;
         let provider_ids_json = crate::provider_ids_json::encode(&m.provider_ids);
@@ -557,12 +558,12 @@ impl MediaStore for SqliteStore {
                 artist, album, album_artist, genre, created_at, chapters_json, \
                 video_profile, video_level, \
                 pixel_format, color_primaries, color_transfer, color_space, \
-                audio_tracks_json, \
+                audio_tracks_json, attachments_json, \
                 community_rating, critic_rating, official_rating, production_year, \
                 premiere_date, overview, tagline, provider_ids, \
                 series_folder, series_year, title_fold) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            title_fold = excluded.title_fold,
@@ -594,6 +595,7 @@ impl MediaStore for SqliteStore {
                                            color_transfer = excluded.color_transfer,
                                            color_space = excluded.color_space,
                                            audio_tracks_json = excluded.audio_tracks_json,
+                                           attachments_json = excluded.attachments_json,
                                            community_rating = excluded.community_rating,
                                            critic_rating = excluded.critic_rating,
                                            official_rating = excluded.official_rating,
@@ -643,6 +645,7 @@ impl MediaStore for SqliteStore {
         .bind(p.color_transfer.as_deref())
         .bind(p.color_space.as_deref())
         .bind(crate::audio_track_json::encode(&p.audio_tracks))
+        .bind(attachments_json)
         .bind(m.community_rating)
         .bind(m.critic_rating)
         .bind(m.official_rating.as_deref())
@@ -2092,6 +2095,7 @@ struct MediaRow {
     season_number: Option<i64>,
     episode_number: Option<i64>,
     subtitle_tracks_json: Option<String>,
+    attachments_json: Option<String>,
     artist: Option<String>,
     album: Option<String>,
     album_artist: Option<String>,
@@ -2144,6 +2148,7 @@ impl MediaRow {
                 self.subtitle_tracks_json.as_deref(),
             ),
             audio_tracks: crate::audio_track_json::decode(self.audio_tracks_json.as_deref()),
+            attachments: crate::attachment_json::decode(self.attachments_json.as_deref()),
             artist: self.artist,
             album: self.album,
             album_artist: self.album_artist,

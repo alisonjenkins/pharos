@@ -19,6 +19,7 @@ pub mod postgres;
 
 // JSON adapter for MediaProbe.subtitle_tracks persistence — kept
 // outside the feature gates so both backends use it.
+pub mod attachment_json;
 pub mod subtitle_track_json;
 
 // JSON adapter for MediaProbe.chapters persistence (T54 phase 4

@@ -160,6 +160,11 @@ struct FfprobeStreamTags {
     replaygain_track_gain_upper: Option<String>,
     #[serde(default, rename = "REPLAYGAIN_ALBUM_GAIN")]
     replaygain_album_gain_upper: Option<String>,
+    /// Attachment streams (fonts) carry the file name + MIME type here.
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    mimetype: Option<String>,
 }
 
 /// P37 — parse a ReplayGain string of the form `"-7.34 dB"` /
@@ -329,6 +334,20 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         })
         .collect();
 
+    let attachments: Vec<pharos_core::MediaAttachment> = parsed
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "attachment")
+        .filter_map(|s| {
+            Some(pharos_core::MediaAttachment {
+                stream_index: s.index?,
+                filename: s.tags.filename.clone(),
+                mime_type: s.tags.mimetype.clone(),
+                codec: s.codec_name.clone(),
+            })
+        })
+        .collect();
+
     let chapters: Vec<MediaChapter> = parsed
         .chapters
         .iter()
@@ -382,6 +401,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             sample_rate,
             subtitle_tracks,
             audio_tracks,
+            attachments,
             artist: parsed.format.tags.artist,
             album: parsed.format.tags.album,
             album_artist: parsed.format.tags.album_artist,

@@ -1127,6 +1127,12 @@ pub struct MediaProbe {
     /// pre-date the multi-track migration. Empty Vec = no audio
     /// streams in source.
     pub audio_tracks: Vec<AudioTrack>,
+    /// Embedded attachment streams (fonts for ASS/SSA subtitles). Stored
+    /// JSON-serialised in the `attachments_json` column; empty when the source
+    /// carries none. Defaulted so rows written before the column existed
+    /// deserialise cleanly.
+    #[serde(default)]
+    pub attachments: Vec<MediaAttachment>,
     /// Common audio-file format tags (`title` / `artist` / `album` /
     /// `album_artist` / `genre`). Populated by FfmpegProber from
     /// ffprobe's `format.tags`. None when the file lacks the tag.
@@ -1228,6 +1234,22 @@ pub struct SubtitleTrack {
     /// `IsHearingImpaired` so jellyfin-web's subtitle picker can
     /// label the track and accessibility filtering works.
     pub is_hearing_impaired: bool,
+}
+
+/// One embedded attachment stream — typically a font that ASS/SSA subtitles
+/// reference. jellyfin-web hands these to SubtitlesOctopus (libass) so styled
+/// subtitles render with the right glyphs; without them libass fails to start
+/// the track and the subtitle doesn't show at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaAttachment {
+    /// ffprobe stream index — `ffmpeg -dump_attachment:<n>` extracts it.
+    pub stream_index: u32,
+    /// `filename` tag (e.g. `Arial.ttf`).
+    pub filename: Option<String>,
+    /// `mimetype` tag (e.g. `application/x-truetype-font`).
+    pub mime_type: Option<String>,
+    /// Codec name (`ttf`, `otf`, …).
+    pub codec: Option<String>,
 }
 
 impl MediaProbe {

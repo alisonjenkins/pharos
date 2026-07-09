@@ -299,6 +299,77 @@ impl ImageCache {
         Ok(())
     }
 
+    /// Extract embedded attachment stream `stream_index` (a font) from
+    /// `source` to a cached file, returning its path. Cached under
+    /// `{root}/attachments/{id}/{index}`; extraction runs once on a miss.
+    /// jellyfin-web fetches these for SubtitlesOctopus so ASS/SSA render.
+    pub async fn attachment(
+        &self,
+        id: u64,
+        source: &Path,
+        stream_index: u32,
+    ) -> Result<PathBuf, ImageCacheError> {
+        let dir = self.root.join("attachments").join(id.to_string());
+        let out = dir.join(stream_index.to_string());
+        if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+            return Ok(out);
+        }
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = out.with_extension("tmp");
+        if let Err(e) = self.extract_attachment_to(source, stream_index, &tmp).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&tmp, &out).await?;
+        Ok(out)
+    }
+
+    /// Write attachment stream `stream_index`'s bytes to `out` — resident libav
+    /// worker in prod, else `ffmpeg -dump_attachment`.
+    async fn extract_attachment_to(
+        &self,
+        source: &Path,
+        stream_index: u32,
+        out: &Path,
+    ) -> Result<(), ImageCacheError> {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            return pool
+                .extract_attachment(source.to_path_buf(), stream_index, out.to_path_buf())
+                .await
+                .map_err(|e| ImageCacheError::Ffmpeg(None, format!("libav attachment: {e}")));
+        }
+        let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        // `-dump_attachment:<idx> <file>` writes the attachment; the `-f null`
+        // sink satisfies ffmpeg's "need an output" without producing one.
+        let status = Command::new(&self.ffmpeg_bin)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                &format!("-dump_attachment:{stream_index}"),
+                out_str,
+                "-i",
+                source_str,
+                "-f",
+                "null",
+                "-",
+            ])
+            .status()
+            .await
+            .map_err(|e| ImageCacheError::Ffmpeg(None, format!("spawn: {e}")))?;
+        if tokio::fs::try_exists(out).await.unwrap_or(false) {
+            return Ok(());
+        }
+        Err(ImageCacheError::Ffmpeg(
+            status.code(),
+            "ffmpeg dump_attachment produced no file".into(),
+        ))
+    }
+
     /// Atomically persist a client-uploaded image at the given role +
     /// index slot. Used by `POST /Items/{id}/Images/{type}`.
     #[instrument(skip(self, body), fields(media.id = %id, role = ?role, bytes = body.len()))]

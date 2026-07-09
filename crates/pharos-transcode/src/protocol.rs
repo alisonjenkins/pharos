@@ -155,6 +155,12 @@ pub enum TinyOp {
         quality: i32,
         out: PathBuf,
     },
+    /// Extract an embedded attachment stream (a font) to `out` -> `Done`.
+    ExtractAttachment {
+        input: PathBuf,
+        stream_index: u32,
+        out: PathBuf,
+    },
     /// Generate trickplay sprite sheets into `out_dir` (0-based `{i}.jpg`)
     /// → `Done` (`out_bytes` carries the sheet count).
     Trickplay {

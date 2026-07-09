@@ -138,6 +138,23 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Extract an embedded attachment stream (a font) to `out`.
+    pub async fn extract_attachment(
+        &self,
+        input: impl Into<PathBuf>,
+        stream_index: u32,
+        out: impl Into<PathBuf>,
+    ) -> Result<(), PoolError> {
+        let ev = self
+            .run(TinyOp::ExtractAttachment {
+                input: input.into(),
+                stream_index,
+                out: out.into(),
+            })
+            .await?;
+        expect_done(ev).map(|_| ())
+    }
+
     /// Extract a single scaled JPEG frame to `out`.
     pub async fn extract_image(
         &self,

@@ -10,8 +10,9 @@ use crate::{
         auth_extractor::AuthUser,
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{
-            build_media_streams_with_subtitles, container_for, BaseItemDto, ItemsResultDto,
-            SubtitleStreamCtx, VirtualFolderInfoDto, VirtualFolderOptionsDto,
+            build_media_attachments, build_media_streams_with_subtitles, container_for,
+            BaseItemDto, ItemsResultDto, SubtitleStreamCtx, VirtualFolderInfoDto,
+            VirtualFolderOptionsDto,
         },
         subtitles::discover_sidecars,
     },
@@ -1591,6 +1592,9 @@ async fn playback_info(
         sidecar_langs,
     };
     let streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
+    // Embedded fonts → MediaAttachments so jellyfin-web hands them to
+    // SubtitlesOctopus and ASS/SSA subtitles render.
+    let media_attachments = build_media_attachments(item.id, &probe.attachments);
     // Find the audio stream's actual index (or skip if there isn't one).
     // Hard-coding `1` for silent-video files made jellyfin-web's player
     // try to select a track that doesn't exist.
@@ -1662,6 +1666,7 @@ async fn playback_info(
         "RequiresLooping": false,
         "SupportsProbing": true,
         "MediaStreams": streams,
+        "MediaAttachments": media_attachments.clone(),
         "Bitrate": probe.bitrate_bps,
         "VideoType": "VideoFile",
         "DefaultAudioStreamIndex": default_audio_stream_index,
@@ -1721,6 +1726,7 @@ async fn playback_info(
             // don't carry independent stream enrichment. Future
             // scanner work fills this per-source.
             "MediaStreams": streams,
+            "MediaAttachments": media_attachments.clone(),
             "Bitrate": alt.bitrate_bps.or(probe.bitrate_bps),
             "VideoType": "VideoFile",
             "DefaultAudioStreamIndex": default_audio_stream_index,

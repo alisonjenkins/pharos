@@ -11,7 +11,9 @@
 
 use ffmpeg::ffi;
 use ffmpeg_the_third as ffmpeg;
-use pharos_core::{AudioTrack, MediaChapter, MediaKind, MediaProbe, ProbeInfo, SubtitleTrack};
+use pharos_core::{
+    AudioTrack, MediaAttachment, MediaChapter, MediaKind, MediaProbe, ProbeInfo, SubtitleTrack,
+};
 use std::ffi::CStr;
 use std::path::Path;
 
@@ -61,6 +63,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
     let mut video: Option<VideoFields> = None;
     let mut audio_tracks: Vec<AudioTrack> = Vec::new();
     let mut subtitle_tracks: Vec<SubtitleTrack> = Vec::new();
+    let mut attachments: Vec<MediaAttachment> = Vec::new();
 
     for stream in ictx.streams() {
         // SAFETY: stream + its codecpar are valid for the iteration.
@@ -102,6 +105,16 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
                     is_hearing_impaired: disp & ffi::AV_DISPOSITION_HEARING_IMPAIRED != 0,
                 });
             }
+            ffi::AVMediaType::ATTACHMENT => {
+                // Fonts referenced by ASS/SSA subtitles. The filename +
+                // mimetype live in the stream metadata.
+                attachments.push(MediaAttachment {
+                    stream_index: index,
+                    filename: dict_get(st.metadata, "filename"),
+                    mime_type: dict_get(st.metadata, "mimetype"),
+                    codec: codec_name(par.codec_id),
+                });
+            }
             _ => {}
         }
     }
@@ -137,6 +150,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             sample_rate: audio_tracks.first().and_then(|a| a.sample_rate),
             subtitle_tracks,
             audio_tracks,
+            attachments,
             artist: ftags.artist,
             album: ftags.album,
             album_artist: ftags.album_artist,

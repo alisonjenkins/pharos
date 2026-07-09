@@ -10,8 +10,9 @@
 //! blocking; callers run them on a blocking thread.
 
 #[cfg(feature = "backend-lib")]
-pub mod frames;
+pub mod attachment;
 #[cfg(feature = "backend-lib")]
+pub mod frames;
 pub mod image;
 #[cfg(feature = "backend-lib")]
 pub mod probe;

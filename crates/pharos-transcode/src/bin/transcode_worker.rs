@@ -310,6 +310,17 @@ fn handle_tiny(
             },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::ExtractAttachment {
+            input,
+            stream_index,
+            out,
+        } => match libav::attachment::extract_attachment(&input, stream_index, &out) {
+            Ok(()) => WorkerEvent::Done {
+                job_id,
+                out_bytes: file_len(&out),
+            },
+            Err(e) => frame_err(job_id, e),
+        },
         TinyOp::Trickplay {
             input,
             interval_ms,

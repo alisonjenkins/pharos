@@ -1441,11 +1441,65 @@ pub fn build_media_streams_with_subtitles(
     streams
 }
 
+/// Build a MediaSource's `MediaAttachments` array — one entry per embedded
+/// attachment (fonts). Each carries a `DeliveryUrl` jellyfin-web fetches and
+/// hands to SubtitlesOctopus so ASS/SSA subtitles render with the right fonts.
+pub fn build_media_attachments(
+    item_id: pharos_core::MediaId,
+    attachments: &[pharos_core::MediaAttachment],
+) -> Vec<serde_json::Value> {
+    attachments
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "Index": a.stream_index,
+                "FileName": a.filename,
+                "MimeType": a.mime_type,
+                "Codec": a.codec,
+                "DeliveryUrl": format!(
+                    "/Videos/{id}/{id}/Attachments/{idx}",
+                    id = item_id,
+                    idx = a.stream_index,
+                ),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use pharos_core::MediaProbe;
+
+    #[test]
+    fn media_attachments_emit_font_delivery_urls() {
+        // ASS/SSA fonts must surface as MediaAttachments with a DeliveryUrl so
+        // jellyfin-web hands them to SubtitlesOctopus.
+        let atts = vec![
+            pharos_core::MediaAttachment {
+                stream_index: 7,
+                filename: Some("Arial.ttf".into()),
+                mime_type: Some("application/x-truetype-font".into()),
+                codec: Some("ttf".into()),
+            },
+            pharos_core::MediaAttachment {
+                stream_index: 8,
+                filename: Some("Bold.otf".into()),
+                mime_type: Some("application/vnd.ms-opentype".into()),
+                codec: Some("otf".into()),
+            },
+        ];
+        let out = build_media_attachments(42, &atts);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["Index"], 7);
+        assert_eq!(out[0]["FileName"], "Arial.ttf");
+        assert_eq!(out[0]["MimeType"], "application/x-truetype-font");
+        assert_eq!(out[0]["Codec"], "ttf");
+        assert_eq!(out[0]["DeliveryUrl"], "/Videos/42/42/Attachments/7");
+        assert_eq!(out[1]["Index"], 8);
+        assert_eq!(out[1]["DeliveryUrl"], "/Videos/42/42/Attachments/8");
+    }
 
     #[test]
     fn stream_display_title_composes_language_title_codec_channels() {

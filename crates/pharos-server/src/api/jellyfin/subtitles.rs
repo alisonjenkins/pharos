@@ -82,7 +82,71 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/videos/{id}/{media_source_id}/subtitles/{stream_index}/{start_ticks}/stream.js",
         web::get().to(stream_js_ticks),
+    )
+    // Embedded attachment (font) delivery. SubtitlesOctopus fetches these
+    // from the MediaAttachments DeliveryUrls to render ASS/SSA correctly.
+    .route(
+        "/videos/{id}/{media_source_id}/attachments/{stream_index}",
+        web::get().to(stream_attachment),
+    )
+    .route(
+        "/videos/{id}/attachments/{stream_index}",
+        web::get().to(stream_attachment_short),
     );
+}
+
+async fn stream_attachment(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, _msid, stream_index) = path.into_inner();
+    deliver_attachment(&state, &id, stream_index).await
+}
+
+async fn stream_attachment_short(
+    state: web::Data<AppState>,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, stream_index) = path.into_inner();
+    deliver_attachment(&state, &id, stream_index).await
+}
+
+/// Extract + serve an embedded attachment (font) by stream index. Cached on
+/// disk after the first fetch. Public, like the subtitle + image routes.
+async fn deliver_attachment(
+    state: &AppState,
+    id_str: &str,
+    stream_index: u32,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id: u64 = id_str
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let Some(cache) = state.images.as_ref() else {
+        return Err(error::ErrorNotFound("no attachment cache"));
+    };
+    // Content-Type from the probed mimetype; fall back to a generic type.
+    let content_type = item
+        .probe
+        .attachments
+        .iter()
+        .find(|a| a.stream_index == stream_index)
+        .and_then(|a| a.mime_type.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let path = cache
+        .attachment(id, &item.path, stream_index)
+        .await
+        .map_err(|e| error::ErrorNotFound(format!("attachment: {e}")))?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type(content_type)
+        .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
+        .body(bytes))
 }
 
 async fn stream_ass(

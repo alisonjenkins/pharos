@@ -29,7 +29,7 @@ use pharos_core::{
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
     bitrate_bps, video_codec, audio_codec, width, height, frame_rate_mille, \
     audio_channels, sample_rate, series_name, season_number, episode_number, \
-    subtitle_tracks_json, artist, album, album_artist, genre, created_at, chapters_json, \
+    subtitle_tracks_json, attachments_json, artist, album, album_artist, genre, created_at, chapters_json, \
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, series_folder, series_year";
@@ -510,6 +510,7 @@ impl MediaStore for PostgresStore {
             .and_then(|s| s.series_folder.as_deref());
         let series_year = item.series.as_ref().and_then(|s| s.series_year);
         let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
+        let attachments_json = crate::attachment_json::encode(&p.attachments);
         let chapters_json = crate::chapter_json::encode(&p.chapters);
         let m = &item.metadata;
         let provider_ids_json = crate::provider_ids_json::encode(&m.provider_ids);
@@ -532,11 +533,11 @@ impl MediaStore for PostgresStore {
                 audio_tracks_json, \
                 community_rating, critic_rating, official_rating, production_year, \
                 premiere_date, overview, tagline, provider_ids, \
-                series_folder, series_year, title_fold) \
+                series_folder, series_year, title_fold, attachments_json) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
-                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
+                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             title_fold = EXCLUDED.title_fold,
@@ -578,6 +579,7 @@ impl MediaStore for PostgresStore {
                                             provider_ids = EXCLUDED.provider_ids,
                                             series_folder = EXCLUDED.series_folder,
                                             series_year = EXCLUDED.series_year,
+                                            attachments_json = EXCLUDED.attachments_json,
                                             created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
@@ -624,6 +626,7 @@ impl MediaStore for PostgresStore {
         .bind(series_year.map(|v| v as i32))
         // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
         .bind(item.title.to_lowercase())
+        .bind(attachments_json)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -2308,6 +2311,7 @@ struct MediaRow {
     season_number: Option<i32>,
     episode_number: Option<i32>,
     subtitle_tracks_json: Option<String>,
+    attachments_json: Option<String>,
     artist: Option<String>,
     album: Option<String>,
     album_artist: Option<String>,
@@ -2360,6 +2364,7 @@ impl MediaRow {
                 self.subtitle_tracks_json.as_deref(),
             ),
             audio_tracks: crate::audio_track_json::decode(self.audio_tracks_json.as_deref()),
+            attachments: crate::attachment_json::decode(self.attachments_json.as_deref()),
             artist: self.artist,
             album: self.album,
             album_artist: self.album_artist,
