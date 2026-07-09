@@ -1120,8 +1120,9 @@ fn playback_qs(req: &HttpRequest) -> String {
 // useless to them; they get VP9 instead. Progressive WebM plays but cannot
 // seek or report a resume position — so, like Jellyfin, pharos serves VP9 as
 // fMP4 HLS. Each `.m4s` is generated on demand exactly like a `.ts` segment
-// (independent `ffmpeg -ss/-t` run, codec-keyed cache), then post-processed
-// by `fmp4::process_segment` into moof-only media with a corrected `tfdt`.
+// (independent `ffmpeg -ss/-t` run with SOURCE-anchored timestamps — see
+// pharos-transcode — plus a codec-keyed cache), then post-processed by
+// `fmp4::process_segment` into moof-only media (negative tfdt clamped).
 
 /// RFC 7741 CODECS token for the VP9 fMP4 output. Profile 0 (8-bit 4:2:0),
 /// level 4.0 (covers ≤ 1080p30), which is what the encoder emits. Firefox is
@@ -1247,7 +1248,7 @@ async fn vp9_init(
     )
     .await;
     let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
-    let processed = fmp4::process_segment(&raw, 0, SEGMENT_SECONDS)
+    let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
     Ok(HttpResponse::Ok()
         .content_type("video/mp4")
@@ -1284,7 +1285,7 @@ async fn vp9_segment(
     )
     .await;
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
-    let processed = fmp4::process_segment(&raw, seg, SEGMENT_SECONDS)
+    let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
     Ok(HttpResponse::Ok()
         .content_type(Container::Fmp4.content_type())

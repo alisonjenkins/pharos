@@ -449,6 +449,20 @@ fn build_args_for_device(
     // is unaffected: it reads the file directly via the `subtitles` filter, not
     // a mapped output stream.
     a.push("-sn".into());
+    // fMP4 HLS segments are independent per-segment encodes that must tile on
+    // ONE shared timeline (hls.js concatenates them under a single init
+    // segment). Anchor each segment's timestamps to the SOURCE clock instead
+    // of letting the muxer zero-base them — see the fMP4 muxer block below
+    // for the mux-side half. `-enc_time_base 1:90000` stops libvpx/libx264
+    // from quantizing timestamps to whole frame durations (the default
+    // 1/framerate timebase rounds the zero-based first-frame pts to frame
+    // index 0 or 1 semi-randomly per segment, gapping/duping the boundary
+    // frame by ±1 frame). Encoder option → only when actually encoding video.
+    let fmp4_segment = matches!(opts.container, Container::Fmp4);
+    if fmp4_segment && opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy)) {
+        a.push("-enc_time_base".into());
+        a.push("1:90000".into());
+    }
     a.push("-f".into());
     a.push(opts.container.ffmpeg_muxer().into());
     // `-movflags` is an mp4/mov-muxer option — fragmented MP4 for progressive
@@ -457,10 +471,29 @@ fn build_args_for_device(
     // cluster writing). `Fmp4` needs the SAME fragmentation flags: the VP9-in-
     // HLS path (see api::jellyfin::fmp4) generates each segment as a self-
     // contained fragmented mp4 (`ftyp moov moof mdat`), then splits off the
-    // init and rewrites `tfdt` so per-segment output concatenates in hls.js.
+    // init so per-segment output concatenates in hls.js.
     if matches!(opts.container, Container::Mp4 | Container::Fmp4) {
         a.push("-movflags".into());
-        a.push("+empty_moov+frag_keyframe+default_base_moof".into());
+        if fmp4_segment {
+            // Source-anchored HLS segment (mux side): re-apply the seek
+            // offset at the muxer so tfdt = the frame's TRUE source
+            // timestamp. Consecutive segments then butt-join exactly and
+            // audio/video share one clock — forcing a nominal 6.0 s tfdt
+            // grid instead accumulates the per-segment video-vs-audio
+            // content differential (~6 ms/segment) into audible A/V drift
+            // over a full episode. `frag_discont` marks the runs as
+            // intentionally discontinuous; `-avoid_negative_ts disabled`
+            // stops the muxer from re-shifting the anchored timestamps
+            // (opus preskip puts segment 0's first audio packet slightly
+            // below zero — fmp4::process_segment clamps it).
+            a.push("+empty_moov+frag_keyframe+default_base_moof+frag_discont".into());
+            a.push("-avoid_negative_ts".into());
+            a.push("disabled".into());
+            a.push("-output_ts_offset".into());
+            a.push(format!("{:.3}", start.unwrap_or(0.0)));
+        } else {
+            a.push("+empty_moov+frag_keyframe+default_base_moof".into());
+        }
     }
     // File-direct outputs are written by the worker; ffmpeg refuses to
     // overwrite an existing file without `-y`, and the scheduler hands
@@ -567,6 +600,59 @@ mod tests {
         assert!(joined.contains("-threads "), "{joined}");
         // `-movflags` is mp4-only; the webm muxer rejects it.
         assert!(!joined.contains("-movflags"), "{joined}");
+    }
+
+    #[test]
+    fn fmp4_segments_are_source_anchored() {
+        // The VP9-in-HLS path generates each segment as an independent
+        // `ffmpeg -ss N*6 -t 6` run. Left to its defaults the mp4 muxer
+        // zero-bases every run, so segments only concatenate if tfdt is
+        // rewritten onto a nominal 6.0 s grid afterwards — and forcing that
+        // grid desyncs A/V progressively (video/audio real content ≈ 6.012 /
+        // 6.006 s per segment). Instead, anchor every segment to the SOURCE
+        // timeline at the muxer (`-output_ts_offset`), so consecutive
+        // segments tile exactly and both tracks share one clock:
+        // - `-enc_time_base 1:90000`: without it libvpx quantizes timestamps
+        //   to whole frame durations, randomly dropping/gapping the boundary
+        //   frame (±1 frame per segment).
+        // - `-avoid_negative_ts disabled`: the mp4 muxer must not re-shift
+        //   the anchored timestamps (opus preskip makes seg 0 slightly
+        //   negative; fmp4.rs clamps that).
+        // - `+frag_discont`: per-segment runs are discontinuous by design.
+        let o = TranscodeOptions {
+            container: Container::Fmp4,
+            video: Some(VideoCodec::Vp9),
+            audio: Some(AudioCodec::Opus),
+            video_bitrate_bps: Some(2_000_000),
+            audio_bitrate_bps: Some(128_000),
+            start_position_ticks: 30 * 10_000_000, // segment 5 → 30 s
+            duration_ticks: Some(6 * 10_000_000),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+        };
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
+        assert!(
+            joined.contains("-movflags +empty_moov+frag_keyframe+default_base_moof+frag_discont"),
+            "{joined}"
+        );
+        assert!(joined.contains("-avoid_negative_ts disabled"), "{joined}");
+        assert!(joined.contains("-output_ts_offset 30.000"), "{joined}");
+    }
+
+    #[test]
+    fn progressive_mp4_stays_zero_based() {
+        // Progressive (non-HLS) MP4 keeps ffmpeg's default zero-based
+        // timestamps: the client plays a single stream from the requested
+        // position and expects it to start at t≈0. Source-anchoring is a
+        // per-segment HLS concern only.
+        let mut o = opts(); // Container::Mp4
+        o.start_position_ticks = 30 * 10_000_000;
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(!joined.contains("-output_ts_offset"), "{joined}");
+        assert!(!joined.contains("-avoid_negative_ts"), "{joined}");
+        assert!(!joined.contains("frag_discont"), "{joined}");
+        assert!(!joined.contains("-enc_time_base"), "{joined}");
     }
 
     #[test]

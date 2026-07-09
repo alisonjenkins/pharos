@@ -68,7 +68,13 @@ fn codec_tag(video: Option<VideoCodec>) -> u32 {
         Some(VideoCodec::Copy) => 1,
         Some(VideoCodec::H264) => 2,
         Some(VideoCodec::H265) => 3,
-        Some(VideoCodec::Vp9) => 4,
+        // 6 (was 4): VP9 fMP4 segments became SOURCE-anchored
+        // (`-output_ts_offset`, see pharos-transcode) and the server stopped
+        // re-anchoring tfdt onto the 6.0 s grid. A cached zero-based segment
+        // served un-shifted would collapse onto t=0, so orphan every pre-
+        // anchoring VP9 file — LRU reclaims the space, exactly like the
+        // codec-blind `{seg}.ts` orphaning documented on `segment_path_keyed`.
+        Some(VideoCodec::Vp9) => 6,
         Some(VideoCodec::Av1) => 5,
     }
 }

@@ -8,9 +8,13 @@
 //!   2. variant → VOD playlist with an `EXT-X-MAP` init + `.m4s` segments.
 //!   3. init.mp4 → `ftyp`+`moov`, NO `moof` (a valid shared init segment).
 //!   4. `{seg}.m4s` → `moof`+`mdat`, NO `moov`/`ftyp` (moof-only media).
-//!   5. segment N's `tfdt` == N·6·timescale — the timeline correction that
-//!      lets independently-transcoded segments concatenate + seek. This is the
-//!      whole reason the path exists, verified through real ffmpeg output.
+//!   5. segment N's `tfdt` is SOURCE-anchored (≈ N·6 s, off by at most the
+//!      first-frame offset / opus preskip) and consecutive segments TILE:
+//!      tfdt(N+1) ≈ tfdt(N) + content(N) per track. Forcing tfdt onto an
+//!      exact 6.0 grid instead re-times video against audio by a few ms
+//!      every segment (real content is ~6.012 s video / ~6.006 s audio) and
+//!      accumulates into audible A/V drift over a long title. Verified
+//!      through real ffmpeg output.
 //!
 //! `#[ignore]` + ffmpeg-gated like the other real-transcode suites; the clip
 //! is generated in-test via lavfi so no fixture corpus is required.
@@ -130,6 +134,130 @@ fn tfdt_values(data: &[u8]) -> Vec<u64> {
     out
 }
 
+/// Walk the direct children of `data[start..end]`: `(fourcc, body_start, box_end)`.
+fn boxes(data: &[u8], start: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+    let mut out = Vec::new();
+    let mut off = start;
+    while off + 8 <= end {
+        let size32 = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        let kind: [u8; 4] = data[off + 4..off + 8].try_into().unwrap();
+        let (hdr, size) = match size32 {
+            1 => (
+                16,
+                u64::from_be_bytes(data[off + 8..off + 16].try_into().unwrap()) as usize,
+            ),
+            0 => (8, end - off),
+            s => (8, s),
+        };
+        if size < hdr || off + size > end {
+            break;
+        }
+        out.push((kind, off + hdr, off + size));
+        off += size;
+    }
+    out
+}
+
+/// Per-track media timescales from the init's `moov/trak/mdia/mdhd`, in track
+/// order (matches the per-moof `traf` order ffmpeg writes).
+fn init_timescales(init: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for (kind, bs, be) in boxes(init, 0, init.len()) {
+        if &kind != b"moov" {
+            continue;
+        }
+        for (tk, tbs, tbe) in boxes(init, bs, be) {
+            if &tk != b"trak" {
+                continue;
+            }
+            for (mk, mbs, mbe) in boxes(init, tbs, tbe) {
+                if &mk != b"mdia" {
+                    continue;
+                }
+                for (hk, hbs, _) in boxes(init, mbs, mbe) {
+                    if &hk == b"mdhd" {
+                        let off = hbs + 4 + if init[hbs] == 1 { 16 } else { 8 };
+                        out.push(u32::from_be_bytes(init[off..off + 4].try_into().unwrap()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Sample-accurate per-track timing of a media segment: for each track id,
+/// the earliest `tfdt` and the summed sample durations across ALL its moofs
+/// (a 6 s segment usually carries several fragments).
+fn frag_timing(seg: &[u8]) -> Vec<(u64, u64)> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    for (kind, bs, be) in boxes(seg, 0, seg.len()) {
+        if &kind != b"moof" {
+            continue;
+        }
+        for (tk, tbs, tbe) in boxes(seg, bs, be) {
+            if &tk != b"traf" {
+                continue;
+            }
+            let (mut tid, mut base, mut default_dur, mut dur_sum) = (0u32, u64::MAX, 0u64, 0u64);
+            for (ck, cbs, _) in boxes(seg, tbs, tbe) {
+                let flags = u32::from_be_bytes(seg[cbs..cbs + 4].try_into().unwrap()) & 0x00FF_FFFF;
+                match &ck {
+                    b"tfhd" => {
+                        let mut p = cbs + 4;
+                        tid = u32::from_be_bytes(seg[p..p + 4].try_into().unwrap());
+                        p += 4;
+                        if flags & 0x1 != 0 {
+                            p += 8; // base-data-offset
+                        }
+                        if flags & 0x2 != 0 {
+                            p += 4; // sample-description-index
+                        }
+                        if flags & 0x8 != 0 {
+                            default_dur =
+                                u32::from_be_bytes(seg[p..p + 4].try_into().unwrap()) as u64;
+                        }
+                    }
+                    b"tfdt" => {
+                        base = if seg[cbs] == 1 {
+                            u64::from_be_bytes(seg[cbs + 4..cbs + 12].try_into().unwrap())
+                        } else {
+                            u32::from_be_bytes(seg[cbs + 4..cbs + 8].try_into().unwrap()) as u64
+                        };
+                    }
+                    b"trun" => {
+                        let mut p = cbs + 4;
+                        let count = u32::from_be_bytes(seg[p..p + 4].try_into().unwrap());
+                        p += 4;
+                        if flags & 0x1 != 0 {
+                            p += 4; // data-offset
+                        }
+                        if flags & 0x4 != 0 {
+                            p += 4; // first-sample-flags
+                        }
+                        if flags & 0x100 != 0 {
+                            for _ in 0..count {
+                                dur_sum +=
+                                    u32::from_be_bytes(seg[p..p + 4].try_into().unwrap()) as u64;
+                                p += 4;
+                                p += 4 * u32::count_ones(flags & 0xE00) as usize;
+                            }
+                        } else {
+                            dur_sum += default_dur * count as u64;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let e = acc.entry(tid).or_insert((u64::MAX, 0));
+            e.0 = e.0.min(base);
+            e.1 += dur_sum;
+        }
+    }
+    acc.into_values().collect()
+}
+
 #[actix_web::test]
 #[ignore = "requires ffmpeg (libvpx-vp9 + libopus) on PATH"]
 async fn vp9_fmp4_path_serves_seekable_hls() {
@@ -224,29 +352,65 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
         "seg0's first fragment starts at tfdt 0: {seg0_tfdts:?}"
     );
 
-    // 5. Segment 2's first fragment sits at 12 s — the correction that makes
-    //    independently-transcoded fMP4 segments concatenate + seek. Opus in mp4
-    //    is always timescale 48000, so the first-fragment audio tfdt is a fixed
-    //    12·48000; video timescale is encoder-chosen so just assert it shifted.
-    let seg2 = test::call_and_read_body(
-        &app,
-        test::TestRequest::get()
-            .uri(&format!("/videos/42/vp9/2.m4s?api_key={token}"))
-            .to_request(),
-    )
-    .await;
-    let seg2_tfdts = tfdt_values(&seg2);
-    assert!(
-        seg2_tfdts.len() >= 2,
-        "seg2 needs ≥1 fragment: {seg2_tfdts:?}"
-    );
+    // 5. Segments are SOURCE-anchored and tile per track. This is the A/V
+    //    drift regression guard: an exact-6.0-grid tfdt would pass a naive
+    //    "seg2 starts at 12 s" check while re-timing video against audio by
+    //    a few ms per segment; asserting butt-joins on the true source
+    //    timeline pins the correct behaviour.
+    let timescales = init_timescales(&init);
     assert_eq!(
-        seg2_tfdts[1],
-        12 * 48_000,
-        "seg2 first-fragment audio tfdt must be 12s·48000=576000: {seg2_tfdts:?}"
+        timescales.len(),
+        2,
+        "expect video+audio tracks: {timescales:?}"
     );
-    assert!(
-        seg2_tfdts[0] > 0,
-        "seg2 first-fragment video tfdt must be shifted off 0: {seg2_tfdts:?}"
-    );
+    let (vts, ats) = (timescales[0] as f64, timescales[1] as f64);
+    let mut segs = Vec::new();
+    for n in 0..3u32 {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/videos/42/vp9/{n}.m4s?api_key={token}"))
+                .to_request(),
+        )
+        .await;
+        let timing = frag_timing(&body);
+        assert_eq!(timing.len(), 2, "seg{n} needs video+audio: {timing:?}");
+        segs.push(timing);
+    }
+    for (n, timing) in segs.iter().enumerate() {
+        let (v_start, a_start) = (timing[0].0 as f64 / vts, timing[1].0 as f64 / ats);
+        let want = n as f64 * 6.0;
+        // Video anchors at the first source frame ≥ the boundary — within
+        // one frame duration (24 fps ⇒ ~42 ms) of N·6, never before it.
+        assert!(
+            (want - 0.001..want + 0.1).contains(&v_start),
+            "seg{n} video start {v_start:.4} not source-anchored near {want}"
+        );
+        // Audio anchors at the boundary minus the opus preskip (312/48000 ≈
+        // 6.5 ms); segment 0 is clamped to exactly 0.
+        assert!(
+            (want - 0.01..want + 0.001).contains(&a_start),
+            "seg{n} audio start {a_start:.4} not source-anchored near {want}"
+        );
+    }
+    for n in 0..2usize {
+        let v_gap = (segs[n + 1][0].0 as f64 - (segs[n][0].0 + segs[n][0].1) as f64) / vts * 1000.0;
+        let a_gap = (segs[n + 1][1].0 as f64 - (segs[n][1].0 + segs[n][1].1) as f64) / ats * 1000.0;
+        // Video must butt-join: no dropped boundary frame (gap ≤ ~half a
+        // frame) and no more than one duplicated frame of overlap.
+        assert!(
+            (-45.0..=20.0).contains(&v_gap),
+            "seg{n}→{}: video tiling gap {v_gap:.1} ms (want ≈0: >0 drops frames → stutter, \
+             <-45 duplicates >1 frame)",
+            n + 1
+        );
+        // Audio overlaps by exactly the opus preskip (constant, never grows).
+        // The 0→1 boundary carries one extra preskip: segment 0's clamped
+        // tfdt (-6.5 ms → 0) pushes its end 6.5 ms late, so ≈ -13 ms there.
+        assert!(
+            (-15.0..=1.0).contains(&a_gap),
+            "seg{n}→{}: audio tiling gap {a_gap:.1} ms (want ≈-6.5 preskip overlap)",
+            n + 1
+        );
+    }
 }

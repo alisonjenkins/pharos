@@ -10,7 +10,7 @@
 //! **VP9-in-fMP4 HLS**: hls.js gets a VOD playlist of `.m4s` segments plus a
 //! shared init segment, which gives seeking, resume, and track-switching.
 //!
-//! ## The tfdt problem this module solves
+//! ## The timeline problem this module (and the encoder args) solve
 //!
 //! pharos generates HLS segments **per-segment on demand**: segment N is an
 //! independent `ffmpeg -ss {N*6} -t 6` run. That model is trivial for MPEG-TS
@@ -20,13 +20,27 @@
 //! so naively-concatenated per-segment fMP4 collapses onto t=0 and only the
 //! first segment plays (proven empirically against hls.js).
 //!
-//! [`process_segment`] repairs this after ffmpeg:
+//! An earlier iteration repaired this here by re-anchoring every `tfdt` onto
+//! a nominal `segIndex * 6.0 s` grid. That plays — but it accumulates A/V
+//! drift over a long title: a segment's real video content is ~6.012 s and
+//! its audio ~6.006 s (frame-grid overhang vs opus preskip), so forcing both
+//! onto the same 6.0 grid re-times the two tracks against each other by a few
+//! ms EVERY segment. The fix is **source-anchoring at the encoder**
+//! (`-output_ts_offset N*6 -avoid_negative_ts disabled -enc_time_base
+//! 1:90000 +frag_discont`, see `pharos_transcode::ffmpeg_transcode_args`):
+//! ffmpeg then writes each frame's TRUE source timestamp into `tfdt`, so
+//! consecutive segments butt-join exactly and audio/video share one clock —
+//! no per-segment re-anchoring, no accumulation, and segments stay
+//! independently generatable (parallel encode preserved).
+//!
+//! [`process_segment`]'s remaining jobs:
 //! 1. Split the self-contained fragmented-mp4 (`ftyp moov moof mdat …`) into an
 //!    **init** (`ftyp`+`moov`) and **media** (`moof`+`mdat` pairs).
-//! 2. Rewrite each fragment's `tfdt` to `original + segIndex*segSeconds*track_timescale`,
-//!    per track, so the segment lands at its true position on the global
-//!    timeline. Adding (not overwriting) preserves any intra-segment fragment
-//!    offsets when a segment carries more than one `moof`.
+//! 2. Clamp a *negative* `tfdt` to 0: segment 0's opus preskip (312 samples)
+//!    puts the first audio packet slightly below zero, which ffmpeg writes as
+//!    a two's-complement negative under `-avoid_negative_ts disabled`; an
+//!    unsigned reader (MSE) would see an astronomically large time and drop
+//!    the fragment.
 //! 3. Drop the trailing `mfra` (its `tfra` holds absolute file offsets that go
 //!    stale once the init is stripped).
 //!
@@ -34,12 +48,6 @@
 //! settings ⇒ same `stsd`/`vpcC`/timescale; only cosmetic `mvhd`/`mdhd`
 //! duration fields vary), so serving segment 0's init for every media segment
 //! is correct — the init route just extracts and caches it.
-
-/// Nominal HLS segment length in seconds. Must match the value the variant
-/// playlist advertises and the `-ss/-t` window the segment generator uses, so
-/// the computed `tfdt` base (`seg_index * SEGMENT_SECONDS * timescale`) lines
-/// up with where the segment actually sits on the timeline.
-pub const SEGMENT_SECONDS: f64 = 6.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Fmp4Error {
@@ -139,32 +147,36 @@ fn track_timescales(data: &[u8], moov: &Box) -> Result<Vec<u32>, Fmp4Error> {
     Ok(out)
 }
 
-/// Shift every `tfdt` inside one `moof` by `base_ticks[k]` for the K-th
-/// `traf`, in place. Adds to the existing value so multi-fragment segments
-/// keep their intra-segment offsets.
-fn shift_moof_tfdt(data: &mut [u8], moof: &Box, base_ticks: &[u64]) -> Result<(), Fmp4Error> {
+/// Clamp any *negative* `tfdt` inside one `moof` to 0, in place. ffmpeg
+/// writes segment 0's opus-preskip decode time as a two's-complement
+/// negative (`-avoid_negative_ts disabled`); the K-th `traf`'s track
+/// timescale bounds how negative a real preskip can be (well under one
+/// second), which distinguishes a wrapped negative from a legitimately
+/// huge decode time on a very long title.
+fn clamp_moof_tfdt(data: &mut [u8], moof: &Box, timescales: &[u32]) -> Result<(), Fmp4Error> {
     let trafs = walk(data, moof.start + moof.header..moof.end)?;
     for (traf_k, traf) in trafs.iter().filter(|b| &b.kind == b"traf").enumerate() {
         let children = walk(data, traf.start + traf.header..traf.end)?;
         for tfdt in children.iter().filter(|b| &b.kind == b"tfdt") {
             let body = tfdt.start + tfdt.header;
             let version = data.get(body).copied().unwrap_or(0);
-            let base = base_ticks.get(traf_k).copied().unwrap_or(0);
+            let ts = timescales.get(traf_k).copied().unwrap_or(48_000) as u64;
             if version == 1 {
                 if body + 12 <= tfdt.end {
                     let cur =
                         u64::from_be_bytes(data[body + 4..body + 12].try_into().unwrap_or([0; 8]));
-                    data[body + 4..body + 12]
-                        .copy_from_slice(&cur.saturating_add(base).to_be_bytes());
+                    if (cur as i64) < 0 {
+                        data[body + 4..body + 12].copy_from_slice(&0u64.to_be_bytes());
+                    }
                 }
             } else if body + 8 <= tfdt.end {
-                let cur = u32::from_be_bytes(data[body + 4..body + 8].try_into().unwrap_or([0; 4]))
-                    as u64;
-                // A 32-bit tfdt can overflow once the base decode time exceeds
-                // ~2^32 ticks; clamp defensively (ffmpeg emits v1 for long
-                // media, so this is the short-media fast path).
-                let sum = cur.saturating_add(base).min(u32::MAX as u64) as u32;
-                data[body + 4..body + 8].copy_from_slice(&sum.to_be_bytes());
+                let cur = u32::from_be_bytes(data[body + 4..body + 8].try_into().unwrap_or([0; 4]));
+                // v0 is 32-bit: a wrapped negative lands within one second
+                // (one timescale) of u32::MAX — anything that close to the
+                // wrap can't be a real decode time (≈24 h @ 48 kHz).
+                if (cur as u64) > u64::from(u32::MAX) - ts {
+                    data[body + 4..body + 8].copy_from_slice(&0u32.to_be_bytes());
+                }
             }
         }
     }
@@ -172,15 +184,9 @@ fn shift_moof_tfdt(data: &mut [u8], moof: &Box, base_ticks: &[u64]) -> Result<()
 }
 
 /// Split a self-contained fragmented-mp4 segment into a shared init and a
-/// timeline-corrected media segment (see the module docs).
-///
-/// `seg_index` is the zero-based HLS segment number; `seg_seconds` the nominal
-/// segment length (normally [`SEGMENT_SECONDS`]).
-pub fn process_segment(
-    raw: &[u8],
-    seg_index: u32,
-    seg_seconds: f64,
-) -> Result<Processed, Fmp4Error> {
+/// media segment whose (already source-anchored) `tfdt`s are passed through
+/// verbatim, with negatives clamped to 0 (see the module docs).
+pub fn process_segment(raw: &[u8]) -> Result<Processed, Fmp4Error> {
     let top = walk(raw, 0..raw.len())?;
     let moov = top
         .iter()
@@ -200,14 +206,10 @@ pub fn process_segment(
     }
 
     let timescales = track_timescales(raw, moov)?;
-    let base_ticks: Vec<u64> = timescales
-        .iter()
-        .map(|&ts| (seg_index as f64 * seg_seconds * ts as f64).round() as u64)
-        .collect();
 
     // Media = every moof+mdat (and any other post-moov boxes) EXCEPT the
     // trailing mfra, whose tfra offsets are invalidated by stripping the init.
-    // Copy into a mutable buffer and patch each moof's tfdt in place.
+    // Copy into a mutable buffer and clamp each moof's tfdt in place.
     let mut media = Vec::new();
     let mut moof_spans: Vec<std::ops::Range<usize>> = Vec::new();
     for b in &top {
@@ -242,7 +244,7 @@ pub fn process_segment(
             end: span.end,
             header,
         };
-        shift_moof_tfdt(&mut media, &moof, &base_ticks)?;
+        clamp_moof_tfdt(&mut media, &moof, &timescales)?;
     }
 
     Ok(Processed { init, media })
@@ -325,7 +327,7 @@ mod tests {
     #[test]
     fn splits_init_and_media() {
         let seg = sample_segment();
-        let p = process_segment(&seg, 0, SEGMENT_SECONDS).unwrap();
+        let p = process_segment(&seg).unwrap();
         // init carries ftyp + moov, media carries moof + mdat, mfra dropped.
         assert_eq!(&p.init[4..8], b"ftyp");
         assert!(p.init.windows(4).any(|w| w == b"moov"));
@@ -339,35 +341,54 @@ mod tests {
     }
 
     #[test]
-    fn patches_tfdt_per_track_timescale() {
-        let seg = sample_segment();
-        // Segment index 3 → video base 3*6*15360, audio base 3*6*48000.
-        let p = process_segment(&seg, 3, SEGMENT_SECONDS).unwrap();
-        let tfdts = read_tfdt(&p.media);
-        assert_eq!(tfdts, vec![3 * 6 * 15360, 3 * 6 * 48000]);
-    }
-
-    #[test]
-    fn segment_zero_leaves_tfdt_untouched() {
-        let seg = sample_segment();
-        let p = process_segment(&seg, 0, SEGMENT_SECONDS).unwrap();
-        assert_eq!(read_tfdt(&p.media), vec![0, 0]);
-    }
-
-    #[test]
-    fn adds_to_existing_offset() {
-        // A fragment already at intra-segment offset 100 must keep it: seg 2,
-        // video base 2*6*15360 = 184320, plus the pre-existing 100.
+    fn preserves_source_anchored_tfdt() {
+        // ffmpeg now writes the TRUE source timestamps (`-output_ts_offset`
+        // + `-avoid_negative_ts disabled` — see pharos-transcode). The
+        // surgery must pass them through verbatim: re-anchoring onto a
+        // nominal 6.0 s grid is exactly the bug that accumulated A/V drift.
         let ftyp = mk_box(b"ftyp", b"isom");
-        let moov = mk_box(b"moov", &trak(15360));
-        let moof = mk_box(b"moof", &traf(100));
+        let mut moov_body = Vec::new();
+        moov_body.extend_from_slice(&trak(15360));
+        moov_body.extend_from_slice(&trak(48000));
+        let moov = mk_box(b"moov", &moov_body);
+        let mut moof_body = Vec::new();
+        // Segment 3 at source-anchored times: video 18.006 s, audio 17.9935 s.
+        moof_body.extend_from_slice(&traf(276_572)); // 18.006 * 15360
+        moof_body.extend_from_slice(&traf(863_688)); // 17.9935 * 48000
+        let moof = mk_box(b"moof", &moof_body);
+        let mdat = mk_box(b"mdat", &[0xAA; 32]);
+        let mut seg = Vec::new();
+        for part in [&ftyp, &moov, &moof, &mdat] {
+            seg.extend_from_slice(part);
+        }
+        let p = process_segment(&seg).unwrap();
+        assert_eq!(read_tfdt(&p.media), vec![276_572, 863_688]);
+    }
+
+    #[test]
+    fn clamps_negative_tfdt_to_zero() {
+        // Segment 0's opus preskip (312 samples) puts the first audio
+        // packet's decode time slightly BELOW zero; with
+        // `-avoid_negative_ts disabled` ffmpeg writes it as a two's-
+        // complement negative, which an unsigned tfdt reader (MSE) sees as
+        // an astronomically large time and drops the fragment. Clamp to 0.
+        let ftyp = mk_box(b"ftyp", b"isom");
+        let moov = mk_box(b"moov", &trak(48000));
+        let moof = mk_box(b"moof", &traf((-312i64) as u64));
         let mdat = mk_box(b"mdat", &[0; 8]);
         let mut seg = Vec::new();
         for part in [&ftyp, &moov, &moof, &mdat] {
             seg.extend_from_slice(part);
         }
-        let p = process_segment(&seg, 2, SEGMENT_SECONDS).unwrap();
-        assert_eq!(read_tfdt(&p.media), vec![2 * 6 * 15360 + 100]);
+        let p = process_segment(&seg).unwrap();
+        assert_eq!(read_tfdt(&p.media), vec![0]);
+    }
+
+    #[test]
+    fn segment_zero_leaves_tfdt_untouched() {
+        let seg = sample_segment();
+        let p = process_segment(&seg).unwrap();
+        assert_eq!(read_tfdt(&p.media), vec![0, 0]);
     }
 
     #[test]
@@ -377,9 +398,6 @@ mod tests {
         let mut seg = Vec::new();
         seg.extend_from_slice(&ftyp);
         seg.extend_from_slice(&moov);
-        assert!(matches!(
-            process_segment(&seg, 0, SEGMENT_SECONDS),
-            Err(Fmp4Error::NoMoof)
-        ));
+        assert!(matches!(process_segment(&seg), Err(Fmp4Error::NoMoof)));
     }
 }
