@@ -397,24 +397,32 @@ fn build_args_for_device(
                 // playback. Only the software libvpx encoder needs this (the
                 // H.264/HEVC hw + x264 paths pace fine).
                 if matches!(c, VideoCodec::Vp9) && encoder == "libvpx-vp9" {
+                    // Benchmarked (scratchpad/vp9bench) for pharos's per-segment
+                    // realtime transcode on a CPU-only box wanting several
+                    // concurrent streams. A 6 s segment encodes in ~0.4-0.7 s, so
+                    // the goal is not single-stream speed (already 10×+ realtime)
+                    // but keeping the CPU footprint small so N concurrent streams
+                    // don't oversubscribe the cores.
                     a.push("-deadline".into());
                     a.push("realtime".into());
+                    // cpu-used 8 = fastest realtime. At streaming bitrates its
+                    // SSIM matches cpu-used 7 within noise (0.9501 vs 0.9488),
+                    // for less CPU — so max speed, no quality cost.
                     a.push("-cpu-used".into());
                     a.push("8".into());
                     a.push("-row-mt".into());
                     a.push("1".into());
-                    // libvpx with only row-mt pins to ~2 cores, so a 1080p
-                    // realtime encode falls below playback speed and the client
-                    // stutters even while the node sits mostly idle. Split the
-                    // frame into tile columns and hand libvpx a real thread pool
-                    // so it parallelises across the spare cores. `-tile-columns`
-                    // is a log2 count (4 → up to 16 cols, auto-clamped to what
-                    // the width allows); pair it with enough threads to fill the
-                    // tiles + row workers.
+                    // tile-columns 2 (up to 4 cols) parallelises enough for
+                    // realtime while keeping FEWER tile boundaries than the old
+                    // `4` — measured SSIM 0.9501 vs 0.9499 AND ~10% smaller, so
+                    // it's actually higher quality-per-bit. Pairs with ~4 threads.
                     a.push("-tile-columns".into());
-                    a.push("4".into());
-                    a.push("-frame-parallel".into());
-                    a.push("1".into());
+                    a.push("2".into());
+                    // No `-frame-parallel`: deprecated in modern libvpx, measured
+                    // zero speed benefit here, and it weakens inter-frame
+                    // prediction (bigger files) + risks decoder-compat quirks.
+                    a.push("-lag-in-frames".into());
+                    a.push("0".into());
                     a.push("-threads".into());
                     a.push(vp9_encode_threads().to_string());
                 }
@@ -514,15 +522,18 @@ fn build_args_for_device(
     a
 }
 
-/// Thread budget for a live libvpx-vp9 encode. Enough to keep a 1080p
-/// realtime encode above playback speed, but capped so two concurrent
-/// streams on a typical box don't oversubscribe every core (leaving none
-/// for muxing / the other stream / the OS).
+/// Thread budget for a live libvpx-vp9 encode. Benchmarked: a 1080p realtime
+/// segment encodes in ~0.6 s at 4 threads (well above the 6 s realtime
+/// budget), and MORE threads barely help single-stream latency while their
+/// footprint sums across concurrent streams. Cap at 4 so several streams
+/// coexist on a CPU-only box without oversubscribing every core — 4 threads ×
+/// 4 concurrent = 16, and even 3× that finished a 6-stream batch in ~1.7 s in
+/// the bench. Lower-core boxes scale down (min 2).
 fn vp9_encode_threads() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4)
-        .clamp(4, 8)
+        .clamp(2, 4)
 }
 
 #[cfg(test)]
@@ -603,9 +614,15 @@ mod tests {
         assert!(joined.contains("-deadline realtime"), "{joined}");
         assert!(joined.contains("-cpu-used 8"), "{joined}");
         assert!(joined.contains("-row-mt 1"), "{joined}");
-        // Multithreading across tile columns keeps the 1080p realtime encode
-        // above playback speed instead of pinning to ~2 cores.
-        assert!(joined.contains("-tile-columns 4"), "{joined}");
+        // Benchmark-tuned (scratchpad/vp9bench): tile-columns 2 (not 4) —
+        // enough parallelism for realtime, fewer tile boundaries → equal/better
+        // SSIM + smaller output; no `-frame-parallel` (deprecated, no benefit);
+        // `-lag-in-frames 0` (realtime, no lookahead); a small thread cap so
+        // concurrent streams don't oversubscribe the cores.
+        assert!(joined.contains("-tile-columns 2"), "{joined}");
+        assert!(!joined.contains("-tile-columns 4"), "{joined}");
+        assert!(!joined.contains("-frame-parallel"), "{joined}");
+        assert!(joined.contains("-lag-in-frames 0"), "{joined}");
         assert!(joined.contains("-threads "), "{joined}");
         // `-movflags` is mp4-only; the webm muxer rejects it.
         assert!(!joined.contains("-movflags"), "{joined}");
