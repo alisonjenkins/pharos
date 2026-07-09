@@ -272,7 +272,13 @@ async fn serve_image(
         // for the read endpoint, same as a missing file.
         Err(ImageCacheError::UploadOnly) => return Ok(HttpResponse::NotFound().body("")),
         Err(e) => {
-            tracing::warn!(error = %e, "image extraction failed");
+            tracing::warn!(
+                error = %e,
+                media.id = id,
+                media.path = %item.path.display(),
+                ?role,
+                "image extraction failed"
+            );
             return Ok(HttpResponse::NotFound().body(""));
         }
     };

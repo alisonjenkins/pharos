@@ -655,6 +655,7 @@ impl<P: Prober> FsScanner<P> {
     /// LIB-A8 — probe a single path and persist it (the create/modify tail
     /// shared by [`update_path`]). `existed` drives the added-vs-updated
     /// result; `fp` is reused when already computed during move-detect.
+    #[tracing::instrument(skip(self, store, sig, fp), fields(media.path = %path.display()))]
     async fn probe_put_one<
         S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
     >(
@@ -788,6 +789,7 @@ impl<P: Prober> FsScanner<P> {
         self.resolver.resolve(&req).await
     }
 
+    #[tracing::instrument(skip(self), fields(media.path = %path.display()))]
     async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
         match self.prober.probe(&path).await {
             Ok(info) => {
