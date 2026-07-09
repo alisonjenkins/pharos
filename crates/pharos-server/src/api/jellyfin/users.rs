@@ -100,6 +100,13 @@ async fn quick_connect_initiate(
         "Code": entry.code,
         "Secret": entry.secret,
         "DeviceId": entry.device_id,
+        // DeviceName / AppName / AppVersion are non-null strings in Jellyfin's
+        // QuickConnectResult; the Android/Google TV app's kotlin SDK rejects the
+        // whole response if they're missing (→ greys out the button). Echo them
+        // from the caller's `X-Emby-Authorization` header.
+        "DeviceName": auth.device.clone().unwrap_or_default(),
+        "AppName": auth.client.clone().unwrap_or_default(),
+        "AppVersion": auth.version.clone().unwrap_or_default(),
         "Authenticated": false,
         "DateAdded": pharos_jellyfin_api::dto::format_iso8601(now_secs),
     })))

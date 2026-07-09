@@ -56,6 +56,29 @@ async fn enabled_endpoint_returns_true() {
 }
 
 #[actix_web::test]
+async fn initiate_response_includes_device_and_app_metadata() {
+    // The Jellyfin Android/Google TV app deserializes the QuickConnectResult
+    // into a model with non-null DeviceName / AppName / AppVersion. Omitting
+    // them makes the kotlin SDK reject the response → the app greys out the
+    // Quick Connect button. They come from the `X-Emby-Authorization` header.
+    let (state, _) = seed_admin().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Initiate")
+        .insert_header((
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Jellyfin Android TV", Device="Chromecast", DeviceId="dev-qc", Version="0.19.9""#,
+        ))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["DeviceName"], "Chromecast", "DeviceName from header");
+    assert_eq!(v["AppName"], "Jellyfin Android TV", "AppName = Client");
+    assert_eq!(v["AppVersion"], "0.19.9", "AppVersion = Version");
+    assert_eq!(v["DeviceId"], "dev-qc");
+}
+
+#[actix_web::test]
 async fn initiate_authorize_connect_full_flow_yields_access_token() {
     let (state, admin_token) = seed_admin().await;
     let app = test::init_service(build_app(state)).await;
