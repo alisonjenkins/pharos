@@ -377,11 +377,12 @@ async fn set_user_password(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (dashboard button
-/// + `refreshLibrary` flows). Spawns a background scan of every configured
-/// media root and returns `204` immediately; the `LibraryChanged` broadcast on
-/// completion lets connected clients invalidate caches. (Jellyfin's UI polls
-/// /ScheduledTasks for progress — not implemented; the broadcast suffices.)
+/// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (the dashboard
+/// button and the `refreshLibrary` flows). Spawns a background scan of every
+/// configured media root and returns `204` immediately; the `LibraryChanged`
+/// broadcast on completion lets connected clients invalidate caches. (Jellyfin's
+/// UI polls `/ScheduledTasks` for progress — not implemented; the broadcast
+/// suffices.)
 ///
 /// pharos extension: `?force=true` re-probes every file, bypassing the
 /// incremental `(mtime, size)` skip. The recovery path for a probe-schema
