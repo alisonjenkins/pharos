@@ -954,6 +954,78 @@ async fn scan_stem_matched(
     }
 }
 
+/// Parse the subtitle language from a sidecar filename, e.g.
+/// `Movie.eng.forced.srt` → `eng`, `English.srt` → `English`, `Movie.srt` →
+/// None. Scans the dot-separated tokens before the extension right-to-left,
+/// skipping disposition tags (forced/sdh/…) to reach the language; a token
+/// that's neither a disposition nor a recognisable language ends the search
+/// (it's the title/stem).
+pub(crate) fn sidecar_language_from_name(name: &str) -> Option<String> {
+    const DISPOSITIONS: &[&str] = &[
+        "forced", "sdh", "hi", "cc", "default", "foreign", "full", "normal",
+    ];
+    let base = name.rsplit_once('.').map(|(b, _)| b)?; // drop extension
+    for tok in base.split('.').rev() {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if DISPOSITIONS.contains(&t.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        if is_language_token(t) {
+            return Some(t.to_string());
+        }
+        break; // title/stem token — no language present
+    }
+    None
+}
+
+/// Heuristic: is `t` a language identifier? A 2-3 letter ISO-639 code, a
+/// locale like `pt-BR`, or a spelled-out English language name.
+fn is_language_token(t: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "english",
+        "japanese",
+        "spanish",
+        "french",
+        "german",
+        "italian",
+        "chinese",
+        "korean",
+        "russian",
+        "portuguese",
+        "arabic",
+        "dutch",
+        "polish",
+        "swedish",
+        "danish",
+        "finnish",
+        "norwegian",
+        "hindi",
+        "turkish",
+        "greek",
+        "hebrew",
+        "thai",
+        "czech",
+        "hungarian",
+        "romanian",
+    ];
+    let lower = t.to_ascii_lowercase();
+    if NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    // Locale form: pt-BR, zh-CN.
+    if let Some((a, b)) = t.split_once('-') {
+        return (2..=3).contains(&a.len())
+            && a.chars().all(|c| c.is_ascii_alphabetic())
+            && !b.is_empty()
+            && b.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    // Bare ISO code: 2 or 3 letters.
+    (2..=3).contains(&t.len()) && t.chars().all(|c| c.is_ascii_alphabetic())
+}
+
 /// Push EVERY subtitle file in `dir` regardless of name — for a per-episode
 /// subtitle folder whose files are named by language (`English.srt`,
 /// `eng.ass`) rather than after the video.
@@ -1160,6 +1232,41 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn sidecar_language_parsed_from_filename() {
+        // The token before the extension is the language, unless it's a
+        // disposition tag (forced/sdh/…). Missing → None.
+        assert_eq!(
+            sidecar_language_from_name("Movie.eng.srt").as_deref(),
+            Some("eng")
+        );
+        assert_eq!(
+            sidecar_language_from_name("Movie.en.vtt").as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            sidecar_language_from_name("Show.S01E01.pt-BR.ass").as_deref(),
+            Some("pt-BR")
+        );
+        // Disposition tags are skipped to reach the language.
+        assert_eq!(
+            sidecar_language_from_name("Movie.eng.forced.srt").as_deref(),
+            Some("eng")
+        );
+        assert_eq!(
+            sidecar_language_from_name("Movie.en.sdh.srt").as_deref(),
+            Some("en")
+        );
+        // Language-named files in a per-episode subs folder.
+        assert_eq!(
+            sidecar_language_from_name("English.srt").as_deref(),
+            Some("English")
+        );
+        // No language token.
+        assert_eq!(sidecar_language_from_name("Movie.srt"), None);
+        assert_eq!(sidecar_language_from_name("Movie.forced.srt"), None);
+    }
 
     #[test]
     fn vtt_ts_parses_to_ticks() {

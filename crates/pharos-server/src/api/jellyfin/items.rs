@@ -1577,9 +1577,18 @@ async fn playback_info(
     }
 
     let sidecars = discover_sidecars(&item.path).await;
+    let sidecar_langs: Vec<Option<String>> = sidecars
+        .iter()
+        .map(|(p, _)| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::api::jellyfin::subtitles::sidecar_language_from_name)
+        })
+        .collect();
     let ctx = SubtitleStreamCtx {
         item_id: item.id,
         sidecar_count: sidecars.len() as u32,
+        sidecar_langs,
     };
     let streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
     // Find the audio stream's actual index (or skip if there isn't one).

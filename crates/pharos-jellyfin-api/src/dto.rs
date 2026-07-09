@@ -1164,6 +1164,10 @@ pub fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> String 
 pub struct SubtitleStreamCtx {
     pub item_id: pharos_core::MediaId,
     pub sidecar_count: u32,
+    /// Per-sidecar language (index = offset), parsed from the filename by the
+    /// caller. `None` where the filename carried no language token. Labels each
+    /// external track with its language instead of a bare "External N".
+    pub sidecar_langs: Vec<Option<String>>,
 }
 
 impl SubtitleStreamCtx {
@@ -1171,6 +1175,7 @@ impl SubtitleStreamCtx {
         Self {
             item_id,
             sidecar_count: 0,
+            sidecar_langs: Vec::new(),
         }
     }
 }
@@ -1368,6 +1373,16 @@ pub fn build_media_streams_with_subtitles(
             // Sidecars: stream_index = SIDECAR_BASE + offset.
             for offset in 0..ctx.sidecar_count {
                 let idx = SIDECAR_BASE_INDEX + offset;
+                let lang = ctx
+                    .sidecar_langs
+                    .get(offset as usize)
+                    .and_then(|l| l.clone());
+                // Label by language when the filename carried one; else the
+                // positional "External N" fallback.
+                let title = match lang.as_deref() {
+                    Some(l) => Some(language_display_name(l)),
+                    None => Some(format!("External {}", offset + 1)),
+                };
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
                     index: idx,
@@ -1381,8 +1396,8 @@ pub fn build_media_streams_with_subtitles(
                     aspect_ratio: None,
                     real_frame_rate: None,
                     average_frame_rate: None,
-                    language: None,
-                    title: Some(format!("External {}", offset + 1)),
+                    language: lang.clone(),
+                    title,
                     is_external: Some(true),
                     is_forced: Some(false),
                     is_hearing_impaired: Some(false),
