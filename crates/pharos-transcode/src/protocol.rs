@@ -161,6 +161,11 @@ pub enum TinyOp {
         stream_index: u32,
         out: PathBuf,
     },
+    /// Dump EVERY embedded attachment (font) to `out_dir/{stream_index}` in a
+    /// single source open → `Done` (`out_bytes` carries the count). ASS
+    /// subtitles reference many fonts; extracting them one-by-one re-opens the
+    /// (NFS, multi-GB) source per font and stalls SubtitlesOctopus.
+    ExtractAllAttachments { input: PathBuf, out_dir: PathBuf },
     /// Generate trickplay sprite sheets into `out_dir` (0-based `{i}.jpg`)
     /// → `Done` (`out_bytes` carries the sheet count).
     Trickplay {

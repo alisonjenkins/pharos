@@ -321,6 +321,16 @@ fn handle_tiny(
             },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::ExtractAllAttachments { input, out_dir } => {
+            match libav::attachment::extract_all_attachments(&input, &out_dir) {
+                // out_bytes carries the number of attachments written.
+                Ok(count) => WorkerEvent::Done {
+                    job_id,
+                    out_bytes: count as u64,
+                },
+                Err(e) => frame_err(job_id, e),
+            }
+        }
         TinyOp::Trickplay {
             input,
             interval_ms,

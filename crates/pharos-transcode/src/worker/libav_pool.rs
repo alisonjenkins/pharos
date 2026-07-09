@@ -155,6 +155,22 @@ impl LibavWorkerPool {
         expect_done(ev).map(|_| ())
     }
 
+    /// Dump every embedded attachment (font) to `out_dir/{stream_index}` in one
+    /// source open. Returns the number of attachments written.
+    pub async fn extract_all_attachments(
+        &self,
+        input: impl Into<PathBuf>,
+        out_dir: impl Into<PathBuf>,
+    ) -> Result<u64, PoolError> {
+        let ev = self
+            .run(TinyOp::ExtractAllAttachments {
+                input: input.into(),
+                out_dir: out_dir.into(),
+            })
+            .await?;
+        expect_done(ev)
+    }
+
     /// Extract a single scaled JPEG frame to `out`.
     pub async fn extract_image(
         &self,
