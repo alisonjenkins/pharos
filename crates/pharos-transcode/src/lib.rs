@@ -441,6 +441,14 @@ fn build_args_for_device(
             a.push("-an".into());
         }
     }
+    // Never mux a subtitle into the transcoded AV container. pharos delivers
+    // subtitles out-of-band (Stream.js / WebVTT / MediaAttachments), but
+    // ffmpeg's default stream selection otherwise grabs a source subtitle and
+    // writes it as a `mov_text` track — a spurious third track in every fMP4
+    // segment that bloats the stream and can confuse hls.js's timeline. Burn-in
+    // is unaffected: it reads the file directly via the `subtitles` filter, not
+    // a mapped output stream.
+    a.push("-sn".into());
     a.push("-f".into());
     a.push(opts.container.ffmpeg_muxer().into());
     // `-movflags` is an mp4/mov-muxer option — fragmented MP4 for progressive
@@ -511,6 +519,22 @@ mod tests {
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-f mp4"), "{joined}");
         assert!(joined.contains("pipe:1"));
+    }
+
+    #[test]
+    fn args_suppress_muxed_subtitles() {
+        // pharos delivers subtitles out-of-band (Stream.js / WebVTT /
+        // MediaAttachments), never muxed into the transcoded AV container.
+        // Without `-sn`, ffmpeg's default stream selection picks up a source
+        // subtitle and muxes it as a `mov_text` track — producing a 3-track
+        // fMP4 (video + audio + text) that bloats every VP9 segment and can
+        // confuse hls.js's timeline mapping. Proven against a live segment:
+        // the deployed VP9 stream carried a spurious `text` track.
+        let joined = build_args("/m/x.mkv", &opts()).join(" ");
+        assert!(
+            joined.contains(" -sn "),
+            "must suppress muxed subtitles: {joined}"
+        );
     }
 
     #[test]
