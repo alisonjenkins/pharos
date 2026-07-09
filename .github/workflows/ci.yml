@@ -72,13 +72,24 @@ jobs:
       - uses: alisonjenkins/setup-host-nix@v1
       - name: nix build .#pharos
         run: nix build .#pharos --print-out-paths
-      - name: nix build .#oci
-        run: nix build .#oci --print-out-paths
-      - name: Upload OCI image tarball
+      # Build BOTH OCI archives here — the single build-once step. This also
+      # validates the jellyfin-web image on PRs (it was previously only ever
+      # built at publish time, so a broken jfweb image slipped past PR CI).
+      # `cp -L` dereferences the store symlink to a fixed, predictable filename
+      # so the `publish` job can address the tarball without knowing the store
+      # hash. Both are docker-archive tarballs (skopeo reads them directly).
+      - name: Build OCI archives
+        run: |
+          mkdir -p oci-out
+          nix build .#oci           --out-link result-oci   --print-out-paths
+          nix build .#jellyfinWebOci --out-link result-jfweb --print-out-paths
+          cp -L result-oci   oci-out/pharos.tar
+          cp -L result-jfweb oci-out/pharos-jellyfin-web.tar
+      - name: Upload OCI image tarballs
         uses: actions/upload-artifact@v4
         with:
           name: pharos-oci-${{ github.sha }}
-          path: result
+          path: oci-out
           if-no-files-found: error
           retention-days: 7
 
@@ -87,9 +98,9 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [test, oci]
-    # Only on a push that landed on main — PRs build the image (oci job)
-    # but must not publish. Uses the built-in GITHUB_TOKEN (packages:
-    # write) as the GHCR credential; no external secret needed.
+    # Only on a push that landed on main — PRs build the images (oci job)
+    # but must not publish. Consumes the tarballs the `oci` job already built
+    # (build-once): no second `nix build`, just download + push.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
@@ -97,10 +108,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: alisonjenkins/setup-host-nix@v1
-      - name: Build OCI archives
+      - name: Download OCI archives from the oci job
+        uses: actions/download-artifact@v4
+        with:
+          name: pharos-oci-${{ github.sha }}
+          path: oci-out
+      - name: Stage archives at the paths the publish step expects
         run: |
-          nix build .#oci --out-link result-oci --print-out-paths
-          nix build .#jellyfinWebOci --out-link result-jfweb --print-out-paths
+          ln -sf oci-out/pharos.tar               result-oci
+          ln -sf oci-out/pharos-jellyfin-web.tar  result-jfweb
       - name: Push to GHCR (latest + immutable sha tag)
         env:
           # A PAT with write:packages, NOT the workflow GITHUB_TOKEN: these
