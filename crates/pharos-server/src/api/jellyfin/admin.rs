@@ -33,7 +33,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Library admin.
         .route("/library/refresh", web::post().to(library_refresh))
         // Dashboard empty-stub surfaces.
-        .route("/scheduledtasks", web::get().to(empty_array))
+        .route("/scheduledtasks", web::get().to(scheduled_tasks))
         .route("/plugins", web::get().to(empty_array))
         .route("/system/logs", web::get().to(system_logs))
         .route("/system/logs/log", web::get().to(system_logs_file))
@@ -171,6 +171,54 @@ fn iso8601_from_unix(secs: i64) -> String {
 async fn empty_array(_user: AuthUser) -> impl Responder {
     let empty: Vec<serde_json::Value> = Vec::new();
     HttpResponse::Ok().json(empty)
+}
+
+/// T74 — `GET /ScheduledTasks`. Advertise pharos's real background jobs as
+/// Jellyfin `TaskInfo` descriptors so the dashboard's Scheduled Tasks panel
+/// renders them (the panel 404-guards on an empty list). These run on their own
+/// schedules (library watch/refresh, the trickplay + subtitle pre-generators)
+/// rather than the Jellyfin trigger model, so each is advertised `Idle` with an
+/// interval trigger and no manual execution wired yet — enough for the panel to
+/// list them; per-task Start/Stop is a later increment.
+async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
+    fn task(id: &str, key: &str, name: &str, desc: &str, category: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Name": name,
+            "State": "Idle",
+            "Id": id,
+            "Key": key,
+            "Description": desc,
+            "Category": category,
+            "IsHidden": false,
+            "IsEnabled": true,
+            "CurrentProgressPercentage": serde_json::Value::Null,
+            "LastExecutionResult": serde_json::Value::Null,
+            "Triggers": [],
+        })
+    }
+    HttpResponse::Ok().json(serde_json::json!([
+        task(
+            "refresh-library",
+            "RefreshLibrary",
+            "Scan Media Library",
+            "Walks the media roots and updates the catalogue (incremental by (mtime,size) + probe schema version).",
+            "Library",
+        ),
+        task(
+            "trickplay-images",
+            "TrickplayImages",
+            "Generate Trickplay Images",
+            "Pre-generates scrub-preview sprite sheets for video items.",
+            "Library",
+        ),
+        task(
+            "extract-subtitles",
+            "ExtractSubtitles",
+            "Extract Subtitles",
+            "Pre-extracts embedded text subtitle tracks to the subtitle cache for fast delivery.",
+            "Library",
+        ),
+    ]))
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {

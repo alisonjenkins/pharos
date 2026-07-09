@@ -224,7 +224,6 @@ async fn activity_log_entries() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: /ScheduledTasks is empty — no built-in tasks / execution (T74)"]
 async fn scheduled_task_execution() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;

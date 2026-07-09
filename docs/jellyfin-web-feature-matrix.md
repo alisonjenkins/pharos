@@ -219,8 +219,8 @@ Each page reads `GET System/Configuration/{key}` and writes
 | Feature | jellyfin-web source | Server endpoint | status | Test |
 |---|---|---|---|---|
 | API keys | `keys/index.tsx` | `GET/POST/DELETE Auth/Keys` | DONE (T58) | `api_keys_endpoint_present` |
-| Scheduled tasks (list) | `tasks/index.tsx` | `GET ScheduledTasks` | THIN (empty) | — |
-| Scheduled tasks (run/triggers) | `tasks/task.tsx` | `POST ScheduledTasks/{id}/Triggers`, start/stop | MISSING | `scheduled_task_execution` *(T74, ignored)* |
+| Scheduled tasks (list) | `tasks/index.tsx` | `GET ScheduledTasks` | DONE | `scheduled_task_execution` |
+| Scheduled tasks (run/triggers) | `tasks/task.tsx` | `POST ScheduledTasks/{id}/Triggers`, start/stop | MISSING | — *(triggers/start-stop still absent, T74)* |
 | Plugins (list) | `plugins/index.tsx` | `GET Plugins` | THIN (empty) | — |
 | Plugin install / packages | `plugins/plugin.tsx` | `GET Packages`, `POST Packages/Installed/{name}` | MISSING | `plugins_install` *(T75, ignored)* |
 | Activity log | `activity/index.tsx` | `GET System/ActivityLog/Entries` | THIN (empty stub) | `activity_log_entries` *(T73, ignored)* |
