@@ -201,10 +201,10 @@ async fn library_refresh_non_admin_403() {
 }
 
 #[actix_web::test]
-async fn scheduled_tasks_and_plugins_return_empty_arrays() {
+async fn plugins_and_logs_return_empty_arrays() {
     let (state, token, _uid) = seed(true).await;
     let app = test::init_service(build_app(state)).await;
-    for path in ["/ScheduledTasks", "/Plugins", "/System/Logs"] {
+    for path in ["/Plugins", "/System/Logs"] {
         let req = test::TestRequest::get()
             .uri(path)
             .insert_header(("X-Emby-Token", token.as_str()))
@@ -212,6 +212,28 @@ async fn scheduled_tasks_and_plugins_return_empty_arrays() {
         let body = test::call_and_read_body(&app, req).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v.as_array().unwrap().is_empty(), "{path}");
+    }
+}
+
+#[actix_web::test]
+async fn scheduled_tasks_advertise_builtin_jobs() {
+    // T74 — /ScheduledTasks lists pharos's real background jobs as TaskInfo
+    // descriptors (the dashboard panel 404-guards on an empty list).
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/ScheduledTasks")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tasks = v.as_array().unwrap();
+    assert!(!tasks.is_empty(), "must advertise the built-in jobs");
+    for t in tasks {
+        for field in ["Name", "State", "Id", "Key", "Description", "Category"] {
+            assert!(t.get(field).is_some(), "TaskInfo missing {field}: {t}");
+        }
+        assert_eq!(t["State"], "Idle");
     }
 }
 
