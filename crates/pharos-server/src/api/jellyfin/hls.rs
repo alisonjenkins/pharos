@@ -961,6 +961,25 @@ fn build_segment_opts(
 ) -> TranscodeOptions {
     use crate::api::jellyfin::device_profile::Decision;
 
+    // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
+    // stream indices (jellyfin-web's convention), but the encoder selects by
+    // per-CODEC index (`-map 0:a:N`, subtitle-filter `si=N`). Convert via each
+    // track's position among its own codec's streams — identical to the VP9
+    // path (`vp9_segment_opts`). Passing the absolute index straight through
+    // (the previous behaviour) picked the wrong audio/subtitle whenever the
+    // wanted stream wasn't the first of its codec — e.g. a file with subtitle
+    // streams interleaved before the second audio track. `None` (unknown
+    // index) falls back to ffmpeg's default selection rather than mis-mapping.
+    let audio_stream_index = audio_stream_index.and_then(|abs| {
+        codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
+    });
+    let subtitle_stream_index = subtitle_stream_index.and_then(|abs| {
+        codec_relative_index(
+            item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
+            abs,
+        )
+    });
+
     if let Some(session) = session {
         match session.decision {
             Decision::Transcode {
@@ -1455,6 +1474,74 @@ mod stream_index_tests {
         // falls back to ffmpeg's default selection rather than mis-mapping.
         assert_eq!(codec_relative_index(audio_abs.iter().copied(), 3), None);
     }
+
+    use super::build_segment_opts;
+    use pharos_core::{AudioTrack, MediaItem, MediaProbe, SubtitleTrack};
+
+    fn item_with_tracks(video_codec: &str) -> MediaItem {
+        MediaItem {
+            id: 1,
+            probe: MediaProbe {
+                video_codec: Some(video_codec.into()),
+                // video@0, audio@1, audio@2 (absolute ffprobe indices).
+                audio_tracks: vec![
+                    AudioTrack {
+                        stream_index: 1,
+                        ..Default::default()
+                    },
+                    AudioTrack {
+                        stream_index: 2,
+                        ..Default::default()
+                    },
+                ],
+                // subtitle@3, subtitle@5.
+                subtitle_tracks: vec![
+                    SubtitleTrack {
+                        stream_index: 3,
+                        ..Default::default()
+                    },
+                    SubtitleTrack {
+                        stream_index: 5,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn segment_opts_map_absolute_audio_to_per_codec_index() {
+        // The .ts (H.264) segment path must convert the ABSOLUTE AudioStreamIndex
+        // jellyfin-web sends to the per-codec index ffmpeg's `-map 0:a:N` wants —
+        // exactly like the VP9 path. Passing the absolute index straight through
+        // selected the WRONG audio track (or none) whenever audio wasn't the
+        // first streams. Source is HEVC so it re-encodes to H.264 (burn-in
+        // allowed → the subtitle index is threaded too).
+        let item = item_with_tracks("hevc");
+        // abs audio 2 → relative 1; abs subtitle 5 → relative 1.
+        let opts = build_segment_opts(None, &item, 0, 60_000_000, Some(2), Some(5));
+        assert_eq!(
+            opts.audio_source_stream_index,
+            Some(1),
+            "absolute audio index 2 must map to per-codec 0:a:1"
+        );
+        assert_eq!(
+            opts.burn_subtitle_stream_index,
+            Some(1),
+            "absolute subtitle index 5 must map to per-codec si=1"
+        );
+    }
+
+    #[test]
+    fn segment_opts_unknown_audio_index_falls_back_to_default() {
+        // An absolute index not among the audio streams → None → ffmpeg default
+        // selection, never a mis-map.
+        let item = item_with_tracks("hevc");
+        let opts = build_segment_opts(None, &item, 0, 60_000_000, Some(9), None);
+        assert_eq!(opts.audio_source_stream_index, None);
+    }
 }
 
 #[cfg(test)]
@@ -1716,6 +1803,13 @@ mod tests {
                 height: Some(1080),
                 bitrate_bps: Some(4_000_000),
                 video_codec: codec.map(|s| s.to_string()),
+                // One subtitle stream at ABSOLUTE ffprobe index 2 → per-codec
+                // index si=0, so the burn-in tests exercise the absolute→
+                // relative mapping instead of an empty-list coincidence.
+                subtitle_tracks: vec![pharos_core::SubtitleTrack {
+                    stream_index: 2,
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             series: None,
@@ -1781,10 +1875,11 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn fallback_keeps_subtitle_burn_in_when_transcoding() {
-        // Re-encode path retains the requested burn-in index.
+        // Re-encode path retains the requested burn-in, MAPPED from the
+        // absolute ffprobe index (2) to the per-codec subtitle index (si=0).
         let item = item_with_video_codec(Some("vp9"));
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
-        assert_eq!(opts.burn_subtitle_stream_index, Some(2));
+        assert_eq!(opts.burn_subtitle_stream_index, Some(0));
     }
 
     #[::core::prelude::v1::test]
