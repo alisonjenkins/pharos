@@ -66,7 +66,46 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/videos/{id}/vp9/master.m3u8", web::get().to(vp9_master))
         .route("/videos/{id}/vp9/main.m3u8", web::get().to(vp9_variant))
         .route("/videos/{id}/vp9/init.mp4", web::get().to(vp9_init))
-        .route("/videos/{id}/vp9/{seg}.m4s", web::get().to(vp9_segment));
+        .route("/videos/{id}/vp9/{seg}.m4s", web::get().to(vp9_segment))
+        // `DELETE /Videos/ActiveEncodings` — jellyfin-web calls
+        // `apiClient.stopActiveEncodings(playSessionId)` as the FIRST step of a
+        // mid-playback audio/subtitle/quality switch (its `changeStream` tears
+        // down the old transcode before requesting a new PlaybackInfo). Vanilla
+        // Jellyfin answers 204; pharos returned 404 (route absent), and
+        // jellyfin-web's switch promise chain is UNGUARDED (no `.catch`), so the
+        // rejection killed the whole switch — the new PlaybackInfo never fired
+        // and the audio never changed (only a full stop+resume worked). This is
+        // exactly why switching worked on real Jellyfin but not pharos.
+        .route(
+            "/videos/activeencodings",
+            web::delete().to(stop_active_encodings),
+        );
+}
+
+/// `DELETE /Videos/ActiveEncodings?deviceId=…&PlaySessionId=…`. Stop the named
+/// play session's transcode so a client switching tracks can start a fresh
+/// one. pharos transcodes per-segment on demand (no long-lived encoder), so
+/// "stopping" just drops the session — subsequent segment requests under it
+/// 410 (see `check_session`) and the client is about to open a new session
+/// anyway. Always 204, matching Jellyfin (jellyfin-web ignores the body).
+async fn stop_active_encodings(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+) -> HttpResponse {
+    // PlaySessionId is a query param; match case-insensitively (clients send
+    // `PlaySessionId`, some `playSessionId`).
+    let psid = req.query_string().split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        k.eq_ignore_ascii_case("playsessionid")
+            .then(|| v.to_string())
+    });
+    if let Some(psid) = psid {
+        if let Err(e) = state.transcode_sessions.remove(&psid).await {
+            tracing::warn!(error = %e, psid, "stop_active_encodings: session remove failed");
+        }
+    }
+    HttpResponse::NoContent().finish()
 }
 
 async fn subtitle_playlist(
@@ -1592,6 +1631,34 @@ mod tests {
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
             .uri("/videos/7/master.m3u8")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn stop_active_encodings_returns_204() {
+        // jellyfin-web DELETEs /Videos/ActiveEncodings as the first step of a
+        // mid-playback track switch; a 404 here kills its unguarded switch
+        // promise chain (the audio never changes). Must answer 204 like Jellyfin.
+        let (state, token) = seed().await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::delete()
+            .uri(&format!(
+                "/videos/activeencodings?deviceId=d&PlaySessionId=nope&api_key={token}"
+            ))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        // 204 even for an unknown session (idempotent stop, Jellyfin-compatible).
+        assert_eq!(resp.status(), 204);
+    }
+
+    #[actix_web::test]
+    async fn stop_active_encodings_requires_auth() {
+        let (state, _t) = seed().await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::delete()
+            .uri("/videos/activeencodings?PlaySessionId=x")
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);
