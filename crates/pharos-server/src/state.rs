@@ -170,7 +170,17 @@ pub struct AppState {
     pub item_list_cache: Arc<
         tokio::sync::Mutex<Option<(u64, std::time::Instant, Arc<Vec<pharos_core::MediaItem>>)>>,
     >,
+    /// T73 — recent activity entries (logins, etc.) for the dashboard's
+    /// Activity panel, newest-first. In-memory ring buffer (session-scoped, not
+    /// persisted — the panel wants "recent activity", and a bounded buffer keeps
+    /// it cheap); capped at [`ACTIVITY_LOG_CAP`]. Entries are pre-shaped Jellyfin
+    /// `ActivityLogEntry` JSON. `next_activity_id` hands out monotonic ids.
+    pub activity_log: Arc<std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
+    pub next_activity_id: Arc<std::sync::atomic::AtomicI64>,
 }
+
+/// Max recent activity entries retained in memory (T73).
+pub const ACTIVITY_LOG_CAP: usize = 250;
 
 /// Unix time in whole seconds (0 if the clock is before the epoch).
 fn unix_now_secs() -> i64 {
@@ -203,6 +213,55 @@ impl AppState {
     pub fn note_playback_activity(&self) {
         self.playback_activity
             .store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// T73 — record a dashboard activity entry (newest-first, bounded). `kind`
+    /// is the Jellyfin activity type (e.g. `"SessionStarted"`); `overview` is an
+    /// optional one-line detail. Best-effort — a poisoned lock is ignored rather
+    /// than propagated into a request path.
+    pub fn record_activity(
+        &self,
+        name: &str,
+        kind: &str,
+        user_id: Option<&str>,
+        overview: Option<&str>,
+    ) {
+        let id = self
+            .next_activity_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let entry = serde_json::json!({
+            "Id": id,
+            "Name": name,
+            "Type": kind,
+            "Date": crate::api::jellyfin::dto::format_iso8601(unix_now_secs()),
+            "UserId": user_id,
+            "Severity": "Information",
+            "ShortOverview": overview,
+        });
+        if let Ok(mut log) = self.activity_log.lock() {
+            log.push_front(entry);
+            while log.len() > ACTIVITY_LOG_CAP {
+                log.pop_back();
+            }
+        }
+    }
+
+    /// T73 — a `(total, page)` snapshot of the activity log for
+    /// `/System/ActivityLog/Entries`, applying `start_index` + `limit` over the
+    /// newest-first buffer.
+    pub fn activity_entries(
+        &self,
+        start_index: usize,
+        limit: usize,
+    ) -> (usize, Vec<serde_json::Value>) {
+        match self.activity_log.lock() {
+            Ok(log) => {
+                let total = log.len();
+                let page = log.iter().skip(start_index).take(limit).cloned().collect();
+                (total, page)
+            }
+            Err(_) => (0, Vec::new()),
+        }
     }
 
     /// Seconds since the last live-segment request (saturating; large when
@@ -257,6 +316,8 @@ impl AppState {
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         }
     }
 
@@ -318,6 +379,8 @@ impl AppState {
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         })
     }
 

@@ -200,7 +200,6 @@ async fn named_configuration_livetv() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: activity log is an empty stub — real events not recorded (T73)"]
 async fn activity_log_entries() {
     let f = seed_rich().await;
     // A real login should leave an activity entry.

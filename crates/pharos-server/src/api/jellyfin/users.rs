@@ -255,6 +255,13 @@ async fn authenticate_by_name(
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
 
     let user_id_str = user.id.0.simple().to_string();
+    // T73 — record the login for the dashboard Activity panel.
+    state.record_activity(
+        &format!("{} logged in", user.name),
+        "SessionStarted",
+        Some(&user_id_str),
+        auth.client.as_deref(),
+    );
     let result = AuthenticationResultDto {
         session_info: SessionInfoDto {
             id: Uuid::new_v4().simple().to_string(),

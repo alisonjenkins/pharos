@@ -39,7 +39,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/system/logs/log", web::get().to(system_logs_file))
         .route(
             "/system/activitylog/entries",
-            web::get().to(empty_items_result),
+            web::get().to(activity_log_entries),
         )
         // POST writes to /System/Configuration are accepted + no-op'd;
         // pharos's runtime config is the toml file (re-read on restart).
@@ -221,12 +221,30 @@ async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
     ]))
 }
 
-async fn empty_items_result(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0,
-    }))
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ActivityLogQuery {
+    start_index: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// T73 — `GET /System/ActivityLog/Entries`. Serves the in-memory activity ring
+/// buffer (logins etc.) in Jellyfin's `ActivityLogEntryQueryResult` shape so the
+/// dashboard Activity panel renders real events instead of a permanent blank.
+async fn activity_log_entries(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<ActivityLogQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let start = q.start_index.unwrap_or(0);
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let (total, items) = state.activity_entries(start, limit);
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": start,
+    })))
 }
 
 async fn list_users(
