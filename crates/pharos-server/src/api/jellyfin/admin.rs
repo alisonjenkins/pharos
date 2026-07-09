@@ -377,57 +377,39 @@ async fn set_user_password(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (dashboard button
+/// + `refreshLibrary` flows). Spawns a background scan of every configured
+/// media root and returns `204` immediately; the `LibraryChanged` broadcast on
+/// completion lets connected clients invalidate caches. (Jellyfin's UI polls
+/// /ScheduledTasks for progress — not implemented; the broadcast suffices.)
+///
+/// pharos extension: `?force=true` re-probes every file, bypassing the
+/// incremental `(mtime, size)` skip. The recovery path for a probe-schema
+/// change (e.g. embedded-font `MediaAttachments`) whose new fields the
+/// incremental scan would never backfill onto byte-identical existing files.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct LibraryRefreshQuery {
+    force: bool,
+}
+
 async fn library_refresh(
     state: web::Data<AppState>,
     user: AuthUser,
+    q: web::Query<LibraryRefreshQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
-    // Spawn the scan on the runtime and return immediately — Jellyfin's
-    // admin UI expects 204 quickly, then polls /ScheduledTasks for
-    // progress (not implemented yet; the LibraryChanged broadcast on
-    // completion is enough for connected clients to invalidate caches).
     let state = state.into_inner();
-    actix_web::rt::spawn(async move {
-        let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
-            .with_rate_limit_ms(state.scan_rate_limit_ms);
-        // LIB-A4 — accumulate the per-root deltas so the post-scan broadcast
-        // can hand connected clients the exact ItemsAdded / ItemsRemoved ids.
-        let mut added: Vec<pharos_core::MediaId> = Vec::new();
-        let mut removed: Vec<pharos_core::MediaId> = Vec::new();
-        for root in &state.media_roots {
-            match scanner.scan_into(root, &state.stores).await {
-                Ok(outcome) => {
-                    tracing::info!(
-                        root = %root.display(),
-                        added = outcome.added.len(),
-                        updated = outcome.updated.len(),
-                        removed = outcome.removed.len(),
-                        skipped = outcome.skipped,
-                        "library refresh: root scanned"
-                    );
-                    added.extend(outcome.added.iter().copied());
-                    // An in-place update also invalidates client caches; relay
-                    // it as an add so jellyfin-web re-fetches the changed item.
-                    added.extend(outcome.updated.iter().copied());
-                    removed.extend(outcome.removed.iter().copied());
-                }
-                Err(e) => tracing::warn!(
-                    root = %root.display(),
-                    error = %e,
-                    "library refresh: scan failed"
-                ),
-            }
-        }
-        // LIB-C1 — re-stamp media_items.library_id by path-prefix so any
-        // newly-imported items resolve under their typed library. Idempotent.
-        if !added.is_empty() {
-            use pharos_core::LibraryStore;
-            if let Err(e) = state.stores.backfill_library_ids().await {
-                tracing::warn!(error = %e, "library refresh: library_id backfill failed");
-            }
-        }
-        state.notify_library_delta(&added, &removed);
-    });
+    let roots = state.media_roots.clone();
+    tracing::info!(
+        force = q.force,
+        roots = roots.len(),
+        "library refresh requested"
+    );
+    // Shares the scan spawn with the add-library wizard: cfg-gated prober
+    // (the distroless OCI image ships no `ffprobe`, so the libav prober is
+    // mandatory there) + the post-scan library-id backfill + delta broadcast.
+    crate::api::jellyfin::items::spawn_scan(state, roots, q.force);
     Ok(HttpResponse::NoContent().finish())
 }
 

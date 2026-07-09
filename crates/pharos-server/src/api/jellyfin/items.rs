@@ -3827,7 +3827,7 @@ async fn add_virtual_folder(
         .filter(|p| !state.media_roots.iter().any(|r| p.starts_with(r)))
         .collect();
     if !new_roots.is_empty() {
-        spawn_scan(state.clone().into_inner(), new_roots);
+        spawn_scan(state.clone().into_inner(), new_roots, false);
     }
 
     // Echo the created folder set back (jellyfin-web ignores the body but
@@ -3895,10 +3895,26 @@ async fn reload_libraries_and_backfill(state: &AppState) -> Result<(), actix_web
 /// Spawn a background incremental scan of `roots` on the actix runtime, mirroring
 /// `/Library/Refresh`. Returns immediately; the `LibraryChanged` broadcast on
 /// completion lets connected clients invalidate their caches.
-fn spawn_scan(state: std::sync::Arc<AppState>, roots: Vec<std::path::PathBuf>) {
+pub(crate) fn spawn_scan(
+    state: std::sync::Arc<AppState>,
+    roots: Vec<std::path::PathBuf>,
+    force: bool,
+) {
     actix_web::rt::spawn(async move {
+        // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build probes
+        // in-process via the resident libav worker (the distroless OCI image
+        // ships no `ffprobe` binary, so `FfmpegProber` would fail every probe);
+        // the spawn build keeps `FfmpegProber`. `force` bypasses the
+        // incremental `(mtime,size)` skip to re-probe every file.
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        let scanner =
+            pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+                .with_rate_limit_ms(state.scan_rate_limit_ms)
+                .with_force(force);
+        #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
         let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
-            .with_rate_limit_ms(state.scan_rate_limit_ms);
+            .with_rate_limit_ms(state.scan_rate_limit_ms)
+            .with_force(force);
         let mut added: Vec<pharos_core::MediaId> = Vec::new();
         let mut removed: Vec<pharos_core::MediaId> = Vec::new();
         for root in &roots {
