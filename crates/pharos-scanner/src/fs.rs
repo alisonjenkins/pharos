@@ -307,7 +307,11 @@ impl<P: Prober> FsScanner<P> {
                 // signature still matches; otherwise re-probe + put. `--force`
                 // (self.force) bypasses the skip so every file is re-probed.
                 if let Some((mtime, size)) = sig {
-                    if !self.force && state.file_mtime == mtime && state.file_size == size {
+                    if !self.force
+                        && state.file_mtime == mtime
+                        && state.file_size == size
+                        && state.probe_schema_version == pharos_core::PROBE_SCHEMA_VERSION
+                    {
                         store.mark_seen(id, scan_id, mtime, size).await?;
                         seen += 1;
                         outcome.skipped += 1;
@@ -1582,6 +1586,8 @@ mod tests {
                         file_mtime: mtime,
                         file_size: size,
                         last_seen_scan_id: scan_id,
+                        // Mirror the store: mark_seen stamps the current version.
+                        probe_schema_version: pharos_core::PROBE_SCHEMA_VERSION,
                     },
                 );
             Ok(())
@@ -2605,6 +2611,50 @@ mod tests {
             prober.calls.load(Ordering::SeqCst) - before,
             2,
             "both files re-probed under force"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_schema_version_forces_reprobe() {
+        // #10 — a file unchanged on disk but last probed under an OLDER
+        // `PROBE_SCHEMA_VERSION` (or a pre-migration row that defaulted to 0)
+        // must be re-probed so a new probe field backfills automatically —
+        // resumably, without `--force`.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "movie.mkv", b"aaaa").await;
+        let prober = FakeProber::default();
+        let store = MemStore::default();
+        let s = FsScanner::new(prober.clone());
+
+        // First scan probes + stamps the current version.
+        assert_eq!(s.scan_into(td.path(), &store).await.unwrap().probed(), 1);
+
+        // Force the stored version stale (simulate an old / pre-migration row).
+        let id = stable_id(&td.path().join("movie.mkv"));
+        store
+            .states
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .probe_schema_version = 0;
+
+        // Rescan, file unchanged: the stale version alone triggers a re-probe.
+        let before = prober.calls.load(Ordering::SeqCst);
+        let out = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(out.skipped, 0, "stale-version row must not be skipped");
+        assert_eq!(out.updated.len(), 1, "stale-version row is re-probed");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst) - before,
+            1,
+            "exactly one re-probe"
+        );
+
+        // Now current again → a subsequent unchanged scan skips.
+        assert_eq!(
+            s.scan_into(td.path(), &store).await.unwrap().skipped,
+            1,
+            "row at current version skips when unchanged"
         );
     }
 

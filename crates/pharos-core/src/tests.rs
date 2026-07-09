@@ -211,6 +211,7 @@ impl MediaStore for MemStore {
                     file_mtime: mtime,
                     file_size: size,
                     last_seen_scan_id: scan_id,
+                    probe_schema_version: crate::PROBE_SCHEMA_VERSION,
                 },
             );
         Ok(())

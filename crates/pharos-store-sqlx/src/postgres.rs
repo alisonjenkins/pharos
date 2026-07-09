@@ -732,8 +732,8 @@ impl MediaStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
         let id_i64 = media_id_i64(id)?;
-        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
-            "SELECT last_scanned, file_mtime, file_size_seen, last_seen_scan_id \
+        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
+            "SELECT last_scanned, file_mtime, file_size_seen, last_seen_scan_id, probe_schema_version \
              FROM media_items WHERE id = $1",
         )
         .bind(id_i64)
@@ -741,11 +741,12 @@ impl MediaStore for PostgresStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(row.map(
-            |(last_scanned, file_mtime, file_size, last_seen)| ScanState {
+            |(last_scanned, file_mtime, file_size, last_seen, schema_version)| ScanState {
                 last_scanned: last_scanned.unwrap_or(0),
                 file_mtime: file_mtime.unwrap_or(0),
                 file_size: file_size.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
                 last_seen_scan_id: last_seen.unwrap_or(0),
+                probe_schema_version: schema_version.unwrap_or(0),
             },
         ))
     }
@@ -777,14 +778,16 @@ impl MediaStore for PostgresStore {
         let size_i64 =
             i64::try_from(size).map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
         let now = now_unix_secs();
+        // Stamp the current probe schema version (see the sqlite mark_seen).
         sqlx::query(
             "UPDATE media_items SET file_mtime = $1, file_size_seen = $2, \
-             last_scanned = $3, last_seen_scan_id = $4 WHERE id = $5",
+             last_scanned = $3, last_seen_scan_id = $4, probe_schema_version = $5 WHERE id = $6",
         )
         .bind(mtime)
         .bind(size_i64)
         .bind(now)
         .bind(scan_id)
+        .bind(pharos_core::PROBE_SCHEMA_VERSION)
         .bind(id_i64)
         .execute(&self.pool)
         .await

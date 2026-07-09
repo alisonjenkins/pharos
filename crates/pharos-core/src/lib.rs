@@ -1340,7 +1340,25 @@ pub struct ScanState {
     pub file_size: u64,
     /// Id of the most recent `scan_runs` entry that saw this row.
     pub last_seen_scan_id: i64,
+    /// [`PROBE_SCHEMA_VERSION`] in force when this row was last probed. The
+    /// incremental scan re-probes a file whose `(mtime, size)` is unchanged but
+    /// whose stored version is older than current — so a probe-schema addition
+    /// (a new field like embedded-font attachments or subtitle tracks) is
+    /// backfilled automatically on the next scan, resumably, without a manual
+    /// `--force`. Legacy rows (pre-migration) read back as 0, which is older
+    /// than any real version, so they are re-probed exactly once.
+    pub probe_schema_version: i64,
 }
+
+/// Bump this whenever [`MediaProbe`]'s extracted content changes (a new stream
+/// field, a new attachment kind, a bug-fix that yields different output) so the
+/// incremental scan re-probes already-indexed files whose bytes are unchanged.
+/// See [`ScanState::probe_schema_version`].
+///
+/// History:
+///   1 — baseline: subtitle tracks, audio-track detail, embedded-font
+///       MediaAttachments, chapters (the set present as of 2026-07).
+pub const PROBE_SCHEMA_VERSION: i64 = 1;
 
 /// LIB-A4 — structured result of an incremental scan. Replaces the bare
 /// `usize` probed-count `scan_into` used to return so callers can broadcast
