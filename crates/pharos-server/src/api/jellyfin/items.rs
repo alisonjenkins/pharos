@@ -1387,6 +1387,14 @@ async fn playback_info(
     if let Some(tx) = &state.trickplay_priority {
         let _ = tx.send(id);
     }
+    // Warm THIS item's text subtitles NOW, ungated, so extraction starts the
+    // moment playback is negotiated — seconds before the client toggles subs.
+    // The gated library warm-all parks during active playback, so an
+    // un-warmed title's first Stream.vtt/js/ass would otherwise cold-demux the
+    // whole file (~seconds–30s) and the client gives up (the "swap away and
+    // back to make a sub work" symptom — the retry hits the now-warm cache).
+    // Idempotent: the persistent cache skips already-warm tracks instantly.
+    crate::library_watch::spawn_warm_item_subtitles(state.clone(), id);
     // P4 — defensive resume offset. Clients that drive playback
     // purely from PlaybackInfo (Finamp, Jellyfin-Android-TV) never
     // see UserData.PlaybackPositionTicks via /Items/{id}; emit it

@@ -326,6 +326,20 @@ pub fn spawn_subtitle_warm_all(state: web::Data<AppState>) {
     });
 }
 
+/// Warm ONE item's text subtitles immediately and UNGATED — called from
+/// PlaybackInfo. The item is being watched right now, so its subs must warm
+/// before the client toggles them; unlike the bulk warm-all this does not park
+/// on the playback gate (it's a single item, and it's the very file already
+/// being segmented, so its pages are hot). Idempotent via the persistent cache.
+pub fn spawn_warm_item_subtitles(state: web::Data<AppState>, id: u64) {
+    if state.subtitles.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        warm_item_subtitles(&state, vec![id], None, "playback priority").await;
+    });
+}
+
 /// Warm the given items' text subtitles into the cache, at most
 /// [`SUBTITLE_WARM_CONCURRENCY`] whole-file demuxes at once. When `gate` is
 /// `Some`, each task parks until live playback has been quiet, so a bulk
