@@ -556,6 +556,7 @@ async fn list_genres(
 async fn list_artists(
     state: web::Data<AppState>,
     _user: AuthUser,
+    q: web::Query<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::artist_id_for;
     use std::collections::HashSet;
@@ -563,12 +564,23 @@ async fn list_artists(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // A-Z letter picker filters by artist name.
+    let name_prefix = q
+        .name_starts_with
+        .as_deref()
+        .or(q.name_starts_with_or_greater.as_deref())
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty());
     let mut seen: HashSet<String> = HashSet::new();
     let mut names: Vec<String> = Vec::new();
     for i in all.iter() {
         for src in [i.probe.album_artist.as_deref(), i.probe.artist.as_deref()] {
             if let Some(n) = src.filter(|s| !s.is_empty()) {
-                if seen.insert(n.to_string()) {
+                if name_prefix
+                    .as_deref()
+                    .map_or(true, |pre| name_matches_letter(n, pre))
+                    && seen.insert(n.to_string())
+                {
                     names.push(n.to_string());
                 }
             }
@@ -605,6 +617,7 @@ async fn list_artists(
 async fn list_albums(
     state: web::Data<AppState>,
     _user: AuthUser,
+    q: web::Query<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     use std::collections::HashMap;
@@ -612,6 +625,13 @@ async fn list_albums(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // A-Z letter picker filters by album name.
+    let name_prefix = q
+        .name_starts_with
+        .as_deref()
+        .or(q.name_starts_with_or_greater.as_deref())
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty());
     // Map album_name → (album_artist, sample track id) so a click
     // into the album renders with the right artist on the tile.
     let mut albums: HashMap<String, Option<String>> = HashMap::new();
@@ -620,6 +640,12 @@ async fn list_albums(
             continue;
         };
         if name.is_empty() {
+            continue;
+        }
+        if name_prefix
+            .as_deref()
+            .is_some_and(|pre| !name_matches_letter(name, pre))
+        {
             continue;
         }
         let entry = albums.entry(name.to_string()).or_insert(None);
@@ -3336,6 +3362,22 @@ fn virtual_show_kind(include_item_types: Option<&str>) -> Option<ShowFolderKind>
 /// Collapse the scoped episodes into synthetic Series (or Season) folder tiles.
 /// Returns `None` when the request is not an exclusively-virtual show browse,
 /// so the caller falls through to the normal media query.
+/// Does `name` fall in the letter-picker bucket `prefix_lower` (already
+/// lower-cased)? Letters match a case-insensitive prefix; the "#" bucket
+/// (jellyfin's non-alphabetic chip) matches names whose first character isn't
+/// an ASCII letter (digits, symbols, CJK, …).
+fn name_matches_letter(name: &str, prefix_lower: &str) -> bool {
+    let name_lower = name.trim_start().to_lowercase();
+    if prefix_lower == "#" {
+        !name_lower
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+    } else {
+        name_lower.starts_with(prefix_lower)
+    }
+}
+
 async fn maybe_list_virtual_shows(
     state: &AppState,
     user_id: UserId,
@@ -3365,6 +3407,19 @@ async fn maybe_list_virtual_shows(
     mq.limit = None;
     mq.start_index = 0;
     mq.sort = Vec::new();
+    // The A-Z letter picker filters by NAME. These synthetic tiles are Series
+    // (or Seasons), so the name is the *series name* — but the media query
+    // filters `media_items.title` (the episode title). Applied there it would
+    // pick series that merely *have* an episode titled "A…", not series *named*
+    // "A…". Strip it from the episode query and re-apply it to the collapsed
+    // series names below.
+    let name_prefix = q
+        .name_starts_with
+        .as_deref()
+        .or(q.name_starts_with_or_greater.as_deref())
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty());
+    mq.filters.name_starts_with = None;
     let (episodes, _total) = state
         .stores
         .query(&mq)
@@ -3384,6 +3439,13 @@ async fn maybe_list_virtual_shows(
                 let Some(series) = ep.series.as_ref() else {
                     continue;
                 };
+                // A-Z letter picker: keep only series whose NAME matches the
+                // clicked letter (the whole point of the jump nav).
+                if let Some(pre) = name_prefix.as_deref() {
+                    if !name_matches_letter(&series.series_name, pre) {
+                        continue;
+                    }
+                }
                 // Sort key: lowercase name for a stable case-insensitive order,
                 // with the folder-keyed id appended so same-name shows in
                 // distinct folders stay separate tiles.
@@ -3854,4 +3916,26 @@ fn spawn_scan(state: std::sync::Arc<AppState>, roots: Vec<std::path::PathBuf>) {
         }
         state.notify_library_delta(&added, &removed);
     });
+}
+
+#[cfg(test)]
+mod alpha_picker_tests {
+    use super::name_matches_letter;
+
+    #[test]
+    fn letter_prefix_is_case_insensitive_and_trims() {
+        assert!(name_matches_letter("Angel", "a"));
+        assert!(name_matches_letter("angel", "a"));
+        assert!(name_matches_letter("  Angel", "a")); // leading space trimmed
+        assert!(!name_matches_letter("Breaking Bad", "a"));
+        assert!(name_matches_letter("An Idiot Abroad", "an"));
+    }
+
+    #[test]
+    fn hash_bucket_matches_non_letters() {
+        assert!(name_matches_letter("24", "#"));
+        assert!(name_matches_letter("3%", "#"));
+        assert!(name_matches_letter("[REC]", "#"));
+        assert!(!name_matches_letter("Angel", "#"));
+    }
 }
