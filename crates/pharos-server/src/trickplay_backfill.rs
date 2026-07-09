@@ -62,6 +62,19 @@ async fn await_playback_quiet(playback: &AtomicI64) {
     }
 }
 
+/// The playback-yield gate, with a `bypass` escape hatch. Bulk pre-generation
+/// parks on [`await_playback_quiet`] so a whole-file decode never makes an
+/// active stream buffer. But the *actively-watched* item (the priority-tier
+/// seed) is exactly what the viewer is about to scrub — it must be generated
+/// immediately, even mid-playback, or its previews never appear during the
+/// session that wants them. `bypass = true` skips the gate for that case.
+async fn await_gate(bypass: bool, playback: &AtomicI64) {
+    if bypass {
+        return;
+    }
+    await_playback_quiet(playback).await;
+}
+
 /// Handle for nudging the pre-generator to prioritise an item (and its series).
 pub type PriorityTx = mpsc::UnboundedSender<u64>;
 
@@ -131,7 +144,7 @@ async fn run(
             for id in pending.drain(..) {
                 generate_priority(id, &items, &cache, subs, &playback, &widths, interval_ms).await;
             }
-            generate_item(item, &cache, subs, &playback, &widths, interval_ms).await;
+            generate_item(item, &cache, subs, &playback, &widths, interval_ms, false).await;
         }
 
         // 3. Sweep done — sleep until the next pass, but wake immediately if a
@@ -170,19 +183,22 @@ async fn generate_priority(
     let Some(seed) = items.iter().find(|i| i.id == id) else {
         return;
     };
-    match seed.series.as_ref() {
-        Some(s) => {
-            let sid = series_id_for_key(s.series_folder.as_deref(), &s.series_name);
-            for item in items.iter().filter(|i| {
-                is_video(i)
-                    && i.series.as_ref().is_some_and(|si| {
-                        series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
-                    })
-            }) {
-                generate_item(item, cache, subs, playback, widths, interval_ms).await;
-            }
+    // The seed is what the viewer is scrubbing right now: generate it first,
+    // bypassing the playback-quiet gate so its previews appear mid-session.
+    generate_item(seed, cache, subs, playback, widths, interval_ms, true).await;
+    // Series siblings are "next up" — worth pre-warming, but they stay gated
+    // so their bulk decode still yields to the active stream.
+    if let Some(s) = seed.series.as_ref() {
+        let sid = series_id_for_key(s.series_folder.as_deref(), &s.series_name);
+        for item in items.iter().filter(|i| {
+            i.id != seed.id
+                && is_video(i)
+                && i.series.as_ref().is_some_and(|si| {
+                    series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
+                })
+        }) {
+            generate_item(item, cache, subs, playback, widths, interval_ms, false).await;
         }
-        None => generate_item(seed, cache, subs, playback, widths, interval_ms).await,
     }
 }
 
@@ -195,6 +211,7 @@ async fn generate_item(
     playback: &AtomicI64,
     widths: &[u32],
     interval_ms: u32,
+    bypass_gate: bool,
 ) {
     if !is_video(item) {
         return;
@@ -208,7 +225,9 @@ async fn generate_item(
         };
         // Yield to live playback: park here (not mid-decode) until streaming
         // has been quiet, so this whole-file decode never makes a viewer buffer.
-        await_playback_quiet(playback).await;
+        // The actively-watched seed (`bypass_gate`) skips the wait so its
+        // previews appear during the session that wants them.
+        await_gate(bypass_gate, playback).await;
         match cache.ensure_generated(item.id, layout, &item.path).await {
             Ok(true) => {
                 tracing::debug!(media.id = item.id, width, "trickplay pre-generated");
@@ -225,9 +244,33 @@ async fn generate_item(
     // whole-file demux (esp. multi-GB lossless-audio anime).
     if let Some(sc) = subs {
         if !item.probe.subtitle_tracks.is_empty() {
-            await_playback_quiet(playback).await;
+            await_gate(bypass_gate, playback).await;
             crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
             tokio::time::sleep(COOLDOWN).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The priority-tier seed (`bypass = true`) must generate immediately even
+    /// while playback is active — otherwise the previews for the very item
+    /// being watched never appear during that session.
+    #[tokio::test]
+    async fn gate_bypass_returns_immediately_during_active_playback() {
+        let active = AtomicI64::new(unix_now_secs()); // "playback just happened"
+        let r = tokio::time::timeout(Duration::from_millis(100), await_gate(true, &active)).await;
+        assert!(r.is_ok(), "bypass must not park on the playback-quiet gate");
+    }
+
+    /// Non-bypass (bulk) generation still parks while playback is active, so a
+    /// whole-file decode never steals cycles from a live stream.
+    #[tokio::test]
+    async fn gate_without_bypass_parks_during_active_playback() {
+        let active = AtomicI64::new(unix_now_secs());
+        let r = tokio::time::timeout(Duration::from_millis(100), await_gate(false, &active)).await;
+        assert!(r.is_err(), "bulk generation must yield to active playback");
     }
 }
