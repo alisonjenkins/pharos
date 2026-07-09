@@ -8,14 +8,17 @@
 //! ```
 //!
 //! Verifies:
-//! 1. First GET on a tile spawns ffmpeg, returns a valid JPEG.
-//! 2. Second GET on the same tile hits cache (no spawn — proven by
-//!    pointing the cache at a missing ffmpeg binary after the first
-//!    fetch warmed the disk).
+//! 1. `generates_valid_sprite_grid_from_inline_clip` — generate a sprite sheet
+//!    (self-contained inline clip, ffmpeg-gated only) then serve a valid JPEG
+//!    grid through the real tile route. The route is cache-only (generation is
+//!    a background job, never on the request path), so the test pre-generates
+//!    via `ensure_generated`, then asserts the served tile.
+//! 2. `item_dto_trickplay_is_nested_by_media_source_id` — the full serialized
+//!    BaseItemDto carries the NESTED `Trickplay[mediaSourceId][width]` shape
+//!    jellyfin-web needs (regression guard for the invisible-previews bug).
 //! 3. Unknown width 404s.
 //! 4. Tile index past the layout's tile_count 404s.
-//! 5. BaseItemDto.Trickplay carries the layout map advertising the
-//!    configured widths.
+//! 5. `dto_layout_map_advertises_configured_widths` — the inner width→info map.
 
 use actix_web::{test, web, App};
 use pharos_cache::TrickplayCache;
@@ -97,55 +100,6 @@ async fn seed(cache_dir: &std::path::Path) -> (web::Data<AppState>, String) {
 
 #[actix_web::test]
 #[ignore = "requires ffmpeg + PHAROS_TEST_FIXTURES"]
-async fn first_fetch_generates_then_second_fetch_hits_cache() {
-    if !ffmpeg_available() {
-        eprintln!("skipping: ffmpeg/fixture missing");
-        return;
-    }
-    let td = TempDir::new().unwrap();
-    let (state, token) = seed(td.path()).await;
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(trickplay::register),
-    )
-    .await;
-
-    // 1. Miss → ffmpeg runs → JPEG returned with SOI marker.
-    let req = test::TestRequest::get()
-        .uri(&format!("/videos/7/trickplay/320/0.jpg?api_key={token}"))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 200, "first fetch failed");
-    let body = test::read_body(resp).await;
-    assert!(body.len() > 256, "tile too small: {} bytes", body.len());
-    assert_eq!(&body[..2], &[0xFF, 0xD8], "expected JPEG SOI");
-
-    // 2. Replace the cache with one whose ffmpeg path is missing —
-    // ensures the second call cannot transcode. The on-disk warm
-    // segment must still serve it.
-    let warm_state = web::Data::new(
-        AppState::new(state.stores.clone(), "t".into())
-            .with_trickplay_cache(
-                TrickplayCache::new(td.path(), 32 * 1024 * 1024).with_ffmpeg("/no/such/ffmpeg"),
-            )
-            .with_trickplay_layout(vec![320], 1_000),
-    );
-    let app2 = test::init_service(
-        App::new()
-            .app_data(warm_state)
-            .configure(trickplay::register),
-    )
-    .await;
-    let req2 = test::TestRequest::get()
-        .uri(&format!("/videos/7/trickplay/320/0.jpg?api_key={token}"))
-        .to_request();
-    let resp2 = test::call_service(&app2, req2).await;
-    assert_eq!(resp2.status(), 200, "warm fetch failed");
-}
-
-#[actix_web::test]
-#[ignore = "requires ffmpeg + PHAROS_TEST_FIXTURES"]
 async fn unknown_width_404s() {
     if !ffmpeg_available() {
         return;
@@ -176,6 +130,155 @@ async fn out_of_range_tile_index_404s() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 404);
+}
+
+/// Generate a self-contained ~5 s clip so the generation path is exercised in
+/// CI without an external `PHAROS_TEST_FIXTURES` video.
+fn make_clip(dir: &std::path::Path) -> PathBuf {
+    let out = dir.join("clip.webm");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=320x240:rate=10",
+            "-c:v",
+            "libvpx-vp9",
+            "-b:v",
+            "200k",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+        ])
+        .arg(&out)
+        .arg("-y")
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "clip generation failed");
+    out
+}
+
+fn ffmpeg_only() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[actix_web::test]
+#[ignore = "requires ffmpeg (libvpx-vp9) on PATH"]
+async fn generates_valid_sprite_grid_from_inline_clip() {
+    // The full path the user cares about: a scrub request generates a sprite
+    // sheet and serves a valid JPEG grid. Self-contained (inline clip), so it
+    // runs in CI wherever ffmpeg is present — no external fixture needed.
+    if !ffmpeg_only() {
+        eprintln!("skipping: ffmpeg missing");
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let clip = make_clip(td.path());
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap().0.expose().to_string();
+    stores
+        .put(MediaItem {
+            id: 7,
+            path: clip.clone(),
+            title: "fx".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(5_000),
+                width: Some(320),
+                height: Some(240),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let cache = TrickplayCache::new(td.path().join("cache"), 32 * 1024 * 1024);
+    // The tile route serves cache-only (generation is a background job, never
+    // on the request path — see trickplay.rs). So exercise the real generation
+    // API first, then assert the route serves the produced grid.
+    let probe = MediaStore::get(&stores, 7).await.unwrap().probe;
+    let layout = pharos_jellyfin_api::dto::build_layout(&probe, 320, 1_000).unwrap();
+    cache
+        .ensure_generated(7, layout, &clip)
+        .await
+        .expect("trickplay generation failed");
+    let state = web::Data::new(
+        AppState::new(stores, "t".into())
+            .with_trickplay_cache(cache)
+            .with_trickplay_layout(vec![320], 1_000),
+    );
+    let app = test::init_service(App::new().app_data(state).configure(trickplay::register)).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/videos/7/trickplay/320/0.jpg?api_key={token}"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "tile serve after generation failed");
+    let body = test::read_body(resp).await;
+    assert_eq!(&body[..2], &[0xFF, 0xD8], "expected JPEG SOI");
+    assert!(
+        body.len() > 1024,
+        "sprite grid too small: {} bytes",
+        body.len()
+    );
+}
+
+#[actix_web::test]
+async fn item_dto_trickplay_is_nested_by_media_source_id() {
+    // Regression guard for the wire-shape bug that made previews invisible in
+    // jellyfin-web: the client reads `item.Trickplay[mediaSourceId][width]`.
+    // The pre-fix flat `{ width -> info }` map left that lookup undefined so the
+    // client never requested a tile. Assert the FULL serialized BaseItemDto —
+    // not just the inner builder — carries the nested shape.
+    use pharos_core::{MediaItem, MediaKind};
+    use pharos_jellyfin_api::dto::BaseItemDto;
+    let item = MediaItem {
+        id: 7,
+        path: "/m/x.mkv".into(),
+        title: "x".into(),
+        kind: MediaKind::Movie,
+        probe: MediaProbe {
+            duration_ms: Some(180_000),
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let dto =
+        BaseItemDto::from_domain(&item, "srv").with_trickplay(&item.probe, &[320, 640], 10_000);
+    let v = serde_json::to_value(&dto).unwrap();
+    assert_eq!(v["Trickplay"]["7"]["320"]["Width"].as_u64().unwrap(), 320);
+    assert_eq!(v["Trickplay"]["7"]["640"]["Width"].as_u64().unwrap(), 640);
+    assert!(
+        v["Trickplay"].get("320").is_none(),
+        "flat wire shape regressed (width at top level): {}",
+        v["Trickplay"]
+    );
 }
 
 #[actix_web::test]
