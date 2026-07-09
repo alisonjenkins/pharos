@@ -86,6 +86,14 @@ pub struct ServerConfig {
     /// for the largest realistic library; pairs with byte cap.
     #[serde(default = "default_subtitle_cache_entries")]
     pub subtitle_cache_max_entries: usize,
+    /// Directory to PERSIST extracted subtitles under (the cache PVC). A
+    /// subtitle extraction demuxes the whole source (~tens of seconds over
+    /// NFS), so persisting it makes that a once-ever cost instead of
+    /// re-incurring on every pod restart. When unset, pharos derives a
+    /// `subtitles` sibling of `transcode_cache_dir` / `image_cache_dir` if
+    /// either is set; otherwise the cache stays memory-only.
+    #[serde(default)]
+    pub subtitle_cache_dir: Option<PathBuf>,
     /// Live-TV M3U playlist path (T47). When set, /LiveTv/Channels
     /// + /LiveTv/Programs serve channels + EPG from this backend.
     #[serde(default)]

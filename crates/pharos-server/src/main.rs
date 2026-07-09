@@ -521,10 +521,25 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // P5 — subtitle cache, always on. Pure in-process; the only
     // tunables are bytes + entry cap. Disabled by setting both to 0.
     if cfg.server.subtitle_cache_max_bytes > 0 && cfg.server.subtitle_cache_max_entries > 0 {
-        state = state.with_subtitle_cache(SubtitleCache::new(
+        let mut sub_cache = SubtitleCache::new(
             cfg.server.subtitle_cache_max_bytes,
             cfg.server.subtitle_cache_max_entries,
-        ));
+        );
+        // Persist under the cache PVC so a subtitle's whole-file demux is a
+        // once-ever cost, not re-paid on every restart. Use the explicit dir if
+        // set, else a `subtitles` sibling of an existing cache dir.
+        let sub_dir = cfg.server.subtitle_cache_dir.clone().or_else(|| {
+            cfg.server
+                .transcode_cache_dir
+                .as_ref()
+                .or(cfg.server.image_cache_dir.as_ref())
+                .and_then(|d| d.parent().map(|p| p.join("subtitles")))
+        });
+        if let Some(dir) = sub_dir {
+            tracing::info!(dir = %dir.display(), "subtitle cache persisting to disk");
+            sub_cache = sub_cache.with_disk(dir);
+        }
+        state = state.with_subtitle_cache(sub_cache);
     }
     if !cfg.server.trickplay_widths.is_empty() {
         if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
