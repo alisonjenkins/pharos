@@ -386,6 +386,24 @@ pub struct MediaStreamDto {
     /// deliver the track and nothing renders.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_method: Option<&'static str>,
+    /// Subtitle-only. `true` for text subs (subrip/ass/vtt/…), `false` for image
+    /// subs (PGS/VOBSUB). jellyfin-web's player checks this to pick its render
+    /// path (native `<track>` / SubtitlesOctopus / custom cue renderer). WITHOUT
+    /// it the client treats a text sub as non-text and never renders the cues —
+    /// the track appears in the picker but nothing shows on screen.
+    #[serde(
+        rename = "IsTextSubtitleStream",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub is_text_subtitle_stream: Option<bool>,
+    /// Subtitle-only. `true` when the client can fetch the track out-of-band via
+    /// `DeliveryUrl` (all text subs here). jellyfin-web gates the "download /
+    /// external" render path on it; absent, it falls back to burn-in-only.
+    #[serde(
+        rename = "SupportsExternalStream",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supports_external_stream: Option<bool>,
     /// P37 — Audio-only. `{ "TrackGain": …, "AlbumGain": … }` in dB.
     /// Finamp reads this and applies loudness normalisation; absent
     /// keys leave the player at unity gain.
@@ -1285,6 +1303,8 @@ pub fn build_media_streams_with_subtitles(
             is_hearing_impaired: None,
             delivery_url: None,
             delivery_method: None,
+            is_text_subtitle_stream: None,
+            supports_external_stream: None,
             replay_gain: None,
             display_title: None,
         });
@@ -1316,6 +1336,8 @@ pub fn build_media_streams_with_subtitles(
                     is_hearing_impaired: None,
                     delivery_url: None,
                     delivery_method: None,
+                    is_text_subtitle_stream: None,
+                    supports_external_stream: None,
                     replay_gain: build_replay_gain(t),
                     display_title: None,
                 });
@@ -1345,6 +1367,8 @@ pub fn build_media_streams_with_subtitles(
                 is_hearing_impaired: None,
                 delivery_url: None,
                 delivery_method: None,
+                is_text_subtitle_stream: None,
+                supports_external_stream: None,
                 replay_gain: None,
                 display_title: None,
             });
@@ -1418,6 +1442,8 @@ pub fn build_media_streams_with_subtitles(
                         )
                     }),
                     delivery_method: Some(if is_text { "External" } else { "Encode" }),
+                    is_text_subtitle_stream: Some(is_text),
+                    supports_external_stream: Some(is_text),
                     replay_gain: None,
                     display_title: None,
                 });
@@ -1457,8 +1483,10 @@ pub fn build_media_streams_with_subtitles(
                         "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
                         id = ctx.item_id,
                     )),
-                    // Sidecars are already WebVTT — always External.
+                    // Sidecars are already WebVTT — always External text.
                     delivery_method: Some("External"),
+                    is_text_subtitle_stream: Some(true),
+                    supports_external_stream: Some(true),
                     replay_gain: None,
                     display_title: None,
                 });
@@ -1485,6 +1513,8 @@ pub fn build_media_streams_with_subtitles(
             is_hearing_impaired: None,
             delivery_url: None,
             delivery_method: None,
+            is_text_subtitle_stream: None,
+            supports_external_stream: None,
             replay_gain: None,
             display_title: None,
         });
@@ -1652,6 +1682,12 @@ mod tests {
             text.delivery_url.as_deref(),
             Some("/Videos/42/42/Subtitles/2/Stream.vtt")
         );
+        // jellyfin-web's subtitle engine gates on these two flags: it only
+        // fetches an external track (Stream.js / Stream.vtt) when
+        // IsTextSubtitleStream && SupportsExternalStream. Omitting them (the
+        // pre-fix wire shape) made the client skip text subs entirely.
+        assert_eq!(text.is_text_subtitle_stream, Some(true));
+        assert_eq!(text.supports_external_stream, Some(true));
         // PGS → Encode (burn), no URL.
         let image = streams.iter().find(|s| s.index == 3).unwrap();
         assert_eq!(image.delivery_method, Some("Encode"));
@@ -1659,6 +1695,9 @@ mod tests {
             image.delivery_url.is_none(),
             "image subs burn in, no .vtt URL"
         );
+        // Image subs are neither text nor externally deliverable.
+        assert_eq!(image.is_text_subtitle_stream, Some(false));
+        assert_eq!(image.supports_external_stream, Some(false));
         // ASS → External but RAW .ass URL (SubtitlesOctopus, not a VTT track).
         let ass = streams.iter().find(|s| s.index == 4).unwrap();
         assert_eq!(ass.delivery_method, Some("External"));
@@ -1666,6 +1705,8 @@ mod tests {
             ass.delivery_url.as_deref(),
             Some("/Videos/42/42/Subtitles/4/Stream.ass")
         );
+        assert_eq!(ass.is_text_subtitle_stream, Some(true));
+        assert_eq!(ass.supports_external_stream, Some(true));
     }
 
     #[test]
