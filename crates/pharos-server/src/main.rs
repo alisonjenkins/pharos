@@ -116,10 +116,12 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let scanner = FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
+        .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_force(force);
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner = FsScanner::new(FfmpegProber::new())
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
+        .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_force(force);
 
     let stdout = std::io::stdout();
@@ -564,6 +566,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_log_dir(cfg.obs.log_dir.clone());
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+    state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
     let app_state = web::Data::new(state);
 
     // LIB-A9 — tiered library change-detection. Each media root picks the best
@@ -580,6 +583,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             rate_limit_ms: cfg.server.scan_rate_limit_ms,
         };
         let rate_limit_ms = cfg.server.scan_rate_limit_ms;
+        let probe_concurrency = cfg.server.scan_probe_concurrency;
         // P48 — same prober selection as the CLI scan + admin refresh paths.
         // The closure builds a fresh owned scanner per root (each spawned task
         // owns its own — the prober isn't required to be Clone).
@@ -588,11 +592,13 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             {
                 pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
                     .with_rate_limit_ms(rate_limit_ms)
+                    .with_probe_concurrency_opt(probe_concurrency)
             }
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
             {
                 pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
                     .with_rate_limit_ms(rate_limit_ms)
+                    .with_probe_concurrency_opt(probe_concurrency)
             }
         };
         spawn_for_roots(app_state.clone(), &scan_roots, watch_cfg, make_scanner)

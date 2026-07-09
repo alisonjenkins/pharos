@@ -49,6 +49,11 @@ config:
     ssdpAdvertiseUrl: null
     playedThresholdPct: 90
     scanRateLimitMs: 0
+    # #11 — concurrent per-file probes during a scan. 0 = the scanner's
+    # conservative default (leaves shared-storage I/O headroom so a scan doesn't
+    # starve foreground reads: subtitle extraction, HLS segments, trickplay
+    # generation). Raise to 8 on local-SSD storage; lower on a slow NFS/SMB link.
+    scanProbeConcurrency: 0
     libraryWatchEnabled: true
     libraryPollIntervalSecs: 300
   obs:

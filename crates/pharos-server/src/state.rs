@@ -128,6 +128,9 @@ pub struct AppState {
     /// here so the admin spawn reads the configured value without
     /// re-parsing the toml config.
     pub scan_rate_limit_ms: u64,
+    /// #11 — probe fan-out cap for background `/Library/Refresh` scans. 0 keeps
+    /// the scanner's conservative default (leaves shared-storage I/O headroom).
+    pub scan_probe_concurrency: usize,
     /// P48 — ffmpeg operations backend. `Arc<dyn FfmpegBackend>` so
     /// the spawn / lib-FFI swap happens at construction time without
     /// rippling generic parameters through every handler signature.
@@ -247,6 +250,7 @@ impl AppState {
             bus,
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
+            scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
@@ -307,6 +311,7 @@ impl AppState {
             bus,
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
+            scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
@@ -330,6 +335,13 @@ impl AppState {
     /// can't make a refresh run effectively forever.
     pub fn with_scan_rate_limit_ms(mut self, ms: u64) -> Self {
         self.scan_rate_limit_ms = ms.min(5_000);
+        self
+    }
+
+    /// #11 builder — probe fan-out cap for background refresh spawns. 0 keeps
+    /// the scanner default; capped at the scanner's ceiling.
+    pub fn with_scan_probe_concurrency(mut self, degree: usize) -> Self {
+        self.scan_probe_concurrency = degree.min(8);
         self
     }
 

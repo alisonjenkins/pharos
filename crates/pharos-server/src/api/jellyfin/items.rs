@@ -3910,10 +3910,12 @@ pub(crate) fn spawn_scan(
         let scanner =
             pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
+                .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_force(force);
         #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
         let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
             .with_rate_limit_ms(state.scan_rate_limit_ms)
+            .with_probe_concurrency_opt(state.scan_probe_concurrency)
             .with_force(force);
         let mut added: Vec<pharos_core::MediaId> = Vec::new();
         let mut removed: Vec<pharos_core::MediaId> = Vec::new();

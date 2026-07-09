@@ -122,6 +122,13 @@ pub struct ServerConfig {
     /// catalog walk.
     #[serde(default)]
     pub scan_rate_limit_ms: u64,
+    /// #11 — cap on concurrent per-file probes during a scan. `0` (default)
+    /// auto-sizes conservatively (leaves shared-storage I/O headroom so a scan
+    /// doesn't starve foreground reads — subtitle extraction, HLS segments,
+    /// trickplay generation). Raise it (e.g. 8) on local-SSD deployments that
+    /// want faster catalog walks; lower it further on a slow NFS/SMB link.
+    #[serde(default)]
+    pub scan_probe_concurrency: usize,
     /// LIB-A9 — enable native filesystem watching (inotify / kqueue /
     /// ReadDirectoryChangesW) for media roots that support it, so the
     /// library index stays live between full scans without polling.

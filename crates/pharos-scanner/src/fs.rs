@@ -44,21 +44,30 @@ pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// LIB-A5 — hard ceiling on the parallel-probe fan-out. The default
-/// degree is `available_parallelism()` clamped to this; a single library
-/// scan shouldn't spawn dozens of concurrent ffprobe forks / libav jobs
-/// and starve the rest of the server (and disk seek thrash hurts past a
-/// point anyway). Callers can still override via [`FsScanner::with_probe_concurrency`].
+/// LIB-A5 — hard ceiling on the parallel-probe fan-out a caller may request
+/// via [`FsScanner::with_probe_concurrency`]. Above this, disk seek thrash and
+/// (on shared storage) link saturation cost more than they buy.
 const MAX_PROBE_CONCURRENCY: usize = 8;
 
-/// LIB-A5 — default probe fan-out: available CPU parallelism, clamped to
-/// `[1, MAX_PROBE_CONCURRENCY]`. Falls back to 1 if the platform can't
+/// LIB-A5 / #11 — DEFAULT probe fan-out. Deliberately below the CPU count: the
+/// practical bottleneck for a library scan is usually shared-storage I/O
+/// (NFS/SMB), not CPU, so a high fan-out saturates the link and starves
+/// foreground reads — subtitle extraction, HLS segments, trickplay generation —
+/// even on a many-core box (observed live: 8 concurrent remux probes over NFS
+/// pushed a 15 s subtitle extract past the 60 s request timeout). Cap the
+/// default low to leave I/O headroom; local-storage deployments that want full
+/// speed set `[server].scan_probe_concurrency` (or call
+/// `with_probe_concurrency`) explicitly.
+const DEFAULT_PROBE_CONCURRENCY: usize = 4;
+
+/// Default probe fan-out: available CPU parallelism, clamped to
+/// `[1, DEFAULT_PROBE_CONCURRENCY]`. Falls back to 1 if the platform can't
 /// report parallelism.
 fn default_probe_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, MAX_PROBE_CONCURRENCY)
+        .clamp(1, DEFAULT_PROBE_CONCURRENCY)
 }
 
 /// LIB-A8 — outcome of a single-path incremental update (one watch event).
@@ -183,6 +192,17 @@ impl<P: Prober> FsScanner<P> {
     pub fn with_rate_limit_ms(mut self, ms: u64) -> Self {
         self.rate_limit = std::time::Duration::from_millis(ms);
         self
+    }
+
+    /// #11 — apply a config-supplied probe fan-out. `0` keeps the conservative
+    /// [`default_probe_concurrency`] (leaves shared-storage I/O headroom);
+    /// non-zero overrides it, clamped to `[1, MAX_PROBE_CONCURRENCY]`.
+    pub fn with_probe_concurrency_opt(self, degree: usize) -> Self {
+        if degree == 0 {
+            self
+        } else {
+            self.with_probe_concurrency(degree)
+        }
     }
 
     /// LIB-A5 — override the bounded probe fan-out. `0` is coerced to `1`
