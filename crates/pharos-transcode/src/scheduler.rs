@@ -487,6 +487,13 @@ fn retry_or_fail(
 /// Try to dispatch `ctx` to its best eligible device; queue if all
 /// permits are busy; fail if no device can ever take it.
 fn place(state: &mut SchedState, job_id: JobId, ctx: JobCtx, self_tx: &mpsc::Sender<SchedMsg>) {
+    // Caller gone (client seeked/disconnected → dropped the `submit().await`
+    // and its oneshot receiver): don't spend a worker on a segment nobody is
+    // waiting for. This is the post-seek contention fix — a dead prefetch job
+    // must not sit ahead of the seek-target segment in a device queue.
+    if ctx.reply.is_closed() {
+        return;
+    }
     let now = Instant::now();
     let full_eligible = state.devices.eligible_for(&ctx.opts, now);
     if full_eligible.is_empty() {
@@ -572,6 +579,11 @@ fn try_place_no_queue(
     self_tx: &mpsc::Sender<SchedMsg>,
     requeue: &mut VecDeque<(JobId, JobCtx)>,
 ) {
+    // Drop a queued job whose caller has gone (see `place`): on a freed permit
+    // we dispatch the seek-target instead of resurrecting dead prefetch work.
+    if ctx.reply.is_closed() {
+        return;
+    }
     let now = Instant::now();
     let full_eligible = state.devices.eligible_for(&ctx.opts, now);
     let candidates: SmallVec<[DeviceId; 5]> = full_eligible
@@ -1029,6 +1041,77 @@ mod tests {
             .await
             .expect("scheduler deadlocked under saturation");
         assert_eq!(ok, 200);
+    }
+
+    #[tokio::test]
+    async fn abandoned_queued_jobs_are_skipped_not_dispatched() {
+        // Post-seek contention: hls.js aborts the in-flight prefetch fetches
+        // for the OLD position when the user seeks; actix drops those handler
+        // futures, dropping each `submit().await` and its oneshot receiver.
+        // A queued job whose caller has gone must NOT burn a worker slot when
+        // permits free — otherwise the seek-target segment waits behind dead
+        // work and the user stares at a spinner. Proven by counting real
+        // worker runs: only the blockers + the live queued job execute; the
+        // abandoned jobs are dropped from the pending queue.
+        let runs = Arc::new(AtomicU64::new(0));
+        let r2 = runs.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(150), move |_, _| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+
+        // 5 blockers occupy every permit (2 nvenc + 1 vaapi + 2 cpu).
+        let mut blockers = Vec::new();
+        for _ in 0..5 {
+            let s2 = s.clone();
+            blockers.push(tokio::spawn(async move {
+                s2.submit(PathBuf::from("/m/block"), h264(), file_sink())
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // 10 "old position" jobs queue behind the blockers, then their
+        // callers vanish (seek) — abort the tasks so the futures (and their
+        // oneshot receivers) drop.
+        let mut abandoned = Vec::new();
+        for _ in 0..10 {
+            let s2 = s.clone();
+            abandoned.push(tokio::spawn(async move {
+                s2.submit(PathBuf::from("/m/old"), h264(), file_sink())
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        for h in &abandoned {
+            h.abort();
+        }
+        // One legitimate seek-target job that stays queued behind the same
+        // blockers — it MUST still complete (we skip only abandoned work).
+        let s3 = s.clone();
+        let seek_target = tokio::spawn(async move {
+            s3.submit(PathBuf::from("/m/seek"), h264(), file_sink())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        for h in blockers {
+            h.await.unwrap().unwrap();
+        }
+        let seek = tokio::time::timeout(Duration::from_secs(2), seek_target)
+            .await
+            .expect("seek-target hung behind abandoned work")
+            .unwrap();
+        assert!(seek.is_ok(), "seek-target segment must complete: {seek:?}");
+        // Let any (erroneously) dispatched abandoned jobs finish so the count
+        // is stable, then assert none ran.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            6,
+            "only 5 blockers + 1 seek-target may run; abandoned queued jobs must be skipped"
+        );
     }
 
     #[tokio::test]
