@@ -161,6 +161,12 @@ compat-playwright-full:
     url = "sqlite://$TMP/pharos.db?mode=rwc"
     EOF
     PHAROS_CONFIG="$TMP/pharos.toml"
+    # The default (ffmpeg-lib) build probes via a separate `transcode-worker`
+    # binary that pharos spawns as a sibling of its own executable. `cargo run
+    # --bin pharos` builds ONLY pharos, so without this the worker is missing
+    # ("spawn worker: No such file or directory"), every fixture fails to probe,
+    # the library comes up empty and the crawl 404s. Build the sibling first.
+    nix develop --command cargo build -q --bin transcode-worker
     nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
     nix develop --command bash -c "cargo run -q --bin pharos -- --config '$PHAROS_CONFIG' serve" &
     SERVER_PID=$!
