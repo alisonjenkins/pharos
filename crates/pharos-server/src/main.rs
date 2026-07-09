@@ -413,23 +413,36 @@ async fn build_transcode_scheduler(
 
     let devices = enumerate(detected);
     let caps: Vec<(DeviceId, usize)> = if probe_caps && !devices.is_empty() {
-        // Learn real session caps; fall back to the configured cap for
-        // any device the probe couldn't measure.
+        // Learn real session caps via a trial encode per device. A device the
+        // probe COULDN'T encode on (cap 0 → omitted from `probed.caps`) is a
+        // PHANTOM: ffmpeg lists h264_nvenc/vaapi as compiled-in even with no
+        // usable GPU (no libcuda / no VA render node), and routing real jobs to
+        // it just fails + retries on CPU — wasted work + latency. So EXCLUDE
+        // unconfirmed devices rather than falling back to a guessed cap. No
+        // working GPU ⇒ CPU-only; add a GPU later ⇒ the trial passes and it's
+        // picked up automatically.
         let probed = probe_device_caps(&devices, &ProbeConfig::default()).await;
         let caps: Vec<(DeviceId, usize)> = devices
             .iter()
-            .map(|d| {
-                let c = probed
+            .filter_map(|d| {
+                probed
                     .caps
                     .iter()
                     .find(|(pd, _)| pd == d)
-                    .map(|(_, c)| *c)
-                    .unwrap_or_else(|| hw_session_cap.max(1));
-                (*d, c)
+                    .map(|(_, c)| (*d, *c))
             })
             .collect();
-        for (d, c) in &caps {
-            tracing::info!(device = %d, sessions = c, "probed device session cap");
+        for d in &devices {
+            if caps.iter().any(|(cd, _)| cd == d) {
+                let c = caps
+                    .iter()
+                    .find(|(cd, _)| cd == d)
+                    .map(|(_, c)| *c)
+                    .unwrap_or(0);
+                tracing::info!(device = %d, sessions = c, "hardware encoder confirmed by trial encode");
+            } else {
+                tracing::warn!(device = %d, "hardware encoder detected but trial encode FAILED (no usable GPU?) — excluded; transcodes stay on CPU");
+            }
         }
         caps
     } else {
