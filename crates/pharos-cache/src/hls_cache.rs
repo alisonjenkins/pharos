@@ -257,18 +257,30 @@ impl HlsSegmentCache {
         // client will stall. Logged per miss so Loki/Tempo show exactly which
         // segments are slow and why (codec + subtitle burn are the usual cost).
         let started = std::time::Instant::now();
-        if let Err(e) = self.write_segment(source, opts, &tmp).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
-        }
+        let timing = match self.write_segment(source, opts, &tmp).await {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(e);
+            }
+        };
         tokio::fs::rename(&tmp, &path).await?;
 
         let bytes = tokio::fs::read(&path).await?;
         let transcode_ms = started.elapsed().as_millis();
+        // Split total transcode_ms into scheduler queue-wait vs actual encode
+        // (from the scheduler's JobDone), plus the winning device + retry count,
+        // so a slow segment is diagnosable: high queue_wait_ms = saturated
+        // devices / failed-device retry churn (e.g. phantom GPUs), high
+        // encode_ms = a genuinely slow encoder. Fields land on the HTTP request
+        // span this runs under.
         tracing::info!(
             media.id = media_id,
             seg = seg_index,
             transcode_ms = transcode_ms as u64,
+            queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
+            encode_ms = timing.as_ref().map(|t| t.encode_ms),
+            device = timing.as_ref().map(|t| t.device.to_string()),
             bytes = bytes.len(),
             codec = codec_tag(opts.video),
             burn = opts.burn_subtitle_stream_index.is_some(),
@@ -317,18 +329,21 @@ impl HlsSegmentCache {
         self.root.join(media_id.to_string()).join(filename)
     }
 
+    /// Transcode one segment to `out`. Returns the scheduler's timing split
+    /// (queue-wait vs encode + device) when the scheduler path ran, so the
+    /// caller can attribute a slow segment; `None` on the inline fallback.
     async fn write_segment(
         &self,
         source: &Path,
         opts: &TranscodeOptions,
         out: &Path,
-    ) -> Result<(), HlsCacheError> {
+    ) -> Result<Option<pharos_transcode::scheduler::JobDone>, HlsCacheError> {
         let _ = source.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
         // Scheduler path: the worker writes the segment file itself,
         // load-balanced across GPUs + CPU. We just await completion.
         if let Some(sched) = &self.scheduler {
             use pharos_transcode::scheduler::SinkRequest;
-            sched
+            let done = sched
                 .submit(
                     source.to_path_buf(),
                     opts.clone(),
@@ -338,7 +353,7 @@ impl HlsSegmentCache {
                 )
                 .await
                 .map_err(|e| HlsCacheError::Transcode(e.to_string()))?;
-            return Ok(());
+            return Ok(Some(done));
         }
         // Legacy inline path: one ffmpeg, stream to file.
         let mut stream = self
@@ -356,7 +371,7 @@ impl HlsSegmentCache {
             tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
-        Ok(())
+        Ok(None)
     }
 
     async fn touch(&self, key: CacheKey) {

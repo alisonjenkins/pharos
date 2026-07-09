@@ -107,6 +107,11 @@ pub enum SinkRequest {
 pub struct JobDone {
     pub device: DeviceId,
     pub out_bytes: u64,
+    /// Time the job spent queued before its (final) dispatch — includes any
+    /// failed-device retry churn. High = saturated devices / retries.
+    pub queue_wait_ms: u64,
+    /// Time the winning device took to actually encode. High = slow encoder.
+    pub encode_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +217,15 @@ struct JobCtx {
     excluded: SmallVec<[DeviceId; 4]>,
     retries: u8,
     last_error: Option<WorkerError>,
+    /// When the job entered the scheduler (first `Submit`). Used to split
+    /// end-to-end latency into queue-wait vs actual encode: the segment-path
+    /// `transcode_ms` conflates the two, hiding whether a slow segment is a
+    /// saturated device (long queue) or a slow encoder.
+    enqueued: Instant,
+    /// When the job most recently grabbed a device permit + started running.
+    /// `None` while queued. Re-stamped on each (re)dispatch so a retry's wait
+    /// is counted in the queue, not the encode.
+    dispatched: Option<Instant>,
 }
 
 struct SchedState {
@@ -337,6 +351,8 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 excluded: SmallVec::new(),
                 retries: 0,
                 last_error: None,
+                enqueued: Instant::now(),
+                dispatched: None,
             };
             place(state, job_id, ctx, self_tx);
         }
@@ -408,7 +424,36 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             };
             match result {
                 WorkerRunResult::Done { out_bytes } => {
-                    let _ = ctx.reply.send(Ok(JobDone { device, out_bytes }));
+                    // Split end-to-end latency: queue-wait (Submit → first
+                    // dispatch, includes any failed-device retries) vs encode
+                    // (last dispatch → now). A slow segment with high
+                    // queue_wait_ms = saturated devices / retry churn; high
+                    // encode_ms = a genuinely slow encoder. `retries` > 0 flags
+                    // a job that bounced off a device (e.g. a phantom GPU).
+                    let now = Instant::now();
+                    let queue_ms = ctx
+                        .dispatched
+                        .map(|d| d.saturating_duration_since(ctx.enqueued).as_millis() as u64)
+                        .unwrap_or(0);
+                    let encode_ms = ctx
+                        .dispatched
+                        .map(|d| now.saturating_duration_since(d).as_millis() as u64)
+                        .unwrap_or(0);
+                    tracing::info!(
+                        %job_id,
+                        %device,
+                        out_bytes,
+                        queue_wait_ms = queue_ms,
+                        encode_ms,
+                        retries = ctx.retries,
+                        "transcode job done"
+                    );
+                    let _ = ctx.reply.send(Ok(JobDone {
+                        device,
+                        out_bytes,
+                        queue_wait_ms: queue_ms,
+                        encode_ms,
+                    }));
                 }
                 WorkerRunResult::Failed(err) if !err.is_transient() => {
                     tracing::warn!(%job_id, %device, error = %err, "transcode job failed (non-recoverable)");
@@ -486,7 +531,7 @@ fn retry_or_fail(
 
 /// Try to dispatch `ctx` to its best eligible device; queue if all
 /// permits are busy; fail if no device can ever take it.
-fn place(state: &mut SchedState, job_id: JobId, ctx: JobCtx, self_tx: &mpsc::Sender<SchedMsg>) {
+fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc::Sender<SchedMsg>) {
     // Caller gone (client seeked/disconnected → dropped the `submit().await`
     // and its oneshot receiver): don't spend a worker on a segment nobody is
     // waiting for. This is the post-seek contention fix — a dead prefetch job
@@ -533,6 +578,7 @@ fn place(state: &mut SchedState, job_id: JobId, ctx: JobCtx, self_tx: &mpsc::Sen
                 device: dev,
                 sink: to_output_sink(&ctx.sink),
             };
+            ctx.dispatched = Some(Instant::now());
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
                 state.spawner.clone(),
@@ -575,7 +621,7 @@ fn drain_pending(state: &mut SchedState, self_tx: &mpsc::Sender<SchedMsg>) {
 fn try_place_no_queue(
     state: &mut SchedState,
     job_id: JobId,
-    ctx: JobCtx,
+    mut ctx: JobCtx,
     self_tx: &mpsc::Sender<SchedMsg>,
     requeue: &mut VecDeque<(JobId, JobCtx)>,
 ) {
@@ -614,6 +660,7 @@ fn try_place_no_queue(
                 device: dev,
                 sink: to_output_sink(&ctx.sink),
             };
+            ctx.dispatched = Some(Instant::now());
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
                 state.spawner.clone(),
