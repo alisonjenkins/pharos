@@ -95,6 +95,12 @@ pub struct FsScanner<P: Prober> {
     /// to the local provider set (NFO ▸ sidecar ▸ filename); swappable via
     /// [`with_resolver`](Self::with_resolver) for tests.
     resolver: Arc<MetadataResolver>,
+    /// When set, the incremental `(mtime, size)` skip is bypassed and every
+    /// file is re-probed regardless of its stored signature. The recovery
+    /// path for a probe-schema change (e.g. newly extracted MediaAttachments)
+    /// that leaves on-disk files byte-identical, so the incremental scan would
+    /// never otherwise re-read them. Off by default (`pharos scan --force`).
+    force: bool,
 }
 
 impl<P: Prober> std::fmt::Debug for FsScanner<P> {
@@ -131,6 +137,7 @@ impl<P: Prober> FsScanner<P> {
             rate_limit: std::time::Duration::ZERO,
             probe_concurrency: default_probe_concurrency(),
             resolver: Arc::new(default_resolver()),
+            force: false,
         }
     }
 
@@ -141,7 +148,17 @@ impl<P: Prober> FsScanner<P> {
             rate_limit: std::time::Duration::ZERO,
             probe_concurrency: default_probe_concurrency(),
             resolver: Arc::new(default_resolver()),
+            force: false,
         }
+    }
+
+    /// Force a full re-probe: bypass the incremental `(mtime, size)` skip so
+    /// every file is re-read even when unchanged on disk. Used by
+    /// `pharos scan --force` to backfill fields added by a probe-schema change
+    /// (e.g. embedded-font MediaAttachments) onto already-indexed items.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
     }
 
     /// LIB-D7 — override the metadata resolver. Production callers use the
@@ -267,9 +284,10 @@ impl<P: Prober> FsScanner<P> {
             if let Some(state) = existing_state {
                 // Existing-by-path: the row is keyed on this exact path
                 // (its id is stable_id(path)). Skip the probe iff the
-                // signature still matches; otherwise re-probe + put.
+                // signature still matches; otherwise re-probe + put. `--force`
+                // (self.force) bypasses the skip so every file is re-probed.
                 if let Some((mtime, size)) = sig {
-                    if state.file_mtime == mtime && state.file_size == size {
+                    if !self.force && state.file_mtime == mtime && state.file_size == size {
                         store.mark_seen(id, scan_id, mtime, size).await?;
                         seen += 1;
                         outcome.skipped += 1;
@@ -551,7 +569,7 @@ impl<P: Prober> FsScanner<P> {
         let existing_state = store.scan_state(id).await?;
         if let Some(state) = existing_state {
             if let Some((mtime, size)) = sig {
-                if state.file_mtime == mtime && state.file_size == size {
+                if !self.force && state.file_mtime == mtime && state.file_size == size {
                     store.mark_seen(id, scan_id, mtime, size).await?;
                     return Ok(PathUpdate::Skipped);
                 }
@@ -2533,6 +2551,41 @@ mod tests {
         );
         // Rows are still present (skipped != deleted).
         assert_eq!(store.list().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn force_scan_reprobes_unchanged_files() {
+        // A forced rescan re-probes every file even when its (mtime,size)
+        // signature is unchanged — the recovery path for a probe-schema change
+        // (e.g. newly extracted MediaAttachments) that the incremental skip
+        // would otherwise never pick up.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "movie.mkv", b"aaaa").await;
+        write_file(td.path(), "song.flac", b"bbbbbb").await;
+
+        let prober = FakeProber::default();
+        let store = MemStore::default();
+
+        let first = FsScanner::new(prober.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(first.probed(), 2, "first scan probes both");
+
+        let before = prober.calls.load(Ordering::SeqCst);
+        // An incremental rescan would skip both; --force re-probes both.
+        let out = FsScanner::new(prober.clone())
+            .with_force(true)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(out.skipped, 0, "force scan skips nothing");
+        assert_eq!(out.updated.len(), 2, "force re-probes both as updates");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst) - before,
+            2,
+            "both files re-probed under force"
+        );
     }
 
     #[tokio::test]

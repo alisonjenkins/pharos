@@ -17,7 +17,15 @@ pub enum Cmd {
     /// Start HTTP server.
     Serve,
     /// One-shot library scan.
-    Scan,
+    Scan {
+        /// Re-probe every file even when unchanged on disk. Use after a
+        /// probe-schema change (e.g. embedded-font MediaAttachments) to
+        /// backfill the new fields onto already-indexed items — the
+        /// incremental scan skips unchanged files by `(mtime, size)` and
+        /// would never otherwise re-read them.
+        #[arg(long)]
+        force: bool,
+    },
     /// Admin operations.
     Admin {
         #[command(subcommand)]

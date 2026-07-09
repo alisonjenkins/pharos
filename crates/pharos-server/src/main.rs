@@ -68,7 +68,7 @@ async fn main() -> Result<(), AppError> {
 
     match cli.cmd {
         Cmd::Serve => serve(cfg).await?,
-        Cmd::Scan => scan(&cfg).await?,
+        Cmd::Scan { force } => scan(&cfg, force).await?,
         Cmd::Admin { op } => match op {
             AdminOp::PrintConfig => {
                 let stdout = std::io::stdout();
@@ -92,7 +92,7 @@ async fn main() -> Result<(), AppError> {
     Ok(())
 }
 
-async fn scan(cfg: &Config) -> Result<(), AppError> {
+async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     use pharos_scanner::FfmpegProber;
     use pharos_scanner::FsScanner;
@@ -115,10 +115,12 @@ async fn scan(cfg: &Config) -> Result<(), AppError> {
     // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let scanner = FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
-        .with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+        .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
+        .with_force(force);
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
-    let scanner =
-        FsScanner::new(FfmpegProber::new()).with_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+    let scanner = FsScanner::new(FfmpegProber::new())
+        .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
+        .with_force(force);
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
