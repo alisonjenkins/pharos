@@ -285,7 +285,18 @@ impl<P: Prober> FsScanner<P> {
             existed: bool,
         }
         let mut pending: Vec<Pending> = Vec::new();
+        // Buffer the skip-path `mark_seen` stamps (the bulk of scan writes — one
+        // per unchanged file) and flush them in transactions, so N unchanged
+        // files cost a handful of WAL commits instead of N autocommit fsyncs
+        // (the occasional ~1s `UPDATE media_items` stalls seen under scan load).
+        // Chunked so the write lock is never held for a whole huge library.
+        const SEEN_FLUSH: usize = 512;
+        let mut seen_batch: Vec<(pharos_core::MediaId, i64, u64)> = Vec::new();
         for (primary, alts) in groups {
+            if seen_batch.len() >= SEEN_FLUSH {
+                store.mark_seen_batch(&seen_batch, scan_id).await?;
+                seen_batch.clear();
+            }
             // Cheap fs stat up front: lets us skip the expensive probe when
             // the file is byte-for-byte unchanged since the last scan. A
             // stat failure (file vanished mid-scan, permission flip) just
@@ -312,7 +323,7 @@ impl<P: Prober> FsScanner<P> {
                         && state.file_size == size
                         && state.probe_schema_version == pharos_core::PROBE_SCHEMA_VERSION
                     {
-                        store.mark_seen(id, scan_id, mtime, size).await?;
+                        seen_batch.push((id, mtime, size));
                         seen += 1;
                         outcome.skipped += 1;
                         continue;
@@ -360,7 +371,7 @@ impl<P: Prober> FsScanner<P> {
                 // this is the steady state reached after a move.
                 Some(c) if c.path == primary => {
                     if let Some((mtime, size)) = sig {
-                        store.mark_seen(c.id, scan_id, mtime, size).await?;
+                        seen_batch.push((c.id, mtime, size));
                     }
                     if let Some(fp) = fp {
                         store.set_fingerprint(c.id, fp).await?;
@@ -377,7 +388,7 @@ impl<P: Prober> FsScanner<P> {
                 Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
                     store.rebind_path(c.id, &primary).await?;
                     if let Some((mtime, size)) = sig {
-                        store.mark_seen(c.id, scan_id, mtime, size).await?;
+                        seen_batch.push((c.id, mtime, size));
                     }
                     if let Some(fp) = fp {
                         store.set_fingerprint(c.id, fp).await?;
@@ -400,6 +411,11 @@ impl<P: Prober> FsScanner<P> {
                 }
             }
         }
+        // Flush the remaining skip-path stamps before the probe stream + sweep
+        // (sweep deletes rows not stamped with this scan_id, so every seen file
+        // must be committed first).
+        store.mark_seen_batch(&seen_batch, scan_id).await?;
+        seen_batch.clear();
 
         // Phase 2 + 3 — bounded-concurrency probe stream feeding a sequential
         // write consumer. `buffer_unordered` keeps at most `probe_concurrency`

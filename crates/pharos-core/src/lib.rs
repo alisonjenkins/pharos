@@ -1847,6 +1847,26 @@ pub trait MediaStore: Send + Sync {
         size: u64,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
+    /// Stamp many rows' scan signatures in ONE transaction. During a scan the
+    /// bulk of writes are `mark_seen`s for unchanged files; committing each
+    /// autonomously fsyncs the WAL per row and pressures checkpointing, which
+    /// showed up as occasional ~1s `UPDATE media_items` stalls under scan load.
+    /// Batching amortizes the commit cost. `items` = `(id, mtime, size)`. The
+    /// default loops per-item (correct, unbatched) so non-sqlite stores keep
+    /// working; the sqlite store overrides with a real transaction.
+    fn mark_seen_batch(
+        &self,
+        items: &[(MediaId, i64, u64)],
+        scan_id: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        async move {
+            for &(id, mtime, size) in items {
+                self.mark_seen(id, scan_id, mtime, size).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// LIB-A1 — root-scoped mark-and-sweep delete. Removes
     /// `media_items` rows under `root_prefix` whose `last_seen_scan_id`
     /// is NULL or != `scan_id` (i.e. not observed by the current run),

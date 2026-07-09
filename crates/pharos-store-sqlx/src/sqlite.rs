@@ -841,6 +841,47 @@ impl MediaStore for SqliteStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, items), fields(scan.id = scan_id, batch = items.len()))]
+    async fn mark_seen_batch(
+        &self,
+        items: &[(MediaId, i64, u64)],
+        scan_id: i64,
+    ) -> DomainResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix_secs();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for &(id, mtime, size) in items {
+            let id_i64 =
+                i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+            let size_i64 = i64::try_from(size)
+                .map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
+            sqlx::query(
+                "UPDATE media_items SET file_mtime = ?, file_size_seen = ?, \
+                 last_scanned = ?, last_seen_scan_id = ?, probe_schema_version = ? WHERE id = ?",
+            )
+            .bind(mtime)
+            .bind(size_i64)
+            .bind(now)
+            .bind(scan_id)
+            .bind(pharos_core::PROBE_SCHEMA_VERSION)
+            .bind(id_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        // One commit → one WAL fsync for the whole batch instead of N.
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), fields(scan.id = scan_id))]
     async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
         // Root-scoped, single atomic DELETE (V10). The pattern matches only
