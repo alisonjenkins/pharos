@@ -684,7 +684,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             // route patterns and RedMetrics falls back to the concrete
             // URI, exploding Prometheus label cardinality (one series per
             // item id). To get that ingress order, register bottom-up.
-            .wrap(TracingLogger::default())
+            .wrap(TracingLogger::<pharos_server::obs::StatusRootSpanBuilder>::new())
             .wrap(RedMetrics)
             .wrap(LowercasePath)
             .wrap(cors)

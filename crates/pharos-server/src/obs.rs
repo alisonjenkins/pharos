@@ -5,6 +5,38 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::{Once, OnceLock};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
+/// Root-span builder that records the HTTP response status on every request
+/// span AND emits a visible event for error statuses. `DefaultRootSpanBuilder`
+/// records `http.status_code` on the span, but that attribute is only set at
+/// request-end and never surfaces as a log line, so a 4xx/5xx (e.g. a client
+/// hitting a route pharos doesn't implement) is invisible in the logs. This
+/// makes failures greppable: `WARN ... http request completed with error
+/// status ... status=404 ... http.target=/videos/activeencodings`.
+pub struct StatusRootSpanBuilder;
+
+impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
+    fn on_request_start(request: &actix_web::dev::ServiceRequest) -> tracing::Span {
+        tracing_actix_web::root_span!(request)
+    }
+
+    fn on_request_end<B: actix_web::body::MessageBody>(
+        span: tracing::Span,
+        outcome: &Result<actix_web::dev::ServiceResponse<B>, actix_web::Error>,
+    ) {
+        // A cheap handle clone so we can log after the default builder records
+        // the standard otel fields (incl. http.status_code) onto the span.
+        let logged = span.clone();
+        tracing_actix_web::DefaultRootSpanBuilder::on_request_end(span, outcome);
+        if let Ok(resp) = outcome {
+            let status = resp.status().as_u16();
+            if status >= 400 {
+                let _e = logged.enter();
+                tracing::warn!(status, "http request completed with error status");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ObsError {
     #[error("prometheus: {0}")]
