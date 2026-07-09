@@ -213,15 +213,27 @@ affinity: {}
 podAnnotations: {}
 podLabels: {}
 
+# Probe tolerances are deliberately generous. A library scan (boot, periodic,
+# or a forced re-probe) drives the libav worker pool + sqlite writes hard and
+# can stall the async runtime past the k8s-default 1s probe timeout for brief
+# windows. With the defaults (timeoutSeconds 1, failureThreshold 3) the kubelet
+# killed the pod mid-scan, the replacement started another boot scan, and the
+# server crash-looped — no scan ever completed. Give /healthz ~90s and /readyz
+# ~60s of grace so a busy-but-alive server is not mistaken for a hung one, while
+# a genuinely dead server is still caught.
 livenessProbe:
   httpGet:
     path: /healthz
     port: http
   initialDelaySeconds: 5
   periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 6
 readinessProbe:
   httpGet:
     path: /readyz
     port: http
   initialDelaySeconds: 3
   periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
