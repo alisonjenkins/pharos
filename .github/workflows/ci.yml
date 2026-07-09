@@ -110,9 +110,16 @@ jobs:
           GHCR_CREDS: alisonjenkins:${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
+          # Flux image automation orders tags numerically, and a commit SHA
+          # doesn't sort. Add a monotonic `main-<commit-unix-ts>-<shortsha>`
+          # tag: the timestamp lets the ImagePolicy pick the newest build while
+          # the short SHA keeps it traceable. `latest` + full SHA stay for
+          # humans / manual pins.
+          COMMIT_TS="$(git show -s --format=%ct HEAD)"
+          SORTABLE="main-${COMMIT_TS}-${GITHUB_SHA:0:12}"
           publish() {
             archive="$1"; repo="$2"
-            for tag in latest "$GITHUB_SHA"; do
+            for tag in latest "$GITHUB_SHA" "$SORTABLE"; do
               nix develop --command skopeo --insecure-policy copy \
                 --dest-creds "$GHCR_CREDS" \
                 "docker-archive:$archive" \
