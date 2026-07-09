@@ -108,7 +108,7 @@ never populated anywhere. `GET Items/{id}/MetadataEditor` is absent.
 | Cast/crew on **detail** | `itemDetails` | `GET Users/{id}/Items/{id}` `People`/`Studios`/`Tags` | DONE | `item_detail_enriches_people_studios_tags` |
 | Provider ids | `itemDetails`, external-link builder | `GET Items/{id}` `ProviderIds` | DONE | `list_and_detail_populate_provider_ids` |
 | Chapters | `itemDetails` chapter strip | `GET Items/{id}` `Chapters` | DONE | — |
-| External links | external-link builder (`ExternalUrls`) | `GET Items/{id}` `ExternalUrls` | MISSING | `item_external_urls_populated` *(T67, ignored)* |
+| External links | external-link builder (`ExternalUrls`) | `GET Items/{id}` `ExternalUrls` | DONE | `item_external_urls_populated` |
 | Remote trailers | `itemDetails` trailer button | `GET Items/{id}` `RemoteTrailers` | MISSING | `item_remote_trailers_populated` *(T67, ignored)* |
 | Production locations | `itemDetails` | `GET Items/{id}` `ProductionLocations` | MISSING | `item_production_locations_populated` *(T67, ignored)* |
 | Metadata-editor payload | `components/metadataEditor/` | `GET Items/{id}/MetadataEditor` (Cultures/ParentalRatings/ContentTypeOptions/ExternalIdInfos) | MISSING | `metadata_editor_endpoint_returns_cultures_and_external_ids` *(T67, ignored)* |

@@ -119,7 +119,6 @@ async fn list_items_populate_studios_and_tags() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: ExternalUrls (IMDb/TMDb links) never populated (T67)"]
 async fn item_external_urls_populated() {
     let f = seed_rich().await;
     let d = rich_detail(&f).await;

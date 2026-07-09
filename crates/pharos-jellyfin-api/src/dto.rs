@@ -880,7 +880,7 @@ impl BaseItemDto {
                 })
                 .collect(),
             trickplay: serde_json::Map::new(),
-            external_urls: vec![],
+            external_urls: external_urls(item),
             image_tags: image_tags_for(item),
             // Audio items have no video frames, so the image handler 404s a
             // Backdrop request for them (api::jellyfin::images). Keep this list
@@ -951,6 +951,45 @@ impl BaseItemDto {
             premiere_date: item.metadata.premiere_date.map(format_iso8601),
         }
     }
+}
+
+/// T67 — build `BaseItemDto.ExternalUrls` (the "IMDb / TheMovieDb" links
+/// jellyfin-web renders on the detail page) from the item's provider ids. Pure
+/// derivation from data already on the item — no store lookup — so it populates
+/// list rows and detail alike. TMDb links are type-scoped (`/movie` vs `/tv`).
+fn external_urls(item: &pharos_core::MediaItem) -> Vec<serde_json::Value> {
+    let ids = &item.metadata.provider_ids;
+    let mut out = Vec::new();
+    let mut push = |name: &str, url: String| {
+        out.push(serde_json::json!({ "Name": name, "Url": url }));
+    };
+    if let Some(imdb) = &ids.imdb {
+        push("IMDb", format!("https://www.imdb.com/title/{imdb}/"));
+    }
+    if let Some(tmdb) = &ids.tmdb {
+        let seg = if matches!(item.kind, pharos_core::MediaKind::Movie) {
+            "movie"
+        } else {
+            "tv"
+        };
+        push(
+            "TheMovieDb",
+            format!("https://www.themoviedb.org/{seg}/{tmdb}"),
+        );
+    }
+    if let Some(tvdb) = &ids.tvdb {
+        push(
+            "TheTVDB",
+            format!("https://thetvdb.com/?tab=series&id={tvdb}"),
+        );
+    }
+    if let Some(mbid) = &ids.mbid {
+        push(
+            "MusicBrainz",
+            format!("https://musicbrainz.org/recording/{mbid}"),
+        );
+    }
+    out
 }
 
 /// LIB-C9 — project core [`ProviderIds`](pharos_core::ProviderIds) into
@@ -1668,6 +1707,27 @@ mod tests {
         assert_eq!(v["ProviderIds"]["Tmdb"], "603");
         assert_eq!(v["ProviderIds"]["Imdb"], "tt0133093");
         assert!(v["ProviderIds"].get("Tvdb").is_none());
+        // T67 — ExternalUrls derived from the provider ids. A Movie's TMDb link
+        // is type-scoped to `/movie`; the IMDb link points at `/title`.
+        let urls: Vec<(String, String)> = v["ExternalUrls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["Name"].as_str().unwrap().to_string(),
+                    e["Url"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(urls.contains(&(
+            "IMDb".into(),
+            "https://www.imdb.com/title/tt0133093/".into()
+        )));
+        assert!(urls.contains(&(
+            "TheMovieDb".into(),
+            "https://www.themoviedb.org/movie/603".into()
+        )));
     }
 
     #[test]
