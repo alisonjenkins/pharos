@@ -1431,6 +1431,32 @@ where
 }
 
 #[cfg(test)]
+mod stream_index_tests {
+    use super::codec_relative_index;
+
+    #[test]
+    fn maps_absolute_audio_to_per_codec_index() {
+        // jellyfin-web sends `AudioStreamIndex` as an ABSOLUTE ffprobe stream
+        // index; the encoder selects by per-codec index (`-map 0:a:N`). This
+        // conversion is what lets a viewer pick the Japanese track on a
+        // multi-audio anime. Layout: video@0, jpn audio@1, eng dub audio@2.
+        let audio_abs = [1u32, 2];
+        assert_eq!(codec_relative_index(audio_abs.iter().copied(), 1), Some(0)); // jpn → 0:a:0
+        assert_eq!(codec_relative_index(audio_abs.iter().copied(), 2), Some(1)); // eng → 0:a:1
+
+        // Non-contiguous (subtitle streams interleaved): video@0, subtitle@1,
+        // audio@2, subtitle@3, audio@4 → the two audio tracks are 0:a:0 / 0:a:1.
+        let non_contig = [2u32, 4];
+        assert_eq!(codec_relative_index(non_contig.iter().copied(), 2), Some(0));
+        assert_eq!(codec_relative_index(non_contig.iter().copied(), 4), Some(1));
+
+        // An absolute index that isn't an audio stream → None, so the caller
+        // falls back to ffmpeg's default selection rather than mis-mapping.
+        assert_eq!(codec_relative_index(audio_abs.iter().copied(), 3), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
