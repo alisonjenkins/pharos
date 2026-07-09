@@ -7,14 +7,20 @@
 //! bytes so the second + Nth fetch never respawns ffmpeg.
 //!
 //! Concurrency follows the `HlsSegmentCache` pattern: per-key fetch
-//! lock deduplicates concurrent first-fetches; LRU eviction keeps
-//! total bytes under the configured cap.
+//! lock deduplicates concurrent first-fetches; LRU eviction keeps the
+//! in-memory hot layer under the configured cap.
 //!
-//! No on-disk persistence — subtitle ffmpeg is fast enough that
-//! cold-cache cost on restart is negligible.
+//! **On-disk persistence (optional, via [`SubtitleCache::with_disk`]).**
+//! Extracting an embedded subtitle demuxes the WHOLE source — a sparse
+//! subtitle stream spans the entire container — so over an NFS-backed
+//! multi-GB library a cold extraction costs tens of seconds, not the
+//! "negligible" it was once assumed to be. A disk layer under the cache
+//! PVC makes extraction a once-ever cost that survives pod restarts; the
+//! in-memory map stays as a hot layer in front of it.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -59,6 +65,10 @@ struct CacheState {
 pub struct SubtitleCache {
     max_bytes: u64,
     max_entries: usize,
+    /// Persistence root under the cache PVC. When set, extractions land on
+    /// disk (`{root}/{key}.sub`) and survive restarts; the in-memory map is a
+    /// hot layer in front. `None` → memory-only (tests / minimal deployments).
+    root: Option<PathBuf>,
     state: Arc<Mutex<CacheState>>,
 }
 
@@ -76,8 +86,35 @@ impl SubtitleCache {
         Self {
             max_bytes,
             max_entries,
+            root: None,
             state: Arc::new(Mutex::new(CacheState::default())),
         }
+    }
+
+    /// Persist extracted subtitles under `root` (the cache PVC) so the cost is
+    /// paid once ever and survives restarts, not re-incurred on every boot.
+    pub fn with_disk(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = Some(root.into());
+        self
+    }
+
+    /// On-disk path for a key: `{root}/subtitles/{hash(path)}-{mtime}-{idx}-{k}.sub`.
+    /// The source path is hashed (it contains `/` and arbitrary chars); mtime +
+    /// index + kind keep distinct extractions apart and invalidate on edit.
+    fn disk_path(&self, key: &Key) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.path.hash(&mut h);
+        let ph = h.finish();
+        let k = match key.kind {
+            SubtitleKind::Embedded => 'e',
+            SubtitleKind::Sidecar => 's',
+            SubtitleKind::EmbeddedAss => 'a',
+        };
+        Some(root.join("subtitles").join(format!(
+            "{ph:016x}-{}-{}-{k}.sub",
+            key.mtime_secs, key.stream_index
+        )))
     }
 
     /// Lookup the cached WebVTT bytes for this key. Returns `None` on
@@ -95,12 +132,45 @@ impl SubtitleCache {
             stream_index,
             kind,
         };
+        {
+            let mut state = self.state.lock().await;
+            state.access_counter += 1;
+            let counter = state.access_counter;
+            if let Some(entry) = state.entries.get_mut(&key) {
+                entry.1.last_used = counter;
+                return Some(entry.0.clone());
+            }
+        }
+        // Memory miss → try the persistent disk layer (survives restart). A hit
+        // promotes the bytes back into the in-memory hot map.
+        let disk = self.disk_path(&key)?;
+        let bytes = tokio::fs::read(&disk).await.ok()?;
+        Some(self.insert(key, bytes).await)
+    }
+
+    /// Insert bytes into the in-memory hot map (shared by `get`'s disk-promote
+    /// and `store`), returning the shared handle. Does NOT touch disk.
+    async fn insert(&self, key: Key, bytes: Vec<u8>) -> Arc<Vec<u8>> {
+        let len = bytes.len() as u64;
+        let shared = Arc::new(bytes);
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
-        let entry = state.entries.get_mut(&key)?;
-        entry.1.last_used = counter;
-        Some(entry.0.clone())
+        if let Some((_, old_meta)) = state.entries.insert(
+            key,
+            (
+                shared.clone(),
+                EntryMeta {
+                    bytes: len,
+                    last_used: counter,
+                },
+            ),
+        ) {
+            state.total_bytes = state.total_bytes.saturating_sub(old_meta.bytes);
+        }
+        state.total_bytes = state.total_bytes.saturating_add(len);
+        self.evict_if_needed(&mut state);
+        shared
     }
 
     /// Acquire the per-key fetch lock so concurrent first-fetchers
@@ -144,27 +214,16 @@ impl SubtitleCache {
             stream_index,
             kind,
         };
-        let len = bytes.len() as u64;
-        let shared = Arc::new(bytes);
-        let mut state = self.state.lock().await;
-        state.access_counter += 1;
-        let counter = state.access_counter;
-        if let Some((_, old_meta)) = state.entries.insert(
-            key.clone(),
-            (
-                shared.clone(),
-                EntryMeta {
-                    bytes: len,
-                    last_used: counter,
-                },
-            ),
-        ) {
-            state.total_bytes = state.total_bytes.saturating_sub(old_meta.bytes);
+        // Persist to disk first (atomic write) so a restart keeps the bytes; a
+        // disk-write failure is non-fatal (memory layer still serves this run).
+        if let Some(disk) = self.disk_path(&key) {
+            if let Err(e) = write_atomic(&disk, &bytes).await {
+                tracing::warn!(error = %e, path = %disk.display(), "subtitle cache disk write failed");
+            }
         }
-        state.total_bytes = state.total_bytes.saturating_add(len);
+        let shared = self.insert(key.clone(), bytes).await;
         // Release the fetch lock — populated entry stays in the LRU.
-        state.fetch_locks.remove(&key);
-        self.evict_if_needed(&mut state);
+        self.state.lock().await.fetch_locks.remove(&key);
         shared
     }
 
@@ -195,6 +254,17 @@ impl SubtitleCache {
     }
 }
 
+/// Write `bytes` to `path` atomically (temp + rename) so a concurrent reader
+/// or a crash mid-write never sees a truncated subtitle. Creates the parent.
+async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("sub.tmp");
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
 /// Read the source path's mtime as seconds since epoch. Returns `0`
 /// when the file is missing or stat fails — handlers fall through to
 /// "always miss" behaviour, which is the conservative default.
@@ -220,6 +290,63 @@ mod tests {
         let cache = SubtitleCache::new(1_024, 64);
         assert!(cache
             .get(Path::new("/x"), 0, 0, SubtitleKind::Embedded)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn disk_layer_survives_a_restart() {
+        // The whole point of persistence: a subtitle extracted once must not be
+        // re-demuxed (~30 s over NFS) after a pod restart. Model the restart as
+        // a FRESH cache (empty memory) pointed at the same disk root.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("cache");
+        let bytes = b"WEBVTT\n\n00:00.000 --> 00:02.000\nhi\n".to_vec();
+
+        let first = SubtitleCache::new(1_024 * 1_024, 64).with_disk(&root);
+        first
+            .store(
+                Path::new("/m/x.mkv"),
+                7,
+                3,
+                SubtitleKind::EmbeddedAss,
+                bytes.clone(),
+            )
+            .await;
+
+        // Fresh instance, cold memory, same disk → must hit disk (no re-extract).
+        let restarted = SubtitleCache::new(1_024 * 1_024, 64).with_disk(&root);
+        assert_eq!(restarted.entry_count().await, 0, "memory starts cold");
+        let got = restarted
+            .get(Path::new("/m/x.mkv"), 7, 3, SubtitleKind::EmbeddedAss)
+            .await;
+        assert_eq!(
+            got.as_deref(),
+            Some(&bytes),
+            "disk layer must serve after restart"
+        );
+        // And it promoted into the hot memory map.
+        assert_eq!(restarted.entry_count().await, 1);
+
+        // A different mtime (edited file) must NOT match the stale disk entry.
+        assert!(restarted
+            .get(Path::new("/m/x.mkv"), 8, 3, SubtitleKind::EmbeddedAss)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_only_when_no_disk_root() {
+        // Without with_disk, nothing persists — a fresh instance is empty.
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = dir; // no disk root used
+        let cache = SubtitleCache::new(1_024, 64);
+        cache
+            .store(Path::new("/x"), 1, 0, SubtitleKind::Embedded, b"x".to_vec())
+            .await;
+        let fresh = SubtitleCache::new(1_024, 64);
+        assert!(fresh
+            .get(Path::new("/x"), 1, 0, SubtitleKind::Embedded)
             .await
             .is_none());
     }
