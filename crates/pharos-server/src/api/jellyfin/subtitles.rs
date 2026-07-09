@@ -113,6 +113,7 @@ async fn stream_attachment_short(
 
 /// Extract + serve an embedded attachment (font) by stream index. Cached on
 /// disk after the first fetch. Public, like the subtitle + image routes.
+#[tracing::instrument(skip(state), fields(media.id = %id_str, idx = stream_index, kind = "attachment"))]
 async fn deliver_attachment(
     state: &AppState,
     id_str: &str,
@@ -178,6 +179,7 @@ async fn stream_ass_short(
 /// Serve a subtitle track as RAW ASS/SSA (for SubtitlesOctopus). Sidecars pass
 /// through verbatim; embedded streams are extracted with `-c:s ass -f ass` and
 /// cached (distinct `EmbeddedAss` key from the VTT form).
+#[tracing::instrument(skip(state), fields(media.id = %id_str, idx = stream_index, kind = "ass"))]
 async fn deliver_ass(
     state: &AppState,
     id_str: &str,
@@ -310,6 +312,7 @@ async fn run_ffmpeg_embedded_ass(
     input: &str,
     stream_index: u32,
 ) -> Result<Vec<u8>, actix_web::Error> {
+    let started = std::time::Instant::now();
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -335,6 +338,12 @@ async fn run_ffmpeg_embedded_ass(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    tracing::info!(
+        idx = stream_index,
+        bytes = out.stdout.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "subtitle ass extracted (ffmpeg, cold demux)"
+    );
     Ok(out.stdout)
 }
 
@@ -361,6 +370,7 @@ async fn stream_srt_short(
 /// P40 — SRT-form delivery. ffmpeg converts the embedded stream to
 /// `-c:s subrip -f srt`. Hits the same image-codec refusal as the
 /// VTT path so PGS/DVB return 415 instead of empty bodies.
+#[tracing::instrument(skip(state), fields(media.id = %id_str, idx = stream_index, kind = "srt"))]
 async fn deliver_srt(
     state: &AppState,
     id_str: &str,
@@ -479,6 +489,7 @@ fn parse_forced_only(qs: &str) -> bool {
     false
 }
 
+#[tracing::instrument(skip(state, style), fields(media.id = %id_str, idx = stream_index, kind = "vtt"))]
 async fn deliver_vtt(
     state: &AppState,
     id_str: &str,
@@ -618,6 +629,7 @@ async fn stream_js_ticks(
 /// WebVTT extraction as `Stream.vtt` (sidecar or embedded, cached) then
 /// converts the cues to the `{ "TrackEvents": [...] }` shape jellyfin
 /// expects. Image-codec tracks are rejected (they burn, never render here).
+#[tracing::instrument(skip(state), fields(media.id = %id_str, idx = stream_index, kind = "js"))]
 async fn deliver_js(
     state: &AppState,
     id_str: &str,
@@ -693,6 +705,7 @@ async fn resolve_vtt_bytes(
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
         {
+            tracing::debug!(idx = stream_index, "subtitle cache hit (warm)");
             return Ok((*bytes).clone());
         }
         let lock = cache
@@ -703,8 +716,15 @@ async fn resolve_vtt_bytes(
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
         {
+            tracing::debug!(idx = stream_index, "subtitle cache hit (after lock)");
             return Ok((*bytes).clone());
         }
+        // Cold: not pre-warmed by the backfill yet → extract now (blocks this
+        // fetch). A slow one here is the "subtitles take too long" symptom.
+        tracing::info!(
+            idx = stream_index,
+            "subtitle cache MISS — extracting on the request path"
+        );
         let out = run_ffmpeg_embedded(input, stream_index).await?;
         let stored = cache
             .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
@@ -901,6 +921,10 @@ fn vtt_response(mut body: Vec<u8>, style_lossy: bool, style: &SubtitleStyle) -> 
 }
 
 async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, actix_web::Error> {
+    // Cold subtitle extraction opens the whole (often multi-GB, NFS-backed)
+    // source to demux one text stream — the dominant cost of a first Stream.vtt
+    // / Stream.js fetch. Timed so a slow first-fetch is visible in traces.
+    let started = std::time::Instant::now();
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -926,6 +950,12 @@ async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, 
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    tracing::info!(
+        idx = stream_index,
+        bytes = out.stdout.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "subtitle webvtt extracted (ffmpeg, cold demux)"
+    );
     Ok(out.stdout)
 }
 

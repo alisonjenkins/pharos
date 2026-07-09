@@ -407,7 +407,17 @@ impl ImageCache {
         let tmp = dir.join(".batch.tmp");
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await?;
+        // One cold source open dumps every font. Timed so the ASS "Fetching
+        // assets" cost is visible: this is the whole first-font latency.
+        let started = std::time::Instant::now();
         let res = self.extract_all_attachments_to(source, indices, &tmp).await;
+        tracing::info!(
+            media.id = id,
+            fonts = indices.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = res.is_ok(),
+            "attachment batch extracted (one source open)"
+        );
         if let Err(e) = res {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
             return Err(e);
