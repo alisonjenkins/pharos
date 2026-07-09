@@ -26,7 +26,12 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
     UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin::trickplay, auth::BuiltinAuth, state::AppState};
+use pharos_server::{
+    api::jellyfin::{self, trickplay},
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::AppState,
+};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -298,4 +303,77 @@ async fn dto_layout_map_advertises_configured_widths() {
     assert_eq!(v.get("Interval").unwrap().as_u64().unwrap(), 10_000);
     // 180s / 10s = 18 thumbs.
     assert_eq!(v.get("ThumbnailCount").unwrap().as_u64().unwrap(), 18);
+}
+
+#[actix_web::test]
+async fn http_get_item_emits_nested_trickplay() {
+    // End-to-end wire guard, no ffmpeg: the real `GET /Items/{id}` handler
+    // must call `with_trickplay` using the server's configured widths so
+    // jellyfin-web receives `item.Trickplay[mediaSourceId][width]`. The
+    // DTO-only test (`item_dto_trickplay_is_nested_by_media_source_id`)
+    // exercises the builder in isolation and the tile test exercises the
+    // image route — neither catches a handler that forgot the call or an
+    // empty `state.trickplay_widths` (a no-op `with_trickplay`), which is
+    // exactly what makes previews silently invisible. The layout is
+    // probe-derived, so no fixture / ffmpeg is needed.
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 7,
+            path: "/m/x.mkv".into(),
+            title: "x".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(180_000),
+                width: Some(1920),
+                height: Some(1080),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(
+        AppState::new(stores, "srv".into()).with_trickplay_layout(vec![320, 640], 10_000),
+    );
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri("/Items/7")
+        .insert_header(("X-Emby-Token", token.0.expose().to_string()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(
+        v["Trickplay"]["7"]["320"]["Width"].as_u64().unwrap(),
+        320,
+        "GET /Items/7 dropped the nested Trickplay map: {v}"
+    );
+    assert_eq!(v["Trickplay"]["7"]["640"]["Width"].as_u64().unwrap(), 640);
+    // Guard the pre-fix flat shape can't creep back at the HTTP layer either.
+    assert!(
+        v["Trickplay"].get("320").is_none(),
+        "flat wire shape regressed: {}",
+        v["Trickplay"]
+    );
 }
