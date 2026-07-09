@@ -519,12 +519,51 @@ async fn post_system_configuration(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// T72 — persist a named configuration section (`encoding`, `network`,
+/// `metadata`, `livetv`, …). jellyfin-web's dashboard POSTs the section's
+/// full form blob here; pharos stores it as an opaque JSON object keyed by
+/// the section name and overlays it on the served defaults on the matching
+/// GET, so the change survives restart. The incoming object is merged into
+/// any previously-stored blob (a partial patch keeps prior keys), then
+/// persisted. Non-object bodies are rejected — every Jellyfin section form
+/// is a JSON object.
 async fn post_system_configuration_key(
+    state: web::Data<AppState>,
     user: AuthUser,
-    _path: web::Path<String>,
-    _body: web::Bytes,
+    path: web::Path<String>,
+    body: web::Bytes,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
+    let key = path.into_inner().to_ascii_lowercase();
+    let incoming: serde_json::Value = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| error::ErrorBadRequest(format!("invalid configuration JSON: {e}")))?
+    };
+    let patch = incoming
+        .as_object()
+        .ok_or_else(|| error::ErrorBadRequest("configuration body must be a JSON object"))?;
+    // Merge onto any prior stored blob so a partial POST keeps earlier keys.
+    let mut merged = match state
+        .stores
+        .load_named_config(&key)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+    {
+        Some(raw) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+            .unwrap_or_default(),
+        None => serde_json::Map::new(),
+    };
+    for (k, v) in patch {
+        merged.insert(k.clone(), v.clone());
+    }
+    let serialized = serde_json::Value::Object(merged).to_string();
+    state
+        .stores
+        .set_named_config(&key, &serialized)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
 }
 

@@ -109,9 +109,12 @@ async fn system_configuration() -> impl Responder {
 /// doesn't persist these (its config is the toml file), but returning a
 /// well-shaped default lets each dashboard page render its form fields with
 /// sensible values instead of throwing on a 404 / undefined access.
-async fn system_configuration_named(path: web::Path<String>) -> impl Responder {
+async fn system_configuration_named(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
     let key = path.into_inner().to_ascii_lowercase();
-    let body = match key.as_str() {
+    let mut body = match key.as_str() {
         "network" => serde_json::json!({
             "BaseUrl": "",
             "EnableHttps": false,
@@ -156,7 +159,25 @@ async fn system_configuration_named(path: web::Path<String>) -> impl Responder {
         // Unknown key → an empty object (still valid JSON the form can read).
         _ => serde_json::json!({}),
     };
-    HttpResponse::Ok().json(body)
+    // T72 — overlay any persisted section blob on the shaped defaults so a
+    // dashboard change (POST to the same key) is reflected here and survives
+    // restart. Stored keys win; keys pharos didn't persist keep their default.
+    if let Some(raw) = state
+        .stores
+        .load_named_config(&key)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+    {
+        if let (Some(base), Ok(serde_json::Value::Object(stored))) = (
+            body.as_object_mut(),
+            serde_json::from_str::<serde_json::Value>(&raw),
+        ) {
+            for (k, v) in stored {
+                base.insert(k, v);
+            }
+        }
+    }
+    Ok(HttpResponse::Ok().json(body))
 }
 
 async fn empty_backup_list() -> impl Responder {

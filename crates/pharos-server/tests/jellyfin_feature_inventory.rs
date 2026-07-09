@@ -149,7 +149,6 @@ async fn named_config_roundtrip_survives(f: &common::Fixture, key: &str, patch: 
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /System/Configuration/encoding is a no-op — transcoding settings don't persist (T72)"]
 async fn named_configuration_encoding() {
     let f = seed_rich().await;
     assert!(
@@ -164,7 +163,6 @@ async fn named_configuration_encoding() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /System/Configuration/network is a no-op — networking settings don't persist (T72)"]
 async fn named_configuration_network() {
     let f = seed_rich().await;
     assert!(
@@ -175,7 +173,6 @@ async fn named_configuration_network() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /System/Configuration/metadata is a no-op — library display settings don't persist (T72)"]
 async fn named_configuration_metadata() {
     let f = seed_rich().await;
     assert!(
@@ -190,7 +187,6 @@ async fn named_configuration_metadata() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /System/Configuration/livetv is a no-op — live TV settings don't persist (T72)"]
 async fn named_configuration_livetv() {
     let f = seed_rich().await;
     assert!(

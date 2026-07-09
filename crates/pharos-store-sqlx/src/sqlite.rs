@@ -431,6 +431,42 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// T72 — read a persisted named-configuration section blob by key
+    /// (`encoding`, `network`, …). Returns the raw JSON string, or `None`
+    /// when the section has never been written (the handler then serves
+    /// its shaped defaults unmodified).
+    pub async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query_as::<_, (String,)>("SELECT value FROM named_config WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// T72 — upsert a named-configuration section blob. `value` is the
+    /// opaque JSON the handler wants persisted for `key`; a later GET
+    /// overlays it on the served defaults so the dashboard change survives
+    /// restart.
+    pub async fn set_named_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        sqlx::query(
+            "INSERT INTO named_config (key, value, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// LIB-B2 — distinct `(series_folder, series_name)` keys, for resolving a
     /// `?ParentId=<series synth id>` to its folder/name without loading every
     /// item. The API hashes each candidate via `series_id_for_key` to find

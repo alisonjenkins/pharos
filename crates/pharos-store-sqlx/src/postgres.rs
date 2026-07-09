@@ -417,6 +417,34 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// T72 — read a persisted named-configuration section blob by key (see
+    /// the sqlite twin). `None` when the section has never been written.
+    pub async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query_as::<_, (String,)>("SELECT value FROM named_config WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// T72 — upsert a named-configuration section blob (see the sqlite twin).
+    pub async fn set_named_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let now = now_unix_secs();
+        sqlx::query(
+            "INSERT INTO named_config (key, value, updated_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (key) DO UPDATE SET
+                 value = EXCLUDED.value,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// LIB-B2 — distinct `(series_folder, series_name)` keys (see the sqlite
     /// twin). Used by the API to resolve a `?ParentId=<series synth id>`.
     pub async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {

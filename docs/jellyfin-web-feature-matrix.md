@@ -207,11 +207,11 @@ Each page reads `GET System/Configuration/{key}` and writes
 | Config key | jellyfin-web page | status | Test |
 |---|---|---|---|
 | general (`System/Configuration`) | `settings/index.tsx` | DONE (T65 branding subset) | — |
-| `encoding` | `playback/transcoding.tsx` | THIN (GET serves defaults; POST no-op) | `named_configuration_encoding` *(T72, ignored)* |
-| `network` | `controllers/networking.js` | THIN (GET defaults; POST no-op) | `named_configuration_network` *(T72, ignored)* |
-| `metadata` | `libraries/display.tsx` | THIN (GET empty; POST no-op) | `named_configuration_metadata` *(T72, ignored)* |
-| `livetv` | `livetv/index.tsx` | THIN (GET defaults; POST no-op) | `named_configuration_livetv` *(T72, ignored)* |
-| `xbmcmetadata` (NFO) | `libraries/nfo.tsx` | THIN | *(T72 backlog)* |
+| `encoding` | `playback/transcoding.tsx` | DONE (POST persists; overlaid on GET defaults) | `named_configuration_encoding` |
+| `network` | `controllers/networking.js` | DONE (POST persists; overlaid on GET defaults) | `named_configuration_network` |
+| `metadata` | `libraries/display.tsx` | DONE (POST persists; overlaid on GET defaults) | `named_configuration_metadata` |
+| `livetv` | `livetv/index.tsx` | DONE (POST persists; overlaid on GET defaults) | `named_configuration_livetv` |
+| `xbmcmetadata` (NFO) | `libraries/nfo.tsx` | DONE (generic `named_config` store covers any key) | *(T72)* |
 | `branding` | `branding/index.tsx` | DONE (T65) | — |
 
 ## Other admin surfaces
