@@ -283,14 +283,23 @@ fn build_args_for_device(
         a.push("-t".into());
         a.push(format!("{dur:.3}"));
     }
-    // W1 — when the caller specifies an audio stream, route the
-    // video + the chosen audio track explicitly. `0:v?` keeps video
-    // optional (no error on audio-only sources). Default selection
-    // falls through to ffmpeg's "pick the most appropriate stream"
-    // heuristic which mirrors the prior behaviour.
+    // W1 — when the caller specifies an audio stream, route the video + the
+    // chosen audio track explicitly. Map only the PRIMARY video (`0:v:0`), not
+    // ALL video (`0:v?`): a source with a second video stream — an embedded
+    // cover-art / attached-picture poster, common in anime releases — would
+    // otherwise have BOTH mapped, and libvpx/x264 fails encoding the poster
+    // ("[vf#0:1] Error sending frames to consumers: Invalid argument", -22),
+    // so "at least one stream received no packets" and the whole segment 500s.
+    // ffmpeg's default stream selection (taken when no audio index is given)
+    // already picks a single primary video and excludes attached pictures,
+    // which is why default playback works; this branch must match it. The `?`
+    // keeps the map optional so an audio-only source still transcodes. `0:v:0`
+    // also aligns with the probe, which advertises the first video as THE
+    // video track. (B6 — surfaced once B4 made the audio index actually reach
+    // the segment; before that the index was dropped and this path never ran.)
     if let Some(audio_idx) = opts.audio_source_stream_index {
         a.push("-map".into());
-        a.push("0:v?".into());
+        a.push("0:v:0?".into());
         a.push("-map".into());
         a.push(format!("0:a:{audio_idx}"));
     }
@@ -701,7 +710,16 @@ mod tests {
         o.audio_source_stream_index = Some(2);
         let a = build_args("/m/x.mkv", &o);
         let joined = a.join(" ");
-        assert!(joined.contains("-map 0:v?"), "{joined}");
+        // Only the PRIMARY video (`0:v:0`), never all video (`0:v?`): a source
+        // with an embedded cover-art / attached-picture second video stream
+        // (common in anime releases) would otherwise have BOTH mapped, and the
+        // encoder chokes on the poster ("Error sending frames to consumers:
+        // Invalid argument" → the whole segment 500s). ffmpeg's default
+        // stream-selection (used when no audio track is chosen) already picks a
+        // single primary video, which is why default playback works; the
+        // explicit-map branch must match it. See B6.
+        assert!(joined.contains("-map 0:v:0?"), "{joined}");
+        assert!(!joined.contains("-map 0:v?"), "{joined}");
         assert!(joined.contains("-map 0:a:2"), "{joined}");
     }
 
