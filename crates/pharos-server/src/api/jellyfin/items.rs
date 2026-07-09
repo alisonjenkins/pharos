@@ -1350,6 +1350,14 @@ async fn shows_seasons(
 #[serde(rename_all = "PascalCase", default)]
 struct PlaybackInfoBody {
     device_profile: Option<DeviceProfile>,
+    /// Audio/subtitle track picks jellyfin-web sends when the user switches
+    /// tracks on a TRANSCODED stream: it re-POSTs PlaybackInfo with the new
+    /// index in the `playbackInfoDto` BODY (not the query string) and reloads
+    /// the returned TranscodingUrl. Threaded into the transcode URL below so
+    /// the reloaded stream actually carries the chosen track. Subtitle uses
+    /// `i64` because Jellyfin's "off" sentinel is `-1`.
+    audio_stream_index: Option<u32>,
+    subtitle_stream_index: Option<i64>,
 }
 
 async fn playback_info(
@@ -1410,9 +1418,17 @@ async fn playback_info(
         height: probe.height,
     };
 
-    let profile = body
-        .and_then(|b| b.into_inner().device_profile)
-        .unwrap_or_default();
+    // Consume the POST body once: the DeviceProfile drives negotiation, and
+    // the track picks (present when jellyfin-web reloads for an audio/subtitle
+    // switch) fall back into the transcode URL below.
+    let (profile, body_audio_index, body_subtitle_index) = match body.map(web::Json::into_inner) {
+        Some(b) => (
+            b.device_profile.unwrap_or_default(),
+            b.audio_stream_index,
+            b.subtitle_stream_index,
+        ),
+        None => (DeviceProfile::default(), None, None),
+    };
     let decision = negotiate(&profile, &source);
 
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
@@ -1479,20 +1495,35 @@ async fn playback_info(
     // select) + burns the chosen subtitle in.
     let stream_selection = {
         let q = req.query_string();
-        let mut s = String::new();
-        for key in ["AudioStreamIndex", "SubtitleStreamIndex"] {
-            if let Some(v) = q
-                .split('&')
+        // Query string wins (legacy/other clients + explicit overrides); the
+        // POST body is the fallback, since jellyfin-web's transcode audio/
+        // subtitle switch sends the index ONLY in the body.
+        let from_query = |key: &str| -> Option<String> {
+            q.split('&')
                 .filter_map(|kv| kv.split_once('='))
                 .find(|(k, _)| k.eq_ignore_ascii_case(key))
                 .map(|(_, v)| v)
                 .filter(|v| !v.is_empty())
-            {
-                s.push('&');
-                s.push_str(key);
-                s.push('=');
-                s.push_str(v);
-            }
+                .map(str::to_owned)
+        };
+        let mut s = String::new();
+        let mut push = |key: &str, val: String| {
+            s.push('&');
+            s.push_str(key);
+            s.push('=');
+            s.push_str(&val);
+        };
+        if let Some(v) =
+            from_query("AudioStreamIndex").or_else(|| body_audio_index.map(|n| n.to_string()))
+        {
+            push("AudioStreamIndex", v);
+        }
+        // Subtitle "off" (-1) is meaningful to the segment handler (it clears
+        // any prior burn-in) — forward it, unlike an absent value.
+        if let Some(v) =
+            from_query("SubtitleStreamIndex").or_else(|| body_subtitle_index.map(|n| n.to_string()))
+        {
+            push("SubtitleStreamIndex", v);
         }
         s
     };
