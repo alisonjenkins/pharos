@@ -87,7 +87,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 async fn stream_ass(
     state: web::Data<AppState>,
-    _user: AuthUser,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, _media_source_id, stream_index) = path.into_inner();
@@ -96,7 +95,6 @@ async fn stream_ass(
 
 async fn stream_ass_short(
     state: web::Data<AppState>,
-    _user: AuthUser,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
@@ -268,7 +266,6 @@ async fn run_ffmpeg_embedded_ass(
 
 async fn stream_srt(
     state: web::Data<AppState>,
-    _user: AuthUser,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -279,7 +276,6 @@ async fn stream_srt(
 
 async fn stream_srt_short(
     state: web::Data<AppState>,
-    _user: AuthUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -364,26 +360,36 @@ async fn deliver_srt(
 
 async fn stream_vtt(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: Option<AuthUser>,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, _media_source_id, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
-    let style = subtitle_style_for(&state, user.0.id).await;
+    let style = user_subtitle_style(&state, user).await;
     deliver_vtt(&state, &id, stream_index, forced_only, style).await
 }
 
 async fn stream_vtt_short(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: Option<AuthUser>,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
-    let style = subtitle_style_for(&state, user.0.id).await;
+    let style = user_subtitle_style(&state, user).await;
     deliver_vtt(&state, &id, stream_index, forced_only, style).await
+}
+
+/// Per-user subtitle style when the request is authenticated; default styling
+/// otherwise (subtitle routes are public — jellyfin-web's JS renderer fetches
+/// them without a token, like the image routes).
+async fn user_subtitle_style(state: &AppState, user: Option<AuthUser>) -> SubtitleStyle {
+    match user {
+        Some(u) => subtitle_style_for(state, u.0.id).await,
+        None => SubtitleStyle::default(),
+    }
 }
 
 fn parse_forced_only(qs: &str) -> bool {
@@ -511,7 +517,6 @@ async fn deliver_vtt(
 
 async fn stream_js(
     state: web::Data<AppState>,
-    _user: AuthUser,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, _msid, stream_index) = path.into_inner();
@@ -520,7 +525,6 @@ async fn stream_js(
 
 async fn stream_js_short(
     state: web::Data<AppState>,
-    _user: AuthUser,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
@@ -529,7 +533,6 @@ async fn stream_js_short(
 
 async fn stream_js_ticks(
     state: web::Data<AppState>,
-    _user: AuthUser,
     path: web::Path<(String, String, u32, i64)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, _msid, stream_index, _start_ticks) = path.into_inner();
