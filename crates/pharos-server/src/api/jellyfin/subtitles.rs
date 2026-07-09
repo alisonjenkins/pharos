@@ -136,11 +136,21 @@ async fn deliver_attachment(
         .find(|a| a.stream_index == stream_index)
         .and_then(|a| a.mime_type.clone())
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let path = cache
-        .attachment(id, &item.path, stream_index)
+    // Warm EVERY font in one source open, not just the requested one:
+    // SubtitlesOctopus fetches all of them before rendering, so a per-font
+    // extraction re-opens the (NFS, multi-GB) source N times and stalls the
+    // "Fetching assets" phase. The remaining N-1 requests then hit warm cache.
+    let indices: Vec<u32> = item
+        .probe
+        .attachments
+        .iter()
+        .map(|a| a.stream_index)
+        .collect();
+    let dir = cache
+        .ensure_all_attachments(id, &item.path, &indices)
         .await
         .map_err(|e| error::ErrorNotFound(format!("attachment: {e}")))?;
-    let bytes = tokio::fs::read(&path)
+    let bytes = tokio::fs::read(dir.join(stream_index.to_string()))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
     Ok(HttpResponse::Ok()

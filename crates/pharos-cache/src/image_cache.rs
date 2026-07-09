@@ -370,6 +370,116 @@ impl ImageCache {
         ))
     }
 
+    /// Ensure EVERY listed attachment (font) is extracted, in a SINGLE source
+    /// open, and return the directory holding `{stream_index}` files. ASS/SSA
+    /// subtitles reference many fonts and SubtitlesOctopus fetches all of them
+    /// before drawing a cue; extracting one-per-request re-opens the (NFS,
+    /// multi-GB) source N times and stalls the "Fetching assets" phase. Warm
+    /// them together so only the first font request pays one open and the rest
+    /// hit cache. `indices` are the ffprobe attachment stream indices from the
+    /// item probe.
+    pub async fn ensure_all_attachments(
+        &self,
+        id: u64,
+        source: &Path,
+        indices: &[u32],
+    ) -> Result<PathBuf, ImageCacheError> {
+        let dir = self.root.join("attachments").join(id.to_string());
+        // Fast path: all requested indices already resident.
+        if !indices.is_empty() {
+            let mut all = true;
+            for &idx in indices {
+                if !tokio::fs::try_exists(dir.join(idx.to_string()))
+                    .await
+                    .unwrap_or(false)
+                {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return Ok(dir);
+            }
+        }
+        tokio::fs::create_dir_all(&dir).await?;
+        // Extract into a scratch dir in one pass, then move each file into
+        // place (atomic per file) so a concurrent reader never sees a partial.
+        let tmp = dir.join(".batch.tmp");
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await?;
+        let res = self.extract_all_attachments_to(source, indices, &tmp).await;
+        if let Err(e) = res {
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
+            return Err(e);
+        }
+        let mut rd = tokio::fs::read_dir(&tmp).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let dst = dir.join(entry.file_name());
+            let _ = tokio::fs::rename(entry.path(), &dst).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        Ok(dir)
+    }
+
+    /// Dump all attachments to `out_dir` in one open — resident libav worker in
+    /// prod (discovers attachment streams itself), else one `ffmpeg` process
+    /// with a `-dump_attachment:<idx>` per index (still a single input open).
+    async fn extract_all_attachments_to(
+        &self,
+        source: &Path,
+        indices: &[u32],
+        out_dir: &Path,
+    ) -> Result<(), ImageCacheError> {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            return pool
+                .extract_all_attachments(source.to_path_buf(), out_dir.to_path_buf())
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    ImageCacheError::Ffmpeg(None, format!("libav batch attachment: {e}"))
+                });
+        }
+        let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        let out_str = out_dir.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
+        // One ffmpeg process, N `-dump_attachment` input options → one open.
+        let mut args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-nostdin".into(),
+            "-y".into(),
+        ];
+        for idx in indices {
+            args.push(format!("-dump_attachment:{idx}"));
+            args.push(format!("{out_str}/{idx}"));
+        }
+        args.push("-i".into());
+        args.push(source_str.into());
+        args.push("-f".into());
+        args.push("null".into());
+        args.push("-".into());
+        let _ = Command::new(&self.ffmpeg_bin)
+            .args(&args)
+            .status()
+            .await
+            .map_err(|e| ImageCacheError::Ffmpeg(None, format!("spawn: {e}")))?;
+        // ffmpeg exits non-zero after dumping attachments (the null sink has no
+        // stream to mux), so don't gate on the status — verify a file landed.
+        for idx in indices {
+            if tokio::fs::try_exists(out_dir.join(idx.to_string()))
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        Err(ImageCacheError::Ffmpeg(
+            None,
+            "ffmpeg dump_attachment produced no files".into(),
+        ))
+    }
+
     /// Atomically persist a client-uploaded image at the given role +
     /// index slot. Used by `POST /Items/{id}/Images/{type}`.
     #[instrument(skip(self, body), fields(media.id = %id, role = ?role, bytes = body.len()))]

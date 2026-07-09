@@ -21,7 +21,7 @@
 
 use crate::state::Stores;
 use pharos_cache::trickplay_cache::TrickplayCache;
-use pharos_cache::SubtitleCache;
+use pharos_cache::{ImageCache, SubtitleCache};
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_jellyfin_api::dto::{build_layout, series_id_for_key};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -86,18 +86,20 @@ pub fn spawn(
     stores: Stores,
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
+    images: Option<ImageCache>,
     playback: Arc<AtomicI64>,
     widths: Vec<u32>,
     interval_ms: u32,
 ) -> PriorityTx {
     let (tx, rx) = mpsc::unbounded_channel();
-    // Run whenever there's *some* asset to pre-build: trickplay widths or a
-    // subtitle cache to warm.
-    if !widths.is_empty() || subtitles.is_some() {
+    // Run whenever there's *some* asset to pre-build: trickplay widths, a
+    // subtitle cache to warm, or embedded fonts to pre-extract.
+    if !widths.is_empty() || subtitles.is_some() || images.is_some() {
         tokio::spawn(run(
             stores,
             cache,
             subtitles,
+            images,
             playback,
             widths,
             interval_ms,
@@ -107,10 +109,12 @@ pub fn spawn(
     tx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     stores: Stores,
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
+    images: Option<ImageCache>,
     playback: Arc<AtomicI64>,
     widths: Vec<u32>,
     interval_ms: u32,
@@ -118,6 +122,7 @@ async fn run(
 ) {
     tokio::time::sleep(WARMUP).await;
     let subs = subtitles.as_ref();
+    let imgs = images.as_ref();
     let mut pending: Vec<u64> = Vec::new();
     loop {
         drain_into(&mut prio_rx, &mut pending);
@@ -132,7 +137,17 @@ async fn run(
 
         // 1. Priority: actively-watched items, expanded to their whole series.
         for id in pending.drain(..) {
-            generate_priority(id, &items, &cache, subs, &playback, &widths, interval_ms).await;
+            generate_priority(
+                id,
+                &items,
+                &cache,
+                subs,
+                imgs,
+                &playback,
+                &widths,
+                interval_ms,
+            )
+            .await;
         }
 
         // 2. General sweep, newest-first.
@@ -142,9 +157,29 @@ async fn run(
             // A show that starts playing mid-sweep preempts the rest.
             drain_into(&mut prio_rx, &mut pending);
             for id in pending.drain(..) {
-                generate_priority(id, &items, &cache, subs, &playback, &widths, interval_ms).await;
+                generate_priority(
+                    id,
+                    &items,
+                    &cache,
+                    subs,
+                    imgs,
+                    &playback,
+                    &widths,
+                    interval_ms,
+                )
+                .await;
             }
-            generate_item(item, &cache, subs, &playback, &widths, interval_ms, false).await;
+            generate_item(
+                item,
+                &cache,
+                subs,
+                imgs,
+                &playback,
+                &widths,
+                interval_ms,
+                false,
+            )
+            .await;
         }
 
         // 3. Sweep done — sleep until the next pass, but wake immediately if a
@@ -171,11 +206,13 @@ fn drain_into(rx: &mut mpsc::UnboundedReceiver<u64>, buf: &mut Vec<u64>) {
 
 /// Generate trickplay for `id` and, when it's an episode, every other item in
 /// the same series — the viewer will scrub the next episodes too.
+#[allow(clippy::too_many_arguments)]
 async fn generate_priority(
     id: u64,
     items: &[MediaItem],
     cache: &TrickplayCache,
     subs: Option<&SubtitleCache>,
+    imgs: Option<&ImageCache>,
     playback: &AtomicI64,
     widths: &[u32],
     interval_ms: u32,
@@ -185,7 +222,7 @@ async fn generate_priority(
     };
     // The seed is what the viewer is scrubbing right now: generate it first,
     // bypassing the playback-quiet gate so its previews appear mid-session.
-    generate_item(seed, cache, subs, playback, widths, interval_ms, true).await;
+    generate_item(seed, cache, subs, imgs, playback, widths, interval_ms, true).await;
     // Series siblings are "next up" — worth pre-warming, but they stay gated
     // so their bulk decode still yields to the active stream.
     if let Some(s) = seed.series.as_ref() {
@@ -197,17 +234,29 @@ async fn generate_priority(
                     series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
                 })
         }) {
-            generate_item(item, cache, subs, playback, widths, interval_ms, false).await;
+            generate_item(
+                item,
+                cache,
+                subs,
+                imgs,
+                playback,
+                widths,
+                interval_ms,
+                false,
+            )
+            .await;
         }
     }
 }
 
 /// Pre-build one item's derived assets, skipping anything already cached:
 /// trickplay sprites for each configured width, then its text subtitles.
+#[allow(clippy::too_many_arguments)]
 async fn generate_item(
     item: &MediaItem,
     cache: &TrickplayCache,
     subs: Option<&SubtitleCache>,
+    imgs: Option<&ImageCache>,
     playback: &AtomicI64,
     widths: &[u32],
     interval_ms: u32,
@@ -246,6 +295,27 @@ async fn generate_item(
         if !item.probe.subtitle_tracks.is_empty() {
             await_gate(bypass_gate, playback).await;
             crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
+            tokio::time::sleep(COOLDOWN).await;
+        }
+    }
+    // Warm embedded fonts (attachments) in one source open so an ASS
+    // subtitle's SubtitlesOctopus render doesn't stall on "Fetching assets"
+    // fetching each font cold. Only matters for titles that carry fonts.
+    if let Some(ic) = imgs {
+        if !item.probe.attachments.is_empty() {
+            await_gate(bypass_gate, playback).await;
+            let indices: Vec<u32> = item
+                .probe
+                .attachments
+                .iter()
+                .map(|a| a.stream_index)
+                .collect();
+            if let Err(e) = ic
+                .ensure_all_attachments(item.id, &item.path, &indices)
+                .await
+            {
+                tracing::warn!(error = %e, media.id = item.id, "font pre-extract failed");
+            }
             tokio::time::sleep(COOLDOWN).await;
         }
     }
