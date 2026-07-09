@@ -620,6 +620,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         spawn_for_roots(app_state.clone(), &scan_roots, watch_cfg, make_scanner)
     };
 
+    // Backfill the existing library's text subtitles into the persistent cache
+    // (playback-gated) so a viewer's first play of any already-indexed title
+    // finds warm subs, not a cold ~30 s whole-file demux. New/changed items are
+    // warmed at scan time; this covers everything already on disk.
+    pharos_server::library_watch::spawn_subtitle_warm_all(app_state.clone());
+
     let group_registry = web::Data::new(GroupRegistry::spawn());
     let token_resolver_data = web::Data::new(token_resolver);
 
