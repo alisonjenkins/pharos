@@ -62,13 +62,21 @@ async fn real_main() -> i32 {
             };
             bench(PathBuf::from(input)).await
         }
+        "probe" => {
+            let Some(input) = args.get(1) else {
+                eprintln!("usage: transcode-tool probe <input>");
+                return 2;
+            };
+            probe_one(PathBuf::from(input)).await
+        }
         _ => {
             eprintln!(
-                "transcode-tool <detect|run|stress|bench>\n  \
+                "transcode-tool <detect|run|stress|bench|probe>\n  \
                  detect                         list encoders + slot caps\n  \
                  run    <input> <output>        transcode one file\n  \
                  stress <input> [-n N] [--saturate]   N concurrent jobs\n  \
-                 bench  <input>                 per-device throughput"
+                 bench  <input>                 per-device throughput\n  \
+                 probe  <input>                 probe one file via the libav worker (dumps streams)"
             );
             2
         }
@@ -79,6 +87,54 @@ async fn real_main() -> i32 {
 fn parse_flag_usize(args: &[String], flag: &str) -> Option<usize> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1)?.parse().ok()
+}
+
+/// Probe ONE file through the exact deployed path — the libav worker pool —
+/// and dump the extracted streams. Purpose-built to confirm subtitle /
+/// attachment extraction on a single known file before committing to a
+/// whole-library scan. Exits 0 on success, 1 on probe failure.
+#[cfg(unix)]
+async fn probe_one(input: std::path::PathBuf) -> i32 {
+    let pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
+    let info = match pool.probe(&input).await {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("probe failed: {e}");
+            return 1;
+        }
+    };
+    let p = &info.probe;
+    println!("kind: {:?}", info.kind);
+    println!(
+        "container={:?} duration_ms={:?} {}x{}",
+        p.container,
+        p.duration_ms,
+        p.width.unwrap_or(0),
+        p.height.unwrap_or(0),
+    );
+    println!("video_codec={:?}", p.video_codec);
+    println!("audio_tracks: {}", p.audio_tracks.len());
+    for a in &p.audio_tracks {
+        println!(
+            "  [a] idx={} codec={:?} ch={:?} lang={:?} title={:?} default={}",
+            a.stream_index, a.codec, a.channels, a.language, a.title, a.is_default,
+        );
+    }
+    println!("subtitle_tracks: {}", p.subtitle_tracks.len());
+    for s in &p.subtitle_tracks {
+        println!(
+            "  [s] idx={} codec={:?} lang={:?} title={:?} default={} forced={}",
+            s.stream_index, s.codec, s.language, s.title, s.is_default, s.is_forced,
+        );
+    }
+    println!("attachments: {}", p.attachments.len());
+    for at in &p.attachments {
+        println!(
+            "  [t] idx={} codec={:?} filename={:?} mime={:?}",
+            at.stream_index, at.codec, at.filename, at.mime_type,
+        );
+    }
+    0
 }
 
 #[cfg(unix)]
