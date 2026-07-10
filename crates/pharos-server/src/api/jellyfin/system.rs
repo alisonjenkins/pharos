@@ -60,7 +60,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/localization/options", web::get().to(localization_options))
         // Per-client device listing — admin dashboard reads this.
         .route("/devices", web::get().to(devices_list))
+        .route("/devices", web::delete().to(delete_device))
         .route("/devices/info", web::get().to(devices_list))
+        .route("/devices/options", web::post().to(device_options))
         // MediaSegments (intro/outro skip) — empty stub keeps the
         // client's pre-playback fetch from cascading 404s.
         .route(
@@ -502,9 +504,18 @@ async fn devices_list(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         for t in tokens {
+            // Operator-set custom name (POST /Devices/Options), else the id.
+            let display_name = state
+                .stores
+                .load_named_config(&format!("devname:{}", t.device_id))
+                .await
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| t.device_id.clone());
             items.push(serde_json::json!({
                 "Id": t.device_id,
-                "Name": t.device_id, // No DeviceName stored — phase 2.
+                "Name": display_name,
                 "AppName": "Jellyfin",
                 "AppVersion": "0",
                 "LastUserId": u.id.0.simple().to_string(),
@@ -519,6 +530,78 @@ async fn devices_list(
         "TotalRecordCount": total,
         "StartIndex": 0,
     })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DeviceIdQuery {
+    id: Option<String>,
+}
+
+/// `DELETE /Devices?id={deviceId}` — the dashboard "delete device" button.
+/// Revokes every token issued to that device id (across all users), kicking
+/// the device: its next request 401s and it must re-authenticate.
+async fn delete_device(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<DeviceIdQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::UserStore;
+    if !user.0.policy.admin {
+        return Err(error::ErrorForbidden("admin required"));
+    }
+    let device_id =
+        q.id.as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
+    let users = state
+        .stores
+        .list()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut revoked = 0u64;
+    for u in users {
+        revoked += state
+            .stores
+            .revoke_tokens_by_device(u.id, device_id)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    }
+    tracing::info!(device_id, revoked, "device deleted (tokens revoked)");
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct DeviceOptionsBody {
+    custom_name: Option<String>,
+}
+
+/// `POST /Devices/Options?id={deviceId}` — persist an operator-set display
+/// name for a device (shown in the devices list). Stored via named_config
+/// (`devname:{id}`). Empty name clears the override.
+async fn device_options(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<DeviceIdQuery>,
+    body: Option<web::Json<DeviceOptionsBody>>,
+) -> Result<impl Responder, actix_web::Error> {
+    if !user.0.policy.admin {
+        return Err(error::ErrorForbidden("admin required"));
+    }
+    let device_id =
+        q.id.as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
+    let name = body
+        .and_then(|b| b.into_inner().custom_name)
+        .unwrap_or_default();
+    state
+        .stores
+        .set_named_config(&format!("devname:{device_id}"), name.trim())
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 async fn media_segments_stub(

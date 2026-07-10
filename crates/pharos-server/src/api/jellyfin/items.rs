@@ -88,6 +88,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             web::get().to(environment_directory_contents),
         )
         .route("/library/mediafolders", web::get().to(media_folders))
+        .route("/items/{id}/refresh", web::post().to(refresh_item))
         .route("/items/{id}/playbackinfo", web::get().to(playback_info))
         .route("/items/{id}/playbackinfo", web::post().to(playback_info));
 
@@ -4172,6 +4173,38 @@ async fn remove_virtual_folder(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     reload_libraries_and_backfill(&state).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `POST /Items/{id}/Refresh` — the metadata-editor "Refresh" button + the
+/// context-menu "Refresh metadata". jellyfin-web re-fetches from providers;
+/// pharos has no online providers, so a refresh = re-PROBE the item's file
+/// (force-bypassing the incremental `(mtime,size)` skip) so a changed file or
+/// a probe-schema bump is picked up, plus a re-read of its NFO/sidecars. Kicks
+/// a background force-scan of the item's parent directory and returns 204.
+async fn refresh_item(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    use pharos_core::MediaStore;
+    let id: u64 = path
+        .into_inner()
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    // Scan the item's parent directory (force) so its file is re-probed. The
+    // walk skips unchanged siblings quickly; only the target (and any genuinely
+    // changed sibling) is re-read.
+    let Some(dir) = item.path.parent().map(std::path::Path::to_path_buf) else {
+        return Err(error::ErrorInternalServerError("item has no parent dir"));
+    };
+    tracing::info!(media.id = id, dir = %dir.display(), "item refresh requested");
+    spawn_scan(state.into_inner(), vec![dir], true);
     Ok(HttpResponse::NoContent().finish())
 }
 

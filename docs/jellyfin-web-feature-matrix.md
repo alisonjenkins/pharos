@@ -133,7 +133,7 @@ jellyfin-web: `src/components/{metadataEditor,itemidentifier,imageeditor,imageDo
 |---|---|---|---|---|
 | Edit item fields | `metadataEditor/` | `POST Items/{id}` | MISSING | `item_content_type` *(T76)* covers ContentType (accepted; kind stays probe-derived); edit-item tracked with T67 |
 | Identify / remote search | `itemidentifier/` | `GET Items/{id}/ExternalIdInfos`, `POST Items/RemoteSearch/{type}`, `POST Items/RemoteSearch/Apply/{id}` | MISSING | *(T67 backlog)* |
-| Refresh metadata | `refreshdialog/` | `POST Items/{id}/Refresh` | THIN | — |
+| Refresh metadata | `refreshdialog/` | `POST Items/{id}/Refresh` | DONE (re-probes file) | — |
 | Image editor (delete/reorder) | `imageeditor/` | `GET Items/{id}/Images`, `DELETE .../{type}/{index}`, `POST .../{type}/{index}/Index` | PARTIAL (local image CRUD tracked separately) | `remote_image_search` *(T76)* |
 | Remote image search/download | `imageDownloader/` | `GET Items/{id}/RemoteImages`, `POST .../RemoteImages/Download` | MISSING | `remote_image_search` *(T76)* — empty (no providers) |
 
@@ -226,7 +226,7 @@ Each page reads `GET System/Configuration/{key}` and writes
 | Plugin install / packages | `plugins/plugin.tsx` | `GET Packages`, `POST Packages/Installed/{name}` | MISSING | `plugins_install` *(T75, ignored)* |
 | Activity log | `activity/index.tsx` | `GET System/ActivityLog/Entries` | THIN (in-memory, records logins; not persisted) | `activity_log_entries` |
 | Logs | `logs/index.tsx` | `GET System/Logs[/Log]` | DONE (T62) | — |
-| Devices | `devices/index.tsx` | `GET Devices`, `POST Devices/Options`, `DELETE Devices` | THIN | — |
+| Devices | `devices/index.tsx` | `GET Devices`, `POST Devices/Options`, `DELETE Devices` | DONE (list/rename/revoke) | — |
 | Branding (runtime) | `branding/index.tsx` | `GET Branding/Configuration`, `POST System/Configuration` | DONE (T65) | — |
 | Backups | `backups/index.tsx` | `GET/POST Backup*` | THIN | — |
 | Notifications | `dashboard/notifications` | `GET Notifications/{Types,Services}` | THIN (stub) | — |
