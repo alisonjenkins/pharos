@@ -159,6 +159,12 @@ async fn handle_connection<S>(
         member_name.clone(),
         out_tx.clone(),
     );
+    tracing::info!(
+        device_id = %device_key,
+        %member_id,
+        user = %member_name,
+        "syncplay: /socket connected + registered in hub"
+    );
     // Jellyfin-wire context derived from the ServerMsg stream: the current
     // group id (from `Joined`) and the current queue item's PlaylistItemId
     // (from `PlayQueue`), both needed to shape outbound commands.
@@ -285,6 +291,7 @@ async fn handle_connection<S>(
     // belonged to (the HTTP path stores it in the hub, the WS path in
     // `current_group` — union the two so neither leaks a ghost member).
     let hub_group = hub.deregister(&device_key);
+    tracing::info!(device_id = %device_key, %member_id, "syncplay: /socket disconnected");
     for h in current_group.take().into_iter().chain(hub_group) {
         let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
     }
