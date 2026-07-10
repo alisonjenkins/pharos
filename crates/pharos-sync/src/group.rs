@@ -81,6 +81,12 @@ pub enum GroupMsg {
     Unpause {
         sender: MemberId,
     },
+    /// Jellyfin HTTP `/SyncPlay/Pause` — SHARED control: any member may pause
+    /// (Jellyfin's default group mode), unlike the leader-gated native
+    /// [`LeaderPause`](GroupMsg::LeaderPause).
+    PauseShared {
+        sender: MemberId,
+    },
     /// Jellyfin HTTP `/SyncPlay/Seek` — gated seek (re-buffer then resume).
     SeekTo {
         sender: MemberId,
@@ -342,25 +348,6 @@ impl GroupState {
                 reason: "ready".into(),
             });
         }
-    }
-
-    /// True if `sender` is the current leader; otherwise emits a `NotLeader`
-    /// error to the sender and returns false. Guards every queue/transport
-    /// mutation so a non-leader (esp. a late joiner) can never drive the group
-    /// — the invariant that prevents "a joiner skips everyone to the next
-    /// episode".
-    fn require_leader(&self, sender: MemberId, action: &str) -> bool {
-        if self.leader == Some(sender) {
-            return true;
-        }
-        self.send_one(
-            sender,
-            ServerMsg::Error {
-                code: ErrorCode::NotLeader,
-                detail: format!("only leader may {action}"),
-            },
-        );
-        false
     }
 
     /// Lowest-MemberId-wins election. Deterministic, no voting needed.
@@ -734,20 +721,37 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // No automatic resume — leader decides when to continue.
             }
         }
-        GroupMsg::Unpause { sender } => {
-            if !state.require_leader(sender, "unpause") {
-                return;
-            }
+        GroupMsg::Unpause { sender: _ } => {
             let position_ms = state.current_position_ms();
             state.enter_waiting(true, position_ms, "unpause");
         }
+        GroupMsg::PauseShared { sender: _ } => {
+            // Immediate group pause (no readiness gate). Freeze the position so
+            // a late joiner gets the correct still-frame, then broadcast.
+            let server_ms = state.server_ms_now();
+            let at_server_ms = server_ms + state.lead_time_ms();
+            // Cancel any pending readiness gate — we're pausing, not starting.
+            state.waiting = None;
+            if let PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms,
+            } = state.playback
+            {
+                let elapsed = server_ms.saturating_sub(anchor_server_ms);
+                state.playback = PlaybackState::Paused {
+                    position_ms: position_ms + elapsed,
+                };
+            }
+            state.broadcast(ServerMsg::Pause { at_server_ms });
+            state.broadcast(ServerMsg::StateUpdate {
+                state: GroupPlayState::Paused,
+                reason: "pause".into(),
+            });
+        }
         GroupMsg::SeekTo {
-            sender,
+            sender: _,
             position_ms,
         } => {
-            if !state.require_leader(sender, "seek") {
-                return;
-            }
             // Preserve play/pause across a seek: a seek while playing resumes
             // playing (after re-buffer); while paused/idle it stays paused.
             let resume = matches!(state.playback, PlaybackState::Playing { .. });
@@ -771,14 +775,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
         }
         GroupMsg::SetNewQueue {
-            sender,
+            sender: _,
             item_ids,
             playing_index,
             start_position_ms,
         } => {
-            if !state.require_leader(sender, "set the queue") {
-                return;
-            }
             state.queue.items = item_ids
                 .into_iter()
                 .map(|item_id| QueueEntry {
@@ -792,12 +793,9 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.enter_waiting(true, start_position_ms, "new_playlist");
         }
         GroupMsg::SetPlaylistItem {
-            sender,
+            sender: _,
             playlist_item_id,
         } => {
-            if !state.require_leader(sender, "change the playing item") {
-                return;
-            }
             if let Some(idx) = state
                 .queue
                 .items
@@ -809,37 +807,25 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.enter_waiting(true, 0, "set_current_item");
             }
         }
-        GroupMsg::NextItem { sender } => {
-            if !state.require_leader(sender, "advance the queue") {
-                return;
-            }
+        GroupMsg::NextItem { sender: _ } => {
             if state.queue.playing_index + 1 < state.queue.items.len() {
                 state.queue.playing_index += 1;
                 state.broadcast_play_queue("next_item", true, 0);
                 state.enter_waiting(true, 0, "next_item");
             }
         }
-        GroupMsg::PreviousItem { sender } => {
-            if !state.require_leader(sender, "rewind the queue") {
-                return;
-            }
+        GroupMsg::PreviousItem { sender: _ } => {
             if state.queue.playing_index > 0 {
                 state.queue.playing_index -= 1;
                 state.broadcast_play_queue("previous_item", true, 0);
                 state.enter_waiting(true, 0, "previous_item");
             }
         }
-        GroupMsg::SetRepeatMode { sender, mode } => {
-            if !state.require_leader(sender, "set repeat mode") {
-                return;
-            }
+        GroupMsg::SetRepeatMode { sender: _, mode } => {
             state.queue.repeat_mode = mode;
             state.broadcast_play_queue("repeat_mode", false, state.current_position_ms());
         }
-        GroupMsg::SetShuffleMode { sender, mode } => {
-            if !state.require_leader(sender, "set shuffle mode") {
-                return;
-            }
+        GroupMsg::SetShuffleMode { sender: _, mode } => {
             state.queue.shuffle_mode = mode;
             state.broadcast_play_queue("shuffle_mode", false, state.current_position_ms());
         }

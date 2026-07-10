@@ -275,7 +275,7 @@ async fn unpause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse 
 
 async fn pause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
     dispatch(&hub, auth.device_id.as_deref(), "pause", |mid| {
-        GroupMsg::LeaderPause { sender: mid }
+        GroupMsg::PauseShared { sender: mid }
     })
     .await
 }

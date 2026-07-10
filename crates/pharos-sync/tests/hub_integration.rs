@@ -237,7 +237,9 @@ async fn late_joiner_does_not_advance_the_queue() {
         other => panic!("joiner should receive PlayQueue, got {other:?}"),
     }
 
-    // The joiner (non-leader) cannot advance the group.
+    // Shared control (Jellyfin default): ANY member may advance the queue — the
+    // join above was passive (didn't advance), but an EXPLICIT NextItem from any
+    // member now moves the whole group to item 1.
     handle
         .tx
         .send(GroupMsg::NextItem {
@@ -245,9 +247,18 @@ async fn late_joiner_does_not_advance_the_queue() {
         })
         .await
         .unwrap();
-    let err = recv_until(&mut c, |m| matches!(m, ServerMsg::Error { .. })).await;
+    let adv = recv_until(&mut a, |m| {
+        matches!(
+            m,
+            ServerMsg::PlayQueue {
+                playing_index: 1,
+                ..
+            }
+        )
+    })
+    .await;
     assert!(
-        matches!(err, Some(ServerMsg::Error { .. })),
-        "non-leader NextItem is rejected, got {err:?}"
+        adv.is_some(),
+        "an explicit NextItem from any member advances the group to item 1"
     );
 }
