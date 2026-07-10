@@ -270,11 +270,6 @@ where
     }
 }
 
-/// Concurrency ceiling for scan-time subtitle extraction. Small on purpose:
-/// each task does a whole-file NFS read, and the crash-loop taught us that
-/// fanning those out unbounded starves live segment transcoding.
-const SUBTITLE_WARM_CONCURRENCY: usize = 3;
-
 /// Pre-extract the text subtitles of the freshly added/updated items into the
 /// (persistent) subtitle cache, so a viewer's first Stream.vtt / Stream.js /
 /// Stream.ass fetch is a warm-cache hit instead of a cold ~30 s demux.
@@ -287,15 +282,12 @@ async fn warm_scanned_subtitles(state: &AppState, outcome: &pharos_core::ScanOut
         .collect();
     // Scan-context: these files were just read anyway, so don't park on the
     // playback gate — warm them promptly.
-    warm_item_subtitles(state, ids, None, "scan-time").await;
+    warm_item_subtitles(state, ids, true, "scan-time").await;
 }
 
 /// Delay before the startup library-wide subtitle warm begins, so it doesn't
 /// pile onto boot I/O.
 const WARM_ALL_DELAY: Duration = Duration::from_secs(60);
-/// How long playback must be quiet before the bulk warm reads another file, so
-/// its whole-file demuxes never starve a live stream.
-const WARM_GATE_QUIET_SECS: i64 = 20;
 
 /// Spawn a one-shot, playback-gated pass that warms EVERY already-indexed
 /// item's text subtitles into the persistent cache. Scan-time warming only
@@ -321,8 +313,7 @@ pub fn spawn_subtitle_warm_all(state: web::Data<AppState>) {
                 return;
             }
         };
-        let playback = state.playback_activity.clone();
-        warm_item_subtitles(&state, ids, Some(playback), "library warm-all").await;
+        warm_item_subtitles(&state, ids, true, "library warm-all").await;
     });
 }
 
@@ -336,20 +327,19 @@ pub fn spawn_warm_item_subtitles(state: web::Data<AppState>, id: u64) {
         return;
     }
     tokio::spawn(async move {
-        warm_item_subtitles(&state, vec![id], None, "playback priority").await;
+        warm_item_subtitles(&state, vec![id], false, "playback priority").await;
     });
 }
 
-/// Warm the given items' text subtitles into the cache, at most
-/// [`SUBTITLE_WARM_CONCURRENCY`] whole-file demuxes at once. When `gate` is
-/// `Some`, each task parks until live playback has been quiet, so a bulk
-/// backfill never steals NFS bandwidth from an active stream.
-async fn warm_item_subtitles(
-    state: &AppState,
-    ids: Vec<u64>,
-    gate: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
-    why: &str,
-) {
+/// Warm the given items' text subtitles into the cache. Each whole-file demux
+/// is a heavy NFS read, so when `throttle` is set every task takes a permit
+/// from the shared adaptive [`AppState::bg_io`] gate — which the regulator
+/// squeezes down to a trickle whenever a client is streaming, so a bulk warm
+/// (scan-time / library-wide) keeps making progress but never starves a live
+/// stream. `throttle = false` bypasses the gate for the single item being
+/// actively played (its subs must warm promptly before the viewer toggles
+/// them — see [`spawn_warm_item_subtitles`]).
+async fn warm_item_subtitles(state: &AppState, ids: Vec<u64>, throttle: bool, why: &str) {
     use pharos_core::MediaStore;
     let Some(cache) = state.subtitles.clone() else {
         return;
@@ -358,18 +348,19 @@ async fn warm_item_subtitles(
         return;
     }
     let started = std::time::Instant::now();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SUBTITLE_WARM_CONCURRENCY));
     let mut tasks = Vec::with_capacity(ids.len());
     for id in ids {
         let cache = cache.clone();
         let stores = state.stores.clone();
-        let sem = sem.clone();
-        let gate = gate.clone();
+        // The adaptive gate replaces both the old fixed warm-concurrency cap
+        // and the all-or-nothing playback quiet-gate: it bounds concurrency
+        // AND yields to playback, in one primitive.
+        let bg = throttle.then(|| state.bg_io.clone());
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            if let Some(pb) = gate.as_ref() {
-                await_playback_quiet_secs(pb, WARM_GATE_QUIET_SECS).await;
-            }
+            let _permit = match &bg {
+                Some(sem) => sem.clone().acquire_owned().await.ok(),
+                None => None,
+            };
             match stores.get(id).await {
                 Ok(item) if !item.probe.subtitle_tracks.is_empty() => {
                     crate::api::jellyfin::subtitles::pre_extract_subtitles(&cache, &item).await;
@@ -388,23 +379,6 @@ async fn warm_item_subtitles(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "subtitle warm pass complete"
     );
-}
-
-/// Park until `playback` (unix-seconds of last live-segment activity) has been
-/// idle for `quiet_secs`. Mirrors the trickplay backfill's yield-to-playback
-/// gate so bulk subtitle demuxes don't contend with live streaming.
-async fn await_playback_quiet_secs(playback: &std::sync::atomic::AtomicI64, quiet_secs: i64) {
-    use std::sync::atomic::Ordering;
-    loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if now.saturating_sub(playback.load(Ordering::Relaxed)) >= quiet_secs {
-            return;
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
 }
 
 /// Relay a [`pharos_core::ScanOutcome`] to connected `/socket` clients. An

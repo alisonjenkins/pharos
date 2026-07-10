@@ -613,6 +613,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         };
         let rate_limit_ms = cfg.server.scan_rate_limit_ms;
         let probe_concurrency = cfg.server.scan_probe_concurrency;
+        // Adaptive backpressure — the periodic incremental rescan draws its
+        // probe reads through the same shared I/O gate the server shrinks
+        // during live playback, so it paces itself down while streaming.
+        let io_gate = app_state.bg_io.clone();
         // P48 — same prober selection as the CLI scan + admin refresh paths.
         // The closure builds a fresh owned scanner per root (each spawned task
         // owns its own — the prober isn't required to be Clone).
@@ -622,12 +626,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
                     .with_rate_limit_ms(rate_limit_ms)
                     .with_probe_concurrency_opt(probe_concurrency)
+                    .with_io_gate(io_gate.clone())
             }
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
             {
                 pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
                     .with_rate_limit_ms(rate_limit_ms)
                     .with_probe_concurrency_opt(probe_concurrency)
+                    .with_io_gate(io_gate.clone())
             }
         };
         spawn_for_roots(app_state.clone(), &scan_roots, watch_cfg, make_scanner)
@@ -637,6 +643,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // (playback-gated) so a viewer's first play of any already-indexed title
     // finds warm subs, not a cold ~30 s whole-file demux. New/changed items are
     // warmed at scan time; this covers everything already on disk.
+    // Adaptive background-I/O regulator: throttles scan probes + subtitle
+    // warm-demuxes down to a trickle while a client is streaming so they never
+    // starve live playback, then reopens when quiet.
+    pharos_server::state::AppState::spawn_bg_io_regulator(app_state.clone().into_inner());
     pharos_server::library_watch::spawn_subtitle_warm_all(app_state.clone());
 
     let group_registry = web::Data::new(GroupRegistry::spawn());

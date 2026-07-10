@@ -4490,16 +4490,23 @@ pub(crate) fn spawn_scan(
         // ships no `ffprobe` binary, so `FfmpegProber` would fail every probe);
         // the spawn build keeps `FfmpegProber`. `force` bypasses the
         // incremental `(mtime,size)` skip to re-probe every file.
+        // Adaptive backpressure — draw every probe read through the shared I/O
+        // gate the server shrinks during live playback, so this background
+        // re-scan paces itself down to a trickle while streaming instead of
+        // saturating shared storage (the failure mode that stalled playback),
+        // yet never fully pauses.
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
         let scanner =
             pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
+                .with_io_gate(state.bg_io.clone())
                 .with_force(force);
         #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
         let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
             .with_rate_limit_ms(state.scan_rate_limit_ms)
             .with_probe_concurrency_opt(state.scan_probe_concurrency)
+            .with_io_gate(state.bg_io.clone())
             .with_force(force);
         let mut added: Vec<pharos_core::MediaId> = Vec::new();
         let mut removed: Vec<pharos_core::MediaId> = Vec::new();
