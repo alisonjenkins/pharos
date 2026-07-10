@@ -127,6 +127,11 @@ fn build_app(
 > {
     App::new()
         .app_data(state)
+        // SyncPlay handlers extract these; without them a missing-Data 500
+        // would beat the pending 401 (extractors resolve in arg order), so the
+        // auth audit for /SyncPlay/* needs them present to see the real 401.
+        .app_data(web::Data::new(pharos_sync::GroupRegistry::spawn()))
+        .app_data(web::Data::new(pharos_sync::SessionHub::new()))
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
 }

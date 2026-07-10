@@ -62,6 +62,7 @@ fn build_app(
     App::new()
         .app_data(state)
         .app_data(reg)
+        .app_data(web::Data::new(pharos_sync::SessionHub::new()))
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
 }

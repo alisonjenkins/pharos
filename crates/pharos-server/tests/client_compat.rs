@@ -68,6 +68,7 @@ async fn boot_server() -> (TestServer, String) {
         App::new()
             .app_data(state.clone())
             .app_data(registry.clone())
+            .app_data(web::Data::new(pharos_sync::SessionHub::new()))
             .wrap(LowercasePath)
             .configure(jellyfin::configure)
     });

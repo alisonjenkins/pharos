@@ -1,41 +1,319 @@
-//! Jellyfin `/SyncPlay/*` HTTP surface.
+//! Jellyfin `/SyncPlay/*` HTTP surface — the command channel stock
+//! jellyfin-web (and every official Jellyfin client) uses to drive group
+//! watch. Commands arrive as HTTP POSTs identified by the caller's `deviceId`;
+//! the resulting playback commands + group updates flow back to each member
+//! over `/socket`.
 //!
-//! Group-watch UI in jellyfin-web fetches `GET /SyncPlay/List` the
-//! moment the user clicks the group icon. Without a route there, the
-//! 404 surfaces as "Error" in the UI and the panel never renders.
-//!
-//! The real SyncPlay protocol flows over the `/socket` WebSocket
-//! (T16 / T17) — these HTTP endpoints keep jellyfin-web's REST
-//! polling happy and expose the group list so the dropdown can show
-//! existing groups before the user joins one.
+//! Each handler resolves the caller's session via the [`SessionHub`] (keyed by
+//! `deviceId`), sends the matching [`GroupMsg`] to the group actor, and returns
+//! `204` — matching Jellyfin, whose HTTP responses are empty and whose real
+//! work rides the WebSocket. A caller with no registered socket, or not in a
+//! group, is a `204` no-op.
 
-use crate::api::jellyfin::auth_extractor::AuthUser;
+use crate::api::jellyfin::auth_extractor::{AuthSession, AuthUser};
 use actix_web::{web, HttpResponse, Responder};
-use pharos_sync::GroupRegistry;
-use serde::Serialize;
+use pharos_sync::group::{GroupHandle, GroupMsg};
+use pharos_sync::messages::{GroupId, MemberId};
+use pharos_sync::{GroupRegistry, SessionHub};
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
+const POSITION_TICKS_PER_MS: u64 = 10_000;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: paths registered lowercase; `LowercasePath` middleware
     // folds jellyfin-web's PascalCase requests before routing.
     cfg.route("/syncplay/list", web::get().to(list_groups))
-        .route("/syncplay/new", web::post().to(no_op_204))
-        .route("/syncplay/join", web::post().to(no_op_204))
-        .route("/syncplay/leave", web::post().to(no_op_204))
-        .route("/syncplay/setnewqueue", web::post().to(no_op_204))
-        .route("/syncplay/buffering", web::post().to(no_op_204))
-        .route("/syncplay/ready", web::post().to(no_op_204))
-        .route("/syncplay/pause", web::post().to(no_op_204))
-        .route("/syncplay/unpause", web::post().to(no_op_204))
-        .route("/syncplay/seek", web::post().to(no_op_204))
+        .route("/syncplay/new", web::post().to(new_group))
+        .route("/syncplay/join", web::post().to(join_group))
+        .route("/syncplay/leave", web::post().to(leave_group))
+        .route("/syncplay/setnewqueue", web::post().to(set_new_queue))
+        .route("/syncplay/buffering", web::post().to(buffering))
+        .route("/syncplay/ready", web::post().to(ready))
+        .route("/syncplay/pause", web::post().to(pause))
+        .route("/syncplay/unpause", web::post().to(unpause))
+        .route("/syncplay/seek", web::post().to(seek))
+        .route(
+            "/syncplay/setplaylistitem",
+            web::post().to(set_playlist_item),
+        )
+        .route("/syncplay/nextitem", web::post().to(next_item))
+        .route("/syncplay/previousitem", web::post().to(previous_item))
+        .route("/syncplay/setrepeatmode", web::post().to(set_repeat_mode))
+        .route("/syncplay/setshufflemode", web::post().to(set_shuffle_mode))
+        // Not yet modelled by the engine — accept + ignore so the client's
+        // flow isn't broken by a 404.
         .route("/syncplay/moveplaylistitem", web::post().to(no_op_204))
-        .route("/syncplay/setignorewait", web::post().to(no_op_204))
-        .route("/syncplay/nextitem", web::post().to(no_op_204))
-        .route("/syncplay/previousitem", web::post().to(no_op_204))
-        .route("/syncplay/setplaylistitem", web::post().to(no_op_204))
         .route("/syncplay/removefromplaylist", web::post().to(no_op_204))
-        .route("/syncplay/setrepeatmode", web::post().to(no_op_204))
-        .route("/syncplay/setshufflemode", web::post().to(no_op_204))
+        .route("/syncplay/setignorewait", web::post().to(no_op_204))
         .route("/syncplay/ping", web::post().to(no_op_204));
+}
+
+fn no_content() -> HttpResponse {
+    HttpResponse::NoContent().finish()
+}
+
+/// Resolve the caller's group and send it a `GroupMsg` built from the caller's
+/// member id. The common shape of every command handler: no device / no socket
+/// / not in a group all collapse to a `204` no-op.
+async fn dispatch(
+    hub: &SessionHub,
+    device_id: Option<&str>,
+    make: impl FnOnce(MemberId) -> GroupMsg,
+) -> HttpResponse {
+    if let Some(dev) = device_id {
+        if let Some(sess) = hub.resolve(dev) {
+            if let Some(h) = sess.group {
+                let _ = h.tx.send(make(sess.member_id)).await;
+            }
+        }
+    }
+    no_content()
+}
+
+/// Add the caller (from the hub) to `handle` as a member. Shared by New + Join.
+async fn add_caller_to_group(hub: &SessionHub, device_id: &str, handle: GroupHandle) {
+    let Some(sess) = hub.resolve(device_id) else {
+        return;
+    };
+    // Record the group before AddMember so the wall-clock epoch is available
+    // the instant the first catch-up command is broadcast to the socket.
+    hub.attach_group(device_id, handle.clone());
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if handle
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: sess.member_id,
+            name: sess.name,
+            sink: sess.sink,
+            reply: reply_tx,
+        })
+        .await
+        .is_ok()
+    {
+        let _ = reply_rx.await;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct JoinGroupBody {
+    group_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SetNewQueueBody {
+    #[serde(default)]
+    playing_queue: Vec<String>,
+    #[serde(default)]
+    playing_item_position: usize,
+    #[serde(default)]
+    start_position_ticks: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SeekBody {
+    #[serde(default)]
+    position_ticks: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReadyBody {
+    #[serde(default)]
+    position_ticks: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SetPlaylistItemBody {
+    playlist_item_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ModeBody {
+    #[serde(default)]
+    mode: String,
+}
+
+async fn new_group(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+) -> HttpResponse {
+    let Some(dev) = auth.device_id.as_deref() else {
+        return no_content();
+    };
+    let Ok(handle) = registry.create().await else {
+        return no_content();
+    };
+    add_caller_to_group(&hub, dev, handle).await;
+    no_content()
+}
+
+async fn join_group(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    body: web::Json<JoinGroupBody>,
+) -> HttpResponse {
+    let Some(dev) = auth.device_id.as_deref() else {
+        return no_content();
+    };
+    let Ok(handle) = registry.get_or_create(GroupId(body.group_id)).await else {
+        return no_content();
+    };
+    add_caller_to_group(&hub, dev, handle).await;
+    no_content()
+}
+
+async fn leave_group(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+    if let Some(dev) = auth.device_id.as_deref() {
+        if let Some(sess) = hub.resolve(dev) {
+            if let Some(h) = hub.detach_group(dev) {
+                let _ =
+                    h.tx.send(GroupMsg::RemoveMember {
+                        member_id: sess.member_id,
+                    })
+                    .await;
+            }
+        }
+    }
+    no_content()
+}
+
+async fn set_new_queue(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<SetNewQueueBody>,
+) -> HttpResponse {
+    let body = body.into_inner();
+    let start_ms = body.start_position_ticks / POSITION_TICKS_PER_MS;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::SetNewQueue {
+            sender: mid,
+            item_ids: body.playing_queue,
+            playing_index: body.playing_item_position,
+            start_position_ms: start_ms,
+        }
+    })
+    .await
+}
+
+async fn unpause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+    dispatch(&hub, auth.device_id.as_deref(), |mid| GroupMsg::Unpause {
+        sender: mid,
+    })
+    .await
+}
+
+async fn pause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+    dispatch(&hub, auth.device_id.as_deref(), |mid| {
+        GroupMsg::LeaderPause { sender: mid }
+    })
+    .await
+}
+
+async fn seek(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<SeekBody>,
+) -> HttpResponse {
+    let pos = body.position_ticks / POSITION_TICKS_PER_MS;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::SeekTo {
+            sender: mid,
+            position_ms: pos,
+        }
+    })
+    .await
+}
+
+async fn buffering(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<ReadyBody>,
+) -> HttpResponse {
+    let pos = body.position_ticks / POSITION_TICKS_PER_MS;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::BufferingStart {
+            member_id: mid,
+            position_ms: pos,
+        }
+    })
+    .await
+}
+
+async fn ready(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<ReadyBody>,
+) -> HttpResponse {
+    let pos = body.position_ticks / POSITION_TICKS_PER_MS;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::MemberReady {
+            member_id: mid,
+            position_ms: pos,
+        }
+    })
+    .await
+}
+
+async fn set_playlist_item(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<SetPlaylistItemBody>,
+) -> HttpResponse {
+    let pli = body.into_inner().playlist_item_id;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::SetPlaylistItem {
+            sender: mid,
+            playlist_item_id: pli,
+        }
+    })
+    .await
+}
+
+async fn next_item(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+    dispatch(&hub, auth.device_id.as_deref(), |mid| GroupMsg::NextItem {
+        sender: mid,
+    })
+    .await
+}
+
+async fn previous_item(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+    dispatch(&hub, auth.device_id.as_deref(), |mid| {
+        GroupMsg::PreviousItem { sender: mid }
+    })
+    .await
+}
+
+async fn set_repeat_mode(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<ModeBody>,
+) -> HttpResponse {
+    let mode = body.into_inner().mode;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::SetRepeatMode { sender: mid, mode }
+    })
+    .await
+}
+
+async fn set_shuffle_mode(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<ModeBody>,
+) -> HttpResponse {
+    let mode = body.into_inner().mode;
+    dispatch(&hub, auth.device_id.as_deref(), move |mid| {
+        GroupMsg::SetShuffleMode { sender: mid, mode }
+    })
+    .await
 }
 
 /// Jellyfin's `GroupInfoDto` shape. Only the fields jellyfin-web reads
@@ -67,18 +345,17 @@ async fn list_groups(_user: AuthUser, registry: web::Data<GroupRegistry>) -> imp
         let Some(snap) = h.snapshot().await else {
             continue;
         };
+        use pharos_sync::messages::GroupPlayState;
+        let state = match snap.play_state {
+            GroupPlayState::Idle => "Idle",
+            GroupPlayState::Waiting => "Waiting",
+            GroupPlayState::Playing => "Playing",
+            GroupPlayState::Paused => "Paused",
+        };
         out.push(GroupInfoDto {
             group_id: snap.id.to_string(),
             group_name: format!("Group {}", snap.id),
-            // Snapshot doesn't currently expose play/pause state at
-            // the HTTP level; surface the count signals so the
-            // dropdown can render a label. Real state still flows
-            // via /socket SyncPlayGroupUpdate.
-            state: if snap.buffering_member_count > 0 {
-                "Waiting"
-            } else {
-                "Idle"
-            },
+            state,
             // Member ids; richer display-name lives over the socket.
             participants: (0..snap.member_count)
                 .map(|i| format!("member-{i}"))
@@ -95,11 +372,11 @@ async fn no_op_204(_user: AuthUser) -> impl Responder {
 
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    format!("{secs}")
+    crate::api::jellyfin::dto::format_iso8601_ms(ms)
 }
 
 #[cfg(test)]
