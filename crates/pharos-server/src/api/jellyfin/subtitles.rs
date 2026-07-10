@@ -974,7 +974,7 @@ fn is_styled_text_subtitle_codec(codec: &str) -> bool {
 /// these to text-WebVTT (they're rasters); attempts produce empty
 /// or malformed output. Refused with 415 so the client doesn't
 /// mistake an empty track for a working one.
-fn is_image_subtitle_codec(codec: &str) -> bool {
+pub(crate) fn is_image_subtitle_codec(codec: &str) -> bool {
     matches!(
         codec.to_ascii_lowercase().as_str(),
         "hdmv_pgs_subtitle"

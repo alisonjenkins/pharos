@@ -596,6 +596,14 @@ async fn firefox_webm_url_forwards_audio_and_subtitle_index() {
                 container: Some("matroska".into()),
                 video_codec: Some("hevc".into()),
                 audio_codec: Some("aac".into()),
+                // Stream 3 = image sub (PGS): must burn, so its index rides the
+                // transcode URL. (A text sub would be delivered External and its
+                // index withheld — see jellyfin_playbackinfo_stream_selection.)
+                subtitle_tracks: vec![pharos_core::SubtitleTrack {
+                    stream_index: 3,
+                    codec: Some("hdmv_pgs_subtitle".into()),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             ..Default::default()

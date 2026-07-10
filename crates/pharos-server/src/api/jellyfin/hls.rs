@@ -1040,6 +1040,22 @@ fn build_segment_opts(
         codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
     });
     let subtitle_stream_index = subtitle_stream_index.and_then(|abs| {
+        // Burn only IMAGE subtitles (PGS/VOBSUB); text/ASS are delivered as a
+        // separate External rendition the client renders — burning them is both
+        // redundant and (via output-seek decode-from-0) tens-of-seconds slow
+        // deep in a file. Same guard as the VP9 path (`vp9_segment_opts`).
+        let is_image = item
+            .probe
+            .subtitle_tracks
+            .iter()
+            .find(|t| t.stream_index == abs)
+            .map(|t| {
+                super::subtitles::is_image_subtitle_codec(&t.codec.clone().unwrap_or_default())
+            })
+            .unwrap_or(false);
+        if !is_image {
+            return None;
+        }
         codec_relative_index(
             item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
             abs,
@@ -1687,6 +1703,24 @@ async fn vp9_segment_opts(
     // progressive-webm handler so multi-audio selection + subtitle burn-in
     // pick the right track.
     let sub_rel = subtitle_stream_index.and_then(|abs| {
+        // Defence-in-depth: only IMAGE subtitles (PGS/VOBSUB) are burned in.
+        // Text/ASS subs are delivered as a separate External rendition — burning
+        // them is redundant and, because a burned-sub segment decodes from 0
+        // (output seeking), tens-of-seconds slow deep in the file. The
+        // PlaybackInfo layer already withholds text-sub indices from the URL;
+        // this guards the segment path even if one leaks through.
+        let is_image = item
+            .probe
+            .subtitle_tracks
+            .iter()
+            .find(|t| t.stream_index == abs)
+            .map(|t| {
+                super::subtitles::is_image_subtitle_codec(&t.codec.clone().unwrap_or_default())
+            })
+            .unwrap_or(false);
+        if !is_image {
+            return None;
+        }
         codec_relative_index(
             item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
             abs,
@@ -1831,14 +1865,18 @@ mod stream_index_tests {
                         ..Default::default()
                     },
                 ],
-                // subtitle@3, subtitle@5.
+                // subtitle@3, subtitle@5 — IMAGE codec (PGS) so they burn in
+                // (text subs are delivered External and never burned, so the
+                // burn-index mapping only applies to image subs).
                 subtitle_tracks: vec![
                     SubtitleTrack {
                         stream_index: 3,
+                        codec: Some("hdmv_pgs_subtitle".into()),
                         ..Default::default()
                     },
                     SubtitleTrack {
                         stream_index: 5,
+                        codec: Some("hdmv_pgs_subtitle".into()),
                         ..Default::default()
                     },
                 ],
@@ -2211,11 +2249,13 @@ mod tests {
                 height: Some(1080),
                 bitrate_bps: Some(4_000_000),
                 video_codec: codec.map(|s| s.to_string()),
-                // One subtitle stream at ABSOLUTE ffprobe index 2 → per-codec
-                // index si=0, so the burn-in tests exercise the absolute→
-                // relative mapping instead of an empty-list coincidence.
+                // One IMAGE subtitle stream at ABSOLUTE ffprobe index 2 →
+                // per-codec index si=0. Image (PGS) so the burn-in tests
+                // exercise the absolute→relative mapping (text subs are never
+                // burned — they're delivered as an External rendition).
                 subtitle_tracks: vec![pharos_core::SubtitleTrack {
                     stream_index: 2,
+                    codec: Some("hdmv_pgs_subtitle".into()),
                     ..Default::default()
                 }],
                 ..Default::default()

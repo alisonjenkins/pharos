@@ -63,6 +63,20 @@ async fn seed() -> (web::Data<AppState>, String) {
                 container: Some("mp4".into()),
                 video_codec: Some("h264".into()),
                 audio_codec: Some("aac".into()),
+                // Stream 5 = image sub (PGS → must burn), stream 6 = text sub
+                // (subrip → delivered External, must NOT be baked into the URL).
+                subtitle_tracks: vec![
+                    pharos_core::SubtitleTrack {
+                        stream_index: 5,
+                        codec: Some("hdmv_pgs_subtitle".into()),
+                        ..Default::default()
+                    },
+                    pharos_core::SubtitleTrack {
+                        stream_index: 6,
+                        codec: Some("subrip".into()),
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             },
             ..Default::default()
@@ -117,7 +131,52 @@ async fn audio_stream_index_in_body_reaches_transcoding_url() {
     );
     assert!(
         url.contains("SubtitleStreamIndex=5"),
-        "TranscodingUrl must carry the body's SubtitleStreamIndex: {url:?}"
+        "an IMAGE sub (PGS, stream 5) MUST burn → its index rides the URL: {url:?}"
+    );
+}
+
+#[actix_web::test]
+async fn text_subtitle_index_is_not_baked_into_transcoding_url() {
+    // Regression: a TEXT/ASS sub is delivered as a separate External rendition
+    // the client renders — baking its index into the transcode URL makes the
+    // VP9 segments burn it in, which (via output-seek decode-from-0) takes tens
+    // of seconds per segment deep in a file and stutters playback. Stream 6 is
+    // subrip → the URL must NOT carry SubtitleStreamIndex.
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_FIREFOX).unwrap()["DeviceProfile"],
+        "SubtitleStreamIndex": 6,
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        url.contains("/vp9/master.m3u8"),
+        "expected the Firefox VP9 transcode surface, got {url:?}"
+    );
+    assert!(
+        !url.contains("SubtitleStreamIndex"),
+        "a text sub must be delivered External, not burned — index must be \
+         withheld from the transcode URL: {url:?}"
     );
 }
 

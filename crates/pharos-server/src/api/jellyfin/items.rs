@@ -1554,10 +1554,38 @@ async fn playback_info(
         }
         // Subtitle "off" (-1) is meaningful to the segment handler (it clears
         // any prior burn-in) — forward it, unlike an absent value.
+        //
+        // Only forward a POSITIVE index when the selected track is an IMAGE
+        // subtitle (PGS/VOBSUB) — those MUST burn into the transcode. A TEXT /
+        // ASS sub is delivered as a separate `External` rendition the client
+        // renders (SubtitlesOctopus / cue JSON), so burning it is redundant AND
+        // catastrophically slow: a burned-sub VP9 segment uses output seeking
+        // (decode from 0), so a segment deep in the file takes tens of seconds
+        // (Code Geass S01E01 seg ~90 measured at ~100 s for 6 s of content →
+        // constant stutter). Never bake a text-sub index into the transcode URL.
         if let Some(v) =
             from_query("SubtitleStreamIndex").or_else(|| body_subtitle_index.map(|n| n.to_string()))
         {
-            push("SubtitleStreamIndex", v);
+            let forward = v.trim() == "-1"
+                || v.trim()
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|abs| {
+                        probe
+                            .subtitle_tracks
+                            .iter()
+                            .find(|t| t.stream_index == abs)
+                            .map(|t| {
+                                !crate::api::jellyfin::dto::is_text_subtitle_codec(
+                                    t.codec.as_deref(),
+                                )
+                            })
+                    })
+                    // Unknown index → be safe and don't burn.
+                    .unwrap_or(false);
+            if forward {
+                push("SubtitleStreamIndex", v);
+            }
         }
         s
     };

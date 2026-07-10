@@ -446,7 +446,7 @@ fn language_display_name(code: &str) -> String {
 /// served as an `External` track the client renders), vs an IMAGE format
 /// (PGS/VOBSUB/DVB — bitmap, can't be VTT, so it must be burned into the
 /// transcode via `Encode`).
-fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
+pub fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
     matches!(
         codec.unwrap_or("").to_ascii_lowercase().as_str(),
         "subrip"
