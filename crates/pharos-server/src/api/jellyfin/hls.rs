@@ -1367,6 +1367,27 @@ async fn vp9_segment(
     // transcode so N and N+1.. queue together across the CPU pool.
     spawn_segment_prefetch(&state, &item, seg, &opts);
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    // A/V-sync diagnostic (T-avsync): log each track's tfdt + content duration
+    // so real playback reveals a per-segment gap/overlap or an audio-vs-video
+    // duration mismatch — the mechanism behind the reported drift + clicks.
+    // traf order: 0 = video, 1 = audio (the -map order in the encoder args).
+    let timing = fmp4::segment_track_timing(&raw);
+    if let (Some(v), Some(a)) = (timing.first(), timing.get(1)) {
+        tracing::info!(
+            media.id = item.id,
+            seg,
+            v_tfdt = v.tfdt_secs,
+            v_dur = v.duration_secs,
+            v_end = v.tfdt_secs + v.duration_secs,
+            a_tfdt = a.tfdt_secs,
+            a_dur = a.duration_secs,
+            a_end = a.tfdt_secs + a.duration_secs,
+            av_dur_delta_ms = (v.duration_secs - a.duration_secs) * 1000.0,
+            av_tfdt_delta_ms = (v.tfdt_secs - a.tfdt_secs) * 1000.0,
+            a_timescale = a.timescale,
+            "vp9 segment A/V timing"
+        );
+    }
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
     Ok(HttpResponse::Ok()

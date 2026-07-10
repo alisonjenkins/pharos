@@ -183,6 +183,154 @@ fn clamp_moof_tfdt(data: &mut [u8], moof: &Box, timescales: &[u32]) -> Result<()
     Ok(())
 }
 
+/// Per-track timing of one segment, in seconds: the `tfdt` decode-time anchor
+/// and the summed sample duration (content length). Used only for A/V-sync
+/// DIAGNOSTICS — comparing consecutive segments' `tfdt + duration` (this
+/// segment's end) against the next segment's `tfdt` reveals a boundary gap or
+/// overlap (the mechanism behind audible clicks + drift), and comparing the
+/// audio track's duration against the video track's reveals a per-segment
+/// content-length mismatch that accumulates.
+#[derive(Debug, Clone, Copy)]
+pub struct TrackTiming {
+    pub timescale: u32,
+    pub tfdt_secs: f64,
+    pub duration_secs: f64,
+}
+
+/// Read `(timescale, tfdt, Σ sample_duration)` per track across ALL moofs of
+/// the segment (frag_keyframe emits several fragments per segment), in `traf`
+/// order (index K = the K-th track's mdhd timescale). `tfdt` is the FIRST
+/// fragment's (segment start); `duration_secs` sums every fragment's samples
+/// (the whole segment's content length). Best-effort — a parse miss yields an
+/// empty/short vec rather than an error; this is a diagnostic, never
+/// load-bearing.
+pub fn segment_track_timing(raw: &[u8]) -> Vec<TrackTiming> {
+    let Ok(top) = walk(raw, 0..raw.len()) else {
+        return Vec::new();
+    };
+    let Some(moov) = top.iter().find(|b| &b.kind == b"moov") else {
+        return Vec::new();
+    };
+    let timescales = track_timescales(raw, moov).unwrap_or_default();
+    // Accumulate per traf index: (timescale, first tfdt, summed duration).
+    let mut acc: Vec<(u32, Option<u64>, u64)> = Vec::new();
+    for moof in top.iter().filter(|b| &b.kind == b"moof") {
+        let Ok(trafs) = walk(raw, moof.start + moof.header..moof.end) else {
+            continue;
+        };
+        for (k, traf) in trafs.iter().filter(|b| &b.kind == b"traf").enumerate() {
+            let ts = timescales.get(k).copied().unwrap_or(48_000);
+            let Ok(children) = walk(raw, traf.start + traf.header..traf.end) else {
+                continue;
+            };
+            let tfdt = read_tfdt(raw, &children);
+            let dur = read_trun_duration(raw, &children);
+            if k == acc.len() {
+                acc.push((ts, tfdt, dur));
+            } else if let Some(e) = acc.get_mut(k) {
+                e.1 = e.1.or(tfdt); // keep the first fragment's tfdt
+                e.2 += dur;
+            }
+        }
+    }
+    acc.into_iter()
+        .map(|(ts, tfdt, dur)| {
+            let ts_f = ts.max(1) as f64;
+            TrackTiming {
+                timescale: ts,
+                tfdt_secs: tfdt.unwrap_or(0) as f64 / ts_f,
+                duration_secs: dur as f64 / ts_f,
+            }
+        })
+        .collect()
+}
+
+/// The `tfdt` base decode time (0-clamped) from a traf's children, if present.
+fn read_tfdt(raw: &[u8], children: &[Box]) -> Option<u64> {
+    let b = children.iter().find(|b| &b.kind == b"tfdt")?;
+    let body = b.start + b.header;
+    let ver = raw.get(body).copied().unwrap_or(0);
+    let v = if ver == 1 {
+        raw.get(body + 4..body + 12)
+            .and_then(|s| s.try_into().ok())
+            .map(u64::from_be_bytes)?
+    } else {
+        raw.get(body + 4..body + 8)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_be_bytes)
+            .map(u64::from)?
+    };
+    Some(if (v as i64) < 0 { 0 } else { v })
+}
+
+/// Sum a traf's sample durations from its `trun` (falling back to the `tfhd`
+/// `default_sample_duration` when the trun omits per-sample durations).
+fn read_trun_duration(raw: &[u8], children: &[Box]) -> u64 {
+    let read_flags = |body: usize| {
+        u32::from_be_bytes([
+            0,
+            raw.get(body + 1).copied().unwrap_or(0),
+            raw.get(body + 2).copied().unwrap_or(0),
+            raw.get(body + 3).copied().unwrap_or(0),
+        ])
+    };
+    let mut default_dur: u32 = 0;
+    if let Some(b) = children.iter().find(|b| &b.kind == b"tfhd") {
+        let body = b.start + b.header;
+        let flags = read_flags(body);
+        let mut p = body + 8; // fullbox(4) + track_ID(4)
+        if flags & 0x01 != 0 {
+            p += 8;
+        }
+        if flags & 0x02 != 0 {
+            p += 4;
+        }
+        if flags & 0x08 != 0 {
+            default_dur = raw
+                .get(p..p + 4)
+                .and_then(|s| s.try_into().ok())
+                .map(u32::from_be_bytes)
+                .unwrap_or(0);
+        }
+    }
+    let Some(b) = children.iter().find(|b| &b.kind == b"trun") else {
+        return 0;
+    };
+    let body = b.start + b.header;
+    let flags = read_flags(body);
+    let count = raw
+        .get(body + 4..body + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_be_bytes)
+        .unwrap_or(0);
+    if flags & 0x000100 == 0 {
+        return u64::from(count) * u64::from(default_dur);
+    }
+    let mut p = body + 8;
+    if flags & 0x000001 != 0 {
+        p += 4;
+    }
+    if flags & 0x000004 != 0 {
+        p += 4;
+    }
+    let per = 4 // duration present (0x100)
+        + (flags & 0x000200 != 0) as usize * 4
+        + (flags & 0x000400 != 0) as usize * 4
+        + (flags & 0x000800 != 0) as usize * 4;
+    let mut sum = 0u64;
+    for _ in 0..count {
+        if let Some(d) = raw
+            .get(p..p + 4)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_be_bytes)
+        {
+            sum += u64::from(d);
+        }
+        p += per;
+    }
+    sum
+}
+
 /// Split a self-contained fragmented-mp4 segment into a shared init and a
 /// media segment whose (already source-anchored) `tfdt`s are passed through
 /// verbatim, with negatives clamped to 0 (see the module docs).
