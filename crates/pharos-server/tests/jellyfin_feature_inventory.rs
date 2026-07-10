@@ -93,7 +93,6 @@ async fn played_toggle_roundtrip() {
 // ===================== backlog placeholders =======================
 
 #[actix_web::test]
-#[ignore = "gap: no /Playlists controller — create/add/reorder absent (T70)"]
 async fn playlists_crud() {
     let f = seed_rich().await;
     let status = post_status(&f, &format!("/Playlists?Name=Mix&Ids={}", f.rich_item_id)).await;

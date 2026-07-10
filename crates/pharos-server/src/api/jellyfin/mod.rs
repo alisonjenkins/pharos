@@ -8,6 +8,7 @@ pub mod hls;
 pub mod images;
 pub mod items;
 pub mod live_tv;
+pub mod playlists;
 pub mod search;
 pub mod sessions;
 pub mod socket;
@@ -39,6 +40,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     // actix router matches by registration order on duplicate specificity).
     admin::register(cfg);
     items::register(cfg);
+    playlists::register(cfg);
     live_tv::register(cfg);
     search::register(cfg);
     user_data::register(cfg);

@@ -954,7 +954,7 @@ struct CollectionMutateQuery {
 /// Parse a comma-separated `Ids=` into numeric media ids, dropping the
 /// 32-hex synth-id namespace (anything that doesn't parse as a u64 ≤ the
 /// 20-digit bound) so a stray wire id never collides with a numeric id.
-fn parse_id_csv(raw: Option<&str>) -> Vec<u64> {
+pub(crate) fn parse_id_csv(raw: Option<&str>) -> Vec<u64> {
     raw.map(|s| {
         s.split(',')
             .map(str::trim)
@@ -2793,7 +2793,7 @@ fn build_media_query(
 /// Build the `ItemsResultDto` for a resolved page of items: bulk user-data
 /// lookup, per-item DTO with trickplay, then parent-id fill. Mirrors the
 /// legacy `paginate` DTO assembly exactly (same field set, same order).
-async fn build_items_page(
+pub(crate) async fn build_items_page(
     state: &AppState,
     user_id: UserId,
     page: &[MediaItem],
