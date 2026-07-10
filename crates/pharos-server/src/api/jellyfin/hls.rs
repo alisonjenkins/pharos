@@ -898,6 +898,10 @@ async fn serve_segment(
     // T42: when an HLS cache is wired, route through it. Otherwise
     // fall back to live transcoding (every request spawns ffmpeg).
     if let Some(cache) = state.hls.as_ref() {
+        // Warm the next few segments so a fast / >1x client doesn't stall on
+        // on-demand transcode (spawned before this segment's own read so they
+        // pipeline across the CPU pool).
+        spawn_segment_prefetch(&state, &item, seg, &opts);
         let bytes = cache
             .segment_bytes_keyed(
                 id_num,
@@ -1342,6 +1346,10 @@ async fn vp9_segment(
         q.subtitle_stream_index,
     )
     .await;
+    // Warm the next few segments in the background so a fast / >1x client finds
+    // them cached instead of stalling. Spawned BEFORE this segment's own
+    // transcode so N and N+1.. queue together across the CPU pool.
+    spawn_segment_prefetch(&state, &item, seg, &opts);
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
@@ -1352,6 +1360,85 @@ async fn vp9_segment(
             "public, max-age=31536000, immutable",
         ))
         .body(processed.media))
+}
+
+/// Segments to speculatively transcode ahead of the one just requested. A
+/// client draining its buffer fast — or playing at >1x — then finds the next
+/// segments already warm in the cache instead of stalling on an on-demand
+/// transcode. This decouples the client's consumption rate from the encoder's
+/// per-segment latency: at 4x, 6s of content is consumed every 1.5s, but with
+/// a few segments pipelined ahead across the CPU pool the player never waits.
+///
+/// Kept small on purpose: prefetch jobs queue on the SAME scheduler as live
+/// segments (which already load-balances across every CPU), and the per-key
+/// single-flight in `HlsSegmentCache` coalesces a prefetch with the client's
+/// own eventual request — so a segment is never transcoded twice and a live
+/// request that catches up simply awaits the in-flight prefetch.
+const SEGMENT_PREFETCH_AHEAD: u32 = 4;
+
+/// The segment indices to prefetch after serving `base_seg`: the next
+/// [`SEGMENT_PREFETCH_AHEAD`], stopping at `total_segs` (exclusive) when the
+/// item's length is known so we never queue a past-EOF transcode. `None`
+/// total = length unknown → prefetch the full window optimistically.
+fn prefetch_target_segments(base_seg: u32, total_segs: Option<u32>) -> Vec<u32> {
+    let mut out = Vec::new();
+    for ahead in 1..=SEGMENT_PREFETCH_AHEAD {
+        let seg = base_seg.saturating_add(ahead);
+        if total_segs.is_some_and(|total| seg >= total) {
+            break;
+        }
+        out.push(seg);
+    }
+    out
+}
+
+/// Fire-and-forget warm of the next [`SEGMENT_PREFETCH_AHEAD`] segments into
+/// the HLS cache, using the same `opts` (audio/subtitle/bitrate/codec) as the
+/// segment just served — only the start position advances. No-op without a
+/// cache; bounded by the item's total segment count (from its probed
+/// duration) so it never transcodes past EOF.
+fn spawn_segment_prefetch(
+    state: &web::Data<AppState>,
+    item: &pharos_core::MediaItem,
+    base_seg: u32,
+    opts: &TranscodeOptions,
+) {
+    if state.hls.is_none() {
+        return;
+    }
+    let total_segs = item
+        .probe
+        .duration_ms
+        .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32);
+    for seg in prefetch_target_segments(base_seg, total_segs) {
+        let state = state.clone();
+        let item = item.clone();
+        let mut o = opts.clone();
+        o.start_position_ticks =
+            (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
+        o.duration_ticks = Some((SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64);
+        // actix arbiter spawn: the future awaits I/O + the scheduler channel
+        // (the encode runs in the transcode worker pool, not here), so it
+        // yields the worker immediately and never blocks request handling.
+        actix_web::rt::spawn(async move {
+            let Some(cache) = state.hls.as_ref() else {
+                return;
+            };
+            if let Err(e) = cache
+                .segment_bytes_keyed(
+                    item.id,
+                    seg,
+                    o.audio_source_stream_index,
+                    o.burn_subtitle_stream_index,
+                    &item.path,
+                    &o,
+                )
+                .await
+            {
+                tracing::debug!(media.id = item.id, seg, error = %e, "segment prefetch failed");
+            }
+        });
+    }
 }
 
 async fn fetch_item(state: &AppState, id: u64) -> Result<pharos_core::MediaItem, actix_web::Error> {
@@ -1587,6 +1674,21 @@ mod stream_index_tests {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    // `use actix_web::test` shadows the bare `#[test]` attribute; qualify it.
+    #[::core::prelude::v1::test]
+    fn prefetch_window_bounds_to_eof() {
+        // Unknown length → the full window from base+1.
+        assert_eq!(prefetch_target_segments(0, None), vec![1, 2, 3, 4]);
+        assert_eq!(prefetch_target_segments(10, None), vec![11, 12, 13, 14]);
+        // Known length → stop before the last segment index (exclusive).
+        assert_eq!(prefetch_target_segments(8, Some(12)), vec![9, 10, 11]);
+        assert_eq!(prefetch_target_segments(10, Some(12)), vec![11]);
+        // At/near the end → nothing to prefetch.
+        assert_eq!(prefetch_target_segments(11, Some(12)), Vec::<u32>::new());
+        assert_eq!(prefetch_target_segments(20, Some(12)), Vec::<u32>::new());
+    }
+
     use crate::auth::BuiltinAuth;
     use actix_web::test;
     use actix_web::App;
