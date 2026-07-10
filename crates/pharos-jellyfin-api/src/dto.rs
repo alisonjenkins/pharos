@@ -640,6 +640,57 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// Millisecond-precision ISO-8601 (Z) formatter — `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+/// SyncPlay clock sync needs sub-second `When`/`EmittedAt`/`GetUtcTime`
+/// timestamps: whole-second precision (as [`format_iso8601`] emits, with a
+/// zeroed `.0000000` fraction) leaves ±1 s of clock error, enough to desync a
+/// group. The client parses this with `new Date(...)`, which accepts a 3-digit
+/// fractional part.
+pub fn format_iso8601_ms(unix_ms: i64) -> String {
+    let secs = unix_ms.div_euclid(1000);
+    let millis = unix_ms.rem_euclid(1000);
+    let secs_per_day: i64 = 86_400;
+    let mut days = secs.div_euclid(secs_per_day);
+    let mut secs_of_day = secs.rem_euclid(secs_per_day);
+    let hh = secs_of_day / 3600;
+    secs_of_day %= 3600;
+    let mm = secs_of_day / 60;
+    let ss = secs_of_day % 60;
+    let mut year: i64 = 1970;
+    loop {
+        let dy: i64 = if is_leap(year) { 366 } else { 365 };
+        if days < dy {
+            break;
+        }
+        days -= dy;
+        year += 1;
+    }
+    let months: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 0;
+    while month < 12 {
+        let dm = if month == 1 && is_leap(year) {
+            29
+        } else {
+            months[month]
+        };
+        if days < dm {
+            break;
+        }
+        days -= dm;
+        month += 1;
+    }
+    let day = days + 1;
+    format!(
+        "{year:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        month as i32 + 1,
+        day,
+        hh,
+        mm,
+        ss,
+        millis
+    )
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ItemsResultDto {
@@ -1553,6 +1604,22 @@ pub fn build_media_attachments(
 mod tests {
     use super::*;
     use pharos_core::MediaProbe;
+
+    #[test]
+    fn format_iso8601_ms_has_three_fraction_digits() {
+        // Epoch → 1970-01-01T00:00:00.000Z.
+        assert_eq!(format_iso8601_ms(0), "1970-01-01T00:00:00.000Z");
+        // 1.234s past a known instant keeps the milliseconds.
+        // 1_700_000_000_000 ms = 2023-11-14T22:13:20.000Z.
+        assert_eq!(
+            format_iso8601_ms(1_700_000_000_123),
+            "2023-11-14T22:13:20.123Z"
+        );
+        // Must match `…THH:MM:SS.mmmZ` (exactly 3 fraction digits).
+        let s = format_iso8601_ms(1_700_000_000_045);
+        let frac = &s[s.len() - 4..];
+        assert_eq!(frac, "045Z", "expected 3-digit ms fraction, got {s}");
+    }
 
     #[test]
     fn media_attachments_emit_font_delivery_urls() {

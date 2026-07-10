@@ -7,22 +7,96 @@
 
 use super::auth_extractor::AuthUser;
 use super::socket_messages::{
-    CommandData, GroupUpdateData, Inbound, Outbound, SyncPlayJoinData, SyncPlayPlayData,
-    SyncPlaySeekData,
+    CommandData, GroupInfoData, GroupStateUpdate, GroupUpdateData, Inbound, Outbound,
+    PlayQueueUpdate, QueuePlaylistItem, SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData,
 };
 use crate::state::{AppState, SocketBroadcast};
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, Session};
 use futures_util::StreamExt;
+use pharos_jellyfin_api::dto::format_iso8601_ms;
 use pharos_sync::{
-    group::{GroupHandle, GroupMsg, Joined},
-    messages::{GroupId, MemberId, ServerMsg},
+    group::{GroupHandle, GroupMsg},
+    messages::{GroupId, GroupPlayState, MemberId, QueueItemInfo, ServerMsg},
     registry::GroupRegistry,
+    SessionHub,
 };
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const POSITION_TICKS_PER_MS: u64 = 10_000;
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Extract the `deviceId` query parameter from the `/socket` URL
+/// (`/socket?api_key=…&deviceId=…`). Jellyfin clients put it in the query
+/// string on the WS handshake; it is the stable session key the HTTP SyncPlay
+/// handlers use to reach this socket via the [`SessionHub`].
+fn device_id_from_query(qs: &str) -> Option<String> {
+    qs.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("deviceid"))
+        .map(|(_, v)| percent_decode(v))
+}
+
+/// Minimal percent-decode for a query value (deviceIds are usually plain, but
+/// may contain `%XX` escapes). Avoids pulling in a urlencoding crate.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The `Idle|Waiting|Playing|Paused` wire string for a `GroupPlayState`.
+fn play_state_str(s: GroupPlayState) -> &'static str {
+    match s {
+        GroupPlayState::Idle => "Idle",
+        GroupPlayState::Waiting => "Waiting",
+        GroupPlayState::Playing => "Playing",
+        GroupPlayState::Paused => "Paused",
+    }
+}
+
+/// Context the socket threads into [`translate_outbound`] so a `ServerMsg`
+/// (which carries only relative timing) can be rendered as the absolute-time,
+/// queue-aware Jellyfin wire shapes.
+struct TranslateCtx<'a> {
+    group_id: Option<GroupId>,
+    /// Group wall-clock epoch (unix ms); `at_server_ms + epoch = When`.
+    epoch_unix_ms: u64,
+    /// The current queue item's `PlaylistItemId` — commands whose id doesn't
+    /// match the client's loaded item are dropped, so every command carries it.
+    current_pli: Option<&'a str>,
+}
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/socket", web::get().to(ws_entry));
@@ -33,6 +107,7 @@ async fn ws_entry(
     body: web::Payload,
     state: web::Data<AppState>,
     registry: web::Data<GroupRegistry>,
+    hub: web::Data<SessionHub>,
     user: AuthUser,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, session, stream) = actix_ws::handle(&req, body)?;
@@ -41,10 +116,16 @@ async fn ws_entry(
         .max_continuation_size(64 * 1024);
     let bus_rx = state.bus.subscribe();
     let user_id_str = user.0.id.0.simple().to_string();
+    // `deviceId` (WS query string) is the key the HTTP SyncPlay handlers use to
+    // reach this socket. Fall back to the member id when absent so a client
+    // without one still gets a stable-per-connection key.
+    let device_id = device_id_from_query(req.query_string());
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
         registry.get_ref().clone(),
+        hub.get_ref().clone(),
+        device_id,
         bus_rx,
         user.0.name,
         user_id_str,
@@ -52,10 +133,13 @@ async fn ws_entry(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S>(
     mut session: Session,
     mut stream: S,
     registry: GroupRegistry,
+    hub: SessionHub,
+    device_id: Option<String>,
     mut bus_rx: broadcast::Receiver<SocketBroadcast>,
     member_name: String,
     bound_user_id: String,
@@ -66,6 +150,20 @@ async fn handle_connection<S>(
     let member_id = MemberId::new();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
     let mut current_group: Option<GroupHandle> = None;
+    // Register this socket so HTTP SyncPlay handlers can reach it by deviceId.
+    // Fall back to the member id as the key when the client sent no deviceId.
+    let device_key = device_id.unwrap_or_else(|| member_id.to_string());
+    hub.register(
+        device_key.clone(),
+        member_id,
+        member_name.clone(),
+        out_tx.clone(),
+    );
+    // Jellyfin-wire context derived from the ServerMsg stream: the current
+    // group id (from `Joined`) and the current queue item's PlaylistItemId
+    // (from `PlayQueue`), both needed to shape outbound commands.
+    let mut current_group_id: Option<GroupId> = None;
+    let mut current_pli: Option<String> = None;
     // P23 — server-initiated keep-alive. Tick every 30 s; track the
     // last time we observed client traffic so a peer that stopped
     // responding (TCP black-holed) gets dropped instead of leaking
@@ -88,7 +186,25 @@ async fn handle_connection<S>(
                 }
             }
             Some(server_msg) = out_rx.recv() => {
-                if let Some(out) = translate_outbound(server_msg, current_group.as_ref().map(|h| h.group_id)) {
+                // Cache the wire context this ServerMsg carries.
+                match &server_msg {
+                    ServerMsg::Joined { group_id, .. } => current_group_id = Some(*group_id),
+                    ServerMsg::PlayQueue { items, playing_index, .. } => {
+                        current_pli = items.get(*playing_index).map(|i| i.playlist_item_id.clone());
+                    }
+                    _ => {}
+                }
+                let epoch = current_group
+                    .as_ref()
+                    .map(|h| h.epoch_unix_ms)
+                    .or_else(|| hub.epoch_of(&device_key))
+                    .unwrap_or(0);
+                let ctx = TranslateCtx {
+                    group_id: current_group_id.or_else(|| current_group.as_ref().map(|h| h.group_id)),
+                    epoch_unix_ms: epoch,
+                    current_pli: current_pli.as_deref(),
+                };
+                if let Some(out) = translate_outbound(server_msg, &ctx) {
                     if send_outbound(&mut session, &out).await.is_err() {
                         break 'pump;
                     }
@@ -165,7 +281,11 @@ async fn handle_connection<S>(
         }
     }
 
-    if let Some(h) = current_group.take() {
+    // Deregister from the hub; RemoveMember from whichever group this session
+    // belonged to (the HTTP path stores it in the hub, the WS path in
+    // `current_group` — union the two so neither leaks a ghost member).
+    let hub_group = hub.deregister(&device_key);
+    for h in current_group.take().into_iter().chain(hub_group) {
         let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
     }
     let _ = session.clone().close(None).await;
@@ -277,85 +397,157 @@ async fn join_via_handle(
     {
         return;
     }
-    let Ok(Joined { group_id, .. }) = reply_rx.await else {
+    if reply_rx.await.is_err() {
         return;
-    };
+    }
+    // The group actor sends `ServerMsg::Joined` to our sink (see AddMember), so
+    // the client's GroupJoined notification flows through `translate_outbound`
+    // uniformly with the HTTP-driven path — no manual self-emit needed.
     *current_group = Some(handle);
-    // Emit a Jellyfin-shaped GroupJoined notification to ourself.
-    let _ = out_tx
-        .send(ServerMsg::Joined {
-            group_id,
-            leader: member_id, // local, will be corrected by actor broadcasts
-            members: vec![],
-        })
-        .await;
 }
 
-fn translate_outbound(msg: ServerMsg, group_id: Option<GroupId>) -> Option<Outbound> {
+/// Map the engine's snake_case queue reason to Jellyfin's `PlayQueueUpdateReason`
+/// (the value jellyfin-web's QueueCore switches on).
+fn play_queue_reason(r: &str) -> String {
+    match r {
+        // A late joiner loads the playlist fresh at the group's current
+        // position — Jellyfin's "NewPlaylist" does exactly that.
+        "new_playlist" | "user_joined" => "NewPlaylist",
+        "set_current_item" => "SetCurrentItem",
+        "next_item" => "NextItem",
+        "previous_item" => "PreviousItem",
+        "repeat_mode" => "RepeatMode",
+        "shuffle_mode" => "ShuffleMode",
+        _ => "NewPlaylist",
+    }
+    .to_string()
+}
+
+/// A `SyncPlayCommand` (`SendCommand`) with the absolute-time + queue fields the
+/// Jellyfin client requires.
+fn command(
+    ctx: &TranslateCtx,
+    kind: &'static str,
+    at_server_ms: u64,
+    position_ms: Option<u64>,
+) -> Option<Outbound> {
+    let when = format_iso8601_ms(ctx.epoch_unix_ms as i64 + at_server_ms as i64);
+    Some(Outbound::new(
+        "SyncPlayCommand",
+        serde_json::to_value(CommandData {
+            command: kind,
+            position_ticks: position_ms.map(|p| p * POSITION_TICKS_PER_MS),
+            when: Some(when),
+            emitted_at: Some(format_iso8601_ms(unix_now_ms())),
+            playlist_item_id: ctx.current_pli.map(str::to_string),
+        })
+        .ok()?,
+    ))
+}
+
+/// A `SyncPlayGroupUpdate` envelope: `{ GroupId, Type, Data }`.
+fn group_update(
+    ctx: &TranslateCtx,
+    kind: &'static str,
+    data: serde_json::Value,
+) -> Option<Outbound> {
+    Some(Outbound::new(
+        "SyncPlayGroupUpdate",
+        serde_json::to_value(GroupUpdateData {
+            kind,
+            group_id: ctx.group_id.map(|g| g.to_string()).unwrap_or_default(),
+            data,
+        })
+        .ok()?,
+    ))
+}
+
+fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
     match msg {
-        ServerMsg::Play { position_ms, .. } => Some(Outbound::new(
-            "SyncPlayCommand",
-            serde_json::to_value(CommandData {
-                command: "Unpause",
-                position_ticks: Some(position_ms * POSITION_TICKS_PER_MS),
-                when: None,
-            })
-            .ok()?,
-        )),
-        ServerMsg::Pause { .. } => Some(Outbound::new(
-            "SyncPlayCommand",
-            serde_json::to_value(CommandData {
-                command: "Pause",
-                position_ticks: None,
-                when: None,
-            })
-            .ok()?,
-        )),
-        ServerMsg::Seek { position_ms, .. } => Some(Outbound::new(
-            "SyncPlayCommand",
-            serde_json::to_value(CommandData {
-                command: "Seek",
-                position_ticks: Some(position_ms * POSITION_TICKS_PER_MS),
-                when: None,
-            })
-            .ok()?,
-        )),
-        ServerMsg::Joined { group_id: gid, .. } => Some(Outbound::new(
-            "SyncPlayGroupUpdate",
-            serde_json::to_value(GroupUpdateData {
-                kind: "GroupJoined",
+        ServerMsg::Play {
+            at_server_ms,
+            position_ms,
+        } => command(ctx, "Unpause", at_server_ms, Some(position_ms)),
+        ServerMsg::Pause { at_server_ms } => command(ctx, "Pause", at_server_ms, None),
+        ServerMsg::Seek {
+            at_server_ms,
+            position_ms,
+        } => command(ctx, "Seek", at_server_ms, Some(position_ms)),
+        ServerMsg::Joined {
+            group_id: gid,
+            members,
+            ..
+        } => {
+            let info = GroupInfoData {
                 group_id: gid.to_string(),
+                group_name: "SyncPlay".to_string(),
+                state: "Idle",
+                participants: members.into_iter().map(|m| m.name).collect(),
+                last_updated_at: format_iso8601_ms(unix_now_ms()),
+            };
+            // Use the joined group's id even if ctx hasn't cached it yet.
+            Some(Outbound::new(
+                "SyncPlayGroupUpdate",
+                serde_json::to_value(GroupUpdateData {
+                    kind: "GroupJoined",
+                    group_id: gid.to_string(),
+                    data: serde_json::to_value(info).ok()?,
+                })
+                .ok()?,
+            ))
+        }
+        ServerMsg::MemberJoined { member } => {
+            group_update(ctx, "UserJoined", serde_json::Value::String(member.name))
+        }
+        ServerMsg::MemberLeft { member_id } => group_update(
+            ctx,
+            "UserLeft",
+            serde_json::Value::String(member_id.to_string()),
+        ),
+        ServerMsg::StateUpdate { state, reason } => group_update(
+            ctx,
+            "StateUpdate",
+            serde_json::to_value(GroupStateUpdate {
+                state: play_state_str(state),
+                reason,
             })
             .ok()?,
-        )),
-        ServerMsg::MemberJoined { .. } => Some(Outbound::new(
-            "SyncPlayGroupUpdate",
-            serde_json::to_value(GroupUpdateData {
-                kind: "UserJoined",
-                group_id: group_id.map(|g| g.to_string()).unwrap_or_default(),
-            })
-            .ok()?,
-        )),
-        ServerMsg::MemberLeft { .. } => Some(Outbound::new(
-            "SyncPlayGroupUpdate",
-            serde_json::to_value(GroupUpdateData {
-                kind: "UserLeft",
-                group_id: group_id.map(|g| g.to_string()).unwrap_or_default(),
-            })
-            .ok()?,
-        )),
+        ),
+        ServerMsg::PlayQueue {
+            reason,
+            items,
+            playing_index,
+            start_position_ms,
+            is_playing,
+            repeat_mode,
+            shuffle_mode,
+        } => {
+            let update = PlayQueueUpdate {
+                reason: play_queue_reason(&reason),
+                last_update: format_iso8601_ms(unix_now_ms()),
+                playlist: items
+                    .into_iter()
+                    .map(|i: QueueItemInfo| QueuePlaylistItem {
+                        item_id: i.item_id,
+                        playlist_item_id: i.playlist_item_id,
+                    })
+                    .collect(),
+                playing_item_index: playing_index,
+                start_position_ticks: start_position_ms * POSITION_TICKS_PER_MS,
+                is_playing,
+                shuffle_mode,
+                repeat_mode,
+            };
+            group_update(ctx, "PlayQueue", serde_json::to_value(update).ok()?)
+        }
+        // Leadership is a pharos concept; stock jellyfin-web has no
+        // LeaderChanged GroupUpdateType, so this is a no-op there (phone/TV
+        // clients that model it still receive it).
         ServerMsg::LeaderChange { leader } => Some(Outbound::new(
             "SyncPlayGroupUpdate",
-            // Jellyfin's PlaybackAccessControl payload is `{ Type:
-            // "LeaderChanged", Data: { LeaderId } }`. We keep the same
-            // top-level kind ("LeaderChanged") jellyfin-web's
-            // playbackManager listens for. group_id flows through as
-            // GroupId so jellyfin-web's group store updates the right
-            // session card; the actual `Leader` rides in `LeaderId`
-            // — wire-level a string for the member uuid.
             serde_json::json!({
                 "Type": "LeaderChanged",
-                "GroupId": group_id.map(|g| g.to_string()).unwrap_or_default(),
+                "GroupId": ctx.group_id.map(|g| g.to_string()).unwrap_or_default(),
                 "LeaderId": leader.to_string(),
             }),
         )),

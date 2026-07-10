@@ -67,14 +67,70 @@ pub struct SyncPlayBufferingData {
     pub playback_position_ticks: u64,
 }
 
+/// Jellyfin `SyncPlayGroupUpdate` payload: `{ GroupId, Type, Data }`. `Data`'s
+/// shape depends on `Type` — `GroupInfoDto` for `GroupJoined`/`GroupLeft`,
+/// [`GroupStateUpdate`] for `StateUpdate`, [`PlayQueueUpdate`] for `PlayQueue`,
+/// the username string for `UserJoined`/`UserLeft`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct GroupUpdateData {
     #[serde(rename = "Type")]
     pub kind: &'static str,
     pub group_id: String,
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    pub data: serde_json::Value,
 }
 
+/// Jellyfin `GroupInfoDto` — the `Data` of a `GroupJoined`/`GroupLeft` update.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct GroupInfoData {
+    pub group_id: String,
+    pub group_name: String,
+    /// `Idle` | `Waiting` | `Playing` | `Paused`.
+    pub state: &'static str,
+    pub participants: Vec<String>,
+    pub last_updated_at: String,
+}
+
+/// Jellyfin `GroupStateUpdate` — the `Data` of a `StateUpdate` group update.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct GroupStateUpdate {
+    /// `Idle` | `Waiting` | `Playing` | `Paused`.
+    pub state: &'static str,
+    /// The command that caused the transition (diagnostic / UI).
+    pub reason: String,
+}
+
+/// One entry of a `PlayQueueUpdate.Playlist`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct QueuePlaylistItem {
+    pub item_id: String,
+    pub playlist_item_id: String,
+}
+
+/// Jellyfin `PlayQueueUpdate` — the `Data` of a `PlayQueue` group update.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlayQueueUpdate {
+    pub reason: String,
+    pub last_update: String,
+    pub playlist: Vec<QueuePlaylistItem>,
+    pub playing_item_index: usize,
+    pub start_position_ticks: u64,
+    pub is_playing: bool,
+    pub shuffle_mode: String,
+    pub repeat_mode: String,
+}
+
+/// Jellyfin `SendCommand` payload (a `SyncPlayCommand` message). The client
+/// drops any command whose `PlaylistItemId` doesn't match its current queue
+/// item and dedups on `Command`+`PlaylistItemId`, so those fields must stay
+/// consistent with the preceding `PlayQueueUpdate`. `When` is the absolute UTC
+/// instant to act; `EmittedAt` gates against the client's sync-enable time —
+/// both are ISO-8601 UTC (ms precision).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CommandData {
@@ -83,6 +139,10 @@ pub struct CommandData {
     pub position_ticks: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emitted_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist_item_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -112,5 +172,67 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"MessageType\":\"SyncPlayGroupUpdate\""), "{s}");
         assert!(s.contains("\"Type\":\"GroupJoined\""), "{s}");
+    }
+
+    #[test]
+    fn command_data_serializes_when_emitted_at_and_playlist_item_id() {
+        // The client drops a command whose When/EmittedAt/PlaylistItemId are
+        // missing or mismatched — assert all three ride the wire in PascalCase.
+        let c = CommandData {
+            command: "Unpause",
+            position_ticks: Some(50_000),
+            when: Some("2026-07-10T12:00:00.123Z".into()),
+            emitted_at: Some("2026-07-10T11:59:59.900Z".into()),
+            playlist_item_id: Some("pli-1".into()),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains("\"Command\":\"Unpause\""), "{s}");
+        assert!(s.contains("\"When\":\"2026-07-10T12:00:00.123Z\""), "{s}");
+        assert!(
+            s.contains("\"EmittedAt\":\"2026-07-10T11:59:59.900Z\""),
+            "{s}"
+        );
+        assert!(s.contains("\"PlaylistItemId\":\"pli-1\""), "{s}");
+        assert!(s.contains("\"PositionTicks\":50000"), "{s}");
+    }
+
+    #[test]
+    fn play_queue_update_serializes_pascalcase() {
+        let u = PlayQueueUpdate {
+            reason: "NewPlaylist".into(),
+            last_update: "2026-07-10T12:00:00.000Z".into(),
+            playlist: vec![QueuePlaylistItem {
+                item_id: "ep1".into(),
+                playlist_item_id: "pli-1".into(),
+            }],
+            playing_item_index: 0,
+            start_position_ticks: 0,
+            is_playing: true,
+            shuffle_mode: "Sorted".into(),
+            repeat_mode: "RepeatNone".into(),
+        };
+        let s = serde_json::to_string(&u).unwrap();
+        assert!(s.contains("\"Reason\":\"NewPlaylist\""), "{s}");
+        assert!(s.contains("\"Playlist\":[{\"ItemId\":\"ep1\""), "{s}");
+        assert!(s.contains("\"PlaylistItemId\":\"pli-1\""), "{s}");
+        assert!(s.contains("\"PlayingItemIndex\":0"), "{s}");
+        assert!(s.contains("\"IsPlaying\":true"), "{s}");
+    }
+
+    #[test]
+    fn group_update_data_omits_null_data() {
+        // GroupJoined carries a GroupInfoDto; UserJoined carries a bare string.
+        let joined = GroupUpdateData {
+            kind: "StateUpdate",
+            group_id: "g1".into(),
+            data: serde_json::to_value(GroupStateUpdate {
+                state: "Playing",
+                reason: "ready".into(),
+            })
+            .unwrap(),
+        };
+        let s = serde_json::to_string(&joined).unwrap();
+        assert!(s.contains("\"Type\":\"StateUpdate\""), "{s}");
+        assert!(s.contains("\"State\":\"Playing\""), "{s}");
     }
 }

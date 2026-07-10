@@ -650,6 +650,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     pharos_server::library_watch::spawn_subtitle_warm_all(app_state.clone());
 
     let group_registry = web::Data::new(GroupRegistry::spawn());
+    // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
+    // per-`/socket` group member sinks. One instance shared across workers.
+    let session_hub = web::Data::new(pharos_sync::SessionHub::new());
     let token_resolver_data = web::Data::new(token_resolver);
 
     // Probes whose readiness must flip true before /readyz returns 200.
@@ -697,6 +700,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
+            .app_data(session_hub.clone())
             .app_data(token_resolver_data.clone())
             // actix runs `.wrap()` layers in REVERSE registration order
             // (last registered = outermost = first on ingress). We want

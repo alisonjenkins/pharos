@@ -120,11 +120,15 @@ async fn theme_media(_user: AuthUser) -> impl Responder {
 
 async fn get_utc_time() -> impl Responder {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    // Millisecond precision is load-bearing for SyncPlay: the client derives
+    // its clock offset from this timestamp, and whole-second precision leaves
+    // ±1 s of error — enough to desync a group. Sample once, between the two
+    // reported instants (reception ≈ transmission at this resolution).
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let iso = crate::api::jellyfin::dto::format_iso8601(secs);
+    let iso = crate::api::jellyfin::dto::format_iso8601_ms(ms);
     // `/GetUtcTime` is unauthenticated — jellyfin-web hits it before
     // the user has a token to skew its internal clock.
     HttpResponse::Ok().json(serde_json::json!({

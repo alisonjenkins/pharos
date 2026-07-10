@@ -42,6 +42,69 @@ impl FromRequest for AuthUser {
     }
 }
 
+/// Like [`AuthUser`] but also yields the client's `deviceId` — the session key
+/// the SyncPlay [`SessionHub`](pharos_sync::SessionHub) uses to route an HTTP
+/// `/SyncPlay/*` command to the caller's `/socket`. The device id comes from the
+/// Emby-Authorization header (`DeviceId="…"`), falling back to the `deviceId`
+/// query param or the `X-Emby-Device-Id` header (all carry the same value a
+/// jellyfin-web client also puts on its `/socket` URL).
+pub struct AuthSession {
+    pub user: User,
+    pub device_id: Option<String>,
+}
+
+impl FromRequest for AuthSession {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self, actix_web::Error>>>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        let token = extract_token(req);
+        let device_id = device_id_from_request(req);
+        let state = req.app_data::<web::Data<AppState>>().cloned();
+        Box::pin(async move {
+            let token = token.ok_or_else(|| ErrorUnauthorized("missing token"))?;
+            let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
+            let uid = state
+                .stores
+                .resolve(&token)
+                .await
+                .map_err(|_| ErrorUnauthorized("invalid token"))?;
+            let record = state
+                .stores
+                .get(uid)
+                .await
+                .map_err(|_| ErrorUnauthorized("user revoked"))?;
+            Ok(AuthSession {
+                user: record.into_user(),
+                device_id,
+            })
+        })
+    }
+}
+
+/// Extract the client's device id from any place Jellyfin clients carry it:
+/// the Emby-Authorization header, the `deviceId` query param, or the
+/// `X-Emby-Device-Id` header.
+pub fn device_id_from_request(req: &HttpRequest) -> Option<String> {
+    if let Some(id) = auth_header_from_request(req).device_id {
+        return Some(id);
+    }
+    for (k, v) in req
+        .query_string()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+    {
+        if k.eq_ignore_ascii_case("deviceid") && !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    req.headers()
+        .get("X-Emby-Device-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Public for tests + handler-side use that need the raw token string.
 ///
 /// Lookup order: `X-Emby-Token` → `X-MediaBrowser-Token` →

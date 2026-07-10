@@ -488,6 +488,18 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 leader,
                 members: summaries.clone(),
             });
+            // Notify the joiner over its own sink too (not just the oneshot
+            // reply), so the HTTP-driven join path — where the reply goes to the
+            // HTTP handler, not the socket — still delivers `GroupJoined` to the
+            // client. The WS path's socket receives the same message.
+            state.send_one(
+                member_id,
+                ServerMsg::Joined {
+                    group_id: state.id,
+                    leader,
+                    members: summaries.clone(),
+                },
+            );
             // Tell existing members someone joined.
             let me = MemberSummary {
                 member_id,
@@ -854,6 +866,11 @@ mod tests {
         .unwrap();
         let joined = reply_rx.await.unwrap();
         assert_eq!(joined.leader, mid);
+        // The engine also sends `Joined` to the member's own sink (so the
+        // HTTP-driven join delivers GroupJoined) — drain it so tests see the
+        // same post-join stream they did before that was added.
+        let mut rx = rx;
+        assert!(matches!(rx.recv().await, Some(ServerMsg::Joined { .. })));
         (h, rx, mid)
     }
 
@@ -870,6 +887,9 @@ mod tests {
         .await
         .unwrap();
         let _ = reply_rx.await.unwrap();
+        // Drain the self-`Joined` (see `fresh`).
+        let mut rx = rx;
+        assert!(matches!(rx.recv().await, Some(ServerMsg::Joined { .. })));
         (mid, rx)
     }
 

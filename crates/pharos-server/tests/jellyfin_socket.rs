@@ -7,9 +7,14 @@ use actix_web::{test, web, App};
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{api::jellyfin, auth::BuiltinAuth, state::AppState};
 use pharos_store_sqlx::sqlite::SqliteStore;
-use pharos_sync::GroupRegistry;
+use pharos_sync::{GroupRegistry, SessionHub};
 
-async fn seed() -> (web::Data<AppState>, web::Data<GroupRegistry>, String) {
+async fn seed() -> (
+    web::Data<AppState>,
+    web::Data<GroupRegistry>,
+    web::Data<SessionHub>,
+    String,
+) {
     let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -26,16 +31,18 @@ async fn seed() -> (web::Data<AppState>, web::Data<GroupRegistry>, String) {
     let token = stores.issue(uid, "test").await.unwrap();
     let state = web::Data::new(AppState::new(stores, "t".into()));
     let registry = web::Data::new(GroupRegistry::spawn());
-    (state, registry, token.0.expose().to_string())
+    let hub = web::Data::new(SessionHub::new());
+    (state, registry, hub, token.0.expose().to_string())
 }
 
 #[actix_web::test]
 async fn socket_requires_auth() {
-    let (state, registry, _) = seed().await;
+    let (state, registry, hub, _) = seed().await;
     let app = test::init_service(
         App::new()
             .app_data(state)
             .app_data(registry)
+            .app_data(hub)
             .configure(jellyfin::configure),
     )
     .await;
@@ -49,11 +56,12 @@ async fn socket_authed_without_upgrade_headers_is_bad_request() {
     // AuthUser passes, actix_ws::handle returns Err because the request
     // lacks `Connection: Upgrade` and `Upgrade: websocket`. Manifests as
     // 400 in the response.
-    let (state, registry, token) = seed().await;
+    let (state, registry, hub, token) = seed().await;
     let app = test::init_service(
         App::new()
             .app_data(state)
             .app_data(registry)
+            .app_data(hub)
             .configure(jellyfin::configure),
     )
     .await;
