@@ -91,6 +91,20 @@ impl Layout {
 
 type CacheKey = (u64, u32);
 
+/// Bump whenever trickplay sprite GENERATION changes in a way that makes
+/// previously-cached tiles wrong (a pixel-format / colour / layout fix). On
+/// startup a mismatch between this and the on-disk `.gen_version` marker wipes
+/// every cached tile so it regenerates with the current code — the cache is
+/// otherwise keyed only by `(media_id, width)` and never re-derives a tile that
+/// already exists, so a stale tile from an older build would persist forever
+/// (observed: magenta-cast Code Geass sprites from a pre-fix build). Starts at
+/// 1: since existing deployments have no marker, the first startup after this
+/// lands treats them as stale and regenerates once.
+const TRICKPLAY_GEN_VERSION: u32 = 1;
+
+/// Name of the on-disk generation-version marker at the cache root.
+const GEN_VERSION_MARKER: &str = ".gen_version";
+
 #[derive(Debug)]
 struct EntryMeta {
     bytes: u64,
@@ -128,14 +142,48 @@ impl std::fmt::Debug for TrickplayCache {
 
 impl TrickplayCache {
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        let root = root.into();
+        Self::reconcile_generation(&root);
         Self {
-            root: root.into(),
+            root,
             max_bytes,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             state: Arc::new(Mutex::new(CacheState::default())),
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
             pool: None,
         }
+    }
+
+    /// Wipe every cached tile when the on-disk generation version doesn't match
+    /// [`TRICKPLAY_GEN_VERSION`], so a generation fix regenerates all sprites
+    /// instead of serving stale ones forever. Runs once at construction (sync —
+    /// startup only). Best-effort: any fs error leaves the cache as-is rather
+    /// than aborting server boot.
+    fn reconcile_generation(root: &Path) {
+        let marker = root.join(GEN_VERSION_MARKER);
+        let on_disk = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if on_disk == Some(TRICKPLAY_GEN_VERSION) {
+            return;
+        }
+        // Version changed (or a pre-versioning cache with tiles already on
+        // disk): drop everything under the root except the marker itself.
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.file_name().and_then(|n| n.to_str()) == Some(GEN_VERSION_MARKER) {
+                    continue;
+                }
+                let _ = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+            }
+        }
+        let _ = std::fs::create_dir_all(root);
+        let _ = std::fs::write(&marker, TRICKPLAY_GEN_VERSION.to_string());
     }
 
     pub fn with_ffmpeg(mut self, p: impl Into<PathBuf>) -> Self {
@@ -502,6 +550,38 @@ impl TrickplayCache {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn stale_tiles_wiped_when_gen_version_absent_then_marker_persists() {
+        let td = TempDir::new().unwrap();
+        // Simulate a pre-versioning cache: a tile on disk, no marker.
+        let stale_dir = td.path().join("42").join("320");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("0.jpg"), b"stale").unwrap();
+
+        // Constructing the cache reconciles: no marker → wipe + write marker.
+        let _cache = TrickplayCache::new(td.path(), 1024);
+        assert!(
+            !stale_dir.join("0.jpg").exists(),
+            "stale tile must be wiped when the generation version is absent"
+        );
+        let marker = td.path().join(GEN_VERSION_MARKER);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            TRICKPLAY_GEN_VERSION.to_string(),
+            "marker written with current generation version"
+        );
+
+        // A tile written under the current version survives a later construction
+        // (marker matches → no wipe).
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("0.jpg"), b"fresh").unwrap();
+        let _cache2 = TrickplayCache::new(td.path(), 1024);
+        assert!(
+            stale_dir.join("0.jpg").exists(),
+            "tiles must persist when the generation version already matches"
+        );
+    }
 
     #[test]
     fn layout_compute_basic_320() {
