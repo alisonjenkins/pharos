@@ -419,6 +419,9 @@ struct HlsItem {
     video_profile: Option<String>,
     video_level: Option<u32>,
     audio_codec: Option<String>,
+    /// Absolute source path — used to warm the continuous-audio pre-encode at
+    /// playlist-request time so the first segment doesn't block on it.
+    source_path: std::path::PathBuf,
     /// Source fps × 1000. Drives frame-aligned segment boundaries so the
     /// playlist's per-segment EXTINF matches the transcoder's actual (frame-
     /// snapped) cut points — otherwise a fixed 6.0 EXTINF drifts against the
@@ -463,6 +466,7 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
         video_profile: item.probe.video_profile.clone(),
         video_level: item.probe.video_level,
         audio_codec: item.probe.audio_codec.clone(),
+        source_path: item.path.clone(),
         frame_rate_mille: item.probe.frame_rate_mille,
         kind: item.kind,
         subtitle_tracks: item.probe.subtitle_tracks.clone(),
@@ -1084,6 +1088,7 @@ fn build_segment_opts(
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
+                    continuous_audio_path: None,
                 };
             }
             // P9 — VideoRemux: copy video, transcode audio (or copy
@@ -1110,6 +1115,7 @@ fn build_segment_opts(
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: None,
+                    continuous_audio_path: None,
                 };
             }
             _ => {}
@@ -1157,6 +1163,7 @@ fn build_segment_opts(
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index,
+        continuous_audio_path: None,
     }
 }
 
@@ -1262,6 +1269,21 @@ async fn vp9_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
+    // Warm the continuous-audio pre-encode NOW (background) so it's ready by
+    // the time the client requests segment 0 — otherwise that first segment
+    // blocks ~seconds on the whole-file audio encode. Default track + bitrate
+    // (the common case); a specific AudioStreamIndex warms lazily per-segment.
+    if let (Ok(media_id), Some(cache)) = (id.parse::<u64>(), state.hls.clone()) {
+        let src = item.source_path.clone();
+        actix_web::rt::spawn(async move {
+            if let Err(e) = cache
+                .whole_audio_path(&src, media_id, None, Some(128_000))
+                .await
+            {
+                tracing::debug!(media.id = media_id, error = %e, "continuous-audio warm failed");
+            }
+        });
+    }
     let duration = item.duration_seconds;
     let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
     let qs = playback_qs(&req);
@@ -1353,7 +1375,7 @@ async fn vp9_segment(
     state.note_playback_activity();
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
-    let opts = vp9_segment_opts(
+    let mut opts = vp9_segment_opts(
         &state,
         &req,
         &item,
@@ -1362,6 +1384,30 @@ async fn vp9_segment(
         q.subtitle_stream_index,
     )
     .await;
+    // A/V-sync fix: point each segment at the WHOLE-file continuous Opus track
+    // so its audio is COPY-sliced (no per-segment preskip → no drift/clicks).
+    // First request encodes + caches it (one-time per title+track); afterwards
+    // it's an instant path lookup. Only when a subtitle burn-in isn't active
+    // (burn-in reads the source directly and keeps the single-input encode).
+    if opts.burn_subtitle_stream_index.is_none() {
+        if let Some(cache) = state.hls.as_ref() {
+            match cache
+                .whole_audio_path(
+                    &item.path,
+                    item.id,
+                    opts.audio_source_stream_index,
+                    opts.audio_bitrate_bps,
+                )
+                .await
+            {
+                Ok(p) => opts.continuous_audio_path = Some(p),
+                Err(e) => tracing::warn!(
+                    media.id = item.id, error = %e,
+                    "continuous-audio pre-encode failed — falling back to per-segment audio"
+                ),
+            }
+        }
+    }
     // Warm the next few segments in the background so a fast / >1x client finds
     // them cached instead of stalling. Spawned BEFORE this segment's own
     // transcode so N and N+1.. queue together across the CPU pool.
@@ -1582,6 +1628,7 @@ async fn vp9_segment_opts(
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: audio_rel,
         burn_subtitle_stream_index: sub_rel,
+        continuous_audio_path: None,
     }
 }
 

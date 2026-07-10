@@ -143,6 +143,7 @@ async fn transcoder_streams_bytes_from_real_video() {
         duration_ticks: None,
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        continuous_audio_path: None,
     };
     let mut stream = FfmpegTranscoder::new()
         .transcode(&fixture, &opts)
@@ -290,6 +291,7 @@ async fn transcoder_honours_audio_stream_index() {
         duration_ticks: Some(20_000_000), // 2 seconds
         audio_source_stream_index: Some(0),
         burn_subtitle_stream_index: None,
+        continuous_audio_path: None,
     };
     let track0_stream = FfmpegTranscoder::new()
         .transcode(&fixture, &common)
@@ -335,6 +337,7 @@ async fn transcoder_honours_burn_subtitle_index() {
         duration_ticks: Some(20_000_000),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        continuous_audio_path: None,
     };
     let no_burn_stream = FfmpegTranscoder::new()
         .transcode(&fixture, &base)

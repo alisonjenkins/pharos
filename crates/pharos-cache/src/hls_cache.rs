@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use pharos_transcode::{FfmpegTranscoder, TranscodeOptions, VideoCodec};
+use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, thiserror::Error)]
@@ -68,17 +68,17 @@ fn codec_tag(video: Option<VideoCodec>) -> u32 {
     // BYTES of a segment for a given (media, index) key. The cache key carries
     // no start time, so a boundary change is exactly such a case.
     //
-    // Latest bump (all re-encoded video, 2026-07-10): segment boundaries are
-    // now FRAME-ALIGNED (see hls::segment_start_secs). A stale segment cached
-    // on the old exact-6.0 s grid represents a slightly different time range
-    // than the new frame-aligned index, so serving it would reintroduce A/V
-    // drift on non-integer-fps sources. Orphan them all.
+    // Frame-aligned boundaries (2026-07-10) bumped every re-encoded video tag.
+    // VP9 bumped again (7→11) the same day: its segment AUDIO is now COPY-sliced
+    // from a whole-file continuous Opus track (the A/V-sync fix — see
+    // HlsSegmentCache::whole_audio_path), which changes the segment bytes, so a
+    // stale preskip-encoded VP9 segment must be orphaned.
     match video {
         None => 0,
         Some(VideoCodec::Copy) => 1,
         Some(VideoCodec::H264) => 8,
         Some(VideoCodec::H265) => 9,
-        Some(VideoCodec::Vp9) => 7,
+        Some(VideoCodec::Vp9) => 11,
         Some(VideoCodec::Av1) => 10,
     }
 }
@@ -108,6 +108,10 @@ struct CacheState {
     /// Per-key locks. Held while a fetch is in flight so concurrent
     /// requests for the same segment don't race.
     fetch_locks: HashMap<CacheKey, Arc<Mutex<()>>>,
+    /// Per-path locks deduplicating concurrent whole-audio pre-encodes
+    /// (the A/V-sync fix): the first request encodes the continuous track,
+    /// others wait then reuse it.
+    audio_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
     entries: HashMap<CacheKey, EntryMeta>,
     total_bytes: u64,
     access_counter: u64,
@@ -378,6 +382,64 @@ impl HlsSegmentCache {
         Ok(None)
     }
 
+    /// A/V-sync fix: return the path to a WHOLE-file, continuously-encoded
+    /// Opus track for `(media_id, audio_index, bitrate)`, transcoding + caching
+    /// it on first request (deduplicated per path). Segments then take audio by
+    /// COPY-slice from this one track, so no independent per-segment Opus
+    /// preskip inflates each segment (which made audio creep ahead + clicked at
+    /// every boundary). ogg-opus: clean + seekable, no mp4 fragmentation.
+    ///
+    /// NOT under LRU: one small audio file per active title; cheap to keep, and
+    /// evicting it mid-playback would force a costly whole-file re-encode.
+    pub async fn whole_audio_path(
+        &self,
+        source: &Path,
+        media_id: u64,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+    ) -> Result<PathBuf, HlsCacheError> {
+        let a = audio_index.unwrap_or(0);
+        let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
+        let dir = self.root.join("_audio");
+        let path = dir.join(format!("{media_id}-a{a}-b{br}.ogg"));
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(path);
+        }
+        let lock = {
+            let mut state = self.state.lock().await;
+            state
+                .audio_locks
+                .entry(path.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(path);
+        }
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = path.with_extension("ogg.tmp");
+        // Whole-file audio-only Opus (video: None → -vn; no start/duration →
+        // the entire track). Downmixed to stereo by the encoder args, matching
+        // what the segments copy.
+        let opts = TranscodeOptions {
+            container: Container::Ogg,
+            video: None,
+            audio: Some(AudioCodec::Opus),
+            audio_bitrate_bps,
+            audio_source_stream_index: audio_index,
+            ..Default::default()
+        };
+        if let Err(e) = self.write_segment(source, &opts, &tmp).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&tmp, &path).await?;
+        let mut state = self.state.lock().await;
+        state.audio_locks.remove(&path);
+        Ok(path)
+    }
+
     async fn touch(&self, key: CacheKey) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
@@ -487,6 +549,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -509,6 +572,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts)
@@ -534,6 +598,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -572,6 +637,7 @@ mod tests {
                 duration_ticks: None,
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
+                continuous_audio_path: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)
@@ -590,6 +656,7 @@ mod tests {
                 duration_ticks: None,
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
+                continuous_audio_path: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)

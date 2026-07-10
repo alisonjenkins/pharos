@@ -279,10 +279,30 @@ fn build_args_for_device(
             a.push(format!("{pos:.3}"));
         }
     }
+    // A/V-sync fix (fMP4-HLS): a second input carrying the WHOLE-file
+    // pre-encoded audio. The segment then takes video by re-encode from input
+    // 0 and audio by COPY-slice from input 1 — so no independent per-segment
+    // Opus preskip inflates each segment (audio-creeps-ahead + boundary clicks).
+    // Same seek as input 0 so the copied slice lands at the segment's start.
+    let has_continuous_audio = opts.continuous_audio_path.is_some();
+    if let Some(ca) = &opts.continuous_audio_path {
+        if let Some(pos) = start {
+            a.push("-ss".into());
+            a.push(format!("{pos:.3}"));
+        }
+        a.push("-i".into());
+        a.push(ca.to_string_lossy().into_owned());
+    }
     if let Some(dur) = opts.duration_seconds() {
         a.push("-t".into());
         a.push(format!("{dur:.3}"));
     }
+    // With a continuous-audio second input, map video from input 0 (re-encode)
+    // + audio from input 1 (copy). This supersedes the single-input `-map`s.
+    if has_continuous_audio {
+        a.push("-map".into());
+        a.push("0:v:0?".into());
+    } else
     // W1 — when the caller specifies an audio stream, route the video + the
     // chosen audio track explicitly. Map only the PRIMARY video (`0:v:0`), not
     // ALL video (`0:v?`): a source with a second video stream — an embedded
@@ -432,30 +452,41 @@ fn build_args_for_device(
             a.push("-vn".into());
         }
     }
-    match opts.audio {
-        Some(AudioCodec::Copy) => {
-            a.push("-c:a".into());
-            a.push("copy".into());
-        }
-        Some(c) => {
-            a.push("-c:a".into());
-            a.push(c.ffmpeg_codec().into());
-            if let Some(b) = opts.audio_bitrate_bps {
-                a.push("-b:a".into());
-                a.push(format!("{b}"));
+    if has_continuous_audio {
+        // Audio comes by COPY from the continuous-audio second input — no
+        // per-segment re-encode, so no per-segment preskip. The ~1-packet
+        // overlap between adjacent slices is byte-identical (one source
+        // stream) so MSE dedups it seamlessly.
+        a.push("-map".into());
+        a.push("1:a:0?".into());
+        a.push("-c:a".into());
+        a.push("copy".into());
+    } else {
+        match opts.audio {
+            Some(AudioCodec::Copy) => {
+                a.push("-c:a".into());
+                a.push("copy".into());
             }
-            // libopus rejects a 5.1(side) source under the default mapping
-            // family (-1) — "Invalid channel layout … for specified mapping
-            // family -1" aborts the whole encode. Downmix to stereo: it's the
-            // browser-safe layout for a progressive VP9/WebM stream anyway, and
-            // avoids opus's finicky multichannel mapping entirely.
-            if matches!(c, AudioCodec::Opus) {
-                a.push("-ac".into());
-                a.push("2".into());
+            Some(c) => {
+                a.push("-c:a".into());
+                a.push(c.ffmpeg_codec().into());
+                if let Some(b) = opts.audio_bitrate_bps {
+                    a.push("-b:a".into());
+                    a.push(format!("{b}"));
+                }
+                // libopus rejects a 5.1(side) source under the default mapping
+                // family (-1) — "Invalid channel layout … for specified mapping
+                // family -1" aborts the whole encode. Downmix to stereo: it's the
+                // browser-safe layout for a progressive VP9/WebM stream anyway, and
+                // avoids opus's finicky multichannel mapping entirely.
+                if matches!(c, AudioCodec::Opus) {
+                    a.push("-ac".into());
+                    a.push("2".into());
+                }
             }
-        }
-        None => {
-            a.push("-an".into());
+            None => {
+                a.push("-an".into());
+            }
         }
     }
     // Never mux a subtitle into the transcoded AV container. pharos delivers
@@ -553,7 +584,58 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         }
+    }
+
+    #[test]
+    fn continuous_audio_uses_second_input_and_copies_audio() {
+        // A/V-sync fix: with a whole-file audio track, video re-encodes from
+        // input 0 and audio is COPY-sliced from input 1 (no per-segment preskip).
+        let mut o = opts();
+        o.container = Container::Fmp4;
+        o.video = Some(VideoCodec::Vp9);
+        o.audio = Some(AudioCodec::Opus);
+        o.start_position_ticks = 60_000_000; // 6 s
+        o.duration_ticks = Some(60_000_000);
+        o.continuous_audio_path = Some(std::path::PathBuf::from("/cache/_audio/1-a0-b128.ogg"));
+        let a = build_args("/m/foo.mkv", &o);
+        let joined = a.join(" ");
+        // Two inputs: the source, then the continuous audio.
+        assert_eq!(
+            a.iter().filter(|x| x.as_str() == "-i").count(),
+            2,
+            "{joined}"
+        );
+        assert!(joined.contains("-i /m/foo.mkv"), "{joined}");
+        assert!(
+            joined.contains("-i /cache/_audio/1-a0-b128.ogg"),
+            "{joined}"
+        );
+        // Video mapped from input 0, audio from input 1 by copy.
+        assert!(joined.contains("-map 0:v:0?"), "{joined}");
+        assert!(joined.contains("-map 1:a:0?"), "{joined}");
+        assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
+        assert!(joined.contains("-c:a copy"), "{joined}");
+        // No per-segment opus re-encode.
+        assert!(!joined.contains("-c:a libopus"), "{joined}");
+    }
+
+    #[test]
+    fn no_continuous_audio_keeps_single_input_encode() {
+        // Without the whole-file track, the classic single-input encode stands.
+        let mut o = opts();
+        o.video = Some(VideoCodec::Vp9);
+        o.audio = Some(AudioCodec::Opus);
+        let a = build_args("/m/foo.mkv", &o);
+        let joined = a.join(" ");
+        assert_eq!(
+            a.iter().filter(|x| x.as_str() == "-i").count(),
+            1,
+            "{joined}"
+        );
+        assert!(joined.contains("-c:a libopus"), "{joined}");
+        assert!(!joined.contains("-c:a copy"), "{joined}");
     }
 
     #[test]
@@ -602,6 +684,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -655,6 +738,7 @@ mod tests {
             duration_ticks: Some(6 * 10_000_000),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -693,6 +777,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -714,6 +799,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            continuous_audio_path: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
