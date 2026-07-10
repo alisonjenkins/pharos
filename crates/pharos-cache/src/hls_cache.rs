@@ -63,19 +63,23 @@ const NO_SUBTITLE: i32 = -1;
 /// Stable small tag distinguishing the output video codec so copy vs
 /// re-encode never share a cache entry.
 fn codec_tag(video: Option<VideoCodec>) -> u32 {
+    // Bumping a tag orphans every pre-existing cached segment for that codec
+    // (LRU reclaims them) — the mechanism used whenever a change alters the
+    // BYTES of a segment for a given (media, index) key. The cache key carries
+    // no start time, so a boundary change is exactly such a case.
+    //
+    // Latest bump (all re-encoded video, 2026-07-10): segment boundaries are
+    // now FRAME-ALIGNED (see hls::segment_start_secs). A stale segment cached
+    // on the old exact-6.0 s grid represents a slightly different time range
+    // than the new frame-aligned index, so serving it would reintroduce A/V
+    // drift on non-integer-fps sources. Orphan them all.
     match video {
         None => 0,
         Some(VideoCodec::Copy) => 1,
-        Some(VideoCodec::H264) => 2,
-        Some(VideoCodec::H265) => 3,
-        // 6 (was 4): VP9 fMP4 segments became SOURCE-anchored
-        // (`-output_ts_offset`, see pharos-transcode) and the server stopped
-        // re-anchoring tfdt onto the 6.0 s grid. A cached zero-based segment
-        // served un-shifted would collapse onto t=0, so orphan every pre-
-        // anchoring VP9 file — LRU reclaims the space, exactly like the
-        // codec-blind `{seg}.ts` orphaning documented on `segment_path_keyed`.
-        Some(VideoCodec::Vp9) => 6,
-        Some(VideoCodec::Av1) => 5,
+        Some(VideoCodec::H264) => 8,
+        Some(VideoCodec::H265) => 9,
+        Some(VideoCodec::Vp9) => 7,
+        Some(VideoCodec::Av1) => 10,
     }
 }
 

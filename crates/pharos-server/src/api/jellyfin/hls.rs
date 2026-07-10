@@ -419,6 +419,11 @@ struct HlsItem {
     video_profile: Option<String>,
     video_level: Option<u32>,
     audio_codec: Option<String>,
+    /// Source fps × 1000. Drives frame-aligned segment boundaries so the
+    /// playlist's per-segment EXTINF matches the transcoder's actual (frame-
+    /// snapped) cut points — otherwise a fixed 6.0 EXTINF drifts against the
+    /// real video timeline on a non-integer-fps source.
+    frame_rate_mille: Option<u32>,
     kind: pharos_core::MediaKind,
     /// P8 — embedded subtitle tracks surfaced as `EXT-X-MEDIA` lines
     /// on the master playlist so HLS clients render a track selector.
@@ -458,6 +463,7 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
         video_profile: item.probe.video_profile.clone(),
         video_level: item.probe.video_level,
         audio_codec: item.probe.audio_codec.clone(),
+        frame_rate_mille: item.probe.frame_rate_mille,
         kind: item.kind,
         subtitle_tracks: item.probe.subtitle_tracks.clone(),
     })
@@ -708,8 +714,11 @@ async fn render_variant_playlist(
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     for seg in 0..segment_count {
-        let remaining = duration - (seg as f64 * SEGMENT_SECONDS);
-        let len = remaining.clamp(0.01, SEGMENT_SECONDS);
+        // Frame-aligned duration matching the transcoder's actual cut points,
+        // clamped by the remaining media at the tail.
+        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
+        let remaining = (duration - start_secs).max(0.01);
+        let len = dur_secs.min(remaining);
         body.push_str(&format!("#EXTINF:{len:.3},\n"));
         // Lowercase: T31 routes are registered lowercase; emit the
         // canonical form so HLS players don't pay a middleware rewrite
@@ -820,8 +829,11 @@ async fn serve_segment(
         None
     };
 
-    let start_ticks = (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
-    let duration_ticks = (SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64;
+    // Frame-aligned boundaries keep audio + video locked across independent
+    // per-segment transcodes (see `segment_start_secs`).
+    let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+    let start_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
+    let duration_ticks = (dur_secs * TICKS_PER_SECOND as f64) as u64;
 
     // P2 — pull negotiated bitrate cap from the live session (if any)
     // so we can clamp the variant override below.
@@ -1272,8 +1284,12 @@ async fn vp9_variant(
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     for seg in 0..segment_count {
-        let remaining = duration - (seg as f64 * SEGMENT_SECONDS);
-        let len = remaining.clamp(0.01, SEGMENT_SECONDS);
+        // Frame-aligned EXTINF matching the transcoder's actual cut points —
+        // a fixed 6.0 drifts against the real video timeline on a non-integer-
+        // fps source and desyncs A/V over a long title.
+        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
+        let remaining = (duration - start_secs).max(0.01);
+        let len = dur_secs.min(remaining);
         body.push_str(&format!("#EXTINF:{len:.3},\n"));
         body.push_str(&format!("/videos/{id}/vp9/{seg}.m4s?{qs}\n"));
     }
@@ -1376,6 +1392,38 @@ async fn vp9_segment(
 /// request that catches up simply awaits the in-flight prefetch.
 const SEGMENT_PREFETCH_AHEAD: u32 = 4;
 
+/// Frame-aligned start time (seconds) of segment `seg`: the nominal
+/// `seg * SEGMENT_SECONDS` boundary snapped to the nearest source video frame.
+///
+/// Why: each HLS segment is an INDEPENDENT transcode seeked to its boundary.
+/// When the source fps doesn't divide the segment length evenly (23.976 fps →
+/// 143.856 frames per 6 s), the nominal boundary lands mid-frame and the
+/// encoder snaps the video's first frame to the frame grid — so the video's
+/// real start walks off the audio's exact-seconds grid, a little more each
+/// segment. That accumulates into audible A/V desync over an episode
+/// (~6 ms/segment measured for 23.976 fps → >1 s across a 25-min title).
+/// Snapping BOTH tracks' seek + tfdt anchor to the SAME frame time locks them
+/// together (measured: a constant −preskip offset, zero accumulation).
+/// Falls back to the nominal grid when fps is unknown.
+fn segment_start_secs(seg: u32, fps_mille: Option<u32>) -> f64 {
+    let nominal = seg as f64 * SEGMENT_SECONDS;
+    match fps_mille {
+        Some(m) if m > 0 => {
+            let fps = m as f64 / 1000.0;
+            (nominal * fps).round() / fps
+        }
+        _ => nominal,
+    }
+}
+
+/// The `(start, duration)` of segment `seg` in seconds, both frame-aligned so
+/// consecutive segments butt-join exactly (segment N ends where N+1 begins).
+fn segment_time_range(seg: u32, fps_mille: Option<u32>) -> (f64, f64) {
+    let start = segment_start_secs(seg, fps_mille);
+    let end = segment_start_secs(seg + 1, fps_mille);
+    (start, (end - start).max(0.001))
+}
+
 /// The segment indices to prefetch after serving `base_seg`: the next
 /// [`SEGMENT_PREFETCH_AHEAD`], stopping at `total_segs` (exclusive) when the
 /// item's length is known so we never queue a past-EOF transcode. `None`
@@ -1414,9 +1462,12 @@ fn spawn_segment_prefetch(
         let state = state.clone();
         let item = item.clone();
         let mut o = opts.clone();
-        o.start_position_ticks =
-            (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
-        o.duration_ticks = Some((SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64);
+        // Same frame-aligned boundary the live handler uses, so the prefetched
+        // bytes are byte-identical to (and cache-key-match) the client's own
+        // eventual request for this segment.
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+        o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
+        o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
         // actix arbiter spawn: the future awaits I/O + the scheduler channel
         // (the encode runs in the transcode worker pool, not here), so it
         // yields the worker immediately and never blocks request handling.
@@ -1476,8 +1527,11 @@ async fn vp9_segment_opts(
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
 ) -> TranscodeOptions {
-    let start_ticks = (seg as u64).saturating_mul(SEGMENT_SECONDS as u64) * TICKS_PER_SECOND;
-    let duration_ticks = (SEGMENT_SECONDS * TICKS_PER_SECOND as f64) as u64;
+    // Frame-aligned boundaries keep audio + video locked across independent
+    // per-segment transcodes (see `segment_start_secs`).
+    let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+    let start_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
+    let duration_ticks = (dur_secs * TICKS_PER_SECOND as f64) as u64;
     let cap = extract_session_bitrate_cap(state, req).await;
     let bitrate = cap
         .map(|c| c.min(HLS_MAX_BITRATE_BPS))
@@ -1676,6 +1730,34 @@ mod tests {
     use super::*;
 
     // `use actix_web::test` shadows the bare `#[test]` attribute; qualify it.
+    #[::core::prelude::v1::test]
+    fn segment_boundaries_frame_align_and_butt_join() {
+        // 23.976 fps (24000/1001): nominal 6 s boundaries land mid-frame, so
+        // they snap to the frame grid — and consecutive segments must join
+        // exactly (segment N end == segment N+1 start) with no gap/overlap.
+        let fps = Some(23_976);
+        let mut prev_end = 0.0_f64;
+        for seg in 0..20u32 {
+            let (start, dur) = segment_time_range(seg, fps);
+            // Butt-join: this segment starts where the previous ended.
+            assert!(
+                (start - prev_end).abs() < 1e-6,
+                "seg {seg} start {start} != prev end {prev_end}"
+            );
+            // Start is snapped to an exact frame boundary.
+            let frames = start * 23_976.0 / 1000.0;
+            assert!(
+                (frames - frames.round()).abs() < 1e-6,
+                "seg {seg} start {start} not on a frame boundary"
+            );
+            // Duration stays within a frame of the nominal 6 s.
+            assert!((dur - SEGMENT_SECONDS).abs() < 0.05, "seg {seg} dur {dur}");
+            prev_end = start + dur;
+        }
+        // Unknown fps → exact nominal grid (no snapping possible).
+        assert_eq!(segment_time_range(3, None), (18.0, 6.0));
+    }
+
     #[::core::prelude::v1::test]
     fn prefetch_window_bounds_to_eof() {
         // Unknown length → the full window from base+1.
