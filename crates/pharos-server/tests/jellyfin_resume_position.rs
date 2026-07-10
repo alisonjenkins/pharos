@@ -188,3 +188,109 @@ async fn playback_info_emits_zero_when_no_user_data_row_exists() {
 fn _items_surface_ref() -> fn(&mut actix_web::web::ServiceConfig) {
     items::register
 }
+
+/// The three home rows (Continue Watching / Listening / Reading) all hit
+/// `/Users/{id}/Items/Resume`, distinguished only by `MediaTypes`. The endpoint
+/// must honour it, else e.g. a movie shows up under "Continue Reading".
+#[actix_web::test]
+async fn resume_list_filters_by_media_types() {
+    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap().0.expose().to_string();
+    // One video (Movie) + one audio item, both mid-playback (resumable).
+    for (id, kind, title) in [
+        (10u64, MediaKind::Movie, "A Movie"),
+        (11u64, MediaKind::Audio, "An Album"),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}").into(),
+                title: title.into(),
+                kind,
+                probe: MediaProbe {
+                    duration_ms: Some(3_600_000),
+                    ..Default::default()
+                },
+                series: None,
+                created_at: None,
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+        stores
+            .set_user_data(
+                uid,
+                id,
+                UserItemData {
+                    played: false,
+                    play_count: 0,
+                    last_played_position_ticks: 60_000_000_000,
+                    is_favorite: false,
+                    last_played_at: 0,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let uid_str = uid.0.simple().to_string();
+
+    let titles = |v: &serde_json::Value| -> Vec<String> {
+        v["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["Name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let get = |mt: &str| {
+        let uri = format!("/Users/{uid_str}/Items/Resume?MediaTypes={mt}");
+        test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request()
+    };
+
+    let video: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, get("Video")).await).unwrap();
+    assert_eq!(
+        titles(&video),
+        vec!["A Movie"],
+        "Video row = the movie only"
+    );
+
+    let audio: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, get("Audio")).await).unwrap();
+    assert_eq!(
+        titles(&audio),
+        vec!["An Album"],
+        "Audio row = the album only"
+    );
+
+    let book: serde_json::Value =
+        serde_json::from_slice(&test::call_and_read_body(&app, get("Book")).await).unwrap();
+    assert!(
+        titles(&book).is_empty(),
+        "Book row must be empty (pharos has no book media): {:?}",
+        titles(&book)
+    );
+}

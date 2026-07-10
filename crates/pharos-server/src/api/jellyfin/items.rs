@@ -3872,22 +3872,50 @@ async fn list_user_items_resume(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
+    req: actix_web::HttpRequest,
 ) -> Result<impl Responder, actix_web::Error> {
     let bearer_id = user.0.id.0.simple().to_string();
     if path.into_inner() != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
+    // jellyfin-web renders three home rows — Continue Watching / Listening /
+    // Reading — from the SAME endpoint, distinguished only by a `MediaTypes`
+    // filter (`Video` / `Audio` / `Book`). Honour it, else every row shows the
+    // same items (e.g. movies under "Continue Reading"). Absent = no filter.
+    let media_types: Vec<String> = req
+        .query_string()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("MediaTypes"))
+        .map(|(_, v)| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let media_type_of = |kind: pharos_core::MediaKind| match kind {
+        pharos_core::MediaKind::Audio => "audio",
+        _ => "video",
+    };
     let ids = state
         .stores
         .resumable_items(user.0.id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
+    let mut ids_kept: Vec<pharos_core::MediaId> = Vec::with_capacity(ids.len());
     for id in &ids {
         if let Ok(item) = state.stores.get(*id).await {
-            items.push(item);
+            // pharos has no Book media, so a `MediaTypes=Book` row is correctly
+            // empty (hidden by the client).
+            if media_types.is_empty() || media_types.iter().any(|t| t == media_type_of(item.kind)) {
+                items.push(item);
+                ids_kept.push(*id);
+            }
         }
     }
+    let ids = ids_kept;
     let user_data = state
         .stores
         .user_data_bulk(user.0.id, &ids)
