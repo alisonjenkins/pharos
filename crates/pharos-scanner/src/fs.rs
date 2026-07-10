@@ -1226,7 +1226,11 @@ fn has_sxxeyy_token(name: &str) -> bool {
 /// Returns `None` when `path` has no parent — pathological case.
 pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let (filename_season, episode) = parse_sxxeyy(name);
+    // Full Emby.Naming-style extraction: SxxEyy, 1x02, EP12, "Episode 12",
+    // and absolute anime numbering ("Series - 07") all resolve here.
+    let parsed = parse_episode_from_name(name);
+    let filename_season = parsed.and_then(|(s, _)| s);
+    let episode = parsed.map(|(_, e)| e);
 
     // Walk parents from closest to farthest, retaining the &Path so the
     // first non-season ancestor's FULL path becomes the C11 folder key.
@@ -1257,7 +1261,14 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
     }
 
     let mut series_name = series_name?;
-    let season_number = season_from_dir.or(filename_season);
+    let mut season_number = season_from_dir.or(filename_season);
+    // An absolute-numbered episode with no season declared belongs to season 1
+    // (Jellyfin's convention) so it groups + orders cleanly rather than under a
+    // null season — without this every such episode sorts equal and renders in
+    // scan order.
+    if season_number.is_none() && episode.is_some() {
+        season_number = Some(1);
+    }
     // LIB-C11: parse a `Show Name (YYYY)` year from the folder component.
     let series_year = series_folder
         .as_deref()
@@ -1312,40 +1323,110 @@ pub(crate) fn parse_folder_year(folder_name: &str) -> Option<u32> {
     (1800..3000).contains(&year).then_some(year)
 }
 
-/// Return the (season, episode) numbers when `name` carries an
-/// `SxxEyy` token at any letter-boundary. `None` if absent.
-fn parse_sxxeyy(name: &str) -> (Option<u32>, Option<u32>) {
-    let lower: Vec<u8> = name.bytes().map(|b| b.to_ascii_lowercase()).collect();
-    let mut i = 0;
-    while i + 5 < lower.len() {
-        let at_boundary = i == 0 || !lower[i - 1].is_ascii_alphabetic();
-        if at_boundary && lower[i] == b's' && lower[i + 1].is_ascii_digit() {
-            // collect season digits
-            let s_start = i + 1;
-            let mut s_end = s_start + 1;
-            while s_end < lower.len() && lower[s_end].is_ascii_digit() {
-                s_end += 1;
-            }
-            if s_end < lower.len() && lower[s_end] == b'e' {
-                let e_start = s_end + 1;
-                let mut e_end = e_start;
-                while e_end < lower.len() && lower[e_end].is_ascii_digit() {
-                    e_end += 1;
-                }
-                if e_end > e_start {
-                    let season = std::str::from_utf8(&lower[s_start..s_end])
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    let episode = std::str::from_utf8(&lower[e_start..e_end])
-                        .ok()
-                        .and_then(|s| s.parse().ok());
-                    return (season, episode);
-                }
+/// One ordered episode-number expression, ported from Emby.Naming's
+/// `EpisodeExpressions`. `optimistic` mirrors Jellyfin's `IsOptimistic`
+/// flag: optimistic expressions run in a SECOND pass, only after the
+/// stricter first pass found nothing (so a title that merely contains a
+/// number doesn't outrank a real `SxxEyy`).
+struct EpExpr {
+    re: regex::Regex,
+    optimistic: bool,
+}
+
+/// The ported expression set. Faithful to Jellyfin's ordering + two-pass
+/// (non-optimistic then optimistic) semantics, but with two deliberate
+/// simplifications: pharos derives the series NAME from the folder tree, so
+/// the `seriesname` captures (and the negative-lookaround guards that only
+/// exist to bound them — Rust's `regex` has no lookaround) are dropped; and
+/// each pattern ends right after the episode-number group so the
+/// `read_episode_number` position guard (Jellyfin's `0-9iIpP` next-char
+/// check) can reject resolutions like `1080p`.
+///
+/// Optimistic absolute-number patterns cap at 3 digits (Jellyfin's `{1,3}`)
+/// so a 4-digit release year can't masquerade as an episode.
+static EP_EXPRS: std::sync::LazyLock<Vec<EpExpr>> = std::sync::LazyLock::new(|| {
+    // Panic-free construction (workspace denies unwrap/expect): a pattern
+    // that fails to compile is logged + skipped rather than aborting. All
+    // patterns are constants covered by unit tests, so this never drops one
+    // in practice.
+    fn compile(pattern: &str, optimistic: bool) -> Option<EpExpr> {
+        match regex::Regex::new(pattern) {
+            Ok(re) => Some(EpExpr { re, optimistic }),
+            Err(e) => {
+                tracing::error!(pattern, error = %e, "invalid episode regex — skipped");
+                None
             }
         }
-        i += 1;
     }
-    (None, None)
+    [
+        // ---- first pass: explicit season+episode / episode markers ----
+        // SxxExx, S01 E02, S01.E02, S01xE02, S01E02-E03 (start captured).
+        compile(r"(?i)s(?<s>\d{1,4})[\]\[ ._x-]*e(?<e>\d+)", false),
+        // Season 1 Episode 2 (words, any separators).
+        compile(
+            r"(?i)season[ ._-]*(?<s>\d{1,4})[ ._-]*episode[ ._-]*(?<e>\d+)",
+            false,
+        ),
+        // 1x02, 01x02, S01x02 (the CxE / NxNN convention).
+        compile(r"(?i)(?:^|[\\/._ \[(-])s?(?<s>\d{1,4})x(?<e>\d+)", false),
+        // EP12 / EP_12.
+        compile(r"(?i)[\\/._ \[(-]ep_?(?<e>\d+)", false),
+        // Episode 12 (word, no season).
+        compile(r"(?i)episode[ ._-]*(?<e>\d+)", false),
+        // E12 at a separator boundary (Show E01, name.E05.).
+        compile(r"(?i)[\\/._ \[(-]e(?<e>\d+)", false),
+        // ---- second pass: optimistic absolute numbering (1-3 digits) ----
+        // Fansub dash: "Series - 07" (greedy prefix → the LAST " - ").
+        compile(r"(?i)^.* - (?<e>\d{1,3})", true),
+        compile(r"(?i)^.*[._]-[._](?<e>\d{1,3})", true),
+        // Bracketed absolute: "Show [12]".
+        compile(r"(?i)\[(?<e>\d{1,3})\]", true),
+        // Whole filename is the number: "07.mkv", "07-08.mkv".
+        compile(r"(?i)(?:^|[\\/])(?<e>\d{1,3})(?:-\d{2,3})?\.[^\\/]+$", true),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+});
+
+/// Parse `(season, episode)` from a filename using the ported Jellyfin
+/// expression set. `season` is `None` when the matching expression carries
+/// no season (absolute / episode-only forms). Returns `None` when no
+/// expression yields an episode number.
+///
+/// Two passes (non-optimistic then optimistic), first match wins — Jellyfin's
+/// `EpisodePathParser.Parse` order. Each candidate is validated: the char
+/// after the episode digits must not continue a number or a resolution
+/// (`0-9 i I p P`), and a season in Jellyfin's junk band (200–1927 or >2500,
+/// where resolutions/years land) is rejected.
+fn parse_episode_from_name(name: &str) -> Option<(Option<u32>, u32)> {
+    for optimistic in [false, true] {
+        for expr in EP_EXPRS.iter().filter(|x| x.optimistic == optimistic) {
+            let Some(caps) = expr.re.captures(name) else {
+                continue;
+            };
+            let Some(e_match) = caps.name("e") else {
+                continue;
+            };
+            // Resolution / continued-number guard (Emby.Naming's next-char
+            // check): the byte after the episode digits must not be another
+            // digit or a resolution marker.
+            if let Some(&next) = name.as_bytes().get(e_match.end()) {
+                if next.is_ascii_digit() || matches!(next, b'i' | b'I' | b'p' | b'P') {
+                    continue;
+                }
+            }
+            let Ok(episode) = e_match.as_str().parse::<u32>() else {
+                continue;
+            };
+            let season = caps
+                .name("s")
+                .and_then(|m| m.as_str().parse::<u32>().ok())
+                .filter(|s| !(200..=1927).contains(s) && *s <= 2500);
+            return Some((season, episode));
+        }
+    }
+    None
 }
 
 /// Parse a "Season N" / "Season NN" / "S01" / "S1" directory name → N.
@@ -3169,6 +3250,75 @@ mod tests {
         assert_eq!(info.series_name, "Another Show");
         assert_eq!(info.season_number, Some(3));
         assert_eq!(info.episode_number, Some(1));
+    }
+
+    #[test]
+    fn parse_episode_covers_season_episode_forms() {
+        // (name, expected (season, episode)) — the explicit season+episode
+        // conventions Jellyfin's first-pass expressions handle.
+        let cases = [
+            ("My.Show.S02E07.mkv", (Some(2), 7)),
+            ("show s1e1.mp4", (Some(1), 1)),
+            ("Series_S12E07_HDTV.mkv", (Some(12), 7)),
+            ("Show S01 E02.mkv", (Some(1), 2)),
+            ("Show.S01.E02.mkv", (Some(1), 2)),
+            ("Show S01xE02.mkv", (Some(1), 2)),
+            ("Show 1x02.mkv", (Some(1), 2)),
+            ("Show 01x02.mkv", (Some(1), 2)),
+            ("Show Season 3 Episode 4.mkv", (Some(3), 4)),
+            // Multi-episode: the START episode is what orders the file.
+            ("Show.S01E02-E03.mkv", (Some(1), 2)),
+            ("Show.S01E02E03.mkv", (Some(1), 2)),
+        ];
+        for (name, want) in cases {
+            assert_eq!(parse_episode_from_name(name), Some(want), "{name}");
+        }
+    }
+
+    #[test]
+    fn parse_episode_covers_absolute_and_marker_forms() {
+        // Episode-only markers → season None (defaulted to 1 upstream).
+        assert_eq!(
+            parse_episode_from_name("Code Geass E01.mkv"),
+            Some((None, 1))
+        );
+        assert_eq!(parse_episode_from_name("Show EP14.mkv"), Some((None, 14)));
+        assert_eq!(
+            parse_episode_from_name("Series Episode 3.mkv"),
+            Some((None, 3))
+        );
+        // Absolute anime numbering — the dominant fansub dash convention.
+        for (name, want) in [
+            ("[Group] Code Geass - 01 [1080p].mkv", 1u32),
+            ("Code Geass Lelouch of the Rebellion - 12 [BD].mkv", 12),
+            ("Code Geass - 25v2.mkv", 25),
+            ("[SubsPlease] Show - 08 (1080p) [ABCD].mkv", 8),
+        ] {
+            assert_eq!(parse_episode_from_name(name), Some((None, want)), "{name}");
+        }
+        // Bracketed absolute + whole-file-is-a-number.
+        assert_eq!(parse_episode_from_name("Show [12].mkv"), Some((None, 12)));
+        assert_eq!(parse_episode_from_name("07.mkv"), Some((None, 7)));
+    }
+
+    #[test]
+    fn parse_episode_rejects_false_positives() {
+        // Resolution / codec / year must NOT read as an episode.
+        assert_eq!(parse_episode_from_name("Movie - 1080p x264.mkv"), None);
+        assert_eq!(parse_episode_from_name("Concert - 2006.mkv"), None);
+        assert_eq!(parse_episode_from_name("Plain Movie (2019).mkv"), None);
+        assert_eq!(parse_episode_from_name("The Big Short 2015.mkv"), None);
+    }
+
+    #[test]
+    fn parse_series_info_uses_absolute_number_and_defaults_season_one() {
+        // Anime folder, no season dir, no SxxEyy — the absolute number drives
+        // ordering and the season defaults to 1 so the episode groups cleanly.
+        let p = Path::new("/anime/Code Geass/[Group] Code Geass - 07 [1080p].mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Code Geass");
+        assert_eq!(info.episode_number, Some(7));
+        assert_eq!(info.season_number, Some(1));
     }
 
     #[test]

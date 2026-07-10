@@ -2980,6 +2980,7 @@ dependencies = [
  "pharos-core",
  "pharos-transcode",
  "quick-xml",
+ "regex",
  "serde",
  "sonic-rs",
  "tempfile",

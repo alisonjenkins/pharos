@@ -24,6 +24,9 @@ notify = { version = "8", optional = true }
 # tags, which the streaming event reader handles cleanly without a rigid
 # derive.
 quick-xml = { workspace = true }
+# Episode-number extraction: a faithful port of Emby.Naming's ordered
+# expression list (SxxEyy, 1x02, EP12, absolute anime numbering, …).
+regex = "1"
 serde = { workspace = true }
 sonic-rs.workspace = true
 thiserror.workspace = true
