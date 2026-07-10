@@ -79,7 +79,6 @@ async fn localization_parental_ratings_route_present() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: /Localization/ParentalRatings serves an empty stub — picker has no ratings (T68)"]
 async fn localization_parental_ratings_nonempty() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;

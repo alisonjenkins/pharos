@@ -427,10 +427,48 @@ async fn localization_countries(_user: AuthUser) -> impl Responder {
     ]))
 }
 
+/// `GET /Localization/ParentalRatings` — the rating catalogue jellyfin-web's
+/// user-policy editor loads for its "maximum allowed rating" picker. Each
+/// `{ Name, Value }` pairs a rating label with Jellyfin's numeric score
+/// (higher = more restrictive); the score is what a future `MaxParentalRating`
+/// comparison uses. Curated to the common US (MPAA/TV) + UK (BBFC) labels —
+/// pharos doesn't ship the full localization DB, but this covers the ratings
+/// real libraries carry. Reference data only: serving it does not by itself
+/// enforce any rating limit (T68 enforcement is separate).
 async fn localization_parental_ratings(_user: AuthUser) -> impl Responder {
-    let empty: Vec<serde_json::Value> = Vec::new();
-    HttpResponse::Ok().json(empty)
+    HttpResponse::Ok().json(PARENTAL_RATINGS)
 }
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ParentalRating {
+    name: &'static str,
+    value: u32,
+}
+
+impl ParentalRating {
+    const fn new(name: &'static str, value: u32) -> Self {
+        Self { name, value }
+    }
+}
+
+/// Ordered least→most restrictive. Values follow Jellyfin's scoring
+/// convention (approve/family low, adult high) so a `MaxParentalRating`
+/// comparison is a simple `<=`.
+const PARENTAL_RATINGS: &[ParentalRating] = &[
+    ParentalRating::new("Approved", 1),
+    ParentalRating::new("G", 1),
+    ParentalRating::new("TV-Y", 1),
+    ParentalRating::new("TV-G", 1),
+    ParentalRating::new("PG", 5),
+    ParentalRating::new("TV-PG", 5),
+    ParentalRating::new("PG-13", 7),
+    ParentalRating::new("TV-14", 7),
+    ParentalRating::new("R", 9),
+    ParentalRating::new("TV-MA", 9),
+    ParentalRating::new("NC-17", 10),
+    ParentalRating::new("X", 10),
+];
 
 async fn localization_options(_user: AuthUser) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!([
