@@ -140,6 +140,30 @@ async fn unknown_playlist_is_404() {
     );
 }
 
+#[actix_web::test]
+async fn playlist_appears_in_items_listing_and_resolves() {
+    let f = seed_rich().await;
+    let (_, v) = get_json_post(&f, &format!("/Playlists?Name=Faves&Ids={}", f.rich_item_id)).await;
+    let pid = v["Id"].as_str().unwrap().to_string();
+
+    // IncludeItemTypes=Playlist lists it (Playlists library view).
+    let (s, list) = get_json(&f, "/Items?IncludeItemTypes=Playlist&Recursive=true").await;
+    assert_eq!(s, 200);
+    let items = list["Items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i["Id"].as_str() == Some(&pid) && i["Type"].as_str() == Some("Playlist")),
+        "created playlist should appear in the Playlist listing"
+    );
+
+    // /Items/{id} resolves the playlist header item.
+    let (rs, rv) = get_json(&f, &format!("/Items/{pid}")).await;
+    assert_eq!(rs, 200);
+    assert_eq!(rv["Type"], "Playlist");
+    assert_eq!(rv["Id"], pid);
+}
+
 /// POST returning JSON — the create endpoint's shape.
 async fn get_json_post(f: &common::Fixture, uri: &str) -> (u16, Value) {
     let app = test::init_service(build_app(f.state.clone())).await;

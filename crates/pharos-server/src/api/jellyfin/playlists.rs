@@ -245,7 +245,7 @@ async fn delete_playlist(
 /// `Playlist` item — opening it lists members via `/Playlists/{id}/Items`
 /// (and the `/Items?ParentId=<wire id>` pivot). `Id` is the wire id so it
 /// round-trips byte-identically.
-fn playlist_dto(
+pub(crate) fn playlist_dto(
     state: &AppState,
     playlist: &pharos_core::Playlist,
     child_count: u32,

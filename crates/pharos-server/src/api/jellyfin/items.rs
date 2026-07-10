@@ -2206,6 +2206,62 @@ async fn list_boxsets_page(
     }))
 }
 
+/// T70 — an `?IncludeItemTypes=Playlist` request (with no media kinds
+/// alongside) asks for the playlist list, which lives in the `playlists`
+/// entity table, NOT the media_items set. Same shape as
+/// [`boxset_only_request`].
+fn playlist_only_request(q: &ListQuery) -> bool {
+    let Some(types) = q.include_item_types.as_deref() else {
+        return false;
+    };
+    let mut saw = false;
+    for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if t.eq_ignore_ascii_case("Playlist") {
+            saw = true;
+        } else {
+            return false;
+        }
+    }
+    saw
+}
+
+/// Build the playlist `/Items` page (entity-backed) for a Playlist-only
+/// request, scoped to the bearer (server-owned playlists always included),
+/// honouring StartIndex / Limit. Shared by `/Items` and `/Users/{u}/Items`.
+async fn list_playlists_page(
+    state: &AppState,
+    user_id: UserId,
+    q: &ListQuery,
+) -> Result<serde_json::Value, actix_web::Error> {
+    use pharos_core::PlaylistStore;
+    let owner = user_id.0.simple().to_string();
+    let rows = state
+        .stores
+        .playlists_for_owner(Some(&owner))
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut all: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for pl in &rows {
+        let count = state
+            .stores
+            .playlist_entries(&pl.wire_id)
+            .await
+            .map(|e| e.len() as u32)
+            .unwrap_or(0);
+        all.push(crate::api::jellyfin::playlists::playlist_dto(
+            state, pl, count,
+        ));
+    }
+    let total = all.len() as u32;
+    let start = q.start_index as usize;
+    let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.limit as usize).collect();
+    Ok(serde_json::json!({
+        "Items": page,
+        "TotalRecordCount": total,
+        "StartIndex": q.start_index,
+    }))
+}
+
 async fn list_items(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -2214,6 +2270,10 @@ async fn list_items(
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
         return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+    }
+    // T70 — Playlist-only listing comes from the playlists entity table.
+    if playlist_only_request(&q) {
+        return Ok(HttpResponse::Ok().json(list_playlists_page(&state, user.0.id, &q).await?));
     }
     if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &q).await? {
         return Ok(resp);
@@ -2237,6 +2297,10 @@ async fn list_user_items(
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
         return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+    }
+    // T70 — Playlist-only listing comes from the playlists entity table.
+    if playlist_only_request(&q) {
+        return Ok(HttpResponse::Ok().json(list_playlists_page(&state, user.0.id, &q).await?));
     }
     // Virtual Series/Season listing — pharos stores no Series/Season row, so a
     // `IncludeItemTypes=Series` (or `Season`) browse collapses the scoped
@@ -3269,6 +3333,27 @@ async fn fetch_item_dto(
                 .map(|m| m.len() as u32)
                 .unwrap_or(0);
             return Ok(HttpResponse::Ok().json(collection_dto(state, &collection, count)));
+        }
+        // T70 — a playlist wire id resolves to its Playlist BaseItemDto so
+        // `/Items/{id}` on a playlist returns the folder item.
+        use pharos_core::PlaylistStore;
+        if let Some(playlist) = state
+            .stores
+            .playlist_by_wire_id(id_str)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        {
+            let count = state
+                .stores
+                .playlist_entries(id_str)
+                .await
+                .map(|e| e.len() as u32)
+                .unwrap_or(0);
+            return Ok(
+                HttpResponse::Ok().json(crate::api::jellyfin::playlists::playlist_dto(
+                    state, &playlist, count,
+                )),
+            );
         }
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
