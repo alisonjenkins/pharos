@@ -230,6 +230,15 @@ async fn handle_connection<S>(
                     current_pli: current_pli.as_deref(),
                 };
                 if let Some(out) = translate_outbound(server_msg, &ctx) {
+                    // TEMP diagnostic: confirm the socket actually pushes the
+                    // SyncPlay group updates + commands the client needs.
+                    let kind = out
+                        .data
+                        .get("Type")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| out.data.get("Command").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    tracing::info!(device_id = %device_key, msg = %out.message_type, kind, "syncplay: → client");
                     if send_outbound(&mut session, &out).await.is_err() {
                         break 'pump;
                     }
