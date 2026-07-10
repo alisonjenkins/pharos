@@ -51,7 +51,7 @@ async fn seed_with_subs(tracks: Vec<SubtitleTrack>) -> (web::Data<AppState>, Str
 }
 
 #[actix_web::test]
-async fn master_playlist_emits_ext_x_media_per_subtitle_track() {
+async fn master_playlist_does_not_advertise_in_manifest_subtitles() {
     let tracks = vec![
         SubtitleTrack {
             stream_index: 2,
@@ -86,29 +86,18 @@ async fn master_playlist_emits_ext_x_media_per_subtitle_track() {
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let s = std::str::from_utf8(&body).unwrap();
-    // Two EXT-X-MEDIA lines, one per track.
+    // Text subtitles are delivered as an External rendition via PlaybackInfo
+    // (jellyfin-web renders them — SubtitlesOctopus / cue JSON). The master must
+    // NOT also advertise an in-manifest subtitle rendition: hls.js would render
+    // a second, unstyled copy on top of the External one ("subtitle twice").
     assert_eq!(
         s.matches("#EXT-X-MEDIA:TYPE=SUBTITLES").count(),
-        2,
-        "expected 2 sub media lines:\n{s}"
+        0,
+        "master must not carry in-manifest subtitle renditions:\n{s}"
     );
-    // Naming + language flow through.
-    assert!(s.contains("NAME=\"English\""), "{s}");
-    assert!(s.contains("LANGUAGE=\"jpn\""), "{s}");
-    // Default flag respects is_default.
     assert!(
-        s.contains("LANGUAGE=\"eng\",DEFAULT=YES"),
-        "first track should default-on:\n{s}"
-    );
-    // URIs point at the per-track playlist endpoint.
-    assert!(s.contains("/videos/9/subtitles/2.m3u8"), "{s}");
-    assert!(s.contains("/videos/9/subtitles/3.m3u8"), "{s}");
-    // Each STREAM-INF carries SUBTITLES="subs".
-    let stream_inf_count = s.matches("#EXT-X-STREAM-INF").count();
-    let with_subs = s.matches("SUBTITLES=\"subs\"").count();
-    assert_eq!(
-        stream_inf_count, with_subs,
-        "every STREAM-INF should reference subs group:\n{s}"
+        !s.contains("SUBTITLES=\"subs\""),
+        "no STREAM-INF should reference a subs group:\n{s}"
     );
 }
 

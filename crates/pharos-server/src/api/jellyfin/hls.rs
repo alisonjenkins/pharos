@@ -436,9 +436,6 @@ struct HlsItem {
     /// real video timeline on a non-integer-fps source.
     frame_rate_mille: Option<u32>,
     kind: pharos_core::MediaKind,
-    /// P8 — embedded subtitle tracks surfaced as `EXT-X-MEDIA` lines
-    /// on the master playlist so HLS clients render a track selector.
-    subtitle_tracks: Vec<pharos_core::SubtitleTrack>,
 }
 
 async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_web::Error> {
@@ -476,7 +473,6 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
         audio_codec: item.probe.audio_codec.clone(),
         frame_rate_mille: item.probe.frame_rate_mille,
         kind: item.kind,
-        subtitle_tracks: item.probe.subtitle_tracks.clone(),
     })
 }
 
@@ -521,24 +517,11 @@ async fn master_playlist(
     // (each segment starts on an IDR / SPS boundary).
     body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
-    // P8 — softsub. Emit EXT-X-MEDIA per subtitle track so HLS
-    // clients render a subtitle selector instead of forcing burn-in.
-    let has_subs =
-        !item.subtitle_tracks.is_empty() && !matches!(item.kind, pharos_core::MediaKind::Audio);
-    if has_subs {
-        for (i, track) in item.subtitle_tracks.iter().enumerate() {
-            let name = subtitle_display_name(track, i);
-            let lang = track.language.as_deref().unwrap_or("und");
-            let default = if track.is_default { "YES" } else { "NO" };
-            let forced = if track.is_forced { "YES" } else { "NO" };
-            body.push_str(&format!(
-                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",\
-                 LANGUAGE=\"{lang}\",DEFAULT={default},FORCED={forced},AUTOSELECT=YES,\
-                 URI=\"/videos/{id}/subtitles/{idx}.m3u8?{qs}\"\n",
-                idx = track.stream_index,
-            ));
-        }
-    }
+    // Text subtitles are delivered as an External rendition via PlaybackInfo
+    // (jellyfin-web renders them — SubtitlesOctopus for ASS / cue JSON). We do
+    // NOT advertise an in-manifest EXT-X-MEDIA:TYPE=SUBTITLES rendition: hls.js
+    // would render it as a second, WebVTT-flattened copy on top of the External
+    // one ("subtitle shown twice"). Image subs still burn into the transcode.
 
     if matches!(item.kind, pharos_core::MediaKind::Audio) {
         // P3 — audio-only HLS: no RESOLUTION token, audio CODECS only.
@@ -584,9 +567,8 @@ async fn master_playlist(
         (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
         _ => String::new(),
     };
-    let sub_attr = if has_subs { ",SUBTITLES=\"subs\"" } else { "" };
     body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}{sub_attr}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}\n\
          /Videos/{id}/main.m3u8?{qs}\n"
     ));
 
@@ -601,7 +583,7 @@ async fn master_playlist(
             None => String::new(),
         };
         body.push_str(&format!(
-            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\"{resolution}{sub_attr}\n\
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\"{resolution}\n\
              /Videos/{id}/variants/{name}.m3u8?{qs}\n",
             bw = v.advertised_bandwidth(),
             name = v.name(),
@@ -639,16 +621,6 @@ fn parse_start_time_ticks_qs(qs: &str) -> u64 {
 
 /// Render a human-readable label for a subtitle track. Falls back to
 /// `Track {idx}` when neither title nor language is present.
-fn subtitle_display_name(track: &pharos_core::SubtitleTrack, idx: usize) -> String {
-    if let Some(title) = track.title.as_ref().filter(|s| !s.is_empty()) {
-        return title.clone();
-    }
-    if let Some(lang) = track.language.as_ref().filter(|s| !s.is_empty()) {
-        return lang.to_ascii_uppercase();
-    }
-    format!("Track {}", idx + 1)
-}
-
 /// Pull the negotiated `max_video_bitrate_bps` from the transcode
 /// session if a PlaySessionId is present and the session is alive.
 /// Returns `None` when no PSID was supplied OR the session has no
@@ -1244,25 +1216,15 @@ async fn vp9_master(
     let item = load_hls_item(&state, &id).await?;
     let qs = playback_qs(&req);
     let bitrate = target_video_bitrate(item.source_bitrate_bps) + 128_000;
-    let has_subs =
-        !item.subtitle_tracks.is_empty() && !matches!(item.kind, pharos_core::MediaKind::Audio);
 
     let mut body = String::new();
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    if has_subs {
-        for (i, track) in item.subtitle_tracks.iter().enumerate() {
-            let name = subtitle_display_name(track, i);
-            let lang = track.language.as_deref().unwrap_or("und");
-            let default = if track.is_default { "YES" } else { "NO" };
-            let forced = if track.is_forced { "YES" } else { "NO" };
-            body.push_str(&format!(
-                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",\
-                 LANGUAGE=\"{lang}\",DEFAULT={default},FORCED={forced},AUTOSELECT=YES,\
-                 URI=\"/videos/{id}/subtitles/{idx}.m3u8?{qs}\"\n",
-                idx = track.stream_index,
-            ));
-        }
-    }
+    // NOTE: text subtitles are delivered as an External rendition via
+    // PlaybackInfo (`DeliveryUrl` → SubtitlesOctopus for ASS / cue JSON), which
+    // jellyfin-web renders itself. We deliberately do NOT also advertise an
+    // in-manifest `EXT-X-MEDIA:TYPE=SUBTITLES` rendition here: hls.js would
+    // render it as a second (WebVTT-flattened, unstyled) copy on top of the
+    // External one — the "subtitle shown twice" bug. Image subs still burn in.
     // Continuous-audio rendition: a separate audio group so the audio is one
     // gapless encode (no per-segment preskip drift/clicks). The video variant
     // references it via AUDIO="aud"; video segments carry no audio.
@@ -1274,9 +1236,8 @@ async fn vp9_master(
         (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
         _ => String::new(),
     };
-    let sub_attr = if has_subs { ",SUBTITLES=\"subs\"" } else { "" };
     body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}{sub_attr}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}\n\
          /videos/{id}/vp9/main.m3u8?{qs}\n"
     ));
     Ok(HttpResponse::Ok()
