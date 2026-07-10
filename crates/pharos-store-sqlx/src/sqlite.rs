@@ -431,6 +431,19 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// T69 — rename a library (identified by its `wire_id`) in place. The
+    /// `wire_id` + `root_path` are unchanged (both derive from the path), so
+    /// client item URLs keyed on the id survive the rename. Returns the number
+    /// of rows updated (0 = no library with that wire id).
+    pub async fn rename_library(&self, wire_id: &str, new_name: &str) -> Result<u64, StoreError> {
+        let res = sqlx::query("UPDATE libraries SET name = ? WHERE wire_id = ?")
+            .bind(new_name)
+            .bind(wire_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// T72 — read a persisted named-configuration section blob by key
     /// (`encoding`, `network`, …). Returns the raw JSON string, or `None`
     /// when the section has never been written (the handler then serves

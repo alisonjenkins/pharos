@@ -64,7 +64,6 @@ async fn remove_virtual_folder_deletes() {
 // ---- backlog T69: honour + expose LibraryOptions ----
 
 #[actix_web::test]
-#[ignore = "gap: add_virtual_folder drops every LibraryOptions field but Path (T69)"]
 async fn add_virtual_folder_persists_library_options() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
@@ -95,7 +94,6 @@ async fn add_virtual_folder_persists_library_options() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /Library/VirtualFolders/LibraryOptions endpoint absent (T69)"]
 async fn update_virtual_folder_options_roundtrip() {
     let f = seed_rich().await;
     let list = list_folders(&f).await;
@@ -124,7 +122,6 @@ async fn update_virtual_folder_options_roundtrip() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /Library/VirtualFolders/Name (rename) endpoint absent (T69)"]
 async fn rename_virtual_folder() {
     let f = seed_rich().await;
     let list = list_folders(&f).await;
@@ -151,7 +148,6 @@ async fn rename_virtual_folder() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST/DELETE /Library/VirtualFolders/Paths endpoints absent (T69)"]
 async fn add_and_remove_media_path() {
     let f = seed_rich().await;
     let list = list_folders(&f).await;
@@ -183,7 +179,6 @@ async fn add_and_remove_media_path() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: GET /Libraries/AvailableOptions (fetcher/TypeOptions catalogue) absent (T69)"]
 async fn available_options_lists_fetchers_and_typeoptions() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
@@ -203,7 +198,6 @@ async fn available_options_lists_fetchers_and_typeoptions() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: GET /Environment/DirectoryContents (folder picker) absent (T69)"]
 async fn environment_directory_contents() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;

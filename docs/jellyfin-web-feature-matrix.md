@@ -40,7 +40,7 @@ jellyfin-web: `src/apps/wizard/routes/routes.tsx`, `src/controllers/wizard/*`.
 |---|---|---|---|---|
 | Server name + UI language | `controllers/wizard/start/index.js` | `GET/POST Startup/Configuration`, `GET Localization/Options` | THIN | — |
 | First admin user | `controllers/wizard/user/index.js` | `GET/POST Startup/User` | THIN | — |
-| Library creation in setup | `controllers/wizard/library.js` | `POST Library/VirtualFolders` | THIN | `add_virtual_folder_persists_library_options` *(T69, ignored)* |
+| Library creation in setup | `controllers/wizard/library.js` | `POST Library/VirtualFolders` | DONE (options persist) | `add_virtual_folder_persists_library_options` *(T69)* |
 | Metadata language/country | `controllers/wizard/settings/index.js` | `POST Startup/Configuration`, `Localization/{Cultures,Countries}` | THIN | — |
 | Remote access toggle | `controllers/wizard/remote/index.js` | `POST Startup/RemoteAccess` | THIN | — |
 | Complete wizard | `controllers/wizard/finish/index.js` | `POST Startup/Complete` | THIN | — |
@@ -192,13 +192,13 @@ update/rename/paths endpoints and `GET Libraries/AvailableOptions` don't exist.
 
 | Feature | jellyfin-web source | Server endpoint | status | Test |
 |---|---|---|---|---|
-| Add library | `mediaLibraryCreator/` | `POST Library/VirtualFolders` (`LibraryOptions`) | THIN | `add_virtual_folder_persists_library_options` *(T69, ignored)* |
+| Add library | `mediaLibraryCreator/` | `POST Library/VirtualFolders` (`LibraryOptions`) | DONE (options persist) | `add_virtual_folder_persists_library_options` *(T69)* |
 | Remove library | `libraries/index.tsx` | `DELETE Library/VirtualFolders?name=` | DONE | `remove_virtual_folder_deletes` |
-| Update library options | `mediaLibraryEditor/` | `POST Library/VirtualFolders/LibraryOptions` | MISSING | `update_virtual_folder_options_roundtrip` *(T69, ignored)* |
-| Rename library | `mediaLibraryEditor/` | `POST Library/VirtualFolders/Name` | MISSING | `rename_virtual_folder` *(T69, ignored)* |
-| Add / remove media path | `mediaLibraryEditor/` | `POST/DELETE Library/VirtualFolders/Paths` | MISSING | `add_and_remove_media_path` *(T69, ignored)* |
-| Available options (fetchers/TypeOptions) | `libraryoptionseditor/` | `GET Libraries/AvailableOptions` | MISSING | `available_options_lists_fetchers_and_typeoptions` *(T69, ignored)* |
-| Folder picker | `directorybrowser/` | `GET Environment/DirectoryContents` | THIN | `environment_directory_contents` *(T69, ignored)* |
+| Update library options | `mediaLibraryEditor/` | `POST Library/VirtualFolders/LibraryOptions` | MISSING | `update_virtual_folder_options_roundtrip` *(T69)* |
+| Rename library | `mediaLibraryEditor/` | `POST Library/VirtualFolders/Name` | MISSING | `rename_virtual_folder` *(T69)* |
+| Add / remove media path | `mediaLibraryEditor/` | `POST/DELETE Library/VirtualFolders/Paths` | MISSING | `add_and_remove_media_path` *(T69)* |
+| Available options (fetchers/TypeOptions) | `libraryoptionseditor/` | `GET Libraries/AvailableOptions` | MISSING | `available_options_lists_fetchers_and_typeoptions` *(T69)* |
+| Folder picker | `directorybrowser/` | `GET Environment/DirectoryContents` | DONE | `environment_directory_contents` *(T69)* |
 
 ## Dashboard settings (named configurations)
 jellyfin-web: `src/apps/dashboard/routes/{settings,playback,libraries,livetv}/*`.

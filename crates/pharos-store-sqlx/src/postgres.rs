@@ -418,6 +418,16 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// T69 — rename a library by `wire_id` in place (see the sqlite twin).
+    pub async fn rename_library(&self, wire_id: &str, new_name: &str) -> Result<u64, StoreError> {
+        let res = sqlx::query("UPDATE libraries SET name = $1 WHERE wire_id = $2")
+            .bind(new_name)
+            .bind(wire_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// T72 — read a persisted named-configuration section blob by key (see
     /// the sqlite twin). `None` when the section has never been written.
     pub async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {

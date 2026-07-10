@@ -11,8 +11,7 @@ use crate::{
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
-            BaseItemDto, ItemsResultDto, SubtitleStreamCtx, VirtualFolderInfoDto,
-            VirtualFolderOptionsDto,
+            BaseItemDto, ItemsResultDto, SubtitleStreamCtx,
         },
         subtitles::discover_sidecars,
     },
@@ -61,6 +60,32 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/library/virtualfolders",
             web::delete().to(remove_virtual_folder),
+        )
+        // T69 — library-settings sub-endpoints (order after the base routes;
+        // more-specific paths so no collision).
+        .route(
+            "/library/virtualfolders/libraryoptions",
+            web::post().to(update_virtual_folder_options),
+        )
+        .route(
+            "/library/virtualfolders/name",
+            web::post().to(rename_virtual_folder),
+        )
+        .route(
+            "/library/virtualfolders/paths",
+            web::post().to(add_media_path),
+        )
+        .route(
+            "/library/virtualfolders/paths",
+            web::delete().to(remove_media_path),
+        )
+        .route(
+            "/libraries/availableoptions",
+            web::get().to(libraries_available_options),
+        )
+        .route(
+            "/environment/directorycontents",
+            web::get().to(environment_directory_contents),
         )
         .route("/library/mediafolders", web::get().to(media_folders))
         .route("/items/{id}/playbackinfo", web::get().to(playback_info))
@@ -3870,44 +3895,127 @@ async fn virtual_folders(
     // configured `media_roots` entry, then to the legacy "All Media" stub
     // when neither is configured (keeps the wire shape jellyfin-web
     // accepts).
-    let libraries = state.libraries();
-    let folders: Vec<VirtualFolderInfoDto> = if !libraries.is_empty() {
-        libraries
-            .iter()
-            .map(|lib| VirtualFolderInfoDto {
-                name: lib.name.clone(),
-                locations: vec![lib.root_path.clone()],
-                collection_type: lib.kind.collection_type(),
-                item_id: lib.wire_id.clone(),
-                library_options: VirtualFolderOptionsDto::default(),
-            })
-            .collect()
+    // Snapshot the library rows into owned tuples so the AppState mutex guard
+    // isn't held across the per-folder `.await`s below.
+    let libraries: Vec<(String, String, &'static str, String)> = state
+        .libraries()
+        .iter()
+        .map(|l| {
+            (
+                l.name.clone(),
+                l.root_path.clone(),
+                l.kind.collection_type(),
+                l.wire_id.clone(),
+            )
+        })
+        .collect();
+    let mut folders: Vec<serde_json::Value> = Vec::new();
+    if !libraries.is_empty() {
+        for (name, root, ctype, wire) in libraries.iter() {
+            folders.push(virtual_folder_json(&state, name, root, ctype, wire).await);
+        }
     } else if !state.media_roots.is_empty() {
-        state
-            .media_roots
-            .iter()
-            .map(|root| VirtualFolderInfoDto {
-                name: root
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Media")
-                    .to_string(),
-                locations: vec![root.to_string_lossy().into_owned()],
-                collection_type: "mixed",
-                item_id: library_id_for_root(root),
-                library_options: VirtualFolderOptionsDto::default(),
-            })
-            .collect()
+        for root in state.media_roots.iter() {
+            let name = root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Media")
+                .to_string();
+            let wire = library_id_for_root(root);
+            folders.push(
+                virtual_folder_json(&state, &name, &root.to_string_lossy(), "mixed", &wire).await,
+            );
+        }
     } else {
-        vec![VirtualFolderInfoDto {
-            name: "All Media".into(),
-            locations: vec![],
-            collection_type: "mixed",
-            item_id: "00000000000000000000000000000000".into(),
-            library_options: VirtualFolderOptionsDto::default(),
-        }]
-    };
+        folders.push(
+            virtual_folder_json(
+                &state,
+                "All Media",
+                "",
+                "mixed",
+                "00000000000000000000000000000000",
+            )
+            .await,
+        );
+    }
     Ok(HttpResponse::Ok().json(folders))
+}
+
+/// T69 — build one `VirtualFolderInfo` as JSON, overlaying the library's
+/// persisted `LibraryOptions` (named_config key `libopts:{wire}`) on the
+/// shaped defaults and appending any operator-added extra `Locations`
+/// (`libpaths:{wire}`) to the root path.
+async fn virtual_folder_json(
+    state: &AppState,
+    name: &str,
+    root_path: &str,
+    collection_type: &'static str,
+    wire_id: &str,
+) -> serde_json::Value {
+    let mut library_options = default_library_options();
+    if let Ok(Some(raw)) = state
+        .stores
+        .load_named_config(&format!("libopts:{wire_id}"))
+        .await
+    {
+        if let (Some(base), Ok(serde_json::Value::Object(stored))) = (
+            library_options.as_object_mut(),
+            serde_json::from_str::<serde_json::Value>(&raw),
+        ) {
+            for (k, v) in stored {
+                base.insert(k, v);
+            }
+        }
+    }
+    let mut locations: Vec<String> = Vec::new();
+    if !root_path.is_empty() {
+        locations.push(root_path.to_string());
+    }
+    locations.extend(library_extra_paths(state, wire_id).await);
+    serde_json::json!({
+        "Name": name,
+        "Locations": locations,
+        "CollectionType": collection_type,
+        "ItemId": wire_id,
+        "LibraryOptions": library_options,
+    })
+}
+
+/// The extra media paths an operator added to a library beyond its root
+/// (`POST /Library/VirtualFolders/Paths`), stored as a JSON array under
+/// `libpaths:{wire}`. Empty when none / on any parse error.
+async fn library_extra_paths(state: &AppState, wire_id: &str) -> Vec<String> {
+    match state
+        .stores
+        .load_named_config(&format!("libpaths:{wire_id}"))
+        .await
+    {
+        Ok(Some(raw)) => serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// A shaped default `LibraryOptions` object — the fields jellyfin-web's
+/// library-settings form reads. Persisted overrides overlay this.
+fn default_library_options() -> serde_json::Value {
+    serde_json::json!({
+        "Enabled": true,
+        "EnablePhotos": true,
+        "EnableRealtimeMonitor": false,
+        "EnableChapterImageExtraction": false,
+        "ExtractChapterImagesDuringLibraryScan": false,
+        "EnableInternetProviders": false,
+        "SaveLocalMetadata": false,
+        "PreferredMetadataLanguage": "en",
+        "MetadataCountryCode": "US",
+        "SeasonZeroDisplayName": "Specials",
+        "AutomaticallyAddToCollection": false,
+        "MetadataSavers": [],
+        "DisabledLocalMetadataReaders": [],
+        "LocalMetadataReaderOrder": ["Nfo"],
+        "TypeOptions": [],
+        "PathInfos": [],
+    })
 }
 
 /// `POST /Library/VirtualFolders` — the dashboard "Add Media Library" wizard.
@@ -3929,41 +4037,32 @@ struct AddVirtualFolderQuery {
     refresh_library: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
-struct AddVirtualFolderBody {
-    library_options: LibraryOptionsBody,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
-struct LibraryOptionsBody {
-    path_infos: Vec<PathInfoBody>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
-struct PathInfoBody {
-    path: String,
-}
-
 async fn add_virtual_folder(
     state: web::Data<AppState>,
     user: AuthUser,
     q: web::Query<AddVirtualFolderQuery>,
-    body: Option<web::Json<AddVirtualFolderBody>>,
+    body: Option<web::Json<serde_json::Value>>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::LibraryStore;
 
+    // The raw LibraryOptions object from the body — persisted per library
+    // (T69) so EnablePhotos / PreferredMetadataLanguage / fetcher order etc.
+    // round-trip, instead of being dropped down to just the path.
+    let body_val = body.map(|b| b.into_inner());
+    let library_options_blob = body_val
+        .as_ref()
+        .and_then(|v| v.get("LibraryOptions"))
+        .cloned();
     // Gather the paths: body PathInfos first, then a `?path=` fallback.
-    let mut paths: Vec<String> = body
-        .map(|b| {
-            b.into_inner()
-                .library_options
-                .path_infos
-                .into_iter()
-                .map(|p| p.path)
+    let mut paths: Vec<String> = library_options_blob
+        .as_ref()
+        .and_then(|lo| lo.get("PathInfos"))
+        .and_then(|pi| pi.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("Path").and_then(|v| v.as_str()))
+                .map(str::to_string)
                 .filter(|p| !p.trim().is_empty())
                 .collect::<Vec<_>>()
         })
@@ -4005,6 +4104,17 @@ async fn add_virtual_folder(
             .upsert_library(&name, path, kind, &wire_id)
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        // T69 — persist the LibraryOptions blob (minus PathInfos, which are the
+        // Locations, tracked separately) so it round-trips on the GET.
+        if let Some(mut lo) = library_options_blob.clone() {
+            if let Some(obj) = lo.as_object_mut() {
+                obj.remove("PathInfos");
+            }
+            let _ = state
+                .stores
+                .set_named_config(&format!("libopts:{wire_id}"), &lo.to_string())
+                .await;
+        }
     }
 
     // Stamp library_id on items already indexed under the new path(s), then
@@ -4063,6 +4173,254 @@ async fn remove_virtual_folder(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     reload_libraries_and_backfill(&state).await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// Resolve a library's `wire_id` from its display name against the current set.
+fn wire_id_for_library_name(state: &AppState, name: &str) -> Option<String> {
+    state
+        .libraries()
+        .iter()
+        .find(|l| l.name == name)
+        .map(|l| l.wire_id.clone())
+}
+
+/// `POST /Library/VirtualFolders/LibraryOptions` (T69) — persist a library's
+/// full `LibraryOptions` blob (keyed by its `Id`/wire id) so the settings
+/// round-trip on the next GET. Body: `{ Id, LibraryOptions }`.
+async fn update_virtual_folder_options(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    body: web::Json<serde_json::Value>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    let v = body.into_inner();
+    let id = v
+        .get("Id")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| error::ErrorBadRequest("missing Id"))?;
+    let mut opts = v
+        .get("LibraryOptions")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    if let Some(obj) = opts.as_object_mut() {
+        obj.remove("PathInfos"); // Locations are tracked separately.
+    }
+    state
+        .stores
+        .set_named_config(&format!("libopts:{id}"), &opts.to_string())
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RenameVirtualFolderQuery {
+    id: Option<String>,
+    new_name: Option<String>,
+}
+
+/// `POST /Library/VirtualFolders/Name?id=&newName=` (T69) — rename a library
+/// in place (wire id + path unchanged, so item URLs survive).
+async fn rename_virtual_folder(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<RenameVirtualFolderQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    let id =
+        q.id.as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
+    let new_name = q
+        .new_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error::ErrorBadRequest("missing newName"))?;
+    let updated = state
+        .stores
+        .rename_library(id, new_name)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if updated == 0 {
+        return Err(error::ErrorNotFound("no such library"));
+    }
+    reload_libraries_and_backfill(&state).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct MediaPathBody {
+    name: String,
+    path_info: PathInfoValue,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct PathInfoValue {
+    path: String,
+}
+
+/// `POST /Library/VirtualFolders/Paths` (T69) — add an extra media path to a
+/// library (appears in `Locations`). Stored under `libpaths:{wire}`.
+///
+/// NOTE: pharos models a library by a single root path in the store, so the
+/// extra path is recorded + surfaced for the UI but is NOT independently
+/// scanned as its own root yet (multi-root libraries are a separate change);
+/// files placed under it are picked up if it's within an existing media root.
+async fn add_media_path(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    body: web::Json<MediaPathBody>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    let body = body.into_inner();
+    let path = body.path_info.path.trim().to_string();
+    if body.name.trim().is_empty() || path.is_empty() {
+        return Err(error::ErrorBadRequest("Name and PathInfo.Path required"));
+    }
+    let Some(wire_id) = wire_id_for_library_name(&state, body.name.trim()) else {
+        return Err(error::ErrorNotFound("no such library"));
+    };
+    let mut paths = library_extra_paths(&state, &wire_id).await;
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+    let json = serde_json::to_string(&paths).unwrap_or_else(|_| "[]".to_string());
+    state
+        .stores
+        .set_named_config(&format!("libpaths:{wire_id}"), &json)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RemoveMediaPathQuery {
+    name: Option<String>,
+    path: Option<String>,
+}
+
+/// `DELETE /Library/VirtualFolders/Paths?name=&path=` (T69) — remove an
+/// operator-added extra media path from a library.
+async fn remove_media_path(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: web::Query<RemoveMediaPathQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    let name = q
+        .name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| error::ErrorBadRequest("missing name"))?;
+    let path = q
+        .path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| error::ErrorBadRequest("missing path"))?;
+    let Some(wire_id) = wire_id_for_library_name(&state, name) else {
+        return Err(error::ErrorNotFound("no such library"));
+    };
+    let mut paths = library_extra_paths(&state, &wire_id).await;
+    paths.retain(|p| p != path);
+    let json = serde_json::to_string(&paths).unwrap_or_else(|_| "[]".to_string());
+    state
+        .stores
+        .set_named_config(&format!("libpaths:{wire_id}"), &json)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `GET /Libraries/AvailableOptions` (T69) — the fetcher / saver / per-type
+/// catalogue jellyfin-web's library-settings form populates its dropdowns
+/// from. pharos ships no ONLINE metadata/image providers (it reads local NFO +
+/// sidecar art), so the fetcher lists are empty; the shape is complete so the
+/// form renders. `Nfo` is advertised as the local metadata reader/saver.
+async fn libraries_available_options(_user: AuthUser) -> impl Responder {
+    let type_option = |t: &str| {
+        serde_json::json!({
+            "Type": t,
+            "MetadataFetchers": [],
+            "MetadataFetcherOrder": [],
+            "ImageFetchers": [],
+            "ImageFetcherOrder": [],
+            "SupportedImageTypes": ["Primary", "Backdrop", "Logo", "Thumb", "Banner"],
+            "DefaultImageOptions": [],
+        })
+    };
+    HttpResponse::Ok().json(serde_json::json!({
+        "MetadataSavers": [
+            { "Name": "Nfo", "DefaultEnabled": false }
+        ],
+        "MetadataReaders": [
+            { "Name": "Nfo", "DefaultEnabled": true }
+        ],
+        "SubtitleFetchers": [],
+        "TypeOptions": [
+            type_option("Movie"),
+            type_option("Series"),
+            type_option("Season"),
+            type_option("Episode"),
+            type_option("MusicAlbum"),
+            type_option("MusicArtist"),
+        ],
+    }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct DirectoryContentsQuery {
+    path: Option<String>,
+    #[serde(default)]
+    include_directories: bool,
+    #[serde(default)]
+    include_files: bool,
+}
+
+/// `GET /Environment/DirectoryContents?path=&includeDirectories=` (T69) — the
+/// server-side folder picker the add-library wizard uses. Lists the entries of
+/// `path` (defaulting to `/`), filtered to directories and/or files. Admin
+/// only (it browses the server filesystem, which is the point).
+async fn environment_directory_contents(
+    user: AuthUser,
+    q: web::Query<DirectoryContentsQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
+    let path = q.path.as_deref().filter(|p| !p.is_empty()).unwrap_or("/");
+    // Default to directories when neither flag is set (the picker's usual mode).
+    let want_dirs = q.include_directories || !q.include_files;
+    let want_files = q.include_files;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let is_dir = ft.is_dir();
+            if (is_dir && !want_dirs) || (!is_dir && !want_files) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue; // hide dotfiles from the picker
+            }
+            out.push(serde_json::json!({
+                "Name": name,
+                "Path": entry.path().to_string_lossy(),
+                "Type": if is_dir { "Directory" } else { "File" },
+            }));
+        }
+    }
+    out.sort_by(|a, b| {
+        a["Name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["Name"].as_str().unwrap_or(""))
+    });
+    Ok(HttpResponse::Ok().json(out))
 }
 
 /// Reload the typed-library set from the store into `AppState`, re-stamping
