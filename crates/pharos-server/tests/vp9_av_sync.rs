@@ -31,7 +31,7 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-const SECS: u32 = 30; // spans 5× 6 s segments → exercises 4 interior boundaries
+const SECS: u32 = 90; // 15× 6 s segments — enough to expose per-segment drift as a slope
                       // 23.976 fps (film/NTSC): 6 s = 143.856 frames, a NON-integer frames-per-
                       // segment, so segment cuts don't land on frame boundaries — the realistic case
                       // that a clean 30 fps (integer 180 frames/segment) source would hide.
@@ -54,9 +54,12 @@ fn make_sync_clip(dir: &Path) -> std::path::PathBuf {
     // Both markers are TIME-keyed (fps-independent) so they line up regardless
     // of frame rate: a ~30 ms white flash and a 40 ms 1 kHz beep in the first
     // slice of each second.
-    let vf = "[0:v]drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='lt(mod(t\\,1)\\,0.03)'[v];\
-         [1:a]volume=enable='lt(mod(t\\,1)\\,0.04)':volume=1:eval=frame,\
-         volume=enable='gte(mod(t\\,1)\\,0.04)':volume=0:eval=frame[a]"
+    // Flash window 0.06 s > one 23.976 fps frame (41.7 ms) so every second
+    // renders at least one white frame (a 0.03 s window fell between frames on
+    // some seconds → intermittently undetectable). Beep 0.05 s to match.
+    let vf = "[0:v]drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='lt(mod(t\\,1)\\,0.06)'[v];\
+         [1:a]volume=enable='lt(mod(t\\,1)\\,0.05)':volume=1:eval=frame,\
+         volume=enable='gte(mod(t\\,1)\\,0.05)':volume=0:eval=frame[a]"
         .to_string();
     let status = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y"])
@@ -327,9 +330,35 @@ async fn vp9_av_sync_holds_across_segment_boundaries() {
         .iter()
         .filter_map(|o| o.map(f64::abs))
         .fold(0.0_f64, f64::max);
+    // Drift SLOPE: least-squares fit of offset(ms) vs flash time(s). A constant
+    // codec-delay offset has slope ~0; accumulating drift (the real desync bug)
+    // shows as a nonzero slope, independent of the constant. This catches the
+    // small per-segment error that a max-offset threshold misses over 30 s but
+    // that grows to seconds across a full episode.
+    let pts: Vec<(f64, f64)> = flashes
+        .iter()
+        .zip(off.iter())
+        .filter_map(|(&t, o)| o.map(|d| (t, d * 1000.0)))
+        .collect();
+    let n = pts.len() as f64;
+    let sx: f64 = pts.iter().map(|(t, _)| t).sum();
+    let sy: f64 = pts.iter().map(|(_, y)| y).sum();
+    let sxx: f64 = pts.iter().map(|(t, _)| t * t).sum();
+    let sxy: f64 = pts.iter().map(|(t, y)| t * y).sum();
+    let slope_ms_per_s = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    eprintln!(
+        "A/V drift slope = {slope_ms_per_s:+.2} ms/s  (→ {:+.0} ms over a 25-min title)",
+        slope_ms_per_s * 1500.0
+    );
     assert!(
         max_off < 0.12,
         "A/V desync across segments: max offset {:.0}ms (per-event above)",
         max_off * 1000.0
+    );
+    // < 3 ms/s ⇒ under ~0.3 s over a 25-min episode — imperceptible + non-
+    // accumulating. A real drift bug is many times this.
+    assert!(
+        slope_ms_per_s.abs() < 3.0,
+        "A/V drift accumulates at {slope_ms_per_s:.2} ms/s (per-event above)"
     );
 }
