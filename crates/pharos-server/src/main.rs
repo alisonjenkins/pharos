@@ -576,7 +576,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 tp,
                 state.subtitles.clone(),
                 state.images.clone(),
-                state.playback_activity.clone(),
+                state.bg_io.clone(),
                 cfg.server.trickplay_widths.clone(),
                 cfg.server.trickplay_interval_ms,
             );

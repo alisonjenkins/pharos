@@ -24,55 +24,29 @@ use pharos_cache::trickplay_cache::TrickplayCache;
 use pharos_cache::{ImageCache, SubtitleCache};
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_jellyfin_api::dto::{build_layout, series_id_for_key};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 const WARMUP: Duration = Duration::from_secs(45);
 const PASS_INTERVAL: Duration = Duration::from_secs(600);
 const COOLDOWN: Duration = Duration::from_secs(3);
-/// A whole-file decode contends with live segment transcoding, so we never
-/// start one while a client is streaming. "Streaming" = a segment was pulled
-/// within this window; playback must be quiet this long before background
-/// work resumes. Larger than a client's read-ahead gap so a buffered player
-/// doesn't repeatedly wave the backfill through between segment bursts.
-const PLAYBACK_QUIET: Duration = Duration::from_secs(30);
-/// How often to re-check the playback gate while parked.
-const GATE_POLL: Duration = Duration::from_secs(3);
 
-/// Unix seconds, mirroring `AppState`'s clock, for the playback-quiet gate.
-fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Block until live playback has been quiet for `PLAYBACK_QUIET`. This is the
-/// yield-to-playback gate: the backfill parks here rather than launching a
-/// CPU/IO-heavy decode that would make an active stream buffer.
-async fn await_playback_quiet(playback: &AtomicI64) {
-    loop {
-        let idle = unix_now_secs().saturating_sub(playback.load(Ordering::Relaxed));
-        if idle >= PLAYBACK_QUIET.as_secs() as i64 {
-            return;
-        }
-        tokio::time::sleep(GATE_POLL).await;
-    }
-}
-
-/// The playback-yield gate, with a `bypass` escape hatch. Bulk pre-generation
-/// parks on [`await_playback_quiet`] so a whole-file decode never makes an
-/// active stream buffer. But the *actively-watched* item (the priority-tier
-/// seed) is exactly what the viewer is about to scrub — it must be generated
-/// immediately, even mid-playback, or its previews never appear during the
-/// session that wants them. `bypass = true` skips the gate for that case.
-async fn await_gate(bypass: bool, playback: &AtomicI64) {
+/// Acquire a background-I/O slot for one bulk pre-generation op. The
+/// actively-watched seed (`bypass = true`) skips throttling entirely — its
+/// previews must appear immediately, mid-session. All other work draws a permit
+/// from the shared adaptive gate ([`AppState::bg_io`]), which the server shrinks
+/// while a client is streaming: so bulk generation PROGRESSES continuously but
+/// throttled (bounded concurrency), instead of the old all-or-nothing "pause
+/// entirely while anyone is watching". Hold the returned guard across the heavy
+/// op and drop it before cooling down, so the slot frees for the next item.
+///
+/// [`AppState::bg_io`]: crate::state::AppState
+async fn acquire_gate(bypass: bool, bg_io: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     if bypass {
-        return;
+        return None;
     }
-    await_playback_quiet(playback).await;
+    bg_io.clone().acquire_owned().await.ok()
 }
 
 /// Handle for nudging the pre-generator to prioritise an item (and its series).
@@ -87,7 +61,7 @@ pub fn spawn(
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
     images: Option<ImageCache>,
-    playback: Arc<AtomicI64>,
+    bg_io: Arc<Semaphore>,
     widths: Vec<u32>,
     interval_ms: u32,
 ) -> PriorityTx {
@@ -100,7 +74,7 @@ pub fn spawn(
             cache,
             subtitles,
             images,
-            playback,
+            bg_io,
             widths,
             interval_ms,
             rx,
@@ -115,7 +89,7 @@ async fn run(
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
     images: Option<ImageCache>,
-    playback: Arc<AtomicI64>,
+    bg_io: Arc<Semaphore>,
     widths: Vec<u32>,
     interval_ms: u32,
     mut prio_rx: mpsc::UnboundedReceiver<u64>,
@@ -137,17 +111,7 @@ async fn run(
 
         // 1. Priority: actively-watched items, expanded to their whole series.
         for id in pending.drain(..) {
-            generate_priority(
-                id,
-                &items,
-                &cache,
-                subs,
-                imgs,
-                &playback,
-                &widths,
-                interval_ms,
-            )
-            .await;
+            generate_priority(id, &items, &cache, subs, imgs, &bg_io, &widths, interval_ms).await;
         }
 
         // 2. General sweep, newest-first.
@@ -157,24 +121,15 @@ async fn run(
             // A show that starts playing mid-sweep preempts the rest.
             drain_into(&mut prio_rx, &mut pending);
             for id in pending.drain(..) {
-                generate_priority(
-                    id,
-                    &items,
-                    &cache,
-                    subs,
-                    imgs,
-                    &playback,
-                    &widths,
-                    interval_ms,
-                )
-                .await;
+                generate_priority(id, &items, &cache, subs, imgs, &bg_io, &widths, interval_ms)
+                    .await;
             }
             generate_item(
                 item,
                 &cache,
                 subs,
                 imgs,
-                &playback,
+                &bg_io,
                 &widths,
                 interval_ms,
                 false,
@@ -213,7 +168,7 @@ async fn generate_priority(
     cache: &TrickplayCache,
     subs: Option<&SubtitleCache>,
     imgs: Option<&ImageCache>,
-    playback: &AtomicI64,
+    bg_io: &Arc<Semaphore>,
     widths: &[u32],
     interval_ms: u32,
 ) {
@@ -222,7 +177,7 @@ async fn generate_priority(
     };
     // The seed is what the viewer is scrubbing right now: generate it first,
     // bypassing the playback-quiet gate so its previews appear mid-session.
-    generate_item(seed, cache, subs, imgs, playback, widths, interval_ms, true).await;
+    generate_item(seed, cache, subs, imgs, bg_io, widths, interval_ms, true).await;
     // Series siblings are "next up" — worth pre-warming, but they stay gated
     // so their bulk decode still yields to the active stream.
     if let Some(s) = seed.series.as_ref() {
@@ -234,17 +189,7 @@ async fn generate_priority(
                     series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
                 })
         }) {
-            generate_item(
-                item,
-                cache,
-                subs,
-                imgs,
-                playback,
-                widths,
-                interval_ms,
-                false,
-            )
-            .await;
+            generate_item(item, cache, subs, imgs, bg_io, widths, interval_ms, false).await;
         }
     }
 }
@@ -257,7 +202,7 @@ async fn generate_item(
     cache: &TrickplayCache,
     subs: Option<&SubtitleCache>,
     imgs: Option<&ImageCache>,
-    playback: &AtomicI64,
+    bg_io: &Arc<Semaphore>,
     widths: &[u32],
     interval_ms: u32,
     bypass_gate: bool,
@@ -272,12 +217,16 @@ async fn generate_item(
         let Some(layout) = build_layout(&item.probe, width, interval_ms) else {
             continue;
         };
-        // Yield to live playback: park here (not mid-decode) until streaming
-        // has been quiet, so this whole-file decode never makes a viewer buffer.
-        // The actively-watched seed (`bypass_gate`) skips the wait so its
-        // previews appear during the session that wants them.
-        await_gate(bypass_gate, playback).await;
-        match cache.ensure_generated(item.id, layout, &item.path).await {
+        // Throttle to the adaptive gate: hold a background-I/O permit across the
+        // decode so bulk generation runs at bounded concurrency (yielding NFS +
+        // CPU headroom to live streams) yet keeps making progress even while
+        // someone is watching. The actively-watched seed bypasses it entirely.
+        // Release the permit before the cooldown so the next item can start.
+        let generated = {
+            let _permit = acquire_gate(bypass_gate, bg_io).await;
+            cache.ensure_generated(item.id, layout, &item.path).await
+        };
+        match generated {
             Ok(true) => {
                 tracing::debug!(media.id = item.id, width, "trickplay pre-generated");
                 // Cool down only after real work so re-scans stay fast.
@@ -293,8 +242,10 @@ async fn generate_item(
     // whole-file demux (esp. multi-GB lossless-audio anime).
     if let Some(sc) = subs {
         if !item.probe.subtitle_tracks.is_empty() {
-            await_gate(bypass_gate, playback).await;
-            crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
+            {
+                let _permit = acquire_gate(bypass_gate, bg_io).await;
+                crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
+            }
             tokio::time::sleep(COOLDOWN).await;
         }
     }
@@ -303,7 +254,7 @@ async fn generate_item(
     // fetching each font cold. Only matters for titles that carry fonts.
     if let Some(ic) = imgs {
         if !item.probe.attachments.is_empty() {
-            await_gate(bypass_gate, playback).await;
+            let _permit = acquire_gate(bypass_gate, bg_io).await;
             let indices: Vec<u32> = item
                 .probe
                 .attachments
@@ -325,22 +276,39 @@ async fn generate_item(
 mod tests {
     use super::*;
 
-    /// The priority-tier seed (`bypass = true`) must generate immediately even
-    /// while playback is active — otherwise the previews for the very item
-    /// being watched never appear during that session.
+    /// The priority-tier seed (`bypass = true`) generates immediately — it takes
+    /// NO permit, so it never blocks even when the gate is fully parked (the
+    /// state during live playback). Otherwise the previews for the very item
+    /// being watched wouldn't appear during that session.
     #[tokio::test]
-    async fn gate_bypass_returns_immediately_during_active_playback() {
-        let active = AtomicI64::new(unix_now_secs()); // "playback just happened"
-        let r = tokio::time::timeout(Duration::from_millis(100), await_gate(true, &active)).await;
-        assert!(r.is_ok(), "bypass must not park on the playback-quiet gate");
+    async fn gate_bypass_takes_no_permit_even_when_fully_parked() {
+        let gate = Arc::new(Semaphore::new(0)); // no permits available at all
+        let r = tokio::time::timeout(Duration::from_millis(100), acquire_gate(true, &gate)).await;
+        assert!(
+            matches!(r, Ok(None)),
+            "bypass acquires no permit + never blocks"
+        );
     }
 
-    /// Non-bypass (bulk) generation still parks while playback is active, so a
-    /// whole-file decode never steals cycles from a live stream.
+    /// Bulk generation is THROTTLED (not paused): it draws from the shared gate,
+    /// so its concurrency is bounded — but as soon as a permit frees it proceeds
+    /// (continuous progress even while a client streams).
     #[tokio::test]
-    async fn gate_without_bypass_parks_during_active_playback() {
-        let active = AtomicI64::new(unix_now_secs());
-        let r = tokio::time::timeout(Duration::from_millis(100), await_gate(false, &active)).await;
-        assert!(r.is_err(), "bulk generation must yield to active playback");
+    async fn gate_non_bypass_is_bounded_by_permits() {
+        let gate = Arc::new(Semaphore::new(1));
+        let p1 = acquire_gate(false, &gate).await;
+        assert!(p1.is_some(), "first op gets the only permit");
+        // A second concurrent op waits for the permit — bounded concurrency.
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), acquire_gate(false, &gate)).await;
+        assert!(
+            blocked.is_err(),
+            "second op is throttled while the first holds it"
+        );
+        // Freeing the permit lets it proceed — it never permanently stalls.
+        drop(p1);
+        let freed =
+            tokio::time::timeout(Duration::from_millis(100), acquire_gate(false, &gate)).await;
+        assert!(matches!(freed, Ok(Some(_))), "permit freed → op proceeds");
     }
 }
