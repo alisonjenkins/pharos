@@ -1990,6 +1990,12 @@ struct ListQuery {
     /// Comma-separated Jellyfin Type names: e.g. "Movie,Episode".
     #[serde(default)]
     include_item_types: Option<String>,
+    /// Comma-separated Jellyfin `Fields` the client wants hydrated on each
+    /// list row (e.g. `People,Studios,Tags`). T67 — the list builder omits
+    /// these join-backed arrays by default (one query per item), populating
+    /// them only when explicitly requested here.
+    #[serde(default)]
+    fields: Option<String>,
     /// `SortName` (default), `Random`, `DateCreated` (currently same as SortName — no created-at column yet).
     #[serde(default)]
     sort_by: Option<String>,
@@ -2369,7 +2375,15 @@ async fn run_items_list(
         } else {
             after_ud[start..end].to_vec()
         };
-        return build_items_page(state, user_id, &page, total, q.start_index).await;
+        return build_items_page_with_fields(
+            state,
+            user_id,
+            &page,
+            total,
+            q.start_index,
+            q.fields.as_deref(),
+        )
+        .await;
     }
 
     let (items, total) = state
@@ -2378,7 +2392,15 @@ async fn run_items_list(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let total = u32::try_from(total).unwrap_or(u32::MAX);
-    build_items_page(state, user_id, &items, total, q.start_index).await
+    build_items_page_with_fields(
+        state,
+        user_id,
+        &items,
+        total,
+        q.start_index,
+        q.fields.as_deref(),
+    )
+    .await
 }
 
 /// How a `?ParentId=` resolved against the store / config.
@@ -2864,30 +2886,77 @@ pub(crate) async fn build_items_page(
     total: u32,
     start_index: u32,
 ) -> Result<ItemsResultDto, actix_web::Error> {
+    build_items_page_with_fields(state, user_id, page, total, start_index, None).await
+}
+
+/// T67 — `build_items_page`, plus optional per-row hydration of the
+/// join-backed `People` / `Studios` / `Tags` arrays when the client's
+/// Jellyfin `Fields` requests them. Those are omitted by default (the
+/// grid doesn't need cast/crew) because each is one indexed query per row;
+/// a `Fields=People` request (the cast-on-cards view) opts into the cost.
+pub(crate) async fn build_items_page_with_fields(
+    state: &AppState,
+    user_id: UserId,
+    page: &[MediaItem],
+    total: u32,
+    start_index: u32,
+    fields: Option<&str>,
+) -> Result<ItemsResultDto, actix_web::Error> {
+    use pharos_core::{PersonStore, StudioStore, TagStore};
+    let want_people = fields_requests(fields, "People");
+    let want_studios = fields_requests(fields, "Studios");
+    let want_tags = fields_requests(fields, "Tags");
     let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
         .user_data_bulk(user_id, &ids)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let mut items: Vec<BaseItemDto> = page
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
+    let mut items: Vec<BaseItemDto> = Vec::with_capacity(page.len());
+    for (i, item) in page.iter().enumerate() {
+        let ud = user_data.get(i).copied().unwrap_or_default();
+        let mut dto = BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            .with_trickplay(
                 &item.probe,
                 &state.trickplay_widths,
                 state.trickplay_interval_ms,
-            )
-        })
-        .collect();
+            );
+        // Best-effort per-row enrichment: a store error just leaves the
+        // array empty, never a 500 (mirrors the detail path).
+        if want_people {
+            if let Ok(p) = state.stores.people_for_item(item.id).await {
+                dto = dto.with_people(&p);
+            }
+        }
+        if want_studios {
+            if let Ok(s) = state.stores.studios_for_item(item.id).await {
+                dto = dto.with_studios(&s);
+            }
+        }
+        if want_tags {
+            if let Ok(t) = state.stores.tags_for_item(item.id).await {
+                dto = dto.with_tags(&t);
+            }
+        }
+        items.push(dto);
+    }
     let refs: Vec<&MediaItem> = page.iter().collect();
     fill_parent_ids(state, &mut items, &refs);
     Ok(ItemsResultDto {
         items,
         total_record_count: total,
         start_index,
+    })
+}
+
+/// Whether the comma-separated Jellyfin `Fields` value requests `name`
+/// (case-insensitive). `ItemCounts`, `PrimaryImageAspectRatio`, … are
+/// ignored here — only the join-backed arrays this builder can hydrate.
+fn fields_requests(fields: Option<&str>, name: &str) -> bool {
+    fields.is_some_and(|f| {
+        f.split(',')
+            .map(str::trim)
+            .any(|t| t.eq_ignore_ascii_case(name))
     })
 }
 

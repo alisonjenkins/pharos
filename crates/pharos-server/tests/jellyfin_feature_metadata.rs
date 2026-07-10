@@ -91,7 +91,6 @@ async fn list_and_detail_populate_provider_ids() {
 // ---- backlog T67: enrich list responses + metadata-editor endpoint ----
 
 #[actix_web::test]
-#[ignore = "gap: list responses omit People even with Fields=People (T67)"]
 async fn list_items_populate_people_when_requested() {
     let f = seed_rich().await;
     let list = list_items(&f, "IncludeItemTypes=Movie&Recursive=true&Fields=People").await;
@@ -102,7 +101,6 @@ async fn list_items_populate_people_when_requested() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: list responses omit Studios/Tags even when requested (T67)"]
 async fn list_items_populate_studios_and_tags() {
     let f = seed_rich().await;
     let list = list_items(
@@ -151,7 +149,6 @@ async fn item_production_locations_populated() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: GET /Items/{id}/MetadataEditor endpoint absent (T67)"]
 async fn metadata_editor_endpoint_returns_cultures_and_external_ids() {
     let f = seed_rich().await;
     let list = list_items(&f, "IncludeItemTypes=Movie&Recursive=true").await;

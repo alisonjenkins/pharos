@@ -29,7 +29,79 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             web::get().to(remote_subtitle_search),
         )
         .route("/audio/{id}/lyrics", web::get().to(get_lyrics))
-        .route("/items/{id}/instantmix", web::get().to(instant_mix));
+        .route("/items/{id}/instantmix", web::get().to(instant_mix))
+        .route("/items/{id}/metadataeditor", web::get().to(metadata_editor));
+}
+
+/// `GET /Items/{id}/MetadataEditor` (T67) — the bundle jellyfin-web's
+/// metadata editor loads to build its form: the culture picker, the
+/// external-id fields (Imdb/Tmdb/Tvdb), the parental-rating + country
+/// options, and the item's current content type. pharos serves the same
+/// static option catalogue everywhere; the per-item bits (ContentType) are
+/// derived from the item's kind.
+async fn metadata_editor(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    let id: u64 = path
+        .into_inner()
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let content_type = match item.kind {
+        pharos_core::MediaKind::Movie => "Movies",
+        pharos_core::MediaKind::Episode => "tvshows",
+        pharos_core::MediaKind::Audio => "music",
+    };
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "ContentType": content_type,
+        "ContentTypeOptions": [
+            { "Name": "Movies", "Value": "movies" },
+            { "Name": "Shows",  "Value": "tvshows" },
+            { "Name": "Music",  "Value": "music" },
+        ],
+        "Cultures": crate::api::jellyfin::system::LOCALIZATION_CULTURES,
+        "Countries": [
+            { "Name": "US", "DisplayName": "United States",
+              "TwoLetterISORegionName": "US", "ThreeLetterISORegionName": "USA" }
+        ],
+        "ParentalRatingOptions": [],
+        "ExternalIdInfos": EXTERNAL_ID_INFOS,
+    })))
+}
+
+/// The external metadata id fields the editor exposes. `UrlFormatString`'s
+/// `{0}` is where jellyfin-web substitutes the id to build the outbound
+/// link — the same set pharos already emits as `ExternalUrls`/`ProviderIds`.
+const EXTERNAL_ID_INFOS: &[ExternalIdInfo] = &[
+    ExternalIdInfo::new("IMDb", "Imdb", "https://www.imdb.com/title/{0}"),
+    ExternalIdInfo::new("TheMovieDb", "Tmdb", "https://www.themoviedb.org/movie/{0}"),
+    ExternalIdInfo::new("TheTVDB", "Tvdb", "https://thetvdb.com/?tab=series&id={0}"),
+];
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ExternalIdInfo {
+    name: &'static str,
+    key: &'static str,
+    #[serde(rename = "Type")]
+    id_type: Option<&'static str>,
+    url_format_string: &'static str,
+}
+
+impl ExternalIdInfo {
+    const fn new(name: &'static str, key: &'static str, url: &'static str) -> Self {
+        Self {
+            name,
+            key,
+            id_type: None,
+            url_format_string: url,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

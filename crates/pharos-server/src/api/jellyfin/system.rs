@@ -356,7 +356,7 @@ async fn localization_cultures(_user: AuthUser) -> impl Responder {
     HttpResponse::Ok().json(LOCALIZATION_CULTURES)
 }
 
-const LOCALIZATION_CULTURES: &[Culture] = &[
+pub(crate) const LOCALIZATION_CULTURES: &[Culture] = &[
     Culture::new("English", "en", "eng"),
     Culture::new("Spanish", "es", "spa"),
     Culture::new("French", "fr", "fre"),
@@ -389,7 +389,7 @@ const LOCALIZATION_CULTURES: &[Culture] = &[
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct Culture {
+pub(crate) struct Culture {
     name: &'static str,
     display_name: &'static str,
     // Jellyfin uses an all-caps `ISO` in these keys

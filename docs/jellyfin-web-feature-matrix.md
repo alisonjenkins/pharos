@@ -98,20 +98,21 @@ jellyfin-web: `src/controllers/itemDetails/index.js`.
 The DTO carries every field; the **list** builder
 (`pharos-jellyfin-api/src/dto.rs`) hardcodes people/studios/tags/external
 arrays empty — only the single-item detail handler (`items.rs:get_item`)
-enriches. `external_urls` / `remote_trailers` / `production_locations` are
-never populated anywhere. `GET Items/{id}/MetadataEditor` is absent.
+enriches. `external_urls` is populated; `remote_trailers` / `production_locations` are
+not (they need new persisted metadata-model fields — a separate slice).
+`GET Items/{id}/MetadataEditor` is served (Cultures + ExternalIdInfos).
 
 | Feature | jellyfin-web source | Server endpoint | status | Test |
 |---|---|---|---|---|
-| Cast & crew on lists | `cardBuilder`, `itemDetails` (`Fields=People`) | `GET Users/{id}/Items?Fields=People` | THIN | `list_items_populate_people_when_requested` *(T67, ignored)* |
-| Studios & tags on lists | `Fields=Studios,Tags` | `GET Users/{id}/Items?Fields=Studios,Tags` | THIN | `list_items_populate_studios_and_tags` *(T67, ignored)* |
+| Cast & crew on lists | `cardBuilder`, `itemDetails` (`Fields=People`) | `GET Users/{id}/Items?Fields=People` | DONE (per-row when Fields=People) | `list_items_populate_people_when_requested` |
+| Studios & tags on lists | `Fields=Studios,Tags` | `GET Users/{id}/Items?Fields=Studios,Tags` | DONE (per-row when requested) | `list_items_populate_studios_and_tags` |
 | Cast/crew on **detail** | `itemDetails` | `GET Users/{id}/Items/{id}` `People`/`Studios`/`Tags` | DONE | `item_detail_enriches_people_studios_tags` |
 | Provider ids | `itemDetails`, external-link builder | `GET Items/{id}` `ProviderIds` | DONE | `list_and_detail_populate_provider_ids` |
 | Chapters | `itemDetails` chapter strip | `GET Items/{id}` `Chapters` | DONE | — |
 | External links | external-link builder (`ExternalUrls`) | `GET Items/{id}` `ExternalUrls` | DONE | `item_external_urls_populated` |
 | Remote trailers | `itemDetails` trailer button | `GET Items/{id}` `RemoteTrailers` | MISSING | `item_remote_trailers_populated` *(T67, ignored)* |
 | Production locations | `itemDetails` | `GET Items/{id}` `ProductionLocations` | MISSING | `item_production_locations_populated` *(T67, ignored)* |
-| Metadata-editor payload | `components/metadataEditor/` | `GET Items/{id}/MetadataEditor` (Cultures/ParentalRatings/ContentTypeOptions/ExternalIdInfos) | MISSING | `metadata_editor_endpoint_returns_cultures_and_external_ids` *(T67, ignored)* |
+| Metadata-editor payload | `components/metadataEditor/` | `GET Items/{id}/MetadataEditor` (Cultures/ParentalRatings/ContentTypeOptions/ExternalIdInfos) | DONE | `metadata_editor_endpoint_returns_cultures_and_external_ids` *(T67)* |
 
 ## Playback
 jellyfin-web: `src/components/playback/playbackmanager.js`, `src/plugins/htmlVideoPlayer/`.
