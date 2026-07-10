@@ -245,7 +245,6 @@ async fn plugins_install() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /Videos/MergeVersions absent (T76)"]
 async fn item_merge_versions() {
     let f = seed_rich().await;
     let status = post_status(
@@ -263,7 +262,6 @@ async fn item_merge_versions() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: POST /Items/{id}/ContentType absent (T76)"]
 async fn item_content_type() {
     let f = seed_rich().await;
     let status = post_status(
@@ -278,7 +276,6 @@ async fn item_content_type() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: GET /Items/{id}/RemoteImages absent (T76)"]
 async fn remote_image_search() {
     let f = seed_rich().await;
     assert_eq!(
@@ -292,7 +289,6 @@ async fn remote_image_search() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: GET /Items/{id}/RemoteSearch/Subtitles/{lang} absent (T76)"]
 async fn remote_subtitle_search() {
     let f = seed_rich().await;
     assert_eq!(
@@ -306,7 +302,6 @@ async fn remote_subtitle_search() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: lyrics endpoints absent (T76)"]
 async fn lyrics_crud() {
     let f = seed_rich().await;
     assert_eq!(
@@ -316,7 +311,6 @@ async fn lyrics_crud() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: GET /Items/{id}/InstantMix absent (T76)"]
 async fn item_instant_mix() {
     let f = seed_rich().await;
     assert_eq!(

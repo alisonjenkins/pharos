@@ -92,7 +92,7 @@ jellyfin-web: `src/controllers/itemDetails/index.js`.
 | Seasons / episodes | `itemDetails/index.js` | `GET Shows/{id}/{Seasons,Episodes}` | DONE | — |
 | Similar items | `itemDetails/index.js` | `GET Items/{id}/Similar` | DONE | — |
 | Special features / extras | `itemDetails/index.js` | `GET Users/{id}/Items/{id}/SpecialFeatures` | THIN (stub) | — |
-| Instant mix (music) | `itemDetails/index.js` | `GET Items/{id}/InstantMix` | MISSING | `item_instant_mix` *(T76, ignored)* |
+| Instant mix (music) | `itemDetails/index.js` | `GET Items/{id}/InstantMix` | MISSING | `item_instant_mix` *(T76)* — same-kind mix |
 
 ## Item metadata richness — **gap A**
 The DTO carries every field; the **list** builder
@@ -130,11 +130,11 @@ jellyfin-web: `src/components/{metadataEditor,itemidentifier,imageeditor,imageDo
 
 | Feature | jellyfin-web source | Server endpoint | status | Test |
 |---|---|---|---|---|
-| Edit item fields | `metadataEditor/` | `POST Items/{id}` | MISSING | `item_content_type` *(T76, ignored)* covers ContentType; edit-item tracked with T67 |
+| Edit item fields | `metadataEditor/` | `POST Items/{id}` | MISSING | `item_content_type` *(T76)* covers ContentType (accepted; kind stays probe-derived); edit-item tracked with T67 |
 | Identify / remote search | `itemidentifier/` | `GET Items/{id}/ExternalIdInfos`, `POST Items/RemoteSearch/{type}`, `POST Items/RemoteSearch/Apply/{id}` | MISSING | *(T67 backlog)* |
 | Refresh metadata | `refreshdialog/` | `POST Items/{id}/Refresh` | THIN | — |
-| Image editor (delete/reorder) | `imageeditor/` | `GET Items/{id}/Images`, `DELETE .../{type}/{index}`, `POST .../{type}/{index}/Index` | MISSING | `remote_image_search` *(T76, ignored)* |
-| Remote image search/download | `imageDownloader/` | `GET Items/{id}/RemoteImages`, `POST .../RemoteImages/Download` | MISSING | `remote_image_search` *(T76, ignored)* |
+| Image editor (delete/reorder) | `imageeditor/` | `GET Items/{id}/Images`, `DELETE .../{type}/{index}`, `POST .../{type}/{index}/Index` | PARTIAL (local image CRUD tracked separately) | `remote_image_search` *(T76)* |
+| Remote image search/download | `imageDownloader/` | `GET Items/{id}/RemoteImages`, `POST .../RemoteImages/Download` | MISSING | `remote_image_search` *(T76)* — empty (no providers) |
 
 ## Subtitles & lyrics
 jellyfin-web: `src/components/{subtitleeditor,subtitleuploader,lyricseditor}/`.
@@ -142,9 +142,9 @@ jellyfin-web: `src/components/{subtitleeditor,subtitleuploader,lyricseditor}/`.
 | Feature | jellyfin-web source | Server endpoint | status | Test |
 |---|---|---|---|---|
 | Subtitle delivery | `htmlVideoPlayer/` | `GET Videos/{id}/{ms}/Subtitles/{idx}/Stream.{fmt}` | DONE | `jellyfin_subtitles` |
-| Remote subtitle search/download | `subtitleeditor/` | `GET Items/{id}/RemoteSearch/Subtitles/{lang}`, `POST .../Subtitles/{id}` | MISSING | `remote_subtitle_search` *(T76, ignored)* |
+| Remote subtitle search/download | `subtitleeditor/` | `GET Items/{id}/RemoteSearch/Subtitles/{lang}`, `POST .../Subtitles/{id}` | MISSING | `remote_subtitle_search` *(T76)* — empty (no providers) |
 | Subtitle upload/delete | `subtitleuploader/` | `POST/DELETE Videos/{id}/Subtitles` | MISSING | *(T76 backlog)* |
-| Lyrics CRUD | `lyricseditor/`, `controllers/lyrics.js` | `GET/POST/DELETE …/Lyrics` | MISSING | `lyrics_crud` *(T76, ignored)* |
+| Lyrics CRUD | `lyricseditor/`, `controllers/lyrics.js` | `GET/POST/DELETE …/Lyrics` | MISSING | `lyrics_crud` *(T76)* — GET from .lrc sidecar |
 
 ## Collections & playlists
 jellyfin-web: `src/components/{collectionEditor,playlisteditor}/`.
@@ -246,8 +246,8 @@ Each page reads `GET System/Configuration/{key}` and writes
 | Favorite toggle | `userdatabuttons/` | `POST/DELETE UserFavoriteItems/{id}` | DONE | `favorite_toggle_roundtrip` |
 | Played / unplayed toggle | `multiSelect/`, `userdatabuttons/` | `POST/DELETE UserPlayedItems/{id}` | DONE | `played_toggle_roundtrip` |
 | Rating / likes | `userdatabuttons/` | `POST UserItems/{id}/Rating` | THIN | — |
-| Merge versions | `multiSelect/` | `POST Videos/MergeVersions` | MISSING | `item_merge_versions` *(T76, ignored)* |
-| Set content type | `metadataEditor/` | `POST Items/{id}/ContentType` | MISSING | `item_content_type` *(T76, ignored)* |
+| Merge versions | `multiSelect/` | `POST Videos/MergeVersions` | MISSING | `item_merge_versions` *(T76)* — accepted (no version grouping) |
+| Set content type | `metadataEditor/` | `POST Items/{id}/ContentType` | MISSING | `item_content_type` *(T76)* |
 | Delete item | `multiSelect/` | `DELETE Items/{id}` | THIN | — |
 
 ## SyncPlay / remote control
