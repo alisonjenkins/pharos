@@ -784,7 +784,6 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
-            continuous_audio_path: None,
         }
     }
 

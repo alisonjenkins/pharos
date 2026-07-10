@@ -176,31 +176,6 @@ pub struct TranscodeOptions {
     /// leaves subtitles as a separate track (or absent on transcode
     /// output containers that don't carry them).
     pub burn_subtitle_stream_index: Option<u32>,
-    /// A/V-sync fix for the fMP4-HLS path: a pre-encoded, WHOLE-file audio
-    /// track (single codec-delay/preskip at t=0). When set on an fMP4 segment,
-    /// the transcoder takes video from the source (re-encode) but the audio by
-    /// COPY-slicing this continuous track — so no independent per-segment
-    /// Opus preskip inflates each segment (the cause of audio creeping ahead +
-    /// boundary clicks). `None` keeps the single-input encode both tracks.
-    #[serde(default)]
-    pub continuous_audio_path: Option<std::path::PathBuf>,
-}
-
-impl Default for TranscodeOptions {
-    fn default() -> Self {
-        Self {
-            container: Container::Mp4,
-            video: None,
-            audio: None,
-            video_bitrate_bps: None,
-            audio_bitrate_bps: None,
-            start_position_ticks: 0,
-            duration_ticks: None,
-            audio_source_stream_index: None,
-            burn_subtitle_stream_index: None,
-            continuous_audio_path: None,
-        }
-    }
 }
 
 impl TranscodeOptions {
@@ -236,7 +211,6 @@ mod tests {
             duration_ticks: Some(50_000_000),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
-            continuous_audio_path: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -254,7 +228,6 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
-            continuous_audio_path: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }

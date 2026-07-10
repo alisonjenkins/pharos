@@ -369,7 +369,6 @@ mod tests {
                 duration_ticks: Some(60_000_000),
                 audio_source_stream_index: Some(1),
                 burn_subtitle_stream_index: None,
-                continuous_audio_path: None,
             },
             device: DeviceId::hw(HwAccel::Nvenc, 0),
             sink: OutputSink::FileDirect {

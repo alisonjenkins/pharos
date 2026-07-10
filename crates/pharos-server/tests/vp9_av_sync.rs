@@ -249,8 +249,7 @@ async fn vp9_av_sync_holds_across_segment_boundaries() {
     );
 
     // Drive the real per-segment path and reassemble the stream MSE-style.
-    let cache_dir = td.path().join("cache");
-    let (state, token) = seed(src, &cache_dir).await;
+    let (state, token) = seed(src, &td.path().join("cache")).await;
     let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
 
     let init = test::call_and_read_body(
@@ -273,22 +272,6 @@ async fn vp9_av_sync_holds_across_segment_boundaries() {
         assert!(!seg.is_empty(), "segment {n} came back empty");
         stream.extend_from_slice(&seg);
     }
-    // The A/V-sync fix must have run: segment audio is COPY-sliced from a
-    // whole-file continuous Opus track (one preskip total, not one per
-    // segment). Assert that continuous track was produced — a silent fallback
-    // to per-segment audio would reintroduce the drift + boundary clicks.
-    let audio_dir = cache_dir.join("_audio");
-    let produced = std::fs::read_dir(&audio_dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .any(|e| e.path().extension().is_some_and(|x| x == "ogg"))
-        })
-        .unwrap_or(false);
-    assert!(
-        produced,
-        "continuous-audio track was not produced — segments fell back to per-segment audio"
-    );
-
     let concat = td.path().join("concat.mp4");
     std::fs::write(&concat, &stream).unwrap();
     // `AVSYNC_DUMP=/path` copies the reassembled stream out for manual probing.

@@ -351,7 +351,6 @@ async fn stream_transcoded_webm(
         duration_ticks: None,
         audio_source_stream_index: audio_rel,
         burn_subtitle_stream_index: sub_rel,
-        continuous_audio_path: None,
     };
     tracing::info!(
         media.id = item.id,
