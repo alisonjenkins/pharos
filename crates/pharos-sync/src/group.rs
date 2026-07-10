@@ -123,6 +123,11 @@ pub enum GroupMsg {
         sender: MemberId,
         mode: String,
     },
+    /// Set the group's display name (from the `/SyncPlay/New` request). Any
+    /// member may set it — jellyfin-web only sends it at creation.
+    SetGroupName {
+        name: String,
+    },
     Snapshot {
         reply: oneshot::Sender<GroupSnapshot>,
     },
@@ -143,6 +148,10 @@ pub struct GroupSnapshot {
     pub buffering_member_count: usize,
     /// Coarse playback state for the `/SyncPlay/List` `GroupInfoDto`.
     pub play_state: GroupPlayState,
+    /// Human-readable group name (what the creator's client sent on `New`).
+    pub group_name: String,
+    /// Member display names — the `Participants` the join dialog renders.
+    pub participants: Vec<String>,
 }
 
 struct MemberRec {
@@ -218,6 +227,8 @@ struct GroupState {
     queue: PlayQueue,
     /// `Some` while the readiness gate is open (group is `Waiting`).
     waiting: Option<WaitingGate>,
+    /// Display name shown in the join dialog (set from `/SyncPlay/New`).
+    group_name: String,
 }
 
 impl GroupState {
@@ -231,6 +242,7 @@ impl GroupState {
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
             waiting: None,
+            group_name: "Watch Party".to_string(),
         }
     }
 
@@ -831,6 +843,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.queue.shuffle_mode = mode;
             state.broadcast_play_queue("shuffle_mode", false, state.current_position_ms());
         }
+        GroupMsg::SetGroupName { name } => {
+            if !name.trim().is_empty() {
+                state.group_name = name;
+            }
+        }
         GroupMsg::Snapshot { reply } => {
             let snap = GroupSnapshot {
                 id: state.id,
@@ -838,6 +855,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 member_count: state.members.len(),
                 buffering_member_count: state.members.values().filter(|m| m.buffering).count(),
                 play_state: state.play_state(),
+                group_name: state.group_name.clone(),
+                participants: state
+                    .member_summaries()
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect(),
             };
             let _ = reply.send(snap);
         }
@@ -901,6 +924,26 @@ mod tests {
         let snap = rx.await.unwrap();
         assert_eq!(snap.leader, Some(mid));
         assert_eq!(snap.member_count, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_group_name_and_member_names() {
+        // The join dialog renders GroupName + Participants from the snapshot —
+        // these must be the real name + usernames, not the group id / member-N.
+        let (h, _rx, _mid) = fresh().await;
+        let _ = add_member(&h, "gf").await;
+        h.tx.send(GroupMsg::SetGroupName {
+            name: "Movie Night".into(),
+        })
+        .await
+        .unwrap();
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(GroupMsg::Snapshot { reply: tx }).await.unwrap();
+        let snap = rx.await.unwrap();
+        assert_eq!(snap.group_name, "Movie Night");
+        let mut names = snap.participants.clone();
+        names.sort();
+        assert_eq!(names, vec!["first".to_string(), "gf".to_string()]);
     }
 
     #[tokio::test]
