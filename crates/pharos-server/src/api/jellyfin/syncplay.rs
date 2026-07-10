@@ -206,12 +206,13 @@ async fn new_group(
             .unwrap_or_else(|| "Watch".to_string());
         format!("{who}'s Group")
     });
-    let _ = handle
-        .tx
-        .send(GroupMsg::SetGroupName { name: name.clone() })
-        .await;
     tracing::info!(device_id = %dev, group = %handle.group_id, %name, "syncplay: New group created");
-    add_caller_to_group(&hub, dev, handle).await;
+    // Add the creator as the FIRST message to the fresh actor. The group actor
+    // terminates the moment it processes a message and finds no members, so a
+    // brand-new (member-less) group must receive AddMember before anything else
+    // (e.g. SetGroupName) — otherwise it dies before the creator ever joins.
+    add_caller_to_group(&hub, dev, handle.clone()).await;
+    let _ = handle.tx.send(GroupMsg::SetGroupName { name }).await;
     no_content()
 }
 

@@ -416,6 +416,12 @@ impl GroupHandle {
         let epoch_unix_ms = unix_now_ms();
         let mut state = GroupState::new(group_id);
         tokio::spawn(async move {
+            // A brand-new group has no members yet — it must NOT terminate on
+            // the empty check before its creator's AddMember lands (else a New
+            // that sends anything first, e.g. SetGroupName, kills the group
+            // before anyone joins). Only terminate once it has HAD a member and
+            // then lost the last one.
+            let mut ever_joined = false;
             loop {
                 // Arm the readiness-gate timeout only while waiting, so a
                 // silent/wedged member can never block the group forever.
@@ -435,9 +441,10 @@ impl GroupHandle {
                         state.resolve_waiting();
                     }
                 }
-                if state.members.is_empty() {
-                    // No members → terminate. Registry will spawn a new one on
-                    // next Join.
+                ever_joined |= !state.members.is_empty();
+                if ever_joined && state.members.is_empty() {
+                    // Had members, now empty → terminate. Registry respawns on
+                    // the next Join.
                     break;
                 }
             }
@@ -910,6 +917,34 @@ mod tests {
         let snap = rx.await.unwrap();
         assert_eq!(snap.leader, Some(mid));
         assert_eq!(snap.member_count, 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_group_survives_a_message_before_its_first_member() {
+        // Regression: a New that sends SetGroupName before AddMember must not
+        // kill the member-less group (the actor's empty-check used to terminate
+        // it before the creator ever joined → "can't create a group").
+        let h = GroupHandle::spawn(GroupId::new());
+        h.tx.send(GroupMsg::SetGroupName {
+            name: "Movie Night".into(),
+        })
+        .await
+        .unwrap();
+        // The actor must still be alive to accept the creator.
+        let (tx, rx) = mpsc::channel(8);
+        let mid = MemberId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(GroupMsg::AddMember {
+            member_id: mid,
+            name: "ali".into(),
+            sink: tx,
+            reply: reply_tx,
+        })
+        .await
+        .expect("actor must still be alive after a pre-member message");
+        let joined = reply_rx.await.expect("AddMember must complete");
+        assert_eq!(joined.leader, mid);
+        drop(rx);
     }
 
     #[tokio::test]
