@@ -21,9 +21,10 @@ use pharos_core::{
     AuthError, AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainError,
     DomainResult, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
     LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore,
-    Person, PersonCount, PersonKind, PersonRef, PersonStore, ScanState, SecretString, SeriesInfo,
-    Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, TokenStore, UserDataStore, UserId,
-    UserItemData, UserPolicy, UserRecord, UserStore,
+    Person, PersonCount, PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry,
+    PlaylistStore, ScanState, SecretString, SeriesInfo, Studio, StudioCount, StudioStore, Tag,
+    TagCount, TagStore, TokenStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
+    UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -1915,6 +1916,293 @@ impl CollectionStore for PostgresStore {
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(Some(removed))
     }
+}
+
+impl PlaylistStore for PostgresStore {
+    #[tracing::instrument(skip(self, item_ids))]
+    async fn create_playlist(
+        &self,
+        name: &str,
+        owner_user_id: Option<&str>,
+        media_type: &str,
+        item_ids: &[MediaId],
+    ) -> DomainResult<Playlist> {
+        let wire_id = uuid::Uuid::new_v4().simple().to_string();
+        let now = now_unix_secs();
+        sqlx::query(
+            "INSERT INTO playlists (wire_id, name, owner_user_id, media_type, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&wire_id)
+        .bind(name)
+        .bind(owner_user_id)
+        .bind(media_type)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if !item_ids.is_empty() {
+            self.add_playlist_items(&wire_id, item_ids).await?;
+        }
+        self.playlist_by_wire_id(&wire_id)
+            .await?
+            .ok_or_else(|| DomainError::Backend("playlist vanished after create".into()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn playlist_by_wire_id(&self, wire_id: &str) -> DomainResult<Option<Playlist>> {
+        let row = sqlx::query_as::<_, (i64, String, String, Option<String>, String)>(
+            "SELECT id, wire_id, name, owner_user_id, media_type FROM playlists \
+             WHERE wire_id = $1 LIMIT 1",
+        )
+        .bind(wire_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(
+            row.map(|(id, wire_id, name, owner_user_id, media_type)| Playlist {
+                id,
+                wire_id,
+                name,
+                owner_user_id,
+                media_type,
+            }),
+        )
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn playlists_for_owner(
+        &self,
+        owner_user_id: Option<&str>,
+    ) -> DomainResult<Vec<Playlist>> {
+        let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, String)>(
+            "SELECT id, wire_id, name, owner_user_id, media_type FROM playlists \
+             WHERE owner_user_id IS NULL OR owner_user_id = $1 ORDER BY name",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, wire_id, name, owner_user_id, media_type)| Playlist {
+                id,
+                wire_id,
+                name,
+                owner_user_id,
+                media_type,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn playlist_entries(&self, wire_id: &str) -> DomainResult<Vec<PlaylistEntry>> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT pi.entry_id, pi.item_id FROM playlist_items pi \
+             JOIN playlists p ON p.id = pi.playlist_id \
+             WHERE p.wire_id = $1 ORDER BY pi.sort_order, pi.entry_id",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(entry_id, item_id)| PlaylistEntry {
+                entry_id,
+                item_id: item_id as MediaId,
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self, item_ids))]
+    async fn add_playlist_items(
+        &self,
+        wire_id: &str,
+        item_ids: &[MediaId],
+    ) -> DomainResult<Option<u64>> {
+        let Some((pid,)) =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM playlists WHERE wire_id = $1")
+                .bind(wire_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (mut next_order,) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM playlist_items WHERE playlist_id = $1",
+        )
+        .bind(pid)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut added = 0u64;
+        for item in item_ids {
+            let item_i64 = i64::try_from(*item)
+                .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+            let entry_id = uuid::Uuid::new_v4().simple().to_string();
+            sqlx::query(
+                "INSERT INTO playlist_items (playlist_id, entry_id, item_id, sort_order) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(pid)
+            .bind(&entry_id)
+            .bind(item_i64)
+            .bind(next_order)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            added += 1;
+            next_order += 1;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(Some(added))
+    }
+
+    #[tracing::instrument(skip(self, entry_ids))]
+    async fn remove_playlist_entries(
+        &self,
+        wire_id: &str,
+        entry_ids: &[String],
+    ) -> DomainResult<Option<u64>> {
+        let Some((pid,)) =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM playlists WHERE wire_id = $1")
+                .bind(wire_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut removed = 0u64;
+        for entry_id in entry_ids {
+            let res =
+                sqlx::query("DELETE FROM playlist_items WHERE playlist_id = $1 AND entry_id = $2")
+                    .bind(pid)
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| DomainError::Backend(e.to_string()))?;
+            removed += res.rows_affected();
+        }
+        repack_playlist_order_pg(&mut tx, pid).await?;
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(Some(removed))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn move_playlist_entry(
+        &self,
+        wire_id: &str,
+        entry_id: &str,
+        new_index: usize,
+    ) -> DomainResult<Option<bool>> {
+        let Some((pid,)) =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM playlists WHERE wire_id = $1")
+                .bind(wire_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let ordered: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT entry_id FROM playlist_items WHERE playlist_id = $1 ORDER BY sort_order, entry_id",
+        )
+        .bind(pid)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?
+        .into_iter()
+        .map(|(e,)| e)
+        .collect();
+        let Some(cur) = ordered.iter().position(|e| e == entry_id) else {
+            return Ok(Some(false));
+        };
+        let mut reordered = ordered.clone();
+        let moved = reordered.remove(cur);
+        let target = new_index.min(reordered.len());
+        reordered.insert(target, moved);
+        for (idx, e) in reordered.iter().enumerate() {
+            sqlx::query(
+                "UPDATE playlist_items SET sort_order = $1 WHERE playlist_id = $2 AND entry_id = $3",
+            )
+            .bind(idx as i64)
+            .bind(pid)
+            .bind(e)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(Some(true))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_playlist(&self, wire_id: &str) -> DomainResult<Option<()>> {
+        let res = sqlx::query("DELETE FROM playlists WHERE wire_id = $1")
+            .bind(wire_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(()))
+        }
+    }
+}
+
+/// Re-pack a playlist's `sort_order` to contiguous 0..n (postgres twin of
+/// the sqlite `repack_playlist_order`).
+async fn repack_playlist_order_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    playlist_id: i64,
+) -> DomainResult<()> {
+    let ordered: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT entry_id FROM playlist_items WHERE playlist_id = $1 ORDER BY sort_order, entry_id",
+    )
+    .bind(playlist_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| DomainError::Backend(e.to_string()))?
+    .into_iter()
+    .map(|(e,)| e)
+    .collect();
+    for (idx, e) in ordered.iter().enumerate() {
+        sqlx::query(
+            "UPDATE playlist_items SET sort_order = $1 WHERE playlist_id = $2 AND entry_id = $3",
+        )
+        .bind(idx as i64)
+        .bind(playlist_id)
+        .bind(e)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+    }
+    Ok(())
 }
 
 impl LibraryStore for PostgresStore {

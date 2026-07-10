@@ -829,6 +829,116 @@ pub trait CollectionStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<Option<u64>>> + Send;
 }
 
+/// T70 — a playlist header row. Unlike a [`Collection`], a playlist is
+/// user-owned, ordered, and may hold the same item more than once, so its
+/// `wire_id` is a fresh random id (not a hash of the name — names collide
+/// and duplicate). Membership lives in `playlist_items`, each row carrying
+/// its own [`PlaylistEntry::entry_id`] so the client's per-entry remove /
+/// reorder (Jellyfin's `EntryIds` + `Move`) target one specific slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Playlist {
+    pub id: i64,
+    pub wire_id: String,
+    pub name: String,
+    /// The creating user's id (`user.id.0.simple()`), or `None` for a
+    /// server-owned playlist. Jellyfin scopes playlists to their owner.
+    pub owner_user_id: Option<String>,
+    /// Jellyfin `MediaType` — `Audio` for a music queue, else `Video`.
+    pub media_type: String,
+}
+
+/// T70 — one ordered playlist membership: the media item plus the stable
+/// per-entry id the client uses to remove or move exactly this slot (the
+/// same item may appear more than once, so the media id alone can't
+/// identify a slot). `entry_id` is Jellyfin's `PlaylistItemId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistEntry {
+    pub entry_id: String,
+    pub item_id: MediaId,
+}
+
+/// T70 — playlists as first-class, user-owned, ordered item containers.
+/// Split from [`MediaStore`] like [`CollectionStore`] so in-memory test
+/// stores that only round-trip items don't have to implement the join.
+///
+/// A playlist resolves as a Jellyfin `Playlist` folder item by its
+/// `wire_id`; `GET /Playlists/{id}/Items` (and the `/Items?ParentId=`
+/// pivot) returns its members in curated order. Every mutating method that
+/// targets a playlist by `wire_id` returns `Option`: `None` means no
+/// playlist carries that id (the handler maps it to 404), distinct from a
+/// `MediaId`-keyed [`DomainError::NotFound`].
+pub trait PlaylistStore: Send + Sync {
+    /// Create a playlist owned by `owner_user_id` (None = server-owned),
+    /// seeding it with `item_ids` in order. Returns the created row so the
+    /// handler can echo its `wire_id` as the new item's `Id`.
+    fn create_playlist(
+        &self,
+        name: &str,
+        owner_user_id: Option<&str>,
+        media_type: &str,
+        item_ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Playlist>> + Send;
+
+    /// The playlist whose `wire_id` matches, or `None`.
+    fn playlist_by_wire_id(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<Playlist>>> + Send;
+
+    /// Every playlist owned by `owner_user_id` (server-owned rows always
+    /// included), ordered by name — the `/Items?IncludeItemTypes=Playlist`
+    /// and Playlists-view listing.
+    fn playlists_for_owner(
+        &self,
+        owner_user_id: Option<&str>,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Playlist>>> + Send;
+
+    /// Ordered members of the playlist whose `wire_id` matches, in curated
+    /// order. Empty Vec when the playlist doesn't exist (renders empty).
+    fn playlist_entries(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<PlaylistEntry>>> + Send;
+
+    /// Append `item_ids` to the playlist named by `wire_id`, each as a new
+    /// entry (duplicates allowed — a playlist can hold an item twice).
+    /// Returns `Some(entries added)`, or `None` when the wire id matches no
+    /// playlist.
+    fn add_playlist_items(
+        &self,
+        wire_id: &str,
+        item_ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Option<u64>>> + Send;
+
+    /// Remove the entries whose `entry_id` is in `entry_ids` from the
+    /// playlist named by `wire_id`, then re-pack the remaining order.
+    /// Returns `Some(entries removed)`, or `None` when the wire id matches
+    /// no playlist.
+    fn remove_playlist_entries(
+        &self,
+        wire_id: &str,
+        entry_ids: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<Option<u64>>> + Send;
+
+    /// Move the entry `entry_id` to `new_index` (clamped to the valid
+    /// range) within the playlist named by `wire_id`, re-packing the order.
+    /// `None` = no such playlist; `Some(false)` = playlist exists but has no
+    /// such entry; `Some(true)` = moved.
+    fn move_playlist_entry(
+        &self,
+        wire_id: &str,
+        entry_id: &str,
+        new_index: usize,
+    ) -> impl std::future::Future<Output = DomainResult<Option<bool>>> + Send;
+
+    /// Delete the playlist named by `wire_id` (and cascade its entries).
+    /// Returns `Some(())` when a row was deleted, `None` otherwise.
+    fn delete_playlist(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<()>>> + Send;
+}
+
 /// LIB-C6 — a tag entity row (one per distinct tag name). `wire_id` is the
 /// stable [`tag_wire_id`] the Jellyfin DTO emits for a synthesised Tag
 /// item; the integer `id` is the internal PK used by the `item_tags`
