@@ -110,6 +110,15 @@ pub struct FsScanner<P: Prober> {
     /// that leaves on-disk files byte-identical, so the incremental scan would
     /// never otherwise re-read them. Off by default (`pharos scan --force`).
     force: bool,
+    /// Adaptive I/O backpressure gate. When set, every per-file probe (the
+    /// heavy NFS read — fingerprint + demux) must first acquire a permit from
+    /// this shared semaphore before running. The server shrinks the semaphore's
+    /// available permits while live playback is active (see
+    /// `AppState::spawn_bg_io_regulator`), so a background re-scan paces itself
+    /// down to a trickle during streaming instead of saturating shared storage,
+    /// yet keeps making progress. `None` (CLI scans, tests) = full throttle,
+    /// bounded only by `probe_concurrency`.
+    io_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl<P: Prober> std::fmt::Debug for FsScanner<P> {
@@ -147,6 +156,7 @@ impl<P: Prober> FsScanner<P> {
             probe_concurrency: default_probe_concurrency(),
             resolver: Arc::new(default_resolver()),
             force: false,
+            io_gate: None,
         }
     }
 
@@ -158,6 +168,7 @@ impl<P: Prober> FsScanner<P> {
             probe_concurrency: default_probe_concurrency(),
             resolver: Arc::new(default_resolver()),
             force: false,
+            io_gate: None,
         }
     }
 
@@ -167,6 +178,16 @@ impl<P: Prober> FsScanner<P> {
     /// (e.g. embedded-font MediaAttachments) onto already-indexed items.
     pub fn with_force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    /// Attach an adaptive I/O backpressure gate shared with the live server.
+    /// Every heavy per-file probe acquires a permit from `gate` before reading,
+    /// so the server can throttle a background re-scan down while playback is
+    /// active (by parking most of the gate's permits) without pausing the scan
+    /// outright. See [`io_gate`](Self::io_gate). CLI scans leave it unset.
+    pub fn with_io_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.io_gate = Some(gate);
         self
     }
 
@@ -425,9 +446,11 @@ impl<P: Prober> FsScanner<P> {
         // `probe_with_alternates`/`probe_one` and simply produces no write
         // (V6 — one bad file never aborts the batch).
         let rate_limit = self.rate_limit;
+        let io_gate = self.io_gate.clone();
         let mut stream = futures_util::stream::iter(pending)
             .map(|p| {
                 let rl = rate_limit;
+                let gate = io_gate.clone();
                 async move {
                     // P43 — preserve the inter-probe throttle. Under
                     // parallelism this paces each probe task's start rather
@@ -436,6 +459,17 @@ impl<P: Prober> FsScanner<P> {
                     if !rl.is_zero() {
                         tokio::time::sleep(rl).await;
                     }
+                    // Adaptive backpressure — hold a shared I/O permit across
+                    // this file's fingerprint + probe (the heavy NFS reads).
+                    // While live playback runs the server parks most of the
+                    // gate's permits, throttling the whole probe fan-out down
+                    // to a trickle so streaming keeps its storage bandwidth;
+                    // the permit drops when this file's reads finish. Unset
+                    // (CLI/tests) = no gate, full throttle.
+                    let _io_permit = match &gate {
+                        Some(sem) => sem.clone().acquire_owned().await.ok(),
+                        None => None,
+                    };
                     // LIB-A7 — ensure a content fingerprint is available for
                     // the row we are about to write so a *future* scan can
                     // recognise this file by content if it moves. Reuse the
@@ -3192,6 +3226,67 @@ mod tests {
         );
         // The in-flight counter must have drained back to zero.
         assert_eq!(prober.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn io_gate_caps_probe_concurrency_below_the_fan_out() {
+        // Adaptive backpressure — a shared I/O gate must throttle the probe
+        // fan-out to at most the gate's available permits, EVEN when
+        // `probe_concurrency` is set higher. This is what lets the live server
+        // shrink the gate (parking permits) during playback to pace a
+        // background rescan down without pausing it. Gate = 2 permits, fan-out
+        // = 8 ⇒ observed peak must never exceed 2.
+        let td = TempDir::new().unwrap();
+        for i in 0..12 {
+            write_file(td.path(), &format!("f{i}.mkv"), &[b'x'; 1]).await;
+        }
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        let prober = ConcurrencyProber::default();
+        let s = FsScanner::new(prober.clone())
+            .with_probe_concurrency(8)
+            .with_io_gate(gate);
+        let store = MemStore::default();
+
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(outcome.added.len(), 12, "all twelve imported");
+
+        let peak = prober.peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "io-gate of 2 permits must cap concurrency below the fan-out of 8 (peak {peak})"
+        );
+        assert!(peak >= 1, "work must still make progress (peak {peak})");
+        assert_eq!(prober.in_flight.load(Ordering::SeqCst), 0, "gate released");
+    }
+
+    #[tokio::test]
+    async fn io_gate_throttled_to_one_serialises_probes() {
+        // The regulator's playback-active state parks all but one permit; with
+        // exactly one permit the scan must serialise (peak 1) yet still finish
+        // every file — proving playback never blocks the scan outright, only
+        // throttles it.
+        let td = TempDir::new().unwrap();
+        for i in 0..6 {
+            write_file(td.path(), &format!("f{i}.mkv"), &[b'x'; 1]).await;
+        }
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let prober = ConcurrencyProber::default();
+        let s = FsScanner::new(prober.clone())
+            .with_probe_concurrency(8)
+            .with_io_gate(gate);
+        let store = MemStore::default();
+
+        let outcome = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            outcome.added.len(),
+            6,
+            "all six imported even fully throttled"
+        );
+        assert_eq!(
+            prober.peak.load(Ordering::SeqCst),
+            1,
+            "a single-permit gate serialises the probe stream"
+        );
     }
 
     #[tokio::test]

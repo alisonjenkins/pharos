@@ -30,7 +30,7 @@ regex = "1"
 serde = { workspace = true }
 sonic-rs.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "process", "macros", "rt-multi-thread", "io-util"] }
+tokio = { workspace = true, features = ["fs", "process", "macros", "rt-multi-thread", "io-util", "sync", "time"] }
 tracing.workspace = true
 walkdir.workspace = true
 xxhash-rust.workspace = true
