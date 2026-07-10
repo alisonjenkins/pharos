@@ -230,15 +230,19 @@ async fn handle_connection<S>(
                     current_pli: current_pli.as_deref(),
                 };
                 if let Some(out) = translate_outbound(server_msg, &ctx) {
-                    // TEMP diagnostic: confirm the socket actually pushes the
-                    // SyncPlay group updates + commands the client needs.
+                    // Trace every SyncPlay message the socket pushes to a
+                    // client (group updates + commands). Debug-level: silent at
+                    // the default filter, but invaluable when diagnosing a
+                    // "group won't sync" report — it shows exactly what reached
+                    // each device. `kind` is the GroupUpdate `Type` or the
+                    // command name, whichever the payload carries.
                     let kind = out
                         .data
                         .get("Type")
                         .and_then(|v| v.as_str())
                         .or_else(|| out.data.get("Command").and_then(|v| v.as_str()))
                         .unwrap_or("");
-                    tracing::info!(device_id = %device_key, msg = %out.message_type, kind, "syncplay: → client");
+                    tracing::debug!(device_id = %device_key, msg = %out.message_type, kind, "syncplay: → client");
                     if send_outbound(&mut session, &out).await.is_err() {
                         break 'pump;
                     }
