@@ -66,6 +66,18 @@ async fn policy_roundtrip_is_administrator() {
     assert_eq!(read_policy(&f, &g).await["IsAdministrator"], true);
 }
 
+#[actix_web::test]
+async fn policy_grants_syncplay_access() {
+    // jellyfin-web hides the group-watch (SyncPlay) UI — and "create a group"
+    // silently no-ops — unless Policy.SyncPlayAccess grants it.
+    let f = seed_rich().await;
+    let g = guest(&f);
+    assert_eq!(
+        read_policy(&f, &g).await["SyncPlayAccess"],
+        "CreateAndJoinGroups"
+    );
+}
+
 /// The route exists (returns 200) but currently serves an empty array.
 #[actix_web::test]
 async fn localization_parental_ratings_route_present() {

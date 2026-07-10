@@ -160,6 +160,11 @@ pub struct UserPolicyDto {
     pub enable_all_channels: bool,
     pub enable_all_folders: bool,
     pub enable_public_sharing: bool,
+    /// Jellyfin `SyncPlayUserAccessType` — `CreateAndJoinGroups` | `JoinGroups`
+    /// | `None`. jellyfin-web hides the group-watch (SyncPlay) UI unless this
+    /// grants access, so an absent/None value makes "create a group" a no-op.
+    /// `String` (not `&'static str`) because the DTO also derives `Deserialize`.
+    pub sync_play_access: String,
 }
 
 impl UserPolicyDto {
@@ -181,6 +186,8 @@ impl UserPolicyDto {
             enable_all_channels: true,
             enable_all_folders: true,
             enable_public_sharing: false,
+            // Everyone may create + join watch-together groups (personal server).
+            sync_play_access: "CreateAndJoinGroups".to_string(),
         }
     }
 }
