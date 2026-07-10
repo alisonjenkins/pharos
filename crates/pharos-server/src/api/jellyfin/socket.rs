@@ -147,29 +147,48 @@ async fn handle_connection<S>(
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
     let started = Instant::now();
-    let member_id = MemberId::new();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
     let mut current_group: Option<GroupHandle> = None;
     // Register this socket so HTTP SyncPlay handlers can reach it by deviceId.
-    // Fall back to the member id as the key when the client sent no deviceId.
-    let device_key = device_id.unwrap_or_else(|| member_id.to_string());
-    hub.register(
-        device_key.clone(),
-        member_id,
-        member_name.clone(),
-        out_tx.clone(),
-    );
-    tracing::info!(
-        device_id = %device_key,
-        %member_id,
-        user = %member_name,
-        "syncplay: /socket connected + registered in hub"
-    );
+    // Fall back to a random key when the client sent no deviceId (such a client
+    // can't be reached by HTTP anyway). The hub owns a STABLE member id per
+    // device across reconnects.
+    let device_key = device_id.unwrap_or_else(|| format!("anon-{}", MemberId::new()));
+    let reg = hub.register(device_key.clone(), member_name.clone(), out_tx.clone());
+    let member_id = reg.member_id;
+    let conn_gen = reg.gen;
     // Jellyfin-wire context derived from the ServerMsg stream: the current
     // group id (from `Joined`) and the current queue item's PlaylistItemId
     // (from `PlayQueue`), both needed to shape outbound commands.
     let mut current_group_id: Option<GroupId> = None;
     let mut current_pli: Option<String> = None;
+    // Reconnect into an existing group: refresh the group's sink to THIS socket
+    // and re-sync. Membership survived the disconnect, so no re-Join is needed.
+    if let Some(group) = reg.group {
+        current_group_id = Some(group.group_id);
+        let _ = group
+            .tx
+            .send(GroupMsg::UpdateSink {
+                member_id,
+                sink: out_tx.clone(),
+            })
+            .await;
+        tracing::info!(device_id = %device_key, %member_id, group = %group.group_id, "syncplay: /socket reconnected into existing group");
+    } else {
+        tracing::info!(
+            device_id = %device_key,
+            %member_id,
+            user = %member_name,
+            "syncplay: /socket connected + registered in hub"
+        );
+    }
+    // Real Jellyfin sends ForceKeepAlive on open; jellyfin-web only starts its
+    // client-side KeepAlive timer after receiving it, so without this the socket
+    // is dropped/churned. Data = the server's idle-timeout seconds.
+    {
+        let out = Outbound::new("ForceKeepAlive", serde_json::json!(60));
+        let _ = send_outbound(&mut session, &out).await;
+    }
     // P23 — server-initiated keep-alive. Tick every 30 s; track the
     // last time we observed client traffic so a peer that stopped
     // responding (TCP black-holed) gets dropped instead of leaking
@@ -287,14 +306,26 @@ async fn handle_connection<S>(
         }
     }
 
-    // Deregister from the hub; RemoveMember from whichever group this session
-    // belonged to (the HTTP path stores it in the hub, the WS path in
-    // `current_group` — union the two so neither leaks a ghost member).
-    let hub_group = hub.deregister(&device_key);
     tracing::info!(device_id = %device_key, %member_id, "syncplay: /socket disconnected");
-    for h in current_group.take().into_iter().chain(hub_group) {
+    // WS-native path (vestigial phone/TV clients): its group lives only in
+    // `current_group`, so remove immediately.
+    if let Some(h) = current_group.take() {
         let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
     }
+    // HTTP path: membership lives in the hub and must SURVIVE this disconnect so
+    // a reconnect (jellyfin-web reconnects its socket constantly) re-attaches
+    // instead of orphaning the member. Schedule a generation-guarded teardown:
+    // if a newer socket connects within the grace window it bumps the
+    // generation and this no-ops; otherwise the member is removed.
+    const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+    let hub2 = hub.clone();
+    let dev2 = device_key.clone();
+    actix_web::rt::spawn(async move {
+        tokio::time::sleep(RECONNECT_GRACE).await;
+        if let Some(group) = hub2.remove_if_current_gen(&dev2, conn_gen) {
+            let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
+        }
+    });
     let _ = session.clone().close(None).await;
 }
 

@@ -134,6 +134,13 @@ pub enum GroupMsg {
     SetGroupName {
         name: String,
     },
+    /// Refresh a member's sink after its `/socket` reconnected (the member
+    /// itself persists across socket churn). Re-sends the catch-up so the
+    /// reconnected client immediately re-syncs to the group's current state.
+    UpdateSink {
+        member_id: MemberId,
+        sink: mpsc::Sender<ServerMsg>,
+    },
     Snapshot {
         reply: oneshot::Sender<GroupSnapshot>,
     },
@@ -276,6 +283,58 @@ impl GroupState {
                 position_ms,
                 anchor_server_ms,
             } => position_ms + self.server_ms_now().saturating_sub(anchor_server_ms),
+        }
+    }
+
+    /// Send one member the current queue + playback state so it (re)syncs to the
+    /// group — used both for a fresh join and for a socket reconnect. Never
+    /// mutates group state (esp. never advances `playing_index`).
+    fn send_catch_up(&self, member_id: MemberId) {
+        if !self.queue.items.is_empty() {
+            self.send_one(
+                member_id,
+                ServerMsg::PlayQueue {
+                    reason: "user_joined".into(),
+                    items: self.queue.item_infos(),
+                    playing_index: self.queue.playing_index,
+                    start_position_ms: self.current_position_ms(),
+                    is_playing: matches!(self.playback, PlaybackState::Playing { .. }),
+                    repeat_mode: self.queue.repeat_mode.clone(),
+                    shuffle_mode: self.queue.shuffle_mode.clone(),
+                },
+            );
+        }
+        let server_ms = self.server_ms_now();
+        match self.playback {
+            PlaybackState::Idle => {}
+            PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms,
+            } => {
+                let elapsed = server_ms.saturating_sub(anchor_server_ms);
+                self.send_one(
+                    member_id,
+                    ServerMsg::Play {
+                        at_server_ms: server_ms + MIN_LEAD_MS,
+                        position_ms: position_ms + elapsed,
+                    },
+                );
+            }
+            PlaybackState::Paused { position_ms } => {
+                self.send_one(
+                    member_id,
+                    ServerMsg::Seek {
+                        at_server_ms: server_ms + MIN_LEAD_MS,
+                        position_ms,
+                    },
+                );
+                self.send_one(
+                    member_id,
+                    ServerMsg::Pause {
+                        at_server_ms: server_ms + MIN_LEAD_MS,
+                    },
+                );
+            }
         }
     }
 
@@ -519,59 +578,18 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                         .try_send(ServerMsg::MemberJoined { member: me.clone() });
                 }
             }
-            // Late-joiner queue catch-up (A6): send the joiner the current
-            // playlist so it loads the SAME item the group is on. Adding a
-            // member NEVER mutates `playing_index` — a join must never advance
-            // the group ("a joiner skips everyone to the next episode").
-            if !state.queue.items.is_empty() {
-                state.send_one(
-                    member_id,
-                    ServerMsg::PlayQueue {
-                        reason: "user_joined".into(),
-                        items: state.queue.item_infos(),
-                        playing_index: state.queue.playing_index,
-                        start_position_ms: state.current_position_ms(),
-                        is_playing: matches!(state.playback, PlaybackState::Playing { .. }),
-                        repeat_mode: state.queue.repeat_mode.clone(),
-                        shuffle_mode: state.queue.shuffle_mode.clone(),
-                    },
-                );
-            }
-            // V19: late joiner catch-up. If the group is in flight,
-            // send the most recent Play/Pause/Seek to just this member
-            // so its UI doesn't sit at position 0 until the next
-            // leader command.
-            let server_ms = state.server_ms_now();
-            match state.playback {
-                PlaybackState::Idle => {}
-                PlaybackState::Playing {
-                    position_ms,
-                    anchor_server_ms,
-                } => {
-                    let elapsed = server_ms.saturating_sub(anchor_server_ms);
-                    state.send_one(
-                        member_id,
-                        ServerMsg::Play {
-                            at_server_ms: server_ms + MIN_LEAD_MS,
-                            position_ms: position_ms + elapsed,
-                        },
-                    );
-                }
-                PlaybackState::Paused { position_ms } => {
-                    state.send_one(
-                        member_id,
-                        ServerMsg::Seek {
-                            at_server_ms: server_ms + MIN_LEAD_MS,
-                            position_ms,
-                        },
-                    );
-                    state.send_one(
-                        member_id,
-                        ServerMsg::Pause {
-                            at_server_ms: server_ms + MIN_LEAD_MS,
-                        },
-                    );
-                }
+            // Queue + playback catch-up so the new member loads the SAME item at
+            // the group's current position. Adding a member NEVER mutates
+            // `playing_index` (A6: a join must not advance the group).
+            state.send_catch_up(member_id);
+        }
+        GroupMsg::UpdateSink { member_id, sink } => {
+            // A reconnected socket for an existing member: swap in the fresh
+            // sink and re-send the catch-up so it immediately re-syncs. The
+            // member (and its place in any readiness gate) is untouched.
+            if let Some(rec) = state.members.get_mut(&member_id) {
+                rec.sink = sink;
+                state.send_catch_up(member_id);
             }
         }
         GroupMsg::RemoveMember { member_id } => {

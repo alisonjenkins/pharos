@@ -24,11 +24,10 @@ struct Client {
 /// client handle. The sink is what the group engine broadcasts to.
 fn connect(hub: &SessionHub, device: &str, name: &str) -> Client {
     let (tx, rx) = mpsc::channel(64);
-    let member_id = MemberId::new();
-    hub.register(device.to_string(), member_id, name.to_string(), tx);
+    let reg = hub.register(device.to_string(), name.to_string(), tx);
     Client {
         device: device.to_string(),
-        member_id,
+        member_id: reg.member_id,
         rx,
     }
 }
@@ -261,4 +260,100 @@ async fn late_joiner_does_not_advance_the_queue() {
         adv.is_some(),
         "an explicit NextItem from any member advances the group to item 1"
     );
+}
+
+#[tokio::test]
+async fn socket_reconnect_keeps_membership_and_resyncs() {
+    // The critical robustness case: a member's /socket drops and reconnects
+    // (jellyfin-web churns its socket constantly). Membership must SURVIVE — the
+    // hub keeps the member id + group, and an UpdateSink re-points the group at
+    // the new socket + re-syncs it. Without this, commands broadcast to a dead
+    // sink and playback never syncs.
+    let hub = SessionHub::new();
+    let registry = GroupRegistry::spawn();
+    let mut a = connect(&hub, "devA", "ali");
+    let mut b = connect(&hub, "devB", "gf");
+
+    let handle = registry.create().await.unwrap();
+    add_to_group(&hub, &handle, &a.device).await;
+    add_to_group(&hub, &handle, &b.device).await;
+    handle
+        .tx
+        .send(GroupMsg::SetNewQueue {
+            sender: a.member_id,
+            item_ids: vec!["ep1".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+    for m in [a.member_id, b.member_id] {
+        handle
+            .tx
+            .send(GroupMsg::MemberReady {
+                member_id: m,
+                position_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+    for c in [&mut a, &mut b] {
+        assert!(recv_until(c, is_play).await.is_some(), "both playing");
+    }
+
+    // B's socket reconnects: SAME device, a NEW sink. The hub returns the
+    // existing member id + group (not a fresh member); the socket then re-points
+    // the group at its new sink via UpdateSink.
+    let (new_tx, mut new_rx) = mpsc::channel(64);
+    let reg = hub.register("devB".to_string(), "gf".to_string(), new_tx);
+    assert_eq!(
+        reg.member_id, b.member_id,
+        "member id stable across reconnect"
+    );
+    let group = reg.group.expect("reconnect sees the existing group");
+    group
+        .tx
+        .send(GroupMsg::UpdateSink {
+            member_id: b.member_id,
+            sink: hub.resolve("devB").unwrap().sink,
+        })
+        .await
+        .unwrap();
+    // A leader command now reaches B's NEW sink.
+    handle
+        .tx
+        .send(GroupMsg::SeekTo {
+            sender: a.member_id,
+            position_ms: 30_000,
+        })
+        .await
+        .unwrap();
+    handle
+        .tx
+        .send(GroupMsg::MemberReady {
+            member_id: a.member_id,
+            position_ms: 30_000,
+        })
+        .await
+        .unwrap();
+    handle
+        .tx
+        .send(GroupMsg::MemberReady {
+            member_id: b.member_id,
+            position_ms: 30_000,
+        })
+        .await
+        .unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match new_rx.recv().await {
+                Some(ServerMsg::Play { position_ms, .. }) if position_ms >= 30_000 => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(got, "reconnected socket receives the group's live commands");
 }

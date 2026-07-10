@@ -23,13 +23,22 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 struct SessionEntry {
+    /// Stable per-device member id — kept ACROSS socket reconnects so a
+    /// reconnecting client stays the same group member (the engine keys members
+    /// by this). Minted once, on the device's first `/socket`.
     member_id: MemberId,
     name: String,
     sink: mpsc::Sender<ServerMsg>,
     /// The group this session currently belongs to, if any. Set by the HTTP
-    /// New/Join handler (via [`attach_group`](SessionHub::attach_group)) and
-    /// cleared on Leave/disconnect.
+    /// New/Join handler (via [`attach_group`](SessionHub::attach_group)),
+    /// cleared on Leave. Deliberately SURVIVES a socket disconnect so a
+    /// reconnect re-attaches instead of orphaning the membership.
     group: Option<GroupHandle>,
+    /// Connection generation — bumped on every `/socket` (re)connect for this
+    /// device. A disconnecting socket captures its generation and only tears the
+    /// membership down if no newer socket has connected since (see
+    /// [`remove_if_current_gen`](SessionHub::remove_if_current_gen)).
+    conn_gen: u64,
 }
 
 /// A session resolved for an HTTP SyncPlay command handler. Clones out of the
@@ -39,6 +48,18 @@ pub struct ResolvedSession {
     pub name: String,
     pub sink: mpsc::Sender<ServerMsg>,
     pub group: Option<GroupHandle>,
+}
+
+/// Outcome of a `/socket` (re)connect registering with the hub.
+pub struct Registered {
+    /// The device's stable member id (new on first connect, reused on reconnect).
+    pub member_id: MemberId,
+    /// The group the device is already a member of, if this is a reconnect into
+    /// an existing group — the socket must refresh the group's sink to itself.
+    pub group: Option<GroupHandle>,
+    /// This connection's generation, to hand back to
+    /// [`remove_if_current_gen`](SessionHub::remove_if_current_gen) on disconnect.
+    pub gen: u64,
 }
 
 /// Shared `deviceId → session` directory. `Clone` is a cheap `Arc` bump; one
@@ -53,32 +74,48 @@ impl SessionHub {
         Self::default()
     }
 
-    /// Register a live socket. Called when a `/socket` WebSocket connects.
-    /// Re-registering the same `device_id` (a reconnect) replaces the prior
-    /// entry — the old sink is dropped, so its group learns of the departure
-    /// only when the old socket task also runs its `deregister` path.
+    /// Register a `/socket` connection. On a device's FIRST connect this mints a
+    /// stable member id and an empty group slot. On a RECONNECT (same
+    /// `device_id`) it keeps the member id + group and just refreshes the sink,
+    /// returning the existing group so the socket can re-point it at itself —
+    /// membership survives socket churn. Always bumps the connection generation.
     pub fn register(
         &self,
         device_id: String,
-        member_id: MemberId,
         name: String,
         sink: mpsc::Sender<ServerMsg>,
-    ) {
-        self.inner.insert(
-            device_id,
-            SessionEntry {
-                member_id,
-                name,
-                sink,
-                group: None,
-            },
-        );
+    ) -> Registered {
+        let mut e = self.inner.entry(device_id).or_insert_with(|| SessionEntry {
+            member_id: MemberId::new(),
+            name: name.clone(),
+            sink: sink.clone(),
+            group: None,
+            conn_gen: 0,
+        });
+        e.name = name;
+        e.sink = sink;
+        e.conn_gen += 1;
+        Registered {
+            member_id: e.member_id,
+            group: e.group.clone(),
+            gen: e.conn_gen,
+        }
     }
 
-    /// Remove a socket on disconnect, returning any group it belonged to so the
-    /// caller can send `RemoveMember`.
-    pub fn deregister(&self, device_id: &str) -> Option<GroupHandle> {
-        self.inner.remove(device_id).and_then(|(_, e)| e.group)
+    /// The device's current connection generation, if registered.
+    pub fn conn_gen(&self, device_id: &str) -> Option<u64> {
+        self.inner.get(device_id).map(|e| e.conn_gen)
+    }
+
+    /// Tear down a device's session ONLY if its generation still equals `gen` —
+    /// i.e. no newer `/socket` has connected since the disconnect that scheduled
+    /// this. Returns the group (for `RemoveMember`) when it actually removes.
+    /// A reconnect within the grace window bumps the generation, so this no-ops.
+    pub fn remove_if_current_gen(&self, device_id: &str, gen: u64) -> Option<GroupHandle> {
+        // `remove_if` avoids a get-then-remove race with a concurrent reconnect.
+        self.inner
+            .remove_if(device_id, |_, e| e.conn_gen == gen)
+            .and_then(|(_, e)| e.group)
     }
 
     /// Resolve a device to its session for an HTTP command handler. `None` when
@@ -141,11 +178,10 @@ mod tests {
     #[tokio::test]
     async fn register_resolve_attach_detach_roundtrip() {
         let hub = SessionHub::new();
-        let mid = MemberId::new();
-        hub.register("devA".into(), mid, "ali".into(), sink());
+        let reg = hub.register("devA".into(), "ali".into(), sink());
         let r = hub.resolve("devA").unwrap();
-        assert_eq!(r.member_id, mid);
-        assert!(r.group.is_none());
+        assert_eq!(r.member_id, reg.member_id);
+        assert!(r.group.is_none() && reg.group.is_none());
 
         let handle = GroupHandle::spawn(GroupId::new());
         hub.attach_group("devA", handle.clone());
@@ -158,12 +194,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deregister_returns_group_for_cleanup() {
+    async fn reconnect_keeps_member_id_and_group_and_bumps_gen() {
         let hub = SessionHub::new();
-        hub.register("devB".into(), MemberId::new(), "b".into(), sink());
+        let first = hub.register("devB".into(), "b".into(), sink());
         let handle = GroupHandle::spawn(GroupId::new());
         hub.attach_group("devB", handle.clone());
-        let left = hub.deregister("devB").unwrap();
+
+        // Reconnect: same member id, same group surfaced, higher generation.
+        let again = hub.register("devB".into(), "b".into(), sink());
+        assert_eq!(again.member_id, first.member_id, "member id is stable");
+        assert_eq!(
+            again.group.map(|g| g.group_id),
+            Some(handle.group_id),
+            "reconnect sees the existing group"
+        );
+        assert!(again.gen > first.gen, "generation bumped");
+
+        // A stale-generation teardown (from the FIRST socket's disconnect) must
+        // NOT remove the reconnected session.
+        assert!(hub.remove_if_current_gen("devB", first.gen).is_none());
+        assert!(
+            hub.resolve("devB").is_some(),
+            "reconnected session survives"
+        );
+
+        // The current generation's teardown removes it and returns the group.
+        let left = hub.remove_if_current_gen("devB", again.gen).unwrap();
         assert_eq!(left.group_id, handle.group_id);
         assert!(hub.resolve("devB").is_none());
     }
