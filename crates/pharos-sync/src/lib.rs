@@ -6,6 +6,8 @@
 //! - [`clock`] — per-member rolling offset estimator (median over N=9)
 //! - [`group`] — `Group` actor; one tokio task per active group (V18)
 //! - [`registry`] — `GroupRegistry` actor; routes Join requests
+//! - [`hub`] — `SessionHub`; bridges HTTP SyncPlay commands (keyed by
+//!   `deviceId`) to the per-socket member sinks
 //! - [`ws`] — `/sync/v1/ws` extended path handler (Jellyfin /socket
 //!   bridge lives in `pharos-server::api::jellyfin::socket`)
 //! - [`host`] — `TokenResolver` trait the server impls so the WS
@@ -14,10 +16,12 @@
 pub mod clock;
 pub mod group;
 pub mod host;
+pub mod hub;
 pub mod messages;
 pub mod registry;
 pub mod ws;
 
 pub use host::TokenResolver;
+pub use hub::{ResolvedSession, SessionHub};
 pub use messages::{ClientMsg, ErrorCode, GroupId, MemberId, MemberSummary, ServerMsg};
 pub use registry::GroupRegistry;

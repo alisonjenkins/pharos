@@ -37,6 +37,7 @@ actix-ws = "0.3"
 anyhow = "1"
 argon2 = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
 getrandom = "0.2"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
