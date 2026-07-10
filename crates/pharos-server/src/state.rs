@@ -18,6 +18,16 @@ use uuid::Uuid;
 pub type Stores = SqliteStore;
 pub type Auth = BuiltinAuth<Stores>;
 
+/// Concurrent heavy background file reads (scan probes + subtitle warm-demuxes)
+/// permitted when NOTHING is playing — the `bg_io` semaphore's full size.
+const BG_IO_MAX: usize = 4;
+/// …and during active playback: a trickle, so background work keeps making
+/// progress but can't saturate NFS out from under a live stream's segment
+/// reads. The regulator parks `BG_IO_MAX - BG_IO_BUSY` permits while playing.
+const BG_IO_BUSY: usize = 1;
+/// A live segment pulled within this many seconds counts as "playing".
+const BG_IO_BUSY_WINDOW_SECS: i64 = 12;
+
 /// Server-originated notifications fanned out to every connected
 /// `/socket`. T40 phase 2 — keeps client UIs (jellyfin-web especially)
 /// in sync with library + per-user state without polling.
@@ -156,6 +166,15 @@ pub struct AppState {
     /// decode never contends with live segment transcoding and makes
     /// playback buffer. Bumped by the HLS + VP9 segment handlers.
     pub playback_activity: Arc<std::sync::atomic::AtomicI64>,
+    /// Adaptive backpressure for HEAVY background file reads (scan probes,
+    /// subtitle warm-demuxes). Every such op acquires a permit here before
+    /// touching the source; live playback does NOT. A regulator task
+    /// ([`spawn_bg_io_regulator`](Self::spawn_bg_io_regulator)) parks all but
+    /// [`BG_IO_BUSY`] permits while a client is streaming, so background I/O
+    /// self-throttles to a trickle (but never stops) and can't starve a live
+    /// stream's segment reads — then reopens to [`BG_IO_MAX`] once playback is
+    /// quiet. This is what lets a full force-rescan run DURING playback.
+    pub bg_io: Arc<tokio::sync::Semaphore>,
     /// Monotonic library version, bumped on every library-mutating notify
     /// (`notify_library_changed` / `notify_library_delta`). The full-item-list
     /// cache below keys on this so any add/remove instantly invalidates it.
@@ -213,6 +232,44 @@ impl AppState {
     pub fn note_playback_activity(&self) {
         self.playback_activity
             .store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when a live segment was pulled within the last [`BG_IO_BUSY_WINDOW_SECS`].
+    pub fn playback_active(&self) -> bool {
+        let last = self
+            .playback_activity
+            .load(std::sync::atomic::Ordering::Relaxed);
+        last != 0 && unix_now_secs() - last < BG_IO_BUSY_WINDOW_SECS
+    }
+
+    /// Spawn the background-I/O regulator: while playback is active it parks
+    /// `BG_IO_MAX - BG_IO_BUSY` permits (throttling all background reads to
+    /// `BG_IO_BUSY` concurrent); when playback goes quiet it releases them so
+    /// background work speeds back up. Idempotent per process — call once at
+    /// startup (needs the tokio runtime). Not spawned in tests (no live
+    /// playback), which keeps the semaphore at full `BG_IO_MAX`.
+    pub fn spawn_bg_io_regulator(state: Arc<Self>) {
+        let sem = state.bg_io.clone();
+        actix_web::rt::spawn(async move {
+            let reserve = (BG_IO_MAX - BG_IO_BUSY) as u32;
+            let mut parked: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            loop {
+                let active = state.playback_active();
+                if active && parked.is_none() {
+                    // Grab (and hold) the reserve so only BG_IO_BUSY remain.
+                    // acquire_many_owned waits for running bg ops to free
+                    // permits, so it converges within ~one op's duration.
+                    if let Ok(p) = sem.clone().acquire_many_owned(reserve).await {
+                        parked = Some(p);
+                        tracing::debug!("bg-io regulator: throttled (playback active)");
+                    }
+                } else if !active && parked.is_some() {
+                    parked = None; // drop → release the reserve
+                    tracing::debug!("bg-io regulator: reopened (playback quiet)");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
     }
 
     /// T73 — record a dashboard activity entry (newest-first, bounded). `kind`
@@ -314,6 +371,7 @@ impl AppState {
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -377,6 +435,7 @@ impl AppState {
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
