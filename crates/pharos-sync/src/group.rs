@@ -304,6 +304,16 @@ impl GroupState {
                 },
             );
         }
+        self.send_playback_state(member_id);
+    }
+
+    /// Send just the live playback command (Play, or Seek+Pause) to a single
+    /// member — the current position/state WITHOUT the `PlayQueue`. Used to
+    /// resume a member that already loaded the current item but missed the
+    /// group's live Play/Pause (see the late-`Ready` path in `MemberReady`).
+    /// Re-sending the `PlayQueue` here would make jellyfin-web reload the
+    /// player from scratch, so this deliberately omits it.
+    fn send_playback_state(&self, member_id: MemberId) {
         let server_ms = self.server_ms_now();
         match self.playback {
             PlaybackState::Idle => {}
@@ -793,6 +803,13 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 w.pending.remove(&member_id);
                 w.pending.is_empty()
             } else {
+                // No waiting gate: the group already resolved (often because
+                // the ready-timeout fired before THIS member's player finished
+                // loading, so it dropped the broadcast Unpause — "no active
+                // player"). Heal it: replay the live playback state to just
+                // this member so a slow-to-start client still catches up
+                // instead of being stranded paused while everyone else plays.
+                state.send_playback_state(member_id);
                 false
             };
             if resolved {
@@ -1030,6 +1047,48 @@ mod tests {
         };
         check(m1);
         check(m2);
+    }
+
+    #[tokio::test]
+    async fn late_ready_after_group_playing_heals_the_member() {
+        // Regression: a member whose player finishes loading AFTER the group
+        // already started playing (e.g. its transcode start outran the
+        // ready-timeout, so it dropped the broadcast Unpause with "no active
+        // player") must still be told to play when it finally reports Ready —
+        // not left stranded paused while everyone else watches.
+        let (h, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, "slow").await;
+        // Drain the MemberJoined the leader receives for m2.
+        let _ = leader_rx.recv().await.unwrap();
+
+        // Group starts playing (LeaderPlay broadcasts directly — no gate left).
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 5000,
+        })
+        .await
+        .unwrap();
+        // Drain the broadcast Play both members receive.
+        let _ = leader_rx.recv().await.unwrap();
+        let _ = m2_rx.recv().await.unwrap();
+
+        // m2 reports Ready only now — after the group is already Playing and
+        // there is no waiting gate.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+
+        // It must be healed with a fresh Play at (at least) the live position.
+        match m2_rx.recv().await.unwrap() {
+            ServerMsg::Play { position_ms, .. } => assert!(
+                position_ms >= 5000,
+                "heal Play should resume at the live position, got {position_ms}"
+            ),
+            other => panic!("expected a heal Play for the late-ready member, got {other:?}"),
+        }
     }
 
     #[tokio::test]
