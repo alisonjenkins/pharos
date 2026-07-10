@@ -9,15 +9,32 @@
 //! V20: actor never sees Jellyfin shapes; only `ServerMsg` flows out.
 
 use super::clock::ClockOffset;
-use super::messages::{ErrorCode, GroupId, MemberId, MemberSummary, ServerMsg};
-use std::collections::HashMap;
-use std::time::Instant;
+use super::messages::{
+    ErrorCode, GroupId, GroupPlayState, MemberId, MemberSummary, QueueItemInfo, ServerMsg,
+};
+use std::collections::{HashMap, HashSet};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 /// Minimum delay between "server decides to play" and `at_server_ms`.
 /// Each member subtracts its own offset to schedule locally — see
 /// `docs/group-sync-protocol.md` §4.
 pub const MIN_LEAD_MS: u64 = 200;
+
+/// How long the readiness gate waits for every member to report `Ready`
+/// before starting anyway. Bounds the WAITING state so a silent or wedged
+/// client can never block the whole group forever (the failure mode behind
+/// jellyfin#8140 / #5619). A client that is genuinely still buffering when
+/// this fires will re-sync via its own drift correction.
+pub const READY_TIMEOUT_MS: u64 = 5_000;
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug)]
 pub enum GroupMsg {
@@ -55,6 +72,57 @@ pub enum GroupMsg {
     BufferingEnd {
         member_id: MemberId,
     },
+    /// Jellyfin HTTP `/SyncPlay/Unpause`. Unlike the native [`LeaderPlay`]
+    /// (which broadcasts immediately), this enters the readiness gate: the
+    /// group starts only once every member has reported `Ready` (or the
+    /// timeout fires), so a slow/transcoding client doesn't start late.
+    ///
+    /// [`LeaderPlay`]: GroupMsg::LeaderPlay
+    Unpause {
+        sender: MemberId,
+    },
+    /// Jellyfin HTTP `/SyncPlay/Seek` — gated seek (re-buffer then resume).
+    SeekTo {
+        sender: MemberId,
+        position_ms: u64,
+    },
+    /// Jellyfin HTTP `/SyncPlay/Ready` — this member has buffered the current
+    /// item and is ready to start. Clears the member from the readiness gate.
+    MemberReady {
+        member_id: MemberId,
+        position_ms: u64,
+    },
+    /// Jellyfin HTTP `/SyncPlay/SetNewQueue` — replace the playlist and start
+    /// (leader only). `item_ids` are library item ids; the server assigns a
+    /// `playlist_item_id` per entry.
+    SetNewQueue {
+        sender: MemberId,
+        item_ids: Vec<String>,
+        playing_index: usize,
+        start_position_ms: u64,
+    },
+    /// Jump to a specific queue entry by its `playlist_item_id` (leader only).
+    SetPlaylistItem {
+        sender: MemberId,
+        playlist_item_id: String,
+    },
+    /// Advance to the next / previous queue entry (leader only).
+    NextItem {
+        sender: MemberId,
+    },
+    PreviousItem {
+        sender: MemberId,
+    },
+    /// Set repeat / shuffle mode (leader only). `mode` is the Jellyfin string
+    /// (`RepeatNone|RepeatOne|RepeatAll`, `Sorted|Shuffle`).
+    SetRepeatMode {
+        sender: MemberId,
+        mode: String,
+    },
+    SetShuffleMode {
+        sender: MemberId,
+        mode: String,
+    },
     Snapshot {
         reply: oneshot::Sender<GroupSnapshot>,
     },
@@ -73,6 +141,8 @@ pub struct GroupSnapshot {
     pub leader: Option<MemberId>,
     pub member_count: usize,
     pub buffering_member_count: usize,
+    /// Coarse playback state for the `/SyncPlay/List` `GroupInfoDto`.
+    pub play_state: GroupPlayState,
 }
 
 struct MemberRec {
@@ -80,6 +150,45 @@ struct MemberRec {
     sink: mpsc::Sender<ServerMsg>,
     offset: ClockOffset,
     buffering: bool,
+}
+
+/// One entry in the group's play queue.
+struct QueueEntry {
+    item_id: String,
+    playlist_item_id: String,
+}
+
+/// The group's play queue (playlist + cursor + modes).
+#[derive(Default)]
+struct PlayQueue {
+    items: Vec<QueueEntry>,
+    playing_index: usize,
+    repeat_mode: String,
+    shuffle_mode: String,
+}
+
+impl PlayQueue {
+    fn item_infos(&self) -> Vec<QueueItemInfo> {
+        self.items
+            .iter()
+            .map(|e| QueueItemInfo {
+                item_id: e.item_id.clone(),
+                playlist_item_id: e.playlist_item_id.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The readiness gate: while `Some`, the group is in `Waiting` and will not
+/// broadcast the pending `Play`/`Pause` until every member in `pending` has
+/// reported `Ready` (or `deadline` fires — the anti-wedge timeout).
+struct WaitingGate {
+    pending: HashSet<MemberId>,
+    /// Whether the group should be `Playing` (true) or `Paused` (false) once
+    /// the gate resolves — e.g. a seek while paused resolves to paused.
+    resume_playing: bool,
+    position_ms: u64,
+    deadline: tokio::time::Instant,
 }
 
 /// Last broadcast playback state. V19 — kept on the actor so a late
@@ -106,6 +215,9 @@ struct GroupState {
     leader: Option<MemberId>,
     group_paused_due_to_buffering: bool,
     playback: PlaybackState,
+    queue: PlayQueue,
+    /// `Some` while the readiness gate is open (group is `Waiting`).
+    waiting: Option<WaitingGate>,
 }
 
 impl GroupState {
@@ -117,11 +229,126 @@ impl GroupState {
             leader: None,
             group_paused_due_to_buffering: false,
             playback: PlaybackState::Idle,
+            queue: PlayQueue::default(),
+            waiting: None,
         }
     }
 
     fn server_ms_now(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// Coarse playback state for snapshots / `StateUpdate`.
+    fn play_state(&self) -> GroupPlayState {
+        if self.waiting.is_some() {
+            return GroupPlayState::Waiting;
+        }
+        match self.playback {
+            PlaybackState::Idle => GroupPlayState::Idle,
+            PlaybackState::Playing { .. } => GroupPlayState::Playing,
+            PlaybackState::Paused { .. } => GroupPlayState::Paused,
+        }
+    }
+
+    fn current_position_ms(&self) -> u64 {
+        match self.playback {
+            PlaybackState::Idle => 0,
+            PlaybackState::Paused { position_ms } => position_ms,
+            PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms,
+            } => position_ms + self.server_ms_now().saturating_sub(anchor_server_ms),
+        }
+    }
+
+    /// Broadcast the current queue to every member (Jellyfin `PlayQueue`).
+    fn broadcast_play_queue(&self, reason: &str, is_playing: bool, start_position_ms: u64) {
+        self.broadcast(ServerMsg::PlayQueue {
+            reason: reason.to_string(),
+            items: self.queue.item_infos(),
+            playing_index: self.queue.playing_index,
+            start_position_ms,
+            is_playing,
+            repeat_mode: self.queue.repeat_mode.clone(),
+            shuffle_mode: self.queue.shuffle_mode.clone(),
+        });
+    }
+
+    /// Open the readiness gate: enter `Waiting`, await every member's `Ready`.
+    /// The group starts (or re-pauses) only once the gate resolves.
+    fn enter_waiting(&mut self, resume_playing: bool, position_ms: u64, reason: &str) {
+        let pending: HashSet<MemberId> = self.members.keys().copied().collect();
+        // An empty group can't resolve a gate; nothing to wait on.
+        if pending.is_empty() {
+            return;
+        }
+        self.waiting = Some(WaitingGate {
+            pending,
+            resume_playing,
+            position_ms,
+            deadline: tokio::time::Instant::now()
+                + std::time::Duration::from_millis(READY_TIMEOUT_MS),
+        });
+        self.broadcast(ServerMsg::StateUpdate {
+            state: GroupPlayState::Waiting,
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Resolve the readiness gate: schedule the pending `Play`/`Pause` for a
+    /// common future instant and broadcast it. Called when the last member
+    /// reports `Ready`, or when the anti-wedge timeout fires.
+    fn resolve_waiting(&mut self) {
+        let Some(w) = self.waiting.take() else {
+            return;
+        };
+        let server_ms = self.server_ms_now();
+        let at_server_ms = server_ms + self.lead_time_ms();
+        if w.resume_playing {
+            self.playback = PlaybackState::Playing {
+                position_ms: w.position_ms,
+                anchor_server_ms: server_ms,
+            };
+            self.broadcast(ServerMsg::Play {
+                at_server_ms,
+                position_ms: w.position_ms,
+            });
+            self.broadcast(ServerMsg::StateUpdate {
+                state: GroupPlayState::Playing,
+                reason: "ready".into(),
+            });
+        } else {
+            self.playback = PlaybackState::Paused {
+                position_ms: w.position_ms,
+            };
+            self.broadcast(ServerMsg::Seek {
+                at_server_ms,
+                position_ms: w.position_ms,
+            });
+            self.broadcast(ServerMsg::StateUpdate {
+                state: GroupPlayState::Paused,
+                reason: "ready".into(),
+            });
+        }
+    }
+
+    /// True if `sender` is the current leader; otherwise emits a `NotLeader`
+    /// error to the sender and returns false. Guards every queue/transport
+    /// mutation so a non-leader (esp. a late joiner) can never drive the group
+    /// — the invariant that prevents "a joiner skips everyone to the next
+    /// episode".
+    fn require_leader(&self, sender: MemberId, action: &str) -> bool {
+        if self.leader == Some(sender) {
+            return true;
+        }
+        self.send_one(
+            sender,
+            ServerMsg::Error {
+                code: ErrorCode::NotLeader,
+                detail: format!("only leader may {action}"),
+            },
+        );
+        false
     }
 
     /// Lowest-MemberId-wins election. Deterministic, no voting needed.
@@ -174,16 +401,41 @@ impl GroupState {
 pub struct GroupHandle {
     pub group_id: GroupId,
     pub tx: mpsc::Sender<GroupMsg>,
+    /// Wall-clock (unix ms) captured at spawn, aligned with the actor's
+    /// monotonic `started_at`. A member's socket adds a `ServerMsg`'s
+    /// `at_server_ms` to this to produce the absolute UTC `When` the Jellyfin
+    /// client schedules against. Exposed on the handle so the HTTP layer can
+    /// stash it in the session hub *before* `AddMember` triggers any late-joiner
+    /// catch-up broadcast (else the first command carries `When = 0`).
+    pub epoch_unix_ms: u64,
 }
 
 impl GroupHandle {
     /// Spawn a fresh group actor.
     pub fn spawn(group_id: GroupId) -> Self {
         let (tx, mut rx) = mpsc::channel::<GroupMsg>(256);
+        let epoch_unix_ms = unix_now_ms();
         let mut state = GroupState::new(group_id);
         tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                handle(&mut state, msg).await;
+            loop {
+                // Arm the readiness-gate timeout only while waiting, so a
+                // silent/wedged member can never block the group forever.
+                let deadline = state.waiting.as_ref().map(|w| w.deadline);
+                tokio::select! {
+                    maybe = rx.recv() => {
+                        let Some(msg) = maybe else { break };
+                        handle(&mut state, msg).await;
+                    }
+                    _ = async {
+                        // `deadline` is Some in this arm (guarded below).
+                        tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)).await
+                    }, if deadline.is_some() => {
+                        // Timeout: drop still-pending members from the gate and
+                        // start anyway (anti-wedge). They re-sync via their own
+                        // drift correction.
+                        state.resolve_waiting();
+                    }
+                }
                 if state.members.is_empty() {
                     // No members → terminate. Registry will spawn a new one on
                     // next Join.
@@ -191,7 +443,11 @@ impl GroupHandle {
                 }
             }
         });
-        Self { tx, group_id }
+        Self {
+            tx,
+            group_id,
+            epoch_unix_ms,
+        }
     }
 
     /// Request a `GroupSnapshot` from the actor. Returns `None` when
@@ -245,6 +501,24 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                         .try_send(ServerMsg::MemberJoined { member: me.clone() });
                 }
             }
+            // Late-joiner queue catch-up (A6): send the joiner the current
+            // playlist so it loads the SAME item the group is on. Adding a
+            // member NEVER mutates `playing_index` — a join must never advance
+            // the group ("a joiner skips everyone to the next episode").
+            if !state.queue.items.is_empty() {
+                state.send_one(
+                    member_id,
+                    ServerMsg::PlayQueue {
+                        reason: "user_joined".into(),
+                        items: state.queue.item_infos(),
+                        playing_index: state.queue.playing_index,
+                        start_position_ms: state.current_position_ms(),
+                        is_playing: matches!(state.playback, PlaybackState::Playing { .. }),
+                        repeat_mode: state.queue.repeat_mode.clone(),
+                        shuffle_mode: state.queue.shuffle_mode.clone(),
+                    },
+                );
+            }
             // V19: late joiner catch-up. If the group is in flight,
             // send the most recent Play/Pause/Seek to just this member
             // so its UI doesn't sit at position 0 until the next
@@ -292,6 +566,15 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 }
             }
             state.broadcast(ServerMsg::MemberLeft { member_id });
+            // A departing member must not wedge the readiness gate: drop it
+            // from the pending set and resolve if it was the last holdout (and
+            // members remain — an empty group terminates the actor anyway).
+            if let Some(w) = state.waiting.as_mut() {
+                w.pending.remove(&member_id);
+                if w.pending.is_empty() && !state.members.is_empty() {
+                    state.resolve_waiting();
+                }
+            }
         }
         GroupMsg::LeaderPlay {
             sender,
@@ -427,12 +710,122 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // No automatic resume — leader decides when to continue.
             }
         }
+        GroupMsg::Unpause { sender } => {
+            if !state.require_leader(sender, "unpause") {
+                return;
+            }
+            let position_ms = state.current_position_ms();
+            state.enter_waiting(true, position_ms, "unpause");
+        }
+        GroupMsg::SeekTo {
+            sender,
+            position_ms,
+        } => {
+            if !state.require_leader(sender, "seek") {
+                return;
+            }
+            // Preserve play/pause across a seek: a seek while playing resumes
+            // playing (after re-buffer); while paused/idle it stays paused.
+            let resume = matches!(state.playback, PlaybackState::Playing { .. });
+            state.enter_waiting(resume, position_ms, "seek");
+        }
+        GroupMsg::MemberReady {
+            member_id,
+            position_ms: _,
+        } => {
+            if let Some(rec) = state.members.get_mut(&member_id) {
+                rec.buffering = false;
+            }
+            let resolved = if let Some(w) = state.waiting.as_mut() {
+                w.pending.remove(&member_id);
+                w.pending.is_empty()
+            } else {
+                false
+            };
+            if resolved {
+                state.resolve_waiting();
+            }
+        }
+        GroupMsg::SetNewQueue {
+            sender,
+            item_ids,
+            playing_index,
+            start_position_ms,
+        } => {
+            if !state.require_leader(sender, "set the queue") {
+                return;
+            }
+            state.queue.items = item_ids
+                .into_iter()
+                .map(|item_id| QueueEntry {
+                    item_id,
+                    playlist_item_id: Uuid::new_v4().simple().to_string(),
+                })
+                .collect();
+            state.queue.playing_index =
+                playing_index.min(state.queue.items.len().saturating_sub(1));
+            state.broadcast_play_queue("new_playlist", true, start_position_ms);
+            state.enter_waiting(true, start_position_ms, "new_playlist");
+        }
+        GroupMsg::SetPlaylistItem {
+            sender,
+            playlist_item_id,
+        } => {
+            if !state.require_leader(sender, "change the playing item") {
+                return;
+            }
+            if let Some(idx) = state
+                .queue
+                .items
+                .iter()
+                .position(|e| e.playlist_item_id == playlist_item_id)
+            {
+                state.queue.playing_index = idx;
+                state.broadcast_play_queue("set_current_item", true, 0);
+                state.enter_waiting(true, 0, "set_current_item");
+            }
+        }
+        GroupMsg::NextItem { sender } => {
+            if !state.require_leader(sender, "advance the queue") {
+                return;
+            }
+            if state.queue.playing_index + 1 < state.queue.items.len() {
+                state.queue.playing_index += 1;
+                state.broadcast_play_queue("next_item", true, 0);
+                state.enter_waiting(true, 0, "next_item");
+            }
+        }
+        GroupMsg::PreviousItem { sender } => {
+            if !state.require_leader(sender, "rewind the queue") {
+                return;
+            }
+            if state.queue.playing_index > 0 {
+                state.queue.playing_index -= 1;
+                state.broadcast_play_queue("previous_item", true, 0);
+                state.enter_waiting(true, 0, "previous_item");
+            }
+        }
+        GroupMsg::SetRepeatMode { sender, mode } => {
+            if !state.require_leader(sender, "set repeat mode") {
+                return;
+            }
+            state.queue.repeat_mode = mode;
+            state.broadcast_play_queue("repeat_mode", false, state.current_position_ms());
+        }
+        GroupMsg::SetShuffleMode { sender, mode } => {
+            if !state.require_leader(sender, "set shuffle mode") {
+                return;
+            }
+            state.queue.shuffle_mode = mode;
+            state.broadcast_play_queue("shuffle_mode", false, state.current_position_ms());
+        }
         GroupMsg::Snapshot { reply } => {
             let snap = GroupSnapshot {
                 id: state.id,
                 leader: state.leader,
                 member_count: state.members.len(),
                 buffering_member_count: state.members.values().filter(|m| m.buffering).count(),
+                play_state: state.play_state(),
             };
             let _ = reply.send(snap);
         }

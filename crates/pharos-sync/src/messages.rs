@@ -57,6 +57,29 @@ pub struct MemberSummary {
     pub is_leader: bool,
 }
 
+/// Coarse group playback state, mirrored to Jellyfin's `GroupStateType`
+/// (`Idle`/`Waiting`/`Playing`/`Paused`). Emitted in [`ServerMsg::StateUpdate`]
+/// so a client can drive its SyncPlay UI (spinner while `Waiting`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupPlayState {
+    Idle,
+    Waiting,
+    Playing,
+    Paused,
+}
+
+/// One entry in a group's play queue. `playlist_item_id` is the server-assigned,
+/// per-entry stable id the Jellyfin client echoes on every command — a
+/// `SendCommand` whose `PlaylistItemId` doesn't match the client's current queue
+/// item is silently dropped, so this id must stay consistent between the
+/// `PlayQueue` update and the following `SendCommand`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueItemInfo {
+    pub item_id: String,
+    pub playlist_item_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
@@ -140,6 +163,26 @@ pub enum ServerMsg {
     },
     MemberLeft {
         member_id: MemberId,
+    },
+    /// Coarse playback-state transition (Jellyfin `SyncPlayGroupUpdate` /
+    /// `StateUpdate`). `reason` is a free-form label (e.g. the command that
+    /// caused the transition) for diagnostics + the client's UI.
+    StateUpdate {
+        state: GroupPlayState,
+        reason: String,
+    },
+    /// The group's play queue changed (Jellyfin `SyncPlayGroupUpdate` /
+    /// `PlayQueue`). Carries the full playlist so a client (incl. a late
+    /// joiner) can render it and load the current item. `is_playing` reflects
+    /// whether the group intends to be playing once buffered.
+    PlayQueue {
+        reason: String,
+        items: Vec<QueueItemInfo>,
+        playing_index: usize,
+        start_position_ms: u64,
+        is_playing: bool,
+        repeat_mode: String,
+        shuffle_mode: String,
     },
     Error {
         code: ErrorCode,
