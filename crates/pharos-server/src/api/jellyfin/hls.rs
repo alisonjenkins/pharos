@@ -66,6 +66,17 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/videos/{id}/vp9/master.m3u8", web::get().to(vp9_master))
         .route("/videos/{id}/vp9/main.m3u8", web::get().to(vp9_variant))
         .route("/videos/{id}/vp9/init.mp4", web::get().to(vp9_init))
+        // Continuous-audio rendition (A/V-sync fix): a separate HLS audio
+        // group backed by ONE ffmpeg session (see hls_cache::ensure_audio_hls).
+        // Video segments are audio-free; the player syncs the two by PTS.
+        .route(
+            "/videos/{id}/vp9/audio.m3u8",
+            web::get().to(vp9_audio_playlist),
+        )
+        .route(
+            "/videos/{id}/vp9/audio/{name}",
+            web::get().to(vp9_audio_file),
+        )
         .route("/videos/{id}/vp9/{seg}.m4s", web::get().to(vp9_segment))
         // `DELETE /Videos/ActiveEncodings` — jellyfin-web calls
         // `apiClient.stopActiveEncodings(playSessionId)` as the FIRST step of a
@@ -1236,19 +1247,128 @@ async fn vp9_master(
             ));
         }
     }
+    // Continuous-audio rendition: a separate audio group so the audio is one
+    // gapless encode (no per-segment preskip drift/clicks). The video variant
+    // references it via AUDIO="aud"; video segments carry no audio.
+    body.push_str(&format!(
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
+         AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
+    ));
     let resolution = match (item.width, item.height) {
         (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
         _ => String::new(),
     };
     let sub_attr = if has_subs { ",SUBTITLES=\"subs\"" } else { "" };
     body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\"{resolution}{sub_attr}\n\
+        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}{sub_attr}\n\
          /videos/{id}/vp9/main.m3u8?{qs}\n"
     ));
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(true))
         .body(body))
+}
+
+/// `GET /videos/{id}/vp9/audio.m3u8` — the continuous-audio rendition playlist.
+/// Kicks the one-ffmpeg audio session (see `hls_cache::ensure_audio_hls`) and
+/// serves a COMPLETE VOD playlist synthesised from the source duration (init +
+/// N × 6 s segments), so the client can request every audio segment
+/// immediately; `vp9_audio_file` polls for each as the session produces it
+/// (ahead of the playhead — no whole-file wait). The audio's own 6 s /
+/// Opus-aligned segments need NOT match the video's frame-aligned boundaries:
+/// as a separate rendition the player syncs the two by PTS.
+async fn vp9_audio_playlist(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+    q: web::Query<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = path.into_inner();
+    let media_id: u64 = id
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let item = fetch_item(&state, media_id).await?;
+    let qs = playback_qs(&req);
+    // Honour the client's AudioStreamIndex (multi-audio titles like Code
+    // Geass) so switching track selects a different rendition session.
+    let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
+    // Start (or reuse) the audio session in the background.
+    let Some(cache) = state.hls.as_ref() else {
+        return Err(error::ErrorNotFound("no cache"));
+    };
+    cache
+        .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
+    let duration = item
+        .probe
+        .duration_ms
+        .map(|ms| ms as f64 / 1000.0)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
+    let mut body = String::with_capacity(128 + segment_count as usize * 48);
+    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
+    body.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        SEGMENT_SECONDS as u32
+    ));
+    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n");
+    body.push_str(&format!(
+        "#EXT-X-MAP:URI=\"/videos/{id}/vp9/audio/init.mp4?{qs}\"\n"
+    ));
+    for seg in 0..segment_count {
+        let remaining = (duration - seg as f64 * SEGMENT_SECONDS).clamp(0.01, SEGMENT_SECONDS);
+        body.push_str(&format!("#EXTINF:{remaining:.3},\n"));
+        body.push_str(&format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}\n"));
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
+        .body(body))
+}
+
+/// `GET /videos/{id}/vp9/audio/{name}` — serve one file (`init.mp4` /
+/// `aN.m4s`) of the continuous-audio session, polling briefly for the session
+/// to produce it. Ensures the session is running (idempotent) so a segment
+/// requested before the playlist still works.
+async fn vp9_audio_file(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<(String, String)>,
+    q: web::Query<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, name) = path.into_inner();
+    let media_id: u64 = id
+        .parse()
+        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let Some(cache) = state.hls.as_ref() else {
+        return Err(error::ErrorNotFound("no cache"));
+    };
+    let item = fetch_item(&state, media_id).await?;
+    let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
+    let dir = cache
+        .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
+    let bytes = cache
+        .audio_hls_file(&dir, &name)
+        .await
+        .map_err(|_| error::ErrorNotFound("audio segment not ready"))?;
+    let ctype = if name.ends_with(".mp4") {
+        "video/mp4"
+    } else {
+        Container::Fmp4.content_type()
+    };
+    Ok(HttpResponse::Ok()
+        .content_type(ctype)
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(bytes))
 }
 
 /// VOD variant playlist for the VP9 fMP4 path: an `EXT-X-MAP` init segment
@@ -1545,7 +1665,10 @@ async fn vp9_segment_opts(
     req: &HttpRequest,
     item: &pharos_core::MediaItem,
     seg: u32,
-    audio_stream_index: Option<u32>,
+    // Audio track selection no longer applies to the (audio-free) video
+    // segment; it drives the separate audio rendition instead. Kept in the
+    // signature for the call sites.
+    _audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
 ) -> TranscodeOptions {
     // Frame-aligned boundaries keep audio + video locked across independent
@@ -1563,9 +1686,6 @@ async fn vp9_segment_opts(
     // each track's position among its own codec's streams — matching the
     // progressive-webm handler so multi-audio selection + subtitle burn-in
     // pick the right track.
-    let audio_rel = audio_stream_index.and_then(|abs| {
-        codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
-    });
     let sub_rel = subtitle_stream_index.and_then(|abs| {
         codec_relative_index(
             item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
@@ -1575,14 +1695,30 @@ async fn vp9_segment_opts(
     TranscodeOptions {
         container: Container::Fmp4,
         video: Some(VideoCodec::Vp9),
-        audio: Some(AudioCodec::Opus),
+        // Video segments are AUDIO-FREE (A/V-sync fix): audio is served as a
+        // separate continuous-encode rendition (see vp9_audio_playlist), so it
+        // carries no per-segment Opus preskip. `audio: None` → `-an`. This also
+        // makes the video segments faster (no per-segment audio mux/encode).
+        audio: None,
         video_bitrate_bps: Some(bitrate),
-        audio_bitrate_bps: Some(128_000),
+        audio_bitrate_bps: None,
         start_position_ticks: start_ticks,
         duration_ticks: Some(duration_ticks),
-        audio_source_stream_index: audio_rel,
+        audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
     }
+}
+
+/// Convert a client `AudioStreamIndex` (absolute ffprobe index) to the
+/// per-codec relative index the continuous-audio session's `-map 0:a:N` wants.
+/// `None` (no selection / unknown index) → the session's default track.
+fn resolve_audio_rel(
+    item: &pharos_core::MediaItem,
+    audio_stream_index: Option<u32>,
+) -> Option<u32> {
+    audio_stream_index.and_then(|abs| {
+        codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
+    })
 }
 
 /// Map an absolute ffprobe stream index to its position among the streams of

@@ -78,7 +78,10 @@ fn codec_tag(video: Option<VideoCodec>) -> u32 {
         Some(VideoCodec::Copy) => 1,
         Some(VideoCodec::H264) => 8,
         Some(VideoCodec::H265) => 9,
-        Some(VideoCodec::Vp9) => 7,
+        // 12 (was 7): VP9 fMP4 segments are now AUDIO-FREE (audio moved to a
+        // separate continuous rendition, the A/V-sync fix) — orphan the old
+        // muxed segments.
+        Some(VideoCodec::Vp9) => 12,
         Some(VideoCodec::Av1) => 10,
     }
 }
@@ -108,6 +111,10 @@ struct CacheState {
     /// Per-key locks. Held while a fetch is in flight so concurrent
     /// requests for the same segment don't race.
     fetch_locks: HashMap<CacheKey, Arc<Mutex<()>>>,
+    /// Per-directory locks deduplicating continuous-audio HLS sessions (the
+    /// A/V-sync fix): the first request spawns the one ffmpeg producing the
+    /// audio rendition; concurrent requests see it already running.
+    audio_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
     entries: HashMap<CacheKey, EntryMeta>,
     total_bytes: u64,
     access_counter: u64,
@@ -376,6 +383,177 @@ impl HlsSegmentCache {
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
         Ok(None)
+    }
+
+    /// A/V-sync fix (continuous-audio rendition): ensure a single ffmpeg is
+    /// producing the whole audio track as an HLS rendition (fMP4 Opus, 6 s
+    /// segments) into a per-(media,track,bitrate) directory, and return that
+    /// directory. ONE continuous encode ⇒ one codec preskip total ⇒ gapless,
+    /// driftless audio (vs the per-segment preskip that made audio creep ahead
+    /// and click). The ffmpeg reads the source SEQUENTIALLY and produces
+    /// segments far faster than realtime, so segment 0 appears almost
+    /// immediately, with no multi-GB upfront read (the batch whole-file
+    /// approach's fatal flaw).
+    ///
+    /// Idempotent + deduped: if the playlist already exists (a finished
+    /// session) or one is mid-run, no new ffmpeg is spawned. The child is
+    /// reaped by a detached task; kill-on-stop is a later optimization.
+    pub async fn ensure_audio_hls(
+        &self,
+        source: &Path,
+        media_id: u64,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+    ) -> Result<PathBuf, HlsCacheError> {
+        let a = audio_index.unwrap_or(0);
+        let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
+        let dir = self
+            .root
+            .join("_audiohls")
+            .join(format!("{media_id}-a{a}-b{br}"));
+        let playlist = dir.join("audio.m3u8");
+        let running = dir.join(".running");
+        // Already finished, or a session is in flight → reuse.
+        if tokio::fs::try_exists(&playlist).await.unwrap_or(false)
+            || tokio::fs::try_exists(&running).await.unwrap_or(false)
+        {
+            return Ok(dir);
+        }
+        let lock = {
+            let mut state = self.state.lock().await;
+            state
+                .audio_locks
+                .entry(dir.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        // Re-check under the lock.
+        if tokio::fs::try_exists(&playlist).await.unwrap_or(false)
+            || tokio::fs::try_exists(&running).await.unwrap_or(false)
+        {
+            return Ok(dir);
+        }
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(&running, b"").await?;
+
+        let src = source
+            .to_str()
+            .ok_or(HlsCacheError::NonUtf8Path)?
+            .to_string();
+        let seg_pat = dir
+            .join("a%d.m4s")
+            .to_str()
+            .ok_or(HlsCacheError::NonUtf8Path)?
+            .to_string();
+        let m3u8 = playlist
+            .to_str()
+            .ok_or(HlsCacheError::NonUtf8Path)?
+            .to_string();
+        let bitrate = audio_bitrate_bps.unwrap_or(128_000);
+        let mut args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-i".into(),
+            src,
+            "-vn".into(),
+        ];
+        // Explicit track select when the client picked one; else ffmpeg default.
+        if let Some(idx) = audio_index {
+            args.push("-map".into());
+            args.push(format!("0:a:{idx}"));
+        } else {
+            args.push("-map".into());
+            args.push("0:a:0?".into());
+        }
+        args.extend(
+            [
+                "-c:a",
+                "libopus",
+                "-b:a",
+                &bitrate.to_string(),
+                "-ac",
+                "2",
+                "-f",
+                "hls",
+                "-hls_time",
+                "6",
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_fmp4_init_filename",
+                "init.mp4",
+                "-hls_list_size",
+                "0",
+                "-hls_segment_filename",
+                &seg_pat,
+                &m3u8,
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+
+        let bin = self.transcoder.binary().to_path_buf();
+        let running_marker = running.clone();
+        let media = media_id;
+        // Detached: run the encode to completion, then drop the `.running`
+        // marker (leaving `audio.m3u8` as the done-marker). Reaps the child.
+        tokio::spawn(async move {
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let status = child.wait().await;
+                    if let Ok(s) = status {
+                        if !s.success() {
+                            tracing::warn!(
+                                media.id = media,
+                                ?s,
+                                "audio HLS session exited non-zero"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(media.id = media, error = %e, "failed to spawn audio HLS session");
+                }
+            }
+            let _ = tokio::fs::remove_file(&running_marker).await;
+        });
+        Ok(dir)
+    }
+
+    /// Read a produced audio-rendition file (`init.mp4`, `aN.m4s`, or
+    /// `audio.m3u8`) from an [`ensure_audio_hls`](Self::ensure_audio_hls)
+    /// directory, polling briefly for it to appear — the continuous ffmpeg
+    /// writes segments ahead of the playhead, so a just-requested segment is
+    /// usually already there; a near-live one may need a moment. Returns
+    /// `NotFound` past the wait budget.
+    pub async fn audio_hls_file(&self, dir: &Path, name: &str) -> Result<Vec<u8>, HlsCacheError> {
+        // Basic traversal guard: names are simple file basenames.
+        if name.contains('/') || name.contains("..") {
+            return Err(HlsCacheError::Io(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )));
+        }
+        let path = dir.join(name);
+        // Up to ~5 s of polling (segments normally land far faster).
+        for _ in 0..100 {
+            match tokio::fs::read(&path).await {
+                Ok(b) if !b.is_empty() => return Ok(b),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        Err(HlsCacheError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )))
     }
 
     async fn touch(&self, key: CacheKey) {
