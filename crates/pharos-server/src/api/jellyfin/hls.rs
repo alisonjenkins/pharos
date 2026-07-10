@@ -1508,7 +1508,22 @@ async fn vp9_segment(
 /// single-flight in `HlsSegmentCache` coalesces a prefetch with the client's
 /// own eventual request — so a segment is never transcoded twice and a live
 /// request that catches up simply awaits the in-flight prefetch.
-const SEGMENT_PREFETCH_AHEAD: u32 = 4;
+///
+/// Core-aware: each software VP9 segment runs ~`vp9_encode_threads()` (≈4)
+/// threads, so `1 live + prefetch` concurrent encodes must not oversubscribe
+/// the cores (the continuous-audio + trickplay backfill also want CPU). A fixed
+/// 4 was measured on the 16-core box to run 5 concurrent encodes with
+/// `queue_wait_ms = 0` — i.e. NOT queued but all racing → each segment took
+/// 2-3.6 s instead of the ~0.6 s single-stream benchmark. Target ~3 concurrent
+/// video encodes (≈12 threads) so audio + previews have headroom.
+fn segment_prefetch_ahead() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    // (cores / ~threads-per-encode) leaves 1 slot for the live segment and ~1
+    // for audio/trickplay; floor at 1 so tiny boxes still pipeline one ahead.
+    (cores / 4).saturating_sub(2).max(1)
+}
 
 /// Frame-aligned start time (seconds) of segment `seg`: the nominal
 /// `seg * SEGMENT_SECONDS` boundary snapped to the nearest source video frame.
@@ -1543,12 +1558,12 @@ fn segment_time_range(seg: u32, fps_mille: Option<u32>) -> (f64, f64) {
 }
 
 /// The segment indices to prefetch after serving `base_seg`: the next
-/// [`SEGMENT_PREFETCH_AHEAD`], stopping at `total_segs` (exclusive) when the
+/// [`segment_prefetch_ahead`], stopping at `total_segs` (exclusive) when the
 /// item's length is known so we never queue a past-EOF transcode. `None`
 /// total = length unknown → prefetch the full window optimistically.
-fn prefetch_target_segments(base_seg: u32, total_segs: Option<u32>) -> Vec<u32> {
+fn prefetch_target_segments(base_seg: u32, total_segs: Option<u32>, ahead_count: u32) -> Vec<u32> {
     let mut out = Vec::new();
-    for ahead in 1..=SEGMENT_PREFETCH_AHEAD {
+    for ahead in 1..=ahead_count {
         let seg = base_seg.saturating_add(ahead);
         if total_segs.is_some_and(|total| seg >= total) {
             break;
@@ -1558,7 +1573,7 @@ fn prefetch_target_segments(base_seg: u32, total_segs: Option<u32>) -> Vec<u32> 
     out
 }
 
-/// Fire-and-forget warm of the next [`SEGMENT_PREFETCH_AHEAD`] segments into
+/// Fire-and-forget warm of the next [`segment_prefetch_ahead`] segments into
 /// the HLS cache, using the same `opts` (audio/subtitle/bitrate/codec) as the
 /// segment just served — only the start position advances. No-op without a
 /// cache; bounded by the item's total segment count (from its probed
@@ -1576,7 +1591,7 @@ fn spawn_segment_prefetch(
         .probe
         .duration_ms
         .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32);
-    for seg in prefetch_target_segments(base_seg, total_segs) {
+    for seg in prefetch_target_segments(base_seg, total_segs, segment_prefetch_ahead()) {
         let state = state.clone();
         let item = item.clone();
         let mut o = opts.clone();
@@ -1916,15 +1931,24 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn prefetch_window_bounds_to_eof() {
+        // Fixed count (the real count is core-aware — see segment_prefetch_ahead).
         // Unknown length → the full window from base+1.
-        assert_eq!(prefetch_target_segments(0, None), vec![1, 2, 3, 4]);
-        assert_eq!(prefetch_target_segments(10, None), vec![11, 12, 13, 14]);
+        assert_eq!(prefetch_target_segments(0, None, 4), vec![1, 2, 3, 4]);
+        assert_eq!(prefetch_target_segments(10, None, 4), vec![11, 12, 13, 14]);
         // Known length → stop before the last segment index (exclusive).
-        assert_eq!(prefetch_target_segments(8, Some(12)), vec![9, 10, 11]);
-        assert_eq!(prefetch_target_segments(10, Some(12)), vec![11]);
+        assert_eq!(prefetch_target_segments(8, Some(12), 4), vec![9, 10, 11]);
+        assert_eq!(prefetch_target_segments(10, Some(12), 4), vec![11]);
         // At/near the end → nothing to prefetch.
-        assert_eq!(prefetch_target_segments(11, Some(12)), Vec::<u32>::new());
-        assert_eq!(prefetch_target_segments(20, Some(12)), Vec::<u32>::new());
+        assert_eq!(prefetch_target_segments(11, Some(12), 4), Vec::<u32>::new());
+        assert_eq!(prefetch_target_segments(20, Some(12), 4), Vec::<u32>::new());
+    }
+
+    #[::core::prelude::v1::test]
+    fn prefetch_ahead_is_core_aware_and_bounded() {
+        // Never zero (always pipeline at least one ahead), and stays modest so a
+        // single stream's concurrent encodes don't oversubscribe the cores.
+        let n = segment_prefetch_ahead();
+        assert!((1..=8).contains(&n), "prefetch-ahead {n} out of sane range");
     }
 
     use crate::auth::BuiltinAuth;
