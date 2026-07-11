@@ -80,21 +80,13 @@
         # cargo applies the build-script cfgs correctly. pkg-config + the
         # ffmpeg dev libs + bindgenHook mirror the devShell's backend-lib env.
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-        # Shared by the deps-only cache build and the final binary build.
+        # Base args shared by the deps cache, the binary build, AND the test
+        # check — one compiled-deps artifact serves all three.
         pharosCommonArgs = {
           pname = "pharos";
           version = "0.0.0";
           src = repoSrc;
           strictDeps = true;
-          # Only the two server-side binaries; the wasm UI crate is built
-          # separately by `dx` (pharosUiBundle).
-          cargoExtraArgs = "--package pharos-server --package pharos-transcode";
-          # Build only — tests + clippy + fmt run in the CI `test` job via cargo.
-          # Running the suite inside this derivation's checkPhase proved fragile:
-          # heavy/timing-sensitive tests (e.g. the 20k-row pagination test) hit
-          # the constrained nix sandbox's slow-timeout and failed the *image
-          # build*. Keep the binary build free of the test gate.
-          doCheck = false;
           # ffmpeg-the-third's *-sys crate runs bindgen over the libav headers;
           # bindgenHook supplies libclang + include paths, pkg-config + the
           # ffmpeg dev libs resolve/link the same ffmpeg the runtime uses. Real
@@ -105,12 +97,55 @@
         };
         # Compile the dependency tree ONCE — a store artifact cached across
         # commits (keyed by Cargo.lock + build inputs). A code-only change then
-        # recompiles just the workspace crates, not all of crates.io, so the
-        # image build stops rebuilding everything every push.
+        # recompiles just the workspace crates, not all of crates.io.
         pharosDeps = craneLib.buildDepsOnly pharosCommonArgs;
         pharosBins = craneLib.buildPackage (
-          pharosCommonArgs // { cargoArtifacts = pharosDeps; }
+          pharosCommonArgs
+          // {
+            cargoArtifacts = pharosDeps;
+            # Only the two server-side binaries; the wasm UI crate is built
+            # separately by `dx` (pharosUiBundle).
+            cargoExtraArgs = "--package pharos-server --package pharos-transcode";
+            # The suite runs in `pharosTests` (below); don't re-run it here.
+            doCheck = false;
+          }
         );
+        # Test the ACTUAL shipped artifact: run the whole workspace suite via
+        # nextest INSIDE the nix sandbox, on the same compiled deps. `--profile
+        # nix` gives heavy seed tests generous timeouts (the sandbox's store
+        # disk is slower than a warm devShell). `.#pharos-tests` is wired as a
+        # flake `check`, so `nix flake check` (CI) gates the binary on a green
+        # suite built from the exact same source + toolchain that ships.
+        pharosTests = craneLib.cargoNextest (
+          pharosCommonArgs
+          // {
+            cargoArtifacts = pharosDeps;
+            cargoExtraArgs = "--workspace";
+            cargoNextestExtraArgs = "--profile nix";
+            # Integration tests that shell out to real ffmpeg/synth fixtures are
+            # `#[ignore]`d and skipped by a default nextest run; the in-process
+            # libav paths + the ephemeral-port client-compat server run fine in
+            # the sandbox (loopback is up).
+          }
+        );
+        # nextest doesn't run doctests — cover them separately (same deps).
+        pharosDoctests = craneLib.cargoDocTest (
+          pharosCommonArgs
+          // {
+            cargoArtifacts = pharosDeps;
+            cargoExtraArgs = "--workspace";
+          }
+        );
+        # Lint + format gates on the same compiled deps — V17's
+        # `-D warnings` (clippy::unwrap_used/expect_used deny) enforced here.
+        pharosClippy = craneLib.cargoClippy (
+          pharosCommonArgs
+          // {
+            cargoArtifacts = pharosDeps;
+            cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
+          }
+        );
+        pharosFmt = craneLib.cargoFmt { inherit (pharosCommonArgs) pname version src; };
         pharos = pharosBins;
         # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
         # (the two binaries share one store path here, but the env var is the
@@ -810,7 +845,15 @@
           '';
         };
 
+        # `nix flake check` gates the shipped artifact on the whole suite +
+        # lints + doctests + a release build — same source + toolchain as
+        # `.#pharos`. These are independent derivations sharing only the
+        # compiled-deps artifact, so nix runs them in PARALLEL.
         checks.workspace-build = pharos;
+        checks.tests = pharosTests;
+        checks.doctests = pharosDoctests;
+        checks.clippy = pharosClippy;
+        checks.fmt = pharosFmt;
 
         formatter = pkgs.nixfmt-rfc-style;
       }

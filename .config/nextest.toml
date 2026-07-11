@@ -17,6 +17,20 @@ fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 3 }
 final-status-level = "slow"
 
+# Run inside the nix build sandbox (crane cargoNextest, `.#pharos` doCheck) —
+# tests the ACTUAL shipped artifact. The sandbox is I/O-constrained (store
+# disk, no page cache warmth) so seed/heavy tests (20k-row pagination) run
+# several times slower than on a warm devShell. Give them generous headroom —
+# this is a batch build, not interactive — so a slow test is never mistaken for
+# a hang and terminated. 12×120s = 24 min ceiling per test; the CI job's own
+# 120-min timeout is the real backstop.
+[profile.nix]
+retries = 1
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 12 }
+final-status-level = "slow"
+test-threads = "num-cpus"
+
 [[profile.default.overrides]]
 # sqlite integration tests in pharos-store-sqlx spin up in-memory pools;
 # parallel runs are fine.
