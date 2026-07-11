@@ -98,15 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: alisonjenkins/setup-host-nix@v1
-      # `needs: [oci]` already built both images into the host-shared warm nix
-      # store, so these resolve to the SAME store paths as instant cache hits —
-      # no rebuild, no artifact round-trip. `--out-link` gives the push step a
-      # stable path to hand skopeo (docker-archive tarballs).
-      - name: Materialise the images from the warm store
-        run: |
-          nix build .#oci            --out-link result-oci
-          nix build .#jellyfinWebOci --out-link result-jfweb
-      - name: Push to GHCR (latest + immutable sha tag)
+      - name: Push images to GHCR (latest + immutable sha tags)
         env:
           # A PAT with write:packages, NOT the workflow GITHUB_TOKEN: these
           # GHCR packages are user-owned + were created out-of-band, so the
@@ -122,17 +114,26 @@ jobs:
           # humans / manual pins.
           COMMIT_TS="$(git show -s --format=%ct HEAD)"
           SORTABLE="main-${COMMIT_TS}-${GITHUB_SHA:0:12}"
+          # `.#oci` / `.#jellyfinWebOci` are streamLayeredImage SCRIPTS (built by
+          # `needs: [oci]` into the warm store → instant cache hits). Each writes
+          # the image tar to stdout; stream it ONCE into a local OCI layout, then
+          # push every tag from that layout — one assembly per image, no per-tag
+          # re-stream, no gzipped store tarball, no artifact round-trip.
+          OCI_SCRIPT="$(nix build .#oci --no-link --print-out-paths)"
+          JFWEB_SCRIPT="$(nix build .#jellyfinWebOci --no-link --print-out-paths)"
           publish() {
-            archive="$1"; repo="$2"
+            script="$1"; repo="$2"
+            stage="$(mktemp -d)/img"
+            "$script" | nix develop --command skopeo --insecure-policy copy \
+              docker-archive:/dev/stdin "oci:${stage}:img"
             for tag in latest "$GITHUB_SHA" "$SORTABLE"; do
               nix develop --command skopeo --insecure-policy copy \
                 --dest-creds "$GHCR_CREDS" \
-                "docker-archive:$archive" \
-                "docker://$repo:$tag"
+                "oci:${stage}:img" "docker://${repo}:${tag}"
             done
           }
-          publish result-oci    ghcr.io/alisonjenkins/pharos
-          publish result-jfweb  ghcr.io/alisonjenkins/pharos-jellyfin-web
+          publish "$OCI_SCRIPT"   ghcr.io/alisonjenkins/pharos
+          publish "$JFWEB_SCRIPT" ghcr.io/alisonjenkins/pharos-jellyfin-web
 
   compat-playwright:
     name: jellyfin-web crawl

@@ -403,7 +403,13 @@
         # explicitly (via `--system aarch64-linux` or via the
         # `packages.<arch>-linux.oci` attribute path), dispatching to
         # the configured linux-builder.
-        ociImage = pkgs.dockerTools.buildLayeredImage {
+        #
+        # streamLayeredImage (not buildLayeredImage): `.#oci` is a SCRIPT that
+        # writes the image tar to stdout on demand, piped straight into skopeo
+        # at publish time. Avoids materialising + gzipping the ~150 MB tarball
+        # into the nix store (and the artifact round-trip). Same args as
+        # buildLayeredImage.
+        ociImage = pkgs.dockerTools.streamLayeredImage {
           name = "pharos";
           tag = "latest";
           architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
@@ -592,7 +598,9 @@
               '';
             };
           in
-          pkgs.dockerTools.buildLayeredImage {
+          # streamLayeredImage: a stdout-streaming script (see the pharos
+          # ociImage note) — piped into skopeo at publish, no store tarball.
+          pkgs.dockerTools.streamLayeredImage {
             name = pname;
             tag = "latest";
             architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
