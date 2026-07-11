@@ -104,8 +104,14 @@
           // {
             cargoArtifacts = pharosDeps;
             # Only the two server-side binaries; the wasm UI crate is built
-            # separately by `dx` (pharosUiBundle).
-            cargoExtraArgs = "--package pharos-server --package pharos-transcode";
+            # separately by `dx` (pharosUiBundle). `pharos-server/postgres`
+            # compiles the runtime-selectable Postgres backend + the distributed
+            # SyncPlay coordinator + the `admin db-migrate` command into the
+            # shipped image, so a `postgres://` config.database.url (and the
+            # zero-downtime multi-replica path) works — the default ffmpeg-lib
+            # feature is preserved (additive).
+            cargoExtraArgs =
+              "--package pharos-server --package pharos-transcode --features pharos-server/postgres";
             # The suite runs in `pharosTests` (below); don't re-run it here.
             doCheck = false;
           }
