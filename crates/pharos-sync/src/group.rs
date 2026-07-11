@@ -1034,6 +1034,24 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // immediately re-syncs. The member (and its place in any readiness
             // gate) is untouched. Ignored if the member isn't in the roster.
             if state.members.contains_key(&member_id) {
+                // A reconnect (page reload / deploy rollover) hands a FRESH
+                // jellyfin-web Manager whose `groupInfo` is null and whose
+                // SyncPlay is not enabled. Lead the catch-up with `Joined`
+                // (→ GroupJoined) so it re-establishes `groupInfo` + re-enables
+                // SyncPlay BEFORE the queue/playback commands — otherwise the
+                // client ignores the resumed Unpause ("SyncPlay not enabled")
+                // and crashes reading `groupInfo.Participants` on the PlayQueue,
+                // poisoning SyncPlay for the whole session. `enableSyncPlay` is
+                // idempotent client-side, so a live socket-blip re-join is a
+                // no-op there.
+                state.send_one(
+                    member_id,
+                    ServerMsg::Joined {
+                        group_id: state.id,
+                        leader: state.leader.unwrap_or(member_id),
+                        members: state.member_summaries(),
+                    },
+                );
                 state.send_catch_up(member_id);
             }
         }
@@ -1856,5 +1874,59 @@ mod tests {
         let mut names = snap_b.participants.clone();
         names.sort();
         assert_eq!(names, vec!["gf".to_string(), "leader".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_resync_resends_group_joined_first() {
+        // A reconnected socket (page reload / deploy rollover) is a FRESH
+        // jellyfin-web Manager whose `this.groupInfo` is null and whose SyncPlay
+        // is not enabled. The catch-up MUST lead with `Joined` (→ GroupJoined),
+        // or the client (a) logs "SyncPlay not enabled, ignoring command" for the
+        // Unpause and (b) crashes reading `this.groupInfo.Participants` on the
+        // PlayQueue — poisoning SyncPlay for the whole session.
+        let (h, sinks, _leader_rx, leader) = fresh().await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["ep1".into(), "ep2".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+
+        // Second member joins, then drain everything its own join produced.
+        let (gf, mut gf_rx) = add_member(&h, &sinks, "gf").await;
+        let _ = snapshot_of(&h).await; // flush the actor
+        while gf_rx.try_recv().is_ok() {}
+
+        // Now simulate the reconnect: its fresh sink is already swapped in, the
+        // actor re-sends the catch-up.
+        h.tx.send(GroupMsg::ResyncMember { member_id: gf })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await; // flush the actor
+
+        let first = gf_rx.try_recv().expect("catch-up must send something");
+        assert!(
+            matches!(first, ServerMsg::Joined { .. }),
+            "reconnect catch-up must lead with Joined (GroupJoined), got {first:?}"
+        );
+        // The queue + playback state still follow.
+        let mut saw_queue = false;
+        while let Ok(msg) = gf_rx.try_recv() {
+            if matches!(msg, ServerMsg::PlayQueue { .. }) {
+                saw_queue = true;
+            }
+        }
+        assert!(
+            saw_queue,
+            "reconnect catch-up must still resend the PlayQueue"
+        );
     }
 }
