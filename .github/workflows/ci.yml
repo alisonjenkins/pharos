@@ -66,32 +66,22 @@ jobs:
     name: package + oci image
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
-    needs: [test]
+    # NO `needs: [test]`: this nix build shares nothing with the cargo build in
+    # `test`, so gating it behind test only serialised ~4 min after ~3 min. Run
+    # it in PARALLEL — `publish` still `needs: [test, oci]`, so a failing test
+    # never ships an image. On PRs this is the sole validation that BOTH images
+    # (pharos + jellyfin-web) still build. With crane's cached dep artifact,
+    # only changed workspace crates recompile here.
     steps:
       - uses: actions/checkout@v4
       - uses: alisonjenkins/setup-host-nix@v1
-      - name: nix build .#pharos
-        run: nix build .#pharos --print-out-paths
-      # Build BOTH OCI archives here — the single build-once step. This also
-      # validates the jellyfin-web image on PRs (it was previously only ever
-      # built at publish time, so a broken jfweb image slipped past PR CI).
-      # `cp -L` dereferences the store symlink to a fixed, predictable filename
-      # so the `publish` job can address the tarball without knowing the store
-      # hash. Both are docker-archive tarballs (skopeo reads them directly).
-      - name: Build OCI archives
+      # Build both images into the (host-shared, warm) nix store. `publish`
+      # reuses these exact store paths as instant cache hits — no artifact
+      # upload/download round-trip of a ~100 MB tarball.
+      - name: Build OCI images
         run: |
-          mkdir -p oci-out
-          nix build .#oci           --out-link result-oci   --print-out-paths
-          nix build .#jellyfinWebOci --out-link result-jfweb --print-out-paths
-          cp -L result-oci   oci-out/pharos.tar
-          cp -L result-jfweb oci-out/pharos-jellyfin-web.tar
-      - name: Upload OCI image tarballs
-        uses: actions/upload-artifact@v4
-        with:
-          name: pharos-oci-${{ github.sha }}
-          path: oci-out
-          if-no-files-found: error
-          retention-days: 7
+          nix build .#oci            --no-link --print-out-paths
+          nix build .#jellyfinWebOci --no-link --print-out-paths
 
   publish:
     name: publish images (ghcr)
@@ -108,15 +98,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: alisonjenkins/setup-host-nix@v1
-      - name: Download OCI archives from the oci job
-        uses: actions/download-artifact@v4
-        with:
-          name: pharos-oci-${{ github.sha }}
-          path: oci-out
-      - name: Stage archives at the paths the publish step expects
+      # `needs: [oci]` already built both images into the host-shared warm nix
+      # store, so these resolve to the SAME store paths as instant cache hits —
+      # no rebuild, no artifact round-trip. `--out-link` gives the push step a
+      # stable path to hand skopeo (docker-archive tarballs).
+      - name: Materialise the images from the warm store
         run: |
-          ln -sf oci-out/pharos.tar               result-oci
-          ln -sf oci-out/pharos-jellyfin-web.tar  result-jfweb
+          nix build .#oci            --out-link result-oci
+          nix build .#jellyfinWebOci --out-link result-jfweb
       - name: Push to GHCR (latest + immutable sha tag)
         env:
           # A PAT with write:packages, NOT the workflow GITHUB_TOKEN: these
