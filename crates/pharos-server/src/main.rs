@@ -770,11 +770,41 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // Per-replica member-sink table: the group actors deliver into it and the
     // `/socket` layer registers each socket's sink. On a single replica this is
     // direct in-process delivery (`LocalDelivery`); the multi-replica Postgres
-    // path swaps in a bus-backed delivery (Phase B4.3d).
+    // path swaps in a bus-backed delivery + per-group ownership (Phase B4.3d).
     let member_sinks = pharos_sync::MemberSinks::new();
-    let group_registry = web::Data::new(GroupRegistry::spawn(std::sync::Arc::new(
-        pharos_sync::LocalDelivery::new(member_sinks.clone()),
-    )));
+    let local_registry = || {
+        GroupRegistry::spawn(std::sync::Arc::new(pharos_sync::LocalDelivery::new(
+            member_sinks.clone(),
+        )))
+    };
+    #[cfg(feature = "postgres")]
+    let group_registry = {
+        let is_postgres = cfg.database.url.starts_with("postgres://")
+            || cfg.database.url.starts_with("postgresql://");
+        if is_postgres {
+            match pharos_server::sync_distributed::build(
+                app_state.stores.clone(),
+                &cfg.database.url,
+                member_sinks.clone(),
+            )
+            .await
+            {
+                Ok(reg) => {
+                    tracing::info!("SyncPlay: distributed multi-replica coordinator active");
+                    reg
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "SyncPlay distributed init failed; single-replica fallback");
+                    local_registry()
+                }
+            }
+        } else {
+            local_registry()
+        }
+    };
+    #[cfg(not(feature = "postgres"))]
+    let group_registry = local_registry();
+    let group_registry = web::Data::new(group_registry);
     let member_sinks_data = web::Data::new(member_sinks);
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
     // per-`/socket` group member sinks. One instance shared across workers.

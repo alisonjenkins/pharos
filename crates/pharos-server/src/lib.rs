@@ -11,6 +11,8 @@ pub mod quick_connect;
 pub mod router;
 pub mod sessions;
 pub mod state;
+#[cfg(feature = "postgres")]
+pub mod sync_distributed;
 pub mod sync_resolver;
 pub mod transcode_sessions;
 pub mod trickplay_backfill;
