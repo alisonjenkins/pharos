@@ -15,12 +15,11 @@ use pharos_server::{
     api::jellyfin::{self, items},
     auth::BuiltinAuth,
     middleware::LowercasePath,
-    state::AppState,
+    state::{AppState, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -135,7 +134,7 @@ async fn playback_info_emits_zero_resume_when_item_is_played() {
 async fn playback_info_emits_zero_when_no_user_data_row_exists() {
     // Items.rs.get_user_data returns default (zeros) for missing rows;
     // playback_info should treat that as "no resume".
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -194,7 +193,7 @@ fn _items_surface_ref() -> fn(&mut actix_web::web::ServiceConfig) {
 /// must honour it, else e.g. a movie shows up under "Continue Reading".
 #[actix_web::test]
 async fn resume_list_filters_by_media_types() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

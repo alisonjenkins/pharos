@@ -8,14 +8,23 @@ use crate::{
 };
 use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
 use pharos_discovery::live_tv::M3uXmltvBackend;
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_store_sqlx::ServerConfigStore;
 use pharos_transcode::FfmpegBackend;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-pub type Stores = SqliteStore;
+// Concrete store backend, chosen at COMPILE time by the `postgres` feature and
+// at RUNTIME by the DB URL scheme:
+// - default (sqlite only): the store is `SqliteStore` directly.
+// - `--features postgres` (the shipped image): `AnyStore`, a runtime enum that
+//   dispatches `sqlite://` vs `postgres://` to the matching backend. Handlers
+//   stay free of generics either way — this alias is the only swap point.
+#[cfg(feature = "postgres")]
+pub type Stores = pharos_store_sqlx::any::AnyStore;
+#[cfg(not(feature = "postgres"))]
+pub type Stores = pharos_store_sqlx::sqlite::SqliteStore;
 pub type Auth = BuiltinAuth<Stores>;
 
 /// Concurrent heavy background file reads permitted when NOTHING is playing

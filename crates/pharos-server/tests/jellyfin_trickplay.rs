@@ -30,9 +30,8 @@ use pharos_server::{
     api::jellyfin::{self, trickplay},
     auth::BuiltinAuth,
     middleware::LowercasePath,
-    state::AppState,
+    state::{AppState, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -60,7 +59,7 @@ fn ffmpeg_available() -> bool {
 }
 
 async fn seed(cache_dir: &std::path::Path) -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -189,7 +188,7 @@ async fn generates_valid_sprite_grid_from_inline_clip() {
     }
     let td = TempDir::new().unwrap();
     let clip = make_clip(td.path());
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -316,7 +315,7 @@ async fn http_get_item_emits_nested_trickplay() {
     // empty `state.trickplay_widths` (a no-op `with_trickplay`), which is
     // exactly what makes previews silently invisible. The layout is
     // probe-derived, so no fixture / ffmpeg is needed.
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

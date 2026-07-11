@@ -6,12 +6,15 @@
 use actix_web::{test, web, App};
 use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, router, state::AppState,
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    router,
+    state::{AppState, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_state() -> web::Data<AppState> {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     stores
@@ -184,10 +187,12 @@ async fn router_mounts_jellyfin_scope_alongside_metrics_and_health() {
 #[actix_web::test]
 async fn user_configuration_persists_across_request() {
     use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
-    use pharos_server::{auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-    let stores = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
-        .await
-        .unwrap();
+    use pharos_server::{
+        auth::BuiltinAuth,
+        middleware::LowercasePath,
+        state::{AppState, Stores},
+    };
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -234,10 +239,12 @@ async fn user_configuration_persists_across_request() {
 #[actix_web::test]
 async fn display_preferences_round_trip_per_user() {
     use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
-    use pharos_server::{auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-    let stores = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
-        .await
-        .unwrap();
+    use pharos_server::{
+        auth::BuiltinAuth,
+        middleware::LowercasePath,
+        state::{AppState, Stores},
+    };
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

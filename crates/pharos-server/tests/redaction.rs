@@ -12,8 +12,12 @@ use actix_test::TestServer;
 use actix_web::{web, App};
 use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_jellyfin_test_client::{DeviceInfo, JellyfinClient};
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 use pharos_sync::GroupRegistry;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
@@ -44,7 +48,7 @@ impl std::io::Write for SharedBuf {
 }
 
 async fn boot() -> (TestServer, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     stores

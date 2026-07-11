@@ -14,9 +14,8 @@ use pharos_server::{
     api::jellyfin::{self},
     auth::BuiltinAuth,
     middleware::LowercasePath,
-    state::AppState,
+    state::{AppState, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 use tempfile::TempDir;
 
 const TICKS_PER_SECOND: u64 = 10_000_000;
@@ -26,7 +25,7 @@ async fn seed(
     bitrate_bps: u64,
     duration_ms: u64,
 ) -> (web::Data<AppState>, String, std::path::PathBuf) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

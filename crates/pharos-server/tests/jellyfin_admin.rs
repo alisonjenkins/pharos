@@ -3,11 +3,15 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 async fn seed(admin_flag: bool) -> (web::Data<AppState>, String, UserId) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -242,9 +246,7 @@ async fn system_logs_lists_files_in_log_dir() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("pharos.log"), b"hello\n").unwrap();
     std::fs::write(tmp.path().join("scan.log"), b"line\n").unwrap();
-    let stores = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
-        .await
-        .unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = pharos_server::auth::BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

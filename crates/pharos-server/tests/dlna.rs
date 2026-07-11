@@ -3,11 +3,14 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{MediaItem, MediaKind, MediaStore};
-use pharos_server::{dlna, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    dlna,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 async fn seed_state() -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     stores
         .put(MediaItem {
             id: 1,

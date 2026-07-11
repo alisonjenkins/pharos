@@ -9,10 +9,9 @@ use pharos_server::{
     health::{ReadinessError, ReadinessHandle},
     middleware::{LowercasePath, RedMetrics},
     obs, router,
-    state::AppState,
+    state::{AppState, Stores},
     sync_resolver,
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
@@ -39,7 +38,7 @@ enum AppError {
 /// one row per configured root/typed-library (the typed kind/name winning
 /// for a path listed both ways) and re-pointing each item's library_id.
 async fn reconcile_libraries(
-    stores: &SqliteStore,
+    stores: &Stores,
     cfg: &Config,
 ) -> Result<Vec<pharos_core::Library>, AppError> {
     use pharos_core::LibraryStore;
@@ -110,7 +109,7 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let stores = Stores::connect(&cfg.database.url).await?;
     // P48 — `ffmpeg-lib` build probes in-process via a resident libav
     // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
@@ -168,7 +167,7 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     };
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let stores = Stores::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
@@ -298,7 +297,7 @@ async fn create_user(
     use pharos_core::SecretString;
     use pharos_server::auth::{BuiltinAuth, CreateUserOutcome};
 
-    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let stores = Stores::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let outcome = auth
@@ -327,7 +326,7 @@ async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), 
     use pharos_core::{SecretString, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let stores = Stores::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let record = stores
@@ -357,7 +356,7 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let stores = Stores::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
@@ -467,7 +466,7 @@ async fn build_transcode_scheduler(
 async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
-    let stores = SqliteStore::connect(&cfg.database.url).await?;
+    let stores = Stores::connect(&cfg.database.url).await?;
     let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
     // LIB-C1 — reconcile the typed `libraries` table from config (one row
     // per configured root/typed-library, with its kind + stable wire id),

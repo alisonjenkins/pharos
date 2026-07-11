@@ -342,12 +342,14 @@ impl SqliteStore {
         }
         Ok(out)
     }
+}
 
+impl crate::ServerConfigStore for SqliteStore {
     /// Read or initialise this server's stable identity UUID. First call
     /// in a fresh install writes a new row; subsequent calls return the
     /// same value. Clients see the same `server_id` across pharos
     /// restarts so they don't have to re-pair (T35).
-    pub async fn load_or_create_server_id(&self) -> Result<String, StoreError> {
+    async fn load_or_create_server_id(&self) -> Result<String, StoreError> {
         if let Some((id,)) =
             sqlx::query_as::<_, (String,)>("SELECT server_id FROM system_identity WHERE id = 1")
                 .fetch_optional(&self.pool)
@@ -382,13 +384,11 @@ impl SqliteStore {
             Err(e) => Err(e.into()),
         }
     }
-}
 
-impl SqliteStore {
     /// Read the persisted runtime config snapshot (`runtime_config`
     /// row id=1). Returns `Default` when the row has never been
     /// written.
-    pub async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
+    async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
             "SELECT server_name, login_disclaimer, custom_css \
              FROM runtime_config WHERE id = 1",
@@ -408,7 +408,7 @@ impl SqliteStore {
     /// Upsert the runtime config snapshot. Callers pass a fully-formed
     /// `RuntimeConfig`; previous values are replaced wholesale (the
     /// dashboard always submits the full form).
-    pub async fn set_runtime_config(&self, cfg: &crate::RuntimeConfig) -> Result<(), StoreError> {
+    async fn set_runtime_config(&self, cfg: &crate::RuntimeConfig) -> Result<(), StoreError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -435,7 +435,7 @@ impl SqliteStore {
     /// `wire_id` + `root_path` are unchanged (both derive from the path), so
     /// client item URLs keyed on the id survive the rename. Returns the number
     /// of rows updated (0 = no library with that wire id).
-    pub async fn rename_library(&self, wire_id: &str, new_name: &str) -> Result<u64, StoreError> {
+    async fn rename_library(&self, wire_id: &str, new_name: &str) -> Result<u64, StoreError> {
         let res = sqlx::query("UPDATE libraries SET name = ? WHERE wire_id = ?")
             .bind(new_name)
             .bind(wire_id)
@@ -448,7 +448,7 @@ impl SqliteStore {
     /// (`encoding`, `network`, …). Returns the raw JSON string, or `None`
     /// when the section has never been written (the handler then serves
     /// its shaped defaults unmodified).
-    pub async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {
+    async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {
         let row = sqlx::query_as::<_, (String,)>("SELECT value FROM named_config WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
@@ -460,7 +460,7 @@ impl SqliteStore {
     /// opaque JSON the handler wants persisted for `key`; a later GET
     /// overlays it on the served defaults so the dashboard change survives
     /// restart.
-    pub async fn set_named_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
+    async fn set_named_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -486,7 +486,7 @@ impl SqliteStore {
     /// the match (the synth id is a one-way hash, so the components must be
     /// recovered from the column values). Episodes only (the only rows with a
     /// series). Cheap: distinct over an indexed-ish small column set.
-    pub async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
+    async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String)>(
             "SELECT DISTINCT series_folder, series_name FROM media_items \
              WHERE series_name IS NOT NULL",
@@ -498,9 +498,7 @@ impl SqliteStore {
 
     /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys,
     /// for resolving a `?ParentId=<season synth id>`.
-    pub async fn distinct_season_keys(
-        &self,
-    ) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
+    async fn distinct_season_keys(&self) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String, i64)>(
             "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
              WHERE series_name IS NOT NULL AND season_number IS NOT NULL",
@@ -513,7 +511,7 @@ impl SqliteStore {
     /// LIB-B2 — distinct non-empty artist + album_artist names, for resolving
     /// a `?ParentId=<artist synth id>`. Union of both probe columns (the
     /// in-memory parent pivot matched either).
-    pub async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
+    async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT artist AS n FROM media_items WHERE artist IS NOT NULL AND artist <> '' \
              UNION SELECT DISTINCT album_artist FROM media_items \
@@ -526,7 +524,7 @@ impl SqliteStore {
 
     /// LIB-B2 — distinct non-empty album names, for resolving a
     /// `?ParentId=<album synth id>`.
-    pub async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
+    async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT album FROM media_items WHERE album IS NOT NULL AND album <> ''",
         )
@@ -540,7 +538,7 @@ impl SqliteStore {
     /// `?ParentId=<genre synth id>` against the LEGACY probe column when the
     /// `item_genres` entity join is empty (rows scanned before LIB-C4 and not
     /// yet backfilled) — preserving the legacy in-memory fallback.
-    pub async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
+    async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
         )

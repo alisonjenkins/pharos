@@ -20,8 +20,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use actix_web::{http::Method, test, web, App};
-use pharos_server::{api::jellyfin, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expect {
@@ -137,7 +140,7 @@ fn build_app(
 }
 
 async fn make_state() -> web::Data<AppState> {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     web::Data::new(AppState::new(stores, "srv".into()))
 }
 

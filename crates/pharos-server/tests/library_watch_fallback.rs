@@ -26,9 +26,8 @@ use pharos_scanner::FsScanner;
 use pharos_scanner::RootWatchability;
 use pharos_server::{
     library_watch::{plan_mode, spawn_for_roots, RootMode, WatchConfig},
-    state::{AppState, SocketBroadcast},
+    state::{AppState, SocketBroadcast, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 
 /// Minimal prober: classifies anything as a movie with an empty probe block.
 /// Lets the scan exercise the full put/mark_seen/broadcast path without
@@ -71,7 +70,7 @@ async fn forced_unsupported_root_uses_periodic_and_picks_up_new_file() {
     let td = tempfile::TempDir::new().unwrap();
     let root = td.path().to_path_buf();
 
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let state = AppState::new(stores, "a9-fallback".into()).with_media_roots(vec![root.clone()]);
     let state = web::Data::new(state);
 
@@ -149,7 +148,7 @@ async fn boot_scan_indexes_preexisting_file_before_first_poll() {
         .unwrap();
     let expected_id = pharos_scanner::stable_id(&root.join("movie.mkv"));
 
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let state = AppState::new(stores, "boot-scan".into()).with_media_roots(vec![root.clone()]);
     let state = web::Data::new(state);
     let mut bus_rx = state.bus.subscribe();

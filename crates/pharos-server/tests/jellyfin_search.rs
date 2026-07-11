@@ -6,11 +6,15 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 async fn seed() -> (web::Data<AppState>, String, UserId) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     let uid = UserId::new();
@@ -207,7 +211,7 @@ async fn search_hints_lowercase_alias_also_works() {
 // /Search/Hints and /Items?SearchTerm search series_name now.
 #[actix_web::test]
 async fn search_matches_series_name_not_just_title() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     let uid = UserId::new();

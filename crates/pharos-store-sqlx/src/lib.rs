@@ -17,6 +17,14 @@ mod preferences_sqlite;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
+#[cfg(all(feature = "sqlite", feature = "postgres"))]
+pub mod any;
+
+// Server-wide config / identity persistence trait, shared by both
+// backends (not a pharos-core domain trait — see module docs).
+pub mod server_config;
+pub use server_config::ServerConfigStore;
+
 // JSON adapter for MediaProbe.subtitle_tracks persistence — kept
 // outside the feature gates so both backends use it.
 pub mod attachment_json;

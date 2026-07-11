@@ -19,6 +19,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
+use pharos_store_sqlx::ServerConfigStore;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {

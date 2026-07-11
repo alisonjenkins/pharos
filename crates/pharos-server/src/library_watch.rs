@@ -492,10 +492,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "spawns ffmpeg to mux + extract a subtitle"]
     async fn scan_time_warm_populates_subtitle_cache() {
+        use crate::state::Stores;
         use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
         use pharos_cache::SubtitleCache;
         use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore, SubtitleTrack};
-        use pharos_store_sqlx::sqlite::SqliteStore;
 
         if std::process::Command::new("ffmpeg")
             .arg("-version")
@@ -536,7 +536,7 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg mux failed");
 
-        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
         stores
             .put(MediaItem {
                 id: 5,

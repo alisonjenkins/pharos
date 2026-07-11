@@ -3,7 +3,8 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::PreferenceStore;
+use pharos_core::{PreferenceStore, TokenStore};
+use pharos_store_sqlx::ServerConfigStore;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {

@@ -23,8 +23,12 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserDataStore, UserId,
     UserItemData, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 struct Fixture {
     state: web::Data<AppState>,
@@ -34,7 +38,7 @@ struct Fixture {
 }
 
 async fn seed_two_users() -> Fixture {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
 

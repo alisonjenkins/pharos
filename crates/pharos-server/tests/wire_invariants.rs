@@ -29,11 +29,15 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, SeriesInfo, SubtitleTrack,
     TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 async fn seed_with_items(items: Vec<MediaItem>) -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -487,7 +491,7 @@ async fn episode_classification_survives_store_roundtrip() {
     use pharos_scanner::is_episode_path;
     let path = std::path::Path::new("/m/Show/Season 1/Show.S01E03.mkv");
     assert!(is_episode_path(path));
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     stores
         .put(MediaItem {
             id: 50,
@@ -519,7 +523,7 @@ async fn episode_classification_survives_store_roundtrip() {
 #[actix_web::test]
 async fn library_mediafolders_and_user_views_emit_identical_items() {
     use pharos_core::UserId;
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

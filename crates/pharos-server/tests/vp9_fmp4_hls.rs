@@ -25,8 +25,11 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
     UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin::hls, auth::BuiltinAuth, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin::hls,
+    auth::BuiltinAuth,
+    state::{AppState, Stores},
+};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -77,7 +80,7 @@ fn make_clip(dir: &Path) -> PathBuf {
 }
 
 async fn seed(fixture: PathBuf, cache_dir: &Path) -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

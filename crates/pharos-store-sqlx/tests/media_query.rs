@@ -17,6 +17,7 @@ use pharos_core::{
     UserDataQuery, UserDataStore, UserId, UserItemData, UserRecord, UserStore,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_store_sqlx::ServerConfigStore;
 
 async fn fresh() -> SqliteStore {
     SqliteStore::connect("sqlite::memory:")

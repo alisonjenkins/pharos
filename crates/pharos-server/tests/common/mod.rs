@@ -22,8 +22,12 @@ use pharos_core::{
     PersonKind, PersonRef, PersonStore, ProviderIds, SecretString, StudioStore, TagStore,
     TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 /// Everything the feature suites need, handed back from [`seed_rich`].
 pub struct Fixture {
@@ -46,7 +50,7 @@ pub struct Fixture {
 
 /// Seed an in-memory store with the rich fixture and wrap it in `AppState`.
 pub async fn seed_rich() -> Fixture {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
 

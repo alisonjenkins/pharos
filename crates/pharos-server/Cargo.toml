@@ -68,6 +68,10 @@ ffmpeg-lib = [
 # feature (pulls in `notify`). With it off, library change-detection still
 # works via the periodic incremental rescan + manual /Library/Refresh.
 watch = ["pharos-scanner/watch"]
+# Dual-backend DB: pull in the postgres store so `state::Stores` becomes the
+# runtime-dispatching `AnyStore` (sqlite:// vs postgres:// by config URL). The
+# shipped OCI image builds with this; default builds stay sqlite-only.
+postgres = ["pharos-store-sqlx/postgres"]
 
 [dev-dependencies]
 actix-test = "0.1"

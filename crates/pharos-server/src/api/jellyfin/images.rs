@@ -707,8 +707,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::state::Stores;
     use actix_web::{test, App};
-    use pharos_store_sqlx::sqlite::SqliteStore;
 
     #[::core::prelude::v1::test]
     fn parse_image_format_picks_webp_and_avif() {
@@ -732,7 +732,7 @@ mod tests {
     }
 
     async fn seed_state() -> web::Data<crate::state::AppState> {
-        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
         web::Data::new(crate::state::AppState::new(stores, "t".into()))
     }
 
@@ -825,7 +825,7 @@ mod tests {
         cache_dir: &std::path::Path,
     ) -> web::Data<crate::state::AppState> {
         use pharos_cache::image_cache::ImageCache;
-        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let state = crate::state::AppState::new(stores, "t".into())
             .with_image_cache(ImageCache::new(cache_dir.to_path_buf()));
         web::Data::new(state)

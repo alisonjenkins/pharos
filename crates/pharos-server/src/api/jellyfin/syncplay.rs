@@ -457,8 +457,8 @@ mod tests {
 
     async fn seed_auth() -> (web::Data<crate::state::AppState>, String) {
         use crate::auth::BuiltinAuth;
-        use pharos_store_sqlx::sqlite::SqliteStore;
-        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        use crate::state::Stores;
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let auth = BuiltinAuth::new(stores.clone());
         let hash = auth.hash_password(&SecretString::new("p")).unwrap();
         let uid = UserId::new();

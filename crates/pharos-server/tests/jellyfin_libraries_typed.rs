@@ -13,14 +13,18 @@ use pharos_core::{
     UserPolicy, UserRecord, UserStore,
 };
 use pharos_server::api::jellyfin::items::library_id_for_root;
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 /// Seed two typed libraries (Movies + a Mixed root), an item under each,
 /// plus a path-boundary sibling under /media/movies-4k that must not leak
 /// into the Movies library.
 async fn seed() -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -179,7 +183,7 @@ async fn parent_id_library_resolves_only_that_librarys_items() {
 async fn single_root_legacy_config_still_works_without_libraries() {
     // The legacy path: no typed libraries wired, only media_roots → one
     // synthesised mixed library per root (back-compat).
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

@@ -5,11 +5,15 @@ use pharos_core::{
     MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
     UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 async fn seed() -> (web::Data<AppState>, String, UserId) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     let uid = UserId::new();
@@ -250,7 +254,7 @@ async fn list_items_sorts_descending_when_requested() {
 /// Seed 3 episodes of "Alpha Show" (2 seasons) + 2 of "Beta Show" (1 season)
 /// plus a stray movie, returning an admin token for browsing.
 async fn seed_shows() -> (web::Data<AppState>, String, UserId) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
     let uid = UserId::new();
@@ -376,7 +380,7 @@ async fn virtual_folders_returns_synth_library() {
 /// hung on the BBB fixture: 5.2 MB delivered against an advertised
 /// 107 KB / 200 kbps stub stalled MSE.
 async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -509,7 +513,7 @@ async fn playback_info_pulls_real_codec_and_size_from_probe() {
 async fn user_views_returns_one_collection_per_media_root() {
     // Seed two roots; expect two CollectionFolder entries with stable
     // ids derived from each root path (T-fix-7 per-root libraries).
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -571,7 +575,7 @@ async fn get_item_by_library_id_returns_collection_folder() {
     // Clicking into a library in jellyfin-web fetches
     // `/Users/{u}/Items/{libraryId}` first; the per-root library id
     // is 32-hex so the old u64::parse path 400'd and the view hung.
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -613,7 +617,7 @@ async fn get_item_by_library_id_returns_collection_folder() {
 
 #[actix_web::test]
 async fn list_items_filters_by_parent_id_to_one_library() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -681,7 +685,7 @@ async fn list_items_filters_by_parent_id_to_one_library() {
 
 #[actix_web::test]
 async fn episode_dto_carries_series_id_and_season_id() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -732,7 +736,7 @@ async fn episode_dto_carries_series_id_and_season_id() {
 
 #[actix_web::test]
 async fn get_item_by_series_id_returns_series_dto() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -815,7 +819,7 @@ async fn get_item_by_series_id_returns_series_dto() {
 
 #[actix_web::test]
 async fn list_items_filters_by_series_id() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -879,7 +883,7 @@ async fn list_items_filters_by_series_id() {
 #[actix_web::test]
 async fn playback_info_lists_sidecar_subtitle_when_present() {
     use std::io::Write;
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -931,7 +935,7 @@ async fn playback_info_lists_sidecar_subtitle_when_present() {
 
 #[actix_web::test]
 async fn shows_next_up_returns_lowest_unwatched_per_series() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1013,7 +1017,7 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
 // returning the library-wide next-up.
 #[actix_web::test]
 async fn shows_hierarchy_and_next_up_scope_to_one_series() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1102,7 +1106,7 @@ async fn shows_hierarchy_and_next_up_scope_to_one_series() {
 // the folder-keyed fix these collapsed into one interleaved series.
 #[actix_web::test]
 async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1180,7 +1184,7 @@ async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
 
 #[actix_web::test]
 async fn audio_item_surfaces_artist_album_genre_from_probe() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1235,7 +1239,7 @@ async fn audio_item_surfaces_artist_album_genre_from_probe() {
 
 #[actix_web::test]
 async fn genres_endpoint_aggregates_distinct_genre_tags() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1293,7 +1297,7 @@ async fn genres_endpoint_aggregates_distinct_genre_tags() {
 
 #[actix_web::test]
 async fn artists_albums_genres_route_into_filtered_tracks() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1396,7 +1400,7 @@ async fn artists_albums_genres_route_into_filtered_tracks() {
 
 #[actix_web::test]
 async fn sort_by_runtime_ticks_orders_by_duration() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1452,7 +1456,7 @@ async fn sort_by_runtime_ticks_orders_by_duration() {
 
 #[actix_web::test]
 async fn sort_by_albumartist_groups_tracks() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1509,7 +1513,7 @@ async fn sort_by_albumartist_groups_tracks() {
 
 #[actix_web::test]
 async fn items_similar_scores_by_series_then_genre() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();
@@ -1600,7 +1604,7 @@ async fn items_similar_scores_by_series_then_genre() {
 
 #[actix_web::test]
 async fn items_counts_aggregates_by_kind_and_distinct_names() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();

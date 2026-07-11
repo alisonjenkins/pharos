@@ -24,8 +24,12 @@ use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, SubtitleTrack, TokenStore, UserId,
     UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -128,7 +132,7 @@ fn make_media_with_subs(dir: &Path) -> PathBuf {
 /// subrip (2), ass (3) and image/PGS (4) subtitle track. Returns the wired
 /// `AppState` (no subtitle cache → handlers spawn ffmpeg directly).
 async fn seed(fixture: &Path) -> web::Data<AppState> {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

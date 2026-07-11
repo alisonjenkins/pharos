@@ -13,8 +13,12 @@ use actix_web::{test, web, App};
 use pharos_core::{
     AuthBackend, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 struct Fixture {
     state: web::Data<AppState>,
@@ -26,7 +30,7 @@ struct Fixture {
 }
 
 async fn seed() -> Fixture {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let alice_pw = SecretString::new("alice-pass");
     let bob_pw = SecretString::new("bob-pass");

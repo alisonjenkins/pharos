@@ -12,8 +12,12 @@ use pharos_core::{
     PersonStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
 use pharos_jellyfin_api::dto::person_id_for;
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 fn actor(name: &str, character: &str, order: u32) -> PersonRef {
     PersonRef {
@@ -26,7 +30,7 @@ fn actor(name: &str, character: &str, order: u32) -> PersonRef {
 }
 
 async fn seed() -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

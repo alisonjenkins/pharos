@@ -8,13 +8,15 @@
 use actix_web::{test, web, App};
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{
-    api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, sessions::SessionEvent,
-    state::AppState,
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    sessions::SessionEvent,
+    state::{AppState, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn seed_two_users_and_sessions() -> (web::Data<AppState>, String, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let alice = UserId::new();
@@ -124,7 +126,7 @@ async fn non_admin_bearer_sees_only_own_session() {
 
 #[actix_web::test]
 async fn admin_bearer_sees_every_session() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let admin_uid = UserId::new();

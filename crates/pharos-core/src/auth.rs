@@ -146,6 +146,15 @@ pub trait TokenStore: Send + Sync {
         &self,
         user: UserId,
     ) -> impl std::future::Future<Output = AuthResult<Vec<TokenRecord>>> + Send;
+
+    /// Revoke every token belonging to `user` whose `device_id` matches
+    /// the supplied value. Returns the number of rows dropped so the
+    /// caller can 404 on a stale id.
+    fn revoke_tokens_by_device(
+        &self,
+        user: UserId,
+        device_id: &str,
+    ) -> impl std::future::Future<Output = AuthResult<u64>> + Send;
 }
 
 /// Per-token metadata exposed to admin endpoints. The actual token

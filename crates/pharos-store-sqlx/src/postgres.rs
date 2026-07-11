@@ -22,9 +22,9 @@ use pharos_core::{
     DomainResult, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
     LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore,
     Person, PersonCount, PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry,
-    PlaylistStore, ScanState, SecretString, SeriesInfo, Studio, StudioCount, StudioStore, Tag,
-    TagCount, TagStore, TokenStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
-    UserStore,
+    PlaylistStore, PreferenceStore, ScanState, SecretString, SeriesInfo, Studio, StudioCount,
+    StudioStore, Tag, TagCount, TagStore, TokenStore, UserDataStore, UserId, UserItemData,
+    UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -346,10 +346,12 @@ impl PostgresStore {
         }
         Ok(out)
     }
+}
 
+impl crate::ServerConfigStore for PostgresStore {
     /// Read or initialise this server's stable identity UUID. Mirrors
     /// `SqliteStore::load_or_create_server_id` (T35).
-    pub async fn load_or_create_server_id(&self) -> Result<String, StoreError> {
+    async fn load_or_create_server_id(&self) -> Result<String, StoreError> {
         if let Some((id,)) =
             sqlx::query_as::<_, (String,)>("SELECT server_id FROM system_identity WHERE id = 1")
                 .fetch_optional(&self.pool)
@@ -379,10 +381,8 @@ impl PostgresStore {
             Err(e) => Err(e.into()),
         }
     }
-}
 
-impl PostgresStore {
-    pub async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
+    async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
             "SELECT server_name, login_disclaimer, custom_css FROM runtime_config WHERE id = 1",
         )
@@ -398,7 +398,7 @@ impl PostgresStore {
         })
     }
 
-    pub async fn set_runtime_config(&self, cfg: &crate::RuntimeConfig) -> Result<(), StoreError> {
+    async fn set_runtime_config(&self, cfg: &crate::RuntimeConfig) -> Result<(), StoreError> {
         let now = now_unix_secs();
         sqlx::query(
             "INSERT INTO runtime_config (id, server_name, login_disclaimer, custom_css, updated_at)
@@ -419,7 +419,7 @@ impl PostgresStore {
     }
 
     /// T69 — rename a library by `wire_id` in place (see the sqlite twin).
-    pub async fn rename_library(&self, wire_id: &str, new_name: &str) -> Result<u64, StoreError> {
+    async fn rename_library(&self, wire_id: &str, new_name: &str) -> Result<u64, StoreError> {
         let res = sqlx::query("UPDATE libraries SET name = $1 WHERE wire_id = $2")
             .bind(new_name)
             .bind(wire_id)
@@ -430,7 +430,7 @@ impl PostgresStore {
 
     /// T72 — read a persisted named-configuration section blob by key (see
     /// the sqlite twin). `None` when the section has never been written.
-    pub async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {
+    async fn load_named_config(&self, key: &str) -> Result<Option<String>, StoreError> {
         let row = sqlx::query_as::<_, (String,)>("SELECT value FROM named_config WHERE key = $1")
             .bind(key)
             .fetch_optional(&self.pool)
@@ -439,7 +439,7 @@ impl PostgresStore {
     }
 
     /// T72 — upsert a named-configuration section blob (see the sqlite twin).
-    pub async fn set_named_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
+    async fn set_named_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let now = now_unix_secs();
         sqlx::query(
             "INSERT INTO named_config (key, value, updated_at)
@@ -458,7 +458,7 @@ impl PostgresStore {
 
     /// LIB-B2 — distinct `(series_folder, series_name)` keys (see the sqlite
     /// twin). Used by the API to resolve a `?ParentId=<series synth id>`.
-    pub async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
+    async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String)>(
             "SELECT DISTINCT series_folder, series_name FROM media_items \
              WHERE series_name IS NOT NULL",
@@ -469,9 +469,7 @@ impl PostgresStore {
     }
 
     /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys.
-    pub async fn distinct_season_keys(
-        &self,
-    ) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
+    async fn distinct_season_keys(&self) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String, i64)>(
             "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
              WHERE series_name IS NOT NULL AND season_number IS NOT NULL",
@@ -482,7 +480,7 @@ impl PostgresStore {
     }
 
     /// LIB-B2 — distinct non-empty artist + album_artist names.
-    pub async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
+    async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT artist AS n FROM media_items WHERE artist IS NOT NULL AND artist <> '' \
              UNION SELECT DISTINCT album_artist FROM media_items \
@@ -494,7 +492,7 @@ impl PostgresStore {
     }
 
     /// LIB-B2 — distinct non-empty album names.
-    pub async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
+    async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT album FROM media_items WHERE album IS NOT NULL AND album <> ''",
         )
@@ -505,7 +503,7 @@ impl PostgresStore {
 
     /// LIB-B2 — distinct raw `genre` probe strings (legacy ParentId=genre
     /// fallback; see the sqlite twin).
-    pub async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
+    async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
         )
@@ -2494,6 +2492,20 @@ impl TokenStore for PostgresStore {
             )
             .collect())
     }
+
+    /// T58 phase 3 — revoke every token belonging to `user` whose
+    /// `device_id` matches the supplied value (mirrors the sqlite twin).
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn revoke_tokens_by_device(&self, user: UserId, device_id: &str) -> AuthResult<u64> {
+        let user_bytes = user.0.as_bytes().to_vec();
+        let res = sqlx::query("DELETE FROM auth_tokens WHERE user_id = $1 AND device_id = $2")
+            .bind(user_bytes)
+            .bind(device_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(res.rows_affected())
+    }
 }
 
 impl UserDataStore for PostgresStore {
@@ -2730,6 +2742,85 @@ impl MediaRow {
             created_at: self.created_at,
             metadata,
         })
+    }
+}
+
+impl PreferenceStore for PostgresStore {
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn get_user_configuration(&self, user: UserId) -> DomainResult<Option<String>> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT config FROM user_configuration WHERE user_id = $1")
+                .bind(id_bytes)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(s,)| s))
+    }
+
+    #[tracing::instrument(skip(self, json), fields(user.id = %user.0.simple(), bytes = json.len()))]
+    async fn set_user_configuration(&self, user: UserId, json: &str) -> DomainResult<()> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        sqlx::query(
+            "INSERT INTO user_configuration (user_id, config, updated_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id) DO UPDATE SET config = EXCLUDED.config,
+                                                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(id_bytes)
+        .bind(json)
+        .bind(now_unix_secs())
+        .execute(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple(), dp_id = %dp_id, client = %client))]
+    async fn get_display_preferences(
+        &self,
+        user: UserId,
+        dp_id: &str,
+        client: &str,
+    ) -> DomainResult<Option<String>> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT prefs FROM display_preferences \
+             WHERE user_id = $1 AND dp_id = $2 AND client = $3",
+        )
+        .bind(id_bytes)
+        .bind(dp_id)
+        .bind(client)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(s,)| s))
+    }
+
+    #[tracing::instrument(skip(self, json), fields(user.id = %user.0.simple(), dp_id = %dp_id, client = %client))]
+    async fn set_display_preferences(
+        &self,
+        user: UserId,
+        dp_id: &str,
+        client: &str,
+        json: &str,
+    ) -> DomainResult<()> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        sqlx::query(
+            "INSERT INTO display_preferences (user_id, dp_id, client, prefs, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (user_id, dp_id, client) DO UPDATE SET prefs = EXCLUDED.prefs,
+                                                                updated_at = EXCLUDED.updated_at",
+        )
+        .bind(id_bytes)
+        .bind(dp_id)
+        .bind(client)
+        .bind(json)
+        .bind(now_unix_secs())
+        .execute(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
     }
 }
 

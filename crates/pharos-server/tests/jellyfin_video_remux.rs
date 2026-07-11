@@ -16,9 +16,8 @@ use pharos_server::{
     },
     auth::BuiltinAuth,
     middleware::LowercasePath,
-    state::AppState,
+    state::{AppState, Stores},
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 
 fn mp4_h264_aac_profile() -> DeviceProfile {
     DeviceProfile {
@@ -119,7 +118,7 @@ fn matching_container_still_takes_direct_play_or_audio_remux_path() {
 
 #[actix_web::test]
 async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -206,7 +205,7 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
 // broke jellyfin-web with "error processing the request".
 #[actix_web::test]
 async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -290,7 +289,7 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
 // surface it can't decode.
 #[actix_web::test]
 async fn playback_info_vp9_profile_gets_progressive_webm() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -371,7 +370,7 @@ async fn playback_info_vp9_profile_gets_progressive_webm() {
 // serve progressive WebM. A non-Firefox UA with the same profile keeps HLS.
 #[actix_web::test]
 async fn firefox_ua_with_h264_first_still_gets_webm() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -474,7 +473,7 @@ async fn firefox_ua_with_h264_first_still_gets_webm() {
 // VP9/WebM transcode. A genuine VP9 source is left to direct-play.
 #[actix_web::test]
 async fn firefox_webm_h264_source_forced_to_transcode_not_directplay() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
@@ -571,7 +570,7 @@ async fn firefox_webm_h264_source_forced_to_transcode_not_directplay() {
 // track + burns the chosen subtitle.
 #[actix_web::test]
 async fn firefox_webm_url_forwards_audio_and_subtitle_index() {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

@@ -26,10 +26,9 @@ use pharos_core::{
 use pharos_server::{
     api::jellyfin::{device_profile::Decision, hls},
     auth::BuiltinAuth,
-    state::AppState,
+    state::{AppState, Stores},
     transcode_sessions::TranscodeSession,
 };
-use pharos_store_sqlx::sqlite::SqliteStore;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -57,7 +56,7 @@ fn ffmpeg_available() -> bool {
 }
 
 async fn seed(cache_dir: &std::path::Path) -> (web::Data<AppState>, String) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();

@@ -36,11 +36,13 @@ async fn admin_create_user_response_never_echoes_password() {
     use actix_web::{test, web, App};
     use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::{
-        api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState,
+        api::jellyfin,
+        auth::BuiltinAuth,
+        middleware::LowercasePath,
+        state::{AppState, Stores},
     };
-    use pharos_store_sqlx::sqlite::SqliteStore;
 
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let admin_id = UserId::new();

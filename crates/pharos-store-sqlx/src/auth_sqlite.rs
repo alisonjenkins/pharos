@@ -215,15 +215,12 @@ impl TokenStore for SqliteStore {
             )
             .collect())
     }
-}
 
-/// T58 phase 3 — inherent helpers used by /Auth/Keys admin endpoints.
-impl SqliteStore {
-    /// Revoke every token belonging to `user` whose `device_id` matches
-    /// the supplied value. Returns the number of rows dropped so the
-    /// handler can 404 on a stale id.
+    /// T58 phase 3 — revoke every token belonging to `user` whose
+    /// `device_id` matches the supplied value. Returns the number of rows
+    /// dropped so the handler can 404 on a stale id.
     #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
-    pub async fn revoke_tokens_by_device(&self, user: UserId, device_id: &str) -> AuthResult<u64> {
+    async fn revoke_tokens_by_device(&self, user: UserId, device_id: &str) -> AuthResult<u64> {
         let user_bytes = user.0.as_bytes().to_vec();
         let res = sqlx::query("DELETE FROM auth_tokens WHERE user_id = ? AND device_id = ?")
             .bind(user_bytes)

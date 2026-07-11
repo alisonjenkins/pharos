@@ -1952,16 +1952,16 @@ mod tests {
     }
 
     use crate::auth::BuiltinAuth;
+    use crate::state::Stores;
     use actix_web::test;
     use actix_web::App;
     use pharos_core::{
         MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
         UserStore,
     };
-    use pharos_store_sqlx::sqlite::SqliteStore;
 
     async fn seed() -> (web::Data<AppState>, String) {
-        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let auth = BuiltinAuth::new(stores.clone());
         let hash = auth.hash_password(&SecretString::new("p")).unwrap();
         let uid = UserId::new();
@@ -2029,7 +2029,7 @@ mod tests {
     }
 
     async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>, String) {
-        let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let auth = BuiltinAuth::new(stores.clone());
         let hash = auth.hash_password(&SecretString::new("p")).unwrap();
         let uid = UserId::new();

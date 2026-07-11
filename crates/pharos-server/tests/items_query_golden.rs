@@ -24,14 +24,18 @@ use pharos_core::{
     MediaStore, PersonKind, PersonRef, PersonStore, SecretString, SeriesInfo, StudioStore,
     TagStore, TokenStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, middleware::LowercasePath, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    middleware::LowercasePath,
+    state::{AppState, Stores},
+};
 
 const ROOT: &str = "/media/Movies";
 
 /// Build the fixed corpus + entity links. Returns (state, token, user id).
 async fn seed() -> (web::Data<AppState>, String, UserId) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
     let uid = UserId::new();

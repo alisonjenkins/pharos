@@ -5,8 +5,11 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
-use pharos_server::{api::jellyfin, auth::BuiltinAuth, state::AppState};
-use pharos_store_sqlx::sqlite::SqliteStore;
+use pharos_server::{
+    api::jellyfin,
+    auth::BuiltinAuth,
+    state::{AppState, Stores},
+};
 use pharos_sync::{GroupRegistry, SessionHub};
 
 async fn seed() -> (
@@ -15,7 +18,7 @@ async fn seed() -> (
     web::Data<SessionHub>,
     String,
 ) {
-    let stores = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
     let uid = UserId::new();
