@@ -146,6 +146,33 @@
           }
         );
         pharosFmt = craneLib.cargoFmt { inherit (pharosCommonArgs) pname version src; };
+        # Postgres-backend conformance: the store trait suite run against a REAL
+        # Postgres started INSIDE the nix sandbox (TCP on loopback — the sandbox
+        # allows 127.0.0.1, no external service). So `nix flake check` exercises
+        # the actual postgres backend hermetically, not just compiles it. The
+        # `backend_conformance` test's postgres arm keys off
+        # PHAROS_TEST_POSTGRES_URL (set below); its sqlite arm runs in the plain
+        # `checks.tests` already.
+        pharosPgTests = craneLib.cargoNextest (
+          pharosCommonArgs
+          // {
+            cargoArtifacts = pharosDeps;
+            cargoExtraArgs = "-p pharos-store-sqlx --features postgres";
+            cargoNextestExtraArgs = "--profile nix";
+            nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ [ pkgs.postgresql ];
+            preCheck = ''
+              export PGDATA="$TMPDIR/pgdata"
+              initdb -U postgres --auth=trust --locale=C --encoding=UTF8 \
+                -D "$PGDATA" >/dev/null 2>&1
+              pg_ctl -D "$PGDATA" -o "-h 127.0.0.1 -p 5433 -k $TMPDIR" -w start
+              createdb -h 127.0.0.1 -p 5433 -U postgres pharos_test
+              export PHAROS_TEST_POSTGRES_URL="postgres://postgres@127.0.0.1:5433/pharos_test"
+            '';
+            postCheck = ''
+              pg_ctl -D "$PGDATA" stop >/dev/null 2>&1 || true
+            '';
+          }
+        );
         pharos = pharosBins;
         # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
         # (the two binaries share one store path here, but the env var is the
@@ -854,6 +881,8 @@
         checks.doctests = pharosDoctests;
         checks.clippy = pharosClippy;
         checks.fmt = pharosFmt;
+        # Runs the store conformance suite against a real ephemeral Postgres.
+        checks.postgres = pharosPgTests;
 
         formatter = pkgs.nixfmt-rfc-style;
       }
