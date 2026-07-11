@@ -18,9 +18,14 @@ use uuid::Uuid;
 pub type Stores = SqliteStore;
 pub type Auth = BuiltinAuth<Stores>;
 
-/// Concurrent heavy background file reads (scan probes + subtitle warm-demuxes)
-/// permitted when NOTHING is playing — the `bg_io` semaphore's full size.
-const BG_IO_MAX: usize = 4;
+/// Concurrent heavy background file reads (scan probes + subtitle warm-demuxes
+/// + trickplay pre-generation) permitted when NOTHING is playing — the `bg_io`
+/// semaphore's full size. Sized for parallel background work on a many-core box
+/// with a 13k-item NFS library: trickplay generation is I/O-bound (keyframe
+/// seeks leave the CPU near-idle), so a low ceiling left the box mostly idle
+/// while the backfill crawled. Only the IDLE ceiling — during playback the
+/// regulator still parks down to `BG_IO_BUSY`, so live streams are unaffected.
+const BG_IO_MAX: usize = 8;
 /// …and during active playback: a trickle, so background work keeps making
 /// progress but can't saturate NFS out from under a live stream's segment
 /// reads. The regulator parks `BG_IO_MAX - BG_IO_BUSY` permits while playing.

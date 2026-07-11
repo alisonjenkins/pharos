@@ -31,6 +31,15 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 const WARMUP: Duration = Duration::from_secs(45);
 const PASS_INTERVAL: Duration = Duration::from_secs(600);
 const COOLDOWN: Duration = Duration::from_secs(3);
+/// How many general-sweep items to generate CONCURRENTLY. Generation is
+/// largely NFS-I/O-bound (keyframe seeks leave the CPU near-idle), so a strictly
+/// sequential sweep wastes almost all of a multi-core box while a 13k-item
+/// library crawls. Overlapping items is a near-linear win. Real concurrency is
+/// still bounded by the shared `bg_io` gate (full when idle, throttled to
+/// `BG_IO_BUSY` while streaming), so this only sets how many are kept in flight;
+/// it never exceeds the gate's live pressure ceiling. Kept a touch above the
+/// idle gate width so a permit freed mid-item is grabbed immediately.
+const SWEEP_CONCURRENCY: usize = 10;
 
 /// Acquire a background-I/O slot for one bulk pre-generation op. The
 /// actively-watched seed (`bypass = true`) skips throttling entirely — its
@@ -114,27 +123,39 @@ async fn run(
             generate_priority(id, &items, &cache, subs, imgs, &bg_io, &widths, interval_ms).await;
         }
 
-        // 2. General sweep, newest-first.
+        // 2. General sweep, newest-first — generated CONCURRENTLY in chunks of
+        //    SWEEP_CONCURRENCY. Each generate_item still draws its own bg_io
+        //    permit per heavy op, so true parallelism is gate-bounded (full
+        //    BG_IO_MAX when idle, throttled to BG_IO_BUSY while streaming) — this
+        //    only stops the sweep from wasting idle capacity one-item-at-a-time.
         let mut general: Vec<&MediaItem> = items.iter().filter(|i| is_video(i)).collect();
         general.sort_by_key(|i| std::cmp::Reverse(i.created_at.unwrap_or(i64::MIN)));
-        for item in general {
-            // A show that starts playing mid-sweep preempts the rest.
+        let mut general = general.into_iter();
+        loop {
+            // A show that starts playing mid-sweep preempts the rest — drained
+            // between chunks so a freshly-watched item waits at most one chunk.
             drain_into(&mut prio_rx, &mut pending);
             for id in pending.drain(..) {
                 generate_priority(id, &items, &cache, subs, imgs, &bg_io, &widths, interval_ms)
                     .await;
             }
-            generate_item(
-                item,
-                &cache,
-                subs,
-                imgs,
-                &bg_io,
-                &widths,
-                interval_ms,
-                false,
-            )
-            .await;
+            let chunk: Vec<&MediaItem> = general.by_ref().take(SWEEP_CONCURRENCY).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let batch = chunk.into_iter().map(|item| {
+                generate_item(
+                    item,
+                    &cache,
+                    subs,
+                    imgs,
+                    &bg_io,
+                    &widths,
+                    interval_ms,
+                    false,
+                )
+            });
+            futures_util::future::join_all(batch).await;
         }
 
         // 3. Sweep done — sleep until the next pass, but wake immediately if a
