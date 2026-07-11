@@ -854,5 +854,3 @@ mod tests {
         }
     }
 }
-
-// ci: verify the nix flake-check test derivation builds + runs on an uncached source
