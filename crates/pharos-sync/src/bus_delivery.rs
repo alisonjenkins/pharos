@@ -14,18 +14,25 @@
 
 use crate::bus::SyncBus;
 use crate::delivery::{Delivery, LocalDelivery, MemberSinks};
-use crate::messages::{MemberId, ServerMsg};
+use crate::group::RemoteCommand;
+use crate::messages::{GroupId, MemberId, ServerMsg};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Wire envelope carried on the bus. Currently only member delivery; inbound
-/// command routing (non-owner → owner) is added in B4.3d-3.
+/// Wire envelope carried on the bus: outbound per-member delivery (owner → all)
+/// and inbound command routing (non-owner → owner).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BusMsg {
     /// Owner → every replica: deliver `msg` to `member_id` wherever it is
     /// connected. Replicas without that member ignore it.
     Deliver { member_id: MemberId, msg: ServerMsg },
+    /// A non-owner replica → the owner: apply `cmd` to group `group_id`. Only
+    /// the replica that owns the group acts on it; others ignore it.
+    Command {
+        group_id: GroupId,
+        cmd: RemoteCommand,
+    },
 }
 
 /// A [`Delivery`] that publishes to the cross-replica bus. Cheap to clone
@@ -74,7 +81,10 @@ pub fn spawn_ingress<B: SyncBus>(bus: &B, sinks: MemberSinks) {
             match rx.recv().await {
                 Ok(payload) => match serde_json::from_str::<BusMsg>(&payload) {
                     Ok(BusMsg::Deliver { member_id, msg }) => local.deliver(member_id, msg),
-                    Err(_) => { /* not a delivery envelope (or future variant) — ignore */ }
+                    // Command envelopes are handled by the command ingress
+                    // (which owns the registry), not this delivery ingress.
+                    Ok(BusMsg::Command { .. }) => {}
+                    Err(_) => { /* not a bus envelope — ignore */ }
                 },
                 // A slow ingress that overran the broadcast buffer skips the
                 // gap; state re-syncs via catch-up. Keep going.

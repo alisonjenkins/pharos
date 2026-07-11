@@ -1,13 +1,33 @@
 //! `GroupRegistry` actor — owns `HashMap<GroupId, GroupHandle>` and routes
 //! membership requests. WS handlers send via the registry, never touching
 //! group state directly (V18).
+//!
+//! Two modes:
+//! - **single-replica** (`spawn`): every group is owned locally; a plain
+//!   `LocalDelivery` reaches members. SQLite deployments. Behaviour identical
+//!   to the original registry.
+//! - **distributed** (`spawn_distributed`): under Postgres, a per-group advisory
+//!   lock elects one owner replica. The owner runs the actor (persisting its
+//!   snapshot, delivering via the bus); non-owners hold a *remote handle* that
+//!   forwards commands to the owner over the bus. A reconnect after the owner
+//!   drained re-attempts ownership and hydrates from the last snapshot — the
+//!   group survives the deploy.
 
 use super::delivery::Delivery;
-use super::group::GroupHandle;
+use super::distributed::{spawn_remote_handle, Distributed};
+use super::group::{GroupHandle, RemoteCommand};
 use super::messages::GroupId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -32,6 +52,131 @@ enum Msg {
     List {
         reply: oneshot::Sender<Vec<GroupHandle>>,
     },
+    /// A command forwarded from a non-owner replica over the bus. Applied only
+    /// if THIS replica owns the group's local actor.
+    DeliverCommand {
+        group_id: GroupId,
+        cmd: RemoteCommand,
+    },
+}
+
+/// The registry actor's mutable state.
+struct Actor {
+    /// Every group this replica has a handle for — owned (local actor) or
+    /// remote (bus router).
+    groups: HashMap<GroupId, GroupHandle>,
+    /// Groups this replica owns a *local actor* for (holds the advisory lease).
+    owned: HashSet<GroupId>,
+    /// How owned actors reach members (`LocalDelivery` or `BusDelivery`).
+    delivery: Arc<dyn Delivery>,
+    /// `Some` in distributed mode: ownership election + hydration + command bus
+    /// + snapshot persistence.
+    distributed: Option<Distributed>,
+}
+
+impl Actor {
+    /// A cached handle if it is live AND authoritative. Owned handles are
+    /// authoritative (we hold the lease); a cached *remote* handle is NOT — the
+    /// owner may have drained — so it is never short-circuited here, forcing a
+    /// fresh ownership attempt (the takeover path).
+    fn cached_owned(&mut self, group_id: GroupId) -> Option<GroupHandle> {
+        if self.owned.contains(&group_id) {
+            match self.groups.get(&group_id) {
+                Some(h) if !h.tx.is_closed() => return Some(h.clone()),
+                _ => self.drop_group(group_id), // owned actor died → release + re-elect
+            }
+        }
+        None
+    }
+
+    /// Forget a group, releasing its ownership lease if we held one.
+    fn drop_group(&mut self, group_id: GroupId) {
+        self.groups.remove(&group_id);
+        if self.owned.remove(&group_id) {
+            if let Some(d) = &self.distributed {
+                d.ownership.release(group_id);
+            }
+        }
+    }
+
+    async fn get_or_create(&mut self, group_id: GroupId) -> GroupHandle {
+        if let Some(h) = self.cached_owned(group_id) {
+            return h;
+        }
+        self.spawn_for(group_id).await
+    }
+
+    /// Elect + spawn (or reuse a remote router for) a group.
+    async fn spawn_for(&mut self, group_id: GroupId) -> GroupHandle {
+        let Some(d) = self.distributed.clone() else {
+            // Single-replica: always own.
+            let h = GroupHandle::spawn(group_id, self.delivery.clone());
+            self.owned.insert(group_id);
+            self.groups.insert(group_id, h.clone());
+            return h;
+        };
+        if d.ownership.try_own(group_id).await {
+            // We own it: hydrate from the last snapshot (or start fresh) and run
+            // the actor locally.
+            let (epoch, json) = match d.hydration.load(group_id).await {
+                Some((e, j)) => (e, Some(j)),
+                None => (unix_now_ms(), None),
+            };
+            let h = GroupHandle::spawn_persistent(
+                group_id,
+                epoch,
+                self.delivery.clone(),
+                d.persistence.clone(),
+                json.as_deref(),
+            );
+            self.owned.insert(group_id);
+            self.groups.insert(group_id, h.clone());
+            h
+        } else {
+            // Another replica owns it: reuse a live remote router if cached,
+            // else build one. Its epoch comes from the persisted snapshot so the
+            // socket's When conversion is correct.
+            if let Some(h) = self.groups.get(&group_id) {
+                if !h.tx.is_closed() && !self.owned.contains(&group_id) {
+                    return h.clone();
+                }
+            }
+            let epoch = d
+                .hydration
+                .load(group_id)
+                .await
+                .map(|(e, _)| e)
+                .unwrap_or_else(unix_now_ms);
+            let h = spawn_remote_handle(group_id, epoch, d.commands.clone());
+            self.groups.insert(group_id, h.clone());
+            h
+        }
+    }
+
+    fn get(&mut self, group_id: GroupId) -> Option<GroupHandle> {
+        match self.groups.get(&group_id) {
+            Some(h) if !h.tx.is_closed() => Some(h.clone()),
+            Some(_) => {
+                self.drop_group(group_id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn deliver_command(&mut self, group_id: GroupId, cmd: RemoteCommand) {
+        // Only the owner's local actor applies a forwarded command.
+        if self.owned.contains(&group_id) {
+            if let Some(h) = self.cached_owned(group_id) {
+                let _ = h.tx.send(cmd.into_group_msg()).await;
+            }
+        }
+    }
+
+    fn list(&mut self) -> Vec<GroupHandle> {
+        self.groups.retain(|_, h| !h.tx.is_closed());
+        self.groups.values().cloned().collect()
+    }
 }
 
 #[derive(Clone)]
@@ -40,63 +185,68 @@ pub struct GroupRegistry {
 }
 
 impl GroupRegistry {
-    /// Spawn the registry. `delivery` is how every group it creates reaches
-    /// members — `LocalDelivery` on a single replica, `BusDelivery` under
-    /// Postgres. Shared (cloned into each group actor).
+    /// Spawn a single-replica registry. `delivery` reaches members
+    /// (`LocalDelivery`). Every group is owned locally; no persistence, no
+    /// ownership election. SQLite deployments.
     pub fn spawn(delivery: Arc<dyn Delivery>) -> Self {
+        Self::spawn_with(delivery, None)
+    }
+
+    /// Spawn a distributed (multi-replica) registry. `delivery` is a
+    /// `BusDelivery`; `distributed` injects ownership election, hydration, the
+    /// command bus, and snapshot persistence.
+    pub fn spawn_distributed(delivery: Arc<dyn Delivery>, distributed: Distributed) -> Self {
+        Self::spawn_with(delivery, Some(distributed))
+    }
+
+    fn spawn_with(delivery: Arc<dyn Delivery>, distributed: Option<Distributed>) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(64);
         tokio::spawn(async move {
-            let mut groups: HashMap<GroupId, GroupHandle> = HashMap::new();
+            let mut actor = Actor {
+                groups: HashMap::new(),
+                owned: HashSet::new(),
+                delivery,
+                distributed,
+            };
             while let Some(msg) = rx.recv().await {
                 match msg {
                     Msg::GetOrCreate { group_id, reply } => {
-                        // A group actor terminates (and closes its tx) when its
-                        // last member leaves. A stale, present-but-dead handle
-                        // must be respawned, else every future join to a reused
-                        // GroupId silently fails (`tx.send` → Err). Treat a
-                        // closed handle as absent.
-                        let needs_spawn = groups
-                            .get(&group_id)
-                            .map(|h| h.tx.is_closed())
-                            .unwrap_or(true);
-                        if needs_spawn {
-                            groups.insert(group_id, GroupHandle::spawn(group_id, delivery.clone()));
-                        }
-                        let handle = groups.get(&group_id).cloned();
-                        // Always Some — we just inserted if needed.
-                        if let Some(h) = handle {
-                            let _ = reply.send(h);
-                        }
-                    }
-                    Msg::Get { group_id, reply } => {
-                        // Don't surface a dead handle. Drop the stale entry so
-                        // the map doesn't leak terminated groups.
-                        let h = match groups.get(&group_id) {
-                            Some(h) if !h.tx.is_closed() => Some(h.clone()),
-                            Some(_) => {
-                                groups.remove(&group_id);
-                                None
-                            }
-                            None => None,
-                        };
+                        let h = actor.get_or_create(group_id).await;
                         let _ = reply.send(h);
                     }
+                    Msg::Get { group_id, reply } => {
+                        let _ = reply.send(actor.get(group_id));
+                    }
                     Msg::Create { reply } => {
-                        let id = GroupId::new();
-                        let h = GroupHandle::spawn(id, delivery.clone());
-                        groups.insert(id, h.clone());
+                        // A brand-new id: `spawn_for` wins ownership immediately
+                        // (nobody else holds the lock) and runs it locally.
+                        let h = actor.spawn_for(GroupId::new()).await;
                         let _ = reply.send(h);
                     }
                     Msg::List { reply } => {
-                        // Prune terminated groups, surface only live ones.
-                        groups.retain(|_, h| !h.tx.is_closed());
-                        let all: Vec<GroupHandle> = groups.values().cloned().collect();
-                        let _ = reply.send(all);
+                        let _ = reply.send(actor.list());
+                    }
+                    Msg::DeliverCommand { group_id, cmd } => {
+                        actor.deliver_command(group_id, cmd).await;
                     }
                 }
             }
         });
         Self { tx }
+    }
+
+    /// Route a bus-forwarded command to this replica's owned actor for the
+    /// group (no-op if this replica doesn't own it). Called by the command
+    /// ingress.
+    pub async fn deliver_command(
+        &self,
+        group_id: GroupId,
+        cmd: RemoteCommand,
+    ) -> Result<(), RegistryError> {
+        self.tx
+            .send(Msg::DeliverCommand { group_id, cmd })
+            .await
+            .map_err(|_| RegistryError::ActorDown)
     }
 
     pub async fn get_or_create(&self, group_id: GroupId) -> Result<GroupHandle, RegistryError> {

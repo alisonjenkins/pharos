@@ -154,6 +154,190 @@ pub enum GroupMsg {
     },
 }
 
+/// The serializable subset of [`GroupMsg`] a non-owner replica forwards to the
+/// owner over the bus (Phase B4.3d). It omits the reply-carrying variants
+/// (`Snapshot`; `AddMember`'s reply is synthesized locally and the real
+/// `Joined` flows back via delivery) — those never cross replicas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RemoteCommand {
+    AddMember {
+        member_id: MemberId,
+        name: String,
+    },
+    RemoveMember {
+        member_id: MemberId,
+    },
+    Resync {
+        member_id: MemberId,
+    },
+    LeaderPlay {
+        sender: MemberId,
+        position_ms: u64,
+    },
+    LeaderPause {
+        sender: MemberId,
+    },
+    LeaderSeek {
+        sender: MemberId,
+        position_ms: u64,
+    },
+    ObserveClock {
+        member_id: MemberId,
+        t1: u64,
+        t2: u64,
+        t3: u64,
+        t4: u64,
+    },
+    BufferingStart {
+        member_id: MemberId,
+        position_ms: u64,
+    },
+    BufferingEnd {
+        member_id: MemberId,
+    },
+    Unpause {
+        sender: MemberId,
+    },
+    PauseShared {
+        sender: MemberId,
+    },
+    SeekTo {
+        sender: MemberId,
+        position_ms: u64,
+    },
+    MemberReady {
+        member_id: MemberId,
+        position_ms: u64,
+    },
+    SetNewQueue {
+        sender: MemberId,
+        item_ids: Vec<String>,
+        playing_index: usize,
+        start_position_ms: u64,
+    },
+    SetPlaylistItem {
+        sender: MemberId,
+        playlist_item_id: String,
+    },
+    NextItem {
+        sender: MemberId,
+    },
+    PreviousItem {
+        sender: MemberId,
+    },
+    SetRepeatMode {
+        sender: MemberId,
+        mode: String,
+    },
+    SetShuffleMode {
+        sender: MemberId,
+        mode: String,
+    },
+    SetGroupName {
+        name: String,
+    },
+}
+
+impl RemoteCommand {
+    /// The `GroupMsg` an owner's actor applies for this forwarded command. For
+    /// `AddMember` a throwaway reply channel is used — the caller on the remote
+    /// replica already answered its own handler, and the real `Joined` reaches
+    /// the member via delivery.
+    pub fn into_group_msg(self) -> GroupMsg {
+        match self {
+            RemoteCommand::AddMember { member_id, name } => {
+                let (reply, _rx) = oneshot::channel();
+                GroupMsg::AddMember {
+                    member_id,
+                    name,
+                    reply,
+                }
+            }
+            RemoteCommand::RemoveMember { member_id } => GroupMsg::RemoveMember { member_id },
+            RemoteCommand::Resync { member_id } => GroupMsg::ResyncMember { member_id },
+            RemoteCommand::LeaderPlay {
+                sender,
+                position_ms,
+            } => GroupMsg::LeaderPlay {
+                sender,
+                position_ms,
+            },
+            RemoteCommand::LeaderPause { sender } => GroupMsg::LeaderPause { sender },
+            RemoteCommand::LeaderSeek {
+                sender,
+                position_ms,
+            } => GroupMsg::LeaderSeek {
+                sender,
+                position_ms,
+            },
+            RemoteCommand::ObserveClock {
+                member_id,
+                t1,
+                t2,
+                t3,
+                t4,
+            } => GroupMsg::ObserveClock {
+                member_id,
+                t1,
+                t2,
+                t3,
+                t4,
+            },
+            RemoteCommand::BufferingStart {
+                member_id,
+                position_ms,
+            } => GroupMsg::BufferingStart {
+                member_id,
+                position_ms,
+            },
+            RemoteCommand::BufferingEnd { member_id } => GroupMsg::BufferingEnd { member_id },
+            RemoteCommand::Unpause { sender } => GroupMsg::Unpause { sender },
+            RemoteCommand::PauseShared { sender } => GroupMsg::PauseShared { sender },
+            RemoteCommand::SeekTo {
+                sender,
+                position_ms,
+            } => GroupMsg::SeekTo {
+                sender,
+                position_ms,
+            },
+            RemoteCommand::MemberReady {
+                member_id,
+                position_ms,
+            } => GroupMsg::MemberReady {
+                member_id,
+                position_ms,
+            },
+            RemoteCommand::SetNewQueue {
+                sender,
+                item_ids,
+                playing_index,
+                start_position_ms,
+            } => GroupMsg::SetNewQueue {
+                sender,
+                item_ids,
+                playing_index,
+                start_position_ms,
+            },
+            RemoteCommand::SetPlaylistItem {
+                sender,
+                playlist_item_id,
+            } => GroupMsg::SetPlaylistItem {
+                sender,
+                playlist_item_id,
+            },
+            RemoteCommand::NextItem { sender } => GroupMsg::NextItem { sender },
+            RemoteCommand::PreviousItem { sender } => GroupMsg::PreviousItem { sender },
+            RemoteCommand::SetRepeatMode { sender, mode } => {
+                GroupMsg::SetRepeatMode { sender, mode }
+            }
+            RemoteCommand::SetShuffleMode { sender, mode } => {
+                GroupMsg::SetShuffleMode { sender, mode }
+            }
+            RemoteCommand::SetGroupName { name } => GroupMsg::SetGroupName { name },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Joined {
     pub group_id: GroupId,
@@ -1569,6 +1753,42 @@ mod tests {
             }
             other => panic!("expected Play, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remote_command_maps_to_group_msg() {
+        // A forwarded command must reconstruct the matching GroupMsg on the
+        // owner. Spot-check a few variants incl. AddMember (synthetic reply).
+        let m = MemberId::new();
+        assert!(matches!(
+            RemoteCommand::AddMember {
+                member_id: m,
+                name: "x".into()
+            }
+            .into_group_msg(),
+            GroupMsg::AddMember { member_id, .. } if member_id == m
+        ));
+        assert!(matches!(
+            RemoteCommand::Resync { member_id: m }.into_group_msg(),
+            GroupMsg::ResyncMember { member_id } if member_id == m
+        ));
+        assert!(matches!(
+            RemoteCommand::PauseShared { sender: m }.into_group_msg(),
+            GroupMsg::PauseShared { sender } if sender == m
+        ));
+        assert!(matches!(
+            RemoteCommand::SetNewQueue {
+                sender: m,
+                item_ids: vec!["a".into()],
+                playing_index: 0,
+                start_position_ms: 9
+            }
+            .into_group_msg(),
+            GroupMsg::SetNewQueue {
+                start_position_ms: 9,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
