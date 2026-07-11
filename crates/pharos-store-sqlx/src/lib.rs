@@ -44,7 +44,7 @@ pub use server_config::ServerConfigStore;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod bg_lock;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub use bg_lock::BgLeadership;
+pub use bg_lock::{BgLeadership, GroupOwnership};
 
 // JSON adapter for MediaProbe.subtitle_tracks persistence — kept
 // outside the feature gates so both backends use it.

@@ -52,3 +52,60 @@ async fn postgres_advisory_lock_is_exclusive() {
         "after the leader's lease drops, another replica must take over"
     );
 }
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_owns_every_group() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    assert!(s.try_acquire_group_ownership("g1").await.unwrap().is_some());
+    assert!(s.try_acquire_group_ownership("g2").await.unwrap().is_some());
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_group_ownership_is_per_group_exclusive() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "SKIP postgres_group_ownership_is_per_group_exclusive: PHAROS_TEST_POSTGRES_URL unset"
+        );
+        return;
+    };
+    let a = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .unwrap();
+    let b = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .unwrap();
+
+    // A owns group "movie-night"; B is locked out of THAT group...
+    let lease_a = a.try_acquire_group_ownership("movie-night").await.unwrap();
+    assert!(lease_a.is_some(), "first replica owns the group");
+    assert!(
+        b.try_acquire_group_ownership("movie-night")
+            .await
+            .unwrap()
+            .is_none(),
+        "a second replica must not own the same group"
+    );
+    // ...but a DIFFERENT group is independently ownable by B (no false sharing).
+    assert!(
+        b.try_acquire_group_ownership("other-party")
+            .await
+            .unwrap()
+            .is_some(),
+        "a different group must be ownable concurrently"
+    );
+
+    // A's lease drops → its group frees → B can take it over.
+    drop(lease_a);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        b.try_acquire_group_ownership("movie-night")
+            .await
+            .unwrap()
+            .is_some(),
+        "after the owner drops, another replica takes over the group"
+    );
+}
