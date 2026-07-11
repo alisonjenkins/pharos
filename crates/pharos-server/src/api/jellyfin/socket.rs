@@ -578,10 +578,15 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
             is_playing,
             repeat_mode,
             shuffle_mode,
+            last_update_unix_ms,
         } => {
             let update = PlayQueueUpdate {
                 reason: play_queue_reason(&reason),
-                last_update: format_iso8601_ms(unix_now_ms()),
+                // Stable per-queue-version timestamp from the engine — NOT
+                // `unix_now_ms()`. A catch-up re-send carries the same value so
+                // jellyfin-web's `LastUpdate <=` guard drops the duplicate
+                // instead of restarting playback (→ "no active player").
+                last_update: format_iso8601_ms(last_update_unix_ms as i64),
                 playlist: items
                     .into_iter()
                     .map(|i: QueueItemInfo| QueuePlaylistItem {

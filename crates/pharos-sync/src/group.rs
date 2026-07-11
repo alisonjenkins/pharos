@@ -378,6 +378,11 @@ struct PlayQueue {
     playing_index: usize,
     repeat_mode: String,
     shuffle_mode: String,
+    /// Wall-clock (unix ms) of the last real change to this queue, monotonic.
+    /// Stamped on every outbound `PlayQueue` as `last_update_unix_ms` so a
+    /// catch-up re-send carries the SAME value the client already applied and
+    /// its `LastUpdate <=` staleness guard drops the duplicate.
+    updated_unix_ms: u64,
 }
 
 impl PlayQueue {
@@ -525,6 +530,10 @@ impl GroupState {
                     is_playing: matches!(self.playback, PlaybackState::Playing { .. }),
                     repeat_mode: self.queue.repeat_mode.clone(),
                     shuffle_mode: self.queue.shuffle_mode.clone(),
+                    // Reuse the queue's current change-timestamp (do NOT bump) —
+                    // this is the same queue the client may already have, so it
+                    // must look NO newer or the client re-processes it.
+                    last_update_unix_ms: self.queue.updated_unix_ms,
                 },
             );
         }
@@ -573,7 +582,12 @@ impl GroupState {
     }
 
     /// Broadcast the current queue to every member (Jellyfin `PlayQueue`).
-    fn broadcast_play_queue(&self, reason: &str, is_playing: bool, start_position_ms: u64) {
+    /// This is the single funnel for a *real* queue change, so it bumps the
+    /// queue's change-timestamp — kept strictly monotonic so two changes in the
+    /// same wall-clock millisecond still each look newer to the client's
+    /// `LastUpdate <=` staleness guard.
+    fn broadcast_play_queue(&mut self, reason: &str, is_playing: bool, start_position_ms: u64) {
+        self.queue.updated_unix_ms = unix_now_ms().max(self.queue.updated_unix_ms + 1);
         self.broadcast(ServerMsg::PlayQueue {
             reason: reason.to_string(),
             items: self.queue.item_infos(),
@@ -582,6 +596,7 @@ impl GroupState {
             is_playing,
             repeat_mode: self.queue.repeat_mode.clone(),
             shuffle_mode: self.queue.shuffle_mode.clone(),
+            last_update_unix_ms: self.queue.updated_unix_ms,
         });
     }
 
@@ -741,6 +756,7 @@ impl GroupState {
             playing_index: self.queue.playing_index,
             repeat_mode: self.queue.repeat_mode.clone(),
             shuffle_mode: self.queue.shuffle_mode.clone(),
+            queue_updated_unix_ms: self.queue.updated_unix_ms,
             waiting: self.waiting.as_ref().map(|w| PersistWaiting {
                 pending: w.pending.iter().copied().collect(),
                 resume_playing: w.resume_playing,
@@ -793,6 +809,7 @@ impl GroupState {
         self.queue.playing_index = ps.playing_index;
         self.queue.repeat_mode = ps.repeat_mode;
         self.queue.shuffle_mode = ps.shuffle_mode;
+        self.queue.updated_unix_ms = ps.queue_updated_unix_ms;
         self.waiting = ps.waiting.map(|w| WaitingGate {
             pending: w.pending.into_iter().collect(),
             resume_playing: w.resume_playing,
@@ -852,6 +869,11 @@ struct PersistState {
     playing_index: usize,
     repeat_mode: String,
     shuffle_mode: String,
+    /// Preserve the queue's change-timestamp across a deploy/takeover so a
+    /// hydrated replica re-sends the SAME `LastUpdate` and clients don't
+    /// re-process the queue. `default` keeps older snapshots deserializable.
+    #[serde(default)]
+    queue_updated_unix_ms: u64,
     waiting: Option<PersistWaiting>,
     group_name: String,
 }
@@ -1927,6 +1949,65 @@ mod tests {
         assert!(
             saw_queue,
             "reconnect catch-up must still resend the PlayQueue"
+        );
+    }
+
+    /// Pull `last_update_unix_ms` from the next `PlayQueue` on `rx`.
+    async fn next_queue_ts(rx: &mut mpsc::Receiver<ServerMsg>) -> u64 {
+        loop {
+            match rx.recv().await.expect("expected a PlayQueue") {
+                ServerMsg::PlayQueue {
+                    last_update_unix_ms,
+                    ..
+                } => return last_update_unix_ms,
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_up_reuses_stable_queue_last_update() {
+        // jellyfin-web drops a PlayQueue whose LastUpdate is `<=` the one it
+        // already applied. So a catch-up re-send of the SAME queue must carry
+        // the SAME timestamp — otherwise the client re-processes it and restarts
+        // playback (the "no active player" loop). A REAL queue change must bump.
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["ep1".into(), "ep2".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let t_queue = next_queue_ts(&mut leader_rx).await;
+        assert!(
+            t_queue > 0,
+            "a real queue change stamps a nonzero timestamp"
+        );
+
+        // A reconnecting member's catch-up must reuse that exact timestamp.
+        let (gf, mut gf_rx) = add_member(&h, &sinks, "gf").await;
+        let _ = snapshot_of(&h).await;
+        while gf_rx.try_recv().is_ok() {}
+        h.tx.send(GroupMsg::ResyncMember { member_id: gf })
+            .await
+            .unwrap();
+        let t_catch_up = next_queue_ts(&mut gf_rx).await;
+        assert_eq!(
+            t_catch_up, t_queue,
+            "catch-up must reuse the queue's timestamp, not stamp a fresh one"
+        );
+
+        // A genuine change (advance the cursor) must produce a STRICTLY newer
+        // timestamp so the client does apply it.
+        h.tx.send(GroupMsg::NextItem { sender: leader })
+            .await
+            .unwrap();
+        let t_next = next_queue_ts(&mut leader_rx).await;
+        assert!(
+            t_next > t_queue,
+            "a real queue change must bump the timestamp ({t_next} > {t_queue})"
         );
     }
 }

@@ -183,6 +183,13 @@ pub enum ServerMsg {
         is_playing: bool,
         repeat_mode: String,
         shuffle_mode: String,
+        /// Wall-clock (unix ms) of the last real queue CHANGE — NOT the moment
+        /// this message was built. jellyfin-web's QueueCore drops a PlayQueue
+        /// whose `LastUpdate` is `<=` the one it already applied, so a catch-up
+        /// re-send of the same queue MUST carry the same value or the client
+        /// re-processes it (restarting playback → "no active player"). Bumped
+        /// only when the queue actually changes; reused verbatim on catch-up.
+        last_update_unix_ms: u64,
     },
     Error {
         code: ErrorCode,
