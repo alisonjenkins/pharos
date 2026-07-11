@@ -38,6 +38,16 @@ pub enum ImageCacheError {
     UnsupportedKind,
     #[error("image role requires upload")]
     UploadOnly,
+    /// The source genuinely carries no extractable image for this role —
+    /// e.g. an audio file with no embedded cover art. Distinct from a
+    /// transient [`Ffmpeg`]/[`Io`] failure: it's a permanent "there is
+    /// nothing here", so the caller negatively-caches it and never re-runs
+    /// ffmpeg for the same key.
+    ///
+    /// [`Ffmpeg`]: ImageCacheError::Ffmpeg
+    /// [`Io`]: ImageCacheError::Io
+    #[error("source has no extractable image for this role")]
+    NoContent,
 }
 
 /// Jellyfin's `ImageType` enum subset that pharos materialises on
@@ -110,6 +120,13 @@ pub fn image_path(root: &Path, role: ImageRole, kind: MediaKind, id: u64, index:
         format!("{id}-{index}.jpg")
     };
     root.join(role.as_dir()).join(media).join(file)
+}
+
+/// Path of the negative-cache marker for a given image slot: an empty sentinel
+/// written beside the (never-created) image when the source proved to have no
+/// extractable content, so subsequent fetches skip the doomed ffmpeg run.
+fn noart_sentinel(out_path: &Path) -> PathBuf {
+    out_path.with_extension("noart")
 }
 
 impl ImageCache {
@@ -189,11 +206,30 @@ impl ImageCache {
         if !role.is_extractable() {
             return Err(ImageCacheError::UploadOnly);
         }
+        // Negative cache: a prior extract proved this source has no image for
+        // this role (e.g. a coverless audio file). Short-circuit to NoContent
+        // without re-spawning ffmpeg — jellyfin-web re-requests these on every
+        // library-grid render, and a storm of doomed extracts loads the libav
+        // pool + spams the log.
+        let noart_path = noart_sentinel(&out_path);
+        if tokio::fs::try_exists(&noart_path).await.unwrap_or(false) {
+            return Err(ImageCacheError::NoContent);
+        }
         if let Some(parent) = out_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp_path = out_path.with_extension("jpg.tmp");
-        self.extract(source, kind, role, &tmp_path).await?;
+        match self.extract(source, kind, role, &tmp_path).await {
+            Ok(()) => {}
+            Err(ImageCacheError::NoContent) => {
+                // Record the "nothing here" verdict so the next request skips
+                // ffmpeg entirely. Best-effort — a failed marker write just
+                // means we retry the (cheap-to-fail) extract next time.
+                let _ = tokio::fs::write(&noart_path, []).await;
+                return Err(ImageCacheError::NoContent);
+            }
+            Err(e) => return Err(e),
+        }
         tokio::fs::rename(&tmp_path, &out_path).await?;
         Ok(out_path)
     }
@@ -790,6 +826,14 @@ impl ImageCache {
         };
         let output = Command::new(&self.ffmpeg_bin).args(&args).output().await?;
         if !output.status.success() {
+            // Audio frame-extract (`-map 0:v?`) only fails because the file has
+            // no embedded cover-art stream ("Output file does not contain any
+            // stream") — a permanent NoContent the caller negatively-caches, not
+            // a transient error worth logging/retrying. Video failures stay
+            // surfaced as Ffmpeg errors.
+            if matches!(kind, MediaKind::Audio) {
+                return Err(ImageCacheError::NoContent);
+            }
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             return Err(ImageCacheError::Ffmpeg(output.status.code(), stderr));
         }
@@ -798,6 +842,9 @@ impl ImageCache {
         let meta = tokio::fs::metadata(out).await?;
         if meta.len() == 0 {
             let _ = tokio::fs::remove_file(out).await;
+            if matches!(kind, MediaKind::Audio) {
+                return Err(ImageCacheError::NoContent);
+            }
             return Err(ImageCacheError::Ffmpeg(Some(0), "no image written".into()));
         }
         Ok(())
@@ -886,6 +933,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, path);
+    }
+
+    #[tokio::test]
+    async fn noart_sentinel_short_circuits_without_spawning_ffmpeg() {
+        let td = tempfile::TempDir::new().unwrap();
+        // A bad ffmpeg bin: if fetch tried to extract, it'd fail with an Io
+        // (spawn) error — distinct from NoContent. So NoContent proves the
+        // sentinel short-circuited before any ffmpeg spawn.
+        let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
+        let out = image_path(td.path(), ImageRole::Primary, MediaKind::Audio, 7, 0);
+        tokio::fs::create_dir_all(out.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&noart_sentinel(&out), []).await.unwrap();
+        let res = cache
+            .fetch(
+                7,
+                ImageRole::Primary,
+                MediaKind::Audio,
+                Path::new("/coverless.mp3"),
+                0,
+            )
+            .await;
+        assert!(
+            matches!(res, Err(ImageCacheError::NoContent)),
+            "sentinel must short-circuit to NoContent, got {res:?}"
+        );
     }
 
     #[tokio::test]

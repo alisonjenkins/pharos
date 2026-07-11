@@ -271,6 +271,11 @@ async fn serve_image(
         // `UploadOnly` when no upload has happened — surface as 404
         // for the read endpoint, same as a missing file.
         Err(ImageCacheError::UploadOnly) => return Ok(HttpResponse::NotFound().body("")),
+        // Source genuinely has no image for this role (e.g. coverless audio).
+        // Expected + now negatively-cached, so 404 quietly — no warn, no repeat
+        // ffmpeg. Prevents the per-grid-render extract storm on cover-art-less
+        // music.
+        Err(ImageCacheError::NoContent) => return Ok(HttpResponse::NotFound().body("")),
         Err(e) => {
             tracing::warn!(
                 error = %e,
