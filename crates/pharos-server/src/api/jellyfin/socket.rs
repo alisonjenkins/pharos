@@ -591,17 +591,14 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
             };
             group_update(ctx, "PlayQueue", serde_json::to_value(update).ok()?)
         }
-        // Leadership is a pharos concept; stock jellyfin-web has no
-        // LeaderChanged GroupUpdateType, so this is a no-op there (phone/TV
-        // clients that model it still receive it).
-        ServerMsg::LeaderChange { leader } => Some(Outbound::new(
-            "SyncPlayGroupUpdate",
-            serde_json::json!({
-                "Type": "LeaderChanged",
-                "GroupId": ctx.group_id.map(|g| g.to_string()).unwrap_or_default(),
-                "LeaderId": leader.to_string(),
-            }),
-        )),
+        // Leadership is purely a pharos-engine concept. Jellyfin's SyncPlay is
+        // server-authoritative and has NO leader — no client (jellyfin-web,
+        // phone, or TV) implements a `LeaderChanged` GroupUpdateType, so every
+        // one of them logs `processGroupUpdate: command LeaderChanged not
+        // recognised` (a console.error) on receipt. It drives nothing client
+        // side, so don't emit it: keep the election internal and the client
+        // console clean.
+        ServerMsg::LeaderChange { .. } => None,
         ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => None,
     }
 }
