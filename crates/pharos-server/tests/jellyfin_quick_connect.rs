@@ -83,7 +83,10 @@ async fn initiate_response_includes_device_and_app_metadata() {
 }
 
 #[actix_web::test]
-async fn initiate_authorize_connect_full_flow_yields_access_token() {
+async fn full_flow_finalizes_at_authenticatewithquickconnect() {
+    // The real jellyfin-web two-endpoint exchange: poll /QuickConnect/Connect
+    // (read-only, echoes Secret) then finalize at
+    // /Users/AuthenticateWithQuickConnect with that Secret to get the token.
     let (state, admin_token) = seed_admin().await;
     let app = test::init_service(build_app(state)).await;
 
@@ -102,6 +105,15 @@ async fn initiate_authorize_connect_full_flow_yields_access_token() {
     assert_eq!(code.len(), 6);
     assert_eq!(v["Authenticated"], serde_json::Value::Bool(false));
 
+    // Finalize BEFORE authorize → 401 (not yet vouched for).
+    let req = test::TestRequest::post()
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(format!(r#"{{"Secret":"{secret}"}}"#))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401, "finalize before authorize must 401");
+
     // Step 2: Authorize (admin bearer).
     let req = test::TestRequest::post()
         .uri(&format!("/QuickConnect/Authorize?Code={code}"))
@@ -110,22 +122,50 @@ async fn initiate_authorize_connect_full_flow_yields_access_token() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
 
-    // Step 3: Connect — returns AccessToken now.
-    let req = test::TestRequest::get()
-        .uri(&format!("/QuickConnect/Connect?Secret={secret}"))
+    // Step 3: Connect poll — Authenticated:true, echoes Secret, NO token.
+    // Read-only: poll twice, both succeed (must not consume).
+    for _ in 0..2 {
+        let req = test::TestRequest::get()
+            .uri(&format!("/QuickConnect/Connect?Secret={secret}"))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Authenticated"], serde_json::Value::Bool(true));
+        assert_eq!(v["Secret"], secret, "Connect must echo Secret back");
+        assert!(
+            v.get("AccessToken").is_none() || v["AccessToken"].is_null(),
+            "Connect must not mint a token"
+        );
+    }
+
+    // Step 4: Finalize → AuthenticationResult with User.Id + AccessToken.
+    let req = test::TestRequest::post()
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(format!(r#"{{"Secret":"{secret}"}}"#))
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["Authenticated"], serde_json::Value::Bool(true));
     let tok = v["AccessToken"].as_str().unwrap();
     assert!(!tok.is_empty());
+    assert!(v["User"]["Id"].as_str().is_some(), "result carries User.Id");
 
-    // Second Connect returns 404 (one-shot consumed).
+    // The issued token actually authenticates.
     let req = test::TestRequest::get()
-        .uri(&format!("/QuickConnect/Connect?Secret={secret}"))
+        .uri("/Users/Me")
+        .insert_header(("X-Emby-Token", tok))
         .to_request();
     let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 200, "quick-connect token must authenticate");
+
+    // Step 5: finalize is one-shot — a second exchange of the same secret 401s.
+    let req = test::TestRequest::post()
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(format!(r#"{{"Secret":"{secret}"}}"#))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401, "secret must be single-use at finalize");
 }
 
 #[actix_web::test]

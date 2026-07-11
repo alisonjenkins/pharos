@@ -6,7 +6,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error::ErrorUnauthorized, web, HttpRequest, HttpResponse, Responder};
-use pharos_core::{AuthBackend, AuthError, PreferenceStore, SecretString, TokenStore};
+use pharos_core::{AuthBackend, AuthError, PreferenceStore, SecretString, TokenStore, UserStore};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -17,6 +17,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route(
         "/users/authenticatebyname",
         web::post().to(authenticate_by_name),
+    )
+    .route(
+        "/users/authenticatewithquickconnect",
+        web::post().to(authenticate_with_quick_connect),
     )
     .route("/users/me", web::get().to(me))
     .route("/users/public", web::get().to(public_users))
@@ -160,10 +164,13 @@ struct ConnectQuery {
     secret: String,
 }
 
-/// `/QuickConnect/Connect?Secret=…` — poll endpoint. Returns the
-/// pending request's current state. Once `Authenticated:true`, the
-/// response carries an `AccessToken` and the pending record is
-/// consumed (one-shot).
+/// `/QuickConnect/Connect?Secret=…` — poll endpoint (Jellyfin's
+/// `QuickConnectResult`). READ-ONLY: returns the pending request's current
+/// state, echoing back `Secret` so the client can hand it to the finalize
+/// call. No token is minted here — jellyfin-web polls this until
+/// `Authenticated:true`, then exchanges the secret at
+/// `/Users/AuthenticateWithQuickConnect` (which is where the record is
+/// consumed and the AccessToken issued).
 async fn quick_connect_connect(
     state: web::Data<AppState>,
     q: web::Query<ConnectQuery>,
@@ -189,23 +196,13 @@ async fn quick_connect_connect(
     let Some(entry) = entry else {
         return Err(actix_web::error::ErrorNotFound("unknown or expired secret"));
     };
-    let Some(by) = entry.authorized_by else {
-        // Not yet authorized — client keeps polling.
-        return Ok(HttpResponse::Ok().json(serde_json::json!({
-            "Code": entry.code,
-            "DeviceId": entry.device_id,
-            "Authenticated": false,
-        })));
-    };
-    // Authorized — mint an AccessToken against the authorizing user.
-    let token = crate::quick_connect::issue_token(&state.stores, by, &entry.device_id)
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+    // `Secret` MUST be echoed: jellyfin-web's login loop passes `data.Secret`
+    // (this response's field, not the one it kept) to the finalize call.
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "Code": entry.code,
+        "Secret": entry.secret,
         "DeviceId": entry.device_id,
-        "Authenticated": true,
-        "AccessToken": token,
+        "Authenticated": entry.authorized_by.is_some(),
     })))
 }
 
@@ -268,6 +265,91 @@ async fn authenticate_by_name(
             user_id: user_id_str.clone(),
             user_name: user.name.clone(),
             device_id,
+            device_name: auth.device_label(),
+            client: auth.client_label(),
+            application_version: auth.version_label(),
+            server_id: state.server_id.clone(),
+        },
+        user: UserDto::from_domain(&user, &state.server_id),
+        access_token: token.0.expose().to_string(),
+        server_id: state.server_id.clone(),
+    };
+    Ok(HttpResponse::Ok().json(result))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct QuickConnectDto {
+    #[serde(default)]
+    secret: String,
+}
+
+/// `POST /Users/AuthenticateWithQuickConnect` — the finalize step of the
+/// Quick Connect flow. UNAUTHENTICATED: the `Secret` in the body IS the
+/// credential (the user already vouched for it via `/QuickConnect/Authorize`
+/// on a signed-in device). Consumes the authorized pending request, issues an
+/// AccessToken against the authorizing user, and returns the same
+/// `AuthenticationResult` shape as `/Users/AuthenticateByName` — which is what
+/// jellyfin-web reads for `result.User.Id` + `result.AccessToken`.
+async fn authenticate_with_quick_connect(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<QuickConnectDto>,
+) -> Result<impl Responder, actix_web::Error> {
+    let secret = body.into_inner().secret;
+    if secret.trim().is_empty() {
+        return Err(actix_web::error::ErrorBadRequest("Secret required"));
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    state
+        .quick_connect
+        .tx
+        .send(crate::quick_connect::QcMsg::Consume {
+            secret,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let entry = reply_rx
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    // None = unknown/expired secret OR not yet authorized. Either way the
+    // caller isn't cleared to log in.
+    let Some(entry) = entry else {
+        return Err(ErrorUnauthorized("quick connect not authorized"));
+    };
+    let by = entry.authorized_by.ok_or_else(|| {
+        actix_web::error::ErrorInternalServerError("consumed entry lacks authorizer")
+    })?;
+
+    // Resolve the authorizing user (same path the auth extractor uses).
+    let user = state
+        .stores
+        .get(by)
+        .await
+        .map_err(|e| ErrorUnauthorized(format!("authorizing user unavailable: {e}")))?
+        .into_user();
+
+    let token = state
+        .stores
+        .issue(by, &entry.device_id)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+
+    let auth = auth_header_from_request(&req);
+    let user_id_str = user.id.0.simple().to_string();
+    state.record_activity(
+        &format!("{} logged in via Quick Connect", user.name),
+        "SessionStarted",
+        Some(&user_id_str),
+        auth.client.as_deref(),
+    );
+    let result = AuthenticationResultDto {
+        session_info: SessionInfoDto {
+            id: Uuid::new_v4().simple().to_string(),
+            user_id: user_id_str.clone(),
+            user_name: user.name.clone(),
+            device_id: entry.device_id.clone(),
             device_name: auth.device_label(),
             client: auth.client_label(),
             application_version: auth.version_label(),

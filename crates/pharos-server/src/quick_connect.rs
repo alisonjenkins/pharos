@@ -8,17 +8,22 @@
 //!    endpoint in jellyfin-web; pharos gates on any authenticated
 //!    user — a non-admin can vouch only for themselves). This marks
 //!    the pending request as authorized + records the bearer's user_id.
-//! 3. Client polls `/QuickConnect/Connect?Secret=…`. While
-//!    `Authenticated:false` they keep polling; once `true`, the
-//!    response carries the `AccessToken` issued via `TokenStore::issue`
-//!    against the authorizing user. The pending request is then
-//!    consumed (one-shot).
+//! 3. Client polls `/QuickConnect/Connect?Secret=…` (READ-ONLY). While
+//!    `Authenticated:false` they keep polling; once `true`, the response
+//!    echoes the `Secret` back but mints no token — the poll never
+//!    consumes the request.
+//! 4. Client finalizes at `POST /Users/AuthenticateWithQuickConnect`
+//!    with `{Secret}` (see `api::jellyfin::users`). That step consumes
+//!    the authorized request (one-shot, via [`QcMsg::Consume`]) and
+//!    issues the `AccessToken` against the authorizing user. This split
+//!    mirrors jellyfin-web, which polls Connect then calls
+//!    `apiClient.quickConnect(secret)` → AuthenticateWithQuickConnect.
 //!
 //! State lives in an in-memory `QuickConnectRegistry` actor (no DB
 //! persistence — pending requests die with the process; that's fine
 //! because the TTL is short and the user just retries).
 
-use pharos_core::{TokenStore, UserId};
+use pharos_core::UserId;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -53,7 +58,18 @@ pub enum QcMsg {
         by: UserId,
         reply: oneshot::Sender<bool>,
     },
+    /// Poll for a pending request's state. READ-ONLY — never consumes the
+    /// entry: jellyfin-web polls this every 5s and, once `Authenticated`,
+    /// finalizes via a SEPARATE `/Users/AuthenticateWithQuickConnect` call
+    /// which is where one-shot consumption happens ([`QcMsg::Consume`]).
     Connect {
+        secret: String,
+        reply: oneshot::Sender<Option<PendingRequest>>,
+    },
+    /// Finalize: return + REMOVE the pending request, but only if it has been
+    /// authorized (single-shot exchange). An unauthorized/unknown secret
+    /// yields `None` and leaves any entry in place (client keeps polling).
+    Consume {
         secret: String,
         reply: oneshot::Sender<Option<PendingRequest>>,
     },
@@ -96,15 +112,23 @@ impl QuickConnectRegistry {
                         let _ = reply.send(ok);
                     }
                     QcMsg::Connect { secret, reply } => {
-                        let result = by_secret.get(&secret).cloned();
-                        // If the request is now authorized + we've
-                        // surfaced the user id, consume it so it can't
-                        // be reused (V8 — single-shot exchange).
+                        // Read-only poll: jellyfin-web reads `Authenticated`
+                        // here but finalizes via /Users/AuthenticateWithQuick
+                        // Connect (QcMsg::Consume), so the entry MUST survive
+                        // this call — consuming here would delete the record
+                        // before the finalize could find it.
+                        let _ = reply.send(by_secret.get(&secret).cloned());
+                    }
+                    QcMsg::Consume { secret, reply } => {
+                        // Single-shot: hand back + remove the record only once
+                        // it's authorized. Unauthorized/unknown → None, entry
+                        // left in place so the client can keep polling.
+                        let result = by_secret
+                            .get(&secret)
+                            .and_then(|e| e.authorized_by.is_some().then(|| e.clone()));
                         if let Some(ref entry) = result {
-                            if entry.authorized_by.is_some() {
-                                by_secret.remove(&secret);
-                                by_code.remove(&entry.code);
-                            }
+                            by_secret.remove(&secret);
+                            by_code.remove(&entry.code);
                         }
                         let _ = reply.send(result);
                     }
@@ -182,20 +206,6 @@ fn generate_secret() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// Helper for handlers — issues an `AccessToken` against `user`'s
-/// account once Connect resolves with an authorized pending request.
-pub async fn issue_token<T: TokenStore>(
-    tokens: &T,
-    user: UserId,
-    device_id: &str,
-) -> Result<String, String> {
-    let t = tokens
-        .issue(user, device_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(t.0.expose().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -243,29 +253,83 @@ mod tests {
             .unwrap();
         assert!(rx.await.unwrap(), "authorize should succeed");
 
-        // Connect after authorize → consumes the entry.
+        // Connect after authorize → reports authorized but is READ-ONLY:
+        // the client polls this repeatedly, so it must not consume.
+        for _ in 0..2 {
+            let (tx, rx) = oneshot::channel();
+            reg.tx
+                .send(QcMsg::Connect {
+                    secret: entry.secret.clone(),
+                    reply: tx,
+                })
+                .await
+                .unwrap();
+            let resolved = rx.await.unwrap().unwrap();
+            assert_eq!(resolved.authorized_by, Some(by));
+        }
+
+        // Consume (the /Users/AuthenticateWithQuickConnect step) resolves the
+        // authorized request once, then it's gone (single-shot exchange).
         let (tx, rx) = oneshot::channel();
         reg.tx
-            .send(QcMsg::Connect {
+            .send(QcMsg::Consume {
                 secret: entry.secret.clone(),
                 reply: tx,
             })
             .await
             .unwrap();
-        let resolved = rx.await.unwrap().unwrap();
-        assert_eq!(resolved.authorized_by, Some(by));
+        assert_eq!(rx.await.unwrap().unwrap().authorized_by, Some(by));
 
-        // Subsequent connect with the same secret returns None
-        // (one-shot consumption).
+        // Second consume with the same secret → None (already spent).
         let (tx, rx) = oneshot::channel();
         reg.tx
-            .send(QcMsg::Connect {
+            .send(QcMsg::Consume {
                 secret: entry.secret.clone(),
                 reply: tx,
             })
             .await
             .unwrap();
         assert!(rx.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn consume_before_authorize_returns_none_and_keeps_entry() {
+        let reg = QuickConnectRegistry::spawn();
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Initiate {
+                device_id: "dev-1".into(),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        let entry = rx.await.unwrap();
+
+        // Not yet authorized → Consume yields None and must NOT delete the
+        // entry (the client is still polling / about to be authorized).
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Consume {
+                secret: entry.secret.clone(),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        assert!(rx.await.unwrap().is_none());
+
+        // Still there: a Connect poll finds it.
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Connect {
+                secret: entry.secret.clone(),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            rx.await.unwrap().is_some(),
+            "unauthorized Consume must not delete the entry"
+        );
     }
 
     #[tokio::test]
