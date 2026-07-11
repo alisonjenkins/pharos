@@ -150,6 +150,12 @@ pub enum ServerMsg {
     },
     Pause {
         at_server_ms: u64,
+        /// The frozen position the group paused at. REQUIRED on the wire:
+        /// jellyfin-web's `schedulePause` seeks to the command's
+        /// PositionTicks after pausing — a `Pause` without a position makes
+        /// the client seek to 0:00 and desync permanently (drift correction
+        /// is off by default in 10.11.8).
+        position_ms: u64,
     },
     Seek {
         at_server_ms: u64,

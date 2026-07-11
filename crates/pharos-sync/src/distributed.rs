@@ -137,6 +137,9 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::SetRepeatMode { sender, mode } => RemoteCommand::SetRepeatMode { sender, mode },
         GroupMsg::SetShuffleMode { sender, mode } => RemoteCommand::SetShuffleMode { sender, mode },
         GroupMsg::SetGroupName { name } => RemoteCommand::SetGroupName { name },
+        GroupMsg::SetIgnoreWait { member_id, ignore } => {
+            RemoteCommand::SetIgnoreWait { member_id, ignore }
+        }
         // Answered locally on the remote replica, never forwarded.
         GroupMsg::AddMember { .. } | GroupMsg::Snapshot { .. } => return None,
     })

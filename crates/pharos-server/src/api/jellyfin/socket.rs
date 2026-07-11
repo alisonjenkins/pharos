@@ -525,7 +525,13 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
             at_server_ms,
             position_ms,
         } => command(ctx, "Unpause", at_server_ms, Some(position_ms)),
-        ServerMsg::Pause { at_server_ms } => command(ctx, "Pause", at_server_ms, None),
+        // Pause MUST carry PositionTicks: jellyfin-web's schedulePause seeks
+        // to the command's position after pausing, so a missing value seeks
+        // the client to 0:00.
+        ServerMsg::Pause {
+            at_server_ms,
+            position_ms,
+        } => command(ctx, "Pause", at_server_ms, Some(position_ms)),
         ServerMsg::Seek {
             at_server_ms,
             position_ms,
@@ -729,6 +735,30 @@ fn is_playstate_command(cmd: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translate_pause_carries_position_ticks() {
+        // jellyfin-web's schedulePause seeks to the command's PositionTicks;
+        // a Pause without one seeks the client to 0:00.
+        let ctx = TranslateCtx {
+            group_id: None,
+            epoch_unix_ms: 0,
+            current_pli: Some("pli-1"),
+        };
+        let out = translate_outbound(
+            ServerMsg::Pause {
+                at_server_ms: 1_000,
+                position_ms: 654_321,
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(out.message_type, "SyncPlayCommand");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["Command"], "Pause");
+        assert_eq!(v["Data"]["PositionTicks"], 654_321u64 * 10_000);
+    }
 
     #[test]
     fn translate_library_changed_emits_libchanged_outbound() {

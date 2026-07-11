@@ -134,8 +134,10 @@ async fn late_joiner_receives_current_play_state() {
     }
 }
 
-/// V19 — late joiner who finds the group paused receives a Seek (to
-/// the freeze position) followed by Pause.
+/// V19 — late joiner who finds the group paused receives a Pause carrying
+/// the freeze position (jellyfin-web's schedulePause seeks to the command's
+/// PositionTicks, so one positioned Pause replaces the old Seek+Pause pair —
+/// and survives the client's single-slot pre-time-sync command queue).
 #[tokio::test]
 async fn late_joiner_receives_pause_state_when_group_paused() {
     let (h, sinks) = spawn_group();
@@ -153,17 +155,19 @@ async fn late_joiner_receives_pause_state_when_group_paused() {
     drain(&mut leader_rx).await;
 
     let (_late, mut late_rx) = add_member(&h, &sinks, "late").await;
-    // Should see at least one Seek followed by Pause.
-    let seek = wait_for(&mut late_rx, Duration::from_millis(500), |m| {
-        matches!(m, ServerMsg::Seek { .. })
-    })
-    .await;
-    assert!(seek.is_some(), "expected Seek for paused late joiner");
+    // Should see a Pause carrying the freeze position (~10s + the 20ms of
+    // play time before the pause).
     let pause = wait_for(&mut late_rx, Duration::from_millis(500), |m| {
         matches!(m, ServerMsg::Pause { .. })
     })
     .await;
-    assert!(pause.is_some(), "expected Pause for paused late joiner");
+    match pause {
+        Some(ServerMsg::Pause { position_ms, .. }) => assert!(
+            (10_000..10_500).contains(&position_ms),
+            "Pause must carry the freeze position (~10000ms), got {position_ms}"
+        ),
+        other => panic!("expected Pause for paused late joiner, got {other:?}"),
+    }
 }
 
 /// V19 — a wedged member with a full sink must not block broadcasts

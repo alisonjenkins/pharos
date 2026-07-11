@@ -120,7 +120,13 @@ mod tests {
         let (tx, mut rx) = ch();
         let mid = MemberId::new();
         sinks.insert(mid, tx);
-        d.deliver(mid, ServerMsg::Pause { at_server_ms: 5 });
+        d.deliver(
+            mid,
+            ServerMsg::Pause {
+                at_server_ms: 5,
+                position_ms: 0,
+            },
+        );
         assert!(matches!(rx.recv().await.unwrap(), ServerMsg::Pause { .. }));
     }
 
@@ -129,7 +135,13 @@ mod tests {
         let sinks = MemberSinks::new();
         let d = LocalDelivery::new(sinks.clone());
         // No sink registered — must not panic, just drop.
-        d.deliver(MemberId::new(), ServerMsg::Pause { at_server_ms: 5 });
+        d.deliver(
+            MemberId::new(),
+            ServerMsg::Pause {
+                at_server_ms: 5,
+                position_ms: 0,
+            },
+        );
     }
 
     #[tokio::test]
@@ -140,7 +152,13 @@ mod tests {
         let mid = MemberId::new();
         sinks.insert(mid, tx);
         sinks.remove(mid);
-        d.deliver(mid, ServerMsg::Pause { at_server_ms: 1 });
+        d.deliver(
+            mid,
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 0,
+            },
+        );
         assert!(rx.try_recv().is_err(), "removed sink receives nothing");
     }
 
@@ -154,7 +172,13 @@ mod tests {
         // Reconnect: same member, fresh sink.
         let (tx2, mut rx2) = ch();
         sinks.insert(mid, tx2);
-        d.deliver(mid, ServerMsg::Pause { at_server_ms: 1 });
+        d.deliver(
+            mid,
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 0,
+            },
+        );
         assert!(rx1.try_recv().is_err(), "stale sink must not receive");
         assert!(matches!(rx2.recv().await.unwrap(), ServerMsg::Pause { .. }));
     }

@@ -150,6 +150,14 @@ pub enum GroupMsg {
     SetGroupName {
         name: String,
     },
+    /// Jellyfin HTTP `/SyncPlay/SetIgnoreWait` — the client asks to be
+    /// excluded from (or re-included in) group waits. jellyfin-web posts
+    /// `true` when it halts its own playback (player never started within its
+    /// 30s budget) and `false` when it re-follows group playback.
+    SetIgnoreWait {
+        member_id: MemberId,
+        ignore: bool,
+    },
     /// A member's `/socket` reconnected (its fresh sink is already swapped into
     /// the per-replica `MemberSinks`; the member persists across socket churn).
     /// Re-sends the catch-up so the reconnected client immediately re-syncs to
@@ -244,6 +252,10 @@ pub enum RemoteCommand {
     },
     SetGroupName {
         name: String,
+    },
+    SetIgnoreWait {
+        member_id: MemberId,
+        ignore: bool,
     },
 }
 
@@ -343,6 +355,9 @@ impl RemoteCommand {
                 GroupMsg::SetShuffleMode { sender, mode }
             }
             RemoteCommand::SetGroupName { name } => GroupMsg::SetGroupName { name },
+            RemoteCommand::SetIgnoreWait { member_id, ignore } => {
+                GroupMsg::SetIgnoreWait { member_id, ignore }
+            }
         }
     }
 }
@@ -372,6 +387,11 @@ struct MemberRec {
     name: String,
     offset: ClockOffset,
     buffering: bool,
+    /// Jellyfin `/SyncPlay/SetIgnoreWait` — the client halted its own playback
+    /// (e.g. its player never started) and asked to be left out of group
+    /// waits. Excluded from every readiness-gate pending set until it posts
+    /// `IgnoreWait: false` (or a `Ready`, which implies it re-followed).
+    ignore_wait: bool,
 }
 
 /// One entry in the group's play queue.
@@ -573,17 +593,15 @@ impl GroupState {
                 );
             }
             PlaybackState::Paused { position_ms } => {
-                self.send_one(
-                    member_id,
-                    ServerMsg::Seek {
-                        at_server_ms: server_ms + MIN_LEAD_MS,
-                        position_ms,
-                    },
-                );
+                // A single Pause suffices: jellyfin-web's schedulePause seeks
+                // to the command's PositionTicks after pausing. (This also
+                // survives the client's pre-time-sync queue, which keeps only
+                // the LAST queued command.)
                 self.send_one(
                     member_id,
                     ServerMsg::Pause {
                         at_server_ms: server_ms + MIN_LEAD_MS,
+                        position_ms,
                     },
                 );
             }
@@ -609,12 +627,65 @@ impl GroupState {
         });
     }
 
-    /// Open the readiness gate: enter `Waiting`, await every member's `Ready`.
-    /// The group starts (or re-pauses) only once the gate resolves.
-    fn enter_waiting(&mut self, resume_playing: bool, position_ms: u64, reason: &str) {
-        let pending: HashSet<MemberId> = self.members.keys().copied().collect();
+    /// The members a readiness gate may wait on: everyone not opted out via
+    /// `SetIgnoreWait` (a halted client never posts `Ready`, so waiting on it
+    /// only ever runs the gate into the anti-wedge timeout).
+    fn follower_ids(&self) -> HashSet<MemberId> {
+        self.members
+            .iter()
+            .filter(|(_, m)| !m.ignore_wait)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Freeze playback into `Paused` at the current live position and return
+    /// it (Idle stays Idle at 0). The value every outbound `Pause` must carry —
+    /// jellyfin-web's `schedulePause` seeks to the command's PositionTicks, so
+    /// a missing position seeks the client to 0:00.
+    fn freeze_paused_position(&mut self) -> u64 {
+        let position_ms = self.current_position_ms();
+        if !matches!(self.playback, PlaybackState::Idle) {
+            self.playback = PlaybackState::Paused { position_ms };
+        }
+        position_ms
+    }
+
+    /// Start group playback NOW: anchor `Playing` and broadcast the scheduled
+    /// `Play` + `StateUpdate`. `reason` must be one of jellyfin-web's OSD
+    /// strings ('Unpause' / 'Ready' — matched case-sensitively).
+    fn start_playing(&mut self, position_ms: u64, reason: &str) {
+        let server_ms = self.server_ms_now();
+        self.playback = PlaybackState::Playing {
+            position_ms,
+            anchor_server_ms: server_ms,
+        };
+        self.group_paused_due_to_buffering = false;
+        self.broadcast(ServerMsg::Play {
+            at_server_ms: server_ms + self.lead_time_ms(),
+            position_ms,
+        });
+        self.broadcast(ServerMsg::StateUpdate {
+            state: GroupPlayState::Playing,
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Open the readiness gate: enter `Waiting` until every member in
+    /// `pending` reports `Ready` (or the anti-wedge deadline fires), then
+    /// start (or re-pause) the group. `pending` must only contain members
+    /// that WILL post a `Ready` — i.e. players about to load/buffer something
+    /// (a queue change or a just-broadcast Seek). jellyfin-web only posts
+    /// `Ready` on a player transition, so gating on an idle paused player
+    /// deadlocks until the timeout.
+    fn enter_waiting(
+        &mut self,
+        pending: HashSet<MemberId>,
+        resume_playing: bool,
+        position_ms: u64,
+        reason: &str,
+    ) {
         // An empty group can't resolve a gate; nothing to wait on.
-        if pending.is_empty() {
+        if self.members.is_empty() {
             return;
         }
         self.waiting = Some(WaitingGate {
@@ -624,45 +695,37 @@ impl GroupState {
             deadline: tokio::time::Instant::now()
                 + std::time::Duration::from_millis(READY_TIMEOUT_MS),
         });
+        // Nobody to wait on (e.g. every member opted out of waits): resolve
+        // straight away — no Waiting broadcast, no timeout detour.
+        if self.waiting.as_ref().is_some_and(|w| w.pending.is_empty()) {
+            self.resolve_waiting();
+            return;
+        }
         self.broadcast(ServerMsg::StateUpdate {
             state: GroupPlayState::Waiting,
             reason: reason.to_string(),
         });
     }
 
-    /// Resolve the readiness gate: schedule the pending `Play`/`Pause` for a
-    /// common future instant and broadcast it. Called when the last member
-    /// reports `Ready`, or when the anti-wedge timeout fires.
+    /// Resolve the readiness gate: schedule the pending `Play` (or settle
+    /// `Paused`) and broadcast it. Called when the last member reports
+    /// `Ready`, or when the anti-wedge timeout fires.
     fn resolve_waiting(&mut self) {
         let Some(w) = self.waiting.take() else {
             return;
         };
-        let server_ms = self.server_ms_now();
-        let at_server_ms = server_ms + self.lead_time_ms();
         if w.resume_playing {
-            self.playback = PlaybackState::Playing {
-                position_ms: w.position_ms,
-                anchor_server_ms: server_ms,
-            };
-            self.broadcast(ServerMsg::Play {
-                at_server_ms,
-                position_ms: w.position_ms,
-            });
-            self.broadcast(ServerMsg::StateUpdate {
-                state: GroupPlayState::Playing,
-                reason: "ready".into(),
-            });
+            self.start_playing(w.position_ms, "Ready");
         } else {
+            // The members already applied the Seek broadcast at gate entry and
+            // sit paused at the position — re-sending it would re-trigger their
+            // seek→Ready cycle. Just settle the group state.
             self.playback = PlaybackState::Paused {
                 position_ms: w.position_ms,
             };
-            self.broadcast(ServerMsg::Seek {
-                at_server_ms,
-                position_ms: w.position_ms,
-            });
             self.broadcast(ServerMsg::StateUpdate {
                 state: GroupPlayState::Paused,
-                reason: "ready".into(),
+                reason: "Ready".into(),
             });
         }
     }
@@ -738,6 +801,7 @@ impl GroupState {
                 .map(|(id, m)| PersistMember {
                     id: *id,
                     name: m.name.clone(),
+                    ignore_wait: m.ignore_wait,
                 })
                 .collect(),
             leader: self.leader,
@@ -790,6 +854,7 @@ impl GroupState {
                         name: m.name,
                         offset: ClockOffset::default(),
                         buffering: false,
+                        ignore_wait: m.ignore_wait,
                     },
                 )
             })
@@ -841,6 +906,9 @@ impl GroupState {
 struct PersistMember {
     id: MemberId,
     name: String,
+    /// `default` keeps older snapshots deserializable.
+    #[serde(default)]
+    ignore_wait: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1023,6 +1091,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     name: name.clone(),
                     offset: ClockOffset::default(),
                     buffering: false,
+                    ignore_wait: false,
                 },
             );
             if was_empty {
@@ -1142,21 +1211,14 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 );
                 return;
             }
-            let server_ms = state.server_ms_now();
-            let at_server_ms = server_ms + state.lead_time_ms();
+            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
             // Freeze position at the moment we paused so late joiners
             // get the correct still-frame.
-            if let PlaybackState::Playing {
+            let position_ms = state.freeze_paused_position();
+            state.broadcast(ServerMsg::Pause {
+                at_server_ms,
                 position_ms,
-                anchor_server_ms,
-            } = state.playback
-            {
-                let elapsed = server_ms.saturating_sub(anchor_server_ms);
-                state.playback = PlaybackState::Paused {
-                    position_ms: position_ms + elapsed,
-                };
-            }
-            state.broadcast(ServerMsg::Pause { at_server_ms });
+            });
         }
         GroupMsg::LeaderSeek {
             sender,
@@ -1210,25 +1272,18 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // to another member's buffering, do nothing.
             if !state.group_paused_due_to_buffering && state.members.values().any(|m| m.buffering) {
                 state.group_paused_due_to_buffering = true;
-                let server_ms = state.server_ms_now();
+                let at_server_ms = state.server_ms_now() + MIN_LEAD_MS;
                 // Freeze playback state too, the same way LeaderPause does.
                 // Without this, `playback` stays `Playing` for the whole
                 // buffering window, so a member joining during the window
                 // hits the late-joiner catch-up and is told to *Play* —
                 // desynced from everyone else who is paused. (V19 buffer
                 // isolation.)
-                if let PlaybackState::Playing {
+                let position_ms = state.freeze_paused_position();
+                state.broadcast(ServerMsg::Pause {
+                    at_server_ms,
                     position_ms,
-                    anchor_server_ms,
-                } = state.playback
-                {
-                    let elapsed = server_ms.saturating_sub(anchor_server_ms);
-                    state.playback = PlaybackState::Paused {
-                        position_ms: position_ms + elapsed,
-                    };
-                }
-                let at_server_ms = server_ms + MIN_LEAD_MS;
-                state.broadcast(ServerMsg::Pause { at_server_ms });
+                });
             }
         }
         GroupMsg::BufferingEnd { member_id } => {
@@ -1241,30 +1296,46 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
         }
         GroupMsg::Unpause { sender: _ } => {
+            // A gate is already open (queue load / seek in flight): it
+            // resolves on its members' Readys — do NOT replace it. (Replacing
+            // reset the anti-wedge deadline, so a user spamming Unpause used
+            // to extend the group's hang indefinitely.)
+            if state.waiting.is_some() {
+                return;
+            }
             let position_ms = state.current_position_ms();
-            state.enter_waiting(true, position_ms, "unpause");
+            // jellyfin-web only posts `Ready` on a player transition, so an
+            // already-buffered paused player never ACKs a withheld Unpause —
+            // gating here deadlocked until the anti-wedge fired (a guaranteed
+            // 30s hang on every resume, and the eventual play() landed
+            // outside the user's activation window → autoplay-blocked).
+            // Start immediately; gate only on members actually buffering.
+            let buffering: HashSet<MemberId> = state
+                .members
+                .iter()
+                .filter(|(_, m)| m.buffering && !m.ignore_wait)
+                .map(|(id, _)| *id)
+                .collect();
+            if buffering.is_empty() {
+                state.start_playing(position_ms, "Unpause");
+            } else {
+                state.enter_waiting(buffering, true, position_ms, "Unpause");
+            }
         }
         GroupMsg::PauseShared { sender: _ } => {
             // Immediate group pause (no readiness gate). Freeze the position so
             // a late joiner gets the correct still-frame, then broadcast.
-            let server_ms = state.server_ms_now();
-            let at_server_ms = server_ms + state.lead_time_ms();
+            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
             // Cancel any pending readiness gate — we're pausing, not starting.
             state.waiting = None;
-            if let PlaybackState::Playing {
+            let position_ms = state.freeze_paused_position();
+            state.broadcast(ServerMsg::Pause {
+                at_server_ms,
                 position_ms,
-                anchor_server_ms,
-            } = state.playback
-            {
-                let elapsed = server_ms.saturating_sub(anchor_server_ms);
-                state.playback = PlaybackState::Paused {
-                    position_ms: position_ms + elapsed,
-                };
-            }
-            state.broadcast(ServerMsg::Pause { at_server_ms });
+            });
             state.broadcast(ServerMsg::StateUpdate {
                 state: GroupPlayState::Paused,
-                reason: "pause".into(),
+                reason: "Pause".into(),
             });
         }
         GroupMsg::SeekTo {
@@ -1274,7 +1345,18 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // Preserve play/pause across a seek: a seek while playing resumes
             // playing (after re-buffer); while paused/idle it stays paused.
             let resume = matches!(state.playback, PlaybackState::Playing { .. });
-            state.enter_waiting(resume, position_ms, "seek");
+            // Deliver the Seek NOW: each client applies it (pause + seek +
+            // re-buffer) and ACKs with `Ready` (scheduleSeek's 'ready'
+            // handler). Withholding it until the gate resolved deadlocked —
+            // nobody can ACK a command they never received.
+            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
+            state.playback = PlaybackState::Paused { position_ms };
+            state.broadcast(ServerMsg::Seek {
+                at_server_ms,
+                position_ms,
+            });
+            let pending = state.follower_ids();
+            state.enter_waiting(pending, resume, position_ms, "Seek");
         }
         GroupMsg::MemberReady {
             member_id,
@@ -1282,6 +1364,9 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         } => {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = false;
+                // jellyfin-web re-follows group playback before posting Ready,
+                // so a Ready implies the member no longer wants ignoring.
+                rec.ignore_wait = false;
             }
             let resolved = if let Some(w) = state.waiting.as_mut() {
                 w.pending.remove(&member_id);
@@ -1293,11 +1378,31 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // player"). Heal it: replay the live playback state to just
                 // this member so a slow-to-start client still catches up
                 // instead of being stranded paused while everyone else plays.
-                state.send_playback_state(member_id);
+                // Only while Playing — a paused member is already settled, and
+                // healing it with another Pause would re-trigger its Ready
+                // (command loop).
+                if matches!(state.playback, PlaybackState::Playing { .. }) {
+                    state.send_playback_state(member_id);
+                }
                 false
             };
             if resolved {
                 state.resolve_waiting();
+            }
+        }
+        GroupMsg::SetIgnoreWait { member_id, ignore } => {
+            if let Some(rec) = state.members.get_mut(&member_id) {
+                rec.ignore_wait = ignore;
+            }
+            // A member opting out must release any gate it currently holds —
+            // it halted its playback and will never post the Ready.
+            if ignore {
+                if let Some(w) = state.waiting.as_mut() {
+                    w.pending.remove(&member_id);
+                    if w.pending.is_empty() {
+                        state.resolve_waiting();
+                    }
+                }
             }
         }
         GroupMsg::SetNewQueue {
@@ -1316,7 +1421,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.queue.playing_index =
                 playing_index.min(state.queue.items.len().saturating_sub(1));
             state.broadcast_play_queue("new_playlist", true, start_position_ms);
-            state.enter_waiting(true, start_position_ms, "new_playlist");
+            let pending = state.follower_ids();
+            state.enter_waiting(pending, true, start_position_ms, "Unpause");
         }
         GroupMsg::SetPlaylistItem {
             sender: _,
@@ -1330,21 +1436,24 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             {
                 state.queue.playing_index = idx;
                 state.broadcast_play_queue("set_current_item", true, 0);
-                state.enter_waiting(true, 0, "set_current_item");
+                let pending = state.follower_ids();
+                state.enter_waiting(pending, true, 0, "Unpause");
             }
         }
         GroupMsg::NextItem { sender: _ } => {
             if state.queue.playing_index + 1 < state.queue.items.len() {
                 state.queue.playing_index += 1;
                 state.broadcast_play_queue("next_item", true, 0);
-                state.enter_waiting(true, 0, "next_item");
+                let pending = state.follower_ids();
+                state.enter_waiting(pending, true, 0, "Unpause");
             }
         }
         GroupMsg::PreviousItem { sender: _ } => {
             if state.queue.playing_index > 0 {
                 state.queue.playing_index -= 1;
                 state.broadcast_play_queue("previous_item", true, 0);
-                state.enter_waiting(true, 0, "previous_item");
+                let pending = state.follower_ids();
+                state.enter_waiting(pending, true, 0, "Unpause");
             }
         }
         GroupMsg::SetRepeatMode { sender: _, mode } => {
@@ -1958,6 +2067,311 @@ mod tests {
         assert!(
             saw_queue,
             "reconnect catch-up must still resend the PlayQueue"
+        );
+    }
+
+    /// Receive until `f` matches or `budget` elapses. Returns the match.
+    async fn recv_matching(
+        rx: &mut mpsc::Receiver<ServerMsg>,
+        budget: Duration,
+        f: impl Fn(&ServerMsg) -> bool,
+    ) -> Option<ServerMsg> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(m)) if f(&m) => return Some(m),
+                Ok(Some(_)) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unpause_with_nobody_buffering_starts_immediately() {
+        // jellyfin-web only posts /SyncPlay/Ready on a player transition, so a
+        // paused idle player never ACKs a withheld Unpause. Gating here
+        // deadlocked until the 30s anti-wedge — a guaranteed hang on every
+        // resume. Unpause must broadcast Play immediately.
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::PauseShared { sender: leader })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::Unpause { sender: leader })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Both members get the Play right away — and NO Waiting state first.
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let mut saw_play = false;
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    ServerMsg::Play { position_ms, .. } => {
+                        assert!(position_ms >= 10_000);
+                        saw_play = true;
+                    }
+                    ServerMsg::StateUpdate { state, .. } => assert_ne!(
+                        state,
+                        GroupPlayState::Waiting,
+                        "unpause of a non-buffering group must not enter Waiting"
+                    ),
+                    _ => {}
+                }
+            }
+            assert!(saw_play, "unpause must broadcast Play immediately");
+        }
+    }
+
+    #[tokio::test]
+    async fn unpause_gates_only_on_buffering_members() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "slow").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        // m2 buffers → group pauses.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        // Unpause while m2 is still buffering → gate on m2 ONLY.
+        h.tx.send(GroupMsg::Unpause { sender: leader })
+            .await
+            .unwrap();
+        let waiting = recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+            matches!(
+                m,
+                ServerMsg::StateUpdate {
+                    state: GroupPlayState::Waiting,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(waiting.is_some(), "unpause with a buffering member gates");
+
+        // The leader never posts Ready (its player is idle-paused, no
+        // transition) — only m2's Ready must resolve the gate.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let play = recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "the buffering member's Ready alone must resolve the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn seek_broadcasts_seek_at_gate_entry_then_play_on_ready() {
+        // The Seek command must be DELIVERED when the gate opens — clients
+        // ACK it with Ready after re-buffering (scheduleSeek's 'ready'
+        // handler). Withholding it deadlocked the gate.
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::SeekTo {
+            sender: leader,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        // Both members receive the Seek immediately (gate still open).
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let seek = recv_matching(rx, Duration::from_millis(500), |m| {
+                matches!(
+                    m,
+                    ServerMsg::Seek {
+                        position_ms: 60_000,
+                        ..
+                    }
+                )
+            })
+            .await;
+            assert!(seek.is_some(), "Seek must be broadcast at gate entry");
+        }
+        // Both ACK → the gate resolves to Play (seek-while-playing resumes).
+        for mid in [leader, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 60_000,
+            })
+            .await
+            .unwrap();
+        }
+        let play = recv_matching(&mut m2_rx, Duration::from_millis(500), |m| {
+            matches!(
+                m,
+                ServerMsg::Play {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(play.is_some(), "all-Ready must resume playback at the seek");
+    }
+
+    #[tokio::test]
+    async fn ignore_wait_member_is_excluded_and_releases_open_gates() {
+        // A member that halted its playback (SetIgnoreWait true) must not
+        // hold any gate: excluded from new pending sets, and removed from an
+        // open gate (resolving it if it was the last holdout).
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "halted").await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["ep1".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        // Leader ACKs; the gate still waits on m2.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: leader,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+        // m2 halts → its pending slot is released → gate resolves now.
+        h.tx.send(GroupMsg::SetIgnoreWait {
+            member_id: m2,
+            ignore: true,
+        })
+        .await
+        .unwrap();
+        let play = recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "a halting member must release the gate it held"
+        );
+
+        // And the NEXT gate must not wait on the ignoring member at all.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: leader,
+            position_ms: 30_000,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: leader,
+            position_ms: 30_000,
+        })
+        .await
+        .unwrap();
+        let play = recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "gates must resolve without the ignore-wait member's Ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_broadcast_carries_the_frozen_position() {
+        // jellyfin-web's schedulePause seeks to the command's PositionTicks —
+        // a Pause without the frozen position seeks the client to 0:00 and
+        // permanently desyncs it (drift correction is off by default).
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_m2, _m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.tx.send(GroupMsg::PauseShared { sender: leader })
+            .await
+            .unwrap();
+        let pause = recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Pause { .. })
+        })
+        .await;
+        match pause {
+            Some(ServerMsg::Pause { position_ms, .. }) => assert!(
+                (10_000..10_500).contains(&position_ms),
+                "Pause must carry the freeze position, got {position_ms}"
+            ),
+            other => panic!("expected Pause, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_while_group_paused_sends_nothing() {
+        // The late-Ready heal must only fire while the group is Playing. A
+        // paused member is already settled; healing it with another Pause
+        // would re-trigger its Ready → an endless command loop.
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::PauseShared { sender: leader })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert!(
+            m2_rx.try_recv().is_err(),
+            "no heal commands while the group is paused"
         );
     }
 

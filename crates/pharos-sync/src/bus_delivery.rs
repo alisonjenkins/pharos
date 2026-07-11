@@ -142,13 +142,25 @@ mod tests {
 
         // Replica A: deliver to `member` (whose sink is on B).
         let delivery_a = BusDelivery::new(bus.clone(), MemberSinks::new());
-        delivery_a.deliver(member, ServerMsg::Pause { at_server_ms: 42 });
+        delivery_a.deliver(
+            member,
+            ServerMsg::Pause {
+                at_server_ms: 42,
+                position_ms: 0,
+            },
+        );
 
         let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("delivery must arrive")
             .expect("channel open");
-        assert!(matches!(got, ServerMsg::Pause { at_server_ms: 42 }));
+        assert!(matches!(
+            got,
+            ServerMsg::Pause {
+                at_server_ms: 42,
+                position_ms: 0
+            }
+        ));
     }
 
     #[tokio::test]
@@ -207,7 +219,13 @@ mod tests {
 
         let delivery = BusDelivery::new(bus.clone(), MemberSinks::new());
         // Deliver to some OTHER member id not registered here.
-        delivery.deliver(MemberId::new(), ServerMsg::Pause { at_server_ms: 1 });
+        delivery.deliver(
+            MemberId::new(),
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 0,
+            },
+        );
 
         // The local member must NOT receive it.
         tokio::time::sleep(Duration::from_millis(50)).await;
