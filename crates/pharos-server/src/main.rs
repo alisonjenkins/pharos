@@ -671,12 +671,18 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     if cfg.server.image_cache_max_bytes > 0 {
         if let Some(images) = state.images.clone() {
             let cap = cfg.server.image_cache_max_bytes;
+            // Phase B2 — only the bg-leader replica evicts, so two replicas
+            // don't fight over (and re-extract) the same shared cache tree.
+            let is_leader = state.is_bg_leader.clone();
             tokio::spawn(async move {
                 // Warm up, then sweep every 10 minutes.
                 tokio::time::sleep(std::time::Duration::from_secs(120)).await;
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
                 loop {
                     tick.tick().await;
+                    if !is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
                     images.enforce_cap(cap).await;
                 }
             });
@@ -700,6 +706,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
     let app_state = web::Data::new(state);
+
+    // Phase B2 — elect the background-work singleton. Under Postgres this
+    // holds an advisory lock so exactly one replica runs the DB-writing
+    // background loops during a rolling-deploy surge; the loops below gate on
+    // `is_bg_leader`. Under SQLite this wins immediately.
+    pharos_server::state::AppState::spawn_bg_leadership(app_state.clone().into_inner());
 
     // LIB-A9 — tiered library change-detection. Each media root picks the best
     // mode it can sustain (native watch on a local fs when the `watch` feature

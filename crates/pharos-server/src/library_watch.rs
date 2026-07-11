@@ -228,6 +228,15 @@ async fn run_scan_and_broadcast<P>(state: &AppState, root: &Path, scanner: &FsSc
 where
     P: Prober + Send + Sync + 'static,
 {
+    // Phase B2 — only the bg-leader replica runs automatic rescans, so a
+    // rolling-deploy surge doesn't double-scan the library (probing every
+    // file twice contends on shared-storage I/O). A follower that later wins
+    // leadership picks up at the next periodic tick. (Manual /Library/Refresh
+    // is a separate, user-triggered path and stays ungated.)
+    if !state.is_bg_leader() {
+        tracing::debug!(root = %root.display(), why, "skipping rescan; not bg-leader");
+        return;
+    }
     match scanner.scan_into(root, &state.stores).await {
         Ok(outcome) => {
             let touched = outcome.added.len() + outcome.updated.len() + outcome.removed.len();
@@ -301,6 +310,10 @@ pub fn spawn_subtitle_warm_all(state: web::Data<AppState>) {
     }
     tokio::spawn(async move {
         tokio::time::sleep(WARM_ALL_DELAY).await;
+        // Phase B2 — one bulk warm across the replica set; wait until we're
+        // the bg-leader (immediate under SQLite) so a deploy surge doesn't run
+        // two whole-library subtitle demuxes against shared storage at once.
+        state.wait_until_bg_leader().await;
         use pharos_core::MediaStore;
         let ids: Vec<u64> = match state.stores.list().await {
             Ok(items) => items

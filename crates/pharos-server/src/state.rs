@@ -189,6 +189,12 @@ pub struct AppState {
     /// stream's segment reads — then reopens to [`BG_IO_MAX`] once playback is
     /// quiet. This is what lets a full force-rescan run DURING playback.
     pub bg_io: Arc<tokio::sync::Semaphore>,
+    /// Phase B2 — true when this replica holds background-work leadership
+    /// (the Postgres advisory lock, or unconditionally under SQLite). The
+    /// DB-writing background loops (library rescan, trickplay/subtitle warm,
+    /// image janitor) gate on it so exactly one replica runs them during a
+    /// rolling-deploy surge. Flipped by [`spawn_bg_leadership`](Self::spawn_bg_leadership).
+    pub is_bg_leader: Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic library version, bumped on every library-mutating notify
     /// (`notify_library_changed` / `notify_library_delta`). The full-item-list
     /// cache below keys on this so any add/remove instantly invalidates it.
@@ -283,6 +289,53 @@ impl AppState {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
+        });
+    }
+
+    /// Phase B2 — does this replica currently hold background-work
+    /// leadership? DB-writing background loops check this before doing work.
+    pub fn is_bg_leader(&self) -> bool {
+        self.is_bg_leader.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Await background-work leadership — resolves once this replica holds it.
+    /// One-shot boot jobs (subtitle / trickplay warm) call this so a follower
+    /// runs them only after it has been elected (e.g. the leader was replaced).
+    pub async fn wait_until_bg_leader(&self) {
+        while !self.is_bg_leader() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Elect this replica as the background-work singleton, then hold the
+    /// leadership lease for the process lifetime. Under Postgres this retries
+    /// the advisory lock every 15 s until it wins — so when the current
+    /// leader's pod is replaced, a surviving replica takes over within a few
+    /// seconds and starts running the background loops. Under SQLite it wins
+    /// immediately (single writer). Call once at startup.
+    pub fn spawn_bg_leadership(state: Arc<Self>) {
+        actix_web::rt::spawn(async move {
+            let lease = loop {
+                match state.stores.try_acquire_bg_leadership().await {
+                    Ok(Some(lease)) => break lease,
+                    Ok(None) => {
+                        // Another replica leads; retry so we take over if it goes away.
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "bg-leadership election failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    }
+                }
+            };
+            state
+                .is_bg_leader
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("acquired background-work leadership");
+            // Hold the lease (and, under Postgres, the lock-owning connection)
+            // for the process lifetime; dropping it would release leadership.
+            let _lease = lease;
+            std::future::pending::<()>().await;
         });
     }
 
@@ -386,6 +439,7 @@ impl AppState {
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
+            is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -450,6 +504,7 @@ impl AppState {
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
+            is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),

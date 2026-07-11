@@ -31,6 +31,12 @@ pub mod migrate;
 pub mod server_config;
 pub use server_config::ServerConfigStore;
 
+// Singleton background-work leadership (advisory lock under Postgres).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub mod bg_lock;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub use bg_lock::BgLeadership;
+
 // JSON adapter for MediaProbe.subtitle_tracks persistence — kept
 // outside the feature gates so both backends use it.
 pub mod attachment_json;
