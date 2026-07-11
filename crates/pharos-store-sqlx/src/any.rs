@@ -8,10 +8,11 @@ use crate::{RuntimeConfig, ServerConfigStore, StoreError};
 use pharos_core::{
     AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult, Fingerprint,
     GenreCount, GenreStore, ItemPerson, Library, LibraryKind, LibraryStore, MediaFacets, MediaId,
-    MediaItem, MediaQuery, MediaStore, Person, PersonCount, PersonRef, PersonStore, Playlist,
-    PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString, Studio,
-    StudioCount, StudioStore, Tag, TagCount, TagStore, TokenRecord, TokenStore, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    MediaItem, MediaQuery, MediaStore, PersistedTranscodeSession, Person, PersonCount, PersonRef,
+    PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery,
+    SecretString, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, TokenRecord,
+    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
+    UserStore,
 };
 
 #[derive(Clone)]
@@ -708,6 +709,53 @@ impl PreferenceStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.set_display_preferences(user, dp_id, client, json).await,
             AnyStore::Postgres(p) => p.set_display_preferences(user, dp_id, client, json).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// TranscodeSessionStore
+// ---------------------------------------------------------------------
+impl TranscodeSessionStore for AnyStore {
+    async fn upsert_transcode_session(
+        &self,
+        play_session_id: &str,
+        session: &PersistedTranscodeSession,
+        now_unix_secs: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.upsert_transcode_session(play_session_id, session, now_unix_secs)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.upsert_transcode_session(play_session_id, session, now_unix_secs)
+                    .await
+            }
+        }
+    }
+
+    async fn get_transcode_session(
+        &self,
+        play_session_id: &str,
+    ) -> DomainResult<Option<PersistedTranscodeSession>> {
+        match self {
+            AnyStore::Sqlite(s) => s.get_transcode_session(play_session_id).await,
+            AnyStore::Postgres(p) => p.get_transcode_session(play_session_id).await,
+        }
+    }
+
+    async fn remove_transcode_session(&self, play_session_id: &str) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.remove_transcode_session(play_session_id).await,
+            AnyStore::Postgres(p) => p.remove_transcode_session(play_session_id).await,
+        }
+    }
+
+    async fn prune_transcode_sessions(&self, cutoff_unix_secs: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.prune_transcode_sessions(cutoff_unix_secs).await,
+            AnyStore::Postgres(p) => p.prune_transcode_sessions(cutoff_unix_secs).await,
         }
     }
 }

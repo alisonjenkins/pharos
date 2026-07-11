@@ -12,9 +12,10 @@
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
     CollectionStore, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind,
-    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersonKind, PersonRef, PersonStore,
-    PlaylistStore, PreferenceStore, SecretString, StudioStore, TagStore, TokenStore, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedTranscodeSession, PersonKind,
+    PersonRef, PersonStore, PlaylistStore, PreferenceStore, SecretString, StudioStore, TagStore,
+    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
+    UserStore,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -56,6 +57,7 @@ where
         + pharos_core::CollectionStore
         + pharos_core::PlaylistStore
         + pharos_core::LibraryStore
+        + pharos_core::TranscodeSessionStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
         + Send
@@ -416,6 +418,82 @@ where
         .await
         .unwrap();
     assert!(owned.iter().any(|p| p.wire_id == playlist.wire_id));
+
+    // -----------------------------------------------------------------
+    // 10. TranscodeSessionStore (Phase B1 failover breadcrumb)
+    // -----------------------------------------------------------------
+    let psid = "conformance-play-session";
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid)
+            .await
+            .unwrap()
+            .is_none(),
+        "unknown play session must be None"
+    );
+    let sess = PersistedTranscodeSession {
+        media_id: item_id,
+        decision_json: r#"{"Transcode":{"target_container":"mp4"}}"#.into(),
+        source_probe_json: r#"{"container":"mkv"}"#.into(),
+    };
+    TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 100)
+        .await
+        .unwrap();
+    let got = TranscodeSessionStore::get_transcode_session(&store, psid)
+        .await
+        .unwrap()
+        .expect("session must round-trip");
+    assert_eq!(got, sess);
+
+    // Upsert overwrites payload + bumps updated_at.
+    let sess2 = PersistedTranscodeSession {
+        media_id: item_id,
+        decision_json: r#"{"DirectPlay":null}"#.into(),
+        source_probe_json: r#"{"container":"mp4"}"#.into(),
+    };
+    TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess2, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        TranscodeSessionStore::get_transcode_session(&store, psid)
+            .await
+            .unwrap()
+            .unwrap(),
+        sess2,
+        "upsert must overwrite an existing play session"
+    );
+
+    // Prune below the row's updated_at (200) is a no-op; above it removes.
+    let pruned_none = TranscodeSessionStore::prune_transcode_sessions(&store, 150)
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned_none, 0,
+        "prune cutoff below updated_at removes nothing"
+    );
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+        .await
+        .unwrap()
+        .is_some());
+    let pruned = TranscodeSessionStore::prune_transcode_sessions(&store, 300)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1, "prune cutoff above updated_at removes the row");
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Explicit remove path (re-insert, then delete).
+    TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 400)
+        .await
+        .unwrap();
+    TranscodeSessionStore::remove_transcode_session(&store, psid)
+        .await
+        .unwrap();
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[cfg(feature = "sqlite")]

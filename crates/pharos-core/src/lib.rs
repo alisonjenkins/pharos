@@ -2138,6 +2138,56 @@ pub trait PreferenceStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
+/// Persisted transcode negotiation for a PlaySessionId (Phase B1 —
+/// zero-downtime deploys). `decision_json` / `source_probe_json` are opaque
+/// serde payloads owned by the server layer (`device_profile::Decision` +
+/// [`MediaProbe`]); the store treats them as text, mirroring the
+/// [`PreferenceStore`] JSON convention, so pharos-core stays codec-agnostic.
+/// A replica that never saw the original negotiation can reload it from here
+/// and serve the next segment instead of 410-ing a mid-stream client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTranscodeSession {
+    pub media_id: MediaId,
+    pub decision_json: String,
+    pub source_probe_json: String,
+}
+
+/// Cross-replica store for [`PersistedTranscodeSession`]s keyed on
+/// PlaySessionId. The in-memory `TranscodeSessionRegistry` is the hot cache;
+/// this is the shared source of truth a failed-over replica falls back to.
+///
+/// `get` deliberately does NOT touch `updated_at`: the common path is a local
+/// cache hit, so segment GETs never write to the DB; the row is stamped only
+/// on negotiate (`upsert`) and on a failover re-cache. `prune` therefore uses
+/// a generous cutoff — the row is a failover breadcrumb, not a liveness clock.
+pub trait TranscodeSessionStore: Send + Sync {
+    /// Upsert the session, setting `updated_at = now_unix_secs`.
+    fn upsert_transcode_session(
+        &self,
+        play_session_id: &str,
+        session: &PersistedTranscodeSession,
+        now_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Fetch a session by PlaySessionId. `None` = no such row.
+    fn get_transcode_session(
+        &self,
+        play_session_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<PersistedTranscodeSession>>> + Send;
+
+    fn remove_transcode_session(
+        &self,
+        play_session_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Drop sessions with `updated_at < cutoff_unix_secs`; returns the count
+    /// removed. Called periodically by the owning replica.
+    fn prune_transcode_sessions(
+        &self,
+        cutoff_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+}
+
 pub trait Scanner: Send + Sync {
     fn scan(
         &self,

@@ -14,6 +14,9 @@ mod user_data_sqlite;
 #[cfg(feature = "sqlite")]
 mod preferences_sqlite;
 
+#[cfg(feature = "sqlite")]
+mod transcode_session_sqlite;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
