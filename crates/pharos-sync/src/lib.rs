@@ -15,6 +15,7 @@
 
 pub mod bus;
 pub mod clock;
+pub mod delivery;
 pub mod group;
 pub mod host;
 pub mod hub;
@@ -23,6 +24,7 @@ pub mod registry;
 pub mod ws;
 
 pub use bus::{BusError, LocalSyncBus, SyncBus};
+pub use delivery::{Delivery, LocalDelivery, MemberSinks};
 pub use host::TokenResolver;
 pub use hub::{ResolvedSession, SessionHub};
 pub use messages::{ClientMsg, ErrorCode, GroupId, MemberId, MemberSummary, ServerMsg};

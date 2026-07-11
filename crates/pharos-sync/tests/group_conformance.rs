@@ -14,21 +14,32 @@
 
 use pharos_sync::group::{GroupHandle, GroupMsg, GroupSnapshot, Joined, MIN_LEAD_MS};
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
+use pharos_sync::{LocalDelivery, MemberSinks};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+/// Spawn a group delivering to an in-process `MemberSinks` (the single-replica
+/// wiring). Returns the sinks so tests register each member before `AddMember`.
+fn spawn_group() -> (GroupHandle, MemberSinks) {
+    let sinks = MemberSinks::new();
+    let h = GroupHandle::spawn(GroupId::new(), Arc::new(LocalDelivery::new(sinks.clone())));
+    (h, sinks)
+}
+
 async fn add_member_with_cap(
     h: &GroupHandle,
+    sinks: &MemberSinks,
     name: &str,
     cap: usize,
 ) -> (MemberId, mpsc::Receiver<ServerMsg>) {
     let (tx, rx) = mpsc::channel(cap);
     let mid = MemberId::new();
+    sinks.insert(mid, tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     h.tx.send(GroupMsg::AddMember {
         member_id: mid,
         name: name.into(),
-        sink: tx,
         reply: reply_tx,
     })
     .await
@@ -37,8 +48,12 @@ async fn add_member_with_cap(
     (mid, rx)
 }
 
-async fn add_member(h: &GroupHandle, name: &str) -> (MemberId, mpsc::Receiver<ServerMsg>) {
-    add_member_with_cap(h, name, 64).await
+async fn add_member(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    name: &str,
+) -> (MemberId, mpsc::Receiver<ServerMsg>) {
+    add_member_with_cap(h, sinks, name, 64).await
 }
 
 async fn snapshot(h: &GroupHandle) -> GroupSnapshot {
@@ -83,9 +98,9 @@ where
 /// on the leader to re-issue Play.
 #[tokio::test]
 async fn late_joiner_receives_current_play_state() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, mut leader_rx) = add_member(&h, "leader").await;
-    let (_m2, _m2_rx) = add_member(&h, "m2").await;
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (_m2, _m2_rx) = add_member(&h, &sinks, "m2").await;
 
     // Leader plays.
     h.tx.send(GroupMsg::LeaderPlay {
@@ -98,7 +113,7 @@ async fn late_joiner_receives_current_play_state() {
 
     // Third member joins after a tick.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let (_late, mut late_rx) = add_member(&h, "late").await;
+    let (_late, mut late_rx) = add_member(&h, &sinks, "late").await;
 
     let msg = wait_for(&mut late_rx, Duration::from_millis(500), |m| {
         matches!(m, ServerMsg::Play { .. })
@@ -123,8 +138,8 @@ async fn late_joiner_receives_current_play_state() {
 /// the freeze position) followed by Pause.
 #[tokio::test]
 async fn late_joiner_receives_pause_state_when_group_paused() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, mut leader_rx) = add_member(&h, "leader").await;
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
     h.tx.send(GroupMsg::LeaderPlay {
         sender: leader,
         position_ms: 10_000,
@@ -137,7 +152,7 @@ async fn late_joiner_receives_pause_state_when_group_paused() {
         .unwrap();
     drain(&mut leader_rx).await;
 
-    let (_late, mut late_rx) = add_member(&h, "late").await;
+    let (_late, mut late_rx) = add_member(&h, &sinks, "late").await;
     // Should see at least one Seek followed by Pause.
     let seek = wait_for(&mut late_rx, Duration::from_millis(500), |m| {
         matches!(m, ServerMsg::Seek { .. })
@@ -156,13 +171,13 @@ async fn late_joiner_receives_pause_state_when_group_paused() {
 /// a full sink (the laggard reconciles on next state catch-up).
 #[tokio::test]
 async fn slow_member_does_not_block_broadcasts() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, mut leader_rx) = add_member(&h, "leader").await;
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
     // Member 2 has capacity 1 and we never read from it — sink fills
     // immediately and any further send would block under the old
     // implementation.
-    let (_slow, mut slow_rx) = add_member_with_cap(&h, "slow", 1).await;
-    let (_m3, mut m3_rx) = add_member(&h, "m3").await;
+    let (_slow, mut slow_rx) = add_member_with_cap(&h, &sinks, "slow", 1).await;
+    let (_m3, mut m3_rx) = add_member(&h, &sinks, "m3").await;
 
     drain(&mut leader_rx).await;
     drain(&mut m3_rx).await;
@@ -210,10 +225,10 @@ async fn slow_member_does_not_block_broadcasts() {
 /// 3-member case with explicit assertions on each survivor's stream.
 #[tokio::test]
 async fn leader_handoff_broadcasts_to_all_survivors() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, _leader_rx) = add_member(&h, "leader").await;
-    let (m2, mut m2_rx) = add_member(&h, "m2").await;
-    let (m3, mut m3_rx) = add_member(&h, "m3").await;
+    let (h, sinks) = spawn_group();
+    let (leader, _leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (m2, mut m2_rx) = add_member(&h, &sinks, "m2").await;
+    let (m3, mut m3_rx) = add_member(&h, &sinks, "m3").await;
     drain(&mut m2_rx).await;
     drain(&mut m3_rx).await;
 
@@ -247,9 +262,9 @@ async fn leader_handoff_broadcasts_to_all_survivors() {
 /// delivers the current play state without leader intervention.
 #[tokio::test]
 async fn network_blip_member_rejoins_to_current_play_state() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, mut leader_rx) = add_member(&h, "leader").await;
-    let (m2, _m2_rx) = add_member(&h, "m2").await;
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (m2, _m2_rx) = add_member(&h, &sinks, "m2").await;
 
     h.tx.send(GroupMsg::LeaderPlay {
         sender: leader,
@@ -267,7 +282,7 @@ async fn network_blip_member_rejoins_to_current_play_state() {
 
     // m2 rejoins — issuing a fresh MemberId because each WS reconnect
     // mints a new one (matches Jellyfin behaviour).
-    let (_m2_again, mut m2_again_rx) = add_member(&h, "m2-reconnect").await;
+    let (_m2_again, mut m2_again_rx) = add_member(&h, &sinks, "m2-reconnect").await;
     let msg = wait_for(&mut m2_again_rx, Duration::from_millis(500), |m| {
         matches!(m, ServerMsg::Play { .. })
     })
@@ -287,9 +302,9 @@ async fn network_blip_member_rejoins_to_current_play_state() {
 /// no longer a member at all) but the new leader's must succeed.
 #[tokio::test]
 async fn after_handoff_old_leader_cannot_issue_play() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, _leader_rx) = add_member(&h, "leader").await;
-    let (m2, mut m2_rx) = add_member(&h, "m2").await;
+    let (h, sinks) = spawn_group();
+    let (leader, _leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (m2, mut m2_rx) = add_member(&h, &sinks, "m2").await;
 
     h.tx.send(GroupMsg::RemoveMember { member_id: leader })
         .await

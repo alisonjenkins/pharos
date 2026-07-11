@@ -7,6 +7,7 @@
 //! `web::Data<Arc<dyn TokenResolver>>` so this crate stays free of
 //! `pharos-server::AppState`.
 
+use super::delivery::MemberSinks;
 use super::group::{GroupMsg, Joined};
 use super::host::TokenResolver;
 use super::messages::{ClientMsg, ErrorCode, MemberId, ServerMsg};
@@ -33,6 +34,7 @@ async fn ws_entry(
     body: web::Payload,
     resolver: web::Data<TokenResolverData>,
     registry: web::Data<GroupRegistry>,
+    sinks: web::Data<MemberSinks>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, session, stream) = actix_ws::handle(&req, body)?;
     let stream = stream
@@ -43,6 +45,7 @@ async fn ws_entry(
         stream,
         resolver.get_ref().clone(),
         registry.get_ref().clone(),
+        sinks.get_ref().clone(),
     ));
     Ok(response)
 }
@@ -60,6 +63,7 @@ async fn handle_connection<S>(
     mut stream: S,
     resolver: TokenResolverData,
     registry: GroupRegistry,
+    sinks: MemberSinks,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
@@ -95,13 +99,15 @@ async fn handle_connection<S>(
             return;
         }
     };
+    // Register this connection's sink into the per-replica delivery table
+    // BEFORE AddMember, so the actor's join catch-up reaches this socket.
+    sinks.insert(member_id, out_tx.clone());
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if group_handle
         .tx
         .send(GroupMsg::AddMember {
             member_id,
             name: member_name.clone(),
-            sink: out_tx.clone(),
             reply: reply_tx,
         })
         .await
@@ -172,8 +178,9 @@ async fn handle_connection<S>(
         }
     }
 
-    // 6) drop membership.
+    // 6) drop membership + deregister the sink.
     let _ = group_tx.send(GroupMsg::RemoveMember { member_id }).await;
+    sinks.remove(member_id);
     let _ = session.clone().close(None).await;
 }
 

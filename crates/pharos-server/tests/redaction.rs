@@ -61,12 +61,17 @@ async fn boot() -> (TestServer, String) {
         .await
         .unwrap();
     let state = web::Data::new(AppState::new(stores, "pharos-redact".into()));
-    let registry = web::Data::new(GroupRegistry::spawn());
+    let member_sinks = pharos_sync::MemberSinks::new();
+    let registry = web::Data::new(GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(member_sinks.clone()),
+    )));
+    let member_sinks = web::Data::new(member_sinks);
     let server = actix_test::start(move || {
         App::new()
             .app_data(state.clone())
             .app_data(registry.clone())
             .app_data(web::Data::new(pharos_sync::SessionHub::new()))
+            .app_data(member_sinks.clone())
             .wrap(LowercasePath)
             .configure(jellyfin::configure)
     });

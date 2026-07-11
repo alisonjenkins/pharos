@@ -19,7 +19,7 @@ use pharos_sync::{
     group::{GroupHandle, GroupMsg},
     messages::{GroupId, GroupPlayState, MemberId, QueueItemInfo, ServerMsg},
     registry::GroupRegistry,
-    SessionHub,
+    MemberSinks, SessionHub,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -108,6 +108,7 @@ async fn ws_entry(
     state: web::Data<AppState>,
     registry: web::Data<GroupRegistry>,
     hub: web::Data<SessionHub>,
+    sinks: web::Data<MemberSinks>,
     user: AuthUser,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, session, stream) = actix_ws::handle(&req, body)?;
@@ -125,6 +126,7 @@ async fn ws_entry(
         stream,
         registry.get_ref().clone(),
         hub.get_ref().clone(),
+        sinks.get_ref().clone(),
         device_id,
         bus_rx,
         user.0.name,
@@ -139,6 +141,7 @@ async fn handle_connection<S>(
     mut stream: S,
     registry: GroupRegistry,
     hub: SessionHub,
+    sinks: MemberSinks,
     device_id: Option<String>,
     mut bus_rx: broadcast::Receiver<SocketBroadcast>,
     member_name: String,
@@ -157,6 +160,11 @@ async fn handle_connection<S>(
     let reg = hub.register(device_key.clone(), member_name.clone(), out_tx.clone());
     let member_id = reg.member_id;
     let conn_gen = reg.gen;
+    // Register this socket's sink in the per-replica delivery table. Safe to do
+    // before any group join: the actor only ever delivers to members in its
+    // roster, so an unrostered sink receives nothing until AddMember admits it.
+    // On a reconnect this replaces the stale sink with the fresh one.
+    sinks.insert(member_id, out_tx.clone());
     // Jellyfin-wire context derived from the ServerMsg stream: the current
     // group id (from `Joined`) and the current queue item's PlaylistItemId
     // (from `PlayQueue`), both needed to shape outbound commands.
@@ -166,13 +174,9 @@ async fn handle_connection<S>(
     // and re-sync. Membership survived the disconnect, so no re-Join is needed.
     if let Some(group) = reg.group {
         current_group_id = Some(group.group_id);
-        let _ = group
-            .tx
-            .send(GroupMsg::UpdateSink {
-                member_id,
-                sink: out_tx.clone(),
-            })
-            .await;
+        // Sink already refreshed in MemberSinks above; ask the actor to re-send
+        // the catch-up so the reconnected client re-syncs to current state.
+        let _ = group.tx.send(GroupMsg::ResyncMember { member_id }).await;
         tracing::info!(device_id = %device_key, %member_id, group = %group.group_id, "syncplay: /socket reconnected into existing group");
     } else {
         tracing::info!(
@@ -303,7 +307,6 @@ async fn handle_connection<S>(
                             &mut current_group,
                             member_id,
                             &member_name,
-                            &out_tx,
                             &registry,
                             started,
                         )
@@ -321,34 +324,37 @@ async fn handle_connection<S>(
 
     tracing::info!(device_id = %device_key, %member_id, "syncplay: /socket disconnected");
     // WS-native path (vestigial phone/TV clients): its group lives only in
-    // `current_group`, so remove immediately.
+    // `current_group`, so remove immediately (sink + roster).
     if let Some(h) = current_group.take() {
         let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
+        sinks.remove(member_id);
     }
     // HTTP path: membership lives in the hub and must SURVIVE this disconnect so
     // a reconnect (jellyfin-web reconnects its socket constantly) re-attaches
     // instead of orphaning the member. Schedule a generation-guarded teardown:
     // if a newer socket connects within the grace window it bumps the
-    // generation and this no-ops; otherwise the member is removed.
+    // generation and this no-ops; otherwise the member is removed. The sink is
+    // only dropped when the teardown actually fires — a reconnect re-inserted a
+    // fresh sink under the same member id, which must not be wiped.
     const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
     let hub2 = hub.clone();
     let dev2 = device_key.clone();
+    let sinks2 = sinks.clone();
     actix_web::rt::spawn(async move {
         tokio::time::sleep(RECONNECT_GRACE).await;
         if let Some(group) = hub2.remove_if_current_gen(&dev2, conn_gen) {
             let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
+            sinks2.remove(member_id);
         }
     });
     let _ = session.clone().close(None).await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_inbound(
     inbound: Inbound,
     current_group: &mut Option<GroupHandle>,
     member_id: MemberId,
     member_name: &str,
-    out_tx: &mpsc::Sender<ServerMsg>,
     registry: &GroupRegistry,
     started: Instant,
 ) {
@@ -362,7 +368,7 @@ async fn handle_inbound(
                 Ok(h) => h,
                 Err(_) => return,
             };
-            join_via_handle(handle, current_group, member_id, member_name, out_tx).await;
+            join_via_handle(handle, current_group, member_id, member_name).await;
         }
         "SyncPlayJoinGroup" => {
             let Ok(data) = serde_json::from_value::<SyncPlayJoinData>(inbound.data) else {
@@ -373,7 +379,7 @@ async fn handle_inbound(
                 Ok(h) => h,
                 Err(_) => return,
             };
-            join_via_handle(handle, current_group, member_id, member_name, out_tx).await;
+            join_via_handle(handle, current_group, member_id, member_name).await;
         }
         "SyncPlayLeaveGroup" => {
             if let Some(h) = current_group.take() {
@@ -432,15 +438,15 @@ async fn join_via_handle(
     current_group: &mut Option<GroupHandle>,
     member_id: MemberId,
     member_name: &str,
-    out_tx: &mpsc::Sender<ServerMsg>,
 ) {
+    // The member's sink is already in the replica's MemberSinks (registered on
+    // socket connect), so AddMember carries no sink — it just admits the member.
     let (reply_tx, reply_rx) = oneshot::channel();
     if handle
         .tx
         .send(GroupMsg::AddMember {
             member_id,
             name: member_name.to_string(),
-            sink: out_tx.clone(),
             reply: reply_tx,
         })
         .await

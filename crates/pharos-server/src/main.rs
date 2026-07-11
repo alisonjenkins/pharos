@@ -767,7 +767,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // breadcrumbs) so the table doesn't grow unbounded.
     app_state.transcode_sessions.spawn_pruner();
 
-    let group_registry = web::Data::new(GroupRegistry::spawn());
+    // Per-replica member-sink table: the group actors deliver into it and the
+    // `/socket` layer registers each socket's sink. On a single replica this is
+    // direct in-process delivery (`LocalDelivery`); the multi-replica Postgres
+    // path swaps in a bus-backed delivery (Phase B4.3d).
+    let member_sinks = pharos_sync::MemberSinks::new();
+    let group_registry = web::Data::new(GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(member_sinks.clone()),
+    )));
+    let member_sinks_data = web::Data::new(member_sinks);
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
     // per-`/socket` group member sinks. One instance shared across workers.
     let session_hub = web::Data::new(pharos_sync::SessionHub::new());
@@ -819,6 +827,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
             .app_data(session_hub.clone())
+            .app_data(member_sinks_data.clone())
             .app_data(token_resolver_data.clone())
             // actix runs `.wrap()` layers in REVERSE registration order
             // (last registered = outermost = first on ingress). We want

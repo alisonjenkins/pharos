@@ -162,11 +162,22 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::delivery::{LocalDelivery, MemberSinks};
     use crate::group::GroupHandle;
     use crate::messages::GroupId;
+    use std::sync::Arc;
 
     fn sink() -> mpsc::Sender<ServerMsg> {
         mpsc::channel(8).0
+    }
+
+    /// A group handle backed by a throwaway in-process delivery — these tests
+    /// exercise the hub's device→member bookkeeping, not message delivery.
+    fn handle() -> GroupHandle {
+        GroupHandle::spawn(
+            GroupId::new(),
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+        )
     }
 
     #[test]
@@ -183,7 +194,7 @@ mod tests {
         assert_eq!(r.member_id, reg.member_id);
         assert!(r.group.is_none() && reg.group.is_none());
 
-        let handle = GroupHandle::spawn(GroupId::new());
+        let handle = handle();
         hub.attach_group("devA", handle.clone());
         assert_eq!(hub.epoch_of("devA"), Some(handle.epoch_unix_ms));
         assert!(hub.resolve("devA").unwrap().group.is_some());
@@ -197,7 +208,7 @@ mod tests {
     async fn reconnect_keeps_member_id_and_group_and_bumps_gen() {
         let hub = SessionHub::new();
         let first = hub.register("devB".into(), "b".into(), sink());
-        let handle = GroupHandle::spawn(GroupId::new());
+        let handle = handle();
         hub.attach_group("devB", handle.clone());
 
         // Reconnect: same member id, same group surfaced, higher generation.

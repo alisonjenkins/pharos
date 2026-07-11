@@ -43,7 +43,9 @@ async fn seed() -> (
     let token = stores.issue(uid, "t").await.unwrap();
     (
         web::Data::new(AppState::new(stores, "edge".into())),
-        web::Data::new(GroupRegistry::spawn()),
+        web::Data::new(GroupRegistry::spawn(std::sync::Arc::new(
+            pharos_sync::LocalDelivery::new(pharos_sync::MemberSinks::new()),
+        ))),
         token.0.expose().to_string(),
         uid,
     )
@@ -65,6 +67,7 @@ fn build_app(
         .app_data(state)
         .app_data(reg)
         .app_data(web::Data::new(pharos_sync::SessionHub::new()))
+        .app_data(web::Data::new(pharos_sync::MemberSinks::new()))
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
 }

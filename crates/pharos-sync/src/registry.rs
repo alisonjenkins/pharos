@@ -2,9 +2,11 @@
 //! membership requests. WS handlers send via the registry, never touching
 //! group state directly (V18).
 
+use super::delivery::Delivery;
 use super::group::GroupHandle;
 use super::messages::GroupId;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +40,10 @@ pub struct GroupRegistry {
 }
 
 impl GroupRegistry {
-    pub fn spawn() -> Self {
+    /// Spawn the registry. `delivery` is how every group it creates reaches
+    /// members — `LocalDelivery` on a single replica, `BusDelivery` under
+    /// Postgres. Shared (cloned into each group actor).
+    pub fn spawn(delivery: Arc<dyn Delivery>) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(64);
         tokio::spawn(async move {
             let mut groups: HashMap<GroupId, GroupHandle> = HashMap::new();
@@ -55,7 +60,7 @@ impl GroupRegistry {
                             .map(|h| h.tx.is_closed())
                             .unwrap_or(true);
                         if needs_spawn {
-                            groups.insert(group_id, GroupHandle::spawn(group_id));
+                            groups.insert(group_id, GroupHandle::spawn(group_id, delivery.clone()));
                         }
                         let handle = groups.get(&group_id).cloned();
                         // Always Some — we just inserted if needed.
@@ -78,7 +83,7 @@ impl GroupRegistry {
                     }
                     Msg::Create { reply } => {
                         let id = GroupId::new();
-                        let h = GroupHandle::spawn(id);
+                        let h = GroupHandle::spawn(id, delivery.clone());
                         groups.insert(id, h.clone());
                         let _ = reply.send(h);
                     }
@@ -144,10 +149,19 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::delivery::{LocalDelivery, MemberSinks};
+
+    /// A registry wired to an in-process delivery, plus the `MemberSinks` its
+    /// groups deliver into (so tests can register a member's socket).
+    fn reg() -> (GroupRegistry, MemberSinks) {
+        let sinks = MemberSinks::new();
+        let r = GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone())));
+        (r, sinks)
+    }
 
     #[tokio::test]
     async fn create_then_get_returns_same_group() {
-        let r = GroupRegistry::spawn();
+        let (r, _sinks) = reg();
         let h1 = r.create().await.unwrap();
         let h2 = r.get(h1.group_id).await.unwrap().unwrap();
         assert_eq!(h1.group_id, h2.group_id);
@@ -155,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_or_create_idempotent() {
-        let r = GroupRegistry::spawn();
+        let (r, _sinks) = reg();
         let id = GroupId::new();
         let h1 = r.get_or_create(id).await.unwrap();
         let h2 = r.get_or_create(id).await.unwrap();
@@ -164,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_unknown_is_none() {
-        let r = GroupRegistry::spawn();
+        let (r, _sinks) = reg();
         let res = r.get(GroupId::new()).await.unwrap();
         assert!(res.is_none());
     }
@@ -176,19 +190,19 @@ mod tests {
         use std::time::Duration;
         use tokio::sync::{mpsc, oneshot};
 
-        let r = GroupRegistry::spawn();
+        let (r, sinks) = reg();
         let id = GroupId::new();
         let h1 = r.get_or_create(id).await.unwrap();
 
         // Add then remove the sole member → the actor empties + terminates.
         let (sink, _rx) = mpsc::channel(8);
         let mid = MemberId::new();
+        sinks.insert(mid, sink);
         let (rtx, rrx) = oneshot::channel();
         h1.tx
             .send(GroupMsg::AddMember {
                 member_id: mid,
                 name: "x".into(),
-                sink,
                 reply: rtx,
             })
             .await
@@ -222,17 +236,17 @@ mod tests {
         use std::time::Duration;
         use tokio::sync::{mpsc, oneshot};
 
-        let r = GroupRegistry::spawn();
+        let (r, sinks) = reg();
         let h1 = r.create().await.unwrap();
         let id = h1.group_id;
         let (sink, _rx) = mpsc::channel(8);
         let mid = MemberId::new();
+        sinks.insert(mid, sink);
         let (rtx, rrx) = oneshot::channel();
         h1.tx
             .send(GroupMsg::AddMember {
                 member_id: mid,
                 name: "x".into(),
-                sink,
                 reply: rtx,
             })
             .await

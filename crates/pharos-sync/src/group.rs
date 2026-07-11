@@ -9,10 +9,12 @@
 //! V20: actor never sees Jellyfin shapes; only `ServerMsg` flows out.
 
 use super::clock::ClockOffset;
+use super::delivery::Delivery;
 use super::messages::{
     ErrorCode, GroupId, GroupPlayState, MemberId, MemberSummary, QueueItemInfo, ServerMsg,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -38,10 +40,13 @@ fn unix_now_ms() -> u64 {
 
 #[derive(Debug)]
 pub enum GroupMsg {
+    /// Register a member in the group's roster. The member's socket sink is
+    /// held by the per-replica `MemberSinks` (registered by the caller before
+    /// this message), not the actor — so no sink travels here, and the same
+    /// message re-adds a member that reconnected onto a different replica.
     AddMember {
         member_id: MemberId,
         name: String,
-        sink: mpsc::Sender<ServerMsg>,
         reply: oneshot::Sender<Joined>,
     },
     RemoveMember {
@@ -134,12 +139,13 @@ pub enum GroupMsg {
     SetGroupName {
         name: String,
     },
-    /// Refresh a member's sink after its `/socket` reconnected (the member
-    /// itself persists across socket churn). Re-sends the catch-up so the
-    /// reconnected client immediately re-syncs to the group's current state.
-    UpdateSink {
+    /// A member's `/socket` reconnected (its fresh sink is already swapped into
+    /// the per-replica `MemberSinks`; the member persists across socket churn).
+    /// Re-sends the catch-up so the reconnected client immediately re-syncs to
+    /// the group's current state. Also the re-hydration path: a member landing
+    /// on a new replica after a deploy resyncs through here.
+    ResyncMember {
         member_id: MemberId,
-        sink: mpsc::Sender<ServerMsg>,
     },
     Snapshot {
         reply: oneshot::Sender<GroupSnapshot>,
@@ -169,7 +175,6 @@ pub struct GroupSnapshot {
 
 struct MemberRec {
     name: String,
-    sink: mpsc::Sender<ServerMsg>,
     offset: ClockOffset,
     buffering: bool,
 }
@@ -248,10 +253,14 @@ struct GroupState {
     waiting: Option<WaitingGate>,
     /// Display name shown in the join dialog (set from `/SyncPlay/New`).
     group_name: String,
+    /// How outbound `ServerMsg`s reach members. `LocalDelivery` on the
+    /// single-replica path (straight to local sinks); `BusDelivery` under
+    /// Postgres (publish to every replica). The actor never touches sinks.
+    delivery: Arc<dyn Delivery>,
 }
 
 impl GroupState {
-    fn new(id: GroupId, epoch_unix_ms: u64) -> Self {
+    fn new(id: GroupId, epoch_unix_ms: u64, delivery: Arc<dyn Delivery>) -> Self {
         Self {
             id,
             epoch_unix_ms,
@@ -262,6 +271,7 @@ impl GroupState {
             queue: PlayQueue::default(),
             waiting: None,
             group_name: "Watch Party".to_string(),
+            delivery,
         }
     }
 
@@ -440,20 +450,32 @@ impl GroupState {
         MIN_LEAD_MS + half_max_rtt
     }
 
-    /// V19: one slow / wedged member must not block the actor or
-    /// delay broadcasts to everyone else. `try_send` returns
-    /// immediately; on a full sink the message is dropped (the
-    /// member will reconcile via the next state catch-up).
+    /// V19: one slow / wedged member must not block the actor or delay
+    /// broadcasts to everyone else. Delivery is fire-and-forget (a full sink
+    /// drops; the member reconciles via the next state catch-up).
+    ///
+    /// Broadcasts are expanded over the actor's OWN roster (not the replica's
+    /// sink table) so a socket that registered its sink before its `AddMember`
+    /// was processed receives nothing until the actor admits it — see the
+    /// delivery module docs.
     fn broadcast(&self, msg: ServerMsg) {
-        for m in self.members.values() {
-            let _ = m.sink.try_send(msg.clone());
+        for mid in self.members.keys() {
+            self.delivery.deliver(*mid, msg.clone());
+        }
+    }
+
+    /// Broadcast to everyone except one member (the "someone joined"
+    /// notification the joiner itself must not receive).
+    fn broadcast_except(&self, except: MemberId, msg: ServerMsg) {
+        for mid in self.members.keys() {
+            if *mid != except {
+                self.delivery.deliver(*mid, msg.clone());
+            }
         }
     }
 
     fn send_one(&self, to: MemberId, msg: ServerMsg) {
-        if let Some(m) = self.members.get(&to) {
-            let _ = m.sink.try_send(msg);
-        }
+        self.delivery.deliver(to, msg);
     }
 
     fn member_summaries(&self) -> Vec<MemberSummary> {
@@ -487,11 +509,12 @@ pub struct GroupHandle {
 }
 
 impl GroupHandle {
-    /// Spawn a fresh group actor.
-    pub fn spawn(group_id: GroupId) -> Self {
+    /// Spawn a fresh group actor delivering through `delivery` (local sinks on
+    /// a single replica, the cross-replica bus under Postgres).
+    pub fn spawn(group_id: GroupId, delivery: Arc<dyn Delivery>) -> Self {
         let (tx, mut rx) = mpsc::channel::<GroupMsg>(256);
         let epoch_unix_ms = unix_now_ms();
-        let mut state = GroupState::new(group_id, epoch_unix_ms);
+        let mut state = GroupState::new(group_id, epoch_unix_ms, delivery);
         tokio::spawn(async move {
             // A brand-new group has no members yet — it must NOT terminate on
             // the empty check before its creator's AddMember lands (else a New
@@ -548,7 +571,6 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         GroupMsg::AddMember {
             member_id,
             name,
-            sink,
             reply,
         } => {
             let was_empty = state.members.is_empty();
@@ -556,7 +578,6 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 member_id,
                 MemberRec {
                     name: name.clone(),
-                    sink,
                     offset: ClockOffset::default(),
                     buffering: false,
                 },
@@ -583,30 +604,24 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     members: summaries.clone(),
                 },
             );
-            // Tell existing members someone joined.
+            // Tell existing members someone joined (not the joiner itself).
             let me = MemberSummary {
                 member_id,
                 name,
                 is_leader: Some(member_id) == state.leader,
             };
-            for (other_id, rec) in &state.members {
-                if *other_id != member_id {
-                    let _ = rec
-                        .sink
-                        .try_send(ServerMsg::MemberJoined { member: me.clone() });
-                }
-            }
+            state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
             // Queue + playback catch-up so the new member loads the SAME item at
             // the group's current position. Adding a member NEVER mutates
             // `playing_index` (A6: a join must not advance the group).
             state.send_catch_up(member_id);
         }
-        GroupMsg::UpdateSink { member_id, sink } => {
-            // A reconnected socket for an existing member: swap in the fresh
-            // sink and re-send the catch-up so it immediately re-syncs. The
-            // member (and its place in any readiness gate) is untouched.
-            if let Some(rec) = state.members.get_mut(&member_id) {
-                rec.sink = sink;
+        GroupMsg::ResyncMember { member_id } => {
+            // A reconnected socket for an existing member (its fresh sink is
+            // already in the replica's MemberSinks): re-send the catch-up so it
+            // immediately re-syncs. The member (and its place in any readiness
+            // gate) is untouched. Ignored if the member isn't in the roster.
+            if state.members.contains_key(&member_id) {
                 state.send_catch_up(member_id);
             }
         }
@@ -908,53 +923,75 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::delivery::{LocalDelivery, MemberSinks};
     use std::time::Duration;
 
-    async fn fresh() -> (GroupHandle, mpsc::Receiver<ServerMsg>, MemberId) {
-        let h = GroupHandle::spawn(GroupId::new());
-        let (tx, rx) = mpsc::channel(64);
-        let mid = MemberId::new();
+    /// Spawn a group whose delivery goes to an in-process `MemberSinks`, the
+    /// same wiring the single-replica server uses. Return the sinks so tests can
+    /// register each member's socket before `AddMember`.
+    fn spawn_group() -> (GroupHandle, MemberSinks) {
+        let sinks = MemberSinks::new();
+        let delivery = Arc::new(LocalDelivery::new(sinks.clone()));
+        let h = GroupHandle::spawn(GroupId::new(), delivery);
+        (h, sinks)
+    }
+
+    /// Register `mid`'s sink in `sinks` (as the socket layer does) then send
+    /// `AddMember`. Drains the self-`Joined` so tests see the post-join stream.
+    async fn join(
+        h: &GroupHandle,
+        sinks: &MemberSinks,
+        mid: MemberId,
+        name: &str,
+    ) -> mpsc::Receiver<ServerMsg> {
+        let (tx, mut rx) = mpsc::channel(64);
+        sinks.insert(mid, tx);
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
             member_id: mid,
-            name: "first".into(),
-            sink: tx,
+            name: name.into(),
             reply: reply_tx,
         })
         .await
         .unwrap();
         let joined = reply_rx.await.unwrap();
-        assert_eq!(joined.leader, mid);
-        // The engine also sends `Joined` to the member's own sink (so the
-        // HTTP-driven join delivers GroupJoined) — drain it so tests see the
-        // same post-join stream they did before that was added.
-        let mut rx = rx;
-        assert!(matches!(rx.recv().await, Some(ServerMsg::Joined { .. })));
-        (h, rx, mid)
+        let first = rx.recv().await;
+        assert!(
+            matches!(first, Some(ServerMsg::Joined { .. })),
+            "first message to a joiner must be Joined, got {first:?}"
+        );
+        let _ = joined;
+        rx
     }
 
-    async fn add_member(h: &GroupHandle, name: &str) -> (MemberId, mpsc::Receiver<ServerMsg>) {
-        let (tx, rx) = mpsc::channel(64);
+    /// A fresh group with one member ("first", the leader). Returns the shared
+    /// `MemberSinks` so the test can add more members via `add_member`.
+    async fn fresh() -> (
+        GroupHandle,
+        MemberSinks,
+        mpsc::Receiver<ServerMsg>,
+        MemberId,
+    ) {
+        let (h, sinks) = spawn_group();
         let mid = MemberId::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        h.tx.send(GroupMsg::AddMember {
-            member_id: mid,
-            name: name.into(),
-            sink: tx,
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-        let _ = reply_rx.await.unwrap();
-        // Drain the self-`Joined` (see `fresh`).
-        let mut rx = rx;
-        assert!(matches!(rx.recv().await, Some(ServerMsg::Joined { .. })));
+        let rx = join(&h, &sinks, mid, "first").await;
+        (h, sinks, rx, mid)
+    }
+
+    /// Add another member to an existing group + its sinks.
+    async fn add_member(
+        h: &GroupHandle,
+        sinks: &MemberSinks,
+        name: &str,
+    ) -> (MemberId, mpsc::Receiver<ServerMsg>) {
+        let mid = MemberId::new();
+        let rx = join(h, sinks, mid, name).await;
         (mid, rx)
     }
 
     #[tokio::test]
     async fn first_member_becomes_leader() {
-        let (h, _rx, mid) = fresh().await;
+        let (h, _sinks, _rx, mid) = fresh().await;
         let (tx, rx) = oneshot::channel();
         h.tx.send(GroupMsg::Snapshot { reply: tx }).await.unwrap();
         let snap = rx.await.unwrap();
@@ -967,7 +1004,7 @@ mod tests {
         // Regression: a New that sends SetGroupName before AddMember must not
         // kill the member-less group (the actor's empty-check used to terminate
         // it before the creator ever joined → "can't create a group").
-        let h = GroupHandle::spawn(GroupId::new());
+        let (h, sinks) = spawn_group();
         h.tx.send(GroupMsg::SetGroupName {
             name: "Movie Night".into(),
         })
@@ -976,11 +1013,11 @@ mod tests {
         // The actor must still be alive to accept the creator.
         let (tx, rx) = mpsc::channel(8);
         let mid = MemberId::new();
+        sinks.insert(mid, tx);
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
             member_id: mid,
             name: "ali".into(),
-            sink: tx,
             reply: reply_tx,
         })
         .await
@@ -994,8 +1031,8 @@ mod tests {
     async fn snapshot_reports_group_name_and_member_names() {
         // The join dialog renders GroupName + Participants from the snapshot —
         // these must be the real name + usernames, not the group id / member-N.
-        let (h, _rx, _mid) = fresh().await;
-        let _ = add_member(&h, "gf").await;
+        let (h, sinks, _rx, _mid) = fresh().await;
+        let _ = add_member(&h, &sinks, "gf").await;
         h.tx.send(GroupMsg::SetGroupName {
             name: "Movie Night".into(),
         })
@@ -1012,8 +1049,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_leader_play_returns_not_leader_error() {
-        let (h, _rx_leader, _leader) = fresh().await;
-        let (other_mid, mut other_rx) = add_member(&h, "second").await;
+        let (h, sinks, _rx_leader, _leader) = fresh().await;
+        let (other_mid, mut other_rx) = add_member(&h, &sinks, "second").await;
         h.tx.send(GroupMsg::LeaderPlay {
             sender: other_mid,
             position_ms: 0,
@@ -1029,8 +1066,8 @@ mod tests {
 
     #[tokio::test]
     async fn leader_play_broadcasts_to_all_members() {
-        let (h, mut leader_rx, leader) = fresh().await;
-        let (_other, mut other_rx) = add_member(&h, "second").await;
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_other, mut other_rx) = add_member(&h, &sinks, "second").await;
         // Drain MemberJoined sent to leader.
         let _ = leader_rx.recv().await.unwrap();
 
@@ -1064,8 +1101,8 @@ mod tests {
         // ready-timeout, so it dropped the broadcast Unpause with "no active
         // player") must still be told to play when it finally reports Ready —
         // not left stranded paused while everyone else watches.
-        let (h, mut leader_rx, leader) = fresh().await;
-        let (m2, mut m2_rx) = add_member(&h, "slow").await;
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "slow").await;
         // Drain the MemberJoined the leader receives for m2.
         let _ = leader_rx.recv().await.unwrap();
 
@@ -1101,9 +1138,9 @@ mod tests {
 
     #[tokio::test]
     async fn leader_handoff_on_leader_remove() {
-        let (h, _leader_rx, leader) = fresh().await;
-        let (m2_id, mut m2_rx) = add_member(&h, "b").await;
-        let (m3_id, mut m3_rx) = add_member(&h, "c").await;
+        let (h, sinks, _leader_rx, leader) = fresh().await;
+        let (m2_id, mut m2_rx) = add_member(&h, &sinks, "b").await;
+        let (m3_id, mut m3_rx) = add_member(&h, &sinks, "c").await;
         h.tx.send(GroupMsg::RemoveMember { member_id: leader })
             .await
             .unwrap();
@@ -1139,9 +1176,9 @@ mod tests {
         // V19: a single broadcast of Pause across the group; subsequent
         // BufferingStart from another member does NOT trigger a second
         // broadcast. Each broadcast = one Pause per member sink.
-        let (h, mut leader_rx, _leader) = fresh().await;
-        let (m2, mut m2_rx) = add_member(&h, "b").await;
-        let (m3, mut m3_rx) = add_member(&h, "c").await;
+        let (h, sinks, mut leader_rx, _leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "b").await;
+        let (m3, mut m3_rx) = add_member(&h, &sinks, "c").await;
 
         // Drain MemberJoined notifications.
         while leader_rx.try_recv().is_ok() {}
@@ -1195,8 +1232,8 @@ mod tests {
         // freshly-joined member must NOT be told to Play (which would
         // desync it from the paused cohort). The buffering pause freezes
         // playback state, so the late joiner's catch-up yields Seek+Pause.
-        let (h, mut leader_rx, leader) = fresh().await;
-        let (m2, mut _m2_rx) = add_member(&h, "b").await;
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut _m2_rx) = add_member(&h, &sinks, "b").await;
         while leader_rx.try_recv().is_ok() {}
 
         // Leader is playing.
@@ -1215,7 +1252,7 @@ mod tests {
         .unwrap();
 
         // Late joiner during the buffer-pause window.
-        let (_late, mut late_rx) = add_member(&h, "late").await;
+        let (_late, mut late_rx) = add_member(&h, &sinks, "late").await;
         // Collect a few messages; must include Pause and must NOT include Play.
         let mut saw_pause = false;
         let mut saw_play = false;
@@ -1236,8 +1273,8 @@ mod tests {
 
     #[tokio::test]
     async fn observe_clock_extends_lead_time_for_high_rtt() {
-        let (h, mut leader_rx, leader) = fresh().await;
-        let (_m2, _m2_rx) = add_member(&h, "b").await;
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_m2, _m2_rx) = add_member(&h, &sinks, "b").await;
         // Drain.
         while leader_rx.try_recv().is_ok() {}
 

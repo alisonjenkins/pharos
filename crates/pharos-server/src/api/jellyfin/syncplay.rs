@@ -14,7 +14,7 @@ use crate::api::jellyfin::auth_extractor::{AuthSession, AuthUser};
 use actix_web::{web, HttpResponse, Responder};
 use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::messages::{GroupId, MemberId};
-use pharos_sync::{GroupRegistry, SessionHub};
+use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -92,7 +92,12 @@ async fn dispatch(
 }
 
 /// Add the caller (from the hub) to `handle` as a member. Shared by New + Join.
-async fn add_caller_to_group(hub: &SessionHub, device_id: &str, handle: GroupHandle) {
+async fn add_caller_to_group(
+    hub: &SessionHub,
+    sinks: &MemberSinks,
+    device_id: &str,
+    handle: GroupHandle,
+) {
     let Some(sess) = hub.resolve(device_id) else {
         tracing::warn!(
             device_id = %device_id,
@@ -104,14 +109,16 @@ async fn add_caller_to_group(hub: &SessionHub, device_id: &str, handle: GroupHan
     // Record the group before AddMember so the wall-clock epoch is available
     // the instant the first catch-up command is broadcast to the socket.
     hub.attach_group(device_id, handle.clone());
-    let (reply_tx, reply_rx) = oneshot::channel();
     let member_id = sess.member_id;
+    // Register the socket's sink in the replica's delivery table before
+    // AddMember, so the actor's join catch-up reaches it.
+    sinks.insert(member_id, sess.sink);
+    let (reply_tx, reply_rx) = oneshot::channel();
     if handle
         .tx
         .send(GroupMsg::AddMember {
             member_id,
             name: sess.name.clone(),
-            sink: sess.sink,
             reply: reply_tx,
         })
         .await
@@ -187,6 +194,7 @@ struct ModeBody {
 async fn new_group(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    sinks: web::Data<MemberSinks>,
     registry: web::Data<GroupRegistry>,
     body: web::Bytes,
 ) -> HttpResponse {
@@ -211,7 +219,7 @@ async fn new_group(
     // terminates the moment it processes a message and finds no members, so a
     // brand-new (member-less) group must receive AddMember before anything else
     // (e.g. SetGroupName) — otherwise it dies before the creator ever joins.
-    add_caller_to_group(&hub, dev, handle.clone()).await;
+    add_caller_to_group(&hub, &sinks, dev, handle.clone()).await;
     let _ = handle.tx.send(GroupMsg::SetGroupName { name }).await;
     no_content()
 }
@@ -219,6 +227,7 @@ async fn new_group(
 async fn join_group(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    sinks: web::Data<MemberSinks>,
     registry: web::Data<GroupRegistry>,
     body: web::Json<JoinGroupBody>,
 ) -> HttpResponse {
@@ -230,7 +239,7 @@ async fn join_group(
         return no_content();
     };
     tracing::info!(device_id = %dev, group = %handle.group_id, "syncplay: Join group");
-    add_caller_to_group(&hub, dev, handle).await;
+    add_caller_to_group(&hub, &sinks, dev, handle).await;
     no_content()
 }
 
@@ -479,7 +488,9 @@ mod tests {
     #[actix_web::test]
     async fn syncplay_list_empty_when_no_groups() {
         let (state, token) = seed_auth().await;
-        let reg = web::Data::new(GroupRegistry::spawn());
+        let reg = web::Data::new(GroupRegistry::spawn(std::sync::Arc::new(
+            pharos_sync::LocalDelivery::new(pharos_sync::MemberSinks::new()),
+        )));
         let app =
             test::init_service(App::new().app_data(state).app_data(reg).configure(register)).await;
         let req = test::TestRequest::get()
@@ -495,7 +506,9 @@ mod tests {
     #[actix_web::test]
     async fn syncplay_list_returns_active_group() {
         let (state, token) = seed_auth().await;
-        let reg = GroupRegistry::spawn();
+        let reg = GroupRegistry::spawn(std::sync::Arc::new(pharos_sync::LocalDelivery::new(
+            pharos_sync::MemberSinks::new(),
+        )));
         let handle = reg.create().await.unwrap();
         // Group has zero members → snapshot may report 0; we don't
         // care about state here, only that the id surfaces.

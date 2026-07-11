@@ -20,17 +20,29 @@
 
 use pharos_sync::group::{GroupHandle, GroupMsg, Joined};
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
+use pharos_sync::{LocalDelivery, MemberSinks};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-async fn add_member(h: &GroupHandle, name: &str) -> (MemberId, mpsc::Receiver<ServerMsg>) {
+fn spawn_group() -> (GroupHandle, MemberSinks) {
+    let sinks = MemberSinks::new();
+    let h = GroupHandle::spawn(GroupId::new(), Arc::new(LocalDelivery::new(sinks.clone())));
+    (h, sinks)
+}
+
+async fn add_member(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    name: &str,
+) -> (MemberId, mpsc::Receiver<ServerMsg>) {
     let (tx, rx) = mpsc::channel(64);
     let mid = MemberId::new();
+    sinks.insert(mid, tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     h.tx.send(GroupMsg::AddMember {
         member_id: mid,
         name: name.into(),
-        sink: tx,
         reply: reply_tx,
     })
     .await
@@ -63,12 +75,12 @@ async fn drain_until_play(rx: &mut mpsc::Receiver<ServerMsg>) -> Option<(u64, u6
 /// matches the leader's.
 #[tokio::test]
 async fn play_anchor_propagates_with_zero_drift_across_five_members() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, _leader_rx) = add_member(&h, "leader").await;
-    let (_, mut m2_rx) = add_member(&h, "m2").await;
-    let (_, mut m3_rx) = add_member(&h, "m3").await;
-    let (_, mut m4_rx) = add_member(&h, "m4").await;
-    let (_, mut m5_rx) = add_member(&h, "m5").await;
+    let (h, sinks) = spawn_group();
+    let (leader, _leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (_, mut m2_rx) = add_member(&h, &sinks, "m2").await;
+    let (_, mut m3_rx) = add_member(&h, &sinks, "m3").await;
+    let (_, mut m4_rx) = add_member(&h, &sinks, "m4").await;
+    let (_, mut m5_rx) = add_member(&h, &sinks, "m5").await;
 
     // Leader fires Play at position 0.
     h.tx.send(GroupMsg::LeaderPlay {
@@ -116,10 +128,10 @@ async fn play_anchor_propagates_with_zero_drift_across_five_members() {
 /// shape as the Play test but after a Seek broadcast.
 #[tokio::test]
 async fn seek_anchor_propagates_with_zero_drift() {
-    let h = GroupHandle::spawn(GroupId::new());
-    let (leader, _leader_rx) = add_member(&h, "leader").await;
-    let (_, mut m2_rx) = add_member(&h, "m2").await;
-    let (_, mut m3_rx) = add_member(&h, "m3").await;
+    let (h, sinks) = spawn_group();
+    let (leader, _leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (_, mut m2_rx) = add_member(&h, &sinks, "m2").await;
+    let (_, mut m3_rx) = add_member(&h, &sinks, "m3").await;
 
     h.tx.send(GroupMsg::LeaderPlay {
         sender: leader,

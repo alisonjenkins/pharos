@@ -47,7 +47,9 @@ async fn seed() -> (
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
     let state = web::Data::new(AppState::new(stores, "smoke".into()));
-    let reg = web::Data::new(GroupRegistry::spawn());
+    let reg = web::Data::new(GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(pharos_sync::MemberSinks::new()),
+    )));
     (state, reg, token.0.expose().to_string(), uid)
 }
 
@@ -67,6 +69,7 @@ fn build_app(
         .app_data(state)
         .app_data(reg)
         .app_data(web::Data::new(pharos_sync::SessionHub::new()))
+        .app_data(web::Data::new(pharos_sync::MemberSinks::new()))
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
 }

@@ -128,13 +128,17 @@ fn build_app(
         InitError = (),
     >,
 > {
+    let member_sinks = pharos_sync::MemberSinks::new();
     App::new()
         .app_data(state)
         // SyncPlay handlers extract these; without them a missing-Data 500
         // would beat the pending 401 (extractors resolve in arg order), so the
         // auth audit for /SyncPlay/* needs them present to see the real 401.
-        .app_data(web::Data::new(pharos_sync::GroupRegistry::spawn()))
+        .app_data(web::Data::new(pharos_sync::GroupRegistry::spawn(
+            std::sync::Arc::new(pharos_sync::LocalDelivery::new(member_sinks.clone())),
+        )))
         .app_data(web::Data::new(pharos_sync::SessionHub::new()))
+        .app_data(web::Data::new(member_sinks))
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
 }

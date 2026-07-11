@@ -9,9 +9,20 @@
 
 use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::messages::{MemberId, ServerMsg};
-use pharos_sync::{GroupRegistry, SessionHub};
+use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// A hub + registry + shared `MemberSinks` wired exactly as the single-replica
+/// server does: the registry's groups deliver into the same sink table the
+/// `/socket` layer registers member sinks into.
+fn wiring() -> (SessionHub, GroupRegistry, MemberSinks) {
+    let hub = SessionHub::new();
+    let sinks = MemberSinks::new();
+    let registry = GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone())));
+    (hub, registry, sinks)
+}
 
 /// A simulated client: a member id + the receiving end of its sink.
 struct Client {
@@ -33,17 +44,18 @@ fn connect(hub: &SessionHub, device: &str, name: &str) -> Client {
 }
 
 /// Add a hub-registered session to `handle` — mirrors the HTTP New/Join
-/// handler's `add_caller_to_group`.
-async fn add_to_group(hub: &SessionHub, handle: &GroupHandle, device: &str) {
+/// handler's `add_caller_to_group`: register the sink into the replica's
+/// `MemberSinks`, then `AddMember`.
+async fn add_to_group(hub: &SessionHub, sinks: &MemberSinks, handle: &GroupHandle, device: &str) {
     let sess = hub.resolve(device).unwrap();
     hub.attach_group(device, handle.clone());
+    sinks.insert(sess.member_id, sess.sink);
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .tx
         .send(GroupMsg::AddMember {
             member_id: sess.member_id,
             name: sess.name,
-            sink: sess.sink,
             reply: reply_tx,
         })
         .await
@@ -77,16 +89,15 @@ fn is_play(m: &ServerMsg) -> bool {
 
 #[tokio::test]
 async fn two_sessions_start_in_lockstep_after_both_ready() {
-    let hub = SessionHub::new();
-    let registry = GroupRegistry::spawn();
+    let (hub, registry, sinks) = wiring();
 
     let mut a = connect(&hub, "devA", "ali");
     let mut b = connect(&hub, "devB", "gf");
 
     // A creates the group (leader) and both join — the HTTP New/Join flow.
     let handle = registry.create().await.unwrap();
-    add_to_group(&hub, &handle, &a.device).await;
-    add_to_group(&hub, &handle, &b.device).await;
+    add_to_group(&hub, &sinks, &handle, &a.device).await;
+    add_to_group(&hub, &sinks, &handle, &b.device).await;
 
     // A (leader) sets the queue → both get a PlayQueue and enter Waiting.
     handle
@@ -141,14 +152,13 @@ async fn silent_member_does_not_wedge_the_group() {
     // fire so the group starts anyway — a silent client can't block playback.
     // `start_paused` auto-advances tokio's clock to the gate deadline, so the
     // 5 s timeout resolves instantly instead of stalling the test.
-    let hub = SessionHub::new();
-    let registry = GroupRegistry::spawn();
+    let (hub, registry, sinks) = wiring();
     let mut a = connect(&hub, "devA", "ali");
     let mut b = connect(&hub, "devB", "gf");
 
     let handle = registry.create().await.unwrap();
-    add_to_group(&hub, &handle, &a.device).await;
-    add_to_group(&hub, &handle, &b.device).await;
+    add_to_group(&hub, &sinks, &handle, &a.device).await;
+    add_to_group(&hub, &sinks, &handle, &b.device).await;
 
     handle
         .tx
@@ -186,14 +196,13 @@ async fn late_joiner_does_not_advance_the_queue() {
     // The "a joiner skips everyone to the next episode" guard: a member joining
     // mid-playback receives the CURRENT queue position, never advances it, and
     // cannot advance it (non-leader NextItem is rejected).
-    let hub = SessionHub::new();
-    let registry = GroupRegistry::spawn();
+    let (hub, registry, sinks) = wiring();
     let mut a = connect(&hub, "devA", "ali");
     let mut b = connect(&hub, "devB", "gf");
 
     let handle = registry.create().await.unwrap();
-    add_to_group(&hub, &handle, &a.device).await;
-    add_to_group(&hub, &handle, &b.device).await;
+    add_to_group(&hub, &sinks, &handle, &a.device).await;
+    add_to_group(&hub, &sinks, &handle, &b.device).await;
 
     handle
         .tx
@@ -222,7 +231,7 @@ async fn late_joiner_does_not_advance_the_queue() {
 
     // A third member joins mid-playback.
     let mut c = connect(&hub, "devC", "friend");
-    add_to_group(&hub, &handle, &c.device).await;
+    add_to_group(&hub, &sinks, &handle, &c.device).await;
 
     // The joiner gets the queue at the CURRENT index (0), not advanced.
     let q = recv_until(&mut c, |m| matches!(m, ServerMsg::PlayQueue { .. })).await;
@@ -269,14 +278,13 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
     // hub keeps the member id + group, and an UpdateSink re-points the group at
     // the new socket + re-syncs it. Without this, commands broadcast to a dead
     // sink and playback never syncs.
-    let hub = SessionHub::new();
-    let registry = GroupRegistry::spawn();
+    let (hub, registry, sinks) = wiring();
     let mut a = connect(&hub, "devA", "ali");
     let mut b = connect(&hub, "devB", "gf");
 
     let handle = registry.create().await.unwrap();
-    add_to_group(&hub, &handle, &a.device).await;
-    add_to_group(&hub, &handle, &b.device).await;
+    add_to_group(&hub, &sinks, &handle, &a.device).await;
+    add_to_group(&hub, &sinks, &handle, &b.device).await;
     handle
         .tx
         .send(GroupMsg::SetNewQueue {
@@ -303,7 +311,8 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
 
     // B's socket reconnects: SAME device, a NEW sink. The hub returns the
     // existing member id + group (not a fresh member); the socket then re-points
-    // the group at its new sink via UpdateSink.
+    // the group at its new sink: re-register the fresh sink in the replica's
+    // MemberSinks, then ResyncMember re-sends the catch-up.
     let (new_tx, mut new_rx) = mpsc::channel(64);
     let reg = hub.register("devB".to_string(), "gf".to_string(), new_tx);
     assert_eq!(
@@ -311,11 +320,11 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
         "member id stable across reconnect"
     );
     let group = reg.group.expect("reconnect sees the existing group");
+    sinks.insert(b.member_id, hub.resolve("devB").unwrap().sink);
     group
         .tx
-        .send(GroupMsg::UpdateSink {
+        .send(GroupMsg::ResyncMember {
             member_id: b.member_id,
-            sink: hub.resolve("devB").unwrap().sink,
         })
         .await
         .unwrap();
