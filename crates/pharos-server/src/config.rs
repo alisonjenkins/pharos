@@ -387,7 +387,8 @@ impl Config {
     }
 
     /// Override fields from environment vars. Prefix `PHAROS_`.
-    /// Recognized: `PHAROS_BIND`, `PHAROS_LOG_LEVEL`, `PHAROS_OTLP_ENDPOINT`.
+    /// Recognized: `PHAROS_BIND`, `PHAROS_LOG_LEVEL`, `PHAROS_OTLP_ENDPOINT`,
+    /// `PHAROS_DATABASE_URL`.
     pub fn apply_env(mut self) -> Self {
         if let Ok(v) = std::env::var("PHAROS_BIND") {
             self.server.bind = v;
@@ -397,6 +398,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PHAROS_OTLP_ENDPOINT") {
             self.obs.otlp_endpoint = Some(v);
+        }
+        // Lets the DB connection string (incl. a generated Postgres password)
+        // be injected from a Secret at runtime instead of baked into config.toml
+        // — so no credential lands in git. Overrides `[database].url`.
+        if let Ok(v) = std::env::var("PHAROS_DATABASE_URL") {
+            self.database.url = v;
         }
         self
     }
@@ -452,13 +459,19 @@ mod tests {
         std::env::set_var("PHAROS_BIND", "1.2.3.4:9000");
         std::env::set_var("PHAROS_LOG_LEVEL", "trace");
         std::env::set_var("PHAROS_OTLP_ENDPOINT", "http://otel:4317");
+        std::env::set_var(
+            "PHAROS_DATABASE_URL",
+            "postgresql://u:p@pharos-db-rw:5432/pharos",
+        );
         let c = Config::from_toml_str(SAMPLE).unwrap().apply_env();
         assert_eq!(c.server.bind, "1.2.3.4:9000");
         assert_eq!(c.obs.log_level, "trace");
         assert_eq!(c.obs.otlp_endpoint.as_deref(), Some("http://otel:4317"));
+        assert_eq!(c.database.url, "postgresql://u:p@pharos-db-rw:5432/pharos");
         std::env::remove_var("PHAROS_BIND");
         std::env::remove_var("PHAROS_LOG_LEVEL");
         std::env::remove_var("PHAROS_OTLP_ENDPOINT");
+        std::env::remove_var("PHAROS_DATABASE_URL");
     }
 
     #[test]
