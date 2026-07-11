@@ -103,6 +103,11 @@ spec:
             - name: PHAROS_OTLP_ENDPOINT
               value: {{ .Values.config.obs.otlpEndpoint | quote }}
             {{- end }}
+            {{- with .Values.extraEnv }}
+            # Extra env (e.g. PHAROS_DATABASE_URL from a Secret so a generated
+            # Postgres password never lands in config.toml / git).
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8096

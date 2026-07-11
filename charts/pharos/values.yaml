@@ -34,6 +34,16 @@ strategy:
 # immediately, then serves in-flight requests during the grace window.
 terminationGracePeriodSeconds: 60
 
+# Extra container env vars (raw list). Use to inject PHAROS_DATABASE_URL from a
+# Secret (e.g. a CloudNativePG-generated app secret) so a Postgres password is
+# never written into config.toml / git. Overrides [database].url at runtime.
+extraEnv: []
+#  - name: PHAROS_DATABASE_URL
+#    valueFrom:
+#      secretKeyRef:
+#        name: pharos-db-app
+#        key: uri
+
 # ── pharos config.toml, rendered into a ConfigMap mounted at
 #    /etc/pharos/config.toml. Optional fields are omitted when null/empty.
 config:
