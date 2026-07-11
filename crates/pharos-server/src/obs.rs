@@ -76,6 +76,7 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
                 .with(fmt_layer)
                 .with(otel_layer)
                 .try_init();
+            install_panic_hook();
             PrometheusBuilder::new()
                 .install_recorder()
                 .map_err(|e| ObsError::Prom(e.to_string()))
@@ -87,6 +88,37 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
         Some(Err(e)) => Err(e.clone()),
         None => Err(ObsError::Prom("init race: result not set".into())),
     }
+}
+
+/// Route panics — including background `tokio::spawn` task panics that the
+/// runtime otherwise SILENTLY swallows — into a structured `ERROR` tracing
+/// event, so they surface in Loki + the OTLP traces instead of only stderr. The
+/// previous default hook is chained (keeps the stderr message + any backtrace).
+///
+/// This is how a panicking background actor (e.g. the SyncPlay group actor)
+/// becomes visible rather than the task just vanishing.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        let thread = std::thread::current();
+        tracing::error!(
+            panic.message = %message,
+            panic.location = %location,
+            panic.thread = thread.name().unwrap_or("unnamed"),
+            "a thread/task panicked"
+        );
+        default_hook(info);
+    }));
 }
 
 /// Build the OTLP/gRPC span-export layer pointed at `endpoint`, registering
