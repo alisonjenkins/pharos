@@ -14,6 +14,7 @@
 //!   handler can authenticate without depending on the server crate
 
 pub mod bus;
+pub mod bus_delivery;
 pub mod clock;
 pub mod delivery;
 pub mod group;
@@ -25,6 +26,7 @@ pub mod registry;
 pub mod ws;
 
 pub use bus::{BusError, LocalSyncBus, SyncBus};
+pub use bus_delivery::{spawn_ingress, BusDelivery, BusMsg};
 pub use delivery::{Delivery, LocalDelivery, MemberSinks};
 pub use host::TokenResolver;
 pub use hub::{ResolvedSession, SessionHub};
