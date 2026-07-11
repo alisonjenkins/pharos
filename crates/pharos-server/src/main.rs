@@ -86,6 +86,8 @@ async fn main() -> Result<(), AppError> {
             AdminOp::SeedPlaywrightUser => seed_playwright_user(&cfg).await?,
             #[cfg(debug_assertions)]
             AdminOp::CreatePlaywrightUser => create_playwright_user(&cfg).await?,
+            #[cfg(feature = "postgres")]
+            AdminOp::DbMigrate { to } => db_migrate(&cfg, &to).await?,
         },
     }
     Ok(())
@@ -344,6 +346,49 @@ async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     writeln!(lock, "reset password for user '{name}'")?;
+    Ok(())
+}
+
+/// One-shot cutover: copy every domain table from the currently-configured
+/// SQLite store into `to` (a Postgres URL), then report per-table row
+/// counts. `to`'s schema is created automatically (`PostgresStore::connect`
+/// runs the postgres migrations), but the target must be an EMPTY database
+/// — the copy inserts into every table, so a pre-populated target would
+/// collide (see `cli::AdminOp::DbMigrate`).
+#[cfg(feature = "postgres")]
+async fn db_migrate(cfg: &Config, to: &str) -> Result<(), AppError> {
+    use pharos_store_sqlx::{
+        migrate::migrate_sqlite_to_postgres, postgres::PostgresStore, sqlite::SqliteStore,
+    };
+
+    if cfg.database.url.starts_with("postgres://") || cfg.database.url.starts_with("postgresql://")
+    {
+        return Err(AppError::Io(std::io::Error::other(format!(
+            "db-migrate source must be the SQLite store, but [database].url is already \
+             postgres: '{}'",
+            cfg.database.url
+        ))));
+    }
+
+    let src = SqliteStore::connect(&cfg.database.url).await?;
+    let dst = PostgresStore::connect(to).await?;
+
+    let report = migrate_sqlite_to_postgres(&src, &dst)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(format!("migration failed: {e}"))))?;
+
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let mut total = 0u64;
+    for (table, rows) in &report.tables {
+        writeln!(lock, "{table}: {rows} rows")?;
+        total += rows;
+    }
+    writeln!(
+        lock,
+        "migration complete: {total} rows across {} tables",
+        report.tables.len()
+    )?;
     Ok(())
 }
 

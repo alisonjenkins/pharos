@@ -20,6 +20,9 @@ pub mod postgres;
 #[cfg(all(feature = "sqlite", feature = "postgres"))]
 pub mod any;
 
+#[cfg(all(feature = "sqlite", feature = "postgres"))]
+pub mod migrate;
+
 // Server-wide config / identity persistence trait, shared by both
 // backends (not a pharos-core domain trait — see module docs).
 pub mod server_config;

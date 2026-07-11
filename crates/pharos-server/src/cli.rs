@@ -85,6 +85,16 @@ pub enum AdminOp {
     /// `create-user` in production.
     #[cfg(debug_assertions)]
     CreatePlaywrightUser,
+    /// Migrate all data from the current (SQLite) store into a target
+    /// Postgres database. The target's schema is created automatically
+    /// (postgres migrations run on connect). Idempotent only against an
+    /// empty target — intended as a one-shot cutover step.
+    #[cfg(feature = "postgres")]
+    DbMigrate {
+        /// Target Postgres URL, e.g. postgres://user:pass@host/db
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[cfg(test)]
