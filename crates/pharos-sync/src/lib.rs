@@ -20,6 +20,7 @@ pub mod group;
 pub mod host;
 pub mod hub;
 pub mod messages;
+pub mod persistence;
 pub mod registry;
 pub mod ws;
 
@@ -28,4 +29,5 @@ pub use delivery::{Delivery, LocalDelivery, MemberSinks};
 pub use host::TokenResolver;
 pub use hub::{ResolvedSession, SessionHub};
 pub use messages::{ClientMsg, ErrorCode, GroupId, MemberId, MemberSummary, ServerMsg};
+pub use persistence::GroupPersistence;
 pub use registry::GroupRegistry;

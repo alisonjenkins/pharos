@@ -13,6 +13,8 @@ use super::delivery::Delivery;
 use super::messages::{
     ErrorCode, GroupId, GroupPlayState, MemberId, MemberSummary, QueueItemInfo, ServerMsg,
 };
+use super::persistence::GroupPersistence;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -257,10 +259,19 @@ struct GroupState {
     /// single-replica path (straight to local sinks); `BusDelivery` under
     /// Postgres (publish to every replica). The actor never touches sinks.
     delivery: Arc<dyn Delivery>,
+    /// Where the group snapshot is persisted after each mutation (Phase B4.3c).
+    /// `None` on the single-replica / SQLite path (groups never leave the
+    /// process); `Some` under Postgres so another replica can take over.
+    persistence: Option<Arc<dyn GroupPersistence>>,
 }
 
 impl GroupState {
-    fn new(id: GroupId, epoch_unix_ms: u64, delivery: Arc<dyn Delivery>) -> Self {
+    fn new(
+        id: GroupId,
+        epoch_unix_ms: u64,
+        delivery: Arc<dyn Delivery>,
+        persistence: Option<Arc<dyn GroupPersistence>>,
+    ) -> Self {
         Self {
             id,
             epoch_unix_ms,
@@ -272,6 +283,19 @@ impl GroupState {
             waiting: None,
             group_name: "Watch Party".to_string(),
             delivery,
+            persistence,
+        }
+    }
+
+    /// Write the current snapshot to the persistence sink (fire-and-forget).
+    /// No-op when persistence isn't wired (single-replica path). A serialize
+    /// failure (not reachable for this plain data) simply skips the write; the
+    /// next mutation re-attempts.
+    fn persist(&self) {
+        if let Some(p) = &self.persistence {
+            if let Ok(json) = serde_json::to_string(&self.to_persist()) {
+                p.persist(self.id, self.epoch_unix_ms, json);
+            }
         }
     }
 
@@ -491,6 +515,161 @@ impl GroupState {
         out.sort_by_key(|s| s.member_id);
         out
     }
+
+    /// Serialize the whole coordination state to the opaque blob the store
+    /// holds (Phase B4.3c). Per-connection data that a re-hydrating replica
+    /// re-derives is deliberately dropped: each member's clock offset (re-
+    /// estimated from fresh NTP pings on reconnect) and buffering flag (reset —
+    /// the client re-reports). The readiness-gate deadline (a `tokio::Instant`,
+    /// neither serializable nor portable) is reconstructed on hydrate.
+    fn to_persist(&self) -> PersistState {
+        PersistState {
+            members: self
+                .members
+                .iter()
+                .map(|(id, m)| PersistMember {
+                    id: *id,
+                    name: m.name.clone(),
+                })
+                .collect(),
+            leader: self.leader,
+            group_paused_due_to_buffering: self.group_paused_due_to_buffering,
+            playback: match self.playback {
+                PlaybackState::Idle => PersistPlayback::Idle,
+                PlaybackState::Playing {
+                    position_ms,
+                    anchor_server_ms,
+                } => PersistPlayback::Playing {
+                    position_ms,
+                    anchor_server_ms,
+                },
+                PlaybackState::Paused { position_ms } => PersistPlayback::Paused { position_ms },
+            },
+            queue_items: self
+                .queue
+                .items
+                .iter()
+                .map(|e| PersistQueueItem {
+                    item_id: e.item_id.clone(),
+                    playlist_item_id: e.playlist_item_id.clone(),
+                })
+                .collect(),
+            playing_index: self.queue.playing_index,
+            repeat_mode: self.queue.repeat_mode.clone(),
+            shuffle_mode: self.queue.shuffle_mode.clone(),
+            waiting: self.waiting.as_ref().map(|w| PersistWaiting {
+                pending: w.pending.iter().copied().collect(),
+                resume_playing: w.resume_playing,
+                position_ms: w.position_ms,
+            }),
+            group_name: self.group_name.clone(),
+        }
+    }
+
+    /// Rebuild a group's state from a persisted snapshot (the takeover path).
+    /// Members are restored with fresh clock offsets + cleared buffering flags;
+    /// a still-open readiness gate gets a fresh deadline so the anti-wedge
+    /// timeout still fires on the new owner.
+    fn apply_persist(&mut self, ps: PersistState) {
+        self.members = ps
+            .members
+            .into_iter()
+            .map(|m| {
+                (
+                    m.id,
+                    MemberRec {
+                        name: m.name,
+                        offset: ClockOffset::default(),
+                        buffering: false,
+                    },
+                )
+            })
+            .collect();
+        self.leader = ps.leader;
+        self.group_paused_due_to_buffering = ps.group_paused_due_to_buffering;
+        self.playback = match ps.playback {
+            PersistPlayback::Idle => PlaybackState::Idle,
+            PersistPlayback::Playing {
+                position_ms,
+                anchor_server_ms,
+            } => PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms,
+            },
+            PersistPlayback::Paused { position_ms } => PlaybackState::Paused { position_ms },
+        };
+        self.queue.items = ps
+            .queue_items
+            .into_iter()
+            .map(|e| QueueEntry {
+                item_id: e.item_id,
+                playlist_item_id: e.playlist_item_id,
+            })
+            .collect();
+        self.queue.playing_index = ps.playing_index;
+        self.queue.repeat_mode = ps.repeat_mode;
+        self.queue.shuffle_mode = ps.shuffle_mode;
+        self.waiting = ps.waiting.map(|w| WaitingGate {
+            pending: w.pending.into_iter().collect(),
+            resume_playing: w.resume_playing,
+            position_ms: w.position_ms,
+            deadline: tokio::time::Instant::now()
+                + std::time::Duration::from_millis(READY_TIMEOUT_MS),
+        });
+        self.group_name = ps.group_name;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persisted snapshot (Phase B4.3c). Mirrors `GroupState` minus per-connection
+// data (sinks, clock offsets, buffering flags) and the non-portable readiness
+// deadline — everything a re-hydrating replica re-derives. Serialized to the
+// opaque `state_json` the store holds.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct PersistMember {
+    id: MemberId,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+enum PersistPlayback {
+    Idle,
+    Playing {
+        position_ms: u64,
+        anchor_server_ms: u64,
+    },
+    Paused {
+        position_ms: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistQueueItem {
+    item_id: String,
+    playlist_item_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistWaiting {
+    pending: Vec<MemberId>,
+    resume_playing: bool,
+    position_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistState {
+    members: Vec<PersistMember>,
+    leader: Option<MemberId>,
+    group_paused_due_to_buffering: bool,
+    playback: PersistPlayback,
+    queue_items: Vec<PersistQueueItem>,
+    playing_index: usize,
+    repeat_mode: String,
+    shuffle_mode: String,
+    waiting: Option<PersistWaiting>,
+    group_name: String,
 }
 
 #[derive(Clone)]
@@ -510,18 +689,56 @@ pub struct GroupHandle {
 
 impl GroupHandle {
     /// Spawn a fresh group actor delivering through `delivery` (local sinks on
-    /// a single replica, the cross-replica bus under Postgres).
+    /// a single replica, the cross-replica bus under Postgres). No persistence.
     pub fn spawn(group_id: GroupId, delivery: Arc<dyn Delivery>) -> Self {
+        Self::spawn_inner(group_id, unix_now_ms(), delivery, None, None)
+    }
+
+    /// Spawn a group actor that persists its snapshot after every mutation, and
+    /// optionally hydrates its initial state from a prior snapshot (the takeover
+    /// path: another replica owned this group before a deploy). `epoch_unix_ms`
+    /// must be the group's persisted origin so scheduling stays absolute across
+    /// the handoff; for a brand-new group pass `unix_now_ms()`.
+    pub fn spawn_persistent(
+        group_id: GroupId,
+        epoch_unix_ms: u64,
+        delivery: Arc<dyn Delivery>,
+        persistence: Arc<dyn GroupPersistence>,
+        hydrate_from: Option<&str>,
+    ) -> Self {
+        let hydrated =
+            hydrate_from.and_then(|json| serde_json::from_str::<PersistState>(json).ok());
+        Self::spawn_inner(
+            group_id,
+            epoch_unix_ms,
+            delivery,
+            Some(persistence),
+            hydrated,
+        )
+    }
+
+    fn spawn_inner(
+        group_id: GroupId,
+        epoch_unix_ms: u64,
+        delivery: Arc<dyn Delivery>,
+        persistence: Option<Arc<dyn GroupPersistence>>,
+        hydrate: Option<PersistState>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<GroupMsg>(256);
-        let epoch_unix_ms = unix_now_ms();
-        let mut state = GroupState::new(group_id, epoch_unix_ms, delivery);
+        let mut state = GroupState::new(group_id, epoch_unix_ms, delivery, persistence);
+        // A hydrated takeover starts already populated, so it must not treat
+        // itself as brand-new (which would terminate on the first empty check).
+        let mut ever_joined = false;
+        if let Some(ps) = hydrate {
+            state.apply_persist(ps);
+            ever_joined = !state.members.is_empty();
+        }
         tokio::spawn(async move {
             // A brand-new group has no members yet — it must NOT terminate on
             // the empty check before its creator's AddMember lands (else a New
             // that sends anything first, e.g. SetGroupName, kills the group
             // before anyone joins). Only terminate once it has HAD a member and
             // then lost the last one.
-            let mut ever_joined = false;
             loop {
                 // Arm the readiness-gate timeout only while waiting, so a
                 // silent/wedged member can never block the group forever.
@@ -529,7 +746,13 @@ impl GroupHandle {
                 tokio::select! {
                     maybe = rx.recv() => {
                         let Some(msg) = maybe else { break };
+                        // Snapshot/ObserveClock don't change persisted state;
+                        // skip a write for them (ObserveClock is high-frequency).
+                        let mutates = !matches!(msg, GroupMsg::Snapshot { .. } | GroupMsg::ObserveClock { .. });
                         handle(&mut state, msg).await;
+                        if mutates {
+                            state.persist();
+                        }
                     }
                     _ = async {
                         // `deadline` is Some in this arm (guarded below).
@@ -539,12 +762,17 @@ impl GroupHandle {
                         // start anyway (anti-wedge). They re-sync via their own
                         // drift correction.
                         state.resolve_waiting();
+                        state.persist();
                     }
                 }
                 ever_joined |= !state.members.is_empty();
                 if ever_joined && state.members.is_empty() {
                     // Had members, now empty → terminate. Registry respawns on
-                    // the next Join.
+                    // the next Join. Drop the persisted snapshot so a stale group
+                    // can't be re-hydrated after everyone has left.
+                    if let Some(p) = &state.persistence {
+                        p.remove(state.id);
+                    }
                     break;
                 }
             }
@@ -924,6 +1152,7 @@ mod tests {
 
     use super::*;
     use crate::delivery::{LocalDelivery, MemberSinks};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     /// Spawn a group whose delivery goes to an in-process `MemberSinks`, the
@@ -934,6 +1163,27 @@ mod tests {
         let delivery = Arc::new(LocalDelivery::new(sinks.clone()));
         let h = GroupHandle::spawn(GroupId::new(), delivery);
         (h, sinks)
+    }
+
+    /// Test persistence sink: captures the latest snapshot the actor wrote, so a
+    /// second (hydrated) actor can be built from it — modelling takeover.
+    #[derive(Default)]
+    struct CapturePersistence {
+        latest: Mutex<Option<(GroupId, u64, String)>>,
+    }
+    impl GroupPersistence for CapturePersistence {
+        fn persist(&self, group_id: GroupId, epoch_unix_ms: u64, state_json: String) {
+            *self.latest.lock().unwrap() = Some((group_id, epoch_unix_ms, state_json));
+        }
+        fn remove(&self, _group_id: GroupId) {
+            *self.latest.lock().unwrap() = None;
+        }
+    }
+
+    async fn snapshot_of(h: &GroupHandle) -> GroupSnapshot {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(GroupMsg::Snapshot { reply: tx }).await.unwrap();
+        rx.await.unwrap()
     }
 
     /// Register `mid`'s sink in `sinks` (as the socket layer does) then send
@@ -1319,5 +1569,72 @@ mod tests {
             }
             other => panic!("expected Play, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_persists_and_hydrates_onto_a_new_replica() {
+        // Phase B4.3c: drive a group through real mutations on "replica A",
+        // capturing each persisted snapshot; then spawn a fresh actor on
+        // "replica B" hydrated from that snapshot (the deploy takeover) and
+        // assert the coordination state — leader, roster, queue, playback,
+        // group name — carried across.
+        let cap = Arc::new(CapturePersistence::default());
+        let sinks_a = MemberSinks::new();
+        let gid = GroupId::new();
+        let epoch = unix_now_ms();
+        let a = GroupHandle::spawn_persistent(
+            gid,
+            epoch,
+            Arc::new(LocalDelivery::new(sinks_a.clone())),
+            cap.clone(),
+            None,
+        );
+
+        // Two members; leader sets a queue and starts playing.
+        let leader = MemberId::new();
+        let _lr = join(&a, &sinks_a, leader, "leader").await;
+        let m2 = MemberId::new();
+        let _r2 = join(&a, &sinks_a, m2, "gf").await;
+        a.tx.send(GroupMsg::SetGroupName {
+            name: "Movie Night".into(),
+        })
+        .await
+        .unwrap();
+        a.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["ep1".into(), "ep2".into()],
+            playing_index: 1,
+            start_position_ms: 4200,
+        })
+        .await
+        .unwrap();
+        // Drain the actor by round-tripping a Snapshot so all writes landed.
+        let snap_a = snapshot_of(&a).await;
+
+        // Grab the last persisted blob (the takeover source).
+        let (cap_gid, cap_epoch, json) = cap.latest.lock().unwrap().clone().expect("persisted");
+        assert_eq!(cap_gid, gid);
+        assert_eq!(cap_epoch, epoch, "epoch persisted for a stable time base");
+
+        // Replica B hydrates a fresh actor from the snapshot. Its members'
+        // sinks re-register on THIS replica (reconnect), but for the state
+        // assertion we only need the roster/queue/leader to have carried over.
+        let sinks_b = MemberSinks::new();
+        let b = GroupHandle::spawn_persistent(
+            gid,
+            cap_epoch,
+            Arc::new(LocalDelivery::new(sinks_b)),
+            cap.clone(),
+            Some(&json),
+        );
+        let snap_b = snapshot_of(&b).await;
+
+        assert_eq!(snap_b.leader, Some(leader), "leader survived takeover");
+        assert_eq!(snap_b.member_count, 2, "roster survived takeover");
+        assert_eq!(snap_b.group_name, "Movie Night");
+        assert_eq!(snap_b.play_state, snap_a.play_state);
+        let mut names = snap_b.participants.clone();
+        names.sort();
+        assert_eq!(names, vec!["gf".to_string(), "leader".to_string()]);
     }
 }
