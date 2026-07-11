@@ -620,6 +620,76 @@ impl ImageCache {
         Ok(())
     }
 
+    /// Enforce a soft byte cap on the whole cache tree: recount every file,
+    /// and if the total exceeds `max_bytes`, delete the oldest (by mtime)
+    /// until back under. `max_bytes == 0` disables the cap (no-op) and returns
+    /// 0. Returns the resulting total bytes.
+    ///
+    /// Unlike an in-memory LRU (which forgets pre-existing files across a
+    /// restart), recounting the disk each pass stays correct over restarts and
+    /// across every write path — fetch / scaled_artwork / attachment /
+    /// chapter / upload — without instrumenting any of them. Eviction is by
+    /// mtime (oldest-written first): true atime-LRU is unreliable under
+    /// relatime/noatime, and an evicted image is cheap to re-extract on the
+    /// next request (V6: a miss is never fatal). Intended to run periodically
+    /// from a background janitor, not on the request path.
+    pub async fn enforce_cap(&self, max_bytes: u64) -> u64 {
+        if max_bytes == 0 {
+            return 0;
+        }
+        struct Scan {
+            path: PathBuf,
+            size: u64,
+            mtime: std::time::SystemTime,
+        }
+        let mut files: Vec<Scan> = Vec::new();
+        let mut total: u64 = 0;
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else if meta.is_file() {
+                    let size = meta.len();
+                    total = total.saturating_add(size);
+                    files.push(Scan {
+                        path: entry.path(),
+                        size,
+                        mtime: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    });
+                }
+            }
+        }
+        if total <= max_bytes {
+            return total;
+        }
+        // Oldest first — evict until under the cap.
+        files.sort_by_key(|f| f.mtime);
+        let mut evicted: u64 = 0;
+        for f in files {
+            if total <= max_bytes {
+                break;
+            }
+            if tokio::fs::remove_file(&f.path).await.is_ok() {
+                total = total.saturating_sub(f.size);
+                evicted = evicted.saturating_add(f.size);
+            }
+        }
+        tracing::info!(
+            evicted_bytes = evicted,
+            remaining_bytes = total,
+            cap_bytes = max_bytes,
+            "image cache: cap enforced"
+        );
+        total
+    }
+
     async fn extract(
         &self,
         source: &Path,
@@ -826,6 +896,46 @@ mod tests {
             .fetch(99, ImageRole::Logo, MediaKind::Movie, Path::new("/n"), 0)
             .await;
         assert!(matches!(res, Err(ImageCacheError::UploadOnly)));
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_zero_is_a_noop() {
+        let td = tempfile::TempDir::new().unwrap();
+        let cache = ImageCache::new(td.path());
+        let dir = td.path().join("primary").join("movie");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("1.jpg"), vec![0u8; 1000])
+            .await
+            .unwrap();
+        // 0 = unbounded: nothing is scanned or deleted.
+        assert_eq!(cache.enforce_cap(0).await, 0);
+        assert!(tokio::fs::try_exists(dir.join("1.jpg")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_oldest_until_under_the_cap() {
+        let td = tempfile::TempDir::new().unwrap();
+        let cache = ImageCache::new(td.path());
+        let dir = td.path().join("primary").join("movie");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Three 1000-byte files, oldest → newest, with a gap so mtimes order.
+        for name in ["old.jpg", "mid.jpg", "new.jpg"] {
+            tokio::fs::write(dir.join(name), vec![0u8; 1000])
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        // Cap at 2000 bytes: must evict the single oldest file.
+        let total = cache.enforce_cap(2000).await;
+        assert!(total <= 2000, "should be under cap, got {total}");
+        assert!(
+            !tokio::fs::try_exists(dir.join("old.jpg")).await.unwrap(),
+            "oldest file evicted first"
+        );
+        assert!(
+            tokio::fs::try_exists(dir.join("new.jpg")).await.unwrap(),
+            "newest file kept"
+        );
     }
 
     #[tokio::test]

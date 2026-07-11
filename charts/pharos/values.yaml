@@ -30,6 +30,10 @@ config:
     # Caches live under the cache volume (see persistence.cache).
     imageCacheDir: "/var/lib/pharos/cache/images"
     imageSeekSeconds: 30
+    # Soft cap (bytes) on the extracted-image cache; 0 = unbounded. A periodic
+    # janitor evicts oldest-first once exceeded. Set it on large libraries so
+    # posters/backdrops/thumbs can't slowly fill the shared cache volume.
+    imageCacheMaxBytes: 0
     transcodeCacheDir: "/var/lib/pharos/cache/transcode"
     transcodeCacheMaxBytes: 1073741824      # 1 GiB
     trickplayCacheDir: "/var/lib/pharos/cache/trickplay"

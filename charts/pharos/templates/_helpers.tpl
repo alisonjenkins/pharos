@@ -58,6 +58,7 @@ ui_dir = {{ $s.uiDir | quote }}
 image_cache_dir = {{ $s.imageCacheDir | quote }}
 {{- end }}
 image_seek_seconds = {{ $s.imageSeekSeconds | int64 }}
+image_cache_max_bytes = {{ $s.imageCacheMaxBytes | int64 }}
 {{- if $s.transcodeCacheDir }}
 transcode_cache_dir = {{ $s.transcodeCacheDir | quote }}
 {{- end }}

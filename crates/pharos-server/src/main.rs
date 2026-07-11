@@ -583,6 +583,30 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             state = state.with_trickplay_priority(prio);
         }
     }
+    // Cap the extracted-image cache. Unlike the trickplay/HLS caches it has no
+    // in-line eviction, so on a large library posters/backdrops/thumbs/scaled
+    // artwork can slowly fill the shared cache volume. A periodic janitor
+    // recounts the tree and evicts the oldest files once it exceeds the cap
+    // (evicted images are re-extracted on next request). Disabled when the cap
+    // is 0 (unbounded — the historical behaviour).
+    if cfg.server.image_cache_max_bytes > 0 {
+        if let Some(images) = state.images.clone() {
+            let cap = cfg.server.image_cache_max_bytes;
+            tokio::spawn(async move {
+                // Warm up, then sweep every 10 minutes.
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+                loop {
+                    tick.tick().await;
+                    images.enforce_cap(cap).await;
+                }
+            });
+            tracing::info!(
+                cap_bytes = cfg.server.image_cache_max_bytes,
+                "image cache janitor enabled"
+            );
+        }
+    }
     if let Some(backend) = build_live_tv_backend(
         cfg.server.live_tv_m3u.clone(),
         cfg.server.live_tv_xmltv.clone(),

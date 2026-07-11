@@ -30,6 +30,15 @@ pub struct ServerConfig {
     /// yields no frame and the image 404s).
     #[serde(default = "default_image_seek_seconds")]
     pub image_seek_seconds: u32,
+    /// Soft cap on the extracted-image cache (posters / backdrops / thumbs /
+    /// scaled sidecar artwork / chapter thumbs), in bytes. `0` = unbounded
+    /// (no janitor — the historical behaviour). When non-zero a periodic
+    /// sweep recounts the cache tree and deletes the oldest files once it
+    /// exceeds the cap; evicted images are re-extracted on next request
+    /// (V6: never fatal). Default 0. Set it on large libraries so the image
+    /// cache can't slowly fill the shared cache volume.
+    #[serde(default)]
+    pub image_cache_max_bytes: u64,
     /// Directory used to cache transcoded HLS segments (T42). When
     /// unset, segments stream live without persisting — every request
     /// spawns ffmpeg.
