@@ -195,6 +195,29 @@ impl MediaStoreExt {
     }
 }
 
+/// Create a dedicated, guaranteed-empty target database for the migrate test,
+/// isolated from the shared conformance database. Connects to the `postgres`
+/// maintenance DB on the same server, drops+recreates `pharos_migrate_roundtrip`,
+/// and returns its URL.
+async fn fresh_target_db(pg_url: &str) -> String {
+    use sqlx::Connection;
+    let (base, _shared_db) = pg_url.rsplit_once('/').expect("postgres url has a db path");
+    let db = "pharos_migrate_roundtrip";
+    let mut admin = sqlx::postgres::PgConnection::connect(&format!("{base}/postgres"))
+        .await
+        .expect("connect postgres maintenance db");
+    // DROP/CREATE DATABASE cannot run inside a transaction — execute directly.
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
+        .execute(&mut admin)
+        .await
+        .expect("drop stale target db");
+    sqlx::query(&format!("CREATE DATABASE {db}"))
+        .execute(&mut admin)
+        .await
+        .expect("create target db");
+    format!("{base}/{db}")
+}
+
 #[tokio::test]
 async fn migrate_sqlite_to_postgres_round_trip() {
     let Ok(pg_url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
@@ -207,7 +230,13 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .expect("connect in-memory sqlite");
     let (uid1, uid2, item1) = seed(&sqlite).await;
 
-    let postgres = PostgresStore::connect(&pg_url)
+    // The migrate engine requires an EMPTY target. The shared
+    // PHAROS_TEST_POSTGRES_URL database is also written by `backend_conformance`
+    // (which runs concurrently under nextest), so migrating into it collides on
+    // unique keys (genres, system_identity). Create a dedicated, freshly-dropped
+    // database for this test instead.
+    let target_url = fresh_target_db(&pg_url).await;
+    let postgres = PostgresStore::connect(&target_url)
         .await
         .expect("connect fresh postgres (must be an empty database)");
 
