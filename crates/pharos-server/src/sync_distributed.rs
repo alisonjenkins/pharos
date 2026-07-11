@@ -101,7 +101,7 @@ struct StorePersistence {
 impl GroupPersistence for StorePersistence {
     fn persist(&self, group_id: GroupId, epoch_unix_ms: u64, state_json: String) {
         let stores = self.stores.clone();
-        actix_web::rt::spawn(async move {
+        tokio::spawn(async move {
             let persisted = pharos_core::PersistedSyncGroup {
                 group_id: group_id.to_string(),
                 epoch_unix_ms: epoch_unix_ms as i64,
@@ -116,7 +116,7 @@ impl GroupPersistence for StorePersistence {
 
     fn remove(&self, group_id: GroupId) {
         let stores = self.stores.clone();
-        actix_web::rt::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = stores.remove_sync_group(&group_id.to_string()).await {
                 tracing::warn!(%group_id, error = %e, "group snapshot remove failed");
             }
@@ -134,7 +134,7 @@ struct BusCommands {
 impl BusCommands {
     fn new(bus: Arc<PgSyncBus>) -> Self {
         let (egress, mut rx) = mpsc::unbounded_channel::<String>();
-        actix_web::rt::spawn(async move {
+        tokio::spawn(async move {
             while let Some(payload) = rx.recv().await {
                 let _ = bus.publish(payload).await;
             }
@@ -187,7 +187,7 @@ pub async fn build(
     // owns (a no-op for the rest).
     let mut cmd_rx = bus.subscribe();
     let reg = registry.clone();
-    actix_web::rt::spawn(async move {
+    tokio::spawn(async move {
         loop {
             match cmd_rx.recv().await {
                 Ok(payload) => {
