@@ -1,0 +1,12 @@
+# Faster linking on the native Linux target with the LLD linker — pharos's
+# binaries are large and the default bfd/gold link dominates a chunk of every
+# build. `-fuse-ld=lld` drives the cc linker to ld.lld (provided by the devShell
+# + the nix build inputs). The Rust-bundled rust-lld would avoid the extra
+# package, but selecting it (`-C link-self-contained=+linker`) is still unstable
+# on the pinned stable toolchain, so use the system ld.lld — same linker, stable
+# flag.
+#
+# Scoped to the native target ONLY: the wasm32-unknown-unknown UI build links
+# with wasm-ld and must not see these flags.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

@@ -8,6 +8,12 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # crane: builds a cached `cargoArtifacts` (compiled deps) derivation reused
+    # across commits, so the image build recompiles only changed workspace
+    # crates instead of the whole dependency tree every time. Uses real cargo
+    # (like buildRustPackage), so ffmpeg-the-third's modern `cargo::` build-cfgs
+    # apply correctly — the reason crate2nix was ruled out.
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -15,6 +21,7 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
+      crane,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -72,31 +79,38 @@
         # the pre-5.1 libswresample API and failed against ffmpeg 8.1. Real
         # cargo applies the build-script cfgs correctly. pkg-config + the
         # ffmpeg dev libs + bindgenHook mirror the devShell's backend-lib env.
-        pharosBins =
-          (pkgs.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
-          }).buildRustPackage {
-            pname = "pharos";
-            version = "0.0.0";
-            src = repoSrc;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-            # Only the two server-side binaries; the wasm UI crate is built
-            # separately by `dx` (pharosUiBundle).
-            cargoBuildFlags = [ "-p" "pharos-server" "-p" "pharos-transcode" ];
-            # Build only — tests + clippy + fmt run in the CI `test` job via
-            # cargo. Running the full workspace suite inside this derivation's
-            # checkPhase (so `.#oci` could reuse one compile) proved too fragile:
-            # heavy/timing-sensitive tests (e.g. the 20k-row pagination test)
-            # that pass under plain `cargo nextest` hit the constrained nix
-            # sandbox's slow-timeout and failed the *image build*. Keeping the
-            # binary build free of the test gate is worth the second compile.
-            doCheck = false;
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
-            buildInputs = [ pkgs.ffmpeg-headless.dev ];
-          };
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        # Shared by the deps-only cache build and the final binary build.
+        pharosCommonArgs = {
+          pname = "pharos";
+          version = "0.0.0";
+          src = repoSrc;
+          strictDeps = true;
+          # Only the two server-side binaries; the wasm UI crate is built
+          # separately by `dx` (pharosUiBundle).
+          cargoExtraArgs = "--package pharos-server --package pharos-transcode";
+          # Build only — tests + clippy + fmt run in the CI `test` job via cargo.
+          # Running the suite inside this derivation's checkPhase proved fragile:
+          # heavy/timing-sensitive tests (e.g. the 20k-row pagination test) hit
+          # the constrained nix sandbox's slow-timeout and failed the *image
+          # build*. Keep the binary build free of the test gate.
+          doCheck = false;
+          # ffmpeg-the-third's *-sys crate runs bindgen over the libav headers;
+          # bindgenHook supplies libclang + include paths, pkg-config + the
+          # ffmpeg dev libs resolve/link the same ffmpeg the runtime uses. Real
+          # cargo (crane) applies the crate's modern `cargo::` build-cfgs
+          # correctly — the correctness reason crate2nix was ruled out.
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+          buildInputs = [ pkgs.ffmpeg-headless.dev ];
+        };
+        # Compile the dependency tree ONCE — a store artifact cached across
+        # commits (keyed by Cargo.lock + build inputs). A code-only change then
+        # recompiles just the workspace crates, not all of crates.io, so the
+        # image build stops rebuilding everything every push.
+        pharosDeps = craneLib.buildDepsOnly pharosCommonArgs;
+        pharosBins = craneLib.buildPackage (
+          pharosCommonArgs // { cargoArtifacts = pharosDeps; }
+        );
         pharos = pharosBins;
         # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
         # (the two binaries share one store path here, but the env var is the
@@ -692,6 +706,10 @@
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
+            # ld.lld for the `-fuse-ld=lld` link flag in .cargo/config.toml —
+            # faster native-target links across every cargo build (test job +
+            # local dev + compat-playwright). wasm links stay on wasm-ld.
+            pkgs.lld
             pkgs.cargo-nextest
             pkgs.cargo-watch
             pkgs.cargo-deny
