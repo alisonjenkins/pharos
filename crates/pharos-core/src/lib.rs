@@ -2188,6 +2188,71 @@ pub trait TranscodeSessionStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
 }
 
+/// Persisted SyncPlay group snapshot (Phase B4 — zero-downtime deploys).
+///
+/// The group's whole coordination state (leader, playback anchor, queue,
+/// member roster, group name, readiness gate) is serialized by the sync layer
+/// into `state_json` — the store treats it as opaque text, keeping pharos-core
+/// free of any dependency on the `pharos-sync` wire types. `epoch_unix_ms` is
+/// the group's wall-clock time base: it is persisted separately (not inside the
+/// blob) because a replica that acquires ownership after a deploy must derive
+/// the actor's monotonic `server_ms` clock from the SAME epoch the original
+/// owner used, so already-scheduled `at_server_ms` instants stay absolute
+/// across the handoff.
+///
+/// A single row per group is the source of truth; the per-group advisory-lock
+/// owner is the sole writer, so no normalized/concurrent-update schema is
+/// needed. `updated_at` (unix seconds) drives the idle-group pruner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSyncGroup {
+    pub group_id: String,
+    pub epoch_unix_ms: i64,
+    pub state_json: String,
+    pub updated_at: i64,
+}
+
+/// Cross-replica store for [`PersistedSyncGroup`] snapshots keyed on group id.
+///
+/// The in-memory group actor is the hot coordinator/cache; this is the shared
+/// state a replica re-hydrates from when it acquires ownership of a group whose
+/// previous owner drained during a rolling deploy. SQLite deployments stay
+/// single-replica (the actor never leaves the process), so this exists purely
+/// for the Postgres multi-replica path — but the trait is implemented on both
+/// backends for parity + testability.
+pub trait SyncGroupStore: Send + Sync {
+    /// Upsert the group snapshot, setting `updated_at = now_unix_secs`.
+    fn upsert_sync_group(
+        &self,
+        group: &PersistedSyncGroup,
+        now_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Fetch a group snapshot by id. `None` = no such row.
+    fn get_sync_group(
+        &self,
+        group_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<PersistedSyncGroup>>> + Send;
+
+    /// Every persisted group snapshot (for the `/SyncPlay/List` surface, which
+    /// must include groups owned by other replicas).
+    fn list_sync_groups(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<PersistedSyncGroup>>> + Send;
+
+    fn remove_sync_group(
+        &self,
+        group_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Drop group snapshots with `updated_at < cutoff_unix_secs`; returns the
+    /// count removed. Guards against a snapshot outliving a crash that never
+    /// ran the group's own teardown.
+    fn prune_sync_groups(
+        &self,
+        cutoff_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+}
+
 pub trait Scanner: Send + Sync {
     fn scan(
         &self,

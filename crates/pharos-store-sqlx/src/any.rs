@@ -8,11 +8,11 @@ use crate::{RuntimeConfig, ServerConfigStore, StoreError};
 use pharos_core::{
     AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult, Fingerprint,
     GenreCount, GenreStore, ItemPerson, Library, LibraryKind, LibraryStore, MediaFacets, MediaId,
-    MediaItem, MediaQuery, MediaStore, PersistedTranscodeSession, Person, PersonCount, PersonRef,
-    PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery,
-    SecretString, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, TokenRecord,
-    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
-    UserStore,
+    MediaItem, MediaQuery, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, Person,
+    PersonCount, PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
+    ScanState, SearchQuery, SecretString, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
+    TagCount, TagStore, TokenRecord, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
+    UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -756,6 +756,50 @@ impl TranscodeSessionStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.prune_transcode_sessions(cutoff_unix_secs).await,
             AnyStore::Postgres(p) => p.prune_transcode_sessions(cutoff_unix_secs).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// SyncGroupStore
+// ---------------------------------------------------------------------
+impl SyncGroupStore for AnyStore {
+    async fn upsert_sync_group(
+        &self,
+        group: &PersistedSyncGroup,
+        now_unix_secs: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.upsert_sync_group(group, now_unix_secs).await,
+            AnyStore::Postgres(p) => p.upsert_sync_group(group, now_unix_secs).await,
+        }
+    }
+
+    async fn get_sync_group(&self, group_id: &str) -> DomainResult<Option<PersistedSyncGroup>> {
+        match self {
+            AnyStore::Sqlite(s) => s.get_sync_group(group_id).await,
+            AnyStore::Postgres(p) => p.get_sync_group(group_id).await,
+        }
+    }
+
+    async fn list_sync_groups(&self) -> DomainResult<Vec<PersistedSyncGroup>> {
+        match self {
+            AnyStore::Sqlite(s) => s.list_sync_groups().await,
+            AnyStore::Postgres(p) => p.list_sync_groups().await,
+        }
+    }
+
+    async fn remove_sync_group(&self, group_id: &str) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.remove_sync_group(group_id).await,
+            AnyStore::Postgres(p) => p.remove_sync_group(group_id).await,
+        }
+    }
+
+    async fn prune_sync_groups(&self, cutoff_unix_secs: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.prune_sync_groups(cutoff_unix_secs).await,
+            AnyStore::Postgres(p) => p.prune_sync_groups(cutoff_unix_secs).await,
         }
     }
 }

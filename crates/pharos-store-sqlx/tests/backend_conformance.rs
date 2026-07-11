@@ -12,10 +12,10 @@
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
     CollectionStore, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind,
-    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedTranscodeSession, PersonKind,
-    PersonRef, PersonStore, PlaylistStore, PreferenceStore, SecretString, StudioStore, TagStore,
-    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
-    UserStore,
+    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup,
+    PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
+    SecretString, StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore,
+    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -58,6 +58,7 @@ where
         + pharos_core::PlaylistStore
         + pharos_core::LibraryStore
         + pharos_core::TranscodeSessionStore
+        + pharos_core::SyncGroupStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
         + Send
@@ -491,6 +492,100 @@ where
         .await
         .unwrap();
     assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+        .await
+        .unwrap()
+        .is_none());
+
+    // -----------------------------------------------------------------
+    // 11. SyncGroupStore (Phase B4 group-survives-deploy snapshot)
+    // -----------------------------------------------------------------
+    let gid = "conformance-sync-group";
+    assert!(
+        SyncGroupStore::get_sync_group(&store, gid)
+            .await
+            .unwrap()
+            .is_none(),
+        "unknown sync group must be None"
+    );
+    assert!(
+        SyncGroupStore::list_sync_groups(&store)
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.group_id != gid),
+        "unknown group must not appear in the list"
+    );
+    let group = PersistedSyncGroup {
+        group_id: gid.to_string(),
+        epoch_unix_ms: 1_700_000_000_000,
+        state_json: r#"{"leader":"m1","playback":"idle"}"#.into(),
+        updated_at: 100,
+    };
+    SyncGroupStore::upsert_sync_group(&store, &group, 100)
+        .await
+        .unwrap();
+    let got = SyncGroupStore::get_sync_group(&store, gid)
+        .await
+        .unwrap()
+        .expect("group must round-trip");
+    assert_eq!(got, group);
+    assert!(
+        SyncGroupStore::list_sync_groups(&store)
+            .await
+            .unwrap()
+            .iter()
+            .any(|g| g.group_id == gid && g.epoch_unix_ms == 1_700_000_000_000),
+        "persisted group must appear in the list with its epoch"
+    );
+
+    // Upsert overwrites the blob + epoch + bumps updated_at.
+    let group2 = PersistedSyncGroup {
+        group_id: gid.to_string(),
+        epoch_unix_ms: 1_700_000_500_000,
+        state_json: r#"{"leader":"m2","playback":{"playing":{"position_ms":42}}}"#.into(),
+        updated_at: 200,
+    };
+    SyncGroupStore::upsert_sync_group(&store, &group2, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        SyncGroupStore::get_sync_group(&store, gid)
+            .await
+            .unwrap()
+            .unwrap(),
+        group2,
+        "upsert must overwrite an existing group snapshot"
+    );
+
+    // Prune below the row's updated_at (200) is a no-op; above it removes.
+    let pruned_none = SyncGroupStore::prune_sync_groups(&store, 150)
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned_none, 0,
+        "prune cutoff below updated_at removes nothing"
+    );
+    assert!(SyncGroupStore::get_sync_group(&store, gid)
+        .await
+        .unwrap()
+        .is_some());
+    let pruned = SyncGroupStore::prune_sync_groups(&store, 300)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1, "prune cutoff above updated_at removes the row");
+    assert!(SyncGroupStore::get_sync_group(&store, gid)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Explicit remove path (re-insert, then delete).
+    SyncGroupStore::upsert_sync_group(&store, &group, 400)
+        .await
+        .unwrap();
+    SyncGroupStore::remove_sync_group(&store, gid)
+        .await
+        .unwrap();
+    assert!(SyncGroupStore::get_sync_group(&store, gid)
         .await
         .unwrap()
         .is_none());
