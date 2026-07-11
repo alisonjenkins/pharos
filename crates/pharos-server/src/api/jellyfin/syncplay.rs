@@ -42,11 +42,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/syncplay/previousitem", web::post().to(previous_item))
         .route("/syncplay/setrepeatmode", web::post().to(set_repeat_mode))
         .route("/syncplay/setshufflemode", web::post().to(set_shuffle_mode))
+        .route("/syncplay/setignorewait", web::post().to(set_ignore_wait))
         // Not yet modelled by the engine — accept + ignore so the client's
         // flow isn't broken by a 404.
         .route("/syncplay/moveplaylistitem", web::post().to(no_op_204))
         .route("/syncplay/removefromplaylist", web::post().to(no_op_204))
-        .route("/syncplay/setignorewait", web::post().to(no_op_204))
         .route("/syncplay/ping", web::post().to(no_op_204));
 }
 
@@ -191,6 +191,13 @@ struct ModeBody {
     mode: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct IgnoreWaitBody {
+    #[serde(default)]
+    ignore_wait: bool,
+}
+
 async fn new_group(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
@@ -332,6 +339,28 @@ async fn ready(
             position_ms: pos,
         }
     })
+    .await
+}
+
+/// jellyfin-web posts `IgnoreWait: true` when it halts its own playback (its
+/// player never started within its 30s budget) and `false` when it re-follows
+/// group playback. Honoring it keeps a halted member from wedging every
+/// subsequent readiness gate into the anti-wedge timeout.
+async fn set_ignore_wait(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Json<IgnoreWaitBody>,
+) -> HttpResponse {
+    let ignore = body.ignore_wait;
+    dispatch(
+        &hub,
+        auth.device_id.as_deref(),
+        "setignorewait",
+        move |mid| GroupMsg::SetIgnoreWait {
+            member_id: mid,
+            ignore,
+        },
+    )
     .await
 }
 
