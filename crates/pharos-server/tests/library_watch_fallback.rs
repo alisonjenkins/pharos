@@ -72,6 +72,11 @@ async fn forced_unsupported_root_uses_periodic_and_picks_up_new_file() {
 
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let state = AppState::new(stores, "a9-fallback".into()).with_media_roots(vec![root.clone()]);
+    // Single-replica test: this process IS the bg-leader, so automatic scans
+    // run (production elects this via spawn_bg_leadership; tests set it directly).
+    state
+        .is_bg_leader
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let state = web::Data::new(state);
 
     // Subscribe to the broadcast bus BEFORE spawning so we don't miss the
@@ -150,6 +155,10 @@ async fn boot_scan_indexes_preexisting_file_before_first_poll() {
 
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let state = AppState::new(stores, "boot-scan".into()).with_media_roots(vec![root.clone()]);
+    // Single-replica test: this process IS the bg-leader (see the fallback test).
+    state
+        .is_bg_leader
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let state = web::Data::new(state);
     let mut bus_rx = state.bus.subscribe();
 
