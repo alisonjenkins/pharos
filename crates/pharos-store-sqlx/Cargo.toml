@@ -13,11 +13,13 @@ postgres = ["sqlx/postgres", "sqlx/tls-rustls"]
 
 [dependencies]
 pharos-core = { path = "../pharos-core" }
+pharos-sync = { path = "../pharos-sync" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }

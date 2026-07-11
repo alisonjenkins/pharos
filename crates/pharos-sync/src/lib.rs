@@ -13,6 +13,7 @@
 //! - [`host`] — `TokenResolver` trait the server impls so the WS
 //!   handler can authenticate without depending on the server crate
 
+pub mod bus;
 pub mod clock;
 pub mod group;
 pub mod host;
@@ -21,6 +22,7 @@ pub mod messages;
 pub mod registry;
 pub mod ws;
 
+pub use bus::{BusError, LocalSyncBus, SyncBus};
 pub use host::TokenResolver;
 pub use hub::{ResolvedSession, SessionHub};
 pub use messages::{ClientMsg, ErrorCode, GroupId, MemberId, MemberSummary, ServerMsg};

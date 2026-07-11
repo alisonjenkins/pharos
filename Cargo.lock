@@ -3062,6 +3062,7 @@ name = "pharos-store-sqlx"
 version = "0.0.0"
 dependencies = [
  "pharos-core",
+ "pharos-sync",
  "proptest",
  "serde",
  "serde_json",

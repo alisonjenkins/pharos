@@ -23,6 +23,12 @@ mod sync_group_sqlite;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
+#[cfg(feature = "postgres")]
+pub mod pg_sync_bus;
+
+#[cfg(feature = "postgres")]
+pub use pg_sync_bus::PgSyncBus;
+
 #[cfg(all(feature = "sqlite", feature = "postgres"))]
 pub mod any;
 
