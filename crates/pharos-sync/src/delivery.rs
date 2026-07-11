@@ -63,6 +63,13 @@ impl MemberSinks {
         self.inner.remove(&member_id);
     }
 
+    /// Whether this replica currently holds `member_id`'s socket. Lets a
+    /// bus-backed delivery short-circuit to a direct local send (which has no
+    /// payload-size cap, unlike Postgres `NOTIFY`) for same-replica members.
+    pub fn contains(&self, member_id: MemberId) -> bool {
+        self.inner.contains_key(&member_id)
+    }
+
     /// V19 carried over: a slow/full sink must not block delivery. `try_send`
     /// drops on a full channel; the member reconciles via the next catch-up.
     pub fn send(&self, member_id: MemberId, msg: ServerMsg) {
@@ -82,6 +89,11 @@ pub struct LocalDelivery {
 impl LocalDelivery {
     pub fn new(sinks: MemberSinks) -> Self {
         Self { sinks }
+    }
+
+    /// The underlying sink table (so a wrapper can test membership locality).
+    pub fn sinks(&self) -> &MemberSinks {
+        &self.sinks
     }
 }
 

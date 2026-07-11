@@ -105,7 +105,7 @@ fn spawn_replica(
     me: usize,
 ) -> Replica {
     let sinks = MemberSinks::new();
-    let delivery = Arc::new(BusDelivery::new(bus.clone()));
+    let delivery = Arc::new(BusDelivery::new(bus.clone(), sinks.clone()));
     let distributed = Distributed {
         ownership: Arc::new(FakeOwnership { map: owners, me }),
         hydration: Arc::new(store.clone()),

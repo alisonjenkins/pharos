@@ -169,7 +169,7 @@ pub async fn build(
     // replica's copy into its local sinks.
     pharos_sync::spawn_ingress(bus.as_ref(), member_sinks.clone());
 
-    let delivery = Arc::new(BusDelivery::new(bus.clone()));
+    let delivery = Arc::new(BusDelivery::new(bus.clone(), member_sinks.clone()));
     let distributed = Distributed {
         ownership: Arc::new(StoreOwnership {
             stores: stores.clone(),

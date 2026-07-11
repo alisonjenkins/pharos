@@ -35,17 +35,24 @@ pub enum BusMsg {
     },
 }
 
-/// A [`Delivery`] that publishes to the cross-replica bus. Cheap to clone
-/// (shares the egress channel).
+/// A [`Delivery`] that delivers to same-replica members directly and publishes
+/// only cross-replica messages to the bus. Cheap to clone (shares the egress
+/// channel + the sink table).
 #[derive(Clone)]
 pub struct BusDelivery {
     egress: mpsc::UnboundedSender<String>,
+    /// The sockets connected to THIS replica. A member found here is delivered
+    /// to directly — bypassing the bus, so it is NOT subject to the Postgres
+    /// `NOTIFY` 8000-byte payload cap that silently drops a large `PlayQueue`.
+    local: LocalDelivery,
 }
 
 impl BusDelivery {
     /// Build a bus-backed delivery over `bus`, spawning the egress task that
-    /// serializes envelopes and publishes them in order.
-    pub fn new<B: SyncBus>(bus: Arc<B>) -> Self {
+    /// serializes envelopes and publishes them in order. `sinks` is this
+    /// replica's member-sink table, used to short-circuit same-replica
+    /// deliveries to a direct local send.
+    pub fn new<B: SyncBus>(bus: Arc<B>, sinks: MemberSinks) -> Self {
         let (egress, mut rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Some(payload) = rx.recv().await {
@@ -56,12 +63,24 @@ impl BusDelivery {
                 let _ = bus.publish(payload).await;
             }
         });
-        Self { egress }
+        Self {
+            egress,
+            local: LocalDelivery::new(sinks),
+        }
     }
 }
 
 impl Delivery for BusDelivery {
     fn deliver(&self, member_id: MemberId, msg: ServerMsg) {
+        // Local-first: a member's socket lives on exactly one replica (the
+        // partition property), so if it is HERE, deliver straight into its sink.
+        // This both avoids a needless bus round-trip AND — critically — sidesteps
+        // the Postgres NOTIFY payload cap that would otherwise silently drop a
+        // whole-season `PlayQueue`. Only genuinely-remote members go on the bus.
+        if self.local.sinks().contains(member_id) {
+            self.local.deliver(member_id, msg);
+            return;
+        }
         let env = BusMsg::Deliver { member_id, msg };
         if let Ok(payload) = serde_json::to_string(&env) {
             // Send failure means the egress task is gone (process shutting
@@ -122,7 +141,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Replica A: deliver to `member` (whose sink is on B).
-        let delivery_a = BusDelivery::new(bus.clone());
+        let delivery_a = BusDelivery::new(bus.clone(), MemberSinks::new());
         delivery_a.deliver(member, ServerMsg::Pause { at_server_ms: 42 });
 
         let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -130,6 +149,48 @@ mod tests {
             .expect("delivery must arrive")
             .expect("channel open");
         assert!(matches!(got, ServerMsg::Pause { at_server_ms: 42 }));
+    }
+
+    #[tokio::test]
+    async fn local_member_is_delivered_directly_bypassing_the_bus() {
+        // The bug: a same-replica member's message was round-tripped through the
+        // bus (Postgres NOTIFY, 8000-byte cap), so a large PlayQueue was silently
+        // dropped. Local-first delivery must reach a local member WITHOUT any bus
+        // hop — proven here by running NO ingress at all and delivering a large
+        // PlayQueue: it must still arrive.
+        let bus = Arc::new(LocalSyncBus::new());
+        let sinks = MemberSinks::new();
+        let (tx, mut rx) = tmpsc::channel(8);
+        let member = MemberId::new();
+        sinks.insert(member, tx);
+
+        // BusDelivery over THIS replica's sinks — no spawn_ingress anywhere.
+        let delivery = BusDelivery::new(bus.clone(), sinks.clone());
+        let big = ServerMsg::PlayQueue {
+            reason: "new_playlist".into(),
+            items: (0..500)
+                .map(|i| crate::messages::QueueItemInfo {
+                    item_id: format!("item-{i}-0123456789abcdef"),
+                    playlist_item_id: format!("pli-{i}-0123456789abcdef"),
+                })
+                .collect(),
+            playing_index: 0,
+            start_position_ms: 0,
+            is_playing: true,
+            repeat_mode: String::new(),
+            shuffle_mode: String::new(),
+            last_update_unix_ms: 1,
+        };
+        delivery.deliver(member, big);
+
+        let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("local delivery must arrive without a bus/ingress")
+            .expect("channel open");
+        match got {
+            ServerMsg::PlayQueue { items, .. } => assert_eq!(items.len(), 500),
+            other => panic!("expected the large PlayQueue, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -144,7 +205,7 @@ mod tests {
         sinks.insert(local_member, tx);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let delivery = BusDelivery::new(bus.clone());
+        let delivery = BusDelivery::new(bus.clone(), MemberSinks::new());
         // Deliver to some OTHER member id not registered here.
         delivery.deliver(MemberId::new(), ServerMsg::Pause { at_server_ms: 1 });
 
@@ -166,7 +227,7 @@ mod tests {
         sinks.insert(member, tx);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let delivery = BusDelivery::new(bus.clone());
+        let delivery = BusDelivery::new(bus.clone(), MemberSinks::new());
         for i in 0..5 {
             delivery.deliver(
                 member,
