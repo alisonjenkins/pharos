@@ -12,11 +12,27 @@ pullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# replicas is intentionally fixed at 1: SQLite is single-writer and the
-# in-process caches/transcode-scheduler are not HA-safe. Use an external
-# Postgres (config.database.url) before considering >1 — and even then the
-# app is not yet horizontally scalable, so this stays 1.
-strategy: Recreate
+# Steady-state replica count. 1 is right for this single-node cluster: even on
+# Postgres, >1 steady replica gives no node-failure HA. Zero-downtime deploys
+# come from the RollingUpdate SURGE (a 2nd pod briefly overlaps the draining
+# old one), not from running 2 all the time. On SQLite this MUST stay 1
+# (single-writer); the chart also forces Recreate there regardless of strategy.
+replicaCount: 1
+
+# Deploy strategy. On SQLite the chart forces Recreate (the RWO db PVC can't be
+# shared by two pods mid-rollout). On Postgres, RollingUpdate gives zero-downtime:
+# a surge pod comes up + becomes ready before the old one drains.
+strategy:
+  type: Recreate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Grace period for a pod to finish in-flight requests after SIGTERM before
+# SIGKILL. Must exceed config.server.drainGraceSecs + the app's ~30s graceful
+# stop. The app flips /readyz to 503 on SIGTERM so the LB stops new traffic
+# immediately, then serves in-flight requests during the grace window.
+terminationGracePeriodSeconds: 60
 
 # ── pharos config.toml, rendered into a ConfigMap mounted at
 #    /etc/pharos/config.toml. Optional fields are omitted when null/empty.
@@ -60,6 +76,10 @@ config:
     scanProbeConcurrency: 0
     libraryWatchEnabled: true
     libraryPollIntervalSecs: 300
+    # Seconds to keep serving in-flight requests after SIGTERM before the
+    # graceful stop. /readyz flips 503 immediately so the LB stops new traffic;
+    # this window lets active segment/stream reads finish (zero-downtime deploy).
+    drainGraceSecs: 10
   obs:
     logLevel: "info"
     otlpEndpoint: null

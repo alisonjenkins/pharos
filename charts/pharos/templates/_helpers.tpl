@@ -89,6 +89,7 @@ scan_rate_limit_ms = {{ $s.scanRateLimitMs | int64 }}
 scan_probe_concurrency = {{ $s.scanProbeConcurrency | int64 }}
 library_watch_enabled = {{ $s.libraryWatchEnabled }}
 library_poll_interval_secs = {{ $s.libraryPollIntervalSecs | int64 }}
+drain_grace_secs = {{ $s.drainGraceSecs | int64 }}
 
 [obs]
 log_level = {{ .Values.config.obs.logLevel | quote }}
