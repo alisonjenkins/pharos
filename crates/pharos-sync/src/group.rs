@@ -31,7 +31,16 @@ pub const MIN_LEAD_MS: u64 = 200;
 /// client can never block the whole group forever (the failure mode behind
 /// jellyfin#8140 / #5619). A client that is genuinely still buffering when
 /// this fires will re-sync via its own drift correction.
-pub const READY_TIMEOUT_MS: u64 = 5_000;
+///
+/// 30s, not 5s: a member joining mid-playback must hydrate the whole play
+/// queue (jellyfin-web fetches every item's metadata — a full season is
+/// hundreds of requests) AND buffer the first segment before its player fires
+/// `playbackstart` and posts `Ready`. At 5s the anti-wedge fired first, the
+/// group's `Unpause` reached the slow joiner before its player was active (so
+/// it was dropped — "no active player"), and the joiner was stranded on a
+/// spinner. A late `Ready` still heals via [`GroupState::send_playback_state`],
+/// but the wider window lets the common case resolve cleanly with everyone in.
+pub const READY_TIMEOUT_MS: u64 = 30_000;
 
 fn unix_now_ms() -> u64 {
     SystemTime::now()

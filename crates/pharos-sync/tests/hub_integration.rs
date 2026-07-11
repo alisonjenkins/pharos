@@ -69,10 +69,11 @@ where
     F: Fn(&ServerMsg) -> bool,
 {
     loop {
-        // Longer than the engine's READY_TIMEOUT so that under a paused clock
-        // (auto-advance picks the EARLIEST timer) the gate deadline fires before
-        // this receive gives up. Passing paths return immediately regardless.
-        match tokio::time::timeout(Duration::from_secs(30), c.rx.recv()).await {
+        // Strictly longer than the engine's READY_TIMEOUT so that under a paused
+        // clock (auto-advance picks the EARLIEST timer) the gate deadline fires
+        // before this receive gives up. Passing paths return immediately.
+        let budget = Duration::from_millis(pharos_sync::group::READY_TIMEOUT_MS + 5_000);
+        match tokio::time::timeout(budget, c.rx.recv()).await {
             Ok(Some(msg)) => {
                 if pred(&msg) {
                     return Some(msg);
