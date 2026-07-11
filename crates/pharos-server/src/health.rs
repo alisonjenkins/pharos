@@ -16,6 +16,11 @@ pub struct ProbeStatus {
 pub struct Snapshot {
     pub ready: bool,
     pub probes: Vec<ProbeStatus>,
+    /// Set once the process is draining (SIGTERM received). Forces `ready`
+    /// false regardless of probe state so the load balancer stops routing
+    /// new requests while in-flight ones finish (Phase B3).
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,6 +40,7 @@ pub enum ReadinessError {
 enum Msg {
     Require(&'static str),
     Mark(&'static str),
+    Drain,
     Snapshot(oneshot::Sender<Snapshot>),
 }
 
@@ -52,6 +58,7 @@ impl ReadinessHandle {
         tokio::spawn(async move {
             let mut state: BTreeMap<&'static str, bool> =
                 init.into_iter().map(|n| (n, false)).collect();
+            let mut draining = false;
             while let Some(msg) = rx.recv().await {
                 match msg {
                     Msg::Require(n) => {
@@ -60,13 +67,20 @@ impl ReadinessHandle {
                     Msg::Mark(n) => {
                         state.insert(n, true);
                     }
+                    Msg::Drain => {
+                        draining = true;
+                    }
                     Msg::Snapshot(reply) => {
                         let probes: Vec<ProbeStatus> = state
                             .iter()
                             .map(|(n, ok)| ProbeStatus { name: n, ok: *ok })
                             .collect();
-                        let ready = !probes.is_empty() && probes.iter().all(|p| p.ok);
-                        let _ = reply.send(Snapshot { ready, probes });
+                        let ready = !draining && !probes.is_empty() && probes.iter().all(|p| p.ok);
+                        let _ = reply.send(Snapshot {
+                            ready,
+                            probes,
+                            draining,
+                        });
                     }
                 }
             }
@@ -84,6 +98,15 @@ impl ReadinessHandle {
     pub async fn mark(&self, name: &'static str) -> Result<(), ReadinessError> {
         self.tx
             .send(Msg::Mark(name))
+            .await
+            .map_err(|_| ReadinessError::ActorDown)
+    }
+
+    /// Flip the process into draining state — `/readyz` goes 503 from here on
+    /// (Phase B3 graceful shutdown). Idempotent; there is no un-drain.
+    pub async fn drain(&self) -> Result<(), ReadinessError> {
+        self.tx
+            .send(Msg::Drain)
             .await
             .map_err(|_| ReadinessError::ActorDown)
     }
@@ -194,5 +217,34 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         // No probes → not ready (avoid false positive on empty config).
         assert_eq!(resp.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn readyz_503_after_drain_even_when_probes_met() {
+        // Graceful drain (Phase B3): once SIGTERM flips the handle to
+        // draining, /readyz must go unready so the LB stops routing new
+        // requests, even though every startup probe is still marked ok.
+        let h = ReadinessHandle::spawn(&["store"]);
+        h.mark("store").await.unwrap();
+        let app = test::init_service(build_app(h.clone())).await;
+
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
+
+        h.drain().await.unwrap();
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 503);
+    }
+
+    #[actix_web::test]
+    async fn healthz_ok_even_while_draining() {
+        // Liveness must stay green during drain — a draining pod is alive,
+        // just not accepting new traffic; kubelet must not restart it.
+        let h = ReadinessHandle::spawn(&["store"]);
+        h.mark("store").await.unwrap();
+        h.drain().await.unwrap();
+        let app = test::init_service(build_app(h)).await;
+        let req = test::TestRequest::get().uri("/healthz").to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
     }
 }

@@ -165,10 +165,23 @@ pub struct ServerConfig {
     /// eligible + built) or on manual `/Library/Refresh` (the floor tier).
     #[serde(default = "default_library_poll_interval_secs")]
     pub library_poll_interval_secs: u64,
+    /// Phase B3 (graceful drain) — seconds to keep serving in-flight
+    /// requests after SIGTERM flips `/readyz` unready, before the HTTP
+    /// server begins its graceful stop. This window lets the load balancer
+    /// observe the unready probe and stop routing new requests, so a rolling
+    /// deploy doesn't cut a viewer mid-segment. Should be ≥ the k8s readiness
+    /// probe period; the pod's `terminationGracePeriodSeconds` must exceed
+    /// this plus the in-flight drain. Default `10`.
+    #[serde(default = "default_drain_grace_secs")]
+    pub drain_grace_secs: u64,
 }
 
 fn default_played_threshold_pct() -> u32 {
     90
+}
+
+fn default_drain_grace_secs() -> u64 {
+    10
 }
 
 fn default_library_poll_interval_secs() -> u64 {

@@ -508,6 +508,41 @@ async fn build_transcode_scheduler(
     ))
 }
 
+/// Resolve when the process is asked to shut down: SIGTERM (k8s pod
+/// termination) or SIGINT (Ctrl-C in dev). On non-unix, Ctrl-C only.
+async fn await_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If a stream fails to install, fall back to never-resolving so the
+        // other signal still drives shutdown (rather than exiting the task).
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler install failed");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGINT handler install failed");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 async fn serve(cfg: Config) -> Result<(), AppError> {
     tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
 
@@ -757,7 +792,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
 
     let handle_for_app = readiness.clone();
     let ui_dir = cfg.server.ui_dir.clone();
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         // Permissive CORS so browser-hosted Jellyfin clients (jellyfin-web,
         // Dioxus UI served from a separate origin) can reach the API.
         // Production should narrow this — tracked under §B if it bites.
@@ -800,8 +835,35 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         app
     })
     .bind(&cfg.server.bind)?
-    .run()
-    .await?;
+    // Phase B3 — we own the SIGTERM/SIGINT → graceful-drain sequencing
+    // below, so actix must not install its own signal handlers (which would
+    // stop the server immediately, before the LB drains).
+    .disable_signals()
+    // In-flight requests (including a live segment GET) get this long to
+    // finish after the graceful stop begins before being force-dropped.
+    .shutdown_timeout(30)
+    .run();
+
+    // Phase B3 — graceful drain. On SIGTERM (rolling deploy) or SIGINT:
+    // flip /readyz unready, wait `drain_grace_secs` for the load balancer to
+    // observe it and stop routing new requests, then stop the server
+    // gracefully (in-flight requests get `shutdown_timeout`). This keeps a
+    // deploy from cutting a viewer mid-segment.
+    let drain_handle = server.handle();
+    let drain_readiness = readiness.clone();
+    let drain_grace = cfg.server.drain_grace_secs;
+    tokio::spawn(async move {
+        await_shutdown_signal().await;
+        tracing::info!(
+            grace_secs = drain_grace,
+            "shutdown signal received; draining"
+        );
+        let _ = drain_readiness.drain().await;
+        tokio::time::sleep(std::time::Duration::from_secs(drain_grace)).await;
+        drain_handle.stop(true).await;
+    });
+
+    server.await?;
     // P31 — shutdown reached. If the SSDP responder is alive, send
     // byebye frames so DLNA clients drop pharos immediately instead
     // of waiting out the CACHE-CONTROL TTL.
