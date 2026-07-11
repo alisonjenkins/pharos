@@ -93,7 +93,7 @@ pub struct AppState {
     /// Per-play-session transcode negotiation cache (T-fix-2 part 2).
     /// Populated by `playback_info`; read by HLS segment handler so
     /// segments honour the negotiated codec/container/bitrate.
-    pub transcode_sessions: TranscodeSessionRegistry,
+    pub transcode_sessions: TranscodeSessionRegistry<Stores>,
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
     /// Load-balancing transcode scheduler (multi-GPU + all-CPU). When
@@ -354,7 +354,7 @@ impl AppState {
     pub fn new(stores: Stores, server_name: String) -> Self {
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
-        let transcode_sessions = TranscodeSessionRegistry::spawn();
+        let transcode_sessions = TranscodeSessionRegistry::spawn(stores.clone());
         let (bus, _) = broadcast::channel(256);
         Self {
             stores,
@@ -418,7 +418,7 @@ impl AppState {
         let server_id = stores.load_or_create_server_id().await?;
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
-        let transcode_sessions = TranscodeSessionRegistry::spawn();
+        let transcode_sessions = TranscodeSessionRegistry::spawn(stores.clone());
         let (bus, _) = broadcast::channel(256);
         Ok(Self {
             stores,

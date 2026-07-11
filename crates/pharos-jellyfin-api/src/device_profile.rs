@@ -112,7 +112,7 @@ pub struct SourceMedia {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Decision {
     DirectPlay,
     /// Audio remux: container + video codec match a DirectPlayProfile

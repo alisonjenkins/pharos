@@ -716,6 +716,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // starve live playback, then reopens when quiet.
     pharos_server::state::AppState::spawn_bg_io_regulator(app_state.clone().into_inner());
     pharos_server::library_watch::spawn_subtitle_warm_all(app_state.clone());
+    // Phase B1 — evict stale durable transcode-session rows (failover
+    // breadcrumbs) so the table doesn't grow unbounded.
+    app_state.transcode_sessions.spawn_pruner();
 
     let group_registry = web::Data::new(GroupRegistry::spawn());
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
