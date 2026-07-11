@@ -1254,6 +1254,39 @@ struct ShowsEpisodesQuery {
     season_id: Option<String>,
     user_id: Option<String>,
     limit: Option<u32>,
+    /// Offset into the (season-, episode-)ordered list. jellyfin-web pages the
+    /// episode list on scroll; ignoring this returned the SAME items from the
+    /// top for every page, so the client appended duplicates (ep1…ep23, then
+    /// ep1, ep23, … again).
+    start_index: Option<u32>,
+    /// Window the list to start AT this item id (jellyfin-web's "episodes from
+    /// the next-up episode" on the series page). Applied after ordering, before
+    /// `Limit`. Takes precedence over `StartIndex` when both are present.
+    start_item_id: Option<String>,
+}
+
+/// Resolve the `[start, end)` slice of the ordered episode list for one page.
+/// `StartItemId` (jellyfin-web's "episodes from the next-up item") wins over
+/// `StartIndex`; an unknown id falls back to the top rather than an empty page.
+/// `Limit` bounds the count. Pure so the paging logic is unit-tested without the
+/// handler's `AppState`. The bug this fixes: ignoring `StartIndex` returned the
+/// SAME items from the top for every page, so a scrolling client appended
+/// duplicates (ep1…ep23, then ep1, ep23, … again).
+fn resolve_episode_window(
+    ids: &[String],
+    start_index: Option<u32>,
+    start_item_id: Option<&str>,
+    limit: Option<u32>,
+) -> std::ops::Range<usize> {
+    let len = ids.len();
+    let start = if let Some(want) = start_item_id {
+        ids.iter().position(|id| id == want).unwrap_or(0)
+    } else {
+        (start_index.unwrap_or(0) as usize).min(len)
+    };
+    let take = limit.map(|l| l.max(1) as usize).unwrap_or(usize::MAX);
+    let end = start.saturating_add(take).min(len);
+    start..end
 }
 
 /// `GET /Shows/{id}/Episodes` — the episodes of a series (optionally one
@@ -1307,10 +1340,16 @@ async fn shows_episodes(
             .unwrap_or(0);
         (s, n)
     });
-    if let Some(limit) = q.limit {
-        eps.truncate(limit.max(1) as usize);
-    }
+    // TotalRecordCount is the full ordered set — computed BEFORE windowing so
+    // the client can page correctly (reporting the truncated count made it
+    // request past the real end and re-append the same items).
+    let total = eps.len() as u32;
+    let ids: Vec<String> = eps.iter().map(|(_, e)| e.id.to_string()).collect();
+    let window = resolve_episode_window(&ids, q.start_index, q.start_item_id.as_deref(), q.limit);
+    let start = window.start;
     let dtos: Vec<BaseItemDto> = eps
+        .get(window)
+        .unwrap_or(&[])
         .iter()
         .map(|(idx, item)| {
             let ud = user_data.get(*idx).copied().unwrap_or_default();
@@ -1321,12 +1360,11 @@ async fn shows_episodes(
             )
         })
         .collect();
-    let total = dtos.len() as u32;
     let _ = q.user_id.as_deref();
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "Items": dtos,
         "TotalRecordCount": total,
-        "StartIndex": 0,
+        "StartIndex": start as u32,
     })))
 }
 
@@ -4602,6 +4640,37 @@ pub(crate) fn spawn_scan(
 #[cfg(test)]
 mod alpha_picker_tests {
     use super::name_matches_letter;
+    use super::resolve_episode_window;
+
+    #[test]
+    fn episode_window_paginates_by_start_index() {
+        let ids: Vec<String> = (1..=23).map(|n| n.to_string()).collect();
+        // Page 3 of a 23-item season: StartIndex=20, Limit=10 → eps 21,22,23.
+        let w = resolve_episode_window(&ids, Some(20), None, Some(10));
+        assert_eq!(w, 20..23, "StartIndex must skip, not return from the top");
+        // First page.
+        assert_eq!(resolve_episode_window(&ids, Some(0), None, Some(10)), 0..10);
+        // No params → the whole list.
+        assert_eq!(resolve_episode_window(&ids, None, None, None), 0..23);
+        // StartIndex past the end → empty page, not a wrap.
+        assert_eq!(
+            resolve_episode_window(&ids, Some(100), None, Some(10)),
+            23..23
+        );
+    }
+
+    #[test]
+    fn episode_window_start_item_id_wins_and_falls_back() {
+        let ids: Vec<String> = (1..=23).map(|n| n.to_string()).collect();
+        // StartItemId takes precedence over StartIndex and windows from that item.
+        let w = resolve_episode_window(&ids, Some(0), Some("21"), Some(5));
+        assert_eq!(w, 20..23);
+        // Unknown id → fall back to the top (not an empty page).
+        assert_eq!(
+            resolve_episode_window(&ids, None, Some("nope"), Some(3)),
+            0..3
+        );
+    }
 
     #[test]
     fn letter_prefix_is_case_insensitive_and_trims() {
