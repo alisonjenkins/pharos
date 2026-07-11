@@ -13,7 +13,7 @@ use super::messages::{
     ErrorCode, GroupId, GroupPlayState, MemberId, MemberSummary, QueueItemInfo, ServerMsg,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -232,7 +232,13 @@ enum PlaybackState {
 
 struct GroupState {
     id: GroupId,
-    started_at: Instant,
+    /// Wall-clock (unix ms) time base. `server_ms` is measured as
+    /// `unix_now_ms() - epoch_unix_ms`, so ANY replica derives the same
+    /// monotonic-looking clock from the same epoch — the property that lets a
+    /// group's actor migrate to another replica after a deploy without shifting
+    /// already-scheduled `at_server_ms` instants. (Replica wall clocks are
+    /// NTP-synced; on the single-node cluster they are the same clock.)
+    epoch_unix_ms: u64,
     members: HashMap<MemberId, MemberRec>,
     leader: Option<MemberId>,
     group_paused_due_to_buffering: bool,
@@ -245,10 +251,10 @@ struct GroupState {
 }
 
 impl GroupState {
-    fn new(id: GroupId) -> Self {
+    fn new(id: GroupId, epoch_unix_ms: u64) -> Self {
         Self {
             id,
-            started_at: Instant::now(),
+            epoch_unix_ms,
             members: HashMap::new(),
             leader: None,
             group_paused_due_to_buffering: false,
@@ -260,7 +266,7 @@ impl GroupState {
     }
 
     fn server_ms_now(&self) -> u64 {
-        self.started_at.elapsed().as_millis() as u64
+        unix_now_ms().saturating_sub(self.epoch_unix_ms)
     }
 
     /// Coarse playback state for snapshots / `StateUpdate`.
@@ -469,12 +475,14 @@ impl GroupState {
 pub struct GroupHandle {
     pub group_id: GroupId,
     pub tx: mpsc::Sender<GroupMsg>,
-    /// Wall-clock (unix ms) captured at spawn, aligned with the actor's
-    /// monotonic `started_at`. A member's socket adds a `ServerMsg`'s
-    /// `at_server_ms` to this to produce the absolute UTC `When` the Jellyfin
-    /// client schedules against. Exposed on the handle so the HTTP layer can
-    /// stash it in the session hub *before* `AddMember` triggers any late-joiner
-    /// catch-up broadcast (else the first command carries `When = 0`).
+    /// Wall-clock (unix ms) time base captured at spawn. It IS the actor's
+    /// `server_ms` origin (`server_ms = unix_now_ms() - epoch_unix_ms`), so a
+    /// member's socket adds a `ServerMsg`'s `at_server_ms` to this to produce
+    /// the absolute UTC `When` the Jellyfin client schedules against. Exposed on
+    /// the handle so the HTTP layer can stash it in the session hub *before*
+    /// `AddMember` triggers any late-joiner catch-up broadcast (else the first
+    /// command carries `When = 0`). Persisted with the group snapshot so a new
+    /// owner after a deploy reuses the same origin.
     pub epoch_unix_ms: u64,
 }
 
@@ -483,7 +491,7 @@ impl GroupHandle {
     pub fn spawn(group_id: GroupId) -> Self {
         let (tx, mut rx) = mpsc::channel::<GroupMsg>(256);
         let epoch_unix_ms = unix_now_ms();
-        let mut state = GroupState::new(group_id);
+        let mut state = GroupState::new(group_id, epoch_unix_ms);
         tokio::spawn(async move {
             // A brand-new group has no members yet — it must NOT terminate on
             // the empty check before its creator's AddMember lands (else a New
