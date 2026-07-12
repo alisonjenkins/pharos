@@ -271,6 +271,17 @@ async fn leave_group(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpRespo
                     })
                     .await;
             }
+            // B25 — ALWAYS acknowledge the leave to the LEAVER, group or not.
+            // jellyfin-web exits SyncPlay mode only on GroupLeft/NotInGroup
+            // over the socket; the group's own MemberLeft broadcast happens
+            // after the roster removal so it never reaches the leaver. Without
+            // this, Leave was a silent 204 and a client whose group the server
+            // had lost (B24) was WEDGED: stuck in group mode, playback
+            // controls hijacked, no way back to the library short of a reload.
+            let _ = sess
+                .sink
+                .send(pharos_sync::messages::ServerMsg::GroupLeft)
+                .await;
         }
     }
     no_content()

@@ -208,6 +208,13 @@ pub enum ServerMsg {
     /// disabling SyncPlay locally — a VISIBLE exit instead of a silent desync
     /// where the sender applies its command locally and nobody else does (B24).
     NotInGroup,
+    /// Acknowledge THIS member's departure (Jellyfin `SyncPlayGroupUpdate` /
+    /// `GroupLeft`). jellyfin-web only exits SyncPlay mode on receiving this
+    /// (or `NotInGroup`) — a `/SyncPlay/Leave` answered with just a 204 leaves
+    /// the client wedged in group mode with playback controls hijacked (B25).
+    /// `MemberLeft` can't serve here: the leaver is already out of the roster
+    /// when it broadcasts, so it only ever reaches the REMAINING members.
+    GroupLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

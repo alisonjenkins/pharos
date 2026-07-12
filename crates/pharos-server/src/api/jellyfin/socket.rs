@@ -659,6 +659,9 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         // jellyfin-web handles NotInGroup by disabling SyncPlay locally — a
         // visible clean exit instead of a silent one-sided desync.
         ServerMsg::NotInGroup => group_update(ctx, "NotInGroup", serde_json::Value::Null),
+        // B25 — leave acknowledgement to the leaver; jellyfin-web exits
+        // SyncPlay mode (disableSyncPlay) on this.
+        ServerMsg::GroupLeft => group_update(ctx, "GroupLeft", serde_json::Value::Null),
         ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => None,
     }
 }

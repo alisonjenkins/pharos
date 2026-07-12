@@ -193,4 +193,109 @@ async fn no_group_command_sends_not_in_group_to_the_caller() {
         matches!(msg, ServerMsg::NotInGroup),
         "expected NotInGroup, got {msg:?}"
     );
+
+    // B25 — /SyncPlay/Leave must acknowledge the LEAVER with GroupLeft even
+    // when the server has no group for the session (lace's wedge: client in
+    // group mode, server group-less; Leave was a silent 204 → no way out of
+    // SyncPlay short of a page reload).
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/SyncPlay/Leave")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("X-Emby-Device-Id", "dev-restart"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sink_rx.recv())
+        .await
+        .expect("leaver's socket must receive a message")
+        .expect("sink open");
+    assert!(
+        matches!(msg, ServerMsg::GroupLeft),
+        "expected GroupLeft, got {msg:?}"
+    );
+}
+
+/// The NORMAL leave (session actually in a group) must also acknowledge the
+/// leaver with GroupLeft — the group's own MemberLeft broadcast fires after
+/// the roster removal, so it only ever reaches the remaining members.
+#[actix_web::test]
+async fn leave_with_group_acknowledges_the_leaver() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "lace".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose().to_string();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+
+    let hub = SessionHub::new();
+    let (sink_tx, mut sink_rx) = mpsc::channel(32);
+    let reg = hub.register("dev-leaver".into(), "lace".into(), sink_tx.clone());
+
+    let member_sinks = MemberSinks::new();
+    member_sinks.insert(reg.member_id, sink_tx);
+    let registry =
+        pharos_sync::GroupRegistry::spawn(Arc::new(LocalDelivery::new(member_sinks.clone())));
+
+    // Join a real group the same way /SyncPlay/New does: attach + AddMember.
+    let handle = registry.create().await.unwrap();
+    hub.attach_group("dev-leaver", handle.clone());
+    let (rtx, rrx) = oneshot::channel();
+    handle
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: reg.member_id,
+            name: "lace".into(),
+            reply: rtx,
+        })
+        .await
+        .unwrap();
+    let _ = rrx.await.unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .app_data(web::Data::new(registry))
+            .app_data(web::Data::new(hub))
+            .app_data(web::Data::new(member_sinks))
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/SyncPlay/Leave")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("X-Emby-Device-Id", "dev-leaver"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // Drain the join-time messages (Joined + catch-up); GroupLeft must arrive.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, sink_rx.recv())
+            .await
+            .expect("leaver must receive GroupLeft before timeout")
+            .expect("sink open");
+        if matches!(msg, ServerMsg::GroupLeft) {
+            break;
+        }
+    }
 }
