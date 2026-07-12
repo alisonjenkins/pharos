@@ -185,7 +185,10 @@ async fn playing_progress(
     // item up across sessions. The session-snapshot path above lives
     // and dies with the in-process actor (V18) and won't survive
     // restarts.
-    if let Ok(item_id) = item_id_str.parse::<pharos_core::MediaId>() {
+    // parse_item_id: clients echo the canonical 32-hex wire id (B15) — a
+    // plain decimal parse silently failed here, so resume positions
+    // stopped persisting for hex-era clients.
+    if let Some(item_id) = pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
         if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
             data.last_played_position_ticks = position_ticks;
             data.last_played_at = now_unix();
@@ -234,7 +237,10 @@ async fn playing_stopped(
     // every finished item forever (jellyfin-web only sends an
     // explicit /PlayedItems POST on manual mark-played).
     if let Some(item_id_str) = body.item_id {
-        if let Ok(item_id) = item_id_str.parse::<pharos_core::MediaId>() {
+        // parse_item_id: clients echo the canonical 32-hex wire id (B15) — a
+        // plain decimal parse silently failed here, so resume positions
+        // stopped persisting for hex-era clients.
+        if let Some(item_id) = pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
             let position = body.position_ticks.unwrap_or(0);
             let runtime = state
                 .stores

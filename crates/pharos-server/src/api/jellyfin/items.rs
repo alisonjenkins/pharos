@@ -1007,9 +1007,11 @@ struct TagMutateQuery {
 /// 32-hex synth id (or any non-numeric / over-long token) is rejected as
 /// 400 — tag mutation targets a real media row, never an aggregate id.
 fn parse_media_id(raw: &str) -> Result<u64, actix_web::Error> {
-    raw.trim()
-        .parse::<u64>()
-        .map_err(|_| error::ErrorBadRequest("invalid item id"))
+    // parse_item_id accepts the canonical 32-hex GUID, dashed, and legacy
+    // decimal forms — and still rejects 32-hex SYNTH ids (non-zero high
+    // half → None), preserving this guard's aggregate-id rejection.
+    pharos_jellyfin_api::dto::parse_item_id(raw)
+        .ok_or_else(|| error::ErrorBadRequest("invalid item id"))
 }
 
 /// Split a `Tags=` value into individual tag names — accept both `|`
@@ -4327,10 +4329,8 @@ async fn refresh_item(
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::MediaStore;
-    let id: u64 = path
-        .into_inner()
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),

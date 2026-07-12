@@ -777,9 +777,8 @@ async fn serve_segment(
     variant: Option<AnyVariant>,
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id_num: u64 = id
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // A client is actively pulling segments → tell the background backfill to
     // stand down so its whole-file decodes don't starve live transcoding.
     state.note_playback_activity();
@@ -1261,9 +1260,8 @@ async fn vp9_audio_playlist(
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let media_id: u64 = id
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, media_id).await?;
     let qs = playback_qs(&req);
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
@@ -1317,9 +1315,8 @@ async fn vp9_audio_file(
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, name) = path.into_inner();
-    let media_id: u64 = id
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let Some(cache) = state.hls.as_ref() else {
         return Err(error::ErrorNotFound("no cache"));
     };
@@ -1406,10 +1403,8 @@ async fn vp9_init(
     path: web::Path<String>,
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id_num: u64 = path
-        .into_inner()
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     let opts = vp9_segment_opts(
@@ -1442,9 +1437,8 @@ async fn vp9_segment(
     q: web::Query<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, seg) = path.into_inner();
-    let id_num: u64 = id
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // Active playback → background backfill yields (see serve_segment).
     state.note_playback_activity();
     let item = fetch_item(&state, id_num).await?;
