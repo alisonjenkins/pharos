@@ -2399,10 +2399,10 @@ mod tests {
     async fn buffering_freeze_auto_resumes_on_last_ready() {
         let (h, sinks, mut rx1, m1) = fresh().await;
         let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
-        // Start playing (leader = lowest id; use whoever is leader).
-        let leader = if m1 < m2 { m1 } else { m2 };
+        // Leader = the FIRST member (election runs only on the empty-join;
+        // a later, lower id does NOT usurp).
         h.tx.send(GroupMsg::LeaderPlay {
-            sender: leader,
+            sender: m1,
             position_ms: 1_000,
         })
         .await
@@ -2463,9 +2463,8 @@ mod tests {
     async fn voluntary_pause_is_not_auto_resumed_by_ready() {
         let (h, sinks, mut rx1, m1) = fresh().await;
         let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
-        let leader = if m1 < m2 { m1 } else { m2 };
         h.tx.send(GroupMsg::LeaderPlay {
-            sender: leader,
+            sender: m1,
             position_ms: 1_000,
         })
         .await
