@@ -52,12 +52,44 @@ impl<T: DeserializeOwned> FromRequest for CiQuery<T> {
 
 /// Rewrite the KEY of every `key=value` pair to snake_case, leaving the (still
 /// percent-encoded) value verbatim so no double-decode occurs.
+///
+/// REPEATED keys are merged into one comma-joined value: jellyfin-web sends
+/// `fields=A&fields=B` for list params, and serde rejects a duplicate key on
+/// a scalar field with a 400 — which broke search (B20). Jellyfin list params
+/// are comma-CSV everywhere, so merging mirrors how ASP.NET's array binding
+/// consumes the repeats.
 fn snake_case_query_keys(qs: &str) -> String {
-    qs.split('&')
-        .filter(|p| !p.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => format!("{}={}", to_snake_case(k), v),
-            None => to_snake_case(pair),
+    let mut order: Vec<String> = Vec::new();
+    let mut merged: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for pair in qs.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (to_snake_case(k), v),
+            None => (to_snake_case(pair), ""),
+        };
+        match merged.get_mut(&k) {
+            Some(existing) => {
+                if !v.is_empty() {
+                    if !existing.is_empty() {
+                        existing.push(',');
+                    }
+                    existing.push_str(v);
+                }
+            }
+            None => {
+                order.push(k.clone());
+                merged.insert(k, v.to_string());
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|k| {
+            let v = &merged[&k];
+            if v.is_empty() {
+                k
+            } else {
+                format!("{k}={v}")
+            }
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -125,5 +157,11 @@ mod tests {
             "include_item_types=Movie%2CSeries"
         );
         assert_eq!(snake_case_query_keys(""), "");
+        // Repeated keys merge into one comma-joined value (B20: jellyfin-web
+        // sends fields=A&fields=B; a duplicate scalar key 400'd search).
+        assert_eq!(
+            snake_case_query_keys("fields=PrimaryImageAspectRatio&fields=CanDelete&searchTerm=x"),
+            "fields=PrimaryImageAspectRatio,CanDelete&search_term=x"
+        );
     }
 }

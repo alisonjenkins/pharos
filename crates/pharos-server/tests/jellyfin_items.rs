@@ -1759,3 +1759,18 @@ async fn shows_episodes_season_filter_is_case_insensitive() {
         );
     }
 }
+
+/// B20 regression: jellyfin-web's search sends REPEATED `fields=` params
+/// (`fields=A&fields=B`). CiQuery merges repeats into one comma-joined value;
+/// a duplicate scalar key would otherwise 400 the whole search.
+#[actix_web::test]
+async fn repeated_query_params_merge_instead_of_400() {
+    let (state, token, _u) = seed_shows().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?searchTerm=Alpha&recursive=true&fields=PrimaryImageAspectRatio&fields=CanDelete&limit=10")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "repeated fields params must not 400");
+}
