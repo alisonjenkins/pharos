@@ -123,7 +123,7 @@ async fn get_item_by_id_returns_pascalcase_dto() {
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["Id"], "100");
+    assert_eq!(v["Id"], "00000000000000000000000000000064");
     assert_eq!(v["Name"], "title-0");
     assert_eq!(v["Type"], "Movie");
 }
@@ -174,7 +174,7 @@ async fn get_user_item_matches_bearer_returns_dto() {
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["Id"], "100");
+    assert_eq!(v["Id"], "00000000000000000000000000000064");
     assert_eq!(v["Name"], "title-0");
 }
 

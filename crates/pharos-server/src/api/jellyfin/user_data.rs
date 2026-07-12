@@ -112,9 +112,8 @@ async fn mutate<F>(
 where
     F: FnOnce(&mut UserItemData),
 {
-    let item_id: MediaId = item_id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid item id"))?;
+    let item_id: MediaId = pharos_jellyfin_api::dto::parse_item_id(item_id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid item id"))?;
     // Confirm the item exists before writing a row that the cascade
     // would have to clean up later.
     state.stores.get(item_id).await.map_err(|e| match e {

@@ -32,7 +32,7 @@
       "Genres": [
         "Jazz"
       ],
-      "Id": "30",
+      "Id": "0000000000000000000000000000001e",
       "ImageTags": {
         "Primary": "4e869b5f937ba34b"
       },
@@ -45,7 +45,7 @@
           "ETag": "0",
           "GenPtsInput": false,
           "HasSegments": false,
-          "Id": "30",
+          "Id": "0000000000000000000000000000001e",
           "IgnoreDts": false,
           "IgnoreIndex": false,
           "IsInfiniteStream": false,
@@ -97,7 +97,7 @@
       "Type": "Audio",
       "UserData": {
         "IsFavorite": false,
-        "ItemId": "30",
+        "ItemId": "0000000000000000000000000000001e",
         "Key": "30",
         "LastPlayedDate": null,
         "Likes": null,
@@ -140,7 +140,7 @@
       "Genres": [
         "Jazz"
       ],
-      "Id": "31",
+      "Id": "0000000000000000000000000000001f",
       "ImageTags": {
         "Primary": "6620922965f75a27"
       },
@@ -153,7 +153,7 @@
           "ETag": "0",
           "GenPtsInput": false,
           "HasSegments": false,
-          "Id": "31",
+          "Id": "0000000000000000000000000000001f",
           "IgnoreDts": false,
           "IgnoreIndex": false,
           "IsInfiniteStream": false,
@@ -205,7 +205,7 @@
       "Type": "Audio",
       "UserData": {
         "IsFavorite": false,
-        "ItemId": "31",
+        "ItemId": "0000000000000000000000000000001f",
         "Key": "31",
         "LastPlayedDate": null,
         "Likes": null,

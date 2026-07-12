@@ -425,7 +425,7 @@ async fn items_similar(
     q: web::Query<SimilarQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
-    let id: u64 = match id_str.parse() {
+    let id: u64 = match pharos_jellyfin_api::dto::parse_item_id(&id_str).ok_or(()) {
         Ok(v) => v,
         // Synth ids (library / series / season / artist / album / genre)
         // — no "similar" semantics, return empty rather than 4xx.
@@ -985,8 +985,10 @@ pub(crate) fn parse_id_csv(raw: Option<&str>) -> Vec<u64> {
     raw.map(|s| {
         s.split(',')
             .map(str::trim)
-            .filter(|t| !t.is_empty() && t.len() <= 20)
-            .filter_map(|t| t.parse::<u64>().ok())
+            // ≤36 admits the dashed-GUID form; the old ≤20 guard (decimal
+            // u64) silently dropped the canonical 32-hex ids (B15).
+            .filter(|t| !t.is_empty() && t.len() <= 36)
+            .filter_map(pharos_jellyfin_api::dto::parse_item_id)
             .collect()
     })
     .unwrap_or_default()
@@ -1344,8 +1346,25 @@ async fn shows_episodes(
     // the client can page correctly (reporting the truncated count made it
     // request past the real end and re-append the same items).
     let total = eps.len() as u32;
-    let ids: Vec<String> = eps.iter().map(|(_, e)| e.id.to_string()).collect();
-    let window = resolve_episode_window(&ids, q.start_index, q.start_item_id.as_deref(), q.limit);
+    // Canonical wire ids; window matching normalizes the client's
+    // StartItemId to the same form below.
+    let ids: Vec<String> = eps
+        .iter()
+        .map(|(_, e)| pharos_jellyfin_api::dto::wire_item_id(e.id))
+        .collect();
+    // Normalize the client's StartItemId to the canonical wire form so a
+    // legacy-decimal id still matches the hex ids in `ids`.
+    let start_item_canonical = q
+        .start_item_id
+        .as_deref()
+        .and_then(pharos_jellyfin_api::dto::parse_item_id)
+        .map(pharos_jellyfin_api::dto::wire_item_id);
+    let window = resolve_episode_window(
+        &ids,
+        q.start_index,
+        start_item_canonical.as_deref(),
+        q.limit,
+    );
     let start = window.start;
     let dtos: Vec<BaseItemDto> = eps
         .get(window)
@@ -1439,9 +1458,11 @@ async fn playback_info(
     // very first `master.m3u8` request 401s and playback dies with a fatal
     // `manifestLoadError`. Recover the bearer that authenticated THIS request.
     let api_key = crate::api::jellyfin::auth_extractor::extract_token(&req).unwrap_or_default();
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    // Canonical wire form regardless of which shape the caller sent —
+    // TranscodingUrl / MediaSource.Id must round-trip consistently.
+    let id_str = pharos_jellyfin_api::dto::wire_item_id(id);
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -2890,7 +2911,7 @@ fn build_media_query(
             .split(',')
             .map(str::trim)
             .filter(|s| s.len() <= 20)
-            .filter_map(|s| s.parse::<u64>().ok())
+            .filter_map(pharos_jellyfin_api::dto::parse_item_id)
             .collect();
     }
     if let Some(raw) = q.genres.as_deref() {
@@ -3487,7 +3508,7 @@ async fn fetch_item_dto(
     // (`synth_series_or_season` → `store.list()`), so gate them behind a
     // non-numeric id — otherwise EVERY item-detail + poster fetch paid a full
     // ~13k-row scan before reaching the cheap `get(id)` below.
-    let numeric_id: Option<u64> = id_str.parse::<u64>().ok();
+    let numeric_id: Option<u64> = pharos_jellyfin_api::dto::parse_item_id(id_str);
     if numeric_id.is_none() {
         // T-fix-7 follow-up: synthesised library CollectionFolder ids.
         if let Some(view) = library_view_for_id(state, id_str) {

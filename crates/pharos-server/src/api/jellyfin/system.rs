@@ -657,7 +657,7 @@ async fn media_segments_stub(
 /// everything else is ignored.
 async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json::Value> {
     use pharos_core::MediaStore;
-    let Ok(id) = item_id.parse::<u64>() else {
+    let Some(id) = pharos_jellyfin_api::dto::parse_item_id(item_id) else {
         return Vec::new();
     };
     let Ok(item) = state.stores.get(id).await else {

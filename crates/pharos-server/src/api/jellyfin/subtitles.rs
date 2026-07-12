@@ -119,9 +119,8 @@ async fn deliver_attachment(
     id_str: &str,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -185,9 +184,8 @@ async fn deliver_ass(
     id_str: &str,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -377,9 +375,8 @@ async fn deliver_srt(
     stream_index: u32,
     forced_only: bool,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -497,9 +494,8 @@ async fn deliver_vtt(
     forced_only: bool,
     style: SubtitleStyle,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -635,9 +631,8 @@ async fn deliver_js(
     id_str: &str,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),

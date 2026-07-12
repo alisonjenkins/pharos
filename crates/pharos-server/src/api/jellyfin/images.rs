@@ -60,9 +60,8 @@ async fn get_chapter_image(
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id_str, idx) = path.into_inner();
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -224,7 +223,7 @@ async fn serve_image(
     // episodes), so resolve it to a representative episode and serve that
     // episode's frame as the show/season poster. Without this every series
     // tile in the library 404'd its image.
-    let item = match id_str.parse::<u64>() {
+    let item = match pharos_jellyfin_api::dto::parse_item_id(id_str).ok_or(()) {
         Ok(id) => match state.stores.get(id).await {
             Ok(it) => it,
             Err(_) => return Ok(HttpResponse::NotFound().body("")),
@@ -653,9 +652,8 @@ async fn upload_image(
             "image cache not configured",
         ));
     };
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("item not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -687,9 +685,8 @@ async fn remove_image(
     let Some(cache) = state.images.as_ref() else {
         return Ok(HttpResponse::NoContent().finish());
     };
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("item not found"),
         other => error::ErrorInternalServerError(other.to_string()),

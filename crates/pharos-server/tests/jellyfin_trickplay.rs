@@ -276,8 +276,18 @@ async fn item_dto_trickplay_is_nested_by_media_source_id() {
     let dto =
         BaseItemDto::from_domain(&item, "srv").with_trickplay(&item.probe, &[320, 640], 10_000);
     let v = serde_json::to_value(&dto).unwrap();
-    assert_eq!(v["Trickplay"]["7"]["320"]["Width"].as_u64().unwrap(), 320);
-    assert_eq!(v["Trickplay"]["7"]["640"]["Width"].as_u64().unwrap(), 640);
+    assert_eq!(
+        v["Trickplay"]["00000000000000000000000000000007"]["320"]["Width"]
+            .as_u64()
+            .unwrap(),
+        320
+    );
+    assert_eq!(
+        v["Trickplay"]["00000000000000000000000000000007"]["640"]["Width"]
+            .as_u64()
+            .unwrap(),
+        640
+    );
     assert!(
         v["Trickplay"].get("320").is_none(),
         "flat wire shape regressed (width at top level): {}",
@@ -364,11 +374,18 @@ async fn http_get_item_emits_nested_trickplay() {
     assert_eq!(resp.status(), 200);
     let v: serde_json::Value = test::read_body_json(resp).await;
     assert_eq!(
-        v["Trickplay"]["7"]["320"]["Width"].as_u64().unwrap(),
+        v["Trickplay"]["00000000000000000000000000000007"]["320"]["Width"]
+            .as_u64()
+            .unwrap(),
         320,
         "GET /Items/7 dropped the nested Trickplay map: {v}"
     );
-    assert_eq!(v["Trickplay"]["7"]["640"]["Width"].as_u64().unwrap(), 640);
+    assert_eq!(
+        v["Trickplay"]["00000000000000000000000000000007"]["640"]["Width"]
+            .as_u64()
+            .unwrap(),
+        640
+    );
     // Guard the pre-fix flat shape can't creep back at the HTTP layer either.
     assert!(
         v["Trickplay"].get("320").is_none(),

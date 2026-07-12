@@ -20,7 +20,7 @@
       "Genres": [
         "Comedy"
       ],
-      "Id": "21",
+      "Id": "00000000000000000000000000000015",
       "ImageTags": {
         "Backdrop": "2de3a8c9b3e8d6f9",
         "Primary": "602404c01aafa6ef",
@@ -35,7 +35,7 @@
           "ETag": "0",
           "GenPtsInput": false,
           "HasSegments": false,
-          "Id": "21",
+          "Id": "00000000000000000000000000000015",
           "IgnoreDts": false,
           "IgnoreIndex": false,
           "IsInfiniteStream": false,
@@ -96,7 +96,7 @@
       "Type": "Episode",
       "UserData": {
         "IsFavorite": false,
-        "ItemId": "21",
+        "ItemId": "00000000000000000000000000000015",
         "Key": "21",
         "LastPlayedDate": null,
         "Likes": null,
@@ -127,7 +127,7 @@
       "Genres": [
         "Action"
       ],
-      "Id": "12",
+      "Id": "0000000000000000000000000000000c",
       "ImageTags": {
         "Backdrop": "6ae7b8ea5e9f2861",
         "Primary": "31ff8654596e02f9",
@@ -141,7 +141,7 @@
           "ETag": "0",
           "GenPtsInput": false,
           "HasSegments": false,
-          "Id": "12",
+          "Id": "0000000000000000000000000000000c",
           "IgnoreDts": false,
           "IgnoreIndex": false,
           "IsInfiniteStream": false,
@@ -196,7 +196,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": false,
-        "ItemId": "12",
+        "ItemId": "0000000000000000000000000000000c",
         "Key": "12",
         "LastPlayedDate": null,
         "Likes": null,
@@ -227,7 +227,7 @@
       "Genres": [
         "Action"
       ],
-      "Id": "10",
+      "Id": "0000000000000000000000000000000a",
       "ImageTags": {
         "Backdrop": "1ebcf8276a730a30",
         "Primary": "72fc7e696b642f89",
@@ -241,7 +241,7 @@
           "ETag": "0",
           "GenPtsInput": false,
           "HasSegments": false,
-          "Id": "10",
+          "Id": "0000000000000000000000000000000a",
           "IgnoreDts": false,
           "IgnoreIndex": false,
           "IsInfiniteStream": false,
@@ -296,7 +296,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": true,
-        "ItemId": "10",
+        "ItemId": "0000000000000000000000000000000a",
         "Key": "10",
         "LastPlayedDate": null,
         "Likes": null,

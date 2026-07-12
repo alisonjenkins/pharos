@@ -20,7 +20,7 @@
       "Genres": [
         "Action"
       ],
-      "Id": "12",
+      "Id": "0000000000000000000000000000000c",
       "ImageTags": {
         "Backdrop": "6ae7b8ea5e9f2861",
         "Primary": "31ff8654596e02f9",
@@ -34,7 +34,7 @@
           "ETag": "0",
           "GenPtsInput": false,
           "HasSegments": false,
-          "Id": "12",
+          "Id": "0000000000000000000000000000000c",
           "IgnoreDts": false,
           "IgnoreIndex": false,
           "IsInfiniteStream": false,
@@ -89,7 +89,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": false,
-        "ItemId": "12",
+        "ItemId": "0000000000000000000000000000000c",
         "Key": "12",
         "LastPlayedDate": null,
         "Likes": null,

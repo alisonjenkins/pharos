@@ -37,9 +37,8 @@ async fn get_waveform(
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_str = path.into_inner();
-    let id: u64 = id_str
-        .parse()
-        .map_err(|_| error::ErrorBadRequest("invalid id"))?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),

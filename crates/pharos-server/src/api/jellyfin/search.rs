@@ -148,8 +148,8 @@ async fn search_hints(
     };
     for i in &term_items {
         hints.push(SearchHint {
-            item_id: i.id.to_string(),
-            id: i.id.to_string(),
+            item_id: pharos_jellyfin_api::dto::wire_item_id(i.id),
+            id: pharos_jellyfin_api::dto::wire_item_id(i.id),
             name: i.title.clone(),
             kind: jellyfin_type(i.kind),
             media_type: media_type(i.kind),

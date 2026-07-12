@@ -73,8 +73,14 @@ async fn playlist_full_lifecycle() {
     // 3. Items in curated order, each with a PlaylistItemId.
     let list = items(&f, &pid).await;
     assert_eq!(list.len(), 2);
-    assert_eq!(list[0]["Id"].as_str().unwrap(), f.rich_item_id.to_string());
-    assert_eq!(list[1]["Id"].as_str().unwrap(), f.other_item_id.to_string());
+    assert_eq!(
+        list[0]["Id"].as_str().unwrap(),
+        format!("{:032x}", f.rich_item_id)
+    );
+    assert_eq!(
+        list[1]["Id"].as_str().unwrap(),
+        format!("{:032x}", f.other_item_id)
+    );
     assert!(list[0]["PlaylistItemId"].as_str().is_some());
 
     // 4. Append the first item again — a playlist may hold it twice.
@@ -89,7 +95,10 @@ async fn playlist_full_lifecycle() {
     );
     let list = items(&f, &pid).await;
     assert_eq!(list.len(), 3);
-    assert_eq!(list[2]["Id"].as_str().unwrap(), f.rich_item_id.to_string());
+    assert_eq!(
+        list[2]["Id"].as_str().unwrap(),
+        format!("{:032x}", f.rich_item_id)
+    );
     let appended_entry = list[2]["PlaylistItemId"].as_str().unwrap().to_string();
 
     // 5. Move the appended entry to the front.

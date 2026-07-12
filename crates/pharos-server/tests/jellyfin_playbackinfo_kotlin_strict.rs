@@ -157,6 +157,14 @@ async fn playback_info_satisfies_kotlin_sdk_required_fields() {
         for s in streams {
             assert_required(s, MEDIA_STREAM_REQUIRED, "MediaStream");
         }
+        // Item ids must be GUID-shaped: jellyfin-android's WebView→native
+        // bridge parses ids with toUUIDOrNull() and silently drops non-UUID
+        // ids — a decimal id empties the play queue (B15).
+        let sid = src["Id"].as_str().unwrap();
+        assert!(
+            sid.len() == 32 && sid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "MediaSource Id must be a dashless GUID, got {sid}"
+        );
         // Attachments (fonts): Index is the SDK's only required field.
         if let Some(atts) = src["MediaAttachments"].as_array() {
             for a in atts {

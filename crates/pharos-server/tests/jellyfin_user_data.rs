@@ -186,7 +186,7 @@ async fn resume_endpoint_lists_items_with_progress() {
     assert_eq!(v["TotalRecordCount"], 1);
     let items = v["Items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["Id"], "300");
+    assert_eq!(items[0]["Id"], "0000000000000000000000000000012c");
     assert_eq!(items[0]["UserData"]["PlaybackPositionTicks"], 50_000_000u64);
 }
 

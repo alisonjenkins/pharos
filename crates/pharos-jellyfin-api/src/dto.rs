@@ -631,7 +631,7 @@ pub struct UserItemDataDto {
 impl UserItemDataDto {
     pub fn from_domain(item_id: pharos_core::MediaId, data: pharos_core::UserItemData) -> Self {
         Self {
-            item_id: item_id.to_string(),
+            item_id: wire_item_id(item_id),
             played: data.played,
             play_count: data.play_count,
             playback_position_ticks: data.last_played_position_ticks,
@@ -652,6 +652,39 @@ impl UserItemDataDto {
 /// Minimal ISO-8601 (Z) formatter for the `LastPlayedDate` field —
 /// avoids pulling in `chrono` just for one render path. T58 phase 3
 /// reuses it from the admin module for `/Auth/Keys` DateCreated.
+/// Canonical wire form of a library item id: the u64 zero-padded into a
+/// dashless 32-hex GUID (`00000000000000000218…`). Jellyfin item ids ARE
+/// Guids, and the native apps parse every id with `toUUIDOrNull()` —
+/// jellyfin-android's WebView→native bridge silently DROPS non-UUID ids, so
+/// a decimal id string empties the play queue and the native player fails
+/// with "Unable to resolve playback info" (B15). Matches the 32-hex shape
+/// [`series_id_for_key`] already uses for synthetic series ids.
+pub fn wire_item_id(id: pharos_core::MediaId) -> String {
+    format!("{id:032x}")
+}
+
+/// Parse an incoming item id in ANY of the shapes clients send back:
+/// - the canonical dashless 32-hex GUID (leading 16 zeros → pharos u64)
+/// - the same GUID with dashes (some SDKs re-serialize UUIDs dashed)
+/// - the legacy plain-decimal form (pre-B15 clients / open sessions)
+pub fn parse_item_id(s: &str) -> Option<pharos_core::MediaId> {
+    let s = s.trim();
+    if s.len() == 36 && s.bytes().filter(|b| *b == b'-').count() == 4 {
+        let undashed: String = s.chars().filter(|c| *c != '-').collect();
+        return parse_item_id(&undashed);
+    }
+    if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let (hi, lo) = s.split_at(16);
+        if hi.bytes().all(|b| b == b'0') {
+            return pharos_core::MediaId::from_str_radix(lo, 16).ok();
+        }
+        // GUID-shaped but not in the item-id namespace (e.g. a synthetic
+        // series/season id) — not a media item id.
+        return None;
+    }
+    s.parse::<pharos_core::MediaId>().ok()
+}
+
 pub fn format_iso8601(unix_secs: i64) -> String {
     // Constants: days/month etc. Use the same algorithm as
     // chrono::NaiveDateTime::from_timestamp — straightforward Gregorian
@@ -926,14 +959,14 @@ impl BaseItemDto {
             .map(|s| s.index);
 
         Self {
-            id: item.id.to_string(),
+            id: wire_item_id(item.id),
             name: item.title.clone(),
             server_id: server_id.to_string(),
             kind,
             media_type,
             is_folder: false,
             user_data: UserItemDataDto {
-                item_id: item.id.to_string(),
+                item_id: wire_item_id(item.id),
                 ..Default::default()
             },
             run_time_ticks,
@@ -941,7 +974,7 @@ impl BaseItemDto {
             can_play: true,
             play_access: "Full",
             media_sources: vec![MediaSourceLiteDto {
-                id: item.id.to_string(),
+                id: wire_item_id(item.id),
                 container,
                 kind: "Default",
                 is_remote: false,
@@ -1584,7 +1617,7 @@ pub fn build_media_streams_with_subtitles(
                     delivery_url: is_text.then(|| {
                         format!(
                             "/Videos/{id}/{id}/Subtitles/{idx}/Stream.{ext}",
-                            id = ctx.item_id,
+                            id = wire_item_id(ctx.item_id),
                             idx = t.stream_index,
                         )
                     }),
@@ -1630,7 +1663,7 @@ pub fn build_media_streams_with_subtitles(
                     is_original: false,
                     delivery_url: Some(format!(
                         "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
-                        id = ctx.item_id,
+                        id = wire_item_id(ctx.item_id),
                     )),
                     // Sidecars are already WebVTT — always External text.
                     delivery_method: Some("External"),
@@ -1691,7 +1724,7 @@ pub fn build_media_attachments(
                 "Codec": a.codec,
                 "DeliveryUrl": format!(
                     "/Videos/{id}/{id}/Attachments/{idx}",
-                    id = item_id,
+                    id = wire_item_id(item_id),
                     idx = a.stream_index,
                 ),
             })
@@ -1704,6 +1737,32 @@ pub fn build_media_attachments(
 mod tests {
     use super::*;
     use pharos_core::MediaProbe;
+
+    #[test]
+    fn wire_item_ids_are_guid_shaped_and_round_trip() {
+        // jellyfin-android parses every id with toUUIDOrNull() and silently
+        // drops non-UUID ids — a decimal id string empties the native play
+        // queue ("Unable to resolve playback info", B15).
+        let id: pharos_core::MediaId = 152_979_617_944_103_156;
+        let wire = wire_item_id(id);
+        assert_eq!(wire.len(), 32);
+        assert!(wire.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            uuid::Uuid::parse_str(&wire).is_ok(),
+            "must be UUID-parseable"
+        );
+        assert_eq!(parse_item_id(&wire), Some(id), "canonical round-trip");
+        // Dashed UUID form (some SDKs re-serialize dashed).
+        let dashed = uuid::Uuid::parse_str(&wire)
+            .unwrap()
+            .hyphenated()
+            .to_string();
+        assert_eq!(parse_item_id(&dashed), Some(id));
+        // Legacy decimal still accepted (pre-B15 clients / open sessions).
+        assert_eq!(parse_item_id("152979617944103156"), Some(id));
+        // Synthetic series ids (non-zero high half) are NOT item ids.
+        assert_eq!(parse_item_id("11112222333344441111222233334444"), None);
+    }
 
     #[test]
     fn format_iso8601_ms_has_three_fraction_digits() {
@@ -1745,9 +1804,9 @@ mod tests {
         assert_eq!(out[0]["FileName"], "Arial.ttf");
         assert_eq!(out[0]["MimeType"], "application/x-truetype-font");
         assert_eq!(out[0]["Codec"], "ttf");
-        assert_eq!(out[0]["DeliveryUrl"], "/Videos/42/42/Attachments/7");
+        assert_eq!(out[0]["DeliveryUrl"], "/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Attachments/7");
         assert_eq!(out[1]["Index"], 8);
-        assert_eq!(out[1]["DeliveryUrl"], "/Videos/42/42/Attachments/8");
+        assert_eq!(out[1]["DeliveryUrl"], "/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Attachments/8");
     }
 
     #[test]
@@ -1847,7 +1906,7 @@ mod tests {
         assert_eq!(text.delivery_method, Some("External"));
         assert_eq!(
             text.delivery_url.as_deref(),
-            Some("/Videos/42/42/Subtitles/2/Stream.vtt")
+            Some("/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Subtitles/2/Stream.vtt")
         );
         // jellyfin-web's subtitle engine gates on these two flags: it only
         // fetches an external track (Stream.js / Stream.vtt) when
@@ -1870,7 +1929,7 @@ mod tests {
         assert_eq!(ass.delivery_method, Some("External"));
         assert_eq!(
             ass.delivery_url.as_deref(),
-            Some("/Videos/42/42/Subtitles/4/Stream.ass")
+            Some("/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Subtitles/4/Stream.ass")
         );
         assert!(ass.is_text_subtitle_stream);
         assert!(ass.supports_external_stream);
@@ -2225,9 +2284,20 @@ mod trickplay_helper_tests {
             10_000,
         );
         let v = serde_json::to_value(&dto).unwrap();
-        // Outer key is the media-source id (== item id "42"); inner keyed by width.
-        assert_eq!(v["Trickplay"]["42"]["320"]["Width"].as_u64().unwrap(), 320);
-        assert_eq!(v["Trickplay"]["42"]["640"]["Width"].as_u64().unwrap(), 640);
+        // Outer key is the media-source id (the item id in canonical 32-hex
+        // GUID wire form — B15); inner keyed by width.
+        assert_eq!(
+            v["Trickplay"]["0000000000000000000000000000002a"]["320"]["Width"]
+                .as_u64()
+                .unwrap(),
+            320
+        );
+        assert_eq!(
+            v["Trickplay"]["0000000000000000000000000000002a"]["640"]["Width"]
+                .as_u64()
+                .unwrap(),
+            640
+        );
         // The old (wrong) flat shape put the width at the top level.
         assert!(
             v["Trickplay"].get("320").is_none(),
