@@ -1509,20 +1509,22 @@ async fn vp9_segment(
 /// own eventual request — so a segment is never transcoded twice and a live
 /// request that catches up simply awaits the in-flight prefetch.
 ///
-/// Core-aware: each software VP9 segment runs ~`vp9_encode_threads()` (≈4)
-/// threads, so `1 live + prefetch` concurrent encodes must not oversubscribe
-/// the cores (the continuous-audio + trickplay backfill also want CPU). A fixed
-/// 4 was measured on the 16-core box to run 5 concurrent encodes with
-/// `queue_wait_ms = 0` — i.e. NOT queued but all racing → each segment took
-/// 2-3.6 s instead of the ~0.6 s single-stream benchmark. Target ~3 concurrent
-/// video encodes (≈12 threads) so audio + previews have headroom.
+/// Permit-aware: every software video segment (VP9 AND x264/x265) runs
+/// `sw_encode_threads()` (≈4) threads and the CPU device admits
+/// `cores / 4` concurrent jobs (`default_cpu_permits`), so `1 live +
+/// prefetch` must fit inside that budget with a slot or two spare for
+/// audio / trickplay / a second viewer. A fixed 4 was measured on the
+/// 16-core box to run 5 concurrent encodes with `queue_wait_ms = 0` —
+/// i.e. NOT queued but all racing → each segment took 2-3.6 s instead of
+/// the ~0.6 s single-stream benchmark. Also capped at 4 ahead (~24 s of
+/// content): past that, a big box (say 64 cores → 16 permits) would flood
+/// the queue with speculative work and starve a second stream's LIVE
+/// segment behind a wall of one viewer's prefetch.
 fn segment_prefetch_ahead() -> u32 {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(4);
-    // (cores / ~threads-per-encode) leaves 1 slot for the live segment and ~1
-    // for audio/trickplay; floor at 1 so tiny boxes still pipeline one ahead.
-    (cores / 4).saturating_sub(2).max(1)
+    let permits = pharos_transcode::device::default_cpu_permits() as u32;
+    // Leave 1 slot for the live segment and ~1 for audio/trickplay; floor
+    // at 1 so tiny boxes still pipeline one ahead, cap at 4 (~24 s buffer).
+    permits.saturating_sub(2).clamp(1, 4)
 }
 
 /// Frame-aligned start time (seconds) of segment `seg`: the nominal

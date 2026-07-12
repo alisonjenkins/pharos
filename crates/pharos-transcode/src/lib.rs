@@ -263,6 +263,19 @@ fn build_args_for_device(
     let burning_subs = opts.video.is_some()
         && !matches!(opts.video, Some(VideoCodec::Copy))
         && opts.burn_subtitle_stream_index.is_some();
+    // Bound DECODER threads for a real video transcode (input-side
+    // `-threads`, before `-i`). ffmpeg otherwise frame-threads the decoder
+    // across every logical core PER JOB, so N concurrent segment encodes
+    // spawn N×cores decode threads and thrash each other — the same
+    // oversubscription the encoder-side cap below prevents. A 4-thread
+    // decode of 1080p 10-bit HEVC still runs well above realtime, and the
+    // scheduler's permit budget (cores / threads-per-encode) only holds if
+    // each job's total footprint actually stays near that many cores.
+    // Copy/remux does no decode → skip; audio-only decode is trivial.
+    if opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy)) {
+        a.push("-threads".into());
+        a.push(sw_encode_threads().to_string());
+    }
     let start = opts.start_position_seconds();
     if let Some(pos) = start {
         if !burning_subs {
@@ -391,6 +404,26 @@ fn build_args_for_device(
                     a.push("-b:v".into());
                     a.push(format!("{b}"));
                 }
+                // Software x264/x265: default preset is `medium` — a
+                // quality-first offline setting ~3-5× slower than realtime
+                // needs, and it auto-threads across EVERY logical core per
+                // job, so concurrent segment encodes (live + prefetch +
+                // other viewers) all fight for all cores and each slows
+                // below realtime (measured: 3.5-12 s per 6 s segment on the
+                // 16-core box → player starves → "video hangs"). Match the
+                // VP9 path's discipline — and Jellyfin's own default
+                // (`veryfast`): speed-first preset + a bounded thread
+                // footprint so `cores / threads` encodes genuinely run in
+                // parallel, each at several× realtime. Scoped to the
+                // software encoders ONLY: NVENC/QSV/VAAPI/VideoToolbox use
+                // different preset vocabularies (`veryfast` aborts NVENC)
+                // and manage their own parallelism on-device.
+                if encoder == "libx264" || encoder == "libx265" {
+                    a.push("-preset".into());
+                    a.push("veryfast".into());
+                    a.push("-threads".into());
+                    a.push(sw_encode_threads().to_string());
+                }
                 // libvpx (VP9) defaults to a glacial good-quality multi-pass
                 // encode — unusable for a live progressive transcode. Force
                 // realtime + multithreaded row encoding so it keeps pace with
@@ -424,7 +457,7 @@ fn build_args_for_device(
                     a.push("-lag-in-frames".into());
                     a.push("0".into());
                     a.push("-threads".into());
-                    a.push(vp9_encode_threads().to_string());
+                    a.push(sw_encode_threads().to_string());
                 }
             }
         }
@@ -522,14 +555,18 @@ fn build_args_for_device(
     a
 }
 
-/// Thread budget for a live libvpx-vp9 encode. Benchmarked: a 1080p realtime
-/// segment encodes in ~0.6 s at 4 threads (well above the 6 s realtime
-/// budget), and MORE threads barely help single-stream latency while their
-/// footprint sums across concurrent streams. Cap at 4 so several streams
-/// coexist on a CPU-only box without oversubscribing every core — 4 threads ×
-/// 4 concurrent = 16, and even 3× that finished a 6-stream batch in ~1.7 s in
-/// the bench. Lower-core boxes scale down (min 2).
-fn vp9_encode_threads() -> u32 {
+/// Thread budget for ONE software video encode/decode job (libvpx-vp9,
+/// libx264, libx265, and the paired decoder). Benchmarked on VP9: a 1080p
+/// realtime segment encodes in ~0.6 s at 4 threads (well above the 6 s
+/// realtime budget), and MORE threads barely help single-stream latency
+/// while their footprint sums across concurrent jobs. Cap at 4 so several
+/// segments genuinely encode in parallel on a CPU-only box — the whole
+/// "many small parallel encodes" design only works when
+/// `threads-per-job × concurrent-jobs ≈ cores`; uncapped jobs each grab
+/// every core and all of them slow below realtime together. Pairs with
+/// [`device::default_cpu_permits`], which admits `cores / this` jobs.
+/// Lower-core boxes scale down (min 2).
+pub fn sw_encode_threads() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4)
@@ -572,6 +609,78 @@ mod tests {
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-f mp4"), "{joined}");
         assert!(joined.contains("pipe:1"));
+    }
+
+    #[test]
+    fn software_h264_gets_speed_preset_and_bounded_threads() {
+        // The parallel-small-encodes design: each software job must be
+        // speed-first (x264 default `medium` runs below realtime under
+        // load) and thread-bounded (an uncapped encoder auto-threads over
+        // every core, so `cores` admitted jobs thrash each other and ALL
+        // slow below realtime — the measured 3.5-12 s per 6 s segment
+        // phone-playback hang).
+        let a = build_args("/m/foo.mkv", &opts());
+        let joined = a.join(" ");
+        assert!(joined.contains("-c:v libx264"), "{joined}");
+        assert!(joined.contains("-preset veryfast"), "{joined}");
+        let cap = sw_encode_threads().to_string();
+        // Bounded on BOTH sides: decoder (input-side, before `-i`) and
+        // encoder (output-side).
+        let i_pos = a.iter().position(|s| s == "-i").expect("has -i");
+        let thread_positions: Vec<usize> = a
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.as_str() == "-threads")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            thread_positions.len(),
+            2,
+            "decoder + encoder thread caps: {joined}"
+        );
+        assert!(
+            thread_positions[0] < i_pos,
+            "decoder cap must precede -i: {joined}"
+        );
+        assert!(
+            thread_positions[1] > i_pos,
+            "encoder cap follows -i: {joined}"
+        );
+        for p in thread_positions {
+            assert_eq!(a[p + 1], cap, "{joined}");
+        }
+    }
+
+    #[test]
+    fn nvenc_h264_keeps_hw_preset_vocabulary() {
+        // `-preset veryfast` is x264/x265 vocabulary; NVENC's presets are
+        // p1-p7/hq/ll — passing veryfast aborts the encode. The speed
+        // preset must stay scoped to the software encoders.
+        let a = build_args_for_device(
+            "/m/foo.mkv",
+            &opts(),
+            crate::protocol::DeviceId::hw(HwAccel::Nvenc, 0),
+            "pipe:1",
+        );
+        let joined = a.join(" ");
+        assert!(joined.contains("h264_nvenc"), "{joined}");
+        assert!(!joined.contains("-preset veryfast"), "{joined}");
+        // Software DECODE still feeds the GPU encoder here (no -hwaccel
+        // input wiring), so the input-side decoder cap stays.
+        let i_pos = a.iter().position(|s| s == "-i").expect("has -i");
+        let dec_cap = a.iter().position(|s| s == "-threads").expect("dec cap");
+        assert!(dec_cap < i_pos, "{joined}");
+    }
+
+    #[test]
+    fn video_copy_skips_thread_caps() {
+        // Remux does no video decode/encode — no thread caps to apply.
+        let mut o = opts();
+        o.video = Some(VideoCodec::Copy);
+        let joined = build_args("/m/foo.mkv", &o).join(" ");
+        assert!(joined.contains("-c:v copy"), "{joined}");
+        assert!(!joined.contains("-threads"), "{joined}");
+        assert!(!joined.contains("-preset"), "{joined}");
     }
 
     #[test]

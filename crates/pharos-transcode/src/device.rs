@@ -55,16 +55,21 @@ pub fn enumerate(detected: &[HwAccel]) -> Vec<DeviceId> {
     out
 }
 
-/// Default CPU encode-permit budget: every logical core. Each permit is
-/// one concurrent software encode; libx264/libx265 are themselves
-/// multithreaded, so with a single active stream one job already spreads
-/// across all cores, and under many streams the scheduler keeps every
-/// core busy. This is the "use all CPUs" budget — pair it with
-/// [`enumerate`] (all GPUs) for full-machine encoding.
+/// Default CPU encode-permit budget: `cores / threads-per-encode`. Each
+/// permit is one concurrent software encode, and every software video job
+/// (encoder AND decoder) is capped at [`crate::sw_encode_threads`] (≈4)
+/// threads — so this admits exactly as many jobs as genuinely fit the
+/// machine, each running at several× realtime. The old "one permit per
+/// core" budget double-counted: each admitted job ALSO auto-threaded
+/// across every core, so 16 jobs × all-core encoders thrashed the box and
+/// every segment slowed BELOW realtime together (3.5-12 s per 6 s segment
+/// measured) — the parallel-small-encodes design self-defeating. Floor at
+/// 1 (tiny boxes serialize; prefetch still pipelines ahead).
 pub fn default_cpu_permits() -> usize {
-    std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
+        .unwrap_or(4);
+    (cores / crate::sw_encode_threads() as usize).max(1)
 }
 
 /// Render-node ordinals present under `/dev/dri` (the `N` in
@@ -214,6 +219,21 @@ mod tests {
     use crate::hwaccel::HwAccel;
     use crate::options::{AudioCodec, Container};
     use std::time::Duration;
+
+    #[test]
+    fn cpu_permits_match_thread_budget_not_core_count() {
+        // permits × threads-per-encode must ≈ cores, never permits = cores
+        // (which double-counts: every admitted job also multi-threads, so
+        // they all contend and slow below realtime together).
+        let cores = std::thread::available_parallelism().unwrap().get();
+        let expect = (cores / crate::sw_encode_threads() as usize).max(1);
+        assert_eq!(default_cpu_permits(), expect);
+        assert!(default_cpu_permits() >= 1);
+        assert!(
+            default_cpu_permits() * crate::sw_encode_threads() as usize <= cores.max(4),
+            "permit budget must not oversubscribe the cores"
+        );
+    }
 
     fn h264_opts() -> TranscodeOptions {
         TranscodeOptions {
