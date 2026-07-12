@@ -231,8 +231,20 @@ async fn person_primary_image_redirects_to_scraped_thumb() {
         .await
         .unwrap();
     let _ = bare;
+    let localpath = state
+        .stores
+        .upsert_person(
+            "Legacy Path",
+            None,
+            None,
+            Some("/config/data/metadata/People/L/Legacy Path/folder.jpg"),
+        )
+        .await
+        .unwrap();
+    let _ = localpath;
     let jane_wire = pharos_core::person_wire_id("Jane Actor");
     let bare_wire = pharos_core::person_wire_id("No Photo");
+    let local_wire = pharos_core::person_wire_id("Legacy Path");
     let app = test::init_service(
         App::new()
             .app_data(state)
@@ -260,4 +272,14 @@ async fn person_primary_image_redirects_to_scraped_thumb() {
         404,
         "person without thumb 404s (placeholder)"
     );
+
+    // A LEGACY local-path thumb (scraped from an old Jellyfin install's
+    // metadata dir — this library has 853 of them and zero http ones) must
+    // NOT redirect: a browser resolves it relative to pharos and 404s
+    // uglier. Serve the placeholder 404 instead.
+    let req = test::TestRequest::get()
+        .uri(&format!("/Items/{local_wire}/Images/Primary"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 404, "local-path thumb must not redirect");
 }
