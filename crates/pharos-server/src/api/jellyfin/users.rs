@@ -116,23 +116,33 @@ async fn quick_connect_initiate(
     })))
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct AuthorizeQuery {
-    #[serde(default)]
-    code: String,
+/// Case-INSENSITIVE lookup of a single query-string parameter. Jellyfin's
+/// API params are camelCase (`secret`, `code`) and ASP.NET binds them
+/// case-insensitively, so the official clients disagree on casing: the
+/// Android TV / mobile SDKs send `?secret=`/`?code=` while jellyfin-web sends
+/// `?Secret=`/`?Code=`. A case-sensitive (serde PascalCase) extractor 400s
+/// every non-web client — so match on any casing, mirroring the real server.
+/// Uses actix's own query parser, so values are percent-decoded correctly.
+fn query_param_ci(query: &str, key: &str) -> Option<String> {
+    web::Query::<std::collections::HashMap<String, String>>::from_query(query)
+        .ok()?
+        .into_inner()
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
 }
 
-/// `/QuickConnect/Authorize?Code=…` — signed-in user vouches for the
+/// `/QuickConnect/Authorize?code=…` — signed-in user vouches for the
 /// pending request. Pharos gates on any authenticated bearer (the
 /// user effectively authorizes themselves); admin-only flow is a
 /// future tightening if it bites.
 async fn quick_connect_authorize(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<AuthorizeQuery>,
+    req: HttpRequest,
 ) -> Result<impl Responder, actix_web::Error> {
-    if q.code.trim().is_empty() {
+    let code = query_param_ci(req.query_string(), "code").unwrap_or_default();
+    if code.trim().is_empty() {
         return Err(actix_web::error::ErrorBadRequest(
             "Code query param required",
         ));
@@ -142,7 +152,7 @@ async fn quick_connect_authorize(
         .quick_connect
         .tx
         .send(crate::quick_connect::QcMsg::Authorize {
-            code: q.code.clone(),
+            code,
             by: user.0.id,
             reply: reply_tx,
         })
@@ -157,25 +167,20 @@ async fn quick_connect_authorize(
     Ok(HttpResponse::Ok().json(true))
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ConnectQuery {
-    #[serde(default)]
-    secret: String,
-}
-
-/// `/QuickConnect/Connect?Secret=…` — poll endpoint (Jellyfin's
+/// `/QuickConnect/Connect?secret=…` — poll endpoint (Jellyfin's
 /// `QuickConnectResult`). READ-ONLY: returns the pending request's current
 /// state, echoing back `Secret` so the client can hand it to the finalize
-/// call. No token is minted here — jellyfin-web polls this until
+/// call. No token is minted here — the client polls this until
 /// `Authenticated:true`, then exchanges the secret at
 /// `/Users/AuthenticateWithQuickConnect` (which is where the record is
-/// consumed and the AccessToken issued).
+/// consumed and the AccessToken issued). `secret` is matched case-
+/// insensitively (Android/mobile SDKs send `secret`, jellyfin-web `Secret`).
 async fn quick_connect_connect(
     state: web::Data<AppState>,
-    q: web::Query<ConnectQuery>,
+    req: HttpRequest,
 ) -> Result<impl Responder, actix_web::Error> {
-    if q.secret.trim().is_empty() {
+    let secret = query_param_ci(req.query_string(), "secret").unwrap_or_default();
+    if secret.trim().is_empty() {
         return Err(actix_web::error::ErrorBadRequest(
             "Secret query param required",
         ));
@@ -185,7 +190,7 @@ async fn quick_connect_connect(
         .quick_connect
         .tx
         .send(crate::quick_connect::QcMsg::Connect {
-            secret: q.secret.clone(),
+            secret,
             reply: reply_tx,
         })
         .await
@@ -280,7 +285,9 @@ async fn authenticate_by_name(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct QuickConnectDto {
-    #[serde(default)]
+    // Accept both `Secret` (jellyfin-web) and `secret` (mobile/TV SDKs) in the
+    // JSON body — Jellyfin's server binds case-insensitively.
+    #[serde(default, alias = "secret")]
     secret: String,
 }
 

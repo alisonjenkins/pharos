@@ -169,6 +169,59 @@ async fn full_flow_finalizes_at_authenticatewithquickconnect() {
 }
 
 #[actix_web::test]
+async fn flow_works_with_lowercase_query_params_like_android_clients() {
+    // Regression: the Jellyfin Android TV app polls `?secret=` and the mobile
+    // browser authorizes with `?code=` (lowercase — the real Jellyfin API
+    // param casing), but pharos used to bind PascalCase-only and 400'd every
+    // request, so the login device "timed out before you could enter the code".
+    let (state, admin_token) = seed_admin().await;
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Initiate")
+        .insert_header((
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Jellyfin Android TV", Device="d", DeviceId="dev-qc", Version="1""#,
+        ))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = v["Code"].as_str().unwrap().to_string();
+    let secret = v["Secret"].as_str().unwrap().to_string();
+
+    // Poll with LOWERCASE `secret` (Android TV) → 200, not 400.
+    let req = test::TestRequest::get()
+        .uri(&format!("/QuickConnect/Connect?secret={secret}"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "lowercase ?secret= must bind");
+
+    // Authorize with LOWERCASE `code` + an extra `userId` param (as the mobile
+    // browser sends) → 200, not 400.
+    let req = test::TestRequest::post()
+        .uri(&format!(
+            "/QuickConnect/Authorize?code={code}&userId=abc123"
+        ))
+        .insert_header(("X-Emby-Token", admin_token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "lowercase ?code= must bind");
+
+    // Finalize with a lowercase-keyed JSON body → 200 + token.
+    let req = test::TestRequest::post()
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(format!(r#"{{"secret":"{secret}"}}"#))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v["AccessToken"].as_str().is_some_and(|t| !t.is_empty()),
+        "lowercase JSON body {{\"secret\"}} must finalize; got {v}"
+    );
+}
+
+#[actix_web::test]
 async fn authorize_unknown_code_404s() {
     let (state, admin_token) = seed_admin().await;
     let app = test::init_service(build_app(state)).await;
