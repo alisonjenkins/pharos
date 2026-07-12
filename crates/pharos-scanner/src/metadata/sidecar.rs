@@ -155,6 +155,9 @@ fn role_base_names(stem: &str) -> Vec<(ArtworkRole, Vec<String>)> {
         thumb.push(format!("{stem}-thumb"));
     }
     thumb.push("thumb".to_string());
+    // Jellyfin's own metadata writers save the 16:9 thumb as `landscape.jpg`
+    // (this library's series folders carry exactly that).
+    thumb.push("landscape".to_string());
 
     table.push((ArtworkRole::Primary, primary));
     table.push((ArtworkRole::Backdrop, backdrop));
