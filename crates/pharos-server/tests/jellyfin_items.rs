@@ -1797,3 +1797,82 @@ async fn items_ids_filter_accepts_hex_and_decimal() {
         assert_eq!(v["TotalRecordCount"].as_u64().unwrap(), 2, "{label}: {v}");
     }
 }
+
+/// B32 — synth MusicAlbum/MusicArtist ids must resolve as SINGLE items, not
+/// just as ParentId filters. jellyfin-web's audio detail page fetches the
+/// track's AlbumId via /Users/{uid}/Items/{id}; the 400 it got aborted the
+/// detail view before the play button was wired — music playback dead.
+#[actix_web::test]
+async fn synth_album_and_artist_ids_resolve_as_single_items() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, artist, album) in [
+        (1u64, "Kevin MacLeod", "Carefree"),
+        (2, "Kevin MacLeod", "Carefree"),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}.mp3").into(),
+                title: format!("Track {id}"),
+                kind: MediaKind::Audio,
+                probe: pharos_core::MediaProbe {
+                    artist: Some(artist.into()),
+                    album_artist: Some(artist.into()),
+                    album: Some(album.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let album_id = pharos_jellyfin_api::dto::album_id_for("Carefree");
+    let artist_id = pharos_jellyfin_api::dto::artist_id_for("Kevin MacLeod");
+
+    // Both the bare and the user-scoped single-item route (jellyfin-web uses
+    // the latter).
+    for uri in [
+        format!("/Items/{album_id}"),
+        format!("/Users/{}/Items/{album_id}", uid.0.simple()),
+    ] {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(&uri)
+                .insert_header(("X-Emby-Token", token.0.expose()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Type"], "MusicAlbum", "{uri} -> {v}");
+        assert_eq!(v["Name"], "Carefree");
+        assert_eq!(v["ChildCount"], 2, "album track count");
+        assert_eq!(v["AlbumArtists"][0]["Name"], "Kevin MacLeod");
+    }
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Items/{artist_id}"))
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Type"], "MusicArtist", "{v}");
+    assert_eq!(v["Name"], "Kevin MacLeod");
+}

@@ -3482,6 +3482,76 @@ fn shuffle_in_place(items: &mut [MediaItem], seed: u64) {
     }
 }
 
+/// B32 — resolve a synth MusicAlbum / MusicArtist wire id to the same DTO
+/// shape the `/Albums` + `/Artists` list builders emit (plus `ChildCount` for
+/// albums so the detail header shows a track count). `None` when the id names
+/// neither. Names are recovered by hashing the store's distinct candidates —
+/// the same pattern `resolve_parent_filter` uses, so any id that resolves as
+/// a `ParentId` also resolves as a single item (and vice versa).
+async fn synth_album_or_artist(
+    state: &AppState,
+    id_str: &str,
+) -> Result<Option<serde_json::Value>, actix_web::Error> {
+    use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
+    let albums = state
+        .stores
+        .distinct_album_names()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if let Some(name) = albums.iter().find(|n| album_id_for(n) == id_str) {
+        let all = state
+            .list_items_cached()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let tracks: Vec<_> = all
+            .iter()
+            .filter(|i| i.probe.album.as_deref() == Some(name.as_str()))
+            .collect();
+        let artist = tracks.iter().find_map(|i| {
+            i.probe
+                .album_artist
+                .clone()
+                .or_else(|| i.probe.artist.clone())
+        });
+        let mut v = serde_json::json!({
+            "Id": id_str,
+            "Name": name,
+            "ServerId": state.server_id,
+            "Type": "MusicAlbum",
+            "MediaType": "Unknown",
+            "IsFolder": true,
+            "ChildCount": tracks.len(),
+            "ImageTags": {},
+            "BackdropImageTags": [],
+            "Genres": [], "Tags": [],
+        });
+        if let Some(a) = artist {
+            v["AlbumArtist"] = serde_json::Value::String(a.clone());
+            v["AlbumArtists"] = serde_json::json!([{ "Name": a, "Id": artist_id_for(&a) }]);
+        }
+        return Ok(Some(v));
+    }
+    let artists = state
+        .stores
+        .distinct_artist_names()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if let Some(name) = artists.iter().find(|n| artist_id_for(n) == id_str) {
+        return Ok(Some(serde_json::json!({
+            "Id": id_str,
+            "Name": name,
+            "ServerId": state.server_id,
+            "Type": "MusicArtist",
+            "MediaType": "Unknown",
+            "IsFolder": true,
+            "ImageTags": {},
+            "BackdropImageTags": [],
+            "Genres": [], "Tags": [],
+        })));
+    }
+    Ok(None)
+}
+
 async fn get_item(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -3566,6 +3636,15 @@ async fn fetch_item_dto(
                     state, &playlist, count,
                 )),
             );
+        }
+        // B32 — synth MusicAlbum / MusicArtist ids. Every list surface
+        // (grids, a track's AlbumId/ArtistItems) emits these, and
+        // jellyfin-web's audio detail page + playbackManager fetch them as
+        // single items — a 400 here broke the whole music play flow (the
+        // detail view aborted before the play button was wired). Same
+        // one-way-hash recovery as `resolve_parent_filter`.
+        if let Some(view) = synth_album_or_artist(state, id_str).await? {
+            return Ok(HttpResponse::Ok().json(view));
         }
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
