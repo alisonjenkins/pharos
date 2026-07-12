@@ -41,6 +41,13 @@
               "Height": 1080,
               "Index": 0,
               "IsDefault": true,
+              "IsExternal": false,
+              "IsForced": false,
+              "IsHearingImpaired": false,
+              "IsInterlaced": false,
+              "IsOriginal": false,
+              "IsTextSubtitleStream": false,
+              "SupportsExternalStream": false,
               "Type": "Video",
               "Width": 1920
             }
@@ -128,6 +135,13 @@
               "Height": 720,
               "Index": 0,
               "IsDefault": true,
+              "IsExternal": false,
+              "IsForced": false,
+              "IsHearingImpaired": false,
+              "IsInterlaced": false,
+              "IsOriginal": false,
+              "IsTextSubtitleStream": false,
+              "SupportsExternalStream": false,
               "Type": "Video",
               "Width": 1280
             }
@@ -209,6 +223,13 @@
               "Height": 2160,
               "Index": 0,
               "IsDefault": true,
+              "IsExternal": false,
+              "IsForced": false,
+              "IsHearingImpaired": false,
+              "IsInterlaced": false,
+              "IsOriginal": false,
+              "IsTextSubtitleStream": false,
+              "SupportsExternalStream": false,
               "Type": "Video",
               "Width": 3840
             }

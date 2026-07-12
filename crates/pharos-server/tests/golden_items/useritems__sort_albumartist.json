@@ -49,6 +49,13 @@
             {
               "Index": 0,
               "IsDefault": true,
+              "IsExternal": false,
+              "IsForced": false,
+              "IsHearingImpaired": false,
+              "IsInterlaced": false,
+              "IsOriginal": false,
+              "IsTextSubtitleStream": false,
+              "SupportsExternalStream": false,
               "Type": "Audio"
             }
           ],
@@ -138,6 +145,13 @@
             {
               "Index": 0,
               "IsDefault": true,
+              "IsExternal": false,
+              "IsForced": false,
+              "IsHearingImpaired": false,
+              "IsInterlaced": false,
+              "IsOriginal": false,
+              "IsTextSubtitleStream": false,
+              "SupportsExternalStream": false,
               "Type": "Audio"
             }
           ],

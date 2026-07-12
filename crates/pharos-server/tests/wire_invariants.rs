@@ -154,10 +154,17 @@ async fn container_alias_is_a_single_known_token() {
 }
 
 /// (3) — When SupportsDirectPlay is true (and we picked the direct-
-/// play path), TranscodingSubProtocol must be omitted. Emitting
-/// "hls" alongside SupportsDirectPlay=true sent jellyfin-web's video
-/// player through hls.js, which threw `manifestParsingError` on
-/// the direct-play webm bytes.
+/// play path), TranscodingSubProtocol must be "http" — NEVER "hls",
+/// and NEVER null/omitted:
+/// - "hls" alongside SupportsDirectPlay=true sent jellyfin-web's video
+///   player through hls.js, which threw `manifestParsingError` on the
+///   direct-play webm bytes (the original invariant).
+/// - null/omitted fails jellyfin-sdk-kotlin outright: the SDK's
+///   MediaSourceInfo marks TranscodingSubProtocol as a REQUIRED
+///   non-nullable enum, so the native Android/TV apps reject the whole
+///   PlaybackInfo response ("Unable to resolve playback info" — B13).
+/// Real Jellyfin emits "http" here; jellyfin-web only routes through
+/// hls.js when a TranscodingUrl is actually present.
 #[actix_web::test]
 async fn direct_play_omits_transcoding_sub_protocol() {
     let probe = MediaProbe {
@@ -194,10 +201,10 @@ async fn direct_play_omits_transcoding_sub_protocol() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let src = &v["MediaSources"][0];
     assert_eq!(src["SupportsDirectPlay"], true, "{src:?}");
-    assert!(
-        src.get("TranscodingSubProtocol")
-            .map_or(true, |t| t.is_null()),
-        "DirectPlay must not advertise a sub-protocol (would route via hls.js): {src:?}"
+    assert_eq!(
+        src["TranscodingSubProtocol"], "http",
+        "DirectPlay advertises sub-protocol 'http' — never 'hls' (would route \
+         via hls.js) and never null (kotlin SDK requires the field): {src:?}"
     );
     assert!(
         src.get("TranscodingUrl").map_or(true, |t| t.is_null()),
