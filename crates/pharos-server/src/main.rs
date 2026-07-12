@@ -844,6 +844,35 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         None
     };
 
+    // B26 — observe SIGTERM/SIGINT BEFORE actix runs its own graceful
+    // shutdown, so socket-teardown paths can tell a draining process from a
+    // departing client and leave SyncPlay memberships (+ persisted group
+    // snapshots) intact for the next replica to recover.
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM listener failed to install");
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGINT listener failed to install");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        tracing::info!("shutdown signal observed — draining (SyncPlay memberships preserved)");
+        pharos_server::state::begin_shutdown();
+    });
+
     let handle_for_app = readiness.clone();
     let ui_dir = cfg.server.ui_dir.clone();
     let server = HttpServer::new(move || {

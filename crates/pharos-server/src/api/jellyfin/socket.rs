@@ -356,6 +356,14 @@ async fn handle_connection<S>(
     }
 
     tracing::info!(device_id = %device_key, %member_id, "syncplay: /socket disconnected");
+    // B26 — a socket that broke because WE are draining (SIGTERM: rolling
+    // deploy) must NOT dismantle the membership: the whole point of the
+    // persisted snapshot is that the next process recovers it. Removing the
+    // member here emptied the group during the drain, and the emptying actor
+    // deleted its own snapshot — recovery found nothing.
+    if crate::state::is_shutting_down() {
+        return;
+    }
     // WS-native path (vestigial phone/TV clients): its group lives only in
     // `current_group`, so remove immediately (sink + roster).
     if let Some(h) = current_group.take() {
@@ -375,6 +383,11 @@ async fn handle_connection<S>(
     let sinks2 = sinks.clone();
     actix_web::rt::spawn(async move {
         tokio::time::sleep(RECONNECT_GRACE).await;
+        // B26 — re-check at fire time: a drain that began during the grace
+        // window must also leave the membership for the next process.
+        if crate::state::is_shutting_down() {
+            return;
+        }
         if let Some(group) = hub2.remove_if_current_gen(&dev2, conn_gen) {
             let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
             sinks2.remove(member_id);

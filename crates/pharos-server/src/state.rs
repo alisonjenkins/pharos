@@ -733,3 +733,22 @@ fn default_ffmpeg_backend() -> Arc<dyn FfmpegBackend> {
         Arc::new(pharos_transcode::SpawnBackend::new())
     }
 }
+
+/// Process-wide "we are draining" flag (B26). Set on SIGTERM/SIGINT (the
+/// rolling-deploy drain) so teardown paths can tell "the CLIENT went away"
+/// (dismantle its membership) from "WE are going away" (leave every
+/// membership + the persisted group snapshot intact for the next process to
+/// recover). Without this, the graceful drain closed every /socket, the
+/// reconnect-grace teardown removed every member, the emptied group deleted
+/// its own snapshot — and B24's restart recovery had nothing to recover.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the process as draining. Called from the signal listener in main.
+pub fn begin_shutdown() {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// True once SIGTERM/SIGINT has been observed.
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
