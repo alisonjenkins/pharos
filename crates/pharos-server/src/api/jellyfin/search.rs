@@ -11,6 +11,7 @@
 //! (LIB-C3) — each a synthetic IsFolder hint sharing the SearchHint
 //! shape so the handler grows additively.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore};
@@ -27,7 +28,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct SearchQuery {
     #[serde(default)]
     search_term: Option<String>,
@@ -72,7 +73,7 @@ struct SearchHintsResult {
 async fn search_hints(
     state: web::Data<AppState>,
     _user: AuthUser,
-    q: web::Query<SearchQuery>,
+    q: CiQuery<SearchQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for, genre_id_for};
     use std::collections::HashSet;

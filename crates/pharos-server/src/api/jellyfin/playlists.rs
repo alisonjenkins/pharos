@@ -12,6 +12,7 @@
 //! `BaseItemDto` shape (user-data, trickplay, parent ids) as every other
 //! `/Items` surface, then overlays the per-entry `PlaylistItemId`.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, items},
     state::AppState,
@@ -38,7 +39,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct CreatePlaylistQuery {
     name: Option<String>,
     /// Comma-separated media ids to seed the playlist with, in order.
@@ -53,7 +54,7 @@ struct CreatePlaylistQuery {
 async fn create_playlist(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<CreatePlaylistQuery>,
+    q: CiQuery<CreatePlaylistQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let name = q
         .name
@@ -152,7 +153,7 @@ async fn playlist_items(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct AddItemsQuery {
     ids: Option<String>,
 }
@@ -162,7 +163,7 @@ async fn add_items(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<AddItemsQuery>,
+    q: CiQuery<AddItemsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let wire_id = path.into_inner();
     let ids = items::parse_id_csv(q.ids.as_deref());
@@ -178,7 +179,7 @@ async fn add_items(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct RemoveItemsQuery {
     /// Comma-separated per-entry ids (Jellyfin's `EntryIds`).
     entry_ids: Option<String>,
@@ -189,7 +190,7 @@ async fn remove_items(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<RemoveItemsQuery>,
+    q: CiQuery<RemoveItemsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let wire_id = path.into_inner();
     let entry_ids = parse_str_csv(q.entry_ids.as_deref());

@@ -1714,3 +1714,48 @@ async fn theme_media_has_all_theme_media_result_shape() {
         );
     }
 }
+
+/// B18 regression: the season episode filter must bind case-insensitively.
+/// The jellyfin SDK (jellyfin-web 10.11 + all apps) sends `seasonId`
+/// (camelCase); a PascalCase-only `ShowsEpisodesQuery` ignored it and returned
+/// EVERY season's episodes, so clicking Season 1 showed the whole series.
+#[actix_web::test]
+async fn shows_episodes_season_filter_is_case_insensitive() {
+    let (state, token, _u) = seed_shows().await;
+    let app = test::init_service(build_app(state)).await;
+
+    let series_id = pharos_jellyfin_api::dto::series_id_for_key(Some("/tv/Alpha"), "Alpha Show");
+    let season1_id =
+        pharos_jellyfin_api::dto::season_id_for_key(Some("/tv/Alpha"), "Alpha Show", 1);
+
+    // Alpha Show: S1 has 2 episodes, S2 has 1; whole series has 3.
+    for (uri, want, label) in [
+        (
+            format!("/Shows/{series_id}/Episodes"),
+            3u64,
+            "unfiltered series",
+        ),
+        (
+            format!("/Shows/{series_id}/Episodes?seasonId={season1_id}"),
+            2,
+            "camelCase seasonId",
+        ),
+        (
+            format!("/Shows/{series_id}/Episodes?SeasonId={season1_id}"),
+            2,
+            "PascalCase SeasonId",
+        ),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["TotalRecordCount"].as_u64().unwrap(),
+            want,
+            "{label} ({uri}): {v}"
+        );
+    }
+}

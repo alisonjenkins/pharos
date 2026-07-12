@@ -10,6 +10,7 @@
 //! V6 stays held by `pharos-transcode`: ffmpeg crashes never crash the
 //! server, abandoned segments don't leak processes.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::auth_extractor::{extract_token, AuthUser},
     api::jellyfin::fmp4,
@@ -715,7 +716,7 @@ async fn render_variant_playlist(
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct SegmentQuery {
     #[serde(default)]
     play_session_id: Option<String>,
@@ -749,7 +750,7 @@ async fn segment_main(
     user: AuthUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, seg) = path.into_inner();
     serve_segment(state, user, req, id, seg, None, q).await
@@ -760,7 +761,7 @@ async fn segment_named(
     user: AuthUser,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, variant, seg) = path.into_inner();
     let av =
@@ -775,7 +776,7 @@ async fn serve_segment(
     id: String,
     seg: u32,
     variant: Option<AnyVariant>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
@@ -1257,7 +1258,7 @@ async fn vp9_audio_playlist(
     _user: AuthUser,
     req: HttpRequest,
     path: web::Path<String>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
@@ -1312,7 +1313,7 @@ async fn vp9_audio_file(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<(String, String)>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, name) = path.into_inner();
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
@@ -1401,7 +1402,7 @@ async fn vp9_init(
     _user: AuthUser,
     req: HttpRequest,
     path: web::Path<String>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
@@ -1434,7 +1435,7 @@ async fn vp9_segment(
     _user: AuthUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
-    q: web::Query<SegmentQuery>,
+    q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, seg) = path.into_inner();
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)

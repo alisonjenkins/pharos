@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod auth_extractor;
+pub mod ci_query;
 pub mod fmp4;
 pub mod hls;
 pub mod images;

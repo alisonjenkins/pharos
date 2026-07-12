@@ -6,6 +6,7 @@
 //! throwing. /LiveTv/Channels/{id}/Stream redirects to the upstream
 //! `stream_url`; transcode-on-tune is its own follow-up.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{http::header, web, HttpResponse, Responder};
 use pharos_core::TunerBackend;
@@ -164,7 +165,7 @@ async fn stream(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct ProgramsQuery {
     /// ISO-8601 or unix-ms — we parse both via a permissive helper.
     #[serde(default)]
@@ -182,7 +183,7 @@ fn default_window_hours() -> u64 {
 async fn programs(
     state: web::Data<AppState>,
     _user: AuthUser,
-    q: web::Query<ProgramsQuery>,
+    q: CiQuery<ProgramsQuery>,
 ) -> impl Responder {
     let Some(backend) = state.live_tv.as_ref() else {
         return HttpResponse::Ok().json(empty_items_result_value());

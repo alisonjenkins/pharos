@@ -1,3 +1,4 @@
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, dto::SystemInfoDto},
     state::AppState,
@@ -74,7 +75,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 #[derive(serde::Deserialize)]
 struct BitrateTestQuery {
-    #[serde(rename = "Size")]
     #[serde(default = "default_bitrate_size")]
     size: usize,
 }
@@ -83,7 +83,7 @@ fn default_bitrate_size() -> usize {
     500_000
 }
 
-async fn bitrate_test(q: web::Query<BitrateTestQuery>) -> impl Responder {
+async fn bitrate_test(q: CiQuery<BitrateTestQuery>) -> impl Responder {
     // Real Jellyfin streams `Size` bytes for the client to measure
     // throughput. Phase-1 stub: return the exact byte count of zeros.
     let n = q.size.min(50 * 1024 * 1024); // cap at 50 MB so abuse can't DoS
@@ -202,7 +202,7 @@ async fn system_endpoint() -> impl Responder {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct DisplayPrefsQuery {
     #[serde(default = "default_client")]
     client: String,
@@ -219,7 +219,7 @@ async fn display_preferences(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<DisplayPrefsQuery>,
+    q: CiQuery<DisplayPrefsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let dp_id = path.into_inner();
     let stored = state
@@ -258,7 +258,7 @@ async fn display_preferences_update(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<DisplayPrefsQuery>,
+    q: CiQuery<DisplayPrefsQuery>,
     body: web::Json<serde_json::Value>,
 ) -> Result<impl Responder, actix_web::Error> {
     let dp_id = path.into_inner();
@@ -563,7 +563,7 @@ async fn devices_list(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct DeviceIdQuery {
     id: Option<String>,
 }
@@ -574,7 +574,7 @@ struct DeviceIdQuery {
 async fn delete_device(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<DeviceIdQuery>,
+    q: CiQuery<DeviceIdQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::UserStore;
     if !user.0.policy.admin {
@@ -613,7 +613,7 @@ struct DeviceOptionsBody {
 async fn device_options(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<DeviceIdQuery>,
+    q: CiQuery<DeviceIdQuery>,
     body: Option<web::Json<DeviceOptionsBody>>,
 ) -> Result<impl Responder, actix_web::Error> {
     if !user.0.policy.admin {

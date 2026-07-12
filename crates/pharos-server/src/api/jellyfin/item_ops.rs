@@ -8,6 +8,7 @@
 //! are served from an `.lrc` sidecar next to the audio file when present.
 //! InstantMix is a real same-kind mix drawn from the library.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, items},
     state::AppState,
@@ -103,7 +104,7 @@ impl ExternalIdInfo {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct MergeVersionsQuery {
     ids: Option<String>,
 }
@@ -117,7 +118,7 @@ struct MergeVersionsQuery {
 async fn merge_versions(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<MergeVersionsQuery>,
+    q: CiQuery<MergeVersionsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     let ids = items::parse_id_csv(q.ids.as_deref());
@@ -145,7 +146,7 @@ async fn merge_versions(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct ContentTypeQuery {
     content_type: Option<String>,
 }
@@ -158,7 +159,7 @@ async fn set_content_type(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<ContentTypeQuery>,
+    q: CiQuery<ContentTypeQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
@@ -261,7 +262,7 @@ fn parse_lrc_line(line: &str) -> Option<(u64, String)> {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct InstantMixQuery {
     limit: Option<u32>,
 }
@@ -274,7 +275,7 @@ async fn instant_mix(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<InstantMixQuery>,
+    q: CiQuery<InstantMixQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::MediaQuery;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())

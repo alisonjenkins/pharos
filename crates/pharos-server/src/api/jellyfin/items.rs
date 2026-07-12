@@ -5,6 +5,7 @@
 //! SortBy / SortOrder. Filtering is in-memory after `MediaStore::list()`
 //! today — moves to SQL-side once library sizes warrant it.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
@@ -237,7 +238,7 @@ async fn items_counts(
 /// filter-drawer request carries. A subset of `ListQuery`; reused to build
 /// the base [`pharos_core::MediaQuery`] the facet counts aggregate over.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct FiltersQuery {
     #[serde(default)]
     parent_id: Option<String>,
@@ -298,7 +299,7 @@ async fn build_facet_base(
 async fn items_filters_legacy(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<FiltersQuery>,
+    q: CiQuery<FiltersQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::FacetRequest;
     let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
@@ -341,7 +342,7 @@ async fn items_filters_legacy(
 async fn items_filters2(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<FiltersQuery>,
+    q: CiQuery<FiltersQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::{FacetRequest, FacetValue};
     let empty = serde_json::json!({
@@ -398,7 +399,7 @@ async fn items_filters2(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct SimilarQuery {
     #[serde(default = "default_similar_limit")]
     limit: u32,
@@ -422,7 +423,7 @@ async fn items_similar(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<SimilarQuery>,
+    q: CiQuery<SimilarQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
     let id: u64 = match pharos_jellyfin_api::dto::parse_item_id(&id_str).ok_or(()) {
@@ -584,7 +585,7 @@ async fn list_genres(
 async fn list_artists(
     state: web::Data<AppState>,
     _user: AuthUser,
-    q: web::Query<ListQuery>,
+    q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::artist_id_for;
     use std::collections::HashSet;
@@ -645,7 +646,7 @@ async fn list_artists(
 async fn list_albums(
     state: web::Data<AppState>,
     _user: AuthUser,
-    q: web::Query<ListQuery>,
+    q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     use std::collections::HashMap;
@@ -812,7 +813,7 @@ async fn item_tags_add(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<TagMutateQuery>,
+    q: CiQuery<TagMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::{MediaStore, TagStore};
     let id = parse_media_id(&path.into_inner())?;
@@ -840,7 +841,7 @@ async fn item_tags_remove(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<TagMutateQuery>,
+    q: CiQuery<TagMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::{MediaStore, TagStore};
     let id = parse_media_id(&path.into_inner())?;
@@ -970,7 +971,7 @@ async fn list_collections(
 /// (comma-separated numeric media ids). Matches Jellyfin's
 /// `POST /Collections?Name=&Ids=` and `/Collections/{id}/Items?Ids=`.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct CollectionMutateQuery {
     #[serde(default)]
     name: Option<String>,
@@ -997,7 +998,7 @@ pub(crate) fn parse_id_csv(raw: Option<&str>) -> Vec<u64> {
 /// LIB-C6 manual tag mutation query: `Tags` (comma/pipe-separated label
 /// names). Matches Jellyfin's `POST /Items/{id}/Tags?Tags=a,b`.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct TagMutateQuery {
     #[serde(default)]
     tags: Option<String>,
@@ -1034,7 +1035,7 @@ fn split_tag_csv(raw: Option<&str>) -> Vec<String> {
 async fn create_collection(
     state: web::Data<AppState>,
     _user: AuthUser,
-    q: web::Query<CollectionMutateQuery>,
+    q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
     let name = q
@@ -1065,7 +1066,7 @@ async fn collection_items_add(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<CollectionMutateQuery>,
+    q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
     let wire_id = path.into_inner();
@@ -1088,7 +1089,7 @@ async fn collection_items_remove(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<CollectionMutateQuery>,
+    q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
     let wire_id = path.into_inner();
@@ -1134,7 +1135,7 @@ fn collection_dto(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct NextUpQuery {
     #[serde(default)]
     user_id: Option<String>,
@@ -1154,7 +1155,7 @@ struct NextUpQuery {
 async fn shows_next_up(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<NextUpQuery>,
+    q: CiQuery<NextUpQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let all = state
         .list_items_cached()
@@ -1251,7 +1252,7 @@ async fn shows_next_up(
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct ShowsEpisodesQuery {
     /// Scope to a single season (jellyfin-web passes this when a season is
     /// selected). Absent → every episode of the series.
@@ -1301,7 +1302,7 @@ async fn shows_episodes(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<ShowsEpisodesQuery>,
+    q: CiQuery<ShowsEpisodesQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
     let series_id = path.into_inner();
@@ -1928,7 +1929,7 @@ async fn list_user_items_latest(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<ListQuery>,
+    q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let user_path = path.into_inner();
     let bearer_id = user.0.id.0.simple().to_string();
@@ -1995,7 +1996,7 @@ async fn user_views(
 
 #[derive(serde::Deserialize)]
 struct UserViewsQuery {
-    #[serde(default, rename = "userId")]
+    #[serde(default)]
     #[allow(dead_code)]
     user_id: Option<String>,
 }
@@ -2003,7 +2004,7 @@ struct UserViewsQuery {
 async fn user_views_query(
     state: web::Data<AppState>,
     _user: AuthUser,
-    _q: web::Query<UserViewsQuery>,
+    _q: CiQuery<UserViewsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     Ok(HttpResponse::Ok().json(synth_views_body(&state)))
 }
@@ -2116,7 +2117,7 @@ async fn media_folders(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct ListQuery {
     #[serde(default)]
     start_index: u32,
@@ -2233,15 +2234,13 @@ struct ListQuery {
     /// chips send. We compare against `probe.width` since aspect
     /// ratios vary and height alone undercounts widescreen content.
     /// Items without width data drop when any of these are active.
-    /// The explicit `rename`s honour Jellyfin's case (Is4K with an
-    /// uppercase K, Is3D with an uppercase D) — serde's PascalCase
-    /// renamer alone produces `Is4k` / `Is3d` which the client never
-    /// sends.
-    #[serde(default, rename = "Is4K")]
+    /// Casing is handled by the `CiQuery` extractor (it snake-cases every
+    /// incoming key, so `Is4K` / `is4K` both bind `is_4k`).
+    #[serde(default)]
     is_4k: Option<bool>,
     #[serde(default)]
     is_hd: Option<bool>,
-    #[serde(default, rename = "Is3D")]
+    #[serde(default)]
     is_3d: Option<bool>,
     /// Explicit min/max bounds on the source video width. Lets a
     /// power user pick a 1440p cutoff that the canned chips miss.
@@ -2409,7 +2408,7 @@ async fn list_playlists_page(
 async fn list_items(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<ListQuery>,
+    q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
@@ -2430,7 +2429,7 @@ async fn list_user_items(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-    q: web::Query<ListQuery>,
+    q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     // V9 spirit: the path user must match the bearer. Reject mismatched.
     let user_path = path.into_inner();
@@ -4167,7 +4166,7 @@ fn default_library_options() -> serde_json::Value {
 /// items under that path, and — only when the path is not already under a
 /// configured media root — kick a background scan to import fresh content.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct AddVirtualFolderQuery {
     name: Option<String>,
     collection_type: Option<String>,
@@ -4181,7 +4180,7 @@ struct AddVirtualFolderQuery {
 async fn add_virtual_folder(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<AddVirtualFolderQuery>,
+    q: CiQuery<AddVirtualFolderQuery>,
     body: Option<web::Json<serde_json::Value>>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
@@ -4283,7 +4282,7 @@ async fn add_virtual_folder(
 /// its display name. The items stay indexed (they still live under a media
 /// root); only the typed grouping is removed.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct RemoveVirtualFolderQuery {
     name: Option<String>,
 }
@@ -4291,7 +4290,7 @@ struct RemoveVirtualFolderQuery {
 async fn remove_virtual_folder(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<RemoveVirtualFolderQuery>,
+    q: CiQuery<RemoveVirtualFolderQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::LibraryStore;
@@ -4385,7 +4384,7 @@ async fn update_virtual_folder_options(
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct RenameVirtualFolderQuery {
     id: Option<String>,
     new_name: Option<String>,
@@ -4396,7 +4395,7 @@ struct RenameVirtualFolderQuery {
 async fn rename_virtual_folder(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<RenameVirtualFolderQuery>,
+    q: CiQuery<RenameVirtualFolderQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     let id =
@@ -4469,7 +4468,7 @@ async fn add_media_path(
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct RemoveMediaPathQuery {
     name: Option<String>,
     path: Option<String>,
@@ -4480,7 +4479,7 @@ struct RemoveMediaPathQuery {
 async fn remove_media_path(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<RemoveMediaPathQuery>,
+    q: CiQuery<RemoveMediaPathQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     let name = q
@@ -4544,7 +4543,7 @@ async fn libraries_available_options(_user: AuthUser) -> impl Responder {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct DirectoryContentsQuery {
     path: Option<String>,
     #[serde(default)]
@@ -4559,7 +4558,7 @@ struct DirectoryContentsQuery {
 /// only (it browses the server filesystem, which is the point).
 async fn environment_directory_contents(
     user: AuthUser,
-    q: web::Query<DirectoryContentsQuery>,
+    q: CiQuery<DirectoryContentsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     let path = q.path.as_deref().filter(|p| !p.is_empty()).unwrap_or("/");

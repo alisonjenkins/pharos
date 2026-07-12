@@ -5,6 +5,7 @@
 //! Plugins, Logs) return empty arrays so the dashboard renders the empty
 //! state rather than throwing on a 404.
 
+use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
@@ -63,7 +64,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 const API_KEY_PREFIX: &str = "apikey:";
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct CreateApiKeyQuery {
     /// `App` matches jellyfin-web's `/Auth/Keys` form param. Tucks into
     /// the token's `device_id` as `apikey:{app}` so the key shows up
@@ -114,7 +115,7 @@ async fn list_api_keys(
 async fn create_api_key(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<CreateApiKeyQuery>,
+    q: CiQuery<CreateApiKeyQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let app_name = q.app.trim();
@@ -223,7 +224,7 @@ async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct ActivityLogQuery {
     start_index: Option<usize>,
     limit: Option<usize>,
@@ -235,7 +236,7 @@ struct ActivityLogQuery {
 async fn activity_log_entries(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<ActivityLogQuery>,
+    q: CiQuery<ActivityLogQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let start = q.start_index.unwrap_or(0);
@@ -456,7 +457,7 @@ async fn set_user_password(
 /// change (e.g. embedded-font `MediaAttachments`) whose new fields the
 /// incremental scan would never backfill onto byte-identical existing files.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "snake_case", default)]
 struct LibraryRefreshQuery {
     force: bool,
 }
@@ -464,7 +465,7 @@ struct LibraryRefreshQuery {
 async fn library_refresh(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<LibraryRefreshQuery>,
+    q: CiQuery<LibraryRefreshQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let state = state.into_inner();
@@ -626,7 +627,7 @@ async fn system_logs(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 struct LogFileQuery {
     name: String,
 }
@@ -637,7 +638,7 @@ struct LogFileQuery {
 async fn system_logs_file(
     state: web::Data<AppState>,
     user: AuthUser,
-    q: web::Query<LogFileQuery>,
+    q: CiQuery<LogFileQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let Some(dir) = state.log_dir.as_ref() else {
