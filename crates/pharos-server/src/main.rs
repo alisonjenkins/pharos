@@ -809,6 +809,13 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // own remove-on-empty; without this the sync_groups table grew forever
     // and B24 recovery could re-attach a device to week-old leftovers).
     pharos_server::sync_recovery::spawn_snapshot_janitor(app_state.stores.clone());
+    // B29 — hydrate fresh persisted groups at boot so the ghost prune can
+    // dissolve no-show parties within minutes instead of them haunting the
+    // join picker until the janitor's 48h cutoff.
+    pharos_server::sync_recovery::spawn_boot_reconciliation(
+        app_state.stores.clone(),
+        group_registry.get_ref().clone(),
+    );
     let member_sinks_data = web::Data::new(member_sinks);
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
     // per-`/socket` group member sinks. One instance shared across workers.

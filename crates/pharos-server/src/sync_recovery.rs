@@ -58,6 +58,44 @@ pub async fn find_persisted_group(stores: &Stores, member_id: MemberId) -> Optio
         .map(GroupId)
 }
 
+/// B29 — boot reconciliation: hydrate every FRESH persisted snapshot into a
+/// live group actor shortly after startup. Without this, a snapshot whose
+/// members never reconnect has NO actor — so the T83 ghost prune never runs
+/// against it and the "group" haunts the join picker (B28 lists snapshots)
+/// until the 48h janitor. Hydrating hands each orphan to the existing
+/// lifecycle: members get MEMBER_TTL_MS to reconnect, no-shows are pruned,
+/// an emptied group's actor deletes the snapshot — self-cleaning within
+/// minutes. Members who DO return were being recovered anyway (B24); this
+/// only accelerates the no-show path. `get_or_create` is ownership-aware
+/// under Postgres (one replica hydrates; others get remote handles).
+pub fn spawn_boot_reconciliation(stores: Stores, registry: pharos_sync::GroupRegistry) {
+    tokio::spawn(async move {
+        // Let the pg bus / ownership plumbing settle first.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let cutoff = now_unix_secs() - RECOVERY_WINDOW_SECS;
+        let rows = match stores.list_sync_groups().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "syncplay: boot reconciliation list failed");
+                return;
+            }
+        };
+        for row in rows.iter().filter(|r| r.updated_at >= cutoff) {
+            let Ok(gid) = uuid::Uuid::parse_str(&row.group_id).map(GroupId) else {
+                continue;
+            };
+            match registry.get_or_create(gid).await {
+                Ok(_) => {
+                    tracing::info!(group = %gid, "syncplay: boot reconciliation hydrated persisted group");
+                }
+                Err(e) => {
+                    tracing::warn!(group = %gid, error = %e, "syncplay: boot reconciliation failed")
+                }
+            }
+        }
+    });
+}
+
 /// T83 — periodic GC for `sync_groups` snapshots. A group actor removes its
 /// own snapshot when the group empties, but a snapshot orphaned by a crash /
 /// kill (no clean empty) previously lived FOREVER: `prune_sync_groups`

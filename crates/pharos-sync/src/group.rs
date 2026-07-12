@@ -1085,10 +1085,14 @@ impl GroupHandle {
         let mut state = GroupState::new(group_id, epoch_unix_ms, delivery, persistence);
         // A hydrated takeover starts already populated, so it must not treat
         // itself as brand-new (which would terminate on the first empty check).
+        // ANY hydration counts as "has had members" (a group only persists
+        // after its creator joined) — so a crash-orphaned EMPTY snapshot
+        // hydrates into an actor that terminates on its first message and
+        // deletes the orphan row, instead of idling forever (B29).
         let mut ever_joined = false;
         if let Some(ps) = hydrate {
             state.apply_persist(ps);
-            ever_joined = !state.members.is_empty();
+            ever_joined = true;
         }
         tokio::spawn(async move {
             // A brand-new group has no members yet — it must NOT terminate on
@@ -1815,6 +1819,61 @@ mod tests {
             snap.participants,
             vec!["alive".to_string()],
             "ghost pruned, pinger survives"
+        );
+    }
+
+    /// B29 — a hydrated group whose members NEVER reconnect must dissolve by
+    /// itself: hydration stamps the roster "seen now", the ghost prune reaps
+    /// everyone after MEMBER_TTL_MS, the emptied actor terminates AND deletes
+    /// its persisted snapshot. This is what keeps orphaned snapshots (pod
+    /// restarted, everyone gone) from haunting the join picker for 48h.
+    #[tokio::test(start_paused = true)]
+    async fn hydrated_group_with_no_show_members_dissolves_and_removes_snapshot() {
+        // Produce a REAL snapshot: an actor with one member persists its state.
+        let capture1 = Arc::new(CapturePersistence::default());
+        let sinks = MemberSinks::new();
+        let delivery = Arc::new(LocalDelivery::new(sinks.clone()));
+        let gid = GroupId::new();
+        let h1 =
+            GroupHandle::spawn_persistent(gid, 1_000, delivery.clone(), capture1.clone(), None);
+        let _rx = join(&h1, &sinks, MemberId::new(), "ghost").await;
+        let json = capture1
+            .latest
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("snapshot persisted")
+            .2;
+        drop(h1);
+
+        // "Restart": hydrate the snapshot on a fresh actor; nobody reconnects.
+        let capture2 = Arc::new(CapturePersistence::default());
+        // Seed the capture as non-empty so we can observe the REMOVE.
+        capture2.persist(gid, 1_000, json.clone());
+        let h2 = GroupHandle::spawn_persistent(
+            gid,
+            1_000,
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+            capture2.clone(),
+            Some(&json),
+        );
+
+        // TTL (150s) + prune tick (30s) → the no-show roster is reaped and the
+        // actor dissolves. Advance well past it.
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..200 {
+            if h2.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(h2.tx.is_closed(), "orphan group actor must terminate");
+        assert!(
+            capture2.latest.lock().unwrap().is_none(),
+            "orphan group's snapshot must be REMOVED on dissolution"
         );
     }
 
