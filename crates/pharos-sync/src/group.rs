@@ -1099,7 +1099,12 @@ impl GroupHandle {
             // the empty check before its creator's AddMember lands (else a New
             // that sends anything first, e.g. SetGroupName, kills the group
             // before anyone joins). Only terminate once it has HAD a member and
-            // then lost the last one.
+            // then lost the last one — OR when nobody ever joins within the
+            // join deadline (B30: a /SyncPlay/New whose caller's AddMember
+            // failed — e.g. no socket registered yet — left an IMMORTAL empty
+            // group squatting in the picker forever).
+            let spawned_at = tokio::time::Instant::now();
+            const NEVER_JOINED_DEADLINE_MS: u64 = 120_000;
             let mut prune_tick =
                 tokio::time::interval(std::time::Duration::from_millis(MEMBER_PRUNE_TICK_MS));
             prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1161,6 +1166,18 @@ impl GroupHandle {
                     // Had members, now empty → terminate. Registry respawns on
                     // the next Join. Drop the persisted snapshot so a stale group
                     // can't be re-hydrated after everyone has left.
+                    if let Some(p) = &state.persistence {
+                        p.remove(state.id);
+                    }
+                    break;
+                }
+                // B30 — nobody EVER joined within the deadline: the creator's
+                // AddMember never arrived (e.g. New without a registered
+                // socket). Dissolve instead of squatting in the picker forever.
+                if !ever_joined
+                    && spawned_at.elapsed().as_millis() as u64 > NEVER_JOINED_DEADLINE_MS
+                {
+                    tracing::info!(group = %state.id, "syncplay: dissolving never-joined group (join deadline)");
                     if let Some(p) = &state.persistence {
                         p.remove(state.id);
                     }
@@ -1819,6 +1836,52 @@ mod tests {
             snap.participants,
             vec!["alive".to_string()],
             "ghost pruned, pinger survives"
+        );
+    }
+
+    /// B30 — a group NOBODY ever joined (New whose caller's AddMember failed)
+    /// dissolves at the join deadline instead of squatting forever.
+    #[tokio::test(start_paused = true)]
+    async fn never_joined_group_dissolves_at_join_deadline() {
+        let (h, _sinks) = spawn_group();
+        // Name it (the New handler does) — still no members.
+        h.tx.send(GroupMsg::SetGroupName {
+            name: "ghost town".into(),
+        })
+        .await
+        .unwrap();
+        // Advance past the 120s join deadline (prune tick wakes the loop).
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..200 {
+            if h.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(h.tx.is_closed(), "never-joined group must dissolve");
+    }
+
+    /// B30 guard-rail: the join deadline must NOT kill a group whose creator
+    /// joined — a live (pinging) group survives well past it. (A joined-but-
+    /// silent group is the T83 ghost path, covered separately.)
+    #[tokio::test(start_paused = true)]
+    async fn joined_group_survives_past_join_deadline() {
+        let (h, sinks) = spawn_group();
+        let m = MemberId::new();
+        let _rx = join(&h, &sinks, m, "pinger").await;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            h.tx.send(GroupMsg::MemberPing { member_id: m })
+                .await
+                .unwrap();
+            let _ = snapshot_of(&h).await;
+        }
+        assert!(
+            !h.tx.is_closed(),
+            "joined + pinging group must survive well past the join deadline"
         );
     }
 
