@@ -93,15 +93,47 @@ impl HydrationSource for StoreHydration {
     }
 }
 
-/// Persists an owned group's snapshot after each mutation (fire-and-forget).
+/// Persists an owned group's snapshot after each mutation (fire-and-forget
+/// from the ACTOR's perspective, but strictly ORDERED per group: each write
+/// runs behind the previous one via a per-group op chain). Without the
+/// ordering, the actor's final persist (the 0-member roster written just
+/// before it terminates) raced its own remove — two independently-spawned
+/// tasks — and a late upsert RESURRECTED the row as an immortal 0-member
+/// orphan in the picker (B31).
 struct StorePersistence {
     stores: Stores,
+    /// group id → the tail of that group's op chain. Each new op awaits the
+    /// previous handle, guaranteeing store-visible ordering per group.
+    chains: std::sync::Mutex<std::collections::HashMap<GroupId, tokio::task::JoinHandle<()>>>,
+}
+
+impl StorePersistence {
+    /// Enqueue `op` behind the group's previous op (if any still runs).
+    fn enqueue<F>(&self, group_id: GroupId, op: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut chains = self
+            .chains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = chains.remove(&group_id);
+        let handle = tokio::spawn(async move {
+            if let Some(p) = prev {
+                let _ = p.await;
+            }
+            op.await;
+        });
+        chains.insert(group_id, handle);
+        // Bound the map: drop entries whose chain already finished.
+        chains.retain(|_, h| !h.is_finished());
+    }
 }
 
 impl GroupPersistence for StorePersistence {
     fn persist(&self, group_id: GroupId, epoch_unix_ms: u64, state_json: String) {
         let stores = self.stores.clone();
-        tokio::spawn(async move {
+        self.enqueue(group_id, async move {
             let persisted = pharos_core::PersistedSyncGroup {
                 group_id: group_id.to_string(),
                 epoch_unix_ms: epoch_unix_ms as i64,
@@ -116,7 +148,7 @@ impl GroupPersistence for StorePersistence {
 
     fn remove(&self, group_id: GroupId) {
         let stores = self.stores.clone();
-        tokio::spawn(async move {
+        self.enqueue(group_id, async move {
             if let Err(e) = stores.remove_sync_group(&group_id.to_string()).await {
                 tracing::warn!(%group_id, error = %e, "group snapshot remove failed");
             }
@@ -179,7 +211,10 @@ pub async fn build(
             stores: stores.clone(),
         }),
         commands: Arc::new(BusCommands::new(bus.clone())),
-        persistence: Arc::new(StorePersistence { stores }),
+        persistence: Arc::new(StorePersistence {
+            stores,
+            chains: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }),
     };
     let registry = GroupRegistry::spawn_distributed(delivery, distributed);
 
@@ -202,4 +237,46 @@ pub async fn build(
     });
 
     Ok(registry)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// B31 — persist and remove for the SAME group must apply in call order.
+    /// The actor's final mutation persists a 0-member roster and then removes
+    /// the row; as two independently-spawned tasks the late upsert could land
+    /// AFTER the delete and resurrect the row as an immortal 0-member orphan.
+    /// The per-group op chain makes the sequence deterministic.
+    #[tokio::test]
+    async fn remove_after_persist_never_resurrects_the_row() {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let p = StorePersistence {
+            stores: stores.clone(),
+            chains: Mutex::new(HashMap::new()),
+        };
+        for i in 0..200 {
+            let gid = GroupId::new();
+            // The exact terminal sequence: last-mutation persist, then remove.
+            p.persist(gid, 1_000, format!("{{\"iteration\":{i}}}"));
+            p.remove(gid);
+            // Wait for the chain to drain.
+            loop {
+                let done = {
+                    let chains = p.chains.lock().unwrap();
+                    chains.get(&gid).is_none_or(|h| h.is_finished())
+                };
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let row = stores.get_sync_group(&gid.to_string()).await.unwrap();
+            assert!(
+                row.is_none(),
+                "iteration {i}: remove-after-persist must leave NO row"
+            );
+        }
+    }
 }

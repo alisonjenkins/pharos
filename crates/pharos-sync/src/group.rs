@@ -1885,6 +1885,45 @@ mod tests {
         );
     }
 
+    /// B29 probe — a hydrated EMPTY snapshot (crash orphan) must dissolve on
+    /// its first tick and REMOVE its row.
+    #[tokio::test(start_paused = true)]
+    async fn hydrated_empty_snapshot_dissolves_immediately() {
+        let capture = Arc::new(CapturePersistence::default());
+        let gid = GroupId::new();
+        // Empty-roster snapshot json, produced by serializing a fresh state.
+        let empty_state = GroupState::new(
+            gid,
+            1_000,
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+            None,
+        );
+        let json = serde_json::to_string(&empty_state.to_persist()).unwrap();
+        capture.persist(gid, 1_000, json.clone());
+        let h = GroupHandle::spawn_persistent(
+            gid,
+            1_000,
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+            capture.clone(),
+            Some(&json),
+        );
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(31)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..200 {
+            if h.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(h.tx.is_closed(), "hydrated-empty actor must terminate");
+        assert!(
+            capture.latest.lock().unwrap().is_none(),
+            "hydrated-empty group's row must be removed"
+        );
+    }
+
     /// B29 — a hydrated group whose members NEVER reconnect must dissolve by
     /// itself: hydration stamps the roster "seen now", the ghost prune reaps
     /// everyone after MEMBER_TTL_MS, the emptied actor terminates AND deletes
