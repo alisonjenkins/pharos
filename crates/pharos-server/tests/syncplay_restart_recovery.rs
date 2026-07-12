@@ -315,6 +315,99 @@ async fn ping_from_groupless_session_heals_with_not_in_group() {
     );
 }
 
+/// B28 — `/SyncPlay/List` must surface groups that exist only as persisted
+/// snapshots (post-restart, or owned by another replica). The in-memory
+/// registry knows nothing about them, but the party must stay joinable from
+/// the picker — otherwise everyone who wasn't auto-recovered has to recreate
+/// the group by hand. Stale snapshots stay hidden.
+#[actix_web::test]
+async fn list_includes_fresh_persisted_groups_after_restart() {
+    let (gid, json) = persisted_snapshot_for("alisons-firefox").await;
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    stores
+        .upsert_sync_group(
+            &PersistedSyncGroup {
+                group_id: gid.to_string(),
+                epoch_unix_ms: 1_000,
+                state_json: json.clone(),
+                updated_at: 0,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    // A second, STALE group (last touched 3 days ago) must stay hidden.
+    let stale_gid = GroupId::new();
+    stores
+        .upsert_sync_group(
+            &PersistedSyncGroup {
+                group_id: stale_gid.to_string(),
+                epoch_unix_ms: 1_000,
+                state_json: json,
+                updated_at: 0,
+            },
+            now - 3 * 24 * 3600,
+        )
+        .await
+        .unwrap();
+
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let member_sinks = MemberSinks::new();
+    // Fresh registry — models the restarted process (nothing in memory).
+    let registry =
+        pharos_sync::GroupRegistry::spawn(Arc::new(LocalDelivery::new(member_sinks.clone())));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .app_data(web::Data::new(registry))
+            .app_data(web::Data::new(SessionHub::new()))
+            .app_data(web::Data::new(member_sinks))
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/SyncPlay/List")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        1,
+        "fresh persisted group listed, stale one hidden: {v}"
+    );
+    assert_eq!(arr[0]["GroupId"], gid.to_string());
+    assert_eq!(
+        arr[0]["Participants"],
+        serde_json::json!(["alison"]),
+        "participants come from the snapshot roster"
+    );
+}
+
 /// The NORMAL leave (session actually in a group) must also acknowledge the
 /// leaver with GroupLeft — the group's own MemberLeft broadcast fires after
 /// the roster removal, so it only ever reaches the remaining members.

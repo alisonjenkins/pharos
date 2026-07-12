@@ -22,9 +22,10 @@ use pharos_sync::group::snapshot_contains_member;
 use pharos_sync::messages::{GroupId, MemberId};
 
 /// How far back a persisted snapshot may date (since its last real mutation)
-/// and still be RECOVERED into. Generous enough for a party paused overnight;
-/// old enough that a device is never re-attached to last week's leftovers.
-const RECOVERY_WINDOW_SECS: i64 = 24 * 3600;
+/// and still be RECOVERED into (or listed by `/SyncPlay/List` — B28).
+/// Generous enough for a party paused overnight; old enough that a device is
+/// never re-attached to last week's leftovers.
+pub const RECOVERY_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Snapshots older than this are garbage-collected by the janitor. Kept past
 /// the recovery window so an operator can still inspect a recently-dead group.
@@ -33,7 +34,7 @@ const PRUNE_CUTOFF_SECS: i64 = 48 * 3600;
 /// How often the janitor sweeps.
 const JANITOR_INTERVAL_SECS: u64 = 6 * 3600;
 
-fn now_unix_secs() -> i64 {
+pub fn now_unix_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

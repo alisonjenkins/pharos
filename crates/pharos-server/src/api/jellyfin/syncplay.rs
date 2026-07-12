@@ -480,7 +480,21 @@ struct GroupInfoDto {
     last_updated_at: String,
 }
 
-async fn list_groups(_user: AuthUser, registry: web::Data<GroupRegistry>) -> impl Responder {
+fn play_state_str(s: pharos_sync::messages::GroupPlayState) -> &'static str {
+    use pharos_sync::messages::GroupPlayState;
+    match s {
+        GroupPlayState::Idle => "Idle",
+        GroupPlayState::Waiting => "Waiting",
+        GroupPlayState::Playing => "Playing",
+        GroupPlayState::Paused => "Paused",
+    }
+}
+
+async fn list_groups(
+    _user: AuthUser,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+) -> impl Responder {
     let Ok(handles) = registry.list().await else {
         // Actor unreachable: return empty rather than 500 so the UI
         // renders an "no active groups" pane instead of an error.
@@ -488,24 +502,46 @@ async fn list_groups(_user: AuthUser, registry: web::Data<GroupRegistry>) -> imp
         return HttpResponse::Ok().json(empty);
     };
     let mut out = Vec::with_capacity(handles.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for h in handles {
         let Some(snap) = h.snapshot().await else {
             continue;
         };
-        use pharos_sync::messages::GroupPlayState;
-        let state = match snap.play_state {
-            GroupPlayState::Idle => "Idle",
-            GroupPlayState::Waiting => "Waiting",
-            GroupPlayState::Playing => "Playing",
-            GroupPlayState::Paused => "Paused",
-        };
+        seen.insert(snap.id.to_string());
         out.push(GroupInfoDto {
             group_id: snap.id.to_string(),
             group_name: snap.group_name,
-            state,
+            state: play_state_str(snap.play_state),
             participants: snap.participants,
             last_updated_at: now_iso8601(),
         });
+    }
+    // B28 — groups this process doesn't hold in memory but that still exist as
+    // fresh persisted snapshots: a just-restarted server (or a replica that
+    // doesn't own the group) must still LIST the party or nobody can rejoin it
+    // from the picker and it has to be recreated by hand. Join goes through
+    // `get_or_create`, which hydrates from this same snapshot.
+    {
+        use pharos_core::SyncGroupStore;
+        let cutoff =
+            crate::sync_recovery::now_unix_secs() - crate::sync_recovery::RECOVERY_WINDOW_SECS;
+        if let Ok(rows) = state.stores.list_sync_groups().await {
+            for row in rows {
+                if row.updated_at < cutoff || seen.contains(&row.group_id) {
+                    continue;
+                }
+                let Some(summary) = pharos_sync::group::snapshot_summary(&row.state_json) else {
+                    continue;
+                };
+                out.push(GroupInfoDto {
+                    group_id: row.group_id,
+                    group_name: summary.group_name,
+                    state: play_state_str(summary.play_state),
+                    participants: summary.participants,
+                    last_updated_at: now_iso8601(),
+                });
+            }
+        }
     }
     HttpResponse::Ok().json(out)
 }

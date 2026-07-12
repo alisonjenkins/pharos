@@ -1000,6 +1000,35 @@ pub fn snapshot_contains_member(state_json: &str, member_id: MemberId) -> bool {
         .unwrap_or(false)
 }
 
+/// The display fields of a persisted snapshot, for the `/SyncPlay/List`
+/// surface (B28): after a restart — or on a replica that doesn't own the
+/// group — the in-memory registry knows nothing, but the party still exists
+/// in the store and MUST stay joinable from the client's group picker.
+pub struct SnapshotSummary {
+    pub group_name: String,
+    pub participants: Vec<String>,
+    pub play_state: GroupPlayState,
+}
+
+/// Parse a persisted snapshot's display summary. `None` for malformed JSON.
+pub fn snapshot_summary(state_json: &str) -> Option<SnapshotSummary> {
+    let ps: PersistState = serde_json::from_str(state_json).ok()?;
+    let play_state = if ps.waiting.is_some() {
+        GroupPlayState::Waiting
+    } else {
+        match ps.playback {
+            PersistPlayback::Idle => GroupPlayState::Idle,
+            PersistPlayback::Playing { .. } => GroupPlayState::Playing,
+            PersistPlayback::Paused { .. } => GroupPlayState::Paused,
+        }
+    };
+    Some(SnapshotSummary {
+        group_name: ps.group_name,
+        participants: ps.members.into_iter().map(|m| m.name).collect(),
+        play_state,
+    })
+}
+
 #[derive(Clone)]
 pub struct GroupHandle {
     pub group_id: GroupId,
@@ -1532,13 +1561,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // Only while Playing — a paused member is already settled, and
                 // healing it with another Pause would re-trigger its Ready
                 // (command loop).
-                if matches!(state.playback, PlaybackState::Playing { .. }) {
-                    state.send_playback_state(member_id);
-                }
-                false
-            };
-            if resolved {
-                state.resolve_waiting();
+                state.send_playback_state(member_id);
             }
         }
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
