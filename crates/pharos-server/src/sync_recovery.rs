@@ -70,29 +70,64 @@ pub async fn find_persisted_group(stores: &Stores, member_id: MemberId) -> Optio
 /// under Postgres (one replica hydrates; others get remote handles).
 pub fn spawn_boot_reconciliation(stores: Stores, registry: pharos_sync::GroupRegistry) {
     tokio::spawn(async move {
-        // Let the pg bus / ownership plumbing settle first.
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let cutoff = now_unix_secs() - RECOVERY_WINDOW_SECS;
-        let rows = match stores.list_sync_groups().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "syncplay: boot reconciliation list failed");
+        // Retry rounds (B33): during a rolling deploy the OLD pod is still
+        // draining (30s grace) when this fires — it holds each group's
+        // advisory lock, so the first `get_or_create` loses the ownership
+        // election and yields a REMOTE handle (a bus-forwarder to an owner
+        // that is about to die). With nothing else touching the group, no
+        // replica ever re-attempted ownership: the group ran with NO actor —
+        // no ghost prune, no dissolution — and its snapshot squatted in the
+        // picker until the 48h janitor. Ownership is detectable from outside
+        // the registry: `snapshot()` answers only from a LOCAL actor (a
+        // remote handle drops the reply), so retry each round until every
+        // fresh group answers — or the rounds run out (~3.5 min, far past
+        // any drain window).
+        for round in 0u32..10 {
+            tokio::time::sleep(std::time::Duration::from_secs(if round == 0 {
+                10
+            } else {
+                20
+            }))
+            .await;
+            let cutoff = now_unix_secs() - RECOVERY_WINDOW_SECS;
+            let rows = match stores.list_sync_groups().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "syncplay: boot reconciliation list failed");
+                    return;
+                }
+            };
+            let mut unowned = 0usize;
+            for row in rows.iter().filter(|r| r.updated_at >= cutoff) {
+                let Ok(gid) = uuid::Uuid::parse_str(&row.group_id).map(GroupId) else {
+                    continue;
+                };
+                match registry.get_or_create(gid).await {
+                    Ok(h) => {
+                        if h.snapshot().await.is_some() {
+                            tracing::info!(group = %gid, round, "syncplay: boot reconciliation hydrated persisted group");
+                        } else {
+                            // Remote handle — another replica (possibly the
+                            // draining old pod) still holds the lock.
+                            unowned += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(group = %gid, error = %e, "syncplay: boot reconciliation failed");
+                        unowned += 1;
+                    }
+                }
+            }
+            if unowned == 0 {
                 return;
             }
-        };
-        for row in rows.iter().filter(|r| r.updated_at >= cutoff) {
-            let Ok(gid) = uuid::Uuid::parse_str(&row.group_id).map(GroupId) else {
-                continue;
-            };
-            match registry.get_or_create(gid).await {
-                Ok(_) => {
-                    tracing::info!(group = %gid, "syncplay: boot reconciliation hydrated persisted group");
-                }
-                Err(e) => {
-                    tracing::warn!(group = %gid, error = %e, "syncplay: boot reconciliation failed")
-                }
-            }
+            tracing::info!(
+                round,
+                unowned,
+                "syncplay: boot reconciliation retrying unowned groups"
+            );
         }
+        tracing::warn!("syncplay: boot reconciliation gave up with unowned groups remaining");
     });
 }
 

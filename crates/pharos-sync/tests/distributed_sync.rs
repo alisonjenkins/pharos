@@ -293,3 +293,57 @@ async fn group_survives_owner_drain_via_takeover() {
     );
     assert_eq!(snap.member_count, 1, "the roster survived takeover");
 }
+
+/// B33 — the boot-reconciliation retry primitive: while another replica (the
+/// DRAINING old pod during a rolling deploy) still holds a group's advisory
+/// lock, `get_or_create` yields a REMOTE handle — detectable because
+/// `snapshot()` answers only from a local actor. Once the lock frees, a
+/// retried `get_or_create` must win ownership and hydrate a LOCAL actor
+/// (snapshot answers). Without the retry, a group nobody touched again ran
+/// with NO actor at all: no ghost prune, no dissolution, snapshot squatting.
+#[tokio::test]
+async fn get_or_create_upgrades_remote_handle_to_owned_after_lock_frees() {
+    let bus = Arc::new(LocalSyncBus::new());
+    let owners = FakeOwnerMap::default();
+    let store = FakeStore::default();
+
+    // "Old pod" (replica 2) owns the group and persisted a snapshot.
+    let r2 = spawn_replica(bus.clone(), owners.clone(), store.clone(), 2);
+    let h2 = r2.registry.create().await.unwrap();
+    let gid = h2.group_id;
+    let m = MemberId::new();
+    let (tx, _rx) = mpsc::channel(8);
+    r2.sinks.insert(m, tx);
+    let (rtx, rrx) = oneshot::channel();
+    h2.tx
+        .send(GroupMsg::AddMember {
+            member_id: m,
+            name: "alison".into(),
+            reply: rtx,
+        })
+        .await
+        .unwrap();
+    let _ = rrx.await.unwrap();
+
+    // New pod (replica 1) boots while the old one still holds the lock:
+    // reconciliation's first attempt yields a REMOTE handle.
+    let r1 = spawn_replica(bus.clone(), owners.clone(), store.clone(), 1);
+    let first = r1.registry.get_or_create(gid).await.unwrap();
+    assert!(
+        first.snapshot().await.is_none(),
+        "while the old owner holds the lock, the handle must be remote"
+    );
+
+    // The old pod finishes draining: its lock releases (B26 keeps the
+    // snapshot intact — nothing removed it).
+    owners.0.lock().unwrap().remove(&gid);
+
+    // Retry (what spawn_boot_reconciliation now does each round): ownership
+    // is won and the LOCAL actor hydrates from the snapshot.
+    let second = r1.registry.get_or_create(gid).await.unwrap();
+    let snap = second
+        .snapshot()
+        .await
+        .expect("after the lock frees, a retried get_or_create must own + hydrate");
+    assert_eq!(snap.member_count, 1, "roster hydrated from the snapshot");
+}

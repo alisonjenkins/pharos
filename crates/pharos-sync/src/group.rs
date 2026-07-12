@@ -1885,6 +1885,37 @@ mod tests {
         );
     }
 
+    /// REAL-TIME probe (not paused clock): hydrated roster with no reconnects
+    /// must ghost-prune + dissolve within ~TTL+tick. Ignored by default (slow);
+    /// run explicitly when chasing live prune failures.
+    #[tokio::test]
+    #[ignore]
+    async fn realtime_hydrated_ghosts_prune() {
+        let capture1 = Arc::new(CapturePersistence::default());
+        let sinks = MemberSinks::new();
+        let delivery = Arc::new(LocalDelivery::new(sinks.clone()));
+        let gid = GroupId::new();
+        let h1 =
+            GroupHandle::spawn_persistent(gid, 1_000, delivery.clone(), capture1.clone(), None);
+        let _r1 = join(&h1, &sinks, MemberId::new(), "a").await;
+        let _r2 = join(&h1, &sinks, MemberId::new(), "b").await;
+        let json = capture1.latest.lock().unwrap().clone().unwrap().2;
+        drop(h1);
+        let capture2 = Arc::new(CapturePersistence::default());
+        capture2.persist(gid, 1_000, json.clone());
+        let h2 = GroupHandle::spawn_persistent(
+            gid,
+            1_000,
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+            capture2.clone(),
+            Some(&json),
+        );
+        // TTL 150s + tick 30s + slack.
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert!(h2.tx.is_closed(), "actor must dissolve in real time");
+        assert!(capture2.latest.lock().unwrap().is_none(), "row removed");
+    }
+
     /// B29 probe — a hydrated EMPTY snapshot (crash orphan) must dissolve on
     /// its first tick and REMOVE its row.
     #[tokio::test(start_paused = true)]
