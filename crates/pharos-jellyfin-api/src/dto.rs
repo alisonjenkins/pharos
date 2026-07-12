@@ -1771,8 +1771,8 @@ mod tests {
         // fetches an external track (Stream.js / Stream.vtt) when
         // IsTextSubtitleStream && SupportsExternalStream. Omitting them (the
         // pre-fix wire shape) made the client skip text subs entirely.
-        assert_eq!(text.is_text_subtitle_stream, true);
-        assert_eq!(text.supports_external_stream, true);
+        assert!(text.is_text_subtitle_stream);
+        assert!(text.supports_external_stream);
         // PGS → Encode (burn), no URL.
         let image = streams.iter().find(|s| s.index == 3).unwrap();
         assert_eq!(image.delivery_method, Some("Encode"));
@@ -1781,8 +1781,8 @@ mod tests {
             "image subs burn in, no .vtt URL"
         );
         // Image subs are neither text nor externally deliverable.
-        assert_eq!(image.is_text_subtitle_stream, false);
-        assert_eq!(image.supports_external_stream, false);
+        assert!(!image.is_text_subtitle_stream);
+        assert!(!image.supports_external_stream);
         // ASS → External but RAW .ass URL (SubtitlesOctopus, not a VTT track).
         let ass = streams.iter().find(|s| s.index == 4).unwrap();
         assert_eq!(ass.delivery_method, Some("External"));
@@ -1790,8 +1790,8 @@ mod tests {
             ass.delivery_url.as_deref(),
             Some("/Videos/42/42/Subtitles/4/Stream.ass")
         );
-        assert_eq!(ass.is_text_subtitle_stream, true);
-        assert_eq!(ass.supports_external_stream, true);
+        assert!(ass.is_text_subtitle_stream);
+        assert!(ass.supports_external_stream);
     }
 
     #[test]
