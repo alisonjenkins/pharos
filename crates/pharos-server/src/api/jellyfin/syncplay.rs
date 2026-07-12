@@ -43,11 +43,15 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/syncplay/setrepeatmode", web::post().to(set_repeat_mode))
         .route("/syncplay/setshufflemode", web::post().to(set_shuffle_mode))
         .route("/syncplay/setignorewait", web::post().to(set_ignore_wait))
+        // T83 — liveness beacon + auto-heal. jellyfin-web posts this
+        // periodically while in a group: it refreshes the member's ghost-prune
+        // TTL, and a group-less pinger gets NotInGroup via `dispatch` (healing
+        // a wedged client without the user touching anything).
+        .route("/syncplay/ping", web::post().to(ping))
         // Not yet modelled by the engine — accept + ignore so the client's
         // flow isn't broken by a 404.
         .route("/syncplay/moveplaylistitem", web::post().to(no_op_204))
-        .route("/syncplay/removefromplaylist", web::post().to(no_op_204))
-        .route("/syncplay/ping", web::post().to(no_op_204));
+        .route("/syncplay/removefromplaylist", web::post().to(no_op_204));
 }
 
 fn no_content() -> HttpResponse {
@@ -100,6 +104,17 @@ async fn dispatch(
         },
     }
     no_content()
+}
+
+/// `POST /SyncPlay/Ping` — the client's periodic time-sync report (body
+/// `{Ping: <ms>}`, ignored). Routed through `dispatch` for its two side
+/// effects: the member's liveness TTL refreshes (T83 ghost prune), and a
+/// group-less caller is answered with NotInGroup.
+async fn ping(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+    dispatch(&hub, auth.device_id.as_deref(), "ping", |mid| {
+        GroupMsg::MemberPing { member_id: mid }
+    })
+    .await
 }
 
 /// Add the caller (from the hub) to `handle` as a member. Shared by New + Join.

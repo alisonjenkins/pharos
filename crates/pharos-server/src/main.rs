@@ -805,6 +805,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(not(feature = "postgres"))]
     let group_registry = local_registry();
     let group_registry = web::Data::new(group_registry);
+    // T83 — GC orphaned SyncPlay snapshots (a crash/kill skips the actor's
+    // own remove-on-empty; without this the sync_groups table grew forever
+    // and B24 recovery could re-attach a device to week-old leftovers).
+    pharos_server::sync_recovery::spawn_snapshot_janitor(app_state.stores.clone());
     let member_sinks_data = web::Data::new(member_sinks);
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
     // per-`/socket` group member sinks. One instance shared across workers.

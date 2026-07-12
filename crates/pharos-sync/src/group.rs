@@ -42,6 +42,17 @@ pub const MIN_LEAD_MS: u64 = 200;
 /// but the wider window lets the common case resolve cleanly with everyone in.
 pub const READY_TIMEOUT_MS: u64 = 30_000;
 
+/// T83 — how long a member may stay SILENT (no socket KeepAlive, no
+/// `/SyncPlay/Ping`, no command) before the group prunes it as a ghost.
+/// jellyfin-web KeepAlives every ~30s, so a live client refreshes several
+/// times per TTL; a hydrated post-restart roster entry whose device never
+/// reconnects exceeds it and is removed instead of wedging every readiness
+/// gate to the anti-wedge timeout forever.
+pub const MEMBER_TTL_MS: u64 = 150_000;
+
+/// How often the actor sweeps for TTL-expired members.
+const MEMBER_PRUNE_TICK_MS: u64 = 30_000;
+
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -166,6 +177,15 @@ pub enum GroupMsg {
     ResyncMember {
         member_id: MemberId,
     },
+    /// Liveness beacon (T83): the member's `/socket` KeepAlive (every ~30s in
+    /// jellyfin-web) and its periodic `/SyncPlay/Ping` both refresh the
+    /// member's `last_seen`. A member silent past [`MEMBER_TTL_MS`] is a GHOST
+    /// (typically a post-restart hydrated roster entry whose device never
+    /// reconnected) and gets pruned — otherwise every readiness gate waits the
+    /// full anti-wedge timeout on it, forever.
+    MemberPing {
+        member_id: MemberId,
+    },
     Snapshot {
         reply: oneshot::Sender<GroupSnapshot>,
     },
@@ -225,6 +245,9 @@ pub enum RemoteCommand {
     MemberReady {
         member_id: MemberId,
         position_ms: u64,
+    },
+    MemberPing {
+        member_id: MemberId,
     },
     SetNewQueue {
         sender: MemberId,
@@ -328,6 +351,7 @@ impl RemoteCommand {
                 member_id,
                 position_ms,
             },
+            RemoteCommand::MemberPing { member_id } => GroupMsg::MemberPing { member_id },
             RemoteCommand::SetNewQueue {
                 sender,
                 item_ids,
@@ -392,6 +416,12 @@ struct MemberRec {
     /// waits. Excluded from every readiness-gate pending set until it posts
     /// `IgnoreWait: false` (or a `Ready`, which implies it re-followed).
     ignore_wait: bool,
+    /// The member's last sign of life (any attributed message — KeepAlive-
+    /// driven `MemberPing`, clock reports, Ready, commands). `tokio::time::
+    /// Instant` (monotonic, test-clock-aware), NOT wall clock. NOT persisted:
+    /// a hydrating replica stamps "now", giving every roster entry a full
+    /// [`MEMBER_TTL_MS`] to reconnect after a deploy.
+    last_seen: tokio::time::Instant,
 }
 
 /// One entry in the group's play queue.
@@ -844,6 +874,9 @@ impl GroupState {
     /// a still-open readiness gate gets a fresh deadline so the anti-wedge
     /// timeout still fires on the new owner.
     fn apply_persist(&mut self, ps: PersistState) {
+        // Stamp every restored member "seen now": each gets a full
+        // MEMBER_TTL_MS to reconnect after the deploy before ghost-pruning.
+        let now = tokio::time::Instant::now();
         self.members = ps
             .members
             .into_iter()
@@ -855,6 +888,7 @@ impl GroupState {
                         offset: ClockOffset::default(),
                         buffering: false,
                         ignore_wait: m.ignore_wait,
+                        last_seen: now,
                     },
                 )
             })
@@ -1033,6 +1067,9 @@ impl GroupHandle {
             // that sends anything first, e.g. SetGroupName, kills the group
             // before anyone joins). Only terminate once it has HAD a member and
             // then lost the last one.
+            let mut prune_tick =
+                tokio::time::interval(std::time::Duration::from_millis(MEMBER_PRUNE_TICK_MS));
+            prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 // Arm the readiness-gate timeout only while waiting, so a
                 // silent/wedged member can never block the group forever.
@@ -1040,9 +1077,13 @@ impl GroupHandle {
                 tokio::select! {
                     maybe = rx.recv() => {
                         let Some(msg) = maybe else { break };
-                        // Snapshot/ObserveClock don't change persisted state;
-                        // skip a write for them (ObserveClock is high-frequency).
-                        let mutates = !matches!(msg, GroupMsg::Snapshot { .. } | GroupMsg::ObserveClock { .. });
+                        // Snapshot/ObserveClock/MemberPing don't change persisted
+                        // state; skip a write for them (ObserveClock and the
+                        // KeepAlive-driven MemberPing are high-frequency).
+                        let mutates = !matches!(msg,
+                            GroupMsg::Snapshot { .. }
+                            | GroupMsg::ObserveClock { .. }
+                            | GroupMsg::MemberPing { .. });
                         handle(&mut state, msg).await;
                         if mutates {
                             state.persist();
@@ -1057,6 +1098,29 @@ impl GroupHandle {
                         // drift correction.
                         state.resolve_waiting();
                         state.persist();
+                    }
+                    _ = prune_tick.tick() => {
+                        // T83 — ghost prune: members silent past MEMBER_TTL_MS
+                        // (no KeepAlive-driven ping, no clock report, no command)
+                        // are gone-for-good roster entries — typically hydrated
+                        // after a deploy from a device that never reconnected.
+                        // Removing them keeps readiness gates from waiting the
+                        // full anti-wedge timeout on every play/seek forever and
+                        // keeps the participants list honest.
+                        let now = tokio::time::Instant::now();
+                        let ghosts: Vec<MemberId> = state
+                            .members
+                            .iter()
+                            .filter(|(_, m)| now.saturating_duration_since(m.last_seen).as_millis() as u64 > MEMBER_TTL_MS)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        if !ghosts.is_empty() {
+                            for id in ghosts {
+                                tracing::info!(group = %state.id, member = %id, "syncplay: pruning unresponsive member (ghost)");
+                                remove_member(&mut state, id);
+                            }
+                            state.persist();
+                        }
                     }
                 }
                 ever_joined |= !state.members.is_empty();
@@ -1088,7 +1152,70 @@ impl GroupHandle {
     }
 }
 
+/// Remove a member from the roster: re-elect leadership if needed, notify the
+/// remaining members, and unblock any readiness gate it was pending in.
+/// Shared by the explicit `RemoveMember` (socket teardown / Leave) and the
+/// T83 ghost prune.
+fn remove_member(state: &mut GroupState, member_id: MemberId) {
+    let was_leader = state.leader == Some(member_id);
+    state.members.remove(&member_id);
+    if was_leader {
+        state.elect_leader();
+        if let Some(new_leader) = state.leader {
+            state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
+        }
+    }
+    state.broadcast(ServerMsg::MemberLeft { member_id });
+    // A departing member must not wedge the readiness gate: drop it
+    // from the pending set and resolve if it was the last holdout (and
+    // members remain — an empty group terminates the actor anyway).
+    if let Some(w) = state.waiting.as_mut() {
+        w.pending.remove(&member_id);
+        if w.pending.is_empty() && !state.members.is_empty() {
+            state.resolve_waiting();
+        }
+    }
+}
+
+/// The member a message is ATTRIBUTED to, for liveness tracking (T83): any
+/// message a client causes counts as a sign of life. `AddMember` stamps its
+/// own fresh record; `RemoveMember`/`Snapshot`/`SetGroupName` carry no
+/// attributable member.
+fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
+    match msg {
+        GroupMsg::MemberPing { member_id }
+        | GroupMsg::MemberReady { member_id, .. }
+        | GroupMsg::BufferingStart { member_id, .. }
+        | GroupMsg::BufferingEnd { member_id }
+        | GroupMsg::ObserveClock { member_id, .. }
+        | GroupMsg::SetIgnoreWait { member_id, .. }
+        | GroupMsg::ResyncMember { member_id } => Some(*member_id),
+        GroupMsg::LeaderPlay { sender, .. }
+        | GroupMsg::LeaderPause { sender }
+        | GroupMsg::LeaderSeek { sender, .. }
+        | GroupMsg::Unpause { sender }
+        | GroupMsg::PauseShared { sender }
+        | GroupMsg::SeekTo { sender, .. }
+        | GroupMsg::SetNewQueue { sender, .. }
+        | GroupMsg::SetPlaylistItem { sender, .. }
+        | GroupMsg::NextItem { sender }
+        | GroupMsg::PreviousItem { sender }
+        | GroupMsg::SetRepeatMode { sender, .. }
+        | GroupMsg::SetShuffleMode { sender, .. } => Some(*sender),
+        GroupMsg::AddMember { .. } | GroupMsg::RemoveMember { .. } | GroupMsg::Snapshot { .. } => {
+            None
+        }
+        GroupMsg::SetGroupName { .. } => None,
+    }
+}
+
 async fn handle(state: &mut GroupState, msg: GroupMsg) {
+    // T83 — any attributed message is a sign of life.
+    if let Some(id) = msg_member(&msg) {
+        if let Some(m) = state.members.get_mut(&id) {
+            m.last_seen = tokio::time::Instant::now();
+        }
+    }
     match msg {
         GroupMsg::AddMember {
             member_id,
@@ -1103,6 +1230,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     offset: ClockOffset::default(),
                     buffering: false,
                     ignore_wait: false,
+                    last_seen: tokio::time::Instant::now(),
                 },
             );
             if was_empty {
@@ -1167,24 +1295,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
         }
         GroupMsg::RemoveMember { member_id } => {
-            let was_leader = state.leader == Some(member_id);
-            state.members.remove(&member_id);
-            if was_leader {
-                state.elect_leader();
-                if let Some(new_leader) = state.leader {
-                    state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
-                }
-            }
-            state.broadcast(ServerMsg::MemberLeft { member_id });
-            // A departing member must not wedge the readiness gate: drop it
-            // from the pending set and resolve if it was the last holdout (and
-            // members remain — an empty group terminates the actor anyway).
-            if let Some(w) = state.waiting.as_mut() {
-                w.pending.remove(&member_id);
-                if w.pending.is_empty() && !state.members.is_empty() {
-                    state.resolve_waiting();
-                }
-            }
+            remove_member(state, member_id);
+        }
+        GroupMsg::MemberPing { member_id } => {
+            // Liveness only — the shared touch at the top of `handle` already
+            // refreshed `last_seen_server_ms`.
+            let _ = member_id;
         }
         GroupMsg::LeaderPlay {
             sender,
@@ -1622,6 +1738,37 @@ mod tests {
         );
         let _ = joined;
         rx
+    }
+
+    /// T83 — a member that stops signalling (no KeepAlive-driven ping, no
+    /// commands) past MEMBER_TTL_MS is pruned as a ghost; a member that keeps
+    /// pinging survives indefinitely. Paused-clock test: `advance` drives both
+    /// the prune interval and the TTL arithmetic deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn ghost_member_is_pruned_while_pinging_member_survives() {
+        let (h, sinks) = spawn_group();
+        let alive = MemberId::new();
+        let ghost = MemberId::new();
+        let _rx_alive = join(&h, &sinks, alive, "alive").await;
+        let _rx_ghost = join(&h, &sinks, ghost, "ghost").await;
+        assert_eq!(snapshot_of(&h).await.participants.len(), 2);
+
+        // 7 × 30s = 210s > MEMBER_TTL_MS (150s). "alive" pings every 30s;
+        // "ghost" stays silent. Snapshot after each step is a processing
+        // barrier (the actor is a single loop).
+        for _ in 0..7 {
+            tokio::time::advance(std::time::Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
+            h.tx.send(GroupMsg::MemberPing { member_id: alive })
+                .await
+                .unwrap();
+            let _ = snapshot_of(&h).await;
+        }
+        let snap = snapshot_of(&h).await;
+        assert_eq!(
+            snap.participants,
+            vec!["alive".to_string()],
+            "ghost pruned, pinger survives"
+        );
     }
 
     /// A fresh group with one member ("first", the leader). Returns the shared

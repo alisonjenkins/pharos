@@ -93,7 +93,13 @@ async fn persisted_snapshot_for(device: &str) -> (GroupId, String) {
 async fn persisted_snapshot_recovers_device_membership_after_restart() {
     let (gid, json) = persisted_snapshot_for("alisons-firefox").await;
 
-    // "Restart": a brand-new process has only the store contents.
+    // "Restart": a brand-new process has only the store contents. The row is
+    // freshly updated (a live party's snapshot rewrites on every mutation),
+    // so it sits inside the recovery window.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     stores
         .upsert_sync_group(
@@ -103,7 +109,7 @@ async fn persisted_snapshot_recovers_device_membership_after_restart() {
                 state_json: json,
                 updated_at: 0,
             },
-            1,
+            now,
         )
         .await
         .unwrap();
@@ -124,6 +130,38 @@ async fn persisted_snapshot_recovers_device_membership_after_restart() {
         find_persisted_group(&stores, MemberId::new()).await,
         None,
         "random member id recovers nothing"
+    );
+}
+
+/// T83 — a snapshot stale past the recovery window must NOT be recovered
+/// into: re-attaching a device to last week's leftover group would trap it in
+/// a dead party. (`updated_at` is stamped by upsert's `now_unix_secs` param.)
+#[actix_web::test]
+async fn stale_snapshot_is_not_recovered() {
+    let (gid, json) = persisted_snapshot_for("alisons-firefox").await;
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    // Last mutation 3 days ago — outside the 24h recovery window.
+    let three_days_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 3 * 24 * 3600;
+    stores
+        .upsert_sync_group(
+            &PersistedSyncGroup {
+                group_id: gid.to_string(),
+                epoch_unix_ms: 1_000,
+                state_json: json,
+                updated_at: 0,
+            },
+            three_days_ago,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        find_persisted_group(&stores, member_id_for_device("alisons-firefox")).await,
+        None,
+        "stale snapshot must be ignored by recovery"
     );
 }
 
@@ -215,6 +253,65 @@ async fn no_group_command_sends_not_in_group_to_the_caller() {
     assert!(
         matches!(msg, ServerMsg::GroupLeft),
         "expected GroupLeft, got {msg:?}"
+    );
+}
+
+/// T83 — `/SyncPlay/Ping` from a group-less session heals the client with
+/// NotInGroup (jellyfin-web pings periodically while it THINKS it's in a
+/// group, so a wedged client now exits SyncPlay within one ping interval
+/// without the user touching anything).
+#[actix_web::test]
+async fn ping_from_groupless_session_heals_with_not_in_group() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "lace".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose().to_string();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let hub = SessionHub::new();
+    let (sink_tx, mut sink_rx) = mpsc::channel(8);
+    hub.register("dev-pinger".into(), "lace".into(), sink_tx);
+    let member_sinks = MemberSinks::new();
+    let registry =
+        pharos_sync::GroupRegistry::spawn(Arc::new(LocalDelivery::new(member_sinks.clone())));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .app_data(web::Data::new(registry))
+            .app_data(web::Data::new(hub))
+            .app_data(web::Data::new(member_sinks))
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/SyncPlay/Ping")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("X-Emby-Device-Id", "dev-pinger"))
+            .set_json(serde_json::json!({"Ping": 12}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sink_rx.recv())
+        .await
+        .expect("pinger's socket must receive a message")
+        .expect("sink open");
+    assert!(
+        matches!(msg, ServerMsg::NotInGroup),
+        "expected NotInGroup, got {msg:?}"
     );
 }
 

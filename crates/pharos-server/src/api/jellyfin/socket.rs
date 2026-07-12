@@ -314,8 +314,7 @@ async fn handle_connection<S>(
                         };
                         // KeepAlive: reply in-line. The Jellyfin clients
                         // close the socket after ~10 s of silence; this
-                        // pong keeps it open without involving the group
-                        // actor.
+                        // pong keeps it open.
                         if inbound.message_type == "KeepAlive" {
                             let out = Outbound::new(
                                 "KeepAlive",
@@ -323,6 +322,16 @@ async fn handle_connection<S>(
                             );
                             if send_outbound(&mut session, &out).await.is_err() {
                                 break 'pump;
+                            }
+                            // T83 — forward as a liveness beacon so the group's
+                            // ghost prune (MEMBER_TTL_MS) never reaps a member
+                            // whose socket is demonstrably alive. jellyfin-web
+                            // KeepAlives every ~30s — cheap, non-persisting.
+                            if let Some(g) = hub
+                                .resolve(&device_key)
+                                .and_then(|s| s.group)
+                            {
+                                let _ = g.tx.send(GroupMsg::MemberPing { member_id }).await;
                             }
                             continue 'pump;
                         }

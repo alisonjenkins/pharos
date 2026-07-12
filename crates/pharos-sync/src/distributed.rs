@@ -114,6 +114,7 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
             member_id,
             position_ms,
         },
+        GroupMsg::MemberPing { member_id } => RemoteCommand::MemberPing { member_id },
         GroupMsg::SetNewQueue {
             sender,
             item_ids,
