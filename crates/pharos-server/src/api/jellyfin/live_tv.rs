@@ -22,6 +22,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             web::get().to(channel_image_primary),
         )
         .route("/livetv/programs", web::get().to(programs))
+        // jellyfin-web's home "On Now" section fetches this UNGUARDED (no
+        // .catch): a 404 rejection propagates into the home page's
+        // Promise.all and kills EVERY home section (Next Up, Resume,
+        // Latest — B17). Empty result → the section hides itself cleanly.
+        .route(
+            "/livetv/programs/recommended",
+            web::get().to(empty_items_result),
+        )
         .route("/livetv/recordings", web::get().to(empty_items_result))
         .route("/livetv/timers", web::get().to(empty_items_result))
         .route("/livetv/seriestimers", web::get().to(empty_items_result))

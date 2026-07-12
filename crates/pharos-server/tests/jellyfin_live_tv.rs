@@ -233,3 +233,23 @@ async fn channels_requires_auth() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 401);
 }
+
+#[actix_web::test]
+async fn recommended_programs_is_registered_because_home_dies_on_its_404() {
+    // B17: jellyfin-web's home "On Now" section calls
+    // /LiveTv/Programs/Recommended with NO .catch; the rejection from a 404
+    // propagates into the home page's Promise.all and blanks EVERY home
+    // section (Next Up, Resume, Latest). The endpoint must always answer —
+    // an empty result makes the section hide itself cleanly.
+    let (state, token) = seed_state_no_live_tv().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/LiveTv/Programs/Recommended?IsAiring=true&limit=1")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "home-critical endpoint must not 404");
+    let v: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(v["TotalRecordCount"], 0);
+    assert!(v["Items"].as_array().is_some_and(|a| a.is_empty()));
+}
