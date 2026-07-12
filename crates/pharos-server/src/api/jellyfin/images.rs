@@ -255,17 +255,36 @@ async fn serve_image(
     // episodes), so resolve it to a representative episode and serve that
     // episode's frame as the show/season poster. Without this every series
     // tile in the library 404'd its image.
+    let mut synth_id = false;
     let item = match pharos_jellyfin_api::dto::parse_item_id(id_str).ok_or(()) {
         Ok(id) => match state.stores.get(id).await {
             Ok(it) => it,
             Err(_) => return Ok(HttpResponse::NotFound().body("")),
         },
-        Err(_) => match resolve_synth_image_item(state, id_str).await {
-            Some(it) => it,
-            None => return Ok(HttpResponse::NotFound().body("")),
-        },
+        Err(_) => {
+            synth_id = true;
+            match resolve_synth_image_item(state, id_str).await {
+                Some(it) => it,
+                None => return Ok(HttpResponse::NotFound().body("")),
+            }
+        }
     };
     let id = item.id;
+    // SEASON-specific sidecars. A synth Season id resolves to a representative
+    // episode above, and that episode's own artwork rows record the SERIES
+    // poster (the sidecar provider probes the show folder for episodes) — so
+    // without this, every season of a show served the identical series
+    // poster.jpg. Probe the Kodi/Jellyfin series-root convention
+    // (`season02-poster.jpg`, `season-specials-poster.jpg`, `…-fanart`,
+    // `…-banner`) for the season the requested id names. Only for synth ids
+    // (a real item id is never a season), and only when the file exists —
+    // otherwise fall through to the episode-artwork path (series poster),
+    // which matches Jellyfin's own season fallback.
+    if synth_id && index == 0 {
+        if let Some(local) = season_sidecar_path(&item, id_str, role).await {
+            return serve_local_artwork(&local, role, head_only, format, state).await;
+        }
+    }
     // LIB-D5 — local-sidecar-first resolution. D4 records artwork
     // discovered at scan time (poster.jpg / fanart.jpg / logo.png /…
     // beside the media, or under the series folder for episodes) as
@@ -448,6 +467,50 @@ fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
     for (id, (item_id, _)) in best {
         cache.entry(id).or_insert(Some(item_id));
     }
+}
+
+/// Resolve a SEASON-level sidecar for a synth season id: when the requested
+/// wire id is the season id of the representative episode's (folder, name,
+/// season), probe the series root for the Kodi/Jellyfin per-season art
+/// convention — `season{NN}-poster.jpg` (zero-padded AND bare), with
+/// `season-specials-*` as the season-0 alias, across the same extension set
+/// the scanner's sidecar provider accepts. Series ids (and everything else)
+/// return `None` and keep the existing resolution. A handful of `stat`s per
+/// season-image request; season pages are rare enough that no memo is needed.
+async fn season_sidecar_path(
+    item: &pharos_core::MediaItem,
+    id_str: &str,
+    role: ImageRole,
+) -> Option<std::path::PathBuf> {
+    use crate::api::jellyfin::dto::season_id_for_key;
+    let s = item.series.as_ref()?;
+    let n = s.season_number?;
+    let folder = s.series_folder.as_deref()?;
+    if !season_id_for_key(Some(folder), &s.series_name, n).eq_ignore_ascii_case(id_str) {
+        return None; // a series (or foreign) id — not this episode's season
+    }
+    let suffix = match role {
+        ImageRole::Primary => "poster",
+        ImageRole::Backdrop => "fanart",
+        ImageRole::Banner => "banner",
+        _ => return None,
+    };
+    let mut bases = vec![
+        format!("season{n:02}-{suffix}"),
+        format!("season{n}-{suffix}"),
+    ];
+    if n == 0 {
+        bases.push(format!("season-specials-{suffix}"));
+    }
+    for base in bases {
+        for ext in ["png", "jpg", "jpeg", "webp"] {
+            let candidate = std::path::Path::new(folder).join(format!("{base}.{ext}"));
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// The `ArtworkRole::as_str` token (D4 stores these in `artwork.role`)
