@@ -236,8 +236,11 @@ async fn ids_query_with_synth_ids_returns_empty() {
     let body = test::call_and_read_body(
         &app,
         test::TestRequest::get()
-            // 32-hex synth id (eg. library root) — no numeric match.
-            .uri("/Items?Ids=00000000000000000000000000000001&Limit=100")
+            // TRUE synth id (non-zero high half — library/series namespace):
+            // must never collide with numeric store ids. NB a zero-high-half
+            // 32-hex string is NOT synth any more — since B15 it is the
+            // canonical wire form of the numeric item id and must match.
+            .uri("/Items?Ids=11112222333344441111222233334444&Limit=100")
             .insert_header(("X-Emby-Token", token.as_str()))
             .to_request(),
     )
@@ -246,6 +249,22 @@ async fn ids_query_with_synth_ids_returns_empty() {
     assert!(
         v["Items"].as_array().unwrap().is_empty(),
         "synth-only Ids must not collide with numeric store ids"
+    );
+
+    // And the canonical zero-padded form DOES resolve to item 1 (B22).
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?Ids=00000000000000000000000000000001&Limit=100")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["Items"].as_array().unwrap().len(),
+        1,
+        "canonical hex form of a real item id must match: {v}"
     );
 }
 

@@ -1774,3 +1774,26 @@ async fn repeated_query_params_merge_instead_of_400() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200, "repeated fields params must not 400");
 }
+
+/// B22 regression: /Items?ids= must return the requested items for the
+/// CANONICAL 32-hex id form. A leftover decimal-era `len() <= 20` guard
+/// silently dropped every hex id → zero rows → jellyfin-web's SyncPlay queue
+/// refetch crashed ("Cannot read properties of undefined (reading 'Type')")
+/// and group playback never started.
+#[actix_web::test]
+async fn items_ids_filter_accepts_hex_and_decimal() {
+    let (state, token, _u) = seed_shows().await;
+    let app = test::init_service(build_app(state)).await;
+    for (form, label) in [
+        (format!("{:032x},{:032x}", 1u64, 2u64), "canonical-hex"),
+        ("1,2".to_string(), "legacy-decimal"),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(&format!("/Items?ids={form}"))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["TotalRecordCount"].as_u64().unwrap(), 2, "{label}: {v}");
+    }
+}

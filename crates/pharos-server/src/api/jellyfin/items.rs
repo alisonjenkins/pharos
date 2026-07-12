@@ -2911,7 +2911,13 @@ fn build_media_query(
         f.ids = raw
             .split(',')
             .map(str::trim)
-            .filter(|s| s.len() <= 20)
+            // ≤36 admits the dashed-GUID form; the old ≤20 guard (decimal
+            // u64) silently dropped EVERY canonical 32-hex id, so any
+            // /Items?ids= refetch returned zero rows — which crashed
+            // jellyfin-web's SyncPlay queue load ("Cannot read properties
+            // of undefined (reading 'Type')") and killed group playback
+            // (B22).
+            .filter(|s| s.len() <= 36)
             .filter_map(pharos_jellyfin_api::dto::parse_item_id)
             .collect();
     }
