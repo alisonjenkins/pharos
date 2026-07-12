@@ -204,3 +204,60 @@ async fn transcoding_url_round_trips_through_the_hls_routes() {
         "server-emitted TranscodingUrl rejected by its own route: {status} {body}"
     );
 }
+
+/// People photos: jellyfin-web's favorites tab + cast lists fetch
+/// /Items/{personWireId}/Images/Primary. The scanner records a scraped
+/// thumb_url for most people — serve it as a 302 (the Live-TV channel-logo
+/// pattern); a person without one 404s and the client draws its initials
+/// placeholder.
+#[actix_web::test]
+async fn person_primary_image_redirects_to_scraped_thumb() {
+    use pharos_core::PersonStore;
+    let (state, _token, _uid) = seed().await;
+    let with_thumb = state
+        .stores
+        .upsert_person(
+            "Jane Actor",
+            None,
+            None,
+            Some("https://img.example/jane.jpg"),
+        )
+        .await
+        .unwrap();
+    let _ = with_thumb;
+    let bare = state
+        .stores
+        .upsert_person("No Photo", None, None, None)
+        .await
+        .unwrap();
+    let _ = bare;
+    let jane_wire = pharos_core::person_wire_id("Jane Actor");
+    let bare_wire = pharos_core::person_wire_id("No Photo");
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/Items/{jane_wire}/Images/Primary"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 302, "person with thumb redirects");
+    assert_eq!(
+        resp.headers().get("location").unwrap(),
+        "https://img.example/jane.jpg"
+    );
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/Items/{bare_wire}/Images/Primary"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        404,
+        "person without thumb 404s (placeholder)"
+    );
+}

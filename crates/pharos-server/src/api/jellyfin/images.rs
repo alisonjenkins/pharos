@@ -215,6 +215,29 @@ async fn serve_image(
     let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
     };
+    // PERSON photos first — jellyfin-web's favorites tab + cast lists fetch
+    // people via /Items/{personWireId}/Images/Primary, and the scanner
+    // records a scraped `thumb_url` for most people. 302 to it — the same
+    // public-redirect pattern the Live-TV channel logos use (an <img src>
+    // can't attach auth; matches Jellyfin's public image routes). Checked
+    // before the cache guard: a redirect needs no image cache. Only for
+    // non-item ids (a person wire id never parses as an item id), so real
+    // items never pay the extra lookup.
+    if matches!(role, ImageRole::Primary)
+        && pharos_jellyfin_api::dto::parse_item_id(id_str).is_none()
+    {
+        use pharos_core::PersonStore;
+        if let Ok(Some(person)) = state.stores.person_by_wire_id(id_str).await {
+            return Ok(match person.thumb_url.filter(|u| !u.is_empty()) {
+                Some(url) => HttpResponse::Found()
+                    .insert_header((actix_web::http::header::LOCATION, url))
+                    .finish(),
+                // Known person, no photo → 404; the client renders its
+                // initials placeholder.
+                None => HttpResponse::NotFound().body(""),
+            });
+        }
+    }
     let Some(cache) = state.images.as_ref() else {
         return Ok(HttpResponse::NotFound().body(""));
     };
