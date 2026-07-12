@@ -1417,9 +1417,16 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = false;
             }
-            if state.group_paused_due_to_buffering && !state.members.values().any(|m| m.buffering) {
-                state.group_paused_due_to_buffering = false;
-                // No automatic resume — leader decides when to continue.
+            // B27 — same auto-resume as the HTTP path's MemberReady: the
+            // buffering-caused freeze lifts the moment the last buffering
+            // member recovers (Jellyfin parity; ws-native clients report
+            // BufferingEnd instead of Ready).
+            if state.group_paused_due_to_buffering
+                && !state.members.values().any(|m| m.buffering)
+                && state.waiting.is_none()
+            {
+                let position_ms = state.current_position_ms();
+                state.start_playing(position_ms, "Ready");
             }
         }
         GroupMsg::Unpause { sender: _ } => {
@@ -1495,10 +1502,27 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // so a Ready implies the member no longer wants ignoring.
                 rec.ignore_wait = false;
             }
-            let resolved = if let Some(w) = state.waiting.as_mut() {
-                w.pending.remove(&member_id);
-                w.pending.is_empty()
-            } else {
+            if state.waiting.is_some() {
+                let resolved = state.waiting.as_mut().is_some_and(|w| {
+                    w.pending.remove(&member_id);
+                    w.pending.is_empty()
+                });
+                if resolved {
+                    state.resolve_waiting();
+                }
+            } else if state.group_paused_due_to_buffering
+                && !state.members.values().any(|m| m.buffering)
+            {
+                // B27 — the freeze was INVOLUNTARY (a member's mid-play
+                // buffering paused the group, V19 buffer isolation); the last
+                // recovering member's Ready must resume the party
+                // automatically. Real Jellyfin does exactly this
+                // (WaitingGroupState issues an internal Unpause once
+                // IsBuffering() clears); without it every network hiccup
+                // paused the group until a human pressed play.
+                let position_ms = state.current_position_ms();
+                state.start_playing(position_ms, "Ready");
+            } else if matches!(state.playback, PlaybackState::Playing { .. }) {
                 // No waiting gate: the group already resolved (often because
                 // the ready-timeout fired before THIS member's player finished
                 // loading, so it dropped the broadcast Unpause — "no active
@@ -2283,6 +2307,111 @@ mod tests {
             saw_queue,
             "reconnect catch-up must still resend the PlayQueue"
         );
+    }
+
+    /// B27 — a mid-play buffering freeze is INVOLUNTARY: when the last
+    /// buffering member reports Ready, the group must resume by itself
+    /// (Jellyfin parity — WaitingGroupState issues an internal Unpause).
+    /// Previously it stayed paused until a human pressed play.
+    #[tokio::test]
+    async fn buffering_freeze_auto_resumes_on_last_ready() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        // Start playing (leader = lowest id; use whoever is leader).
+        let leader = if m1 < m2 { m1 } else { m2 };
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // m2 stalls: group freezes with ONE corrective Pause (V19).
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut saw_pause = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Pause { .. }) {
+                saw_pause = true;
+            }
+        }
+        assert!(saw_pause, "buffering must freeze the group with a Pause");
+
+        // m2 recovers → Ready (the HTTP wire pairing) → the group must
+        // RESUME on its own: both members receive a scheduled Play.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 1_500,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut m1_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m1_play = true;
+            }
+        }
+        let mut m2_play = false;
+        while let Ok(msg) = rx2.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m2_play = true;
+            }
+        }
+        assert!(
+            m1_play && m2_play,
+            "last buffering member's Ready must auto-resume the whole group"
+        );
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.play_state, GroupPlayState::Playing);
+    }
+
+    /// B27 guard-rail: a VOLUNTARY pause (someone pressed pause) must NOT be
+    /// overridden by a stray Ready — auto-resume applies only to the
+    /// buffering-caused freeze.
+    #[tokio::test]
+    async fn voluntary_pause_is_not_auto_resumed_by_ready() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        let leader = if m1 < m2 { m1 } else { m2 };
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        // Someone pauses on purpose.
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // A late Ready trickles in (e.g. a slow player finishing its load).
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while let Ok(msg) = rx1.try_recv() {
+            assert!(
+                !matches!(msg, ServerMsg::Play { .. }),
+                "a voluntary pause must stay paused"
+            );
+        }
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.play_state, GroupPlayState::Paused);
     }
 
     /// Receive until `f` matches or `budget` elapses. Returns the match.
