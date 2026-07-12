@@ -124,6 +124,16 @@ async fn playing_started(
     body: web::Json<PlayingBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
+    // Bump the item being played to the front of the trickplay/subtitle
+    // pre-generator. PlaybackInfo already nudges, but not every client calls
+    // it (and a pod restarted mid-episode would otherwise never re-learn what's
+    // playing) — the playback-report path is the ground truth for "watched
+    // RIGHT NOW". Best-effort; duplicates are deduped by the worker.
+    if let Some(tx) = &state.trickplay_priority {
+        if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(&body.item_id) {
+            let _ = tx.send(id);
+        }
+    }
     let session_id = body
         .play_session_id
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
@@ -189,6 +199,13 @@ async fn playing_progress(
     // plain decimal parse silently failed here, so resume positions
     // stopped persisting for hex-era clients.
     if let Some(item_id) = pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
+        // Keep nudging the pre-generator from progress too: covers a server
+        // restart mid-episode (session started before this process) and
+        // clients that skip /Sessions/Playing. Deduped by the worker, so the
+        // every-~10s cadence costs one HashSet probe.
+        if let Some(tx) = &state.trickplay_priority {
+            let _ = tx.send(item_id);
+        }
         if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
             data.last_played_position_ticks = position_ticks;
             data.last_played_at = now_unix();

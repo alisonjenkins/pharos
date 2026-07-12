@@ -161,6 +161,7 @@ T78|.|music art polish: audio items without any art (no embedded attached-pic, n
 T79|.|cast/person tiles on detail pages: BaseItemPerson.PrimaryImageTag hardcoded None so jellyfin-web never even requests people photos there (favorites tab requests regardless, now served by T77). Emit a tag when people.thumb_url exists so cast lists show photos.|I.jellyfin-api,V1
 T81|.|real person images: this library's people.thumb_url values are all legacy Jellyfin metadata disk paths (unreachable from pharos), so T77's redirect has nothing to serve. Fetch person photos properly — TMDB via people.provider_ids at scan time (store under the cache PVC and serve directly), or import the legacy metadata dir.|I.jellyfin-api
 T80|.|postgres test harness: run the store trait suite against real Postgres in CI (planned Phase A.4, never landed). Until it exists, pg-only type/SQL divergences ship silently (B19 season_number INT4). THE class guard for B19.|V11,V12
+T82|x|trickplay priority worker: dedicated task (split from general sweep) so playing item's previews generate mid-session — nudged by PlaybackInfo + /Sessions/Playing[/Progress] (covers pod restart mid-episode), seed bypasses bg_io gate + skips cooldown, series siblings pre-warm in watch order (next episodes first), fresh nudge preempts previous seed's tail. Guards: trickplay_backfill unit tests + playback_reports_nudge_trickplay_priority.|I.jellyfin-api,V1
 
 ## §B bugs
 

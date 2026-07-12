@@ -325,3 +325,67 @@ async fn seek_command_carries_position_ticks_in_arg() {
         panic!("expected SessionCommand");
     }
 }
+
+/// Playback reports must nudge the trickplay priority channel with the parsed
+/// item id — for BOTH the start and progress paths, and for BOTH wire id
+/// forms (canonical 32-hex + legacy decimal). This is what lets the
+/// pre-generator build the currently-watched episode's scrub previews
+/// mid-session (and re-learn what's playing after a pod restart, when
+/// PlaybackInfo was served by a previous process).
+#[actix_web::test]
+async fn playback_reports_nudge_trickplay_priority() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    let token = token.0.expose().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = web::Data::new(AppState::new(stores, "t".into()).with_trickplay_priority(tx));
+    let app = test::init_service(build_app(state)).await;
+
+    // Start: canonical hex id.
+    let hex = format!("{:032x}", 77u64);
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/Sessions/Playing")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(serde_json::json!({
+                "ItemId": hex, "PlaySessionId": "s1", "PositionTicks": 0u64
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(rx.try_recv().ok(), Some(77), "start must nudge with hex id");
+
+    // Progress: legacy decimal id.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/Sessions/Playing/Progress")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(serde_json::json!({
+                "ItemId": "78", "PlaySessionId": "s1",
+                "PositionTicks": 10_000_000u64, "IsPaused": false
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(78),
+        "progress must nudge with decimal id"
+    );
+}
