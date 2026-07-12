@@ -1768,10 +1768,15 @@ async fn playback_info(
     // guard remains defensive: a progressive `<video src>` `.webm` transcode
     // must be "http" (feeding its bytes to hls.js yields manifestParsingError),
     // in case any path is re-pointed at the legacy progressive handler.
+    // NEVER null: jellyfin-sdk-kotlin's MediaSourceInfo marks
+    // TranscodingSubProtocol as a REQUIRED (non-nullable) MediaStreamProtocol
+    // enum — a null (or absent) value fails the whole PlaybackInfo
+    // deserialization in the native Android/TV apps. Real Jellyfin emits
+    // "http" when not transcoding.
     let transcoding_sub_protocol = match transcoding_url.as_deref() {
-        Some(u) if u.contains(".webm") => Some("http"),
-        Some(_) => Some("hls"),
-        None => None,
+        Some(u) if u.contains(".webm") => "http",
+        Some(_) => "hls",
+        None => "http",
     };
 
     let primary_source = serde_json::json!({
@@ -1797,6 +1802,16 @@ async fn playback_info(
         "RequiresClosing": false,
         "RequiresLooping": false,
         "SupportsProbing": true,
+        // Required (non-nullable) fields in jellyfin-sdk-kotlin's
+        // MediaSourceInfo — the native Android/TV apps fail the WHOLE
+        // response if any is absent ("Unable to resolve playback info").
+        // Values match what real Jellyfin emits for a plain library file.
+        "ReadAtNativeFramerate": false,
+        "IgnoreDts": false,
+        "IgnoreIndex": false,
+        "GenPtsInput": false,
+        "IsInfiniteStream": false,
+        "HasSegments": false,
         "MediaStreams": streams,
         "MediaAttachments": media_attachments.clone(),
         "Bitrate": probe.bitrate_bps,
@@ -1849,11 +1864,18 @@ async fn playback_info(
             "SupportsDirectStream": false,
             "SupportsTranscoding": true,
             "TranscodingUrl": Option::<String>::None,
-            "TranscodingSubProtocol": Option::<&str>::None,
+            // Non-nullable enum in the kotlin SDK — see primary source.
+            "TranscodingSubProtocol": "http",
             "RequiresOpening": false,
             "RequiresClosing": false,
             "RequiresLooping": false,
             "SupportsProbing": true,
+            "ReadAtNativeFramerate": false,
+            "IgnoreDts": false,
+            "IgnoreIndex": false,
+            "GenPtsInput": false,
+            "IsInfiniteStream": false,
+            "HasSegments": false,
             // Reuse the primary's stream list — alternates today
             // don't carry independent stream enrichment. Future
             // scanner work fills this per-source.
