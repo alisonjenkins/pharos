@@ -471,13 +471,20 @@ impl crate::ServerConfigStore for PostgresStore {
 
     /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys.
     async fn distinct_season_keys(&self) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
-        let rows = sqlx::query_as::<_, (Option<String>, String, i64)>(
+        // season_number is INTEGER (INT4) in the postgres schema — decoding
+        // it as i64 aborts the whole query ("mismatched types … INT4"),
+        // which 500'd every /Items?ParentId=<season> (B19). Decode i32,
+        // widen after.
+        let rows = sqlx::query_as::<_, (Option<String>, String, i32)>(
             "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
              WHERE series_name IS NOT NULL AND season_number IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(|(f, n, sn)| (f, n, i64::from(sn)))
+            .collect())
     }
 
     /// LIB-B2 — distinct non-empty artist + album_artist names.
