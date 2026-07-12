@@ -39,7 +39,11 @@ async fn system_info_returns_pascalcase_shape() {
             .configure(jellyfin::configure),
     )
     .await;
-    let req = test::TestRequest::get().uri("/System/Info").to_request();
+    // The anonymous variant — full /System/Info now requires auth (matches
+    // real Jellyfin); the public subset carries the same PascalCase core.
+    let req = test::TestRequest::get()
+        .uri("/System/Info/Public")
+        .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let txt = std::str::from_utf8(&body).unwrap();
     assert!(txt.contains("\"ServerName\":\"pharos-test\""), "{txt}");
@@ -173,7 +177,7 @@ async fn router_mounts_jellyfin_scope_alongside_metrics_and_health() {
             .configure(router::configure),
     )
     .await;
-    for path in ["/", "/metrics", "/healthz", "/info", "/System/Info"] {
+    for path in ["/", "/metrics", "/healthz", "/info", "/System/Info/Public"] {
         let req = test::TestRequest::get().uri(path).to_request();
         let resp = test::call_service(&app, req).await;
         assert!(

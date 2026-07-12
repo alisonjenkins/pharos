@@ -43,7 +43,12 @@
           "Container": "mp3",
           "DefaultAudioStreamIndex": 0,
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "30",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -61,10 +66,16 @@
           ],
           "Name": "Echo Track",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 2000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -86,6 +97,7 @@
       "Type": "Audio",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "30",
         "Key": "30",
         "LastPlayedDate": null,
         "Likes": null,
@@ -139,7 +151,12 @@
           "Container": "mp3",
           "DefaultAudioStreamIndex": 0,
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "31",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -157,10 +174,16 @@
           ],
           "Name": "Foxtrot Track",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 3000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -182,6 +205,7 @@
       "Type": "Audio",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "31",
         "Key": "31",
         "LastPlayedDate": null,
         "Likes": null,

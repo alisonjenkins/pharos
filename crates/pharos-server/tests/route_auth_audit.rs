@@ -40,7 +40,9 @@ use Expect::*;
 fn audit_rows() -> Vec<(Method, &'static str, Expect)> {
     vec![
         // ---- public by design ----
-        (Method::GET, "/System/Info", Public),
+        // Full /System/Info requires auth (matches real Jellyfin); only the
+        // 7-field /System/Info/Public subset is anonymous.
+        (Method::GET, "/System/Info", Auth),
         (Method::GET, "/System/Info/Public", Public),
         (Method::GET, "/System/Configuration", Public),
         (Method::GET, "/System/Endpoint", Public),

@@ -11,7 +11,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase-only routes; `LowercasePath` middleware folds the
     // PascalCase requests jellyfin-web sends onto these.
     cfg.route("/system/info", web::get().to(system_info))
-        .route("/system/info/public", web::get().to(system_info))
+        .route("/system/info/public", web::get().to(system_info_public))
         // Dashboard landing page's storage panel. pharos doesn't track disk
         // usage; an empty `Folders` list renders the panel cleanly (a 404 left
         // it blank + logged an error).
@@ -313,7 +313,36 @@ async fn user_configuration_update(
 /// the real one. Bump this when targeting a newer jellyfin-web build.
 const ADVERTISED_JELLYFIN_VERSION: &str = "10.11.0";
 
-async fn system_info(state: web::Data<AppState>, req: actix_web::HttpRequest) -> impl Responder {
+/// `/System/Info/Public` — UNAUTHENTICATED. Serve only Jellyfin's
+/// `PublicSystemInfo` subset, exactly like the real server. This previously
+/// aliased the full (authenticated) `/System/Info` handler, exposing the
+/// whole SystemInfo shape — the path values were hardcoded placeholders, not
+/// real paths, but an anonymous caller has no business seeing server
+/// internals at all (V9 hygiene).
+async fn system_info_public(
+    state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
+) -> impl Responder {
+    let branding = state.effective_branding().await;
+    let server_name = branding
+        .server_name
+        .unwrap_or_else(|| state.server_name.clone());
+    HttpResponse::Ok().json(serde_json::json!({
+        "Id": state.server_id,
+        "ServerName": server_name,
+        "Version": ADVERTISED_JELLYFIN_VERSION,
+        "ProductName": "Jellyfin Server",
+        "OperatingSystem": std::env::consts::OS,
+        "LocalAddress": derive_local_address(&req),
+        "StartupWizardCompleted": true,
+    }))
+}
+
+async fn system_info(
+    state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
+    _user: crate::api::jellyfin::auth_extractor::AuthUser,
+) -> impl Responder {
     let _ = state.version;
     let branding = state.effective_branding().await;
     let server_name = branding

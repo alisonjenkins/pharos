@@ -37,6 +37,11 @@ pub struct PendingRequest {
     pub secret: String,
     pub device_id: String,
     pub created_at: Instant,
+    /// Wall-clock creation time (unix seconds) — the wire `DateAdded`.
+    /// Jellyfin's C# QuickConnectResult marks DateAdded as a non-nullable
+    /// DateTime, so BOTH Initiate and the Connect poll must carry it (the
+    /// kotlin SDK rejects the poll response without it).
+    pub created_unix_secs: i64,
     /// Set once an authorized user vouches for the code.
     pub authorized_by: Option<UserId>,
 }
@@ -142,6 +147,10 @@ impl QuickConnectRegistry {
 
 fn mint_pending(device_id: String, by_code: &HashMap<String, String>) -> PendingRequest {
     let now = Instant::now();
+    let created_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     // V8/security: codes must be unique among *live* requests. Blindly
     // overwriting an existing code let an attacker spam Initiate to
     // collide a victim's code and bind the victim's later Authorize to
@@ -153,6 +162,7 @@ fn mint_pending(device_id: String, by_code: &HashMap<String, String>) -> Pending
         secret,
         device_id,
         created_at: now,
+        created_unix_secs,
         authorized_by: None,
     }
 }
@@ -395,6 +405,7 @@ mod tests {
             secret: "x".into(),
             device_id: "d".into(),
             created_at: Instant::now() - Duration::from_secs(400),
+            created_unix_secs: 0,
             authorized_by: None,
         };
         assert!(entry.expired(Instant::now()));

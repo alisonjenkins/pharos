@@ -77,6 +77,9 @@ pub struct UserDto {
     pub id: String,
     pub has_password: bool,
     pub has_configured_password: bool,
+    /// Legacy, but a non-nullable bool in Jellyfin's C# UserDto — real
+    /// Jellyfin always serializes it, so strict SDK clients require it.
+    pub has_configured_easy_password: bool,
     pub policy: UserPolicyDto,
     pub configuration: UserConfigurationDto,
     pub primary_image_aspect_ratio: f32,
@@ -134,6 +137,7 @@ impl UserDto {
             id: user.id.0.simple().to_string(),
             has_password: user.has_password,
             has_configured_password: user.has_password,
+            has_configured_easy_password: false,
             policy: UserPolicyDto::from_domain(&user.policy),
             configuration: UserConfigurationDto::default(),
             primary_image_aspect_ratio: 1.0,
@@ -160,6 +164,22 @@ pub struct UserPolicyDto {
     pub enable_all_channels: bool,
     pub enable_all_folders: bool,
     pub enable_public_sharing: bool,
+    // The remaining non-nullable value-type fields of Jellyfin's C# UserPolicy.
+    // Real Jellyfin always serializes every one (ignore-null only skips
+    // nullables), so strict SDK clients (kotlin) require them all.
+    pub enable_collection_management: bool,
+    pub enable_subtitle_management: bool,
+    pub enable_lyric_management: bool,
+    pub enable_user_preference_access: bool,
+    pub enable_remote_control_of_other_users: bool,
+    pub enable_shared_device_control: bool,
+    pub enable_live_tv_management: bool,
+    pub enable_live_tv_access: bool,
+    pub force_remote_source_transcoding: bool,
+    pub invalid_login_attempt_count: i32,
+    pub login_attempts_before_lockout: i32,
+    pub max_active_sessions: i32,
+    pub remote_client_bitrate_limit: i32,
     /// Jellyfin `SyncPlayUserAccessType` — `CreateAndJoinGroups` | `JoinGroups`
     /// | `None`. jellyfin-web hides the group-watch (SyncPlay) UI unless this
     /// grants access, so an absent/None value makes "create a group" a no-op.
@@ -186,6 +206,21 @@ impl UserPolicyDto {
             enable_all_channels: true,
             enable_all_folders: true,
             enable_public_sharing: false,
+            enable_collection_management: p.admin,
+            enable_subtitle_management: p.admin,
+            enable_lyric_management: p.admin,
+            enable_user_preference_access: true,
+            enable_remote_control_of_other_users: p.admin,
+            enable_shared_device_control: true,
+            enable_live_tv_management: p.admin,
+            enable_live_tv_access: true,
+            force_remote_source_transcoding: false,
+            invalid_login_attempt_count: 0,
+            // Jellyfin's defaults: -1 = unlimited attempts, 0 = unlimited
+            // sessions / no bitrate cap.
+            login_attempts_before_lockout: -1,
+            max_active_sessions: 0,
+            remote_client_bitrate_limit: 0,
             // Everyone may create + join watch-together groups (personal server).
             sync_play_access: "CreateAndJoinGroups".to_string(),
         }
@@ -321,6 +356,22 @@ pub struct MediaSourceLiteDto {
     pub supports_direct_play: bool,
     pub supports_direct_stream: bool,
     pub supports_transcoding: bool,
+    // Remaining non-nullable value-type fields of the C# MediaSourceInfo —
+    // real Jellyfin always serializes them; strict SDK clients require them
+    // on the item-embedded MediaSources too, not just PlaybackInfo (B13).
+    pub read_at_native_framerate: bool,
+    pub ignore_dts: bool,
+    pub ignore_index: bool,
+    pub gen_pts_input: bool,
+    pub is_infinite_stream: bool,
+    pub has_segments: bool,
+    pub requires_opening: bool,
+    pub requires_closing: bool,
+    pub requires_looping: bool,
+    pub supports_probing: bool,
+    /// Non-nullable MediaStreamProtocol enum in the SDKs — "http" when not
+    /// transcoding (matches real Jellyfin).
+    pub transcoding_sub_protocol: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_time_ticks: Option<u64>,
     pub protocol: &'static str,
@@ -558,6 +609,10 @@ pub struct ReplayGainDto {
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItemDataDto {
+    /// Non-nullable Guid in the C# DTO — always on the wire from real
+    /// Jellyfin; strict SDK clients require it. Same id string the item DTOs
+    /// use.
+    pub item_id: String,
     pub played: bool,
     pub play_count: u32,
     /// Resume position in Jellyfin's 100ns ticks.
@@ -576,6 +631,7 @@ pub struct UserItemDataDto {
 impl UserItemDataDto {
     pub fn from_domain(item_id: pharos_core::MediaId, data: pharos_core::UserItemData) -> Self {
         Self {
+            item_id: item_id.to_string(),
             played: data.played,
             play_count: data.play_count,
             playback_position_ticks: data.last_played_position_ticks,
@@ -876,7 +932,10 @@ impl BaseItemDto {
             kind,
             media_type,
             is_folder: false,
-            user_data: UserItemDataDto::default(),
+            user_data: UserItemDataDto {
+                item_id: item.id.to_string(),
+                ..Default::default()
+            },
             run_time_ticks,
             location_type: "FileSystem",
             can_play: true,
@@ -889,6 +948,17 @@ impl BaseItemDto {
                 supports_direct_play: true,
                 supports_direct_stream: true,
                 supports_transcoding: true,
+                read_at_native_framerate: false,
+                ignore_dts: false,
+                ignore_index: false,
+                gen_pts_input: false,
+                is_infinite_stream: false,
+                has_segments: false,
+                requires_opening: false,
+                requires_closing: false,
+                requires_looping: false,
+                supports_probing: true,
+                transcoding_sub_protocol: "http",
                 run_time_ticks: probe.run_time_ticks(),
                 protocol: "File",
                 media_streams,
@@ -951,6 +1021,10 @@ impl BaseItemDto {
                     serde_json::json!({
                         "Name": c.title,
                         "StartPositionTicks": ticks,
+                        // Non-nullable DateTime in C# ChapterInfo; real
+                        // Jellyfin emits DateTime.MinValue when the chapter
+                        // has no extracted image. Strict SDKs require it.
+                        "ImageDateModified": "0001-01-01T00:00:00.0000000Z",
                     })
                 })
                 .collect(),
@@ -1248,6 +1322,14 @@ pub struct SessionInfoDto {
     pub client: String,
     pub application_version: String,
     pub server_id: String,
+    // Non-nullable value-type fields of Jellyfin's C# SessionInfoDto — always
+    // on the wire from real Jellyfin, required by strict SDK clients.
+    pub last_activity_date: String,
+    pub last_playback_check_in: String,
+    pub is_active: bool,
+    pub supports_media_control: bool,
+    pub supports_remote_control: bool,
+    pub has_custom_device_name: bool,
 }
 
 /// Pick a container string for the wire response. ffprobe reports

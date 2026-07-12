@@ -134,15 +134,19 @@ pub struct PlayQueueUpdate {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CommandData {
+    /// Non-nullable Guid in the C# SendCommand — always on the wire from
+    /// real Jellyfin; strict SDK clients (kotlin native apps) require it.
+    pub group_id: String,
     pub command: &'static str,
+    /// Nullable in C# — the only optional SendCommand field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_ticks: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub when: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emitted_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub playlist_item_id: Option<String>,
+    // When / EmittedAt / PlaylistItemId are non-nullable in C# (DateTime /
+    // DateTime / Guid) — always serialized, never skipped: the kotlin SDK
+    // fails the whole command otherwise (jellyfin-web tolerates absence).
+    pub when: String,
+    pub emitted_at: String,
+    pub playlist_item_id: String,
 }
 
 #[cfg(test)]
@@ -179,14 +183,17 @@ mod tests {
         // The client drops a command whose When/EmittedAt/PlaylistItemId are
         // missing or mismatched — assert all three ride the wire in PascalCase.
         let c = CommandData {
+            group_id: "g-1".into(),
             command: "Unpause",
             position_ticks: Some(50_000),
-            when: Some("2026-07-10T12:00:00.123Z".into()),
-            emitted_at: Some("2026-07-10T11:59:59.900Z".into()),
-            playlist_item_id: Some("pli-1".into()),
+            when: "2026-07-10T12:00:00.123Z".into(),
+            emitted_at: "2026-07-10T11:59:59.900Z".into(),
+            playlist_item_id: "pli-1".into(),
         };
         let s = serde_json::to_string(&c).unwrap();
         assert!(s.contains("\"Command\":\"Unpause\""), "{s}");
+        // Non-nullable Guid in the C# SendCommand — must always ride along.
+        assert!(s.contains("\"GroupId\":\"g-1\""), "{s}");
         assert!(s.contains("\"When\":\"2026-07-10T12:00:00.123Z\""), "{s}");
         assert!(
             s.contains("\"EmittedAt\":\"2026-07-10T11:59:59.900Z\""),

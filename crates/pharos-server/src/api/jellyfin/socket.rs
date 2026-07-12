@@ -482,6 +482,11 @@ fn play_queue_reason(r: &str) -> String {
 
 /// A `SyncPlayCommand` (`SendCommand`) with the absolute-time + queue fields the
 /// Jellyfin client requires.
+/// `Guid.Empty` in Jellyfin's simple (dashless) form — the value real
+/// Jellyfin sends for "no playlist item" and what we fall back to for a
+/// group id before the join settles. Strict SDK clients parse it fine.
+const EMPTY_GUID: &str = "00000000000000000000000000000000";
+
 fn command(
     ctx: &TranslateCtx,
     kind: &'static str,
@@ -492,11 +497,20 @@ fn command(
     Some(Outbound::new(
         "SyncPlayCommand",
         serde_json::to_value(CommandData {
+            // GroupId/When/EmittedAt/PlaylistItemId are non-nullable in the
+            // C# SendCommand — always emitted (kotlin apps fail otherwise).
+            group_id: ctx
+                .group_id
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| EMPTY_GUID.to_string()),
             command: kind,
             position_ticks: position_ms.map(|p| p * POSITION_TICKS_PER_MS),
-            when: Some(when),
-            emitted_at: Some(format_iso8601_ms(unix_now_ms())),
-            playlist_item_id: ctx.current_pli.map(str::to_string),
+            when,
+            emitted_at: format_iso8601_ms(unix_now_ms()),
+            playlist_item_id: ctx
+                .current_pli
+                .map(str::to_string)
+                .unwrap_or_else(|| EMPTY_GUID.to_string()),
         })
         .ok()?,
     ))

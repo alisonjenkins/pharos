@@ -32,7 +32,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "10",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -53,10 +58,16 @@
           ],
           "Name": "Alpha",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 72000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -78,6 +89,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": true,
+        "ItemId": "10",
         "Key": "10",
         "LastPlayedDate": null,
         "Likes": null,
@@ -120,7 +132,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "12",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -141,10 +158,16 @@
           ],
           "Name": "Charlie",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 60000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -166,6 +189,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "12",
         "Key": "12",
         "LastPlayedDate": null,
         "Likes": null,

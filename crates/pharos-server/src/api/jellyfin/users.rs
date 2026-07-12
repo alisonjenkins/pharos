@@ -96,10 +96,6 @@ async fn quick_connect_initiate(
     // (jellyfin-sdk-kotlin) deserializes it as a DateTime, and an empty string
     // fails to parse — which makes the app treat Quick Connect as unavailable
     // and grey out the button. An empty/omitted value silently breaks it.
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "Code": entry.code,
         "Secret": entry.secret,
@@ -112,7 +108,7 @@ async fn quick_connect_initiate(
         "AppName": auth.client.clone().unwrap_or_default(),
         "AppVersion": auth.version.clone().unwrap_or_default(),
         "Authenticated": false,
-        "DateAdded": pharos_jellyfin_api::dto::format_iso8601(now_secs),
+        "DateAdded": pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
     })))
 }
 
@@ -208,6 +204,9 @@ async fn quick_connect_connect(
         "Secret": entry.secret,
         "DeviceId": entry.device_id,
         "Authenticated": entry.authorized_by.is_some(),
+        // Non-nullable DateTime in the C# QuickConnectResult — the kotlin
+        // SDK (Android TV) rejects the poll response without it.
+        "DateAdded": pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
     })))
 }
 
@@ -225,6 +224,15 @@ async fn branding_css(state: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/css")
         .body(cfg.custom_css.unwrap_or_default())
+}
+
+/// Current wall-clock time as the ISO8601 string the session DTO carries.
+fn now_iso() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    pharos_jellyfin_api::dto::format_iso8601_ms(ms)
 }
 
 async fn authenticate_by_name(
@@ -274,6 +282,13 @@ async fn authenticate_by_name(
             client: auth.client_label(),
             application_version: auth.version_label(),
             server_id: state.server_id.clone(),
+            // Always-on-wire session flags (non-nullable in the C# DTO).
+            last_activity_date: now_iso(),
+            last_playback_check_in: now_iso(),
+            is_active: true,
+            supports_media_control: false,
+            supports_remote_control: false,
+            has_custom_device_name: false,
         },
         user: UserDto::from_domain(&user, &state.server_id),
         access_token: token.0.expose().to_string(),
@@ -361,6 +376,13 @@ async fn authenticate_with_quick_connect(
             client: auth.client_label(),
             application_version: auth.version_label(),
             server_id: state.server_id.clone(),
+            // Always-on-wire session flags (non-nullable in the C# DTO).
+            last_activity_date: now_iso(),
+            last_playback_check_in: now_iso(),
+            is_active: true,
+            supports_media_control: false,
+            supports_remote_control: false,
+            has_custom_device_name: false,
         },
         user: UserDto::from_domain(&user, &state.server_id),
         access_token: token.0.expose().to_string(),

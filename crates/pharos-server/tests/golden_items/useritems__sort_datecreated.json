@@ -43,7 +43,12 @@
           "Container": "mp3",
           "DefaultAudioStreamIndex": 0,
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "31",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -61,10 +66,16 @@
           ],
           "Name": "Foxtrot Track",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 3000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -86,6 +97,7 @@
       "Type": "Audio",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "31",
         "Key": "31",
         "LastPlayedDate": null,
         "Likes": null,
@@ -139,7 +151,12 @@
           "Container": "mp3",
           "DefaultAudioStreamIndex": 0,
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "30",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -157,10 +174,16 @@
           ],
           "Name": "Echo Track",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 2000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -182,6 +205,7 @@
       "Type": "Audio",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "30",
         "Key": "30",
         "LastPlayedDate": null,
         "Likes": null,
@@ -225,7 +249,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "22",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -246,10 +275,16 @@
           ],
           "Name": "Delta S2E1",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 15000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -277,6 +312,7 @@
       "Type": "Episode",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "22",
         "Key": "22",
         "LastPlayedDate": null,
         "Likes": null,
@@ -320,7 +356,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "21",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -341,10 +382,16 @@
           ],
           "Name": "Delta E2",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 15000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -372,6 +419,7 @@
       "Type": "Episode",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "21",
         "Key": "21",
         "LastPlayedDate": null,
         "Likes": null,
@@ -415,7 +463,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "20",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -436,10 +489,16 @@
           ],
           "Name": "Delta E1",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 15000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -467,6 +526,7 @@
       "Type": "Episode",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "20",
         "Key": "20",
         "LastPlayedDate": null,
         "Likes": null,
@@ -509,7 +569,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "11",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -530,10 +595,16 @@
           ],
           "Name": "Bravo",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 54000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -555,6 +626,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "11",
         "Key": "11",
         "LastPlayedDate": null,
         "Likes": null,
@@ -597,7 +669,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "12",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -618,10 +695,16 @@
           ],
           "Name": "Charlie",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 60000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -643,6 +726,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": false,
+        "ItemId": "12",
         "Key": "12",
         "LastPlayedDate": null,
         "Likes": null,
@@ -685,7 +769,12 @@
         {
           "Container": "mp4",
           "ETag": "0",
+          "GenPtsInput": false,
+          "HasSegments": false,
           "Id": "10",
+          "IgnoreDts": false,
+          "IgnoreIndex": false,
+          "IsInfiniteStream": false,
           "IsRemote": false,
           "MediaStreams": [
             {
@@ -706,10 +795,16 @@
           ],
           "Name": "Alpha",
           "Protocol": "File",
+          "ReadAtNativeFramerate": false,
+          "RequiresClosing": false,
+          "RequiresLooping": false,
+          "RequiresOpening": false,
           "RunTimeTicks": 72000000000,
           "SupportsDirectPlay": true,
           "SupportsDirectStream": true,
+          "SupportsProbing": true,
           "SupportsTranscoding": true,
+          "TranscodingSubProtocol": "http",
           "Type": "Default",
           "VideoType": "VideoFile"
         }
@@ -731,6 +826,7 @@
       "Type": "Movie",
       "UserData": {
         "IsFavorite": true,
+        "ItemId": "10",
         "Key": "10",
         "LastPlayedDate": null,
         "Likes": null,

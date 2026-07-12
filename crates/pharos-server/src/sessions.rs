@@ -44,6 +44,11 @@ pub struct SessionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_streaming_bitrate: Option<u64>,
     pub supports_media_control: bool,
+    // Remaining non-nullable value-type fields of the C# SessionInfoDto —
+    // always on the wire from real Jellyfin; strict SDK clients require them.
+    pub is_active: bool,
+    pub supports_remote_control: bool,
+    pub has_custom_device_name: bool,
     /// ISO8601 UTC, stamped on every event. Never empty — see [`iso_now`].
     pub last_activity_date: String,
     pub last_playback_check_in: String,
@@ -158,6 +163,9 @@ impl SessionRegistry {
                                     .as_ref()
                                     .map(|c| c.3)
                                     .unwrap_or(false),
+                                is_active: true,
+                                supports_remote_control: true,
+                                has_custom_device_name: false,
                                 last_activity_date: iso_now(),
                                 last_playback_check_in: iso_now(),
                             },
@@ -208,6 +216,9 @@ impl SessionRegistry {
                                     supported_commands: Vec::new(),
                                     max_streaming_bitrate: None,
                                     supports_media_control: false,
+                                    is_active: true,
+                                    supports_remote_control: true,
+                                    has_custom_device_name: false,
                                     last_activity_date: iso_now(),
                                     last_playback_check_in: iso_now(),
                                 });
