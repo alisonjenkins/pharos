@@ -22,6 +22,20 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Fixed UUIDv5 namespace for deriving a device's [`MemberId`] from its
+/// `deviceId`. DETERMINISTIC on purpose (B24): the persisted group snapshot
+/// stores members by `MemberId`, so a member id that survives a process
+/// restart is what lets a reconnecting device be recognised as an existing
+/// member of a persisted group and re-attached — a random per-process id
+/// orphaned every membership on deploy.
+const MEMBER_ID_NS: uuid::Uuid = uuid::Uuid::from_u128(0x9e1b_52fa_7c44_4bd0_a3ce_8d6f_1b2a_4c33);
+
+/// The stable member id for a device: same device (`deviceId`) → same id,
+/// across reconnects AND process restarts.
+pub fn member_id_for_device(device_id: &str) -> MemberId {
+    MemberId(uuid::Uuid::new_v5(&MEMBER_ID_NS, device_id.as_bytes()))
+}
+
 struct SessionEntry {
     /// Stable per-device member id — kept ACROSS socket reconnects so a
     /// reconnecting client stays the same group member (the engine keys members
@@ -74,8 +88,9 @@ impl SessionHub {
         Self::default()
     }
 
-    /// Register a `/socket` connection. On a device's FIRST connect this mints a
-    /// stable member id and an empty group slot. On a RECONNECT (same
+    /// Register a `/socket` connection. On a device's FIRST connect this derives
+    /// its stable member id (deterministic from the `deviceId` — see
+    /// [`member_id_for_device`]) and an empty group slot. On a RECONNECT (same
     /// `device_id`) it keeps the member id + group and just refreshes the sink,
     /// returning the existing group so the socket can re-point it at itself —
     /// membership survives socket churn. Always bumps the connection generation.
@@ -85,8 +100,9 @@ impl SessionHub {
         name: String,
         sink: mpsc::Sender<ServerMsg>,
     ) -> Registered {
+        let member_id = member_id_for_device(&device_id);
         let mut e = self.inner.entry(device_id).or_insert_with(|| SessionEntry {
-            member_id: MemberId::new(),
+            member_id,
             name: name.clone(),
             sink: sink.clone(),
             group: None,
@@ -233,5 +249,21 @@ mod tests {
         let left = hub.remove_if_current_gen("devB", again.gen).unwrap();
         assert_eq!(left.group_id, handle.group_id);
         assert!(hub.resolve("devB").is_none());
+    }
+
+    /// B24 — the member id must survive a PROCESS RESTART, not just a socket
+    /// reconnect: a fresh hub (new process after a deploy) must derive the
+    /// same member id for the same device, or the persisted group roster can
+    /// never recognise the returning member.
+    #[test]
+    fn member_id_is_stable_across_process_restarts() {
+        let hub_before = SessionHub::new();
+        let a = hub_before.register("devC".into(), "c".into(), sink());
+        let hub_after_restart = SessionHub::new();
+        let b = hub_after_restart.register("devC".into(), "c".into(), sink());
+        assert_eq!(a.member_id, b.member_id, "same device → same member id");
+        assert_eq!(a.member_id, member_id_for_device("devC"));
+        // Distinct devices still get distinct ids.
+        assert_ne!(member_id_for_device("devC"), member_id_for_device("devD"));
     }
 }

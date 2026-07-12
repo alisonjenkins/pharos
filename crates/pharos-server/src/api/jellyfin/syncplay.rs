@@ -76,11 +76,22 @@ async fn dispatch(
                  (client must open /socket before commanding)"
             ),
             Some(sess) => match sess.group {
-                None => tracing::warn!(
-                    command = label,
-                    device_id = %dev,
-                    "syncplay: session is in no group — command dropped"
-                ),
+                None => {
+                    tracing::warn!(
+                        command = label,
+                        device_id = %dev,
+                        "syncplay: session is in no group — telling client NotInGroup"
+                    );
+                    // B24 — never drop silently: the client that sent this
+                    // still believes it's grouped (its group died with a
+                    // restart and no snapshot recovered it, or it was pruned).
+                    // NotInGroup makes stock jellyfin-web disable SyncPlay
+                    // visibly instead of desyncing one-sidedly.
+                    let _ = sess
+                        .sink
+                        .send(pharos_sync::messages::ServerMsg::NotInGroup)
+                        .await;
+                }
                 Some(h) => {
                     tracing::info!(command = label, device_id = %dev, group = %h.group_id, "syncplay: command dispatched");
                     let _ = h.tx.send(make(sess.member_id)).await;

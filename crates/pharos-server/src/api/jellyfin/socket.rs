@@ -124,6 +124,7 @@ async fn ws_entry(
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
+        state.clone(),
         registry.get_ref().clone(),
         hub.get_ref().clone(),
         sinks.get_ref().clone(),
@@ -139,6 +140,7 @@ async fn ws_entry(
 async fn handle_connection<S>(
     mut session: Session,
     mut stream: S,
+    state: web::Data<AppState>,
     registry: GroupRegistry,
     hub: SessionHub,
     sinks: MemberSinks,
@@ -172,7 +174,29 @@ async fn handle_connection<S>(
     let mut current_pli: Option<String> = None;
     // Reconnect into an existing group: refresh the group's sink to THIS socket
     // and re-sync. Membership survived the disconnect, so no re-Join is needed.
-    if let Some(group) = reg.group {
+    //
+    // B24 — when the HUB has no group (this process restarted since the device
+    // last joined), fall back to the PERSISTED snapshots: member ids are
+    // deterministic per device, so a snapshot naming this member proves the
+    // membership. Re-attach + hydrate (get_or_create runs the takeover path)
+    // and resync — the watch party survives the deploy without the client
+    // even knowing.
+    let mut initial_group = reg.group;
+    if initial_group.is_none() {
+        if let Some(gid) =
+            crate::sync_recovery::find_persisted_group(&state.stores, member_id).await
+        {
+            if let Ok(h) = registry.get_or_create(gid).await {
+                hub.attach_group(&device_key, h.clone());
+                tracing::info!(
+                    device_id = %device_key, %member_id, group = %gid,
+                    "syncplay: recovered persisted membership after restart"
+                );
+                initial_group = Some(h);
+            }
+        }
+    }
+    if let Some(group) = initial_group {
         current_group_id = Some(group.group_id);
         // Sink already refreshed in MemberSinks above; ask the actor to re-send
         // the catch-up so the reconnected client re-syncs to current state.
@@ -630,6 +654,11 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         // side, so don't emit it: keep the election internal and the client
         // console clean.
         ServerMsg::LeaderChange { .. } => None,
+        // B24 — the session sent a group command but the server has no
+        // membership for it (unrecoverable: no persisted snapshot names it).
+        // jellyfin-web handles NotInGroup by disabling SyncPlay locally — a
+        // visible clean exit instead of a silent one-sided desync.
+        ServerMsg::NotInGroup => group_update(ctx, "NotInGroup", serde_json::Value::Null),
         ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => None,
     }
 }

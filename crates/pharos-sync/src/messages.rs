@@ -201,6 +201,13 @@ pub enum ServerMsg {
         code: ErrorCode,
         detail: String,
     },
+    /// The server does not consider this session a member of any group, yet
+    /// the client sent a group command (it still believes it's grouped — e.g.
+    /// its group was pruned while it was offline). Translated to Jellyfin's
+    /// `SyncPlayGroupUpdate`/`NotInGroup`, which stock jellyfin-web handles by
+    /// disabling SyncPlay locally — a VISIBLE exit instead of a silent desync
+    /// where the sender applies its command locally and nobody else does (B24).
+    NotInGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

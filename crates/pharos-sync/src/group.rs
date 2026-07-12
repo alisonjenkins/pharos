@@ -955,6 +955,17 @@ struct PersistState {
     group_name: String,
 }
 
+/// Whether a persisted group snapshot's roster contains `member_id` (B24 —
+/// membership recovery after a deploy). Member ids are DETERMINISTIC per
+/// device (`hub::member_id_for_device`), so a reconnecting device derives the
+/// same id the snapshot recorded and the server can re-attach it to its group
+/// without the client re-joining. Malformed / older JSON is simply `false`.
+pub fn snapshot_contains_member(state_json: &str, member_id: MemberId) -> bool {
+    serde_json::from_str::<PersistState>(state_json)
+        .map(|ps| ps.members.iter().any(|m| m.id == member_id))
+        .unwrap_or(false)
+}
+
 #[derive(Clone)]
 pub struct GroupHandle {
     pub group_id: GroupId,
@@ -1496,6 +1507,63 @@ mod tests {
     use crate::delivery::{LocalDelivery, MemberSinks};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    /// B24 — `snapshot_contains_member` recognises a member id in a REAL
+    /// persisted snapshot (produced by the actor's own persistence hook, not a
+    /// hand-written JSON that could drift from `PersistState`).
+    #[tokio::test]
+    async fn snapshot_contains_member_matches_real_persisted_state() {
+        struct Capture(Mutex<Option<String>>);
+        impl crate::persistence::GroupPersistence for Capture {
+            fn persist(&self, _g: GroupId, _e: u64, state_json: String) {
+                *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state_json);
+            }
+            fn remove(&self, _g: GroupId) {}
+        }
+        let capture = Arc::new(Capture(Mutex::new(None)));
+        let sinks = MemberSinks::new();
+        let delivery = Arc::new(LocalDelivery::new(sinks.clone()));
+        let h =
+            GroupHandle::spawn_persistent(GroupId::new(), 1_000, delivery, capture.clone(), None);
+        let member = MemberId::new();
+        let (sink_tx, _sink_rx) = mpsc::channel(8);
+        sinks.insert(member, sink_tx);
+        let (rtx, rrx) = oneshot::channel();
+        h.tx.send(GroupMsg::AddMember {
+            member_id: member,
+            name: "alison".into(),
+            reply: rtx,
+        })
+        .await
+        .unwrap();
+        let _ = rrx.await.unwrap();
+        // The persistence hook fires on mutation; poll briefly for the write.
+        let mut json = None;
+        for _ in 0..100 {
+            json = capture
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if json.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let json = json.expect("snapshot persisted after AddMember");
+        assert!(
+            snapshot_contains_member(&json, member),
+            "roster member found"
+        );
+        assert!(
+            !snapshot_contains_member(&json, MemberId::new()),
+            "foreign member not found"
+        );
+        assert!(!snapshot_contains_member("not json", member));
+    }
 
     /// Spawn a group whose delivery goes to an in-process `MemberSinks`, the
     /// same wiring the single-replica server uses. Return the sinks so tests can
