@@ -99,6 +99,11 @@ pub fn spawn(
     // Run whenever there's *some* asset to pre-build: trickplay widths, a
     // subtitle cache to warm, or embedded fonts to pre-extract.
     if !widths.is_empty() || subtitles.is_some() || images.is_some() {
+        tracing::info!(
+            ?widths,
+            interval_ms,
+            "trickplay backfill: spawning priority worker + sweep"
+        );
         let ctx = GenCtx {
             stores,
             cache,
@@ -154,6 +159,10 @@ async fn enqueue_seed(
     if !done.insert(id) {
         return;
     }
+    tracing::info!(
+        media.id = id,
+        "trickplay priority: nudge accepted, expanding"
+    );
     let items = match ctx.stores.list().await {
         Ok(v) => v,
         Err(e) => {
@@ -228,10 +237,26 @@ async fn run_sweep(ctx: GenCtx) {
         };
         let mut general: Vec<&MediaItem> = items.iter().filter(|i| is_video(i)).collect();
         general.sort_by_key(|i| std::cmp::Reverse(i.created_at.unwrap_or(i64::MIN)));
+        tracing::info!(videos = general.len(), "trickplay sweep: pass starting");
+        let mut done_before = 0usize;
+        for item in general.iter() {
+            if ctx
+                .cache
+                .is_generated(item.id, *ctx.widths.first().unwrap_or(&320))
+                .await
+            {
+                done_before += 1;
+            }
+        }
+        tracing::info!(
+            already_generated = done_before,
+            "trickplay sweep: coverage before pass"
+        );
         for chunk in general.chunks(SWEEP_CONCURRENCY) {
             let batch = chunk.iter().map(|item| generate_item(item, &ctx, false));
             futures_util::future::join_all(batch).await;
         }
+        tracing::info!("trickplay sweep: pass complete");
         tokio::time::sleep(PASS_INTERVAL).await;
     }
 }
@@ -266,7 +291,7 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
         };
         match generated {
             Ok(true) => {
-                tracing::debug!(media.id = item.id, width, "trickplay pre-generated");
+                tracing::info!(media.id = item.id, width, "trickplay pre-generated");
                 // Cool down only after real work so re-scans stay fast — but
                 // never on the actively-watched seed: its remaining widths (and
                 // the next episode behind it) should follow immediately.
