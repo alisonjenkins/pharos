@@ -1,6 +1,9 @@
 # ADR-0014: Watch-together group-sync over a WebSocket, Jellyfin SyncPlay-compatible
 
-- **Status:** Accepted
+- **Status:** Accepted — extended by
+  [ADR-0016](0016-syncplay-durability-distribution.md) (durability, restart
+  recovery, multi-replica ownership; the in-memory actor described here is
+  no longer the only copy of group state)
 - **Date:** 2026-07-09T00:00:00Z
 - **Deciders:** Alison
 

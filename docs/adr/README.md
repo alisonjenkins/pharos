@@ -43,15 +43,18 @@ optional **Alternatives considered** / **References**).
 |---|-------|--------|
 | [0001](0001-jellyfin-api-compatibility.md) | Jellyfin API as the client contract | Accepted |
 | [0002](0002-rust-actix-sqlx-stack.md) | Rust / actix-web / sqlx / tokio stack | Accepted |
-| [0003](0003-sqlite-default-store.md) | SQLite (WAL) default store, Postgres alternative | Accepted |
+| [0003](0003-sqlite-default-store.md) | SQLite (WAL) default store, Postgres alternative | Accepted (amended by 0015) |
 | [0004](0004-ffmpeg-libav-default-backend.md) | libav in-process default backend + crash-isolated worker pool | Accepted |
 | [0005](0005-per-segment-hls-transcode.md) | Per-segment on-demand HLS transcode + VP9-in-fMP4 for Firefox | Accepted |
 | [0006](0006-subtitles-out-of-band.md) | Subtitles delivered out-of-band, never muxed | Accepted |
-| [0007](0007-trickplay-pregeneration.md) | Trickplay pre-generation with playback-yield gate | Accepted |
+| [0007](0007-trickplay-pregeneration.md) | Trickplay pre-generation with playback-yield gate | Accepted (gate superseded by 0017) |
 | [0008](0008-incremental-scan-signature.md) | Incremental scan by (mtime, size) signature | Accepted |
 | [0009](0009-nix-flake-reproducibility.md) | Nix flake + devShell; buildRustPackage for the OCI image | Accepted |
 | [0010](0010-cd-ghcr-flux-automation.md) | CI on self-hosted builder → GHCR → Flux image automation | Accepted |
 | [0011](0011-auth-hashed-bounded-tokens.md) | Hashed, bounded-lifetime session tokens + CLI admin bootstrap | Accepted |
 | [0012](0012-dioxus-wasm-ui.md) | Dioxus + dx (WASM) for the built-in web UI | Accepted |
 | [0013](0013-observability-tracing-metrics.md) | Structured tracing + Prometheus metrics + OTLP traces | Accepted |
-| [0014](0014-watch-together-group-sync.md) | Watch-together group-sync over a WebSocket, Jellyfin SyncPlay-compatible | Accepted |
+| [0014](0014-watch-together-group-sync.md) | Watch-together group-sync over a WebSocket, Jellyfin SyncPlay-compatible | Accepted (extended by 0016) |
+| [0015](0015-postgres-cnpg-deployment.md) | CNPG Postgres for the home deployment; zero-downtime rolling deploys | Accepted |
+| [0016](0016-syncplay-durability-distribution.md) | Durable, multi-replica SyncPlay (persisted groups + advisory-lock ownership) | Accepted |
+| [0017](0017-adaptive-background-io-gate.md) | Adaptive background-I/O gate (shared semaphore, parks while streaming) | Accepted |

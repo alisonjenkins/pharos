@@ -1,6 +1,8 @@
 # ADR-0007: Trickplay pre-generation with playback-yield gate
 
-- **Status:** Accepted
+- **Status:** Accepted — gate mechanism superseded by
+  [ADR-0017](0017-adaptive-background-io-gate.md) (adaptive shared semaphore
+  replaces the binary quiet gate; pre-generation model + seed bypass stand)
 - **Date:** 2026-07-09T00:00:00Z
 - **Deciders:** Alison
 

@@ -1,6 +1,8 @@
 # ADR-0003: SQLite (WAL) default store, Postgres alternative
 
-- **Status:** Accepted
+- **Status:** Accepted — amended by [ADR-0015](0015-postgres-cnpg-deployment.md)
+  (the home deployment runs the Postgres backend since 2026-07-11; SQLite
+  remains the project default)
 - **Date:** 2026-07-09T00:00:00Z
 - **Deciders:** Alison
 
