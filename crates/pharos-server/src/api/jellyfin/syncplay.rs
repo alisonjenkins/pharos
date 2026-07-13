@@ -202,6 +202,21 @@ struct SeekBody {
 struct ReadyBody {
     #[serde(default)]
     position_ticks: u64,
+    /// The queue entry this Ready/Buffering is FOR. jellyfin-web sends it on
+    /// every post; the actor uses it to reject stale reports racing a queue
+    /// change (B37).
+    #[serde(default)]
+    playlist_item_id: Option<String>,
+}
+
+/// `/SyncPlay/NextItem` + `/PreviousItem` body — the entry the CLIENT
+/// believes is playing. Mismatch = client behind / double-press → no-op
+/// (real-Jellyfin semantics, B37).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct NextItemBody {
+    #[serde(default)]
+    playlist_item_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,11 +369,14 @@ async fn buffering(
     hub: web::Data<SessionHub>,
     body: web::Json<ReadyBody>,
 ) -> HttpResponse {
+    let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
+    let pli = body.playlist_item_id;
     dispatch(&hub, auth.device_id.as_deref(), "buffering", move |mid| {
         GroupMsg::BufferingStart {
             member_id: mid,
             position_ms: pos,
+            playlist_item_id: pli,
         }
     })
     .await
@@ -369,11 +387,14 @@ async fn ready(
     hub: web::Data<SessionHub>,
     body: web::Json<ReadyBody>,
 ) -> HttpResponse {
+    let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
+    let pli = body.playlist_item_id;
     dispatch(&hub, auth.device_id.as_deref(), "ready", move |mid| {
         GroupMsg::MemberReady {
             member_id: mid,
             position_ms: pos,
+            playlist_item_id: pli,
         }
     })
     .await
@@ -419,17 +440,41 @@ async fn set_playlist_item(
     .await
 }
 
-async fn next_item(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.device_id.as_deref(), "nextitem", |mid| {
-        GroupMsg::NextItem { sender: mid }
+async fn next_item(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Bytes,
+) -> HttpResponse {
+    // Bytes + lenient parse: tolerate clients that post no body at all.
+    let pli = serde_json::from_slice::<NextItemBody>(&body)
+        .unwrap_or_default()
+        .playlist_item_id;
+    dispatch(&hub, auth.device_id.as_deref(), "nextitem", move |mid| {
+        GroupMsg::NextItem {
+            sender: mid,
+            playlist_item_id: pli,
+        }
     })
     .await
 }
 
-async fn previous_item(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.device_id.as_deref(), "previousitem", |mid| {
-        GroupMsg::PreviousItem { sender: mid }
-    })
+async fn previous_item(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    body: web::Bytes,
+) -> HttpResponse {
+    let pli = serde_json::from_slice::<NextItemBody>(&body)
+        .unwrap_or_default()
+        .playlist_item_id;
+    dispatch(
+        &hub,
+        auth.device_id.as_deref(),
+        "previousitem",
+        move |mid| GroupMsg::PreviousItem {
+            sender: mid,
+            playlist_item_id: pli,
+        },
+    )
     .await
 }
 

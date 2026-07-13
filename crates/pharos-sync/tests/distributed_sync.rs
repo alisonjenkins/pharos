@@ -224,6 +224,7 @@ async fn command_from_non_owner_reaches_members_on_both_replicas() {
         .send(GroupMsg::MemberReady {
             member_id: m_a,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -233,6 +234,7 @@ async fn command_from_non_owner_reaches_members_on_both_replicas() {
         .send(GroupMsg::MemberReady {
             member_id: m_b,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();

@@ -93,9 +93,11 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::BufferingStart {
             member_id,
             position_ms,
+            playlist_item_id,
         } => RemoteCommand::BufferingStart {
             member_id,
             position_ms,
+            playlist_item_id,
         },
         GroupMsg::BufferingEnd { member_id } => RemoteCommand::BufferingEnd { member_id },
         GroupMsg::Unpause { sender } => RemoteCommand::Unpause { sender },
@@ -110,9 +112,11 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::MemberReady {
             member_id,
             position_ms,
+            playlist_item_id,
         } => RemoteCommand::MemberReady {
             member_id,
             position_ms,
+            playlist_item_id,
         },
         GroupMsg::MemberPing { member_id } => RemoteCommand::MemberPing { member_id },
         GroupMsg::SetNewQueue {
@@ -133,8 +137,20 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
             sender,
             playlist_item_id,
         },
-        GroupMsg::NextItem { sender } => RemoteCommand::NextItem { sender },
-        GroupMsg::PreviousItem { sender } => RemoteCommand::PreviousItem { sender },
+        GroupMsg::NextItem {
+            sender,
+            playlist_item_id,
+        } => RemoteCommand::NextItem {
+            sender,
+            playlist_item_id,
+        },
+        GroupMsg::PreviousItem {
+            sender,
+            playlist_item_id,
+        } => RemoteCommand::PreviousItem {
+            sender,
+            playlist_item_id,
+        },
         GroupMsg::SetRepeatMode { sender, mode } => RemoteCommand::SetRepeatMode { sender, mode },
         GroupMsg::SetShuffleMode { sender, mode } => RemoteCommand::SetShuffleMode { sender, mode },
         GroupMsg::SetGroupName { name } => RemoteCommand::SetGroupName { name },

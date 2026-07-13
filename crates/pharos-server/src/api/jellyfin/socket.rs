@@ -467,6 +467,9 @@ async fn handle_inbound(
                 h.tx.send(GroupMsg::BufferingStart {
                     member_id,
                     position_ms: 0,
+                    // Socket-frame variant carries no PlaylistItemId (stock
+                    // jellyfin-web posts Buffering over HTTP, not here).
+                    playlist_item_id: None,
                 })
                 .await;
         }
@@ -622,10 +625,18 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         ServerMsg::MemberJoined { member } => {
             group_update(ctx, "UserJoined", serde_json::Value::String(member.name))
         }
-        ServerMsg::MemberLeft { member_id } => group_update(
+        ServerMsg::MemberLeft { member_id, name } => group_update(
             ctx,
             "UserLeft",
-            serde_json::Value::String(member_id.to_string()),
+            // B37 — jellyfin-web renders this string verbatim in the "left
+            // the group" toast; real Jellyfin sends the USERNAME. The uuid is
+            // only a last-resort fallback for a nameless (hydrated-legacy)
+            // roster entry.
+            serde_json::Value::String(if name.is_empty() {
+                member_id.to_string()
+            } else {
+                name
+            }),
         ),
         ServerMsg::StateUpdate { state, reason } => group_update(
             ctx,
@@ -866,6 +877,30 @@ mod tests {
         assert_eq!(v["Data"]["ItemsAdded"], serde_json::json!(["10", "20"]));
         assert_eq!(v["Data"]["ItemsRemoved"], serde_json::json!(["30"]));
         assert_eq!(v["Data"]["IsEmpty"], false);
+    }
+
+    #[test]
+    fn translate_member_left_carries_username_not_uuid() {
+        // B37 — jellyfin-web renders the UserLeft payload verbatim in its
+        // "left the group" toast; real Jellyfin sends the USERNAME.
+        let member_id = pharos_sync::MemberId::new();
+        let ctx = TranslateCtx {
+            group_id: Some(pharos_sync::GroupId::new()),
+            epoch_unix_ms: 0,
+            current_pli: None,
+        };
+        let out = translate_outbound(
+            ServerMsg::MemberLeft {
+                member_id,
+                name: "jana".into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["Type"], "UserLeft");
+        assert_eq!(v["Data"]["Data"], "jana");
     }
 
     #[test]

@@ -169,6 +169,11 @@ pub enum ServerMsg {
     },
     MemberLeft {
         member_id: MemberId,
+        /// Display name of the departed member. jellyfin-web renders the wire
+        /// `UserLeft` payload directly in its "left the group" toast, and real
+        /// Jellyfin populates it with the USERNAME — sending the member uuid
+        /// here surfaced raw uuids to the party (B37).
+        name: String,
     },
     /// Coarse playback-state transition (Jellyfin `SyncPlayGroupUpdate` /
     /// `StateUpdate`). `reason` is a free-form label (e.g. the command that

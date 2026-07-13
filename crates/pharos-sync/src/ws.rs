@@ -338,6 +338,8 @@ async fn dispatch_client_msg(
                 .send(GroupMsg::BufferingStart {
                     member_id,
                     position_ms,
+                    // ws-native framing has no queue concept yet — never stale.
+                    playlist_item_id: None,
                 })
                 .await;
         }

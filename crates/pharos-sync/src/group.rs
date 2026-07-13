@@ -95,6 +95,9 @@ pub enum GroupMsg {
     BufferingStart {
         member_id: MemberId,
         position_ms: u64,
+        /// The queue entry the client is buffering (jellyfin-web sends it on
+        /// every Buffering/Ready POST). `None` = legacy/native path.
+        playlist_item_id: Option<String>,
     },
     BufferingEnd {
         member_id: MemberId,
@@ -124,6 +127,11 @@ pub enum GroupMsg {
     MemberReady {
         member_id: MemberId,
         position_ms: u64,
+        /// The queue entry this Ready is FOR. A Ready for a stale entry (the
+        /// old episode's teardown transition racing a queue change) must not
+        /// satisfy the new item's readiness gate (B37) — real Jellyfin
+        /// validates this id against the current item.
+        playlist_item_id: Option<String>,
     },
     /// Jellyfin HTTP `/SyncPlay/SetNewQueue` — replace the playlist and start
     /// (leader only). `item_ids` are library item ids; the server assigns a
@@ -140,11 +148,16 @@ pub enum GroupMsg {
         playlist_item_id: String,
     },
     /// Advance to the next / previous queue entry (leader only).
+    /// `playlist_item_id` is the entry the CLIENT believes is playing —
+    /// real Jellyfin no-ops the request when it doesn't match the current
+    /// entry, which dedupes double-presses and racing Next from two members.
     NextItem {
         sender: MemberId,
+        playlist_item_id: Option<String>,
     },
     PreviousItem {
         sender: MemberId,
+        playlist_item_id: Option<String>,
     },
     /// Set repeat / shuffle mode (leader only). `mode` is the Jellyfin string
     /// (`RepeatNone|RepeatOne|RepeatAll`, `Sorted|Shuffle`).
@@ -228,6 +241,8 @@ pub enum RemoteCommand {
     BufferingStart {
         member_id: MemberId,
         position_ms: u64,
+        #[serde(default)]
+        playlist_item_id: Option<String>,
     },
     BufferingEnd {
         member_id: MemberId,
@@ -245,6 +260,8 @@ pub enum RemoteCommand {
     MemberReady {
         member_id: MemberId,
         position_ms: u64,
+        #[serde(default)]
+        playlist_item_id: Option<String>,
     },
     MemberPing {
         member_id: MemberId,
@@ -261,9 +278,13 @@ pub enum RemoteCommand {
     },
     NextItem {
         sender: MemberId,
+        #[serde(default)]
+        playlist_item_id: Option<String>,
     },
     PreviousItem {
         sender: MemberId,
+        #[serde(default)]
+        playlist_item_id: Option<String>,
     },
     SetRepeatMode {
         sender: MemberId,
@@ -330,9 +351,11 @@ impl RemoteCommand {
             RemoteCommand::BufferingStart {
                 member_id,
                 position_ms,
+                playlist_item_id,
             } => GroupMsg::BufferingStart {
                 member_id,
                 position_ms,
+                playlist_item_id,
             },
             RemoteCommand::BufferingEnd { member_id } => GroupMsg::BufferingEnd { member_id },
             RemoteCommand::Unpause { sender } => GroupMsg::Unpause { sender },
@@ -347,9 +370,11 @@ impl RemoteCommand {
             RemoteCommand::MemberReady {
                 member_id,
                 position_ms,
+                playlist_item_id,
             } => GroupMsg::MemberReady {
                 member_id,
                 position_ms,
+                playlist_item_id,
             },
             RemoteCommand::MemberPing { member_id } => GroupMsg::MemberPing { member_id },
             RemoteCommand::SetNewQueue {
@@ -370,8 +395,20 @@ impl RemoteCommand {
                 sender,
                 playlist_item_id,
             },
-            RemoteCommand::NextItem { sender } => GroupMsg::NextItem { sender },
-            RemoteCommand::PreviousItem { sender } => GroupMsg::PreviousItem { sender },
+            RemoteCommand::NextItem {
+                sender,
+                playlist_item_id,
+            } => GroupMsg::NextItem {
+                sender,
+                playlist_item_id,
+            },
+            RemoteCommand::PreviousItem {
+                sender,
+                playlist_item_id,
+            } => GroupMsg::PreviousItem {
+                sender,
+                playlist_item_id,
+            },
             RemoteCommand::SetRepeatMode { sender, mode } => {
                 GroupMsg::SetRepeatMode { sender, mode }
             }
@@ -657,6 +694,46 @@ impl GroupState {
         });
     }
 
+    /// The `playlist_item_id` of the queue entry the group currently plays.
+    fn current_playlist_item_id(&self) -> Option<&str> {
+        self.queue
+            .items
+            .get(self.queue.playing_index)
+            .map(|e| e.playlist_item_id.as_str())
+    }
+
+    /// B37 — a client-reported `PlaylistItemId` that names anything OTHER
+    /// than the current queue entry is STALE: the client hasn't applied the
+    /// latest queue change yet (or its old player raced a teardown
+    /// transition). `None` (legacy / ws-native callers) is never stale.
+    fn pli_is_stale(&self, pli: &Option<String>) -> bool {
+        match (pli.as_deref(), self.current_playlist_item_id()) {
+            (Some(sent), Some(current)) => sent != current,
+            _ => false,
+        }
+    }
+
+    /// Re-send the CURRENT play queue to one member (catch-up). Deliberately
+    /// keeps `updated_unix_ms` unchanged: jellyfin-web applies a PlayQueue
+    /// only when its LastUpdate is NEWER than what it has, so an up-to-date
+    /// client drops this as a duplicate while a behind client (the one whose
+    /// stale Ready triggered it) applies it and loads the right item.
+    fn send_play_queue_to(&self, member_id: MemberId) {
+        self.send_one(
+            member_id,
+            ServerMsg::PlayQueue {
+                reason: "set_current_item".to_string(),
+                items: self.queue.item_infos(),
+                playing_index: self.queue.playing_index,
+                start_position_ms: 0,
+                is_playing: matches!(self.playback, PlaybackState::Playing { .. }),
+                repeat_mode: self.queue.repeat_mode.clone(),
+                shuffle_mode: self.queue.shuffle_mode.clone(),
+                last_update_unix_ms: self.queue.updated_unix_ms,
+            },
+        );
+    }
+
     /// The members a readiness gate may wait on: everyone not opted out via
     /// `SetIgnoreWait` (a halted client never posts `Ready`, so waiting on it
     /// only ever runs the gate into the anti-wedge timeout).
@@ -718,6 +795,14 @@ impl GroupState {
         if self.members.is_empty() {
             return;
         }
+        tracing::info!(
+            group = %self.id,
+            pending = pending.len(),
+            resume_playing,
+            position_ms,
+            reason,
+            "syncplay: readiness gate opened"
+        );
         self.waiting = Some(WaitingGate {
             pending,
             resume_playing,
@@ -744,6 +829,12 @@ impl GroupState {
         let Some(w) = self.waiting.take() else {
             return;
         };
+        tracing::info!(
+            group = %self.id,
+            resume_playing = w.resume_playing,
+            position_ms = w.position_ms,
+            "syncplay: readiness gate resolved"
+        );
         if w.resume_playing {
             self.start_playing(w.position_ms, "Ready");
         } else {
@@ -1134,6 +1225,14 @@ impl GroupHandle {
                         // Timeout: drop still-pending members from the gate and
                         // start anyway (anti-wedge). They re-sync via their own
                         // drift correction.
+                        if let Some(w) = state.waiting.as_ref() {
+                            tracing::warn!(
+                                group = %state.id,
+                                pending = ?w.pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                                reason = "anti-wedge timeout",
+                                "syncplay: readiness gate timed out; starting without stragglers"
+                            );
+                        }
                         state.resolve_waiting();
                         state.persist();
                     }
@@ -1208,6 +1307,14 @@ impl GroupHandle {
 /// T83 ghost prune.
 fn remove_member(state: &mut GroupState, member_id: MemberId) {
     let was_leader = state.leader == Some(member_id);
+    // Capture the display name BEFORE the roster drop — the wire `UserLeft`
+    // toast renders this string verbatim (B37: a uuid here reached users).
+    let name = state
+        .members
+        .get(&member_id)
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    tracing::info!(group = %state.id, member = %member_id, user = %name, "syncplay: member removed from group");
     state.members.remove(&member_id);
     if was_leader {
         state.elect_leader();
@@ -1215,7 +1322,7 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
             state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
         }
     }
-    state.broadcast(ServerMsg::MemberLeft { member_id });
+    state.broadcast(ServerMsg::MemberLeft { member_id, name });
     // A departing member must not wedge the readiness gate: drop it
     // from the pending set and resolve if it was the last holdout (and
     // members remain — an empty group terminates the actor anyway).
@@ -1248,8 +1355,8 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::SeekTo { sender, .. }
         | GroupMsg::SetNewQueue { sender, .. }
         | GroupMsg::SetPlaylistItem { sender, .. }
-        | GroupMsg::NextItem { sender }
-        | GroupMsg::PreviousItem { sender }
+        | GroupMsg::NextItem { sender, .. }
+        | GroupMsg::PreviousItem { sender, .. }
         | GroupMsg::SetRepeatMode { sender, .. }
         | GroupMsg::SetShuffleMode { sender, .. } => Some(*sender),
         GroupMsg::AddMember { .. } | GroupMsg::RemoveMember { .. } | GroupMsg::Snapshot { .. } => {
@@ -1441,13 +1548,29 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         GroupMsg::BufferingStart {
             member_id,
             position_ms: _,
+            playlist_item_id,
         } => {
+            // B37 — a Buffering report for a STALE queue entry is the old
+            // player stalling mid-teardown while the group already moved on
+            // (next episode). Freezing the whole group for it wedges the new
+            // item's start; instead pull the behind client forward.
+            if state.pli_is_stale(&playlist_item_id) {
+                tracing::info!(
+                    group = %state.id, member = %member_id,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    current = state.current_playlist_item_id().unwrap_or(""),
+                    "syncplay: stale-item Buffering ignored; re-sending queue"
+                );
+                state.send_play_queue_to(member_id);
+                return;
+            }
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = true;
             }
             // V19: one corrective Pause, not a storm. If already paused due
             // to another member's buffering, do nothing.
             if !state.group_paused_due_to_buffering && state.members.values().any(|m| m.buffering) {
+                tracing::info!(group = %state.id, member = %member_id, "syncplay: member buffering — freezing group (V19)");
                 state.group_paused_due_to_buffering = true;
                 let at_server_ms = state.server_ms_now() + MIN_LEAD_MS;
                 // Freeze playback state too, the same way LeaderPause does.
@@ -1545,7 +1668,26 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         GroupMsg::MemberReady {
             member_id,
             position_ms: _,
+            playlist_item_id,
         } => {
+            // B37 — the poisoned-gate bug: jellyfin-web posts Ready on EVERY
+            // player transition, including the OLD episode's teardown right
+            // after a NextItem queue change. Counting that stale Ready toward
+            // the new item's readiness gate released Play before anyone had
+            // the next episode loaded. Real Jellyfin validates the Ready's
+            // PlaylistItemId against the current entry — do the same, and
+            // re-send the queue so a genuinely behind client catches up and
+            // posts a fresh (valid) Ready.
+            if state.pli_is_stale(&playlist_item_id) {
+                tracing::info!(
+                    group = %state.id, member = %member_id,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    current = state.current_playlist_item_id().unwrap_or(""),
+                    "syncplay: stale-item Ready ignored; re-sending queue"
+                );
+                state.send_play_queue_to(member_id);
+                return;
+            }
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = false;
                 // jellyfin-web re-follows group playback before posting Ready,
@@ -1635,17 +1777,51 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.enter_waiting(pending, true, 0, "Unpause");
             }
         }
-        GroupMsg::NextItem { sender: _ } => {
+        GroupMsg::NextItem {
+            sender,
+            playlist_item_id,
+        } => {
+            // B37 — real-Jellyfin dedupe: the request names the entry the
+            // client believes is playing. A mismatch means the client is
+            // behind (or two members raced Next) — advancing again would skip
+            // an episode. No-op, like NextItemGroupRequest does.
+            if state.pli_is_stale(&playlist_item_id) {
+                tracing::info!(
+                    group = %state.id, member = %sender,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    current = state.current_playlist_item_id().unwrap_or(""),
+                    "syncplay: NextItem for stale entry ignored (double-press/race)"
+                );
+                return;
+            }
             if state.queue.playing_index + 1 < state.queue.items.len() {
                 state.queue.playing_index += 1;
+                tracing::info!(
+                    group = %state.id, index = state.queue.playing_index,
+                    "syncplay: queue advanced to next item"
+                );
                 state.broadcast_play_queue("next_item", true, 0);
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, "Unpause");
             }
         }
-        GroupMsg::PreviousItem { sender: _ } => {
+        GroupMsg::PreviousItem {
+            sender,
+            playlist_item_id,
+        } => {
+            if state.pli_is_stale(&playlist_item_id) {
+                tracing::info!(
+                    group = %state.id, member = %sender,
+                    "syncplay: PreviousItem for stale entry ignored"
+                );
+                return;
+            }
             if state.queue.playing_index > 0 {
                 state.queue.playing_index -= 1;
+                tracing::info!(
+                    group = %state.id, index = state.queue.playing_index,
+                    "syncplay: queue moved to previous item"
+                );
                 state.broadcast_play_queue("previous_item", true, 0);
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, "Unpause");
@@ -2168,6 +2344,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: m2,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2235,6 +2412,7 @@ mod tests {
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2256,6 +2434,7 @@ mod tests {
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m3,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2293,6 +2472,7 @@ mod tests {
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2548,6 +2728,7 @@ mod tests {
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 1_500,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2565,6 +2746,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: m2,
             position_ms: 1_500,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2614,6 +2796,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: m2,
             position_ms: 1_000,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2705,6 +2888,7 @@ mod tests {
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2733,6 +2917,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: m2,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2788,6 +2973,7 @@ mod tests {
             h.tx.send(GroupMsg::MemberReady {
                 member_id: mid,
                 position_ms: 60_000,
+                playlist_item_id: None,
             })
             .await
             .unwrap();
@@ -2828,6 +3014,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: leader,
             position_ms: 0,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2857,6 +3044,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: leader,
             position_ms: 30_000,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2923,6 +3111,7 @@ mod tests {
         h.tx.send(GroupMsg::MemberReady {
             member_id: m2,
             position_ms: 5_000,
+            playlist_item_id: None,
         })
         .await
         .unwrap();
@@ -2982,13 +3171,308 @@ mod tests {
 
         // A genuine change (advance the cursor) must produce a STRICTLY newer
         // timestamp so the client does apply it.
-        h.tx.send(GroupMsg::NextItem { sender: leader })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
         let t_next = next_queue_ts(&mut leader_rx).await;
         assert!(
             t_next > t_queue,
             "a real queue change must bump the timestamp ({t_next} > {t_queue})"
         );
+    }
+
+    /// B37 — helper: set a 3-entry queue and return each entry's
+    /// playlist_item_id (captured from the PlayQueue broadcast).
+    async fn seed_queue(
+        h: &GroupHandle,
+        leader: MemberId,
+        rx: &mut mpsc::Receiver<ServerMsg>,
+    ) -> Vec<String> {
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["10".into(), "11".into(), "12".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { items, .. }) =
+            recv_matching(rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("no PlayQueue broadcast after SetNewQueue");
+        };
+        items.into_iter().map(|i| i.playlist_item_id).collect()
+    }
+
+    /// B37 — the poisoned-gate bug behind the Code Geass ep20→21 incident:
+    /// jellyfin-web posts Ready on EVERY player transition, including the OLD
+    /// episode's teardown right after NextItem. A Ready naming a stale queue
+    /// entry must NOT satisfy the new item's readiness gate — the sender gets
+    /// a PlayQueue catch-up instead, and Play fires only once every member is
+    /// ready FOR THE NEW ENTRY.
+    #[tokio::test]
+    async fn stale_ready_does_not_resolve_queue_change_gate() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        // Settle the initial load gate (both ready for entry 0).
+        for mid in [leader, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 0,
+                playlist_item_id: Some(plis[0].clone()),
+            })
+            .await
+            .unwrap();
+        }
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        // Advance to entry 1 — a fresh gate opens on both members.
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        // Leader's old player emits a teardown transition → STALE Ready.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: leader,
+            position_ms: 0,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        // m2 is genuinely ready for the NEW entry.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Leader got the queue change + a catch-up re-send, but NO Play yet —
+        // its stale Ready must still be pending in the gate.
+        let mut saw_catch_up = false;
+        while let Ok(m) = leader_rx.try_recv() {
+            match m {
+                ServerMsg::Play { .. } => {
+                    panic!("stale Ready must not resolve the gate (B37)")
+                }
+                ServerMsg::PlayQueue { reason, .. } if reason == "set_current_item" => {
+                    saw_catch_up = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_catch_up,
+            "a stale Ready must trigger a PlayQueue catch-up to its sender"
+        );
+
+        // Leader posts the CORRECT Ready → gate resolves → Play to everyone.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: leader,
+            position_ms: 0,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let mut saw_play = false;
+            while let Ok(m) = rx.try_recv() {
+                if matches!(m, ServerMsg::Play { .. }) {
+                    saw_play = true;
+                }
+            }
+            assert!(
+                saw_play,
+                "gate must resolve once every member is ready for the new entry"
+            );
+        }
+    }
+
+    /// B37 — the catch-up re-send must reuse the queue's LastUpdate, so an
+    /// up-to-date client's `LastUpdate <=` guard drops it as a duplicate
+    /// while a behind client applies it.
+    #[tokio::test]
+    async fn stale_ready_catch_up_reuses_queue_timestamp() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue {
+            last_update_unix_ms: t_change,
+            ..
+        }) = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::PlayQueue { .. })
+        })
+        .await
+        else {
+            panic!("no queue-change broadcast");
+        };
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: leader,
+            position_ms: 0,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue {
+            last_update_unix_ms: t_catch_up,
+            ..
+        }) = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::PlayQueue { .. })
+        })
+        .await
+        else {
+            panic!("no catch-up after stale Ready");
+        };
+        assert_eq!(
+            t_catch_up, t_change,
+            "catch-up must not mint a fresh LastUpdate (it would replay on every client)"
+        );
+    }
+
+    /// B37 — a Buffering report naming a stale entry is the OLD player
+    /// stalling mid-teardown; it must not freeze the whole group.
+    #[tokio::test]
+    async fn stale_buffering_does_not_freeze_group() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        for mid in [leader, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 0,
+                playlist_item_id: Some(plis[0].clone()),
+            })
+            .await
+            .unwrap();
+        }
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        // m2's OLD player reports buffering for the stale entry.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::Pause { .. }),
+                "stale-entry buffering must not pause the group (B37)"
+            );
+        }
+        // The stale reporter gets pulled forward instead.
+        let mut saw_catch_up = false;
+        while let Ok(m) = m2_rx.try_recv() {
+            if matches!(&m, ServerMsg::PlayQueue { reason, .. } if reason == "set_current_item") {
+                saw_catch_up = true;
+            }
+        }
+        assert!(
+            saw_catch_up,
+            "stale buffering must trigger a queue catch-up"
+        );
+    }
+
+    /// B37 — real-Jellyfin NextItem dedupe: the request names the entry the
+    /// client believes is playing; a mismatch (double-press, or two members
+    /// racing Next) must NOT advance again and skip an episode.
+    #[tokio::test]
+    async fn next_item_for_stale_entry_is_ignored() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { playing_index, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("first NextItem must broadcast the queue change");
+        };
+        assert_eq!(playing_index, 1);
+        // Double-press: still names entry 0 → ignored.
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::PlayQueue { .. }),
+                "stale NextItem must not advance the queue again (B37)"
+            );
+        }
+        // A VALID follow-up (naming the now-current entry) advances normally.
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { playing_index, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("valid NextItem must broadcast");
+        };
+        assert_eq!(playing_index, 2);
+    }
+
+    /// B37 — the `MemberLeft` broadcast must carry the member's display name:
+    /// the wire `UserLeft` toast renders it verbatim (a uuid reached users).
+    #[tokio::test]
+    async fn member_left_carries_display_name() {
+        let (h, sinks, mut leader_rx, _leader) = fresh().await;
+        let (m2, _m2_rx) = add_member(&h, &sinks, "jana").await;
+        h.tx.send(GroupMsg::RemoveMember { member_id: m2 })
+            .await
+            .unwrap();
+        let Some(ServerMsg::MemberLeft { name, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::MemberLeft { .. })
+            })
+            .await
+        else {
+            panic!("no MemberLeft broadcast");
+        };
+        assert_eq!(name, "jana");
     }
 }
