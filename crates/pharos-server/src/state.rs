@@ -60,9 +60,16 @@ pub enum SocketBroadcast {
         removed: Vec<String>,
     },
     /// Per-user item state changed (played, favourite, position).
-    /// Carries the originating user + item so receivers can ignore
-    /// updates that don't apply to them.
-    UserDataChanged { user_id: String, item_id: String },
+    /// Carries the originating user plus the FULL serialized
+    /// `UserItemDataDto` entries (B36) — jellyfin-web patches cards in
+    /// place from `UserDataList[n].Played` / `.IsFavorite` / matched by
+    /// `.ItemId` (canonical 32-hex) and `.Key`, so a bare item id is
+    /// useless to it. One broadcast may carry many entries (folder
+    /// cascade marks every child episode in a single frame).
+    UserDataChanged {
+        user_id: String,
+        entries: Vec<serde_json::Value>,
+    },
     /// Remote-control command targeted at a single session.
     /// T-fix-17 / T40 phase 2 — admin or another client tells session
     /// `session_id` to pause / play / stop / seek / change volume.
@@ -690,11 +697,14 @@ impl AppState {
         });
     }
 
-    /// Fire a `UserDataChanged` event scoped to one user + item.
-    pub fn notify_user_data_changed(&self, user_id: &str, item_id: &str) {
+    /// Fire a `UserDataChanged` event scoped to one user, carrying the
+    /// full serialized `UserItemDataDto` for each changed item (B36).
+    /// jellyfin-web needs `ItemId` (32-hex), `Key`, `Played`,
+    /// `IsFavorite`, `PlayedPercentage` … to patch its UI in place.
+    pub fn notify_user_data_changed(&self, user_id: &str, entries: Vec<serde_json::Value>) {
         let _ = self.bus.send(SocketBroadcast::UserDataChanged {
             user_id: user_id.to_string(),
-            item_id: item_id.to_string(),
+            entries,
         });
     }
 

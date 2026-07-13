@@ -630,12 +630,30 @@ pub struct UserItemDataDto {
 
 impl UserItemDataDto {
     pub fn from_domain(item_id: pharos_core::MediaId, data: pharos_core::UserItemData) -> Self {
+        Self::from_domain_with_runtime(item_id, data, 0)
+    }
+
+    /// Like [`Self::from_domain`] but computes `PlayedPercentage` from the
+    /// item's runtime (100ns ticks) when known — jellyfin-web draws card
+    /// resume bars from this field, so a hardcoded 0 blanks them (B36).
+    /// `runtime_ticks == 0` (unknown) keeps the old behaviour.
+    pub fn from_domain_with_runtime(
+        item_id: pharos_core::MediaId,
+        data: pharos_core::UserItemData,
+        runtime_ticks: u64,
+    ) -> Self {
+        let played_percentage = if runtime_ticks > 0 {
+            ((data.last_played_position_ticks as f64 / runtime_ticks as f64) * 100.0)
+                .clamp(0.0, 100.0) as f32
+        } else {
+            0.0
+        };
         Self {
             item_id: wire_item_id(item_id),
             played: data.played,
             play_count: data.play_count,
             playback_position_ticks: data.last_played_position_ticks,
-            played_percentage: 0.0,
+            played_percentage,
             is_favorite: data.is_favorite,
             likes: None,
             rating: None,

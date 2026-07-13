@@ -215,10 +215,22 @@ async fn playing_progress(
                 .await
                 .is_ok()
             {
-                state.notify_user_data_changed(
-                    &user.0.id.0.simple().to_string(),
-                    &item_id.to_string(),
+                // B36 — broadcast the full DTO (with PlayedPercentage
+                // from the item's runtime) so other windows' resume
+                // bars track the live position.
+                let runtime = state
+                    .stores
+                    .get(item_id)
+                    .await
+                    .ok()
+                    .and_then(|it| it.probe.run_time_ticks())
+                    .unwrap_or(0);
+                let dto = pharos_jellyfin_api::dto::UserItemDataDto::from_domain_with_runtime(
+                    item_id, data, runtime,
                 );
+                if let Ok(entry) = serde_json::to_value(&dto) {
+                    state.notify_user_data_changed(&user.0.id.0.simple().to_string(), vec![entry]);
+                }
             }
         }
     }
@@ -286,10 +298,19 @@ async fn playing_stopped(
                     .await
                     .is_ok()
                 {
-                    state.notify_user_data_changed(
-                        &user.0.id.0.simple().to_string(),
-                        &item_id.to_string(),
+                    // B36 — full DTO so the just-finished (or resumable)
+                    // item's card flips its watched tick / resume bar
+                    // everywhere without a refresh. `runtime` was
+                    // already fetched above for the finished check.
+                    let dto = pharos_jellyfin_api::dto::UserItemDataDto::from_domain_with_runtime(
+                        item_id, data, runtime,
                     );
+                    if let Ok(entry) = serde_json::to_value(&dto) {
+                        state.notify_user_data_changed(
+                            &user.0.id.0.simple().to_string(),
+                            vec![entry],
+                        );
+                    }
                 }
             }
         }

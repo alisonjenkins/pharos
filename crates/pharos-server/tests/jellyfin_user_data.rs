@@ -3,8 +3,8 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
-    UserStore,
+    MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserDataStore, UserId, UserPolicy,
+    UserRecord, UserStore,
 };
 use pharos_server::{
     api::jellyfin,
@@ -237,12 +237,223 @@ async fn mark_played_broadcasts_user_data_changed_on_bus() {
         .expect("broadcast timeout")
         .expect("broadcast recv");
     match msg {
-        SocketBroadcast::UserDataChanged { user_id, item_id } => {
+        SocketBroadcast::UserDataChanged { user_id, entries } => {
             assert_eq!(user_id, uid.0.simple().to_string());
-            assert_eq!(item_id, "300");
+            // B36 — the broadcast must carry the FULL DTO: jellyfin-web
+            // matches cards by the 32-hex wire ItemId (a decimal id
+            // matches nothing) and applies Played/IsFavorite in place.
+            assert_eq!(entries.len(), 1);
+            let e = &entries[0];
+            assert_eq!(e["ItemId"], pharos_jellyfin_api::dto::wire_item_id(300));
+            assert_eq!(e["Key"], "300");
+            assert_eq!(e["Played"], true);
+            assert_eq!(e["PlayCount"], 1);
+            assert_eq!(e["IsFavorite"], false);
         }
         other => panic!("expected UserDataChanged, got {other:?}"),
     }
+}
+
+#[actix_web::test]
+async fn unmark_played_broadcasts_played_false() {
+    use pharos_server::state::SocketBroadcast;
+    let (state, token, uid) = seed().await;
+    let app = test::init_service(build_app(state.clone())).await;
+    let mark = test::TestRequest::post()
+        .uri(&format!("/Users/{}/PlayedItems/300", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let _ = test::call_service(&app, mark).await;
+    let mut bus = state.bus.subscribe();
+    let unmark = test::TestRequest::delete()
+        .uri(&format!("/Users/{}/PlayedItems/300", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert!(test::call_service(&app, unmark).await.status().is_success());
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), bus.recv())
+        .await
+        .expect("broadcast timeout")
+        .expect("broadcast recv");
+    match msg {
+        SocketBroadcast::UserDataChanged { entries, .. } => {
+            assert_eq!(entries[0]["Played"], false);
+            assert_eq!(
+                entries[0]["ItemId"],
+                pharos_jellyfin_api::dto::wire_item_id(300)
+            );
+        }
+        other => panic!("expected UserDataChanged, got {other:?}"),
+    }
+}
+
+#[actix_web::test]
+async fn favorite_toggle_broadcasts_is_favorite() {
+    use pharos_server::state::SocketBroadcast;
+    let (state, token, uid) = seed().await;
+    let mut bus = state.bus.subscribe();
+    let app = test::init_service(build_app(state.clone())).await;
+    let fav = test::TestRequest::post()
+        .uri(&format!("/Users/{}/FavoriteItems/301", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert!(test::call_service(&app, fav).await.status().is_success());
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), bus.recv())
+        .await
+        .expect("broadcast timeout")
+        .expect("broadcast recv");
+    match msg {
+        SocketBroadcast::UserDataChanged { entries, .. } => {
+            assert_eq!(entries[0]["IsFavorite"], true);
+            assert_eq!(entries[0]["Played"], false);
+            assert_eq!(
+                entries[0]["ItemId"],
+                pharos_jellyfin_api::dto::wire_item_id(301)
+            );
+        }
+        other => panic!("expected UserDataChanged, got {other:?}"),
+    }
+    let unfav = test::TestRequest::delete()
+        .uri(&format!("/Users/{}/FavoriteItems/301", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert!(test::call_service(&app, unfav).await.status().is_success());
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), bus.recv())
+        .await
+        .expect("broadcast timeout")
+        .expect("broadcast recv");
+    match msg {
+        SocketBroadcast::UserDataChanged { entries, .. } => {
+            assert_eq!(entries[0]["IsFavorite"], false);
+        }
+        other => panic!("expected UserDataChanged, got {other:?}"),
+    }
+}
+
+/// Seed a two-season show for the synthetic-folder cascade tests (B36).
+async fn seed_show() -> (web::Data<AppState>, String, UserId) {
+    use pharos_core::SeriesInfo;
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy { admin: true },
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    for (id, season, ep) in [(400_u64, 1, 1), (401, 1, 2), (402, 2, 1)] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/tv/Buffy/S{season:02}E{ep:02}.mkv").into(),
+                title: format!("s{season:02}e{ep:02}"),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Buffy".into(),
+                    season_number: Some(season),
+                    episode_number: Some(ep),
+                    series_folder: Some("/tv/Buffy".into()),
+                    series_year: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "test".into()));
+    (state, token.0.expose().to_string(), uid)
+}
+
+#[actix_web::test]
+async fn mark_season_played_cascades_to_episodes_and_broadcasts_batch() {
+    use pharos_server::state::SocketBroadcast;
+    let (state, token, uid) = seed_show().await;
+    let mut bus = state.bus.subscribe();
+    let app = test::init_service(build_app(state.clone())).await;
+    let season_id = pharos_jellyfin_api::dto::season_id_for_key(Some("/tv/Buffy"), "Buffy", 1);
+    let req = test::TestRequest::post()
+        .uri(&format!(
+            "/Users/{}/PlayedItems/{season_id}",
+            uid.0.simple()
+        ))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Played"], true, "folder-level response DTO: {v}");
+    // Season 1 episodes flip played; season 2 untouched.
+    for id in [400_u64, 401] {
+        let ud = state.stores.get_user_data(uid, id).await.unwrap();
+        assert!(ud.played, "episode {id} must cascade to played");
+    }
+    assert!(!state.stores.get_user_data(uid, 402).await.unwrap().played);
+    // One frame, all changed entries + the folder entry keyed by the synth id.
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), bus.recv())
+        .await
+        .expect("broadcast timeout")
+        .expect("broadcast recv");
+    match msg {
+        SocketBroadcast::UserDataChanged { user_id, entries } => {
+            assert_eq!(user_id, uid.0.simple().to_string());
+            let ids: Vec<_> = entries.iter().map(|e| e["ItemId"].clone()).collect();
+            assert!(
+                ids.contains(&serde_json::json!(pharos_jellyfin_api::dto::wire_item_id(
+                    400
+                )))
+            );
+            assert!(
+                ids.contains(&serde_json::json!(pharos_jellyfin_api::dto::wire_item_id(
+                    401
+                )))
+            );
+            assert!(ids.contains(&serde_json::json!(season_id)));
+            assert!(entries.iter().all(|e| e["Played"] == true), "{entries:?}");
+        }
+        other => panic!("expected UserDataChanged, got {other:?}"),
+    }
+}
+
+#[actix_web::test]
+async fn mark_series_favorite_cascades_all_episodes() {
+    let (state, token, uid) = seed_show().await;
+    let app = test::init_service(build_app(state.clone())).await;
+    let series_id = pharos_jellyfin_api::dto::series_id_for_key(Some("/tv/Buffy"), "Buffy");
+    let req = test::TestRequest::post()
+        .uri(&format!(
+            "/Users/{}/FavoriteItems/{series_id}",
+            uid.0.simple()
+        ))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["IsFavorite"], true, "folder-level response DTO: {v}");
+    for id in [400_u64, 401, 402] {
+        let ud = state.stores.get_user_data(uid, id).await.unwrap();
+        assert!(ud.is_favorite, "episode {id} must cascade to favorite");
+    }
+}
+
+#[actix_web::test]
+async fn unknown_synth_id_is_404_not_400() {
+    // GUID-shaped id that matches no series/season — must 404 (item not
+    // found), not 400: jellyfin-web treats 400 as a client bug.
+    let (state, token, uid) = seed_show().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri(&format!(
+            "/Users/{}/PlayedItems/ffffffffffffffffffffffffffffffff",
+            uid.0.simple()
+        ))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status().as_u16(), 404);
 }
 
 #[actix_web::test]

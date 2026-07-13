@@ -716,11 +716,17 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 }),
             ))
         }
-        SocketBroadcast::UserDataChanged { user_id, item_id } => Some(Outbound::new(
+        SocketBroadcast::UserDataChanged { user_id, entries } => Some(Outbound::new(
             "UserDataChanged",
+            // B36 — each entry is a full serialized UserItemDataDto.
+            // jellyfin-web matches cards by `ItemId` (32-hex wire id) /
+            // the detail page by `Key`, then applies `Played`,
+            // `IsFavorite`, `PlayedPercentage` … in place. A bare
+            // `{ItemId}` stub matched nothing and carried no state, so
+            // the UI never updated without a manual refresh.
             serde_json::json!({
                 "UserId": user_id,
-                "UserDataList": [{ "ItemId": item_id }],
+                "UserDataList": entries,
             }),
         )),
         SocketBroadcast::SessionCommand {
@@ -863,17 +869,30 @@ mod tests {
     }
 
     #[test]
-    fn translate_userdata_changed_carries_user_and_item_ids() {
+    fn translate_userdata_changed_carries_full_dto_entries() {
+        // B36 — the wire UserDataList must carry the serialized
+        // UserItemDataDto verbatim (ItemId, Key, Played, …), not a bare
+        // {ItemId} stub: jellyfin-web patches cards by ItemId/Key and
+        // reads the state fields off each entry.
+        let entry = serde_json::json!({
+            "ItemId": "0000000000000000000000000000002a",
+            "Key": "42",
+            "Played": true,
+            "IsFavorite": false,
+            "PlayCount": 1,
+            "PlaybackPositionTicks": 0,
+            "PlayedPercentage": 0.0,
+        });
         let out = translate_broadcast(SocketBroadcast::UserDataChanged {
             user_id: "u-1".into(),
-            item_id: "42".into(),
+            entries: vec![entry.clone()],
         })
         .unwrap();
         assert_eq!(out.message_type, "UserDataChanged");
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["UserId"], "u-1");
-        assert_eq!(v["Data"]["UserDataList"][0]["ItemId"], "42");
+        assert_eq!(v["Data"]["UserDataList"][0], entry);
     }
 
     #[test]
