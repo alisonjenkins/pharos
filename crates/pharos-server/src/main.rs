@@ -762,7 +762,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // warm-demuxes down to a trickle while a client is streaming so they never
     // starve live playback, then reopens when quiet.
     pharos_server::state::AppState::spawn_bg_io_regulator(app_state.clone().into_inner());
-    pharos_server::library_watch::spawn_subtitle_warm_all(app_state.clone());
+    // B34 — NO separate library-wide subtitle warm-all: the trickplay
+    // backfill sweep already warms each item's subtitles + fonts right after
+    // its sprites (newest-first). Running both walkers concurrently starved
+    // trickplay COMPLETELY: the warm-all's cold whole-file demuxes (minutes
+    // each) monopolized the shared bg_io gate AND all 4 libav pool workers
+    // (pool `permits.acquire()` has no timeout), so even the gate-bypassing
+    // priority path queued forever — live coverage after days: 119/12100.
+    // Single-item playback-priority warms (PlaybackInfo) are untouched.
     // Phase B1 — evict stale durable transcode-session rows (failover
     // breadcrumbs) so the table doesn't grow unbounded.
     app_state.transcode_sessions.spawn_pruner();
