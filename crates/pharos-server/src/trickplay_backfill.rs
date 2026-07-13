@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 const WARMUP: Duration = Duration::from_secs(45);
 const PASS_INTERVAL: Duration = Duration::from_secs(600);
-const COOLDOWN: Duration = Duration::from_secs(3);
+const COOLDOWN: Duration = Duration::from_secs(1);
 /// How many general-sweep items to generate CONCURRENTLY. Generation is
 /// largely NFS-I/O-bound (keyframe seeks leave the CPU near-idle), so a strictly
 /// sequential sweep wastes almost all of a multi-core box while a 13k-item

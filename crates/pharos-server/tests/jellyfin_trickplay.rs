@@ -355,8 +355,38 @@ async fn http_get_item_emits_nested_trickplay() {
         })
         .await
         .unwrap();
+    // B35 — the DTO must advertise ONLY widths whose tiles are actually on
+    // disk. Seed tile 0 for width 320 (item 7) and nothing for width 640 or
+    // for item 8: the DTO carries "320" only, and item 8 omits Trickplay
+    // entirely (clients otherwise render an empty scrub-preview box against
+    // 404 tiles).
+    stores
+        .put(MediaItem {
+            id: 8,
+            path: "/m/y.mkv".into(),
+            title: "y".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(180_000),
+                width: Some(1920),
+                height: Some(1080),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    // Match the cache's generation marker so construction doesn't wipe the
+    // seeded tile (reconcile_generation clears an unversioned root).
+    std::fs::write(cache_dir.path().join(".gen_version"), "1").unwrap();
+    std::fs::create_dir_all(cache_dir.path().join("7/320")).unwrap();
+    std::fs::write(cache_dir.path().join("7/320/0.jpg"), b"jpg").unwrap();
+    let cache = TrickplayCache::new(cache_dir.path(), u64::MAX);
     let state = web::Data::new(
-        AppState::new(stores, "srv".into()).with_trickplay_layout(vec![320, 640], 10_000),
+        AppState::new(stores, "srv".into())
+            .with_trickplay_cache(cache)
+            .with_trickplay_layout(vec![320, 640], 10_000),
     );
     let app = test::init_service(
         App::new()
@@ -380,16 +410,32 @@ async fn http_get_item_emits_nested_trickplay() {
         320,
         "GET /Items/7 dropped the nested Trickplay map: {v}"
     );
-    assert_eq!(
-        v["Trickplay"]["00000000000000000000000000000007"]["640"]["Width"]
-            .as_u64()
-            .unwrap(),
-        640
+    // Width 640 has NO tiles on disk → must NOT be advertised (B35).
+    assert!(
+        v["Trickplay"]["00000000000000000000000000000007"]
+            .get("640")
+            .is_none(),
+        "ungenerated width advertised: {}",
+        v["Trickplay"]
     );
     // Guard the pre-fix flat shape can't creep back at the HTTP layer either.
     assert!(
         v["Trickplay"].get("320").is_none(),
         "flat wire shape regressed: {}",
+        v["Trickplay"]
+    );
+
+    // Item 8: nothing generated → no Trickplay field at all.
+    let req = test::TestRequest::get()
+        .uri("/Items/8")
+        .insert_header(("X-Emby-Token", token.0.expose().to_string()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = test::read_body_json(resp).await;
+    assert!(
+        v.get("Trickplay").is_none() || v["Trickplay"].as_object().is_some_and(|m| m.is_empty()),
+        "item with no tiles must not advertise Trickplay: {}",
         v["Trickplay"]
     );
 }

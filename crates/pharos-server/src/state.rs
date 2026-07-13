@@ -579,6 +579,17 @@ impl AppState {
         self
     }
 
+    /// The configured trickplay widths that ACTUALLY have tiles on disk for
+    /// `media_id` (B35). Empty when trickplay is disabled or nothing is
+    /// generated yet — `with_trickplay` then omits the DTO field, so clients
+    /// never render an empty scrub-preview box for tiles that 404.
+    pub fn generated_trickplay_widths(&self, media_id: u64) -> Vec<u32> {
+        match &self.trickplay {
+            Some(cache) => cache.generated_widths(media_id, &self.trickplay_widths),
+            None => Vec::new(),
+        }
+    }
+
     pub fn with_trickplay_priority(mut self, tx: crate::trickplay_backfill::PriorityTx) -> Self {
         self.trickplay_priority = Some(tx);
         self

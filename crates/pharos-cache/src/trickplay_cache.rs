@@ -122,6 +122,14 @@ struct CacheState {
 #[derive(Clone)]
 pub struct TrickplayCache {
     root: PathBuf,
+    /// In-memory mirror of "tile 0 exists" per (media, width) — kept so the
+    /// hot DTO path can gate `BaseItemDto.Trickplay` on ACTUAL tile presence
+    /// without a disk stat per item per request (B35: the DTO used to
+    /// advertise trickplay for every video regardless of disk state, so
+    /// clients rendered an empty preview box until tiles existed). Primed by
+    /// a one-shot root walk at construction; updated on generation and
+    /// eviction; self-heals via `is_generated`'s disk fallback.
+    generated: Arc<dashmap::DashSet<CacheKey>>,
     max_bytes: u64,
     ffmpeg_bin: PathBuf,
     state: Arc<Mutex<CacheState>>,
@@ -144,8 +152,31 @@ impl TrickplayCache {
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
         let root = root.into();
         Self::reconcile_generation(&root);
+        let generated = Arc::new(dashmap::DashSet::new());
+        // One-shot prime: walk {root}/{media}/{width}/0.jpg. Sync std::fs at
+        // construction (boot) — ~1 stat per cached width dir.
+        if let Ok(medias) = std::fs::read_dir(&root) {
+            for m in medias.flatten() {
+                let Some(mid) = m.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) else {
+                    continue;
+                };
+                let Ok(widths) = std::fs::read_dir(m.path()) else {
+                    continue;
+                };
+                for w in widths.flatten() {
+                    let Some(wv) = w.file_name().to_str().and_then(|n| n.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if w.path().join("0.jpg").is_file() {
+                        generated.insert((mid, wv));
+                    }
+                }
+            }
+        }
         Self {
             root,
+            generated,
             max_bytes,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             state: Arc::new(Mutex::new(CacheState::default())),
@@ -265,6 +296,7 @@ impl TrickplayCache {
         }
 
         let bytes_written = self.generate(key, layout, source).await?;
+        self.generated.insert(key);
         self.record(key, bytes_written).await;
         self.maybe_evict().await;
         // Drop the per-key fetch lock — the LRU keeps the files.
@@ -303,8 +335,26 @@ impl TrickplayCache {
     /// "already generated?" probe the background pre-generator uses to skip
     /// finished items without re-deriving the layout.
     pub async fn is_generated(&self, media_id: u64, width: u32) -> bool {
+        if self.generated.contains(&(media_id, width)) {
+            return true;
+        }
         let path = self.tile_path((media_id, width), 0);
-        tokio::fs::try_exists(&path).await.unwrap_or(false)
+        let on_disk = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        if on_disk {
+            self.generated.insert((media_id, width));
+        }
+        on_disk
+    }
+
+    /// The subset of `widths` with tiles actually on disk for `media_id` —
+    /// the sync, in-memory gate the DTO builders use for
+    /// `BaseItemDto.Trickplay` (B35).
+    pub fn generated_widths(&self, media_id: u64, widths: &[u32]) -> Vec<u32> {
+        widths
+            .iter()
+            .copied()
+            .filter(|w| self.generated.contains(&(media_id, *w)))
+            .collect()
     }
 
     /// Generate the full sprite set for `(media_id, width)` if it isn't already
@@ -529,7 +579,8 @@ impl TrickplayCache {
                 to_remove.push((key, self.key_dir(key)));
             }
         }
-        for (_, dir) in to_remove {
+        for (key, dir) in to_remove {
+            self.generated.remove(&key);
             let _ = tokio::fs::remove_dir_all(&dir).await;
         }
     }

@@ -40,6 +40,18 @@ const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_HEAVY_OP_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_MAX_WORKERS: usize = 4;
 
+/// Short label for logs.
+fn op_name(op: &TinyOp) -> &'static str {
+    match op {
+        TinyOp::Probe { .. } => "probe",
+        TinyOp::Image { .. } => "image",
+        TinyOp::Trickplay { .. } => "trickplay",
+        TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
+        TinyOp::Waveform { .. } => "waveform",
+        _ => "other",
+    }
+}
+
 /// Whole-file ops that need `heavy_op_timeout` rather than the tiny-op cap.
 fn is_heavy_op(op: &TinyOp) -> bool {
     matches!(op, TinyOp::Trickplay { .. } | TinyOp::Waveform { .. })
@@ -260,12 +272,24 @@ impl LibavWorkerPool {
     /// worker, run one op, and return the terminal `WorkerEvent`. A
     /// healthy worker is returned to the idle set; a broken one is dropped.
     async fn run(&self, op: TinyOp) -> Result<WorkerEvent, PoolError> {
+        // B34 postmortem: an untimed queue here starved trickplay for DAYS
+        // with zero log output. Make saturation visible: warn when an op
+        // waits unreasonably long for a worker slot.
+        let wait_started = std::time::Instant::now();
         let _permit = self
             .inner
             .permits
             .acquire()
             .await
             .map_err(|e| PoolError::Dead(format!("pool closed: {e}")))?;
+        let waited = wait_started.elapsed();
+        if waited > Duration::from_secs(10) {
+            tracing::warn!(
+                waited_ms = waited.as_millis() as u64,
+                op = op_name(&op),
+                "libav pool saturated: op waited long for a worker slot"
+            );
+        }
 
         let job_id = JobId(self.inner.next_job.fetch_add(1, Ordering::Relaxed));
         let op_timeout = if is_heavy_op(&op) {

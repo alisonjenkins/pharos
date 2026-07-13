@@ -471,7 +471,7 @@ async fn items_similar(
             let ud = user_data.get(i).copied().unwrap_or_default();
             BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
         })
@@ -1237,7 +1237,7 @@ async fn shows_next_up(
             let ud = user_data.get(*idx).copied().unwrap_or_default();
             BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
         })
@@ -1377,7 +1377,7 @@ async fn shows_episodes(
             let ud = user_data.get(*idx).copied().unwrap_or_default();
             BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
         })
@@ -1962,7 +1962,7 @@ async fn list_user_items_latest(
             let ud = user_data.get(i).copied().unwrap_or_default();
             BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
         })
@@ -3061,7 +3061,7 @@ pub(crate) async fn build_items_page_with_fields(
         let mut dto = BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
             .with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             );
         // Best-effort per-row enrichment: a store error just leaves the
@@ -3715,7 +3715,7 @@ async fn fetch_item_dto(
         BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
             .with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
             .with_local_artwork_tags(id, &local_art_roles)
@@ -4097,7 +4097,7 @@ async fn list_user_items_resume(
             let ud = user_data.get(i).copied().unwrap_or_default();
             BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
                 &item.probe,
-                &state.trickplay_widths,
+                &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
         })

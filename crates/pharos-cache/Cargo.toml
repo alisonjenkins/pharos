@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+dashmap.workspace = true
 pharos-core = { path = "../pharos-core" }
 pharos-transcode = { path = "../pharos-transcode", default-features = false }
 thiserror.workspace = true
