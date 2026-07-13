@@ -59,10 +59,17 @@ helm install pharos charts/pharos -n pharos --create-namespace \
   --set persistence.media.existingClaim=my-media-pvc
 ```
 
-The chart is single-replica by design: SQLite is single-writer and the
-in-process caches + transcode scheduler are not HA-safe. Use an external
-Postgres before considering scale-out (and note the app is not yet horizontally
-scalable regardless).
+Replicas + deploy strategy depend on the database backend (ADR-0015):
+
+- **SQLite** (default): single replica, and the chart **forces `Recreate`**
+  regardless of `strategy.type` — SQLite is single-writer on an RWO PVC, so
+  two pods must never overlap.
+- **Postgres**: `strategy.type=RollingUpdate` with surge gives zero-downtime
+  deploys (a second pod briefly overlaps the draining one). Multi-replica
+  overlap is safe: SyncPlay groups are persisted and owned per-group via
+  Postgres advisory locks with cross-replica command forwarding (ADR-0016).
+  Steady-state `replicaCount` stays 1 on a single-node cluster — a second
+  permanent replica buys no HA there; the value is the deploy overlap window.
 
 ## Storage
 
@@ -90,6 +97,11 @@ Default is SQLite on the db PVC. Switch to Postgres by setting
 helm install pharos charts/pharos -n pharos \
   --set config.database.url='postgres://pharos:pw@postgres:5432/pharos'
 ```
+
+The reference deployment (home k3s) runs Postgres provisioned by
+[CloudNativePG](https://cloudnative-pg.io/) with `RollingUpdate` for
+zero-downtime deploys — see ADR-0015 for the migration story and why the old
+sqlite PVC is retained as a rollback hatch.
 
 ## Library scan
 

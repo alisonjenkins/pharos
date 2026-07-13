@@ -1,0 +1,34 @@
+direction: up
+
+core: "pharos-core\ntraits + domain types, no IO deps"
+transcode: "pharos-transcode\nlibav pool + spawn backends"
+cache: "pharos-cache\ndisk caches (image/trickplay/\nsegment/subtitle)"
+scanner: "pharos-scanner\nincremental scan + probe"
+sync: "pharos-sync\ngroup actors, registry,\ndelivery + persistence traits"
+japi: "pharos-jellyfin-api\nwire DTOs + id mapping"
+store: "pharos-store-sqlx\nSqliteStore, PostgresStore\n+ parallel migration trees"
+discovery: "pharos-discovery\nSSDP/DLNA announce"
+server: "pharos-server\nactix-web, CLI, config, obs\nwires everything into routes"
+ui: "pharos-ui\nDioxus 0.7 WASM (standalone,\nno internal deps; talks HTTP)"
+testclient: "pharos-jellyfin-test-client\nstrict-serde compat client\n(dev-dep of server tests)"
+
+transcode -> core
+cache -> core
+cache -> transcode
+scanner -> core
+scanner -> transcode
+sync -> core
+japi -> core
+japi -> cache
+store -> core
+store -> sync
+discovery -> core
+server -> core
+server -> store
+server -> japi
+server -> sync
+server -> cache
+server -> scanner
+server -> transcode
+server -> discovery
+testclient -> server: tests {style.stroke-dash: 3}

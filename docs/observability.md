@@ -38,9 +38,9 @@ Two-layer strategy:
 
 `SecretString` is intentionally not `Serialize`/`Deserialize`. Callers needing the bytes off the type must call `.expose()` explicitly — the name is a flag for code review.
 
-## Tracing → OTLP (planned)
+## Tracing → OTLP
 
-`config.obs.otlp_endpoint` is plumbed end-to-end but the actual exporter wiring is feature-gated and lands when the first downstream collector requirement appears. Default deploys emit JSON logs to stdout only.
+When `[obs].otlp_endpoint` is set, spans are additionally exported over **OTLP/gRPC** (`opentelemetry-otlp` + `tonic`, batch processor) to a collector — Tempo in the home cluster, and the Tilt dev stack wires one up automatically (see `docs/kubernetes.md`). The tracer provider lives in a `OnceLock` for the process lifetime so the batch exporter keeps flushing. When the endpoint is unset the OTLP layer is a no-op and deploys emit JSON logs to stdout only. Note: Tempo needs multiple Gi of memory — it OOM-crashlooped at a 512Mi limit (ADR-0013).
 
 ## Where each invariant lives
 

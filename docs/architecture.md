@@ -4,78 +4,36 @@ Brief, technical. For deeper Jellyfin-mapping rationale see [`jellyfin-mapping.m
 
 ## 1. Component overview
 
-```mermaid
-flowchart LR
-    subgraph Clients
-        JC[Jellyfin clients<br/>Finamp/Infuse/web]
-        PC[Plex clients<br/>Plexamp/web]
-        DUI[Dioxus web UI<br/>WASM]
-    end
+![architecture-components](diagrams/architecture-components.svg)
 
-    subgraph pharos-server
-        HTTP[actix-web router]
-        JAPI[Jellyfin API scope]
-        PAPI[Plex API scope]
-        WS[group-sync WS hub]
-        OBS[obs<br/>tracing+Prom+OTLP]
-        HEALTH[health-api<br/>/healthz /readyz /info]
-    end
+*Source: [`docs/diagrams/architecture-components.d2`](diagrams/architecture-components.d2) — re-render with `just diagrams` (or `nix run nixpkgs#d2 -- docs/diagrams/architecture-components.d2 docs/diagrams/architecture-components.svg`).*
 
-    subgraph Adapters
-        STORE[pharos-store-sqlx<br/>MediaStore impl]
-        SCAN[Scanner impl]
-        TRANS[Transcoder impl<br/>ffmpeg subprocess]
-    end
+Solid arrows = runtime data path. Dashed = trait impl-of relationship. All
+adapters depend on `pharos-core` traits only (V12).
 
-    CORE[pharos-core<br/>domain traits + types]
+Notes:
 
-    DB[(SQLite / Postgres)]
-    FS[(media filesystem)]
-    FFM[[ffmpeg binary]]
-    OTEL[(OTLP collector)]
-
-    JC --> HTTP
-    PC --> HTTP
-    DUI --> HTTP
-    HTTP --> JAPI
-    HTTP --> PAPI
-    HTTP --> WS
-    HTTP --> HEALTH
-    HTTP --> OBS
-
-    JAPI --> CORE
-    PAPI --> CORE
-    WS --> CORE
-    HEALTH --> STORE
-
-    STORE -. impl .-> CORE
-    SCAN -. impl .-> CORE
-    TRANS -. impl .-> CORE
-
-    STORE --> DB
-    SCAN --> FS
-    TRANS --> FFM
-    OBS --> OTEL
-```
-
-Solid arrows = runtime data path. Dashed = trait impl-of relationship. All adapters depend on `pharos-core` traits only (V12).
+- The only implemented client API is **Jellyfin** (ADR-0001). A Plex
+  projection is a backlog vision (`docs/library-backlog.md`), not a component.
+- Transcode is **hybrid** (ADR-0004): high-frequency tiny ops (probe, poster,
+  trickplay tiles, subtitle convert, waveform) run on a persistent,
+  crash-isolated libav `transcode-worker` pool; video-segment/live transcodes
+  always fork the `ffmpeg` binary.
+- With Postgres, **two server pods can overlap** during a rolling deploy;
+  SyncPlay group ownership is coordinated per-group via advisory locks and a
+  NOTIFY bus (ADR-0015/0016).
 
 ## 2. Crate graph
 
-```mermaid
-flowchart TB
-    core[pharos-core<br/>traits + domain types<br/>no IO deps]
-    sqlx[pharos-store-sqlx<br/>SqliteStore, PostgresStore<br/>sqlx + migrations]
-    server[pharos-server<br/>actix-web, CLI, config, obs<br/>wires impls into routes]
-    ui[pharos-ui<br/>Dioxus WASM<br/>future T24]
+![crate-graph](diagrams/crate-graph.svg)
 
-    sqlx --> core
-    server --> core
-    server --> sqlx
-    ui --> core
-```
+*Source: [`docs/diagrams/crate-graph.d2`](diagrams/crate-graph.d2) — re-render with `just diagrams` (or `nix run nixpkgs#d2 -- docs/diagrams/crate-graph.d2 docs/diagrams/crate-graph.svg`).*
 
-Direction = `depends-on`. `pharos-core` has zero IO deps so domain logic is testable without DB/fs/network.
+Direction = `depends-on`. `pharos-core` has zero IO deps so domain logic is
+testable without DB/fs/network. `pharos-ui` is deliberately dependency-free
+within the workspace (wasm32 target; no workspace-hack) and speaks to the
+server over HTTP only. A `workspace-hack` crate (cargo-hakari) unifies
+feature-resolution across the native crates.
 
 ## 3. Request flow — Jellyfin `GET /Items/{id}`
 
@@ -138,24 +96,20 @@ Rules (V18):
 - Mutable runtime state owned by exactly one task. Handlers send `mpsc::Sender<Msg>` messages — never lock shared state.
 - `sqlx::Pool` is the exception — it's lock-free internally and acts as its own concurrency primitive.
 - One-shot init (obs, config) uses `OnceLock` / `Once`. No `Mutex` on request path.
+- `tokio::sync::Semaphore` is a sanctioned primitive for *capacity* (not state): the CPU/GPU transcode permits and the adaptive `bg_io` gate (ADR-0017).
+- The SyncPlay group actors live in `pharos-sync` (`GroupRegistry` → one task per group); with Postgres, group ownership spans replicas via advisory locks (ADR-0016).
 
 ## 5. Data flow — scan → store → serve
 
-```mermaid
-flowchart LR
-    FS[(media roots)] -->|walk| SCAN[Scanner task]
-    SCAN -->|ffprobe| FFM[[ffmpeg]]
-    SCAN -->|MediaItem stream| STORE[MediaStore.put]
-    STORE --> DB[(sqlite)]
+![scan-flow](diagrams/scan-flow.svg)
 
-    DB --> RH[API handler<br/>MediaStore.list/get]
-    RH --> NET((client))
+*Source: [`docs/diagrams/scan-flow.d2`](diagrams/scan-flow.d2) — re-render with `just diagrams` (or `nix run nixpkgs#d2 -- docs/diagrams/scan-flow.d2 docs/diagrams/scan-flow.svg`).*
 
-    classDef bg fill:#eef,stroke:#88a;
-    class FS,DB,FFM,NET bg;
-```
-
-Per V5: scan runs in dedicated task pool; never blocks handler tasks. Per V10: each `put` is atomic — readers never see partial entries.
+Per V5: scan runs in dedicated task pool; never blocks handler tasks. Per V10:
+each `put` is atomic — readers never see partial entries. Every background
+whole-file read (scan probes, subtitle warming, trickplay generation) acquires
+the shared adaptive `bg_io` semaphore, which parks to one permit while anyone
+is streaming (ADR-0017).
 
 ## 6. Boundary summary
 
@@ -164,7 +118,10 @@ Per V5: scan runs in dedicated task pool; never blocks handler tasks. Per V10: e
 | HTTP ingress | actix scope + TracingLogger | V4 (no panic), V13 (trace) |
 | Domain ↔ IO | `pharos-core` traits, adapter crates | V12 |
 | Cross-task state | tokio mpsc, actor pattern | V18 |
+| Process ↔ libav | crash-isolated `transcode-worker` subprocess pool (ADR-0004) | V6 (no crash propagation) |
 | Process ↔ ffmpeg | subprocess + structured stdout/stderr | V6 (no crash propagation) |
+| Background I/O ↔ playback | shared adaptive `bg_io` semaphore (ADR-0017) | playback never starved |
+| Replica ↔ replica | per-group advisory lock + NOTIFY bus (ADR-0016) | V25 |
 | Process ↔ logs | `tracing` crate only | V15 |
 | Process ↔ metrics | `metrics` + Prometheus exporter | V14 |
 | Filesystem ↔ HTTP | path canonicalization + auth gate | V9 (no traversal) |

@@ -174,23 +174,24 @@ compat-playwright-full:
     sleep 2
     nix develop --command bash -c 'cd compat-playwright && npx playwright test'
 
-# Render every docs/*.d2 source to a sibling SVG. `d2` is not in the
-# devShell; `nix run nixpkgs#d2` pulls it on demand and caches in the
-# nix store after first run. SVGs are intentionally not committed —
-# the .d2 source is canonical, SVGs regenerate on demand.
+# Render every docs/*.d2 + docs/diagrams/*.d2 source to a sibling SVG.
+# `d2` is not in the devShell; `nix run nixpkgs#d2` pulls it on demand and
+# caches in the nix store after first run. The .d2 source is canonical;
+# rendered SVGs ARE committed so the diagrams display inline on GitHub —
+# re-run this recipe after editing any .d2 and commit both.
 diagrams:
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
     found=0
-    for src in docs/*.d2; do
+    for src in docs/*.d2 docs/diagrams/*.d2; do
       found=1
       out="${src%.d2}.svg"
       echo "rendering $src -> $out"
       nix run nixpkgs#d2 -- "$src" "$out"
     done
     if [[ $found -eq 0 ]]; then
-      echo "no docs/*.d2 sources found"
+      echo "no .d2 sources found under docs/"
       exit 1
     fi
 

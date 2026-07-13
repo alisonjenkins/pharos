@@ -15,7 +15,7 @@ Goal: extract Jellyfin's load-bearing patterns and translate to idiomatic Rust. 
 | `MediaStream` | `MediaStream` enum | `pharos-core` | `Video`, `Audio`, `Subtitle` variants. |
 | `Library` / `CollectionFolder` | `Library` struct | `pharos-core` | Roots + kind + scanner config. |
 | `PlaylistItem` / `Playlist` | `Playlist` struct | `pharos-core` | Ordered list of `MediaId`. |
-| `SyncPlayGroup` | `SyncSession` (actor) | `pharos-server` (or future `pharos-sync` crate) | See §5. |
+| `SyncPlayGroup` | group actor (`GroupState`) | `pharos-sync` | See §5; durability + multi-replica in ADR-0016. |
 
 Rule: every entity is `Debug + Clone + Send + Sync + Serialize + Deserialize` unless a comment justifies otherwise.
 
@@ -31,7 +31,7 @@ Jellyfin uses C# interfaces injected via Autofac. We use Rust traits with native
 | `ILibraryManager` | `LibraryService` (struct, not trait — single impl) | `pharos-server` | Wraps `MediaStore` + `Scanner`. |
 | `IMediaSourceProvider` | `MediaSourceResolver` trait | `pharos-core` | Pending T7. Maps `MediaItem` → playable `MediaSource`s. |
 | `IAuthenticationProvider` | `AuthBackend` trait | `pharos-core` | Pending T4. Variants: builtin (Argon2 over local store), future LDAP/OIDC. |
-| `IMediaEncoder` | `Transcoder` trait | `pharos-core` ✓ (signature only) | ffmpeg adapter in `pharos-transcode` (future). |
+| `IMediaEncoder` | `Transcoder` trait | `pharos-core` | Implemented in `pharos-transcode`: libav worker pool for tiny ops + spawn ffmpeg for segments (ADR-0004). |
 | `ISessionManager` | `SessionActor` | `pharos-server` | Actor-only. No trait — one impl. |
 | `IDeviceManager` | `DeviceRegistry` | `pharos-server` | Actor-only. |
 | `IUserDataManager` | embedded in `MediaStore` | — | Watched/resume position kept in same store under `user_data` table. |

@@ -1,0 +1,16 @@
+direction: right
+
+fs: "media roots (NFS)" {shape: cylinder}
+scan: "Scanner task\n(incremental, ADR-0008)"
+probe: "libav probe\n(transcode-worker pool)"
+store: "MediaStore.put"
+db: "SQLite / Postgres" {shape: cylinder}
+rh: "API handler\nMediaStore.list/get"
+net: "client" {shape: oval}
+
+fs -> scan: walk
+scan -> probe: "probe (bg_io gated)"
+scan -> store: MediaItem stream
+store -> db
+db -> rh
+rh -> net

@@ -4,6 +4,13 @@ Concrete design for synchronized playback across clients in a group. Drives T16 
 
 > **Compatibility note (2026-05-26):** existing Jellyfin phone and TV clients are first-class targets. The Jellyfin-shaped socket described in §10 below is the canonical entry — those clients work unmodified. The richer protocol in §3–§7 is an *extended* path mounted at `/sync/v1/ws` for pharos-native (Dioxus) clients. Server actor is the same for both; only the framing differs.
 
+> **As-built note (2026-07-13):** this is the *design-time* document. The
+> implementation kept the core (actor per group, NTP-style offset, server-clock
+> scheduling, Jellyfin translation layer) but production hardening changed
+> several specifics — **§12 below is the delta list and wins over §2/§7 where
+> they disagree.** Durability + multi-replica distribution are covered by
+> [ADR-0016](adr/0016-syncplay-durability-distribution.md).
+
 See [`jellyfin-mapping.md`](jellyfin-mapping.md) §5 for the C# SyncPlay → Rust translation rationale, and [`architecture.md`](architecture.md) §4 for the surrounding concurrency model.
 
 ## 1. Goal
@@ -188,3 +195,43 @@ Those features land on the extended `/sync/v1/ws` path for Dioxus and other phar
 | V4 (no panic from handler) | WS handler returns `Result<_, actix_ws::Error>`; surface via `Error` frame, not panic |
 | V19 (improve on Jellyfin failure modes) | Per-member offset; one corrective Pause cap on leader handoff; auto-reconverge after <2 s blip without rejoin |
 | V20 (Jellyfin wire-compat) | Translation layer on `/socket`; actor untouched (§10) |
+
+## 12. As-built deltas (2026-07-13)
+
+What production hardening changed vs the design above. Authoritative detail:
+`SPEC.md` §V (V21, V25) + §B (B9, B24–B33) and ADR-0016.
+
+- **Member identity is deterministic** — UUIDv5 derived from the client
+  `deviceId` (`hub.rs`), not a fresh UUIDv4 per connection. Same device ⇒ same
+  member across reconnects *and process restarts*; every recovery path builds
+  on this. §7.1's "lowest MemberId" election was replaced: the **leader is the
+  first joiner**, and election re-runs only when a member joins an empty group.
+- **Groups are durable** — every mutation snapshots to the `sync_groups` table
+  (`GroupPersistence`); on `/socket` connect with no in-memory membership the
+  server recovers from the snapshot and resyncs the client. Never-joined groups
+  dissolve after 120s; snapshots older than 48h are janitored; ghost members
+  are pruned by a ping-fed TTL (150s, fed by the socket `KeepAlive`).
+- **Multi-replica** — one owning replica per group, elected via Postgres
+  advisory lock; non-owners hold bus-forwarding remote handles (NOTIFY), with
+  same-replica members delivered directly. Boot reconciliation re-adopts
+  persisted groups with retries until ownership is confirmed.
+- **Readiness gate replaces the naive buffering rule.** §7's "buffering > 1 s
+  → corrective group Pause" is not what shipped: jellyfin-web ACKs (`Ready`)
+  only on an actual player transition, so the server must **never withhold the
+  command that causes the transition** (SPEC V21/B9). Unpause of a
+  non-buffering group broadcasts immediately; Seek broadcasts at gate entry
+  and gates only the resume; gates carry a 30s anti-wedge timeout and honour
+  `SetIgnoreWait`. A buffering *freeze* auto-resumes when the last straggler
+  reports ready. Every `Pause` carries `PositionTicks` (a positionless Pause
+  makes jellyfin-web seek to 0:00).
+- **No group command is silently dropped** — a command from a session with no
+  recoverable group answers `NotInGroup`; `LeaveGroup` always ACKs `GroupLeft`
+  (V25).
+- **jellyfin-web transport reality:** commands arrive over **HTTP POST**
+  (`/SyncPlay/Pause`, `/SyncPlay/Unpause`, `/SyncPlay/Seek`, `/SyncPlay/Ready`,
+  `/SyncPlay/Ping`, …) — the `/socket` WebSocket is effectively *server→client
+  only* for SyncPlay (`SyncPlayCommand`/`SyncPlayGroupUpdate` out, `KeepAlive`
+  in). §10's inbound `SyncPlayPlay`-style socket messages exist but stock
+  jellyfin-web doesn't send them; an HTTP bridge feeds the same actor.
+- **The extended `/sync/v1/ws` path** remains available for pharos-native
+  clients as designed; the Plex mount (`/:/sync/v1/ws`) never shipped.

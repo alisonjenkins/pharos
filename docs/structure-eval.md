@@ -51,7 +51,9 @@ pharos/
 
 ## 2. Workspace dep graph
 
-Source: [`structure-eval-deps.d2`](./structure-eval-deps.d2) — render via `just diagrams`.
+![structure-eval-deps](structure-eval-deps.svg)
+
+Source: [`structure-eval-deps.d2`](./structure-eval-deps.d2) — re-render via `just diagrams`.
 
 ```d2
 direction: down
@@ -87,7 +89,9 @@ Observations:
 
 ## 3. `pharos-server` internal clusters
 
-Source: [`structure-eval-server.d2`](./structure-eval-server.d2) — render via `just diagrams`.
+![structure-eval-server](structure-eval-server.svg)
+
+Source: [`structure-eval-server.d2`](./structure-eval-server.d2) — re-render via `just diagrams`.
 
 Six containers group the 19 top-level modules into would-be-a-crate boundaries. Orange = top split candidate. All clusters currently funnel through `state::AppState`, which is the main coupling point a split has to address.
 
@@ -209,7 +213,7 @@ Do **not** split `pharos-ui` further. It's already a separate crate, already det
 ## 6. Rendering the diagrams
 
 ```sh
-just diagrams                # renders every docs/*.d2 -> docs/*.svg
+just diagrams                # renders every docs/*.d2 + docs/diagrams/*.d2 -> sibling .svg
 ```
 
-The recipe uses `nix run nixpkgs#d2` so `d2` does not need to live in the devShell. Rendered SVGs are intentionally not committed — the `.d2` source is canonical.
+The recipe uses `nix run nixpkgs#d2` so `d2` does not need to live in the devShell. Rendered SVGs are committed (they display inline on GitHub); the `.d2` source stays canonical — re-render and commit both after editing.

@@ -1,0 +1,51 @@
+direction: right
+
+clients: Clients {
+  jc: "Jellyfin clients\n(jellyfin-web / Android / TV)"
+  dui: "Dioxus web UI (WASM)\nserved at /ui/*"
+}
+
+server: pharos-server {
+  http: "actix-web router\n(LowercasePath)"
+  japi: "Jellyfin API scope\n(api/jellyfin/*)"
+  ws: "/socket WS\n+ SyncPlay HTTP bridge"
+  obs: "obs\ntracing + Prom + OTLP"
+  health: "health-api\n/healthz /readyz /info"
+}
+
+adapters: Adapter crates {
+  store: "pharos-store-sqlx\nMediaStore/UserStore/… impls"
+  scan: "pharos-scanner\nincremental fs walk"
+  trans: "pharos-transcode\nlibav worker pool (tiny ops)\n+ spawn ffmpeg (segments)"
+  cache: "pharos-cache\nimage / trickplay / segment /\nsubtitle caches"
+  sync: "pharos-sync\ngroup actors + registry +\npersistence/delivery traits"
+}
+
+core: "pharos-core — domain traits + types (no IO deps)"
+
+db: "SQLite / Postgres\n(CNPG in the home deploy)" {shape: cylinder}
+fs: "media filesystem (NFS, ro)" {shape: cylinder}
+worker: "transcode-worker\nsubprocess pool" 
+otel: "OTLP collector (Tempo)" {shape: cylinder}
+
+clients.jc -> server.http
+clients.dui -> server.http
+server.http -> server.japi
+server.http -> server.ws
+server.http -> server.health
+server.http -> server.obs
+
+server.japi -> core
+server.ws -> adapters.sync
+server.health -> adapters.store
+
+adapters.store -> core: impl {style.stroke-dash: 3}
+adapters.scan -> core: impl {style.stroke-dash: 3}
+adapters.trans -> core: impl {style.stroke-dash: 3}
+adapters.sync -> core: impl {style.stroke-dash: 3}
+
+adapters.store -> db
+adapters.scan -> fs
+adapters.trans -> worker
+adapters.trans -> fs
+server.obs -> otel
