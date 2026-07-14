@@ -1,222 +1,26 @@
 {
   "Items": [
     {
-      "Album": "Echo Album",
+      "AlbumArtist": "Echo Artist",
       "AlbumArtists": [
         {
           "Id": "1743b84e4044fdd81743b84e4044fdd8",
           "Name": "Echo Artist"
         }
       ],
-      "AlbumId": "080477e50c7a1f08080477e50c7a1f08",
-      "ArtistItems": [
-        {
-          "Id": "1743b84e4044fdd81743b84e4044fdd8",
-          "Name": "Echo Artist"
-        }
-      ],
-      "Artists": [
-        "Echo Artist"
-      ],
       "BackdropImageTags": [],
-      "CanPlay": true,
-      "Chapters": [],
-      "DateCreated": "1970-01-01T01:56:40.0000000Z",
-      "ExternalUrls": [],
-      "GenreItems": [
-        {
-          "Id": "469379f6f37d13f3469379f6f37d13f3",
-          "Name": "Jazz"
-        }
-      ],
-      "Genres": [
-        "Jazz"
-      ],
-      "Id": "0000000000000000000000000000001e",
-      "ImageTags": {
-        "Primary": "4e869b5f937ba34b"
-      },
-      "IsFolder": false,
-      "LocationType": "FileSystem",
-      "MediaSources": [
-        {
-          "Container": "mp3",
-          "DefaultAudioStreamIndex": 0,
-          "ETag": "0",
-          "GenPtsInput": false,
-          "HasSegments": false,
-          "Id": "0000000000000000000000000000001e",
-          "IgnoreDts": false,
-          "IgnoreIndex": false,
-          "IsInfiniteStream": false,
-          "IsRemote": false,
-          "MediaStreams": [
-            {
-              "Index": 0,
-              "IsDefault": true,
-              "IsExternal": false,
-              "IsForced": false,
-              "IsHearingImpaired": false,
-              "IsInterlaced": false,
-              "IsOriginal": false,
-              "IsTextSubtitleStream": false,
-              "SupportsExternalStream": false,
-              "Type": "Audio"
-            }
-          ],
-          "Name": "Echo Track",
-          "Protocol": "File",
-          "ReadAtNativeFramerate": false,
-          "RequiresClosing": false,
-          "RequiresLooping": false,
-          "RequiresOpening": false,
-          "RunTimeTicks": 2000000000,
-          "SupportsDirectPlay": true,
-          "SupportsDirectStream": true,
-          "SupportsProbing": true,
-          "SupportsTranscoding": true,
-          "TranscodingSubProtocol": "http",
-          "Type": "Default",
-          "VideoType": "VideoFile"
-        }
-      ],
-      "MediaType": "Audio",
-      "Name": "Echo Track",
-      "ParentId": "080477e50c7a1f08080477e50c7a1f08",
-      "People": [],
-      "PlayAccess": "Full",
-      "ProductionLocations": [],
-      "ProviderIds": {},
-      "RemoteTrailers": [],
-      "RunTimeTicks": 2000000000,
-      "ScreenshotImageTags": [],
+      "ChildCount": 2,
+      "Genres": [],
+      "Id": "080477e50c7a1f08080477e50c7a1f08",
+      "ImageTags": {},
+      "IsFolder": true,
+      "MediaType": "Unknown",
+      "Name": "Echo Album",
       "ServerId": "SERVERID",
-      "Studios": [],
       "Tags": [],
-      "Trickplay": {},
-      "Type": "Audio",
-      "UserData": {
-        "IsFavorite": false,
-        "ItemId": "0000000000000000000000000000001e",
-        "Key": "30",
-        "LastPlayedDate": null,
-        "Likes": null,
-        "PlayCount": 0,
-        "PlaybackPositionTicks": 0,
-        "Played": false,
-        "PlayedPercentage": 0.0,
-        "Rating": null
-      }
-    },
-    {
-      "Album": "Echo Album",
-      "AlbumArtists": [
-        {
-          "Id": "1743b84e4044fdd81743b84e4044fdd8",
-          "Name": "Echo Artist"
-        }
-      ],
-      "AlbumId": "080477e50c7a1f08080477e50c7a1f08",
-      "ArtistItems": [
-        {
-          "Id": "1743b84e4044fdd81743b84e4044fdd8",
-          "Name": "Echo Artist"
-        }
-      ],
-      "Artists": [
-        "Echo Artist"
-      ],
-      "BackdropImageTags": [],
-      "CanPlay": true,
-      "Chapters": [],
-      "DateCreated": "1970-01-01T02:13:20.0000000Z",
-      "ExternalUrls": [],
-      "GenreItems": [
-        {
-          "Id": "469379f6f37d13f3469379f6f37d13f3",
-          "Name": "Jazz"
-        }
-      ],
-      "Genres": [
-        "Jazz"
-      ],
-      "Id": "0000000000000000000000000000001f",
-      "ImageTags": {
-        "Primary": "6620922965f75a27"
-      },
-      "IsFolder": false,
-      "LocationType": "FileSystem",
-      "MediaSources": [
-        {
-          "Container": "mp3",
-          "DefaultAudioStreamIndex": 0,
-          "ETag": "0",
-          "GenPtsInput": false,
-          "HasSegments": false,
-          "Id": "0000000000000000000000000000001f",
-          "IgnoreDts": false,
-          "IgnoreIndex": false,
-          "IsInfiniteStream": false,
-          "IsRemote": false,
-          "MediaStreams": [
-            {
-              "Index": 0,
-              "IsDefault": true,
-              "IsExternal": false,
-              "IsForced": false,
-              "IsHearingImpaired": false,
-              "IsInterlaced": false,
-              "IsOriginal": false,
-              "IsTextSubtitleStream": false,
-              "SupportsExternalStream": false,
-              "Type": "Audio"
-            }
-          ],
-          "Name": "Foxtrot Track",
-          "Protocol": "File",
-          "ReadAtNativeFramerate": false,
-          "RequiresClosing": false,
-          "RequiresLooping": false,
-          "RequiresOpening": false,
-          "RunTimeTicks": 3000000000,
-          "SupportsDirectPlay": true,
-          "SupportsDirectStream": true,
-          "SupportsProbing": true,
-          "SupportsTranscoding": true,
-          "TranscodingSubProtocol": "http",
-          "Type": "Default",
-          "VideoType": "VideoFile"
-        }
-      ],
-      "MediaType": "Audio",
-      "Name": "Foxtrot Track",
-      "ParentId": "080477e50c7a1f08080477e50c7a1f08",
-      "People": [],
-      "PlayAccess": "Full",
-      "ProductionLocations": [],
-      "ProviderIds": {},
-      "RemoteTrailers": [],
-      "RunTimeTicks": 3000000000,
-      "ScreenshotImageTags": [],
-      "ServerId": "SERVERID",
-      "Studios": [],
-      "Tags": [],
-      "Trickplay": {},
-      "Type": "Audio",
-      "UserData": {
-        "IsFavorite": false,
-        "ItemId": "0000000000000000000000000000001f",
-        "Key": "31",
-        "LastPlayedDate": null,
-        "Likes": null,
-        "PlayCount": 0,
-        "PlaybackPositionTicks": 0,
-        "Played": false,
-        "PlayedPercentage": 0.0,
-        "Rating": null
-      }
+      "Type": "MusicAlbum"
     }
   ],
   "StartIndex": 0,
-  "TotalRecordCount": 2
+  "TotalRecordCount": 1
 }

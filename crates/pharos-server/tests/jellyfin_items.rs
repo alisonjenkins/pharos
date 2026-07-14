@@ -1366,7 +1366,13 @@ async fn artists_albums_genres_route_into_filtered_tracks() {
     )
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["TotalRecordCount"], 3, "{v:?}");
+    // B47 — an artist's children are their ALBUMS (jellyfin-web renders the
+    // discography as album cards; raw tracks left the artist page useless).
+    // Kevin MacLeod's 3 tracks group into 2 albums; no loose tracks here.
+    assert_eq!(v["TotalRecordCount"], 2, "{v:?}");
+    for it in v["Items"].as_array().unwrap() {
+        assert_eq!(it["Type"], "MusicAlbum", "{it:?}");
+    }
 
     // /Albums yields 3 distinct albums.
     let body = test::call_and_read_body(

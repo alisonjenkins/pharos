@@ -406,6 +406,11 @@ struct SimilarQuery {
     #[serde(default)]
     #[allow(dead_code)]
     user_id: Option<String>,
+    /// jellyfin-web's album detail passes the album artist here so "More
+    /// Like This" surfaces OTHER artists' albums, not the same discography
+    /// the "More From" rail already shows.
+    #[serde(default)]
+    exclude_artist_ids: Option<String>,
 }
 fn default_similar_limit() -> u32 {
     12
@@ -428,12 +433,12 @@ async fn items_similar(
     let id_str = path.into_inner();
     let id: u64 = match pharos_jellyfin_api::dto::parse_item_id(&id_str).ok_or(()) {
         Ok(v) => v,
-        // Synth ids (library / series / season / artist / album / genre)
-        // — no "similar" semantics, return empty rather than 4xx.
+        // Synth ids: MusicAlbum / MusicArtist get real music-to-music
+        // similarity (they're the ids jellyfin-web's album + artist detail
+        // pages put in "More Like This"); other synth families (library /
+        // series / season / genre) keep the empty result.
         Err(_) => {
-            return Ok(HttpResponse::Ok().json(serde_json::json!({
-                "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
-            })));
+            return music_similar(&state, &id_str, &q).await;
         }
     };
     let all = state
@@ -485,9 +490,201 @@ async fn items_similar(
     })))
 }
 
+/// "More Like This" for the synth MusicAlbum / MusicArtist detail pages.
+/// Album target → other albums scored by shared album artist + genre-token
+/// overlap (minus `ExcludeArtistIds` discographies — the "More From" rail
+/// already shows those). Artist target → other artists by genre-token
+/// overlap across their tracks. Unknown synth families → empty.
+async fn music_similar(
+    state: &AppState,
+    id_str: &str,
+    q: &SimilarQuery,
+) -> Result<HttpResponse, actix_web::Error> {
+    use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
+    let empty = || {
+        HttpResponse::Ok().json(serde_json::json!({
+            "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
+        }))
+    };
+    let all = state
+        .list_items_cached()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let wanted = id_str.to_ascii_lowercase();
+
+    // Genre tokens of a track ("Rock, Nu Metal" → {rock, nu metal}).
+    fn genre_tokens(i: &MediaItem, out: &mut std::collections::HashSet<String>) {
+        if let Some(g) = i.probe.genre.as_deref() {
+            for t in g.split([',', ';', '/', '|']) {
+                let t = t.trim().to_lowercase();
+                if !t.is_empty() {
+                    out.insert(t);
+                }
+            }
+        }
+    }
+
+    // Album target?
+    let target_album = all.iter().find(|i| {
+        i.kind == pharos_core::MediaKind::Audio
+            && i.probe
+                .album
+                .as_deref()
+                .is_some_and(|a| album_id_for(a).eq_ignore_ascii_case(&wanted))
+    });
+    if let Some(sample) = target_album {
+        let album_name = sample.probe.album.clone().unwrap_or_default();
+        let target_artist = sample
+            .probe
+            .album_artist
+            .clone()
+            .or_else(|| sample.probe.artist.clone());
+        let mut target_genres = std::collections::HashSet::new();
+        for t in all.iter().filter(|i| {
+            i.probe
+                .album
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&album_name))
+        }) {
+            genre_tokens(t, &mut target_genres);
+        }
+        let excluded = id_set(q.exclude_artist_ids.as_deref());
+        // Keep every track; the exclusions below are ALBUM-level.
+        let mut aggs = aggregate_albums(&all, |_| true);
+        aggs.retain(|a| !a.name.eq_ignore_ascii_case(&album_name));
+        if !excluded.is_empty() {
+            aggs.retain(|a| {
+                !a.album_artist
+                    .as_deref()
+                    .is_some_and(|ar| excluded.contains(&artist_id_for(ar).to_ascii_lowercase()))
+            });
+        }
+        // Score: same album artist strongest, then genre-token overlap.
+        let mut scored: Vec<(u32, &AlbumAgg)> = aggs
+            .iter()
+            .map(|a| {
+                let mut score = 0u32;
+                if let (Some(t), Some(c)) = (target_artist.as_deref(), a.album_artist.as_deref()) {
+                    if t.eq_ignore_ascii_case(c) {
+                        score += 50;
+                    }
+                }
+                let mut g = std::collections::HashSet::new();
+                for t in all.iter().filter(|i| {
+                    i.probe
+                        .album
+                        .as_deref()
+                        .is_some_and(|al| al.eq_ignore_ascii_case(&a.name))
+                }) {
+                    genre_tokens(t, &mut g);
+                }
+                score += 20 * g.intersection(&target_genres).count() as u32;
+                (score, a)
+            })
+            .filter(|(s, _)| *s > 0)
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+        });
+        let items: Vec<serde_json::Value> = scored
+            .iter()
+            .take(q.limit as usize)
+            .map(|(_, a)| synth_album_dto(state, a))
+            .collect();
+        let total = items.len() as u32;
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "Items": items, "TotalRecordCount": total, "StartIndex": 0,
+        })));
+    }
+
+    // Artist target?
+    let mut artist_name: Option<String> = None;
+    for i in all.iter() {
+        for cand in [i.probe.album_artist.as_deref(), i.probe.artist.as_deref()] {
+            if let Some(n) = cand.filter(|n| !n.is_empty()) {
+                if artist_id_for(n).eq_ignore_ascii_case(&wanted) {
+                    artist_name = Some(n.to_string());
+                    break;
+                }
+            }
+        }
+        if artist_name.is_some() {
+            break;
+        }
+    }
+    let Some(artist) = artist_name else {
+        return Ok(empty());
+    };
+    let of_artist = |i: &MediaItem, name: &str| {
+        [i.probe.album_artist.as_deref(), i.probe.artist.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|a| a.eq_ignore_ascii_case(name))
+    };
+    let mut target_genres = std::collections::HashSet::new();
+    for t in all.iter().filter(|i| of_artist(i, &artist)) {
+        genre_tokens(t, &mut target_genres);
+    }
+    // Candidate artists: every other distinct artist name.
+    let mut seen = std::collections::HashSet::new();
+    let mut scored: Vec<(u32, String)> = Vec::new();
+    for i in all.iter() {
+        for cand in [i.probe.album_artist.as_deref(), i.probe.artist.as_deref()] {
+            let Some(n) = cand.filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            if n.eq_ignore_ascii_case(&artist) || !seen.insert(n.to_lowercase()) {
+                continue;
+            }
+            let mut g = std::collections::HashSet::new();
+            for t in all.iter().filter(|x| of_artist(x, n)) {
+                genre_tokens(t, &mut g);
+            }
+            let score = 20 * g.intersection(&target_genres).count() as u32;
+            if score > 0 {
+                scored.push((score, n.to_string()));
+            }
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    let items: Vec<serde_json::Value> = scored
+        .iter()
+        .take(q.limit as usize)
+        .map(|(_, n)| {
+            serde_json::json!({
+                "Id": artist_id_for(n),
+                "Name": n,
+                "ServerId": state.server_id,
+                "Type": "MusicArtist",
+                "MediaType": "Unknown",
+                "IsFolder": true,
+                "ImageTags": {},
+                "BackdropImageTags": [],
+                "Genres": [], "Tags": [],
+            })
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "Items": items, "TotalRecordCount": total, "StartIndex": 0,
+    })))
+}
+
 /// Score `candidate` for similarity to `target`. Higher = more
 /// similar. Zero excludes.
 fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
+    // Hard media-class gate: music is only ever similar to music, video to
+    // video. Without it a shared genre string ("Rock" on a concert film,
+    // "Anime" on a soundtrack) surfaced TV shows/movies under an audio
+    // track's "More Like This".
+    let is_audio = |k: pharos_core::MediaKind| matches!(k, pharos_core::MediaKind::Audio);
+    if is_audio(target.kind) != is_audio(candidate.kind) {
+        return 0;
+    }
     let mut s = 0u32;
     // Same Series (Episode) is the strongest signal. LIB-C11 — compare
     // on the folder-keyed identity so two same-name shows in distinct
@@ -2279,6 +2476,23 @@ struct ListQuery {
     min_width: Option<u32>,
     #[serde(default)]
     max_width: Option<u32>,
+    /// Comma-separated synth MusicArtist ids — albums whose ALBUM ARTIST
+    /// is one of these. jellyfin-web's album detail "More From {artist}"
+    /// section sends this with `IncludeItemTypes=MusicAlbum`.
+    #[serde(default)]
+    album_artist_ids: Option<String>,
+    /// Comma-separated synth MusicArtist ids — albums where the artist
+    /// APPEARS (a track's `artist` matches) but is NOT the album artist.
+    /// jellyfin-web's artist detail "Appears On" section.
+    #[serde(default)]
+    contributing_artist_ids: Option<String>,
+    /// Comma-separated synth MusicArtist ids — either role matches.
+    #[serde(default)]
+    artist_ids: Option<String>,
+    /// Comma-separated wire ids dropped from the result (jellyfin-web
+    /// excludes the page's own item from its "More From" rail).
+    #[serde(default)]
+    exclude_item_ids: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2436,6 +2650,299 @@ async fn list_playlists_page(
     }))
 }
 
+/// A `/Items` request that asks ONLY for MusicAlbum rows. pharos stores no
+/// album entity — albums are synthesised by grouping audio rows — so this
+/// short-circuits to [`list_music_albums_page`] the same way BoxSet /
+/// Playlist requests do. (`jellyfin_type_to_kind` has no MusicAlbum mapping,
+/// so without the short-circuit the type filter silently DROPPED nothing and
+/// the request returned every kind — jellyfin-web's "More From {artist}"
+/// rail rendered TV shows + movies under a music album.)
+fn music_album_only_request(q: &ListQuery) -> bool {
+    let Some(types) = q.include_item_types.as_deref() else {
+        return false;
+    };
+    let mut saw = false;
+    for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if t.eq_ignore_ascii_case("MusicAlbum") {
+            saw = true;
+        } else {
+            return false;
+        }
+    }
+    saw
+}
+
+/// Parse a comma-separated synth-id list into a set for hash matching.
+fn id_set(raw: Option<&str>) -> std::collections::HashSet<String> {
+    raw.map(|r| {
+        r.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// One synthesised album: grouped audio rows sharing an `album` tag.
+struct AlbumAgg {
+    name: String,
+    album_artist: Option<String>,
+    /// Earliest release-year tag across the album's tracks.
+    year: Option<u32>,
+    child_count: u32,
+}
+
+/// Group audio rows into albums. `keep` decides which TRACKS participate
+/// (artist-role filters); an album aggregates only its kept tracks.
+fn aggregate_albums(items: &[MediaItem], keep: impl Fn(&MediaItem) -> bool) -> Vec<AlbumAgg> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, AlbumAgg> = HashMap::new();
+    for i in items {
+        if i.kind != pharos_core::MediaKind::Audio || !keep(i) {
+            continue;
+        }
+        let Some(name) = i.probe.album.as_deref().filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        let e = map.entry(name.to_string()).or_insert_with(|| AlbumAgg {
+            name: name.to_string(),
+            album_artist: None,
+            year: None,
+            child_count: 0,
+        });
+        e.child_count += 1;
+        if e.album_artist.is_none() {
+            e.album_artist = i
+                .probe
+                .album_artist
+                .clone()
+                .or_else(|| i.probe.artist.clone());
+        }
+        e.year = match (e.year, i.probe.year) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    map.into_values().collect()
+}
+
+/// Wire DTO for one synthesised album (matches the `/Albums` shape, plus
+/// the year + child count the detail rails render).
+fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
+    use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
+    let mut v = serde_json::json!({
+        "Id": album_id_for(&a.name),
+        "Name": a.name,
+        "ServerId": state.server_id,
+        "Type": "MusicAlbum",
+        "MediaType": "Unknown",
+        "IsFolder": true,
+        "ChildCount": a.child_count,
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "Genres": [], "Tags": [],
+    });
+    if let Some(y) = a.year {
+        v["ProductionYear"] = serde_json::json!(y);
+    }
+    if let Some(artist) = a.album_artist.as_deref() {
+        v["AlbumArtist"] = serde_json::Value::String(artist.to_string());
+        v["AlbumArtists"] = serde_json::json!([{ "Name": artist, "Id": artist_id_for(artist) }]);
+    }
+    v
+}
+
+/// Sort synthesised albums per the request: the music rails ask for
+/// `PremiereDate,ProductionYear,SortName` (year first); anything else
+/// falls back to name. Descending flips the whole chain.
+fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, descending: bool) {
+    let by_year = sort_by
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .next()
+        .is_some_and(|t| matches!(t, "PremiereDate" | "ProductionYear"));
+    if by_year {
+        aggs.sort_by(|a, b| {
+            a.year
+                .cmp(&b.year)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    } else {
+        aggs.sort_by_key(|a| a.name.to_lowercase());
+    }
+    if descending {
+        aggs.reverse();
+    }
+}
+
+/// Music short-circuits for `/Items` + `/Users/{u}/Items`. Returns `None`
+/// when the request isn't a music-shaped one (the caller continues down
+/// the SQL list path).
+///
+/// Handles:
+/// - `IncludeItemTypes=MusicAlbum` (+ AlbumArtistIds / ContributingArtistIds /
+///   ArtistIds / ExcludeItemIds) — the album grid, the "More From {artist}"
+///   rail (album detail) and "Appears On" (artist detail).
+/// - `ParentId=<artist synth id>` with no explicit type filter — the artist
+///   detail's discography: the artist's ALBUMS (jellyfin-web renders this
+///   section as album cards; raw tracks left it effectively empty), plus any
+///   loose tracks that have no album tag.
+async fn maybe_list_music(
+    state: &AppState,
+    user_id: UserId,
+    q: &ListQuery,
+) -> Result<Option<HttpResponse>, actix_web::Error> {
+    use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
+
+    let album_only = music_album_only_request(q);
+    // Artist-children shape: ParentId resolves to an artist, no type filter.
+    let artist_parent: Option<String> = if q.include_item_types.is_none() {
+        match resolve_parent_filter(state, q.parent_id.as_deref()).await? {
+            ParentResolution::Filter(pharos_core::ParentFilter::Artist { name }) => Some(name),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if !album_only && artist_parent.is_none() {
+        return Ok(None);
+    }
+
+    let all = state
+        .list_items_cached()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
+
+    if let Some(artist) = artist_parent {
+        // Discography: albums whose album artist is this artist, falling
+        // back to the track `artist` for untagged album_artist rows.
+        let mut aggs = aggregate_albums(&all, |i| {
+            i.probe
+                .album_artist
+                .as_deref()
+                .or(i.probe.artist.as_deref())
+                .is_some_and(|a| a.eq_ignore_ascii_case(&artist))
+        });
+        sort_album_aggs(&mut aggs, q.sort_by.as_deref(), descending);
+        let mut items: Vec<serde_json::Value> =
+            aggs.iter().map(|a| synth_album_dto(state, a)).collect();
+        // Loose tracks (no album tag) still belong on the artist page.
+        let loose: Vec<&MediaItem> = all
+            .iter()
+            .filter(|i| {
+                i.kind == pharos_core::MediaKind::Audio
+                    && i.probe.album.as_deref().unwrap_or("").is_empty()
+                    && [i.probe.artist.as_deref(), i.probe.album_artist.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|a| a.eq_ignore_ascii_case(&artist))
+            })
+            .collect();
+        if !loose.is_empty() {
+            let ids: Vec<u64> = loose.iter().map(|i| i.id).collect();
+            let ud = state
+                .stores
+                .user_data_bulk(user_id, &ids)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            for (n, t) in loose.iter().enumerate() {
+                let d = ud.get(n).copied().unwrap_or_default();
+                items.push(
+                    serde_json::to_value(BaseItemDto::from_domain_with_user_data(
+                        t,
+                        &state.server_id,
+                        d,
+                    ))
+                    .unwrap_or_default(),
+                );
+            }
+        }
+        let total = items.len() as u32;
+        let start = q.start_index as usize;
+        let page: Vec<serde_json::Value> = items
+            .into_iter()
+            .skip(start)
+            .take(q.limit as usize)
+            .collect();
+        return Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+            "Items": page,
+            "TotalRecordCount": total,
+            "StartIndex": q.start_index,
+        }))));
+    }
+
+    // Album-only listing. Artist-role filters (synth-id sets — recovered by
+    // hashing each track's artist names, same one-way scheme as ParentId).
+    let album_artist_ids = id_set(q.album_artist_ids.as_deref());
+    let contributing_ids = id_set(q.contributing_artist_ids.as_deref());
+    let any_artist_ids = id_set(q.artist_ids.as_deref());
+    let exclude_ids = id_set(q.exclude_item_ids.as_deref());
+
+    let keep = |i: &MediaItem| -> bool {
+        let aa_hash = i
+            .probe
+            .album_artist
+            .as_deref()
+            .map(|a| artist_id_for(a).to_ascii_lowercase());
+        let ar_hash = i
+            .probe
+            .artist
+            .as_deref()
+            .map(|a| artist_id_for(a).to_ascii_lowercase());
+        if !album_artist_ids.is_empty()
+            && !aa_hash
+                .as_deref()
+                .is_some_and(|h| album_artist_ids.contains(h))
+        {
+            return false;
+        }
+        if !contributing_ids.is_empty() {
+            // Appears On: performs on the track but is not the album artist.
+            let contributes = ar_hash
+                .as_deref()
+                .is_some_and(|h| contributing_ids.contains(h));
+            let owns_album = aa_hash
+                .as_deref()
+                .is_some_and(|h| contributing_ids.contains(h));
+            if !contributes || owns_album {
+                return false;
+            }
+        }
+        if !any_artist_ids.is_empty()
+            && !aa_hash
+                .as_deref()
+                .is_some_and(|h| any_artist_ids.contains(h))
+            && !ar_hash
+                .as_deref()
+                .is_some_and(|h| any_artist_ids.contains(h))
+        {
+            return false;
+        }
+        true
+    };
+    let mut aggs = aggregate_albums(&all, keep);
+    if !exclude_ids.is_empty() {
+        aggs.retain(|a| !exclude_ids.contains(&album_id_for(&a.name).to_ascii_lowercase()));
+    }
+    sort_album_aggs(&mut aggs, q.sort_by.as_deref(), descending);
+    let total = aggs.len() as u32;
+    let start = q.start_index as usize;
+    let page: Vec<serde_json::Value> = aggs
+        .iter()
+        .skip(start)
+        .take(q.limit as usize)
+        .map(|a| synth_album_dto(state, a))
+        .collect();
+    Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+        "Items": page,
+        "TotalRecordCount": total,
+        "StartIndex": q.start_index,
+    }))))
+}
+
 async fn list_items(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -2448,6 +2955,9 @@ async fn list_items(
     // T70 — Playlist-only listing comes from the playlists entity table.
     if playlist_only_request(&q) {
         return Ok(HttpResponse::Ok().json(list_playlists_page(&state, user.0.id, &q).await?));
+    }
+    if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
+        return Ok(resp);
     }
     if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &q).await? {
         return Ok(resp);
@@ -2475,6 +2985,9 @@ async fn list_user_items(
     // T70 — Playlist-only listing comes from the playlists entity table.
     if playlist_only_request(&q) {
         return Ok(HttpResponse::Ok().json(list_playlists_page(&state, user.0.id, &q).await?));
+    }
+    if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
+        return Ok(resp);
     }
     // Virtual Series/Season listing — pharos stores no Series/Season row, so a
     // `IncludeItemTypes=Series` (or `Season`) browse collapses the scoped
@@ -2789,6 +3302,9 @@ enum SortPrimary {
     Runtime,
     AlbumArtist,
     Album,
+    /// Album track order: disc then track then name. jellyfin-web's album
+    /// detail sends `SortBy=ParentIndexNumber,IndexNumber,SortName`.
+    TrackOrder,
     Name,
 }
 
@@ -2809,6 +3325,7 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         "RuntimeTicks" | "Runtime" => SortPrimary::Runtime,
         "AlbumArtist" => SortPrimary::AlbumArtist,
         "Album" => SortPrimary::Album,
+        "ParentIndexNumber" | "IndexNumber" => SortPrimary::TrackOrder,
         _ => SortPrimary::Name,
     }
 }
@@ -3033,6 +3550,28 @@ fn build_media_query(
             } else {
                 vec![
                     (SortKey::Album, SortDir::Asc),
+                    (SortKey::Name, SortDir::Asc),
+                ]
+            }
+        }
+        SortPrimary::TrackOrder => {
+            // Disc, then track, then name — the album track listing.
+            // Untagged rows (NULL disc/track) sort AFTER tagged ones in
+            // SQLite ASC? No — NULLs sort FIRST in SQLite ASC, LAST in
+            // Postgres ASC by default. The builder's expression is used
+            // verbatim, so accept the minor backend divergence for
+            // untagged rows: tagged albums order identically on both.
+            if descending {
+                vec![
+                    (SortKey::DiscNumber, SortDir::Desc),
+                    (SortKey::TrackNumber, SortDir::Desc),
+                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            } else {
+                vec![
+                    (SortKey::DiscNumber, SortDir::Asc),
+                    (SortKey::TrackNumber, SortDir::Asc),
                     (SortKey::Name, SortDir::Asc),
                 ]
             }
