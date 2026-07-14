@@ -1542,8 +1542,18 @@ async fn playback_info(
         .get(actix_web::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         // Match "Firefox" only — Chrome's UA contains "like Gecko" so a
-        // bare "Gecko" check would wrongly capture Chromium.
-        .is_some_and(|ua| ua.contains("Firefox"));
+        // bare "Gecko" check would wrongly capture Chromium. B43 — scope the
+        // quirk to DESKTOP LINUX Firefox: only there can the distro build
+        // lack the system H.264 decoder while canPlayType still says
+        // "probably" (the lie this force exists for). Firefox on
+        // macOS (VideoToolbox), Windows (Media Foundation) and Android
+        // (MediaCodec) always decodes H.264 for real — forcing those onto
+        // the VP9 encode path turned an h264 source's near-instant remux
+        // (stream copy) into a ~2.5s-per-segment libvpx encode, the
+        // dominant cost of every seek.
+        .is_some_and(|ua| {
+            ua.contains("Firefox") && ua.contains("Linux") && !ua.contains("Android")
+        });
     let client_offers_vp9 = profile.transcoding_profiles.iter().any(|t| {
         (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
             && t.video_codec.split(',').any(|c| {

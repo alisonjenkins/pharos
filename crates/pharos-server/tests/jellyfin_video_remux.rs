@@ -532,7 +532,13 @@ async fn firefox_webm_h264_source_forced_to_transcode_not_directplay() {
             .uri(&format!("/Items/{id}/PlaybackInfo"))
             .insert_header(("X-Emby-Token", token.0.expose()))
             .insert_header(("content-type", "application/json"))
-            .insert_header(("User-Agent", "Gecko/20100101 Firefox/152.0"))
+            .insert_header((
+                "User-Agent",
+                // B43 — the VP9 force is scoped to DESKTOP-LINUX Firefox
+                // (the only platform whose builds can lack the H.264
+                // decoder); this test models exactly that client.
+                "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+            ))
             .set_payload(body)
             .to_request()
     };
@@ -626,7 +632,13 @@ async fn firefox_webm_url_forwards_audio_and_subtitle_index() {
             test::TestRequest::post()
                 .uri("/Items/30/PlaybackInfo?AudioStreamIndex=6&SubtitleStreamIndex=3")
                 .insert_header(("X-Emby-Token", token.0.expose()))
-                .insert_header(("User-Agent", "Gecko/20100101 Firefox/152.0"))
+                .insert_header((
+                    "User-Agent",
+                    // B43 — the VP9 force is scoped to DESKTOP-LINUX Firefox
+                    // (the only platform whose builds can lack the H.264
+                    // decoder); this test models exactly that client.
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+                ))
                 .insert_header(("content-type", "application/json"))
                 .set_payload(body)
                 .to_request(),

@@ -270,3 +270,93 @@ async fn h264_master_url_carries_stream_selection() {
         "h264 TranscodingUrl must carry the image-sub burn index (B41): {url:?}"
     );
 }
+
+// B43 — the Firefox VP9 force is a LINUX-desktop quirk (distro builds can
+// lack the system H.264 decoder while canPlayType lies). Firefox on macOS /
+// Windows / Android decodes H.264 natively; forcing them onto the VP9 encode
+// path turned an h264 source's near-instant remux into a ~2.5s-per-segment
+// libvpx encode — the dominant cost of every seek.
+const UA_FIREFOX_MAC: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0";
+
+/// What jellyfin-web actually advertises on an H.264-capable Firefox
+/// (macOS/Windows): h264 direct-play + h264 HLS transcode ahead of the VP9
+/// fallback. The Linux force must override this order; Mac must not.
+const PROFILE_FIREFOX_BOTH: &str = r#"{"DeviceProfile":{
+  "DirectPlayProfiles":[
+    {"Container":"mp4","Type":"Video","VideoCodec":"h264","AudioCodec":"aac"},
+    {"Container":"webm","Type":"Video","VideoCodec":"vp8,vp9,av1","AudioCodec":"opus,vorbis"}
+  ],
+  "TranscodingProfiles":[
+    {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"},
+    {"Container":"webm","Type":"Video","Protocol":"http","VideoCodec":"vp9","AudioCodec":"opus"}
+  ]
+}}"#;
+
+#[actix_web::test]
+async fn mac_firefox_is_not_forced_onto_vp9() {
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    // Realistic dual profile — only the UA differs from the Linux case.
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX_MAC))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(PROFILE_FIREFOX_BOTH)
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let ms = &v["MediaSources"][0];
+    let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
+    assert!(
+        !url.contains("/vp9/"),
+        "Mac Firefox decodes H.264 natively — must not be forced onto VP9: {url:?}"
+    );
+    // h264-in-mp4 source + h264 direct-play profile → direct play, the
+    // fastest possible path (no transcode at all).
+    assert_eq!(
+        ms["SupportsDirectPlay"], true,
+        "h264/mp4 source should direct-play on an h264-capable client: {ms}"
+    );
+}
+
+#[actix_web::test]
+async fn linux_firefox_still_forced_onto_vp9() {
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(PROFILE_FIREFOX_BOTH)
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        url.contains("/vp9/master.m3u8"),
+        "desktop-Linux Firefox keeps the VP9 force (its canPlayType lies): {url:?}"
+    );
+}
