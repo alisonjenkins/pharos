@@ -83,6 +83,45 @@ async fn initiate_response_includes_device_and_app_metadata() {
 }
 
 #[actix_web::test]
+async fn connect_poll_includes_device_and_app_metadata() {
+    // B61 — the TV shows the code from Initiate, then POLLS /QuickConnect/Connect
+    // every ~5s. That poll response is ALSO a QuickConnectResult, so it must
+    // carry the same non-null DeviceName/AppName/AppVersion; omitting them made
+    // the kotlin SDK reject the poll → the app hid the code seconds after it
+    // appeared (before the user could type it). Guards against the Connect
+    // response drifting from Initiate's shape again.
+    let (state, _) = seed_admin().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Initiate")
+        .insert_header((
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Jellyfin Android TV", Device="Chromecast", DeviceId="dev-qc", Version="0.19.9""#,
+        ))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let secret = v["Secret"].as_str().unwrap().to_string();
+
+    // The poll must echo the SAME metadata Initiate returned.
+    let req = test::TestRequest::get()
+        .uri(&format!("/QuickConnect/Connect?Secret={secret}"))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["DeviceName"], "Chromecast", "poll carries DeviceName");
+    assert_eq!(v["AppName"], "Jellyfin Android TV", "poll carries AppName");
+    assert_eq!(v["AppVersion"], "0.19.9", "poll carries AppVersion");
+    // All three must be present as strings (a missing key fails kotlin decode).
+    for k in ["DeviceName", "AppName", "AppVersion", "DateAdded"] {
+        assert!(
+            v[k].is_string(),
+            "{k} must be a non-null string on the poll"
+        );
+    }
+}
+
+#[actix_web::test]
 async fn full_flow_finalizes_at_authenticatewithquickconnect() {
     // The real jellyfin-web two-endpoint exchange: poll /QuickConnect/Connect
     // (read-only, echoes Secret) then finalize at

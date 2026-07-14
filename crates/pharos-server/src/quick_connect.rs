@@ -36,6 +36,13 @@ pub struct PendingRequest {
     pub code: String,
     pub secret: String,
     pub device_id: String,
+    /// The initiating client's identity, echoed on BOTH Initiate and the
+    /// Connect poll. Non-nullable strings in Jellyfin's `QuickConnectResult`:
+    /// the Android/Google-TV kotlin SDK rejects a poll response missing them,
+    /// which makes the TV hide the code seconds after it appears (B61).
+    pub device_name: String,
+    pub app_name: String,
+    pub app_version: String,
     pub created_at: Instant,
     /// Wall-clock creation time (unix seconds) — the wire `DateAdded`.
     /// Jellyfin's C# QuickConnectResult marks DateAdded as a non-nullable
@@ -56,6 +63,9 @@ impl PendingRequest {
 pub enum QcMsg {
     Initiate {
         device_id: String,
+        device_name: String,
+        app_name: String,
+        app_version: String,
         reply: oneshot::Sender<PendingRequest>,
     },
     Authorize {
@@ -100,8 +110,15 @@ impl QuickConnectRegistry {
             while let Some(msg) = rx.recv().await {
                 gc_expired(&mut by_secret, &mut by_code);
                 match msg {
-                    QcMsg::Initiate { device_id, reply } => {
-                        let entry = mint_pending(device_id, &by_code);
+                    QcMsg::Initiate {
+                        device_id,
+                        device_name,
+                        app_name,
+                        app_version,
+                        reply,
+                    } => {
+                        let entry =
+                            mint_pending(device_id, device_name, app_name, app_version, &by_code);
                         by_code.insert(entry.code.clone(), entry.secret.clone());
                         by_secret.insert(entry.secret.clone(), entry.clone());
                         let _ = reply.send(entry);
@@ -145,7 +162,13 @@ impl QuickConnectRegistry {
     }
 }
 
-fn mint_pending(device_id: String, by_code: &HashMap<String, String>) -> PendingRequest {
+fn mint_pending(
+    device_id: String,
+    device_name: String,
+    app_name: String,
+    app_version: String,
+    by_code: &HashMap<String, String>,
+) -> PendingRequest {
     let now = Instant::now();
     let created_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -161,6 +184,9 @@ fn mint_pending(device_id: String, by_code: &HashMap<String, String>) -> Pending
         code,
         secret,
         device_id,
+        device_name,
+        app_name,
+        app_version,
         created_at: now,
         created_unix_secs,
         authorized_by: None,
@@ -228,6 +254,9 @@ mod tests {
         reg.tx
             .send(QcMsg::Initiate {
                 device_id: "dev-1".into(),
+                device_name: "Living Room TV".into(),
+                app_name: "Jellyfin Android TV".into(),
+                app_version: "0.18".into(),
                 reply: tx,
             })
             .await
@@ -309,6 +338,9 @@ mod tests {
         reg.tx
             .send(QcMsg::Initiate {
                 device_id: "dev-1".into(),
+                device_name: "Living Room TV".into(),
+                app_name: "Jellyfin Android TV".into(),
+                app_version: "0.18".into(),
                 reply: tx,
             })
             .await
@@ -379,7 +411,13 @@ mod tests {
         // a batch of mints must all differ.
         let mut by_code: HashMap<String, String> = HashMap::new();
         for _ in 0..2000 {
-            let e = mint_pending("d".into(), &by_code);
+            let e = mint_pending(
+                "d".into(),
+                "tv".into(),
+                "app".into(),
+                "1.0".into(),
+                &by_code,
+            );
             assert!(
                 !by_code.contains_key(&e.code),
                 "mint produced a colliding code"
@@ -404,6 +442,9 @@ mod tests {
             code: "000000".into(),
             secret: "x".into(),
             device_id: "d".into(),
+            device_name: "tv".into(),
+            app_name: "app".into(),
+            app_version: "1.0".into(),
             created_at: Instant::now() - Duration::from_secs(400),
             created_unix_secs: 0,
             authorized_by: None,

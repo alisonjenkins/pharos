@@ -85,6 +85,9 @@ async fn quick_connect_initiate(
         .tx
         .send(crate::quick_connect::QcMsg::Initiate {
             device_id: device_id.clone(),
+            device_name: auth.device.clone().unwrap_or_default(),
+            app_name: auth.client.clone().unwrap_or_default(),
+            app_version: auth.version.clone().unwrap_or_default(),
             reply: reply_tx,
         })
         .await
@@ -104,9 +107,9 @@ async fn quick_connect_initiate(
         // QuickConnectResult; the Android/Google TV app's kotlin SDK rejects the
         // whole response if they're missing (→ greys out the button). Echo them
         // from the caller's `X-Emby-Authorization` header.
-        "DeviceName": auth.device.clone().unwrap_or_default(),
-        "AppName": auth.client.clone().unwrap_or_default(),
-        "AppVersion": auth.version.clone().unwrap_or_default(),
+        "DeviceName": entry.device_name,
+        "AppName": entry.app_name,
+        "AppVersion": entry.app_version,
         "Authenticated": false,
         "DateAdded": pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
     })))
@@ -203,6 +206,14 @@ async fn quick_connect_connect(
         "Code": entry.code,
         "Secret": entry.secret,
         "DeviceId": entry.device_id,
+        // B61 — the poll response is a FULL QuickConnectResult, same shape as
+        // Initiate. DeviceName/AppName/AppVersion are non-null strings the
+        // Android/Google-TV kotlin SDK requires: omitting them (as this handler
+        // did) made the TV's 5s poll fail deserialization, so the code vanished
+        // seconds after Initiate showed it — before the user could type it.
+        "DeviceName": entry.device_name,
+        "AppName": entry.app_name,
+        "AppVersion": entry.app_version,
         "Authenticated": entry.authorized_by.is_some(),
         // Non-nullable DateTime in the C# QuickConnectResult — the kotlin
         // SDK (Android TV) rejects the poll response without it.
