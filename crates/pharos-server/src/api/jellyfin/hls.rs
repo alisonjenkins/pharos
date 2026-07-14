@@ -470,12 +470,36 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
 /// budget) and never less than 500 kbps so low-bitrate sources still
 /// look watchable post-transcode.
 const HLS_MIN_BITRATE_BPS: u64 = 500_000;
-const HLS_MAX_BITRATE_BPS: u64 = 8_000_000;
+// B50 — the ceiling honours the client's negotiated MaxStreamingBitrate
+// (jellyfin-web's quality picker offers up to 40 Mbps). The old 8 Mbps cap
+// silently clamped every transcode — a high-bitrate source squeezed into
+// 8 Mbps VP9 at the realtime encoder is visibly grainy (bitrate starvation,
+// benchmarked: SSIM 0.718 @ 8M vs 0.757 @ 25M on grainy 1080p; cpu-used made
+// no difference). `effective_video_bitrate` bounds this by the SOURCE
+// bitrate, so a low-bitrate source is never wastefully over-encoded.
+const HLS_MAX_BITRATE_BPS: u64 = 40_000_000;
 
 fn target_video_bitrate(source: Option<u64>) -> u64 {
     source
         .unwrap_or(HLS_MAX_BITRATE_BPS)
         .clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS)
+}
+
+/// B50 — the video bitrate a transcoded segment actually targets. Honours
+/// the client's negotiated cap (its quality-picker choice), but never
+/// exceeds the SOURCE bitrate (re-encoding above source wastes CPU +
+/// bandwidth for zero quality gain — and VP9/x264 are at least as efficient
+/// as the source codec, so they need no more than it) nor the HLS ceiling.
+/// `None` cap → the source-derived target; `None` source → the cap/ceiling.
+fn effective_video_bitrate(negotiated_cap: Option<u64>, source: Option<u64>) -> u64 {
+    let want = negotiated_cap
+        .unwrap_or(HLS_MAX_BITRATE_BPS)
+        .min(HLS_MAX_BITRATE_BPS);
+    let bounded = match source {
+        Some(src) => want.min(src),
+        None => want,
+    };
+    bounded.clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS)
 }
 
 async fn master_playlist(
@@ -1090,11 +1114,11 @@ fn build_segment_opts(
                     container,
                     video,
                     audio,
-                    video_bitrate_bps: Some(
-                        max_video_bitrate_bps
-                            .map(|cap| cap.min(HLS_MAX_BITRATE_BPS))
-                            .unwrap_or_else(|| target_video_bitrate(item.probe.bitrate_bps)),
-                    ),
+                    // B50 — honour the negotiated cap, bounded by source.
+                    video_bitrate_bps: Some(effective_video_bitrate(
+                        max_video_bitrate_bps,
+                        item.probe.bitrate_bps,
+                    )),
                     audio_bitrate_bps: Some(128_000),
                     start_position_ticks: start_ticks,
                     duration_ticks: Some(duration_ticks),
@@ -1820,9 +1844,8 @@ async fn vp9_segment_opts(
     let start_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
     let duration_ticks = (dur_secs * TICKS_PER_SECOND as f64) as u64;
     let cap = extract_session_bitrate_cap(state, req).await;
-    let bitrate = cap
-        .map(|c| c.min(HLS_MAX_BITRATE_BPS))
-        .unwrap_or_else(|| target_video_bitrate(item.probe.bitrate_bps));
+    // B50 — honour the client's negotiated cap, bounded by source + ceiling.
+    let bitrate = effective_video_bitrate(cap, item.probe.bitrate_bps);
     // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
     // stream indices (jellyfin-web's convention), but the encoder args select
     // by per-CODEC index (`-map 0:a:N`, subtitle-filter `si=N`). Convert via
@@ -2238,9 +2261,42 @@ mod tests {
     #[::core::prelude::v1::test]
     fn target_video_bitrate_clamps_into_window() {
         assert_eq!(target_video_bitrate(Some(100_000)), HLS_MIN_BITRATE_BPS);
-        assert_eq!(target_video_bitrate(Some(20_000_000)), HLS_MAX_BITRATE_BPS);
+        // B50 — a 20 Mbps source is now honoured (was clamped to 8 Mbps).
+        assert_eq!(target_video_bitrate(Some(20_000_000)), 20_000_000);
+        // Above the 40 Mbps ceiling still clamps.
+        assert_eq!(target_video_bitrate(Some(60_000_000)), HLS_MAX_BITRATE_BPS);
         assert_eq!(target_video_bitrate(Some(2_500_000)), 2_500_000);
         assert_eq!(target_video_bitrate(None), HLS_MAX_BITRATE_BPS);
+    }
+
+    #[::core::prelude::v1::test]
+    fn effective_video_bitrate_honours_cap_bounded_by_source() {
+        // B50 — the reported bug: client picks 40 Mbps, source is 25 Mbps.
+        // Old code clamped to 8 Mbps (grainy); now honours the source.
+        assert_eq!(
+            effective_video_bitrate(Some(40_000_000), Some(25_000_000)),
+            25_000_000,
+            "a 40 Mbps pick on a 25 Mbps source encodes at source, not 8 Mbps"
+        );
+        // Client cap BELOW source → honour the client's (lower) choice.
+        assert_eq!(
+            effective_video_bitrate(Some(6_000_000), Some(25_000_000)),
+            6_000_000
+        );
+        // No cap → source-derived, up to the ceiling.
+        assert_eq!(effective_video_bitrate(None, Some(30_000_000)), 30_000_000);
+        // Both above the ceiling → clamp to 40 Mbps.
+        assert_eq!(
+            effective_video_bitrate(Some(80_000_000), Some(60_000_000)),
+            HLS_MAX_BITRATE_BPS
+        );
+        // Unknown source → the cap (bounded by ceiling).
+        assert_eq!(effective_video_bitrate(Some(12_000_000), None), 12_000_000);
+        // Tiny source still floored at the minimum.
+        assert_eq!(
+            effective_video_bitrate(Some(40_000_000), Some(100_000)),
+            HLS_MIN_BITRATE_BPS
+        );
     }
 
     #[::core::prelude::v1::test]
