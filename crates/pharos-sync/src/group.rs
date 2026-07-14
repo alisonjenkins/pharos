@@ -1800,7 +1800,17 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         } => {
             // Preserve play/pause across a seek: a seek while playing resumes
             // playing (after re-buffer); while paused/idle it stays paused.
-            let resume = matches!(state.playback, PlaybackState::Playing { .. });
+            //
+            // B58 — but a Seek always sets `playback = Paused` below, so a
+            // SECOND seek arriving before the first's gate resolves (scrubbing
+            // the timeline while playing sends a burst) would recompute `resume`
+            // from that Paused state = false, and the group would settle Paused
+            // after the seek even though the user was playing. When a Seek gate
+            // is already open it already holds the true intent — carry it over.
+            let resume = match state.waiting.as_ref() {
+                Some(w) => w.resume_playing,
+                None => matches!(state.playback, PlaybackState::Playing { .. }),
+            };
             // Deliver the Seek NOW: each client applies it (pause + seek +
             // re-buffer) and ACKs with `Ready` (scheduleSeek's 'ready'
             // handler). Withholding it until the gate resolved deadlocked —
@@ -3160,6 +3170,52 @@ mod tests {
         }
         assert!(m1_play, "BufferingEnd must resolve the gate and resume");
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// B58 — scrubbing the timeline while playing sends a burst of Seeks. Each
+    /// Seek sets playback=Paused, so a second Seek arriving before the first's
+    /// gate resolves must NOT recompute resume=false and leave the group stuck
+    /// Paused after the seek. The group was playing; it must resume playing.
+    #[tokio::test(start_paused = true)]
+    async fn seek_burst_while_playing_stays_playing() {
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // First seek opens a gate (resume intent = playing).
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        // Second seek arrives before the gate resolves — the burst.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 8_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "still gated on the follower"
+        );
+
+        // Gate resolves via the anti-wedge timeout; the group must land Playing.
+        tokio::time::advance(Duration::from_millis(READY_TIMEOUT_MS + 1_000)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "a seek burst while playing must resume playing, not stick paused"
+        );
     }
 
     /// B27 guard-rail: a VOLUNTARY pause (someone pressed pause) must NOT be
