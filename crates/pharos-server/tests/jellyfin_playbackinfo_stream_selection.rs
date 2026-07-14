@@ -216,3 +216,57 @@ async fn query_string_stream_selection_still_honoured() {
         "query-string AudioStreamIndex must still thread into the URL: {url:?}"
     );
 }
+
+// B41 — the H.264 HLS surface (non-VP9 clients) must carry stream selection
+// exactly like the VP9 one: the h264 master URL used to drop it, so a
+// selected PGS subtitle never reached the segment handler (burn silently
+// off) and an explicit audio track fell back to the default.
+const PROFILE_H264: &str = r#"{"DeviceProfile":{
+  "DirectPlayProfiles":[],
+  "TranscodingProfiles":[
+    {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+  ]
+}}"#;
+
+#[actix_web::test]
+async fn h264_master_url_carries_stream_selection() {
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_H264).unwrap()["DeviceProfile"],
+        "AudioStreamIndex": 3,
+        "SubtitleStreamIndex": 5,
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        url.contains("/master.m3u8") && !url.contains("/vp9/"),
+        "expected the H.264 HLS surface, got {url:?}"
+    );
+    assert!(
+        url.contains("AudioStreamIndex=3"),
+        "h264 TranscodingUrl must carry the audio pick (B41): {url:?}"
+    );
+    assert!(
+        url.contains("SubtitleStreamIndex=5"),
+        "h264 TranscodingUrl must carry the image-sub burn index (B41): {url:?}"
+    );
+}

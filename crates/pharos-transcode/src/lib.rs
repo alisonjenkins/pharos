@@ -574,6 +574,19 @@ fn build_args_for_device(
             a.push("+empty_moov+frag_keyframe+default_base_moof".into());
         }
     }
+    // B41 — mpegts HLS segments must ALSO carry their true timeline position.
+    // Without the offset every `.ts` segment starts at PTS≈0, which works for
+    // linear playback from 0 (hls.js re-anchors fragment-by-fragment) but
+    // breaks a MID-TIMELINE start (subtitle/audio switch resumes at the
+    // current position): hls.js buffers the fragment at its raw PTS near 0
+    // while the playhead sits at the resume position → permanent stall, and
+    // the eventual user retry restarts the movie from 0:00.
+    if matches!(opts.container, Container::Mpegts) {
+        if let Some(pos) = start {
+            a.push("-output_ts_offset".into());
+            a.push(format!("{pos:.3}"));
+        }
+    }
     // File-direct outputs are written by the worker; ffmpeg refuses to
     // overwrite an existing file without `-y`, and the scheduler hands
     // us a fresh `.tmp` path so clobbering is intended.
@@ -991,5 +1004,27 @@ mod tests {
                 .block_on(t.transcode(p, &opts()));
             assert!(matches!(res, Err(TranscodeError::NonUtf8Path)));
         }
+    }
+
+    #[test]
+    fn mpegts_segment_carries_output_ts_offset() {
+        // B41 — every `.ts` segment must carry its true timeline position:
+        // PTS≈0 segments stall any mid-timeline start (subtitle/audio switch
+        // resume), because hls.js buffers them near 0 while the playhead sits
+        // at the resume position.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.start_position_ticks = 300_000_000; // 30s
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(joined.contains("-output_ts_offset 30.000"), "{joined}");
+    }
+
+    #[test]
+    fn mpegts_segment_at_zero_has_no_offset() {
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        let a = build_args("/m/x.mkv", &o);
+        assert!(!a.iter().any(|x| x == "-output_ts_offset"), "{a:?}");
     }
 }

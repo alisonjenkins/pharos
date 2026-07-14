@@ -1691,8 +1691,13 @@ async fn playback_info(
             {
                 Some(vp9_hls_url.clone())
             }
+            // B41 — carry the caller's stream selection (audio track + image-
+            // subtitle burn index) exactly like the VP9 URL: the h264 master
+            // URL dropped it, so a selected PGS subtitle never reached the
+            // segment handler (burn silently off) and an explicit audio track
+            // fell back to the default.
             Decision::Transcode { .. } if is_video => Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
             )),
             // Audio transcode → the universal audio endpoint.
             Decision::Transcode { .. } => Some(format!(
@@ -1702,7 +1707,9 @@ async fn playback_info(
             // the segment handler reads `Decision::VideoRemux` from the
             // registered session and emits `-c:v copy`.
             Decision::VideoRemux { .. } => Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
+                // Remux copies video (no burn possible) but the AUDIO pick
+                // must still ride along (B41).
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
             )),
             _ => None,
         }

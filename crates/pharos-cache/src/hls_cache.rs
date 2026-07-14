@@ -143,15 +143,54 @@ impl std::fmt::Debug for HlsSegmentCache {
     }
 }
 
+/// B41 — bump whenever segment GENERATION changes in a way that makes
+/// previously-cached segments incompatible with fresh ones (e.g. the
+/// mpegts `-output_ts_offset` fix: old segments carry PTS≈0, new ones carry
+/// their true timeline position — mixing them in one hls.js session breaks
+/// buffering). A mismatch with the on-disk `.gen_version` wipes the cache at
+/// construction; segments regenerate on demand (cheap: only what's watched).
+const HLS_GEN_VERSION: u32 = 2;
+const GEN_VERSION_MARKER: &str = ".gen_version";
+
 impl HlsSegmentCache {
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        let root: PathBuf = root.into();
+        Self::reconcile_generation(&root);
         Self {
-            root: root.into(),
+            root,
             max_bytes,
             transcoder: FfmpegTranscoder::new(),
             scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
         }
+    }
+
+    /// Wipe every cached segment when the on-disk generation version doesn't
+    /// match [`HLS_GEN_VERSION`] (same pattern as the trickplay cache).
+    /// Best-effort: fs errors leave the cache as-is rather than failing boot.
+    fn reconcile_generation(root: &std::path::Path) {
+        let marker = root.join(GEN_VERSION_MARKER);
+        let on_disk = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if on_disk == Some(HLS_GEN_VERSION) {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.file_name().and_then(|n| n.to_str()) == Some(GEN_VERSION_MARKER) {
+                    continue;
+                }
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        let _ = std::fs::create_dir_all(root);
+        let _ = std::fs::write(&marker, HLS_GEN_VERSION.to_string());
     }
 
     /// Route segment transcodes through the load-balancing scheduler.
