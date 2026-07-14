@@ -170,11 +170,13 @@ pub struct TranscodeOptions {
     /// sources transcode the chosen track instead of the default.
     /// None defers to ffmpeg's default selection.
     pub audio_source_stream_index: Option<u32>,
-    /// Source-relative subtitle-stream index for burn-in. When set,
-    /// ffmpeg gets `-vf subtitles='{path}:si={N}'` and the chosen
-    /// subtitle stream is rendered into the video frames. None
-    /// leaves subtitles as a separate track (or absent on transcode
-    /// output containers that don't carry them).
+    /// Subtitle-relative stream index for IMAGE-subtitle burn-in
+    /// (PGS/VOBSUB/DVB — the only kind callers request burn for; text subs
+    /// are delivered out-of-band, ADR-0006). When set, ffmpeg gets a
+    /// `-filter_complex "[0:v:0][0:s:N]overlay=…"` graph rendering the
+    /// bitmap subtitle into the video frames (B40 — the text-only
+    /// `subtitles=` filter cannot render image subs). None leaves subtitles
+    /// out of the encode entirely.
     pub burn_subtitle_stream_index: Option<u32>,
 }
 

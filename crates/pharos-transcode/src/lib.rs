@@ -186,26 +186,54 @@ where
     }
 }
 
-/// Quote + escape a path for the ffmpeg `subtitles=filename=…` filter
-/// argument. We wrap the whole filename in single quotes so the
-/// filtergraph metacharacters `: , [ ] ;` inside the path are taken
-/// literally (the previous char-by-char escaping missed `[ ] ;` and
-/// emitted the value unquoted — a real bug: any library path like
-/// `/m/[Group] Title [1080p].mkv` aborted the encode). Inside the
-/// quotes only `\` and `'` need handling; ffmpeg's quote syntax escapes
-/// an embedded single quote as `'\''`.
-fn escape_subtitles_filename(p: &str) -> String {
-    let mut out = String::with_capacity(p.len() + 8);
-    out.push('\'');
-    for c in p.chars() {
-        match c {
-            '\'' => out.push_str("'\\''"),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
+/// Emit the video filter arguments: a plain `-vf` chain normally, or — when
+/// an IMAGE subtitle is being burned in (B40) — a `-filter_complex` that
+/// overlays the subtitle stream onto the video before the rest of the chain:
+///
+/// ```text
+/// [0:v:0][0:s:N]overlay=eof_action=pass[,rest-of-chain][vout]
+/// ```
+///
+/// `overlay` is the only ffmpeg path that renders bitmap subtitles
+/// (PGS/VOBSUB/DVB): the `subtitles=` filter is libass and text-only — using
+/// it for a PGS burn aborts with "Only text based subtitles are currently
+/// supported" (observed live: Avatar's PGS track 500'd every segment). The
+/// `si=N` and `[0:s:N]` indices share the same subtitle-relative meaning.
+/// `eof_action=pass` keeps video flowing when the sparse subtitle stream has
+/// no events in the segment window. A `-filter_complex` disables ffmpeg's
+/// default stream selection, so the video map (`[vout]`) and the audio map
+/// are emitted here too.
+fn push_video_filters(
+    a: &mut Vec<String>,
+    vf_parts: &[String],
+    burn_subtitle_stream_index: Option<u32>,
+    audio_source_stream_index: Option<u32>,
+) {
+    match burn_subtitle_stream_index {
+        Some(si) => {
+            let mut graph = format!("[0:v:0][0:s:{si}]overlay=eof_action=pass");
+            if !vf_parts.is_empty() {
+                graph.push(',');
+                graph.push_str(&vf_parts.join(","));
+            }
+            graph.push_str("[vout]");
+            a.push("-filter_complex".into());
+            a.push(graph);
+            a.push("-map".into());
+            a.push("[vout]".into());
+            a.push("-map".into());
+            a.push(match audio_source_stream_index {
+                Some(i) => format!("0:a:{i}"),
+                None => "0:a:0?".into(),
+            });
+        }
+        None => {
+            if !vf_parts.is_empty() {
+                a.push("-vf".into());
+                a.push(vf_parts.join(","));
+            }
         }
     }
-    out.push('\'');
-    out
 }
 
 #[cfg(test)]
@@ -256,10 +284,14 @@ fn build_args_for_device(
         a.push("-vaapi_device".into());
         a.push(node);
     }
-    // Seek placement: input seeking (`-ss` before `-i`) is fast but
-    // desyncs a burned-in subtitles filter (which demuxes the file from
-    // 0 with original PTS). When burning subtitles at a non-zero start,
-    // use output seeking (`-ss` after `-i`) to keep video + subs aligned.
+    // B40 — image-subtitle burn-in rides `overlay` on the SAME single input
+    // (`[0:v:0][0:s:N]overlay`), so input seeking (`-ss` before `-i`) moves
+    // video and subtitle streams together and stays fast. The old text
+    // `subtitles=` filter needed an output-side seek (it demuxed the file
+    // from 0 — tens of seconds per segment deep into a movie) AND could not
+    // render image subs at all: every PGS burn 500'd with "Only text based
+    // subtitles are currently supported" while the guards upstream only ever
+    // request burn for image subs.
     let burning_subs = opts.video.is_some()
         && !matches!(opts.video, Some(VideoCodec::Copy))
         && opts.burn_subtitle_stream_index.is_some();
@@ -278,20 +310,11 @@ fn build_args_for_device(
     }
     let start = opts.start_position_seconds();
     if let Some(pos) = start {
-        if !burning_subs {
-            a.push("-ss".into());
-            a.push(format!("{pos:.3}"));
-        }
+        a.push("-ss".into());
+        a.push(format!("{pos:.3}"));
     }
     a.push("-i".into());
     a.push(input.to_string());
-    if let Some(pos) = start {
-        if burning_subs {
-            // Output-side seek keeps the subtitles filter in sync.
-            a.push("-ss".into());
-            a.push(format!("{pos:.3}"));
-        }
-    }
     if let Some(dur) = opts.duration_seconds() {
         a.push("-t".into());
         a.push(format!("{dur:.3}"));
@@ -310,7 +333,11 @@ fn build_args_for_device(
     // also aligns with the probe, which advertises the first video as THE
     // video track. (B6 — surfaced once B4 made the audio index actually reach
     // the segment; before that the index was dropped and this path never ran.)
-    if let Some(audio_idx) = opts.audio_source_stream_index {
+    if burning_subs {
+        // B40 — the overlay filter_complex below owns the video map
+        // (`-map [vout]`); adding `0:v:0?` here would map the source video a
+        // second time.
+    } else if let Some(audio_idx) = opts.audio_source_stream_index {
         a.push("-map".into());
         a.push("0:v:0?".into());
         a.push("-map".into());
@@ -322,15 +349,11 @@ fn build_args_for_device(
             a.push("copy".into());
         }
         Some(c) => {
-            // Compose the software filter prefix (subtitle burn-in) that
-            // must run before any hardware upload.
+            // Software filter chain that must run before any hardware
+            // upload. Burn-in is NOT part of this chain: it needs a second
+            // filter input (the subtitle stream) and therefore a
+            // `-filter_complex`, emitted by `push_video_filters` below.
             let mut vf_parts: Vec<String> = Vec::new();
-            if let Some(sub_idx) = opts.burn_subtitle_stream_index {
-                vf_parts.push(format!(
-                    "subtitles=filename={}:si={sub_idx}",
-                    escape_subtitles_filename(input)
-                ));
-            }
             let is_vaapi = matches!(
                 device,
                 DeviceId::Hw {
@@ -343,8 +366,12 @@ fn build_args_for_device(
                 // upload filter chains after any software filters.
                 vf_parts.push("format=nv12".into());
                 vf_parts.push("hwupload".into());
-                a.push("-vf".into());
-                a.push(vf_parts.join(","));
+                push_video_filters(
+                    &mut a,
+                    &vf_parts,
+                    opts.burn_subtitle_stream_index,
+                    opts.audio_source_stream_index,
+                );
                 a.push("-c:v".into());
                 a.push(
                     if matches!(c, VideoCodec::H265) {
@@ -366,10 +393,12 @@ fn build_args_for_device(
                     VideoCodec::H265 => hwaccel.hevc_encoder().unwrap_or(c.ffmpeg_codec()),
                     _ => c.ffmpeg_codec(),
                 };
-                if !vf_parts.is_empty() {
-                    a.push("-vf".into());
-                    a.push(vf_parts.join(","));
-                }
+                push_video_filters(
+                    &mut a,
+                    &vf_parts,
+                    opts.burn_subtitle_stream_index,
+                    opts.audio_source_stream_index,
+                );
                 a.push("-c:v".into());
                 a.push(encoder.into());
                 // Force broadly-decodable 8-bit 4:2:0 output. A 10-bit
@@ -858,51 +887,52 @@ mod tests {
     }
 
     #[test]
-    fn burn_subtitle_appends_subtitles_filter() {
+    fn burn_subtitle_uses_overlay_filter_complex() {
+        // B40 — burn-in is only ever requested for IMAGE subs (PGS/VOBSUB),
+        // which the text-only `subtitles=` filter cannot render ("Only text
+        // based subtitles are currently supported" — every Avatar segment
+        // 500'd). The burn must ride an overlay filter_complex with explicit
+        // maps (a filter_complex disables default stream selection).
         let mut o = opts();
         o.burn_subtitle_stream_index = Some(3);
         let a = build_args("/m/x.mkv", &o);
         let joined = a.join(" ");
         assert!(
-            joined.contains("-vf subtitles=filename='/m/x.mkv':si=3"),
+            joined.contains("-filter_complex [0:v:0][0:s:3]overlay=eof_action=pass[vout]"),
             "{joined}"
         );
+        assert!(joined.contains("-map [vout]"), "{joined}");
+        assert!(joined.contains("-map 0:a:0?"), "{joined}");
+        assert!(!joined.contains("subtitles="), "{joined}");
+        // Video must not ALSO be mapped from the source.
+        assert!(!joined.contains("-map 0:v:0?"), "{joined}");
     }
 
     #[test]
-    fn escape_subtitles_filename_quotes_and_protects_metachars() {
-        // Plain path → wrapped in single quotes.
-        assert_eq!(escape_subtitles_filename("/m/a.mkv"), "'/m/a.mkv'");
-        // Filtergraph metachars `[ ] ; : ,` are literal inside quotes —
-        // the old escaper missed `[ ] ;` entirely.
-        assert_eq!(
-            escape_subtitles_filename("/m/[Grp] T [1080p].mkv"),
-            "'/m/[Grp] T [1080p].mkv'"
-        );
-        assert_eq!(
-            escape_subtitles_filename("/m/a;b,c:d.mkv"),
-            "'/m/a;b,c:d.mkv'"
-        );
-        // Embedded single quote → ffmpeg `'\''` sequence.
-        assert_eq!(
-            escape_subtitles_filename("/m/it's.mkv"),
-            "'/m/it'\\''s.mkv'"
-        );
-        // Backslash doubled.
-        assert_eq!(escape_subtitles_filename("a\\b"), "'a\\\\b'");
+    fn burn_subtitle_with_explicit_audio_maps_that_track() {
+        let mut o = opts();
+        o.burn_subtitle_stream_index = Some(1);
+        o.audio_source_stream_index = Some(2);
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(joined.contains("-map [vout]"), "{joined}");
+        assert!(joined.contains("-map 0:a:2"), "{joined}");
+        assert!(!joined.contains("-map 0:v:0?"), "{joined}");
     }
 
     #[test]
-    fn burn_subtitle_with_seek_uses_output_seek_for_sync() {
-        // Audit fix: burned subs must not desync under -ss. With a seek +
-        // subtitle burn, -ss must appear AFTER -i (output seeking).
+    fn burn_subtitle_with_seek_uses_input_seek() {
+        // B40 — overlay reads the subtitle stream from the SAME input, so an
+        // input-side seek moves video + subs together AND stays fast (the old
+        // text-filter burn forced output seeking = decode-from-0, tens of
+        // seconds per segment deep into a movie).
         let mut o = opts();
         o.start_position_ticks = 50_000_000; // 5s
         o.burn_subtitle_stream_index = Some(0);
         let a = build_args("/m/x.mkv", &o);
         let i_pos = a.iter().position(|x| x == "-i").unwrap();
         let ss_pos = a.iter().position(|x| x == "-ss").unwrap();
-        assert!(ss_pos > i_pos, "expected output seek (-ss after -i): {a:?}");
+        assert!(ss_pos < i_pos, "expected input seek (-ss before -i): {a:?}");
     }
 
     #[test]
