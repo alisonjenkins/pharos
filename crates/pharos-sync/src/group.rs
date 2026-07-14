@@ -26,6 +26,12 @@ use uuid::Uuid;
 /// `docs/group-sync-protocol.md` §4.
 pub const MIN_LEAD_MS: u64 = 200;
 
+/// B38 — upper bound on the RTT-derived part of the scheduling lead.
+/// `lead_time_ms` = MIN_LEAD_MS + min(max_rtt/2, this). Belt-and-braces with
+/// the clock-sample discard (`clock::MAX_SAMPLE_RTT_MS`): even if bad samples
+/// slip in, no command is ever scheduled more than ~2.2s out.
+pub const MAX_HALF_RTT_LEAD_MS: u64 = 2_000;
+
 /// How long the readiness gate waits for every member to report `Ready`
 /// before starting anyway. Bounds the WAITING state so a silent or wedged
 /// client can never block the whole group forever (the failure mode behind
@@ -498,6 +504,13 @@ impl PlayQueue {
 /// reported `Ready` (or `deadline` fires — the anti-wedge timeout).
 struct WaitingGate {
     pending: HashSet<MemberId>,
+    /// B38 — server-clock instant (the broadcast command's `at_server_ms`)
+    /// before which NO legitimate `Ready` can exist: clients execute the
+    /// command AT that time, so an earlier Ready is a spurious player
+    /// transition (e.g. the pause wiggle right after a Seek broadcast) and
+    /// must not count toward the gate. 0 = no scheduled command (queue-change
+    /// gates), accept immediately.
+    not_before_server_ms: u64,
     /// Whether the group should be `Playing` (true) or `Paused` (false) once
     /// the gate resolves — e.g. a seek while paused resolves to paused.
     resume_playing: bool,
@@ -790,6 +803,7 @@ impl GroupState {
         resume_playing: bool,
         position_ms: u64,
         reason: &str,
+        not_before_server_ms: u64,
     ) {
         // An empty group can't resolve a gate; nothing to wait on.
         if self.members.is_empty() {
@@ -801,12 +815,15 @@ impl GroupState {
             resume_playing,
             position_ms,
             reason,
+            not_before_server_ms,
+            lead_ms = self.lead_time_ms(),
             "syncplay: readiness gate opened"
         );
         self.waiting = Some(WaitingGate {
             pending,
             resume_playing,
             position_ms,
+            not_before_server_ms,
             deadline: tokio::time::Instant::now()
                 + std::time::Duration::from_millis(READY_TIMEOUT_MS),
         });
@@ -863,7 +880,12 @@ impl GroupState {
             .map(|m| m.offset.max_rtt_ms() / 2)
             .max()
             .unwrap_or(0);
-        MIN_LEAD_MS + half_max_rtt
+        // B38 — clamp: an unclamped lead let one member's pathological RTT
+        // schedule every command tens of seconds into the future for the
+        // WHOLE group (observed live: ~40s frozen seek). A member whose real
+        // half-RTT exceeds the cap gets its command slightly in the past and
+        // heals via drift correction — vastly better than freezing everyone.
+        MIN_LEAD_MS + half_max_rtt.min(MAX_HALF_RTT_LEAD_MS)
     }
 
     /// V19: one slow / wedged member must not block the actor or delay
@@ -1013,6 +1035,9 @@ impl GroupState {
             pending: w.pending.into_iter().collect(),
             resume_playing: w.resume_playing,
             position_ms: w.position_ms,
+            // Not persisted: the spurious-Ready window is ~lead-sized (≤2.2s)
+            // and a takeover mid-gate re-arms the deadline anyway.
+            not_before_server_ms: 0,
             deadline: tokio::time::Instant::now()
                 + std::time::Duration::from_millis(READY_TIMEOUT_MS),
         });
@@ -1626,7 +1651,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if buffering.is_empty() {
                 state.start_playing(position_ms, "Unpause");
             } else {
-                state.enter_waiting(buffering, true, position_ms, "Unpause");
+                state.enter_waiting(buffering, true, position_ms, "Unpause", 0);
             }
         }
         GroupMsg::PauseShared { sender: _ } => {
@@ -1663,7 +1688,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 position_ms,
             });
             let pending = state.follower_ids();
-            state.enter_waiting(pending, resume, position_ms, "Seek");
+            state.enter_waiting(pending, resume, position_ms, "Seek", at_server_ms);
         }
         GroupMsg::MemberReady {
             member_id,
@@ -1695,6 +1720,26 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 rec.ignore_wait = false;
             }
             if state.waiting.is_some() {
+                // B38 — a Ready arriving BEFORE the gated command's scheduled
+                // at_server_ms cannot be an ACK of it (clients execute the
+                // command AT that instant): it's a spurious player transition,
+                // e.g. the pause wiggle right after a Seek broadcast. Counting
+                // those resolved the gate ~1s after a Seek — long before any
+                // client ran its scheduled seek — so the server's Play then
+                // CANCELLED the clients' pending seek callbacks and everyone
+                // resumed from the pre-seek position.
+                let now = state.server_ms_now();
+                let premature = state
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|w| now < w.not_before_server_ms);
+                if premature {
+                    tracing::debug!(
+                        group = %state.id, member = %member_id,
+                        "syncplay: Ready before the gated command's schedule time — ignored"
+                    );
+                    return;
+                }
                 let resolved = state.waiting.as_mut().is_some_and(|w| {
                     w.pending.remove(&member_id);
                     w.pending.is_empty()
@@ -1759,7 +1804,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 playing_index.min(state.queue.items.len().saturating_sub(1));
             state.broadcast_play_queue("new_playlist", true, start_position_ms);
             let pending = state.follower_ids();
-            state.enter_waiting(pending, true, start_position_ms, "Unpause");
+            state.enter_waiting(pending, true, start_position_ms, "Unpause", 0);
         }
         GroupMsg::SetPlaylistItem {
             sender: _,
@@ -1774,7 +1819,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.queue.playing_index = idx;
                 state.broadcast_play_queue("set_current_item", true, 0);
                 let pending = state.follower_ids();
-                state.enter_waiting(pending, true, 0, "Unpause");
+                state.enter_waiting(pending, true, 0, "Unpause", 0);
             }
         }
         GroupMsg::NextItem {
@@ -1802,7 +1847,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 );
                 state.broadcast_play_queue("next_item", true, 0);
                 let pending = state.follower_ids();
-                state.enter_waiting(pending, true, 0, "Unpause");
+                state.enter_waiting(pending, true, 0, "Unpause", 0);
             }
         }
         GroupMsg::PreviousItem {
@@ -1824,7 +1869,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 );
                 state.broadcast_play_queue("previous_item", true, 0);
                 let pending = state.follower_ids();
-                state.enter_waiting(pending, true, 0, "Unpause");
+                state.enter_waiting(pending, true, 0, "Unpause", 0);
             }
         }
         GroupMsg::SetRepeatMode { sender: _, mode } => {
@@ -2968,6 +3013,9 @@ mod tests {
             .await;
             assert!(seek.is_some(), "Seek must be broadcast at gate entry");
         }
+        // B38 — Readys before the Seek's scheduled at_server_ms are treated
+        // as spurious transitions; wait past MIN_LEAD like a real client.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         // Both ACK → the gate resolves to Play (seek-while-playing resumes).
         for mid in [leader, m2] {
             h.tx.send(GroupMsg::MemberReady {
@@ -3041,6 +3089,8 @@ mod tests {
         })
         .await
         .unwrap();
+        // B38 — ACK after the Seek's scheduled time, like a real client.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         h.tx.send(GroupMsg::MemberReady {
             member_id: leader,
             position_ms: 30_000,
@@ -3474,5 +3524,121 @@ mod tests {
             panic!("no MemberLeft broadcast");
         };
         assert_eq!(name, "jana");
+    }
+
+    /// B38 — one member's pathological RTT must not schedule commands tens of
+    /// seconds into the future for the whole group (observed live: a ~40s
+    /// frozen seek). The RTT-derived lead is clamped.
+    #[tokio::test]
+    async fn seek_lead_is_clamped_against_pathological_rtt() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, _m2_rx) = add_member(&h, &sinks, "laggy").await;
+        // rtt = (t4-t1) - (t3-t2) = 9_998ms — below the sample-discard bound,
+        // far above the lead clamp. Unclamped lead would be ~5.2s.
+        h.tx.send(GroupMsg::ObserveClock {
+            member_id: m2,
+            t1: 0,
+            t2: 4_999,
+            t3: 4_999,
+            t4: 9_998,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::SeekTo {
+            sender: leader,
+            position_ms: 90_000,
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::Seek { at_server_ms, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::Seek { .. })
+            })
+            .await
+        else {
+            panic!("no Seek broadcast");
+        };
+        // server_ms is measured from group creation — the whole test runs in
+        // well under a second, so an unclamped lead (>5s) is unambiguous.
+        assert!(
+            at_server_ms < 3_500,
+            "lead must be clamped (MIN_LEAD + 2s cap), got at_server_ms={at_server_ms}"
+        );
+    }
+
+    /// B38 — the poisoned seek gate: jellyfin-web emits spurious player
+    /// transitions (→ Ready posts) immediately after a Seek broadcast, long
+    /// before any client runs its SCHEDULED seek at `When`. Those must not
+    /// resolve the gate — the resulting early Play cancels the clients'
+    /// pending seek callbacks and the whole group resumes from the pre-seek
+    /// position.
+    #[tokio::test]
+    async fn ready_before_seek_schedule_time_does_not_resolve_gate() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        // Give the group a real lead (~2.2s: rtt 4s → half 2s = cap).
+        h.tx.send(GroupMsg::ObserveClock {
+            member_id: m2,
+            t1: 0,
+            t2: 2_000,
+            t3: 2_000,
+            t4: 4_000,
+        })
+        .await
+        .unwrap();
+        // The group must be PLAYING for the seek gate to resume with Play.
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+        h.tx.send(GroupMsg::SeekTo {
+            sender: leader,
+            position_ms: 90_000,
+        })
+        .await
+        .unwrap();
+        // Spurious instant Readys from BOTH members (well before When).
+        for mid in [leader, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 0,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let _ = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::Play { .. }),
+                "premature Readys must not resolve a seek gate (B38)"
+            );
+        }
+        while m2_rx.try_recv().is_ok() {}
+        // Past When (lead ≈2.2s), the same Readys are legitimate ACKs.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        for mid in [leader, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 90_000,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let got = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(
+            got.is_some(),
+            "post-When Readys must resolve the gate and broadcast Play"
+        );
     }
 }

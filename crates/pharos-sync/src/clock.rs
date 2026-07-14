@@ -13,6 +13,12 @@ use std::collections::VecDeque;
 
 pub const DEFAULT_WINDOW: usize = 9;
 
+/// B38 — samples with an RTT above this are discarded outright. Anything in
+/// the tens of seconds is not network latency; it's a throttled/suspended
+/// client measuring its own stall (observed live: one ~80s sample pushed the
+/// group's scheduling lead to ~40s, freezing a seek for the whole party).
+pub const MAX_SAMPLE_RTT_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
     pub offset_ms: i64,
@@ -42,6 +48,15 @@ impl ClockOffset {
     pub fn observe(&mut self, t1: u64, t2: u64, t3: u64, t4: u64) {
         let offset_ms = ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2;
         let rtt_ms = (t4.saturating_sub(t1)).saturating_sub(t3.saturating_sub(t2));
+        // B38 — discard pathological samples instead of recording them. A
+        // browser tab throttled/suspended mid round-trip reports an RTT of
+        // tens of seconds; recording it poisons max_rtt (and through it the
+        // group's scheduling lead) for the whole window, and its offset
+        // estimate is garbage anyway (the two legs are wildly asymmetric).
+        if rtt_ms > MAX_SAMPLE_RTT_MS {
+            tracing::debug!(rtt_ms, "clock sample discarded: pathological RTT");
+            return;
+        }
         if self.samples.len() == self.window {
             self.samples.pop_front();
         }
@@ -126,5 +141,17 @@ mod tests {
         c.observe(0, 50, 55, 100); // rtt = 100 - 5 = 95
         c.observe(0, 50, 55, 60); // rtt = 60 - 5 = 55
         assert_eq!(c.max_rtt_ms(), 95);
+    }
+
+    /// B38 — a throttled/suspended client reports an RTT of tens of seconds;
+    /// recording it poisons max_rtt (and the group scheduling lead) for the
+    /// whole window. Such samples are discarded outright.
+    #[test]
+    fn pathological_rtt_sample_is_discarded() {
+        let mut c = ClockOffset::default();
+        c.observe(0, 50, 55, 100); // rtt 95 — kept
+        c.observe(0, 40_000, 40_000, 80_000); // rtt 80s — discarded
+        assert_eq!(c.max_rtt_ms(), 95);
+        assert_eq!(c.len(), 1);
     }
 }

@@ -344,6 +344,10 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
         })
         .await
         .unwrap();
+    // B38 — a Ready before the Seek's scheduled at_server_ms (MIN_LEAD after
+    // broadcast) is treated as a spurious player transition and ignored;
+    // wait past it so these Readys count as real ACKs.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     handle
         .tx
         .send(GroupMsg::MemberReady {
