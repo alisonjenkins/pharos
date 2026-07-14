@@ -631,6 +631,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             tracing::info!(dir = %dir.display(), "subtitle cache persisting to disk");
             sub_cache = sub_cache.with_disk(dir);
         }
+        // Event-window scans (burn gating) share the resident libav pool.
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        let sub_cache = sub_cache.with_pool(libav_pool.clone());
         state = state.with_subtitle_cache(sub_cache);
     }
     if !cfg.server.trickplay_widths.is_empty() {

@@ -848,6 +848,11 @@ async fn serve_segment(
         }
     }
 
+    // B46 — strip the burn for segments the subtitle track provably leaves
+    // empty. MUST run before the T87 hint, the ETag, the prefetch AND the
+    // cache read: all of them key on the (post-gating) burn index.
+    gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+
     // T87 — remember this play session's exact variant for SyncPlay seek
     // prewarming (same as the VP9 path).
     if let Some(psid) = q.play_session_id.as_deref() {
@@ -1146,6 +1151,59 @@ fn build_segment_opts(
     }
 }
 
+/// B46 — pad the per-segment window test so an event starting a hair past
+/// the segment boundary (or ending a hair before it) still burns: a frame
+/// or two of missing subtitle at a segment edge is invisible to gating
+/// jitter but very visible to the viewer.
+const BURN_GATE_PAD_MS: u64 = 500;
+
+/// B46 — per-segment burn gating. Image-subtitle burn (overlay decode +
+/// composite + re-encode) runs BELOW realtime for VP9 (~6-11 s per 6 s
+/// segment observed live, B44 rollout), yet a forced track (the Na'vi
+/// case) is SPARSE — most segments contain no event at all. Strip the
+/// burn index when the track's event-window timeline proves this segment
+/// empty: the segment takes the plain fast path AND shares its cache key
+/// with non-burn playback (`sub=off`), so it's usually already warm.
+///
+/// Fail-open by construction: an unknown/failed/in-flight scan keeps the
+/// burn (`EventWindows::Unknown`), so gating can only ever REMOVE
+/// provably-empty burns, never lose a visible subtitle. The first ask
+/// kicks off the once-ever background scan (persisted per file+mtime+track).
+async fn gate_image_sub_burn(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    opts: &mut SegmentOpts,
+    start_secs: f64,
+    dur_secs: f64,
+) {
+    let Some(rel_idx) = opts.burn_subtitle_stream_index else {
+        return;
+    };
+    let Some(subs) = state.subtitles.as_ref() else {
+        return;
+    };
+    let mtime = pharos_cache::subtitle_cache::mtime_secs(&item.path).await;
+    match subs
+        .image_sub_event_windows(&item.path, mtime, rel_idx)
+        .await
+    {
+        pharos_cache::subtitle_cache::EventWindows::Known(windows) => {
+            let start_ms = ((start_secs * 1000.0) as u64).saturating_sub(BURN_GATE_PAD_MS);
+            let end_ms = ((start_secs + dur_secs) * 1000.0) as u64 + BURN_GATE_PAD_MS;
+            if !pharos_transcode::subwin::any_window_overlaps(&windows, start_ms, end_ms) {
+                tracing::debug!(
+                    media.id = item.id,
+                    rel_idx,
+                    start_secs,
+                    "burn gated off: no subtitle event in segment window"
+                );
+                opts.burn_subtitle_stream_index = None;
+            }
+        }
+        pharos_cache::subtitle_cache::EventWindows::Unknown => {}
+    }
+}
+
 /// Produce the query string each embedded segment URL needs.
 /// Carries forward the bearer token (`api_key`), the play-session id,
 /// and any client-supplied per-stream picks (`AudioStreamIndex`,
@@ -1406,7 +1464,7 @@ async fn vp9_init(
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
-    let opts = vp9_segment_opts(
+    let mut opts = vp9_segment_opts(
         &state,
         &req,
         &item,
@@ -1415,6 +1473,12 @@ async fn vp9_init(
         q.subtitle_stream_index,
     )
     .await;
+    // B46 — same gating as the media segments so the init shares seg 0's
+    // cache key.
+    {
+        let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
+        gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    }
     let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
@@ -1442,7 +1506,7 @@ async fn vp9_segment(
     state.note_playback_activity();
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
-    let opts = vp9_segment_opts(
+    let mut opts = vp9_segment_opts(
         &state,
         &req,
         &item,
@@ -1451,6 +1515,12 @@ async fn vp9_segment(
         q.subtitle_stream_index,
     )
     .await;
+    // B46 — strip provably-empty burns BEFORE the hint/prefetch/cache read
+    // (they all key on the burn index).
+    {
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+        gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    }
     // T87 — remember this play session's exact variant so a SyncPlay seek
     // can prewarm its segments before the client even applies the command.
     if let Some(psid) = q.play_session_id.as_deref() {
@@ -1618,6 +1688,9 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                 o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
                 o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
                 actix_web::rt::spawn(async move {
+                    // B46 — gate per TARGET segment (the hinted opts carry the
+                    // hinting segment's burn decision, not this one's).
+                    gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
                     let Some(cache) = state.hls.as_ref() else {
                         return;
                     };
@@ -1679,6 +1752,10 @@ fn spawn_segment_prefetch(
         // (the encode runs in the transcode worker pool, not here), so it
         // yields the worker immediately and never blocks request handling.
         actix_web::rt::spawn(async move {
+            // B46 — re-gate for THIS segment's window (the base opts carry
+            // the requesting segment's burn decision; sparse tracks flip
+            // between segments, and the cache key follows the burn index).
+            gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
             let Some(cache) = state.hls.as_ref() else {
                 return;
             };
