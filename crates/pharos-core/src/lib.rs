@@ -1485,6 +1485,113 @@ pub struct ScanState {
 // ordering + album-year sort) — re-probe so music rows pick them up.
 pub const PROBE_SCHEMA_VERSION: i64 = 2;
 
+/// T86/ADR-0018 — bump when the intro/outro detection ALGORITHM changes in a
+/// way that invalidates stored segments or fingerprints. A season whose stored
+/// segments carry an older version is re-analyzed by the backfill.
+pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
+
+/// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
+/// jellyfin-web's Skip Intro / Skip Outro overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSegmentKind {
+    Intro,
+    Outro,
+    Recap,
+    Preview,
+    Commercial,
+}
+
+impl MediaSegmentKind {
+    /// The wire `Type` string jellyfin-web expects on a MediaSegment.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intro => "Intro",
+            Self::Outro => "Outro",
+            Self::Recap => "Recap",
+            Self::Preview => "Preview",
+            Self::Commercial => "Commercial",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Intro" => Some(Self::Intro),
+            "Outro" => Some(Self::Outro),
+            "Recap" => Some(Self::Recap),
+            "Preview" => Some(Self::Preview),
+            "Commercial" => Some(Self::Commercial),
+            _ => None,
+        }
+    }
+}
+
+/// One detected segment for an item, ready to persist / serve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectedSegment {
+    pub kind: MediaSegmentKind,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// How it was found: `"chromaprint"`, `"blackframe"`, or `"chapter"`.
+    pub detector: String,
+    /// Detector confidence 0..=1 (chapters = 1.0).
+    pub confidence: f32,
+}
+
+/// Which fingerprint window a cached fingerprint covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintKind {
+    /// The episode head (intro detection).
+    Intro,
+    /// The episode tail (credits/outro detection).
+    Credits,
+}
+
+impl FingerprintKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intro => "intro",
+            Self::Credits => "credits",
+        }
+    }
+}
+
+/// Persistence for detected segments + the cached episode fingerprints that
+/// produced them (ADR-0018). Separate from [`MediaStore`] so only the real
+/// SQL backends implement it — the scanner's in-memory test stores don't.
+pub trait MediaSegmentStore: Send + Sync {
+    /// Replace ALL segments for `item_id` with `segments` (stamped with
+    /// `schema_version`). An empty slice clears them.
+    fn set_media_segments(
+        &self,
+        item_id: MediaId,
+        segments: &[DetectedSegment],
+        schema_version: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Every stored segment for `item_id`, any schema version (the caller
+    /// checks freshness). Empty when none.
+    fn media_segments_for(
+        &self,
+        item_id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<DetectedSegment>>> + Send;
+
+    /// Cache an episode's window fingerprint (points serialized little-endian).
+    fn set_episode_fingerprint(
+        &self,
+        item_id: MediaId,
+        kind: FingerprintKind,
+        points: &[u32],
+        schema_version: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// A cached fingerprint at the current `schema_version`, or `None`.
+    fn episode_fingerprint_for(
+        &self,
+        item_id: MediaId,
+        kind: FingerprintKind,
+        schema_version: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Option<Vec<u32>>>> + Send;
+}
+
 /// LIB-A4 — structured result of an incremental scan. Replaces the bare
 /// `usize` probed-count `scan_into` used to return so callers can broadcast
 /// content deltas to connected clients and print richer CLI summaries.

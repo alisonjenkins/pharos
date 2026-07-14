@@ -264,6 +264,73 @@ impl MediaStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// MediaSegmentStore (T86 / ADR-0018)
+// ---------------------------------------------------------------------
+impl pharos_core::MediaSegmentStore for AnyStore {
+    async fn set_media_segments(
+        &self,
+        item_id: MediaId,
+        segments: &[pharos_core::DetectedSegment],
+        schema_version: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.set_media_segments(item_id, segments, schema_version)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.set_media_segments(item_id, segments, schema_version)
+                    .await
+            }
+        }
+    }
+    async fn media_segments_for(
+        &self,
+        item_id: MediaId,
+    ) -> DomainResult<Vec<pharos_core::DetectedSegment>> {
+        match self {
+            AnyStore::Sqlite(s) => s.media_segments_for(item_id).await,
+            AnyStore::Postgres(p) => p.media_segments_for(item_id).await,
+        }
+    }
+    async fn set_episode_fingerprint(
+        &self,
+        item_id: MediaId,
+        kind: pharos_core::FingerprintKind,
+        points: &[u32],
+        schema_version: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.set_episode_fingerprint(item_id, kind, points, schema_version)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.set_episode_fingerprint(item_id, kind, points, schema_version)
+                    .await
+            }
+        }
+    }
+    async fn episode_fingerprint_for(
+        &self,
+        item_id: MediaId,
+        kind: pharos_core::FingerprintKind,
+        schema_version: i64,
+    ) -> DomainResult<Option<Vec<u32>>> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.episode_fingerprint_for(item_id, kind, schema_version)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.episode_fingerprint_for(item_id, kind, schema_version)
+                    .await
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // GenreStore
 // ---------------------------------------------------------------------
 impl GenreStore for AnyStore {

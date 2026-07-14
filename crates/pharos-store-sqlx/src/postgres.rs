@@ -973,6 +973,129 @@ impl MediaStore for PostgresStore {
     }
 }
 
+impl pharos_core::MediaSegmentStore for PostgresStore {
+    async fn set_media_segments(
+        &self,
+        item_id: MediaId,
+        segments: &[pharos_core::DetectedSegment],
+        schema_version: i64,
+    ) -> DomainResult<()> {
+        let id = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        sqlx::query("DELETE FROM media_segments WHERE item_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        for seg in segments {
+            sqlx::query(
+                "INSERT INTO media_segments (item_id, kind, start_ms, end_ms, detector, \
+                    confidence, schema_version) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(id)
+            .bind(seg.kind.as_str())
+            .bind(seg.start_ms as i64)
+            .bind(seg.end_ms as i64)
+            .bind(&seg.detector)
+            .bind(seg.confidence as f64)
+            .bind(schema_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn media_segments_for(
+        &self,
+        item_id: MediaId,
+    ) -> DomainResult<Vec<pharos_core::DetectedSegment>> {
+        let id = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let rows = sqlx::query_as::<_, (String, i64, i64, String, f64)>(
+            "SELECT kind, start_ms, end_ms, detector, confidence FROM media_segments \
+             WHERE item_id = $1 ORDER BY start_ms",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(k, s, e, det, c)| {
+                pharos_core::MediaSegmentKind::from_str(&k).map(|kind| {
+                    pharos_core::DetectedSegment {
+                        kind,
+                        start_ms: s.max(0) as u64,
+                        end_ms: e.max(0) as u64,
+                        detector: det,
+                        confidence: c as f32,
+                    }
+                })
+            })
+            .collect())
+    }
+
+    async fn set_episode_fingerprint(
+        &self,
+        item_id: MediaId,
+        kind: pharos_core::FingerprintKind,
+        points: &[u32],
+        schema_version: i64,
+    ) -> DomainResult<()> {
+        let id = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let bytes: Vec<u8> = points.iter().flat_map(|p| p.to_le_bytes()).collect();
+        sqlx::query(
+            "INSERT INTO episode_fingerprints (item_id, kind, points, schema_version) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (item_id, kind) DO UPDATE SET \
+                points = EXCLUDED.points, schema_version = EXCLUDED.schema_version",
+        )
+        .bind(id)
+        .bind(kind.as_str())
+        .bind(bytes)
+        .bind(schema_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn episode_fingerprint_for(
+        &self,
+        item_id: MediaId,
+        kind: pharos_core::FingerprintKind,
+        schema_version: i64,
+    ) -> DomainResult<Option<Vec<u32>>> {
+        let id = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let row = sqlx::query_as::<_, (Vec<u8>,)>(
+            "SELECT points FROM episode_fingerprints WHERE item_id = $1 AND kind = $2 \
+             AND schema_version = $3",
+        )
+        .bind(id)
+        .bind(kind.as_str())
+        .bind(schema_version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(bytes,)| {
+            bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }))
+    }
+}
+
 impl GenreStore for PostgresStore {
     #[tracing::instrument(skip(self))]
     async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
