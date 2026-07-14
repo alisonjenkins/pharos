@@ -681,26 +681,97 @@ pub fn wire_item_id(id: pharos_core::MediaId) -> String {
     format!("{id:032x}")
 }
 
+/// A parsed inbound wire id, with the real-vs-synthetic distinction made
+/// at the PARSE boundary instead of by ad-hoc high-half masking at use
+/// sites ("make incorrect states unrepresentable").
+///
+/// The two namespaces are disjoint by construction:
+/// - **Real** library item ids serialize as the u64 zero-padded to 32 hex
+///   (high half all zeros — see [`wire_item_id`]).
+/// - **Synth** group ids (series/season/artist/album/genre/tag/collection)
+///   are a 63-bit xxh3 hash emitted DUPLICATED (`{h:016x}{h:016x}`, see
+///   [`series_id_for_key`] et al.), so their high half is non-zero and
+///   equals the low half.
+///
+/// A handler that can only serve real media takes the `Real` arm and gets
+/// a type-checked guarantee no synth id reaches the store; a browse
+/// handler that groups by synth ids matches both arms EXPLICITLY — the
+/// silent parse-fail-to-empty behaviour of funnelling everything through
+/// [`parse_item_id`] is what made synth-id routes return empty instead of
+/// resolving (B32-class bugs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireId {
+    /// A library media item backed by a store row.
+    Real(pharos_core::MediaId),
+    /// A synthesised group id (the 63-bit hash, i.e. the repeated half).
+    /// Never a store key — resolve by re-hashing candidate names/folders.
+    Synth(u64),
+}
+
+impl WireId {
+    /// Parse an incoming id in ANY of the shapes clients send back:
+    /// - the canonical dashless 32-hex GUID
+    /// - the same GUID with dashes (some SDKs re-serialize UUIDs dashed)
+    /// - the legacy plain-decimal form (pre-B15 clients / open sessions;
+    ///   always a REAL id — synth ids never had a decimal form)
+    ///
+    /// Returns `None` for foreign GUIDs in neither namespace (e.g. a user
+    /// id, or another server's item id pasted into a URL).
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.len() == 36 && s.bytes().filter(|b| *b == b'-').count() == 4 {
+            let undashed: String = s.chars().filter(|c| *c != '-').collect();
+            return Self::parse(&undashed);
+        }
+        if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let (hi, lo) = s.split_at(16);
+            if hi.bytes().all(|b| b == b'0') {
+                return pharos_core::MediaId::from_str_radix(lo, 16)
+                    .ok()
+                    .map(Self::Real);
+            }
+            // Synth namespace: the 63-bit hash duplicated into both halves.
+            let hi = u64::from_str_radix(hi, 16).ok()?;
+            let lo = u64::from_str_radix(lo, 16).ok()?;
+            if hi == lo {
+                return Some(Self::Synth(lo));
+            }
+            // GUID-shaped but in neither id namespace.
+            return None;
+        }
+        s.parse::<pharos_core::MediaId>().ok().map(Self::Real)
+    }
+
+    /// The real media id, if this is one. The type-checked replacement for
+    /// "parse then hope it wasn't synthetic".
+    pub fn real(self) -> Option<pharos_core::MediaId> {
+        match self {
+            Self::Real(id) => Some(id),
+            Self::Synth(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WireId {
+    /// Canonical wire form — round-trips through [`WireId::parse`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Real(id) => write!(f, "{id:032x}"),
+            Self::Synth(h) => write!(f, "{h:016x}{h:016x}"),
+        }
+    }
+}
+
 /// Parse an incoming item id in ANY of the shapes clients send back:
 /// - the canonical dashless 32-hex GUID (leading 16 zeros → pharos u64)
 /// - the same GUID with dashes (some SDKs re-serialize UUIDs dashed)
 /// - the legacy plain-decimal form (pre-B15 clients / open sessions)
+///
+/// REAL ids only — a synthetic (series/artist/…) id returns `None`.
+/// Handlers that must also accept synth ids match on [`WireId::parse`]
+/// instead, which makes the two namespaces explicit.
 pub fn parse_item_id(s: &str) -> Option<pharos_core::MediaId> {
-    let s = s.trim();
-    if s.len() == 36 && s.bytes().filter(|b| *b == b'-').count() == 4 {
-        let undashed: String = s.chars().filter(|c| *c != '-').collect();
-        return parse_item_id(&undashed);
-    }
-    if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let (hi, lo) = s.split_at(16);
-        if hi.bytes().all(|b| b == b'0') {
-            return pharos_core::MediaId::from_str_radix(lo, 16).ok();
-        }
-        // GUID-shaped but not in the item-id namespace (e.g. a synthetic
-        // series/season id) — not a media item id.
-        return None;
-    }
-    s.parse::<pharos_core::MediaId>().ok()
+    WireId::parse(s).and_then(WireId::real)
 }
 
 pub fn format_iso8601(unix_secs: i64) -> String {
@@ -1780,6 +1851,45 @@ mod tests {
         assert_eq!(parse_item_id("152979617944103156"), Some(id));
         // Synthetic series ids (non-zero high half) are NOT item ids.
         assert_eq!(parse_item_id("11112222333344441111222233334444"), None);
+    }
+
+    #[test]
+    fn wire_id_separates_the_real_and_synth_namespaces_at_parse() {
+        // Real: canonical + dashed + legacy decimal all land in Real.
+        let id: pharos_core::MediaId = 152_979_617_944_103_156;
+        let wire = wire_item_id(id);
+        assert_eq!(WireId::parse(&wire), Some(WireId::Real(id)));
+        assert_eq!(
+            WireId::parse("152979617944103156"),
+            Some(WireId::Real(id)),
+            "legacy decimal is always a real id"
+        );
+
+        // Synth: every synth emitter uses the duplicated-63-bit-hash shape;
+        // parse must classify it as Synth with the hash recovered, for ANY
+        // of the synth families.
+        for synth in [
+            series_id_for("Cosmos"),
+            season_id_for("Cosmos", 2),
+            artist_id_for("Limp Bizkit"),
+            album_id_for("Significant Other"),
+        ] {
+            let parsed = WireId::parse(&synth);
+            let Some(WireId::Synth(h)) = parsed else {
+                panic!("synth id {synth} must parse as Synth, got {parsed:?}");
+            };
+            // Display round-trips byte-identically.
+            assert_eq!(WireId::Synth(h).to_string(), synth);
+            // And the real-only funnel keeps rejecting it.
+            assert_eq!(parse_item_id(&synth), None);
+        }
+
+        // Foreign GUID (neither namespace: high half ≠ 0 and ≠ low half) —
+        // e.g. a user id — is neither Real nor Synth.
+        assert_eq!(WireId::parse("7f0030cf2cf7436787ddbded65123a89"), None);
+
+        // Real ids round-trip through Display too.
+        assert_eq!(WireId::Real(id).to_string(), wire);
     }
 
     #[test]
