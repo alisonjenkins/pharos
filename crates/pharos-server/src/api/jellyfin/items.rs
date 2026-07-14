@@ -1659,6 +1659,20 @@ async fn playback_info(
             if forward {
                 push("SubtitleStreamIndex", v);
             }
+        } else if let Some(def) = probe.subtitle_tracks.iter().find(|t| {
+            t.is_default && !crate::api::jellyfin::dto::is_text_subtitle_codec(t.codec.as_deref())
+        }) {
+            // B44 — no client pick at all: honour the container's DEFAULT
+            // disposition when it names an IMAGE subtitle. Forced-Na'vi-style
+            // tracks (Avatar: PGS "Forced Stylized (Na'vi)", default+forced)
+            // exist precisely so untranslated-dialogue sections play
+            // subtitled WITHOUT the user doing anything — real Jellyfin
+            // burns them by default. We advertise the track via
+            // DefaultSubtitleStreamIndex, so the client already believes
+            // it's active; not baking it into the transcode URL silently
+            // played those sections unsubtitled. (Text defaults still
+            // deliver External — the client renders them itself.)
+            push("SubtitleStreamIndex", def.stream_index.to_string());
         }
         s
     };

@@ -73,6 +73,10 @@ async fn seed() -> (web::Data<AppState>, String) {
                     pharos_core::SubtitleTrack {
                         stream_index: 5,
                         codec: Some("hdmv_pgs_subtitle".into()),
+                        // Avatar-shaped: the forced-Na'vi track ships
+                        // default+forced so it plays with no user action.
+                        is_default: true,
+                        is_forced: true,
                         ..Default::default()
                     },
                     pharos_core::SubtitleTrack {
@@ -358,5 +362,81 @@ async fn linux_firefox_still_forced_onto_vp9() {
     assert!(
         url.contains("/vp9/master.m3u8"),
         "desktop-Linux Firefox keeps the VP9 force (its canPlayType lies): {url:?}"
+    );
+}
+
+#[actix_web::test]
+async fn default_image_sub_is_baked_without_client_pick() {
+    // B44 — Avatar's forced-Na'vi PGS track is default+forced: with NO
+    // client subtitle pick the transcode must burn it (the client is told
+    // it's active via DefaultSubtitleStreamIndex; not baking it silently
+    // played Na'vi sections unsubtitled).
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(PROFILE_FIREFOX)
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let ms = &v["MediaSources"][0];
+    let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
+    assert!(
+        url.contains("SubtitleStreamIndex=5"),
+        "default image sub must be baked into the transcode URL: {url:?}"
+    );
+    assert_eq!(ms["DefaultSubtitleStreamIndex"], 5, "{ms}");
+}
+
+#[actix_web::test]
+async fn explicit_subtitles_off_beats_the_default_track() {
+    // A client that turned subtitles OFF (-1) must not get the default
+    // image track burned back in.
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_FIREFOX).unwrap()["DeviceProfile"],
+        "SubtitleStreamIndex": -1,
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        url.contains("SubtitleStreamIndex=-1"),
+        "explicit off must ride through: {url:?}"
+    );
+    assert!(
+        !url.contains("SubtitleStreamIndex=5"),
+        "explicit off must beat the default track: {url:?}"
     );
 }
