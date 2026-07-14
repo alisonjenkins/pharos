@@ -72,12 +72,18 @@ async fn dispatch(
             command = label,
             "syncplay: command with no deviceId — dropped"
         ),
-        Some(dev) => match hub.resolve(dev) {
+        // B54 — resolve WITH RETRY: the group-forming commands (SetNewQueue
+        // especially — it hands the group its media) can arrive in the same
+        // open-socket-then-POST race as New/Join. A single resolve then drops
+        // SetNewQueue and the group has nothing to play. A member with a live
+        // socket resolves on the first try (no added latency); only the race
+        // window or a genuine disconnect waits.
+        Some(dev) => match resolve_with_retry(hub, dev).await {
             None => tracing::warn!(
                 command = label,
                 device_id = %dev,
-                "syncplay: no /socket registered for this deviceId — command dropped \
-                 (client must open /socket before commanding)"
+                "syncplay: no /socket registered for this deviceId after retry — command \
+                 dropped (client must open /socket before commanding)"
             ),
             Some(sess) => match sess.group {
                 None => {
