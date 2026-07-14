@@ -470,14 +470,20 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
 /// budget) and never less than 500 kbps so low-bitrate sources still
 /// look watchable post-transcode.
 const HLS_MIN_BITRATE_BPS: u64 = 500_000;
-// B50 — the ceiling honours the client's negotiated MaxStreamingBitrate
-// (jellyfin-web's quality picker offers up to 40 Mbps). The old 8 Mbps cap
-// silently clamped every transcode — a high-bitrate source squeezed into
-// 8 Mbps VP9 at the realtime encoder is visibly grainy (bitrate starvation,
-// benchmarked: SSIM 0.718 @ 8M vs 0.757 @ 25M on grainy 1080p; cpu-used made
-// no difference). `effective_video_bitrate` bounds this by the SOURCE
-// bitrate, so a low-bitrate source is never wastefully over-encoded.
-const HLS_MAX_BITRATE_BPS: u64 = 40_000_000;
+// The ceiling honours the client's negotiated MaxStreamingBitrate up to a
+// bound the CPU-only box can actually ENCODE in realtime.
+//
+// B50 raised this 8M→40M to end VP9 graininess — but 40M is unencodable in
+// realtime by the software VP9 encoder: a 1080p segment took 32s (vs the 6s
+// budget), freezing playback (Supergirl VP9, 2026-07-14). The B50 benchmark
+// used synthetic noise, which encodes far faster than real film detail.
+// B52 caps at 12M: a real improvement over the old 8M (measured grain win),
+// still within the ~1.5-2x realtime margin observed for 1080p VP9 on this
+// box, and `effective_video_bitrate` bounds it by the SOURCE bitrate so a
+// low-bitrate source (most content) is never wastefully over-encoded.
+// x264/VAAPI could sustain more, but one ceiling keeps the negotiation
+// simple and VP9 (desktop-Linux Firefox, B43) is the realtime-tightest path.
+const HLS_MAX_BITRATE_BPS: u64 = 12_000_000;
 
 fn target_video_bitrate(source: Option<u64>) -> u64 {
     source
@@ -2406,22 +2412,30 @@ mod tests {
     #[::core::prelude::v1::test]
     fn target_video_bitrate_clamps_into_window() {
         assert_eq!(target_video_bitrate(Some(100_000)), HLS_MIN_BITRATE_BPS);
-        // B50 — a 20 Mbps source is now honoured (was clamped to 8 Mbps).
-        assert_eq!(target_video_bitrate(Some(20_000_000)), 20_000_000);
-        // Above the 40 Mbps ceiling still clamps.
-        assert_eq!(target_video_bitrate(Some(60_000_000)), HLS_MAX_BITRATE_BPS);
+        // A source below the ceiling is honoured (better than the old 8M cap).
+        assert_eq!(target_video_bitrate(Some(10_000_000)), 10_000_000);
+        // Above the 12 Mbps ceiling clamps (B52 — 40M was unencodable in
+        // realtime on the CPU-only box; froze VP9 playback).
+        assert_eq!(target_video_bitrate(Some(25_000_000)), HLS_MAX_BITRATE_BPS);
         assert_eq!(target_video_bitrate(Some(2_500_000)), 2_500_000);
         assert_eq!(target_video_bitrate(None), HLS_MAX_BITRATE_BPS);
     }
 
     #[::core::prelude::v1::test]
     fn effective_video_bitrate_honours_cap_bounded_by_source() {
-        // B50 — the reported bug: client picks 40 Mbps, source is 25 Mbps.
-        // Old code clamped to 8 Mbps (grainy); now honours the source.
+        // Client picks 40 Mbps, source is 25 Mbps → clamped to the 12 Mbps
+        // realtime ceiling (B52), not the source (which the box can't encode
+        // in realtime).
         assert_eq!(
             effective_video_bitrate(Some(40_000_000), Some(25_000_000)),
-            25_000_000,
-            "a 40 Mbps pick on a 25 Mbps source encodes at source, not 8 Mbps"
+            HLS_MAX_BITRATE_BPS,
+            "an over-ceiling pick+source clamps to the realtime ceiling"
+        );
+        // Source BELOW the ceiling is honoured (no wasteful over-encode).
+        assert_eq!(
+            effective_video_bitrate(Some(40_000_000), Some(9_000_000)),
+            9_000_000,
+            "a 40 Mbps pick on a 9 Mbps source encodes at source"
         );
         // Client cap BELOW source → honour the client's (lower) choice.
         assert_eq!(
@@ -2429,14 +2443,17 @@ mod tests {
             6_000_000
         );
         // No cap → source-derived, up to the ceiling.
-        assert_eq!(effective_video_bitrate(None, Some(30_000_000)), 30_000_000);
-        // Both above the ceiling → clamp to 40 Mbps.
+        assert_eq!(
+            effective_video_bitrate(None, Some(30_000_000)),
+            HLS_MAX_BITRATE_BPS
+        );
+        // Both above the ceiling → clamp to the ceiling.
         assert_eq!(
             effective_video_bitrate(Some(80_000_000), Some(60_000_000)),
             HLS_MAX_BITRATE_BPS
         );
         // Unknown source → the cap (bounded by ceiling).
-        assert_eq!(effective_video_bitrate(Some(12_000_000), None), 12_000_000);
+        assert_eq!(effective_video_bitrate(Some(10_000_000), None), 10_000_000);
         // Tiny source still floored at the minimum.
         assert_eq!(
             effective_video_bitrate(Some(40_000_000), Some(100_000)),

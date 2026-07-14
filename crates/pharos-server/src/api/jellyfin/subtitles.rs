@@ -263,20 +263,17 @@ pub(crate) async fn pre_extract_subtitles(
         return;
     };
     let mtime = mtime_secs(&item.path).await;
-    for (sub_rel, t) in item.probe.subtitle_tracks.iter().enumerate() {
+    for t in item.probe.subtitle_tracks.iter() {
         let codec_lc = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
         if is_image_subtitle_codec(&codec_lc) {
-            // B46 — image subs never extract to a sidecar, but their EVENT
-            // WINDOWS drive per-segment burn gating. Kick the once-ever
-            // (file+mtime+track) scan here so it runs in the warm passes
-            // (scan-time / library warm-all / playback priority) instead of
-            // stalling a viewer's first play. Non-blocking: a miss spawns
-            // the background scan and returns immediately. The window key's
-            // rel index counts ALL subtitle streams (the `[0:s:N]` burn-map
-            // convention), hence the enumerate over the full track list.
-            let _ = cache
-                .image_sub_event_windows(&item.path, mtime, sub_rel as u32)
-                .await;
+            // B52 — image subs never extract to a sidecar. Their EVENT WINDOWS
+            // (burn gating) are scanned ON DEMAND from the segment handler
+            // (`gate_image_sub_burn`) for the item actually being played —
+            // bg-IO gated + deduped, ONE item. B49 kicked that whole-file scan
+            // here in EVERY warm pass, so the library-wide warm-all scanned
+            // every image-sub title on each boot (thousands of whole-file NFS
+            // demuxes), saturating the libav pool and freezing live playback
+            // (Supergirl, 2026-07-14). Never scan from the warm path.
             continue;
         }
         let is_ass = matches!(
