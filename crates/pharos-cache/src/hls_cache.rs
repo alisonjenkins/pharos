@@ -342,6 +342,8 @@ impl HlsSegmentCache {
         // devices / failed-device retry churn (e.g. phantom GPUs), high
         // encode_ms = a genuinely slow encoder. Fields land on the HTTP request
         // span this runs under.
+        let seek_secs = opts.start_position_ticks as f64 / 10_000_000.0;
+        let seg_secs = opts.duration_ticks.map(|t| t as f64 / 10_000_000.0);
         tracing::info!(
             media.id = media_id,
             seg = seg_index,
@@ -352,9 +354,34 @@ impl HlsSegmentCache {
             bytes = bytes.len(),
             codec = codec_tag(opts.video),
             burn = opts.burn_subtitle_stream_index.is_some(),
+            burn_idx = opts.burn_subtitle_stream_index,
             audio_idx = opts.audio_source_stream_index,
+            seek_secs,
             "hls segment transcoded (cache miss)"
         );
+        // A segment covering N seconds of content that takes >3×N to encode
+        // is drowning (client consumes 1×; even prefetch can't hide a 3×
+        // deficit for long). Surface it at WARN with every dimension needed
+        // to attribute the stall — the 170-225 s outliers observed live
+        // (2026-07-14, Avatar burn path) were only findable by correlating
+        // INFO lines after the fact.
+        let realtime_budget_ms = seg_secs.unwrap_or(6.0) * 1000.0;
+        if (transcode_ms as f64) > 3.0 * realtime_budget_ms {
+            tracing::warn!(
+                media.id = media_id,
+                seg = seg_index,
+                transcode_ms = transcode_ms as u64,
+                queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
+                encode_ms = timing.as_ref().map(|t| t.encode_ms),
+                device = timing.as_ref().map(|t| t.device.to_string()),
+                codec = codec_tag(opts.video),
+                burn = opts.burn_subtitle_stream_index.is_some(),
+                seek_secs,
+                seg_secs,
+                source = %source.display(),
+                "hls segment transcode far below realtime"
+            );
+        }
         self.record(key, bytes.len() as u64).await;
         self.maybe_evict().await;
         // Release the per-key fetch lock so future calls don't keep it
