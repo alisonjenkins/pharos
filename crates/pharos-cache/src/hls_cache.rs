@@ -444,6 +444,32 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
     ) -> Result<PathBuf, HlsCacheError> {
+        self.ensure_audio_hls_covering(source, media_id, audio_index, audio_bitrate_bps, 0)
+            .await
+    }
+
+    /// How far past the newest written segment a request may point while we
+    /// still just WAIT for the running from-behind session (it encodes many
+    /// times realtime, so a small gap closes within the read poll budget).
+    /// Anything further is a SEEK: spawn a second session at the target
+    /// (B42 — the single from-0 session made deep seeks 404 "audio segment
+    /// not ready" until the encoder crawled the whole file over NFS).
+    const AUDIO_SEEK_LOOKAHEAD_SEGS: u32 = 20;
+
+    /// Ensure an audio-rendition session exists whose output will cover
+    /// `want_seg` promptly. `want_seg == 0` is the plain from-the-start
+    /// session; a deep target spawns an additional session seeked to that
+    /// segment boundary (`-ss`, `-start_number`, `-output_ts_offset` so the
+    /// fmp4 timestamps stay source-anchored). Sessions share the directory —
+    /// overlapping segments are byte-wise re-written with identical content.
+    pub async fn ensure_audio_hls_covering(
+        &self,
+        source: &Path,
+        media_id: u64,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+        want_seg: u32,
+    ) -> Result<PathBuf, HlsCacheError> {
         let a = audio_index.unwrap_or(0);
         let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
         let dir = self
@@ -451,9 +477,36 @@ impl HlsSegmentCache {
             .join("_audiohls")
             .join(format!("{media_id}-a{a}-b{br}"));
         let playlist = dir.join("audio.m3u8");
-        let running = dir.join(".running");
-        // Already finished, or a session is in flight → reuse.
-        if tokio::fs::try_exists(&playlist).await.unwrap_or(false)
+        // The requested segment already exists → nothing to spawn.
+        if tokio::fs::try_exists(&dir.join(format!("a{want_seg}.m4s")))
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(dir);
+        }
+        // Pick the session start that serves this request.
+        let start_seg = if want_seg <= Self::AUDIO_SEEK_LOOKAHEAD_SEGS {
+            0
+        } else {
+            match Self::audio_session_progress(&dir).await {
+                // A session has written up to n_max; a target within the
+                // lookahead window will land during the read poll.
+                Some(n_max)
+                    if want_seg <= n_max.saturating_add(Self::AUDIO_SEEK_LOOKAHEAD_SEGS) =>
+                {
+                    return Ok(dir);
+                }
+                _ => want_seg,
+            }
+        };
+        let running = dir.join(if start_seg == 0 {
+            ".running".to_string()
+        } else {
+            format!(".running-{start_seg}")
+        });
+        // Already finished (from-0 leaves the playlist as its done-marker),
+        // or a session for this start is in flight → reuse.
+        if (start_seg == 0 && tokio::fs::try_exists(&playlist).await.unwrap_or(false))
             || tokio::fs::try_exists(&running).await.unwrap_or(false)
         {
             return Ok(dir);
@@ -462,13 +515,13 @@ impl HlsSegmentCache {
             let mut state = self.state.lock().await;
             state
                 .audio_locks
-                .entry(dir.clone())
+                .entry(running.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
         let _guard = lock.lock().await;
         // Re-check under the lock.
-        if tokio::fs::try_exists(&playlist).await.unwrap_or(false)
+        if (start_seg == 0 && tokio::fs::try_exists(&playlist).await.unwrap_or(false))
             || tokio::fs::try_exists(&running).await.unwrap_or(false)
         {
             return Ok(dir);
@@ -476,71 +529,20 @@ impl HlsSegmentCache {
         tokio::fs::create_dir_all(&dir).await?;
         tokio::fs::write(&running, b"").await?;
 
-        let src = source
-            .to_str()
-            .ok_or(HlsCacheError::NonUtf8Path)?
-            .to_string();
-        let seg_pat = dir
-            .join("a%d.m4s")
-            .to_str()
-            .ok_or(HlsCacheError::NonUtf8Path)?
-            .to_string();
-        let m3u8 = playlist
-            .to_str()
-            .ok_or(HlsCacheError::NonUtf8Path)?
-            .to_string();
-        let bitrate = audio_bitrate_bps.unwrap_or(128_000);
-        let mut args: Vec<String> = vec![
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "error".into(),
-            "-i".into(),
-            src,
-            "-vn".into(),
-        ];
-        // Explicit track select when the client picked one; else ffmpeg default.
-        if let Some(idx) = audio_index {
-            args.push("-map".into());
-            args.push(format!("0:a:{idx}"));
-        } else {
-            args.push("-map".into());
-            args.push("0:a:0?".into());
+        let args = Self::audio_hls_args(source, &dir, audio_index, audio_bitrate_bps, start_seg)?;
+        if start_seg > 0 {
+            tracing::info!(
+                media.id = media_id,
+                start_seg,
+                "audio HLS: spawning seek session (B42)"
+            );
         }
-        args.extend(
-            [
-                "-c:a",
-                "libopus",
-                "-b:a",
-                &bitrate.to_string(),
-                "-ac",
-                "2",
-                "-f",
-                "hls",
-                "-hls_time",
-                "6",
-                "-hls_segment_type",
-                "fmp4",
-                "-hls_playlist_type",
-                "vod",
-                "-hls_flags",
-                "independent_segments",
-                "-hls_fmp4_init_filename",
-                "init.mp4",
-                "-hls_list_size",
-                "0",
-                "-hls_segment_filename",
-                &seg_pat,
-                &m3u8,
-            ]
-            .into_iter()
-            .map(String::from),
-        );
 
         let bin = self.transcoder.binary().to_path_buf();
         let running_marker = running.clone();
         let media = media_id;
         // Detached: run the encode to completion, then drop the `.running`
-        // marker (leaving `audio.m3u8` as the done-marker). Reaps the child.
+        // marker (the from-0 session leaves `audio.m3u8` as the done-marker).
         tokio::spawn(async move {
             let mut cmd = tokio::process::Command::new(&bin);
             cmd.args(&args)
@@ -567,6 +569,117 @@ impl HlsSegmentCache {
             let _ = tokio::fs::remove_file(&running_marker).await;
         });
         Ok(dir)
+    }
+
+    /// Highest `aN.m4s` index present in an audio-rendition dir — the
+    /// running session's write progress. `None` when no segment exists yet.
+    async fn audio_session_progress(dir: &Path) -> Option<u32> {
+        let mut best: Option<u32> = None;
+        let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+        while let Ok(Some(e)) = rd.next_entry().await {
+            if let Some(name) = e.file_name().to_str() {
+                if let Some(n) = name
+                    .strip_prefix('a')
+                    .and_then(|r| r.strip_suffix(".m4s"))
+                    .and_then(|r| r.parse::<u32>().ok())
+                {
+                    best = Some(best.map_or(n, |b| b.max(n)));
+                }
+            }
+        }
+        best
+    }
+
+    /// Build the ffmpeg argv for an audio-rendition session starting at
+    /// `start_seg` (0 = whole file). Seek sessions are source-anchored:
+    /// `-ss` input seek to the segment boundary, `-start_number` so the
+    /// emitted names line up with the absolute segment index, and
+    /// `-output_ts_offset` so each fragment's tfdt carries its true timeline
+    /// position (a PTS-0 fragment would buffer at 0:00 in hls.js — the same
+    /// failure class as B41's mpegts segments).
+    fn audio_hls_args(
+        source: &Path,
+        dir: &Path,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+        start_seg: u32,
+    ) -> Result<Vec<String>, HlsCacheError> {
+        let src = source
+            .to_str()
+            .ok_or(HlsCacheError::NonUtf8Path)?
+            .to_string();
+        let seg_pat = dir
+            .join("a%d.m4s")
+            .to_str()
+            .ok_or(HlsCacheError::NonUtf8Path)?
+            .to_string();
+        // Seek sessions write a throwaway playlist so they can never clobber
+        // the from-0 session's `audio.m3u8` done-marker.
+        let m3u8_name = if start_seg == 0 {
+            "audio.m3u8".to_string()
+        } else {
+            format!("audio-from-{start_seg}.m3u8")
+        };
+        let m3u8 = dir
+            .join(m3u8_name)
+            .to_str()
+            .ok_or(HlsCacheError::NonUtf8Path)?
+            .to_string();
+        let bitrate = audio_bitrate_bps.unwrap_or(128_000);
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
+        let start_secs = start_seg as f64 * 6.0;
+        if start_seg > 0 {
+            args.push("-ss".into());
+            args.push(format!("{start_secs:.3}"));
+        }
+        args.push("-i".into());
+        args.push(src);
+        args.push("-vn".into());
+        // Explicit track select when the client picked one; else ffmpeg default.
+        if let Some(idx) = audio_index {
+            args.push("-map".into());
+            args.push(format!("0:a:{idx}"));
+        } else {
+            args.push("-map".into());
+            args.push("0:a:0?".into());
+        }
+        args.extend(
+            ["-c:a", "libopus", "-b:a", &bitrate.to_string(), "-ac", "2"]
+                .into_iter()
+                .map(String::from),
+        );
+        if start_seg > 0 {
+            args.push("-output_ts_offset".into());
+            args.push(format!("{start_secs:.3}"));
+        }
+        args.extend(
+            [
+                "-f",
+                "hls",
+                "-hls_time",
+                "6",
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_fmp4_init_filename",
+                "init.mp4",
+                "-hls_list_size",
+                "0",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        if start_seg > 0 {
+            args.push("-start_number".into());
+            args.push(start_seg.to_string());
+        }
+        args.push("-hls_segment_filename".into());
+        args.push(seg_pat);
+        args.push(m3u8);
+        Ok(args)
     }
 
     /// Read a produced audio-rendition file (`init.mp4`, `aN.m4s`, or
@@ -815,5 +928,52 @@ mod tests {
         });
         assert_eq!(a, b);
         assert_eq!(a, b"abc");
+    }
+
+    /// B42 — the from-0 audio session must stay byte-identical to the old
+    /// behaviour: no seek, no renumbering, no timestamp offset, canonical
+    /// playlist name (its presence is the done-marker).
+    #[test]
+    fn audio_hls_args_from_zero_has_no_seek_or_offset() {
+        let a = HlsSegmentCache::audio_hls_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/d"),
+            Some(1),
+            Some(128_000),
+            0,
+        )
+        .unwrap();
+        let joined = a.join(" ");
+        assert!(!joined.contains("-ss"), "{joined}");
+        assert!(!joined.contains("-start_number"), "{joined}");
+        assert!(!joined.contains("-output_ts_offset"), "{joined}");
+        assert!(joined.ends_with("audio.m3u8"), "{joined}");
+        assert!(joined.contains("-map 0:a:1"), "{joined}");
+    }
+
+    /// B42 — a seek session must be source-anchored: input-seek to the
+    /// segment boundary, absolute segment numbering, and true-timeline
+    /// fragment timestamps (a PTS-0 fragment buffers at 0:00 in hls.js —
+    /// the B41 failure class). Its playlist must not clobber the from-0
+    /// session's done-marker.
+    #[test]
+    fn audio_hls_args_seek_session_is_source_anchored() {
+        let a = HlsSegmentCache::audio_hls_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/d"),
+            None,
+            Some(128_000),
+            30,
+        )
+        .unwrap();
+        let joined = a.join(" ");
+        assert!(joined.contains("-ss 180.000"), "{joined}");
+        assert!(joined.contains("-output_ts_offset 180.000"), "{joined}");
+        assert!(joined.contains("-start_number 30"), "{joined}");
+        assert!(joined.ends_with("audio-from-30.m3u8"), "{joined}");
+        // -ss must be an INPUT option (before -i).
+        let ss = a.iter().position(|x| x == "-ss").unwrap();
+        let i = a.iter().position(|x| x == "-i").unwrap();
+        assert!(ss < i, "-ss must precede -i: {joined}");
     }
 }

@@ -1323,8 +1323,18 @@ async fn vp9_audio_file(
     };
     let item = fetch_item(&state, media_id).await?;
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
+    // B42 — tell the cache WHICH segment this request needs: a deep seek
+    // (segment far past the running from-0 session's progress) spawns a
+    // second, seeked session instead of 404ing "not ready" until the
+    // whole-file encode crawls there (observed live: Avatar seek to ~1h40m
+    // → a996.m4s 404 → hls.js stalled the seek).
+    let want_seg = name
+        .strip_prefix('a')
+        .and_then(|r| r.strip_suffix(".m4s"))
+        .and_then(|r| r.parse::<u32>().ok())
+        .unwrap_or(0);
     let dir = cache
-        .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
+        .ensure_audio_hls_covering(&item.path, media_id, audio_rel, Some(128_000), want_seg)
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     let bytes = cache
