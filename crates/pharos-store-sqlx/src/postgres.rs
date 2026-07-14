@@ -363,7 +363,7 @@ impl crate::ServerConfigStore for PostgresStore {
         let new_id = Uuid::new_v4().simple().to_string();
         let now = now_unix_secs();
         match sqlx::query(
-            "INSERT INTO system_identity (id, server_id, created_at) VALUES (1, $1, $2, $3, $4, $5)",
+            "INSERT INTO system_identity (id, server_id, created_at) VALUES (1, $1, $2)",
         )
         .bind(&new_id)
         .bind(now)
