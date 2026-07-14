@@ -168,6 +168,10 @@ compat-playwright-full:
     # the library comes up empty and the crawl 404s. Build the sibling first.
     nix develop --command cargo build -q --bin transcode-worker
     nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    # B53 — a SECOND user for the two-user same-deviceId SyncPlay test
+    # (syncplay-two-users.spec.ts): two different accounts on one browser must
+    # be distinct SyncPlay members.
+    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin create-user --name playwright2 --password playwright2-test-pw --admin
     nix develop --command bash -c "cargo run -q --bin pharos -- --config '$PHAROS_CONFIG' serve" &
     SERVER_PID=$!
     trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
