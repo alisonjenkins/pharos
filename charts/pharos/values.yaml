@@ -71,6 +71,12 @@ config:
     hwaccel: "auto"
     transcodeHwSessionCap: 2
     transcodeProbeCaps: true
+    # B60 — serve H.264 to desktop Linux Firefox instead of the forced VP9/WebM
+    # path (B43). VP9 is a fragile software-only path (separate audio rendition
+    # that stalls a deep seek — the Sabrina hang) and keeps a Linux-FF member off
+    # the group's shared H.264 encode. Modern Linux Firefox decodes H.264 in MSE,
+    # so this is on. Flip to false if a Linux Firefox can't play (hls.js fatals).
+    linuxFirefoxH264: true
     subtitleCacheMaxBytes: 67108864         # 64 MiB
     subtitleCacheMaxEntries: 1024
     liveTvM3u: null
