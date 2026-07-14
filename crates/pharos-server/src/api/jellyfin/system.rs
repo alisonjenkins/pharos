@@ -663,12 +663,18 @@ async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json
     let Ok(item) = state.stores.get(id).await else {
         return Vec::new();
     };
+    use pharos_core::MediaSegmentStore;
     let mut out = Vec::new();
+    // Track which segment Types a CHAPTER already supplied — chapters are exact
+    // (author-labeled) so they win over a fingerprint/black-frame detection for
+    // the same Type (T86/ADR-0018 #6, layered sources).
+    let mut seen_types: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     let chapters = &item.probe.chapters;
     for (idx, c) in chapters.iter().enumerate() {
         let Some(seg_type) = classify_chapter_title(&c.title) else {
             continue;
         };
+        seen_types.insert(seg_type);
         let start_ticks = c.start_ms.saturating_mul(10_000);
         // The chapter's `end_ms` is the *next* chapter's start —
         // ffprobe carries it explicitly so we trust it.
@@ -684,6 +690,25 @@ async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json
             "EndTicks": end_ticks,
             "Type": seg_type,
         }));
+    }
+    // T86 — union the auto-DETECTED segments (audio-fingerprint intro/outro,
+    // black-frame credits) the backfill persisted, skipping any Type a chapter
+    // already covered. This is what makes Skip Intro / Skip Outro work for the
+    // vast majority of TV rips, which carry no labeled intro chapters.
+    if let Ok(detected) = state.stores.media_segments_for(id).await {
+        for (di, seg) in detected.iter().enumerate() {
+            let t = seg.kind.as_str();
+            if seen_types.contains(t) {
+                continue;
+            }
+            out.push(serde_json::json!({
+                "Id": format!("{item_id}:d{di}"),
+                "ItemId": item_id,
+                "StartTicks": seg.start_ms.saturating_mul(10_000),
+                "EndTicks": seg.end_ms.saturating_mul(10_000),
+                "Type": t,
+            }));
+        }
     }
     out
 }

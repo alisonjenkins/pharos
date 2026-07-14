@@ -9,6 +9,8 @@ pub mod middleware;
 pub mod obs;
 pub mod quick_connect;
 pub mod router;
+#[cfg(unix)]
+pub mod segment_backfill;
 pub mod sessions;
 pub mod state;
 #[cfg(feature = "postgres")]

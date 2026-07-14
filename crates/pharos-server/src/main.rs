@@ -668,6 +668,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             state = state.with_trickplay_priority(prio);
         }
     }
+    // T86 — intro/outro detection sweep on the resident libav pool, gated by
+    // the same adaptive bg-IO semaphore so it yields to live playback.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pharos_server::segment_backfill::spawn(
+        state.stores.clone(),
+        state.bg_io.clone(),
+        libav_pool.clone(),
+    );
     // Cap the extracted-image cache. Unlike the trickplay/HLS caches it has no
     // in-line eviction, so on a large library posters/backdrops/thumbs/scaled
     // artwork can slowly fill the shared cache volume. A periodic janitor
