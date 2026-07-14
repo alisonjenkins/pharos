@@ -86,6 +86,20 @@ pub struct ServerConfig {
     /// instead of guessing. Default true.
     #[serde(default = "default_true")]
     pub transcode_probe_caps: bool,
+    /// B60 — serve H.264 to desktop LINUX Firefox instead of forcing the
+    /// VP9/WebM transcode path (B43). The VP9 force exists because some older
+    /// Linux Firefox builds advertise H.264 (`canPlayType` → "probably") yet
+    /// their MSE can't decode it; but VP9 is a fragile, software-only path
+    /// (separate audio rendition that can stall a deep seek — the Sabrina
+    /// hang) and a Linux-FF member on VP9 can't share the group's warm H.264
+    /// encode. Most modern Linux Firefox builds DO decode H.264 in MSE, so
+    /// set this `true` to put Linux Firefox on the shared H.264 stream. Left
+    /// `false` (the VP9 force stays) by default so the change is opt-in and
+    /// reversible without a code change. If a Linux Firefox genuinely can't
+    /// decode H.264, playback fatals (hls.js manifestParsingError) — flip
+    /// back to `false`.
+    #[serde(default)]
+    pub linux_firefox_h264: bool,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.

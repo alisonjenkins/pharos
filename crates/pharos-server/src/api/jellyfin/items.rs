@@ -1750,13 +1750,30 @@ async fn playback_info(
         // dominant cost of every seek.
         .is_some_and(|ua| {
             ua.contains("Firefox") && ua.contains("Linux") && !ua.contains("Android")
-        });
+        })
+        // B60 — opt out of the VP9 force for Linux Firefox when configured:
+        // modern Linux FF decodes H.264 in MSE, so serving h264 puts it on the
+        // shared encode and off the fragile VP9 split-audio path (the Sabrina
+        // hang). Reversible via `[server].linux_firefox_h264`.
+        && !state.linux_firefox_h264;
     let client_offers_vp9 = profile.transcoding_profiles.iter().any(|t| {
         (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
             && t.video_codec.split(',').any(|c| {
                 matches!(
                     c.trim().to_ascii_lowercase().as_str(),
                     "vp9" | "vp8" | "vp09" | "vp08"
+                )
+            })
+    });
+    // B60 — evidence for the codec-decision trace: does the client advertise
+    // h264 as a transcode target at all? If a Linux Firefox that hangs on VP9
+    // never even offers h264, the VP9 force is genuinely required for it.
+    let client_offers_h264 = profile.transcoding_profiles.iter().any(|t| {
+        (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
+            && t.video_codec.split(',').any(|c| {
+                matches!(
+                    c.trim().to_ascii_lowercase().as_str(),
+                    "h264" | "avc" | "avc1"
                 )
             })
     });
@@ -1966,6 +1983,7 @@ async fn playback_info(
         is_video,
         is_firefox,
         client_offers_vp9,
+        client_offers_h264,
         force_webm,
         source_codec = source.video_codec.as_deref().unwrap_or("?"),
         negotiated_video_codec = negotiated_video_codec.as_deref().unwrap_or("-"),

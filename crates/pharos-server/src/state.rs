@@ -163,6 +163,9 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
+    /// B60 — when true, desktop Linux Firefox is served H.264 (shared encode)
+    /// instead of the forced VP9/WebM path. Config `[server].linux_firefox_h264`.
+    pub linux_firefox_h264: bool,
     /// P43 — inter-probe sleep in milliseconds for background
     /// `/Library/Refresh` passes. 0 disables rate-limiting. Surfaced
     /// here so the admin spawn reads the configured value without
@@ -449,6 +452,7 @@ impl AppState {
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
+            linux_firefox_h264: false,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
@@ -515,6 +519,7 @@ impl AppState {
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
+            linux_firefox_h264: false,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
@@ -534,6 +539,11 @@ impl AppState {
     /// clamping to `[50, 100]` so a misconfigured 0 doesn't
     /// flip every play to played=true and a 250 doesn't make
     /// played unreachable.
+    pub fn with_linux_firefox_h264(mut self, on: bool) -> Self {
+        self.linux_firefox_h264 = on;
+        self
+    }
+
     pub fn with_played_threshold_pct(mut self, pct: u32) -> Self {
         self.played_threshold_pct = pct.clamp(50, 100);
         self
