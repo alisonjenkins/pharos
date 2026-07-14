@@ -364,7 +364,15 @@ pub fn negotiate(profile: &DeviceProfile, source: &SourceMedia) -> Decision {
         return Decision::Transcode {
             target_container: pick_first_csv(&tp.container)
                 .unwrap_or_else(|| default_container(source.is_video).into()),
-            target_video_codec: pick_first_csv(&tp.video_codec),
+            // B59 — prefer h264 (shareable + universally decodable) over the
+            // client's first-listed codec for VIDEO, so a SyncPlay group whose
+            // browsers each list a different first codec still converges on one
+            // shared encode. Audio keeps first-listed.
+            target_video_codec: if source.is_video {
+                pick_preferred_video_codec(&tp.video_codec)
+            } else {
+                pick_first_csv(&tp.video_codec)
+            },
             target_audio_codec: pick_first_csv(&tp.audio_codec),
             max_video_bitrate_bps: bitrate_cap,
         };
@@ -424,6 +432,31 @@ fn pick_first_csv(csv: &str) -> Option<String> {
         .map(str::trim)
         .find(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// Pick the transcode VIDEO codec from a client's CSV list, PREFERRING H.264
+/// when the client offers it (B59). H.264 is the universally-decodable,
+/// hardware-friendly target AND — crucially for SyncPlay — the SHAREABLE one:
+/// every group member transcoding to h264 hits ONE cached encode, keyed by
+/// `(media, seg, audio, sub, bitrate, codec)`. Honouring the client's
+/// first-listed codec instead (e.g. a browser that lists `vp9,h264`) split a
+/// group across two encodes — one member cold-transcoding VP9 (slow, software)
+/// while the rest shared a warm h264 stream, so the VP9 member stalled and
+/// never joined the shared playback. A client that offers NO h264 (a VP9/AV1-
+/// only profile) still gets its first codec. The Linux-Firefox-can't-decode-
+/// h264 case is forced to VP9 downstream (playback_info `force_webm`), which
+/// overrides this — so a browser that genuinely needs VP9 still gets it.
+fn pick_preferred_video_codec(csv: &str) -> Option<String> {
+    let codecs: Vec<&str> = csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    codecs
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("h264"))
+        .or_else(|| codecs.first())
+        .map(|s| (*s).to_string())
 }
 
 #[cfg(test)]
@@ -508,6 +541,56 @@ mod tests {
                 assert_eq!(target_video_codec.as_deref(), Some("h264"));
                 assert_eq!(target_audio_codec.as_deref(), Some("aac"));
             }
+            other => panic!("expected Transcode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefers_h264_over_first_listed_video_codec() {
+        // B59 — the pure picker: h264 wins whenever offered, whatever its slot.
+        assert_eq!(
+            pick_preferred_video_codec("vp9,h264").as_deref(),
+            Some("h264")
+        );
+        assert_eq!(
+            pick_preferred_video_codec("h264,vp9").as_deref(),
+            Some("h264")
+        );
+        // Case-insensitive match.
+        assert_eq!(
+            pick_preferred_video_codec("VP9, H264").as_deref(),
+            Some("H264")
+        );
+        // No h264 offered → first listed stands (a VP9/AV1-only browser).
+        assert_eq!(
+            pick_preferred_video_codec("av1,vp9").as_deref(),
+            Some("av1")
+        );
+        assert_eq!(pick_preferred_video_codec("vp9").as_deref(), Some("vp9"));
+    }
+
+    #[test]
+    fn transcode_target_prefers_h264_when_client_lists_vp9_first() {
+        // A browser that lists `vp9,h264` (jana's Windows Firefox) must still
+        // transcode to h264 so it shares the group's warm h264 encode instead
+        // of cold-transcoding its own VP9. (B59.)
+        let source = SourceMedia {
+            container: "mkv".into(),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            bitrate_bps: Some(8_000_000),
+            is_video: true,
+            ..Default::default()
+        };
+        let profile = DeviceProfile {
+            // No direct-play match (container mkv absent) → must transcode.
+            transcoding_profiles: vec![tp("ts", "vp9,h264", "aac", "Video")],
+            ..Default::default()
+        };
+        match negotiate(&profile, &source) {
+            Decision::Transcode {
+                target_video_codec, ..
+            } => assert_eq!(target_video_codec.as_deref(), Some("h264")),
             other => panic!("expected Transcode, got {other:?}"),
         }
     }

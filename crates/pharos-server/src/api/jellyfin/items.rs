@@ -1943,6 +1943,36 @@ async fn playback_info(
         _ => container.clone(),
     };
 
+    // B59 — codec-decision trace: exactly why a client got the codec it did.
+    // The VP9-vs-h264 split is what breaks SyncPlay encode-sharing (a member
+    // on VP9 can't share the group's warm h264 encode), so log every input to
+    // the decision — the negotiated target codec, the Firefox force, whether
+    // the client advertised VP9 — and the final route (vp9 fMP4 vs h264 HLS).
+    let negotiated_video_codec = match &decision {
+        Decision::Transcode {
+            target_video_codec, ..
+        } => target_video_codec.clone(),
+        _ => None,
+    };
+    let route = match transcoding_url.as_deref() {
+        Some(u) if u.contains("/vp9/") => "vp9-fmp4",
+        Some(u) if u.contains("/master.m3u8") => "h264-hls",
+        Some(_) => "other",
+        None => "direct",
+    };
+    tracing::info!(
+        media.id = id,
+        user.name = %user.0.name,
+        is_video,
+        is_firefox,
+        client_offers_vp9,
+        force_webm,
+        source_codec = source.video_codec.as_deref().unwrap_or("?"),
+        negotiated_video_codec = negotiated_video_codec.as_deref().unwrap_or("-"),
+        route,
+        "playbackinfo: codec decision"
+    );
+
     // Register the negotiated Decision so HLS segment generation
     // honours the target codec / container / bitrate cap. Only
     // matters when we actually emitted a TranscodingUrl; direct play
