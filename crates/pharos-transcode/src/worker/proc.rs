@@ -312,7 +312,8 @@ impl Worker for ProcWorker {
                         // segment scheduler) — ignore.
                         WorkerEvent::Hello(_)
                         | WorkerEvent::ProbeResult { .. }
-                        | WorkerEvent::WaveformResult { .. } => continue,
+                        | WorkerEvent::WaveformResult { .. }
+                        | WorkerEvent::SubtitleWindowsResult { .. } => continue,
                     },
                 }
             }

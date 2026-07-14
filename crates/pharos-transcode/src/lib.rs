@@ -22,6 +22,7 @@ pub mod probe;
 pub mod protocol;
 pub mod scheduler;
 pub mod segment;
+pub mod subwin;
 #[cfg(unix)]
 pub mod worker;
 

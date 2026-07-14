@@ -19,6 +19,8 @@ pub mod probe;
 #[cfg(feature = "backend-lib")]
 pub mod subtitle;
 #[cfg(feature = "backend-lib")]
+pub mod subtitle_windows;
+#[cfg(feature = "backend-lib")]
 pub mod trickplay;
 #[cfg(feature = "backend-lib")]
 pub mod waveform;

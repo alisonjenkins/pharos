@@ -182,6 +182,15 @@ pub enum TinyOp {
     },
     /// Convert a SubRip sidecar to WebVTT, written to `out` → `Done`.
     SrtToWebvtt { input: PathBuf, out: PathBuf },
+    /// Scan one subtitle stream's packet timeline → merged on-screen
+    /// windows (`WorkerEvent::SubtitleWindowsResult`). Demux-only (no
+    /// decode); drives per-segment burn gating — event-free segments skip
+    /// the overlay pipeline entirely.
+    SubtitleWindows {
+        input: PathBuf,
+        /// Codec-relative subtitle index (the `N` of `-map 0:s:N`).
+        stream_rel_idx: u32,
+    },
     /// Audio RMS waveform → `WorkerEvent::WaveformResult`.
     Waveform {
         input: PathBuf,
@@ -238,6 +247,12 @@ pub enum WorkerEvent {
     WaveformResult {
         job_id: JobId,
         bins: Vec<f32>,
+    },
+    /// Reply to `TinyOp::SubtitleWindows` — merged `(start_ms, end_ms)`
+    /// on-screen intervals, sorted.
+    SubtitleWindowsResult {
+        job_id: JobId,
+        windows: Vec<(u64, u64)>,
     },
 }
 

@@ -48,13 +48,19 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::Trickplay { .. } => "trickplay",
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
+        TinyOp::SubtitleWindows { .. } => "subtitle_windows",
         _ => "other",
     }
 }
 
 /// Whole-file ops that need `heavy_op_timeout` rather than the tiny-op cap.
 fn is_heavy_op(op: &TinyOp) -> bool {
-    matches!(op, TinyOp::Trickplay { .. } | TinyOp::Waveform { .. })
+    matches!(
+        op,
+        // SubtitleWindows demuxes the whole file (no decode) — NFS-bound,
+        // minutes on a large movie, so it needs the heavy cap too.
+        TinyOp::Trickplay { .. } | TinyOp::Waveform { .. } | TinyOp::SubtitleWindows { .. }
+    )
 }
 
 /// Errors surfaced to callers of the pool.
@@ -268,6 +274,25 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Subtitle event windows — merged `(start_ms, end_ms)` intervals of
+    /// the `stream_rel_idx`-th subtitle stream. Demux-only whole-file scan.
+    pub async fn subtitle_windows(
+        &self,
+        input: impl Into<PathBuf>,
+        stream_rel_idx: u32,
+    ) -> Result<Vec<(u64, u64)>, PoolError> {
+        let ev = self
+            .run(TinyOp::SubtitleWindows {
+                input: input.into(),
+                stream_rel_idx,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::SubtitleWindowsResult { windows, .. } => Ok(windows),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Core request/reply: acquire a permit, check out (or spawn) a
     /// worker, run one op, and return the terminal `WorkerEvent`. A
     /// healthy worker is returned to the idle set; a broken one is dropped.
@@ -378,6 +403,7 @@ impl LibavWorkerPool {
             match &ev {
                 WorkerEvent::ProbeResult { job_id: j, .. }
                 | WorkerEvent::WaveformResult { job_id: j, .. }
+                | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
                 | WorkerEvent::Done { job_id: j, .. }
                 | WorkerEvent::Failed { job_id: j, .. } => {
                     if *j != job_id {

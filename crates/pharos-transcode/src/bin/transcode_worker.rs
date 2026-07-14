@@ -384,6 +384,13 @@ fn handle_tiny(
             Ok(bins) => WorkerEvent::WaveformResult { job_id, bins },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::SubtitleWindows {
+            input,
+            stream_rel_idx,
+        } => match libav::subtitle_windows::subtitle_event_windows(&input, stream_rel_idx) {
+            Ok(windows) => WorkerEvent::SubtitleWindowsResult { job_id, windows },
+            Err(e) => frame_err(job_id, e),
+        },
     }
 }
 
