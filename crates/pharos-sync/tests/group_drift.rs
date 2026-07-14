@@ -38,7 +38,7 @@ async fn add_member(
 ) -> (MemberId, mpsc::Receiver<ServerMsg>) {
     let (tx, rx) = mpsc::channel(64);
     let mid = MemberId::new();
-    sinks.insert(mid, tx);
+    sinks.insert(mid, 1, tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     h.tx.send(GroupMsg::AddMember {
         member_id: mid,

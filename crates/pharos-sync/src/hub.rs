@@ -62,6 +62,11 @@ pub struct ResolvedSession {
     pub name: String,
     pub sink: mpsc::Sender<ServerMsg>,
     pub group: Option<GroupHandle>,
+    /// The generation of the socket whose `sink` this is. Captured atomically
+    /// with `sink` under the map shard lock, so an HTTP handler re-registering
+    /// this sink in `MemberSinks` can gen-fence the write and never clobber a
+    /// newer socket that reconnected after this resolve (B56).
+    pub conn_gen: u64,
 }
 
 /// Outcome of a `/socket` (re)connect registering with the hub.
@@ -143,6 +148,7 @@ impl SessionHub {
             name: e.name.clone(),
             sink: e.sink.clone(),
             group: e.group.clone(),
+            conn_gen: e.conn_gen,
         })
     }
 

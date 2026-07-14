@@ -145,7 +145,7 @@ async fn join(
     name: &str,
 ) -> mpsc::Receiver<ServerMsg> {
     let (tx, rx) = mpsc::channel(64);
-    sinks.insert(member, tx);
+    sinks.insert(member, 1, tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .tx
@@ -315,7 +315,7 @@ async fn get_or_create_upgrades_remote_handle_to_owned_after_lock_frees() {
     let gid = h2.group_id;
     let m = MemberId::new();
     let (tx, _rx) = mpsc::channel(8);
-    r2.sinks.insert(m, tx);
+    r2.sinks.insert(m, 1, tx);
     let (rtx, rrx) = oneshot::channel();
     h2.tx
         .send(GroupMsg::AddMember {

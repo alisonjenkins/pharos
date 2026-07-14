@@ -2024,7 +2024,7 @@ mod tests {
             GroupHandle::spawn_persistent(GroupId::new(), 1_000, delivery, capture.clone(), None);
         let member = MemberId::new();
         let (sink_tx, _sink_rx) = mpsc::channel(8);
-        sinks.insert(member, sink_tx);
+        sinks.insert(member, 1, sink_tx);
         let (rtx, rrx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
             member_id: member,
@@ -2099,7 +2099,7 @@ mod tests {
         name: &str,
     ) -> mpsc::Receiver<ServerMsg> {
         let (tx, mut rx) = mpsc::channel(64);
-        sinks.insert(mid, tx);
+        sinks.insert(mid, 1, tx);
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
             member_id: mid,
@@ -2369,7 +2369,7 @@ mod tests {
         // The actor must still be alive to accept the creator.
         let (tx, rx) = mpsc::channel(8);
         let mid = MemberId::new();
-        sinks.insert(mid, tx);
+        sinks.insert(mid, 1, tx);
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
             member_id: mid,

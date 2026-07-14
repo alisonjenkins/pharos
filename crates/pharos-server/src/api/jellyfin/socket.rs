@@ -173,7 +173,7 @@ async fn handle_connection<S>(
     // before any group join: the actor only ever delivers to members in its
     // roster, so an unrostered sink receives nothing until AddMember admits it.
     // On a reconnect this replaces the stale sink with the fresh one.
-    sinks.insert(member_id, out_tx.clone());
+    sinks.insert(member_id, conn_gen, out_tx.clone());
     // Jellyfin-wire context derived from the ServerMsg stream: the current
     // group id (from `Joined`) and the current queue item's PlaylistItemId
     // (from `PlayQueue`), both needed to shape outbound commands.
@@ -374,8 +374,13 @@ async fn handle_connection<S>(
     // WS-native path (vestigial phone/TV clients): its group lives only in
     // `current_group`, so remove immediately (sink + roster).
     if let Some(h) = current_group.take() {
-        let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
-        sinks.remove(member_id);
+        // B56 — gen-fence even the WS-native immediate teardown: a fast
+        // reconnect that already registered a newer sink under this member_id
+        // must not have it wiped by this older socket's disconnect.
+        if hub.conn_gen(&device_key) == Some(conn_gen) {
+            let _ = h.tx.send(GroupMsg::RemoveMember { member_id }).await;
+        }
+        sinks.remove(member_id, conn_gen);
     }
     // HTTP path: membership lives in the hub and must SURVIVE this disconnect so
     // a reconnect (jellyfin-web reconnects its socket constantly) re-attaches
@@ -397,7 +402,7 @@ async fn handle_connection<S>(
         }
         if let Some(group) = hub2.remove_if_current_gen(&dev2, conn_gen) {
             let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
-            sinks2.remove(member_id);
+            sinks2.remove(member_id, conn_gen);
         }
     });
     let _ = session.clone().close(None).await;

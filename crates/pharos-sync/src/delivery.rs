@@ -43,7 +43,16 @@ pub trait Delivery: Send + Sync + 'static {
 /// and the delivery layer (which reads them).
 #[derive(Clone, Default)]
 pub struct MemberSinks {
-    inner: Arc<DashMap<MemberId, mpsc::Sender<ServerMsg>>>,
+    inner: Arc<DashMap<MemberId, SinkEntry>>,
+}
+
+/// A member's outbound sink tagged with the connection generation that owns it.
+/// `gen` is the hub's per-device `conn_gen` (member_id derives from the device,
+/// so it is a strictly-increasing generation for this member). Delivery reads
+/// only `sink`; `gen` exists so a stale writer can never clobber a live socket.
+struct SinkEntry {
+    gen: u64,
+    sink: mpsc::Sender<ServerMsg>,
 }
 
 impl MemberSinks {
@@ -51,16 +60,34 @@ impl MemberSinks {
         Self::default()
     }
 
-    /// Register (or replace, on socket reconnect) a member's sink. Replacing is
-    /// how a reconnected socket re-points delivery at its fresh channel without
-    /// disturbing the actor's roster.
-    pub fn insert(&self, member_id: MemberId, sink: mpsc::Sender<ServerMsg>) {
-        self.inner.insert(member_id, sink);
+    /// Register (or replace, on socket reconnect) a member's sink, generation-
+    /// fenced. `gen` is the registering socket's `conn_gen`. A write only lands
+    /// when `gen >= the stored generation`, so two sockets for one member racing
+    /// their inserts (fast reconnect, or an HTTP New/Join carrying a snapshot
+    /// sink resolved just before a reconnect) can NEVER leave the older, dead
+    /// sink installed over the newer live one (B56). `>=` (not `>`) keeps a
+    /// same-generation re-insert (socket connect + HTTP add for the same
+    /// connection) idempotent.
+    pub fn insert(&self, member_id: MemberId, gen: u64, sink: mpsc::Sender<ServerMsg>) {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(member_id) {
+            Entry::Occupied(mut o) => {
+                if gen >= o.get().gen {
+                    *o.get_mut() = SinkEntry { gen, sink };
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert(SinkEntry { gen, sink });
+            }
+        }
     }
 
-    /// Drop a member's sink (socket closed / member left this replica).
-    pub fn remove(&self, member_id: MemberId) {
-        self.inner.remove(&member_id);
+    /// Drop a member's sink (socket closed / member left this replica), only if
+    /// `gen` still owns it. A reconnect installs a higher generation, so a stale
+    /// disconnect teardown from an older socket no-ops instead of wiping the
+    /// live sink the reconnect just registered (B56).
+    pub fn remove(&self, member_id: MemberId, gen: u64) {
+        self.inner.remove_if(&member_id, |_, e| e.gen == gen);
     }
 
     /// Whether this replica currently holds `member_id`'s socket. Lets a
@@ -73,8 +100,8 @@ impl MemberSinks {
     /// V19 carried over: a slow/full sink must not block delivery. `try_send`
     /// drops on a full channel; the member reconciles via the next catch-up.
     pub fn send(&self, member_id: MemberId, msg: ServerMsg) {
-        if let Some(sink) = self.inner.get(&member_id) {
-            let _ = sink.try_send(msg);
+        if let Some(e) = self.inner.get(&member_id) {
+            let _ = e.sink.try_send(msg);
         }
     }
 }
@@ -119,7 +146,7 @@ mod tests {
         let d = LocalDelivery::new(sinks.clone());
         let (tx, mut rx) = ch();
         let mid = MemberId::new();
-        sinks.insert(mid, tx);
+        sinks.insert(mid, 1, tx);
         d.deliver(
             mid,
             ServerMsg::Pause {
@@ -150,8 +177,8 @@ mod tests {
         let d = LocalDelivery::new(sinks.clone());
         let (tx, mut rx) = ch();
         let mid = MemberId::new();
-        sinks.insert(mid, tx);
-        sinks.remove(mid);
+        sinks.insert(mid, 1, tx);
+        sinks.remove(mid, 1);
         d.deliver(
             mid,
             ServerMsg::Pause {
@@ -168,10 +195,10 @@ mod tests {
         let d = LocalDelivery::new(sinks.clone());
         let mid = MemberId::new();
         let (tx1, mut rx1) = ch();
-        sinks.insert(mid, tx1);
+        sinks.insert(mid, 1, tx1);
         // Reconnect: same member, fresh sink.
         let (tx2, mut rx2) = ch();
-        sinks.insert(mid, tx2);
+        sinks.insert(mid, 1, tx2);
         d.deliver(
             mid,
             ServerMsg::Pause {
@@ -181,5 +208,59 @@ mod tests {
         );
         assert!(rx1.try_recv().is_err(), "stale sink must not receive");
         assert!(matches!(rx2.recv().await.unwrap(), ServerMsg::Pause { .. }));
+    }
+
+    /// B56 — an OLDER-generation insert (a slow/stale writer: an HTTP New/Join
+    /// carrying a snapshot sink resolved just before a reconnect, or the losing
+    /// task of two racing connects) must NOT clobber the newer live sink. This
+    /// is the wedge: a dead sink installed over a live one silently blackholes
+    /// all of a member's SyncPlay traffic until its next reconnect.
+    #[tokio::test]
+    async fn stale_generation_insert_does_not_clobber_the_live_sink() {
+        let sinks = MemberSinks::new();
+        let d = LocalDelivery::new(sinks.clone());
+        let mid = MemberId::new();
+        let (tx_live, mut rx_live) = ch();
+        sinks.insert(mid, 2, tx_live); // gen 2 = the reconnected, live socket
+        let (tx_stale, mut rx_stale) = ch();
+        sinks.insert(mid, 1, tx_stale); // gen 1 = the older writer, arrives late
+        d.deliver(
+            mid,
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 0,
+            },
+        );
+        assert!(
+            rx_stale.try_recv().is_err(),
+            "older-gen sink must be rejected"
+        );
+        assert!(
+            matches!(rx_live.recv().await.unwrap(), ServerMsg::Pause { .. }),
+            "live newer-gen sink still delivers"
+        );
+    }
+
+    /// B56 — a stale disconnect teardown (older generation) must NOT remove the
+    /// sink a newer reconnect just installed.
+    #[tokio::test]
+    async fn stale_generation_remove_spares_the_live_sink() {
+        let sinks = MemberSinks::new();
+        let d = LocalDelivery::new(sinks.clone());
+        let mid = MemberId::new();
+        let (tx_live, mut rx_live) = ch();
+        sinks.insert(mid, 2, tx_live);
+        sinks.remove(mid, 1); // the gen-1 socket's late teardown
+        d.deliver(
+            mid,
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 0,
+            },
+        );
+        assert!(
+            matches!(rx_live.recv().await.unwrap(), ServerMsg::Pause { .. }),
+            "live sink survives a stale-gen remove"
+        );
     }
 }

@@ -25,6 +25,12 @@ use tokio::sync::mpsc;
 /// multiple `Arc<dyn _>`s are registered.
 pub type TokenResolverData = Arc<dyn TokenResolver>;
 
+/// Monotonic per-connection generation for the native WS path. member_id can
+/// repeat across reconnects, so — like the Jellyfin `/socket` conn_gen — this
+/// lets a stale disconnect teardown avoid wiping the sink a fresh reconnect
+/// registered, and an older insert avoid clobbering a newer one (B56).
+static WS_CONN_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/sync/v1/ws", web::get().to(ws_entry));
 }
@@ -68,6 +74,7 @@ async fn handle_connection<S>(
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
     let started = Instant::now();
+    let conn_gen = WS_CONN_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 1) wait for Hello, authenticate.
     let (member_name, member_id) =
         match expect_hello(&mut session, &mut stream, resolver.as_ref()).await {
@@ -101,7 +108,7 @@ async fn handle_connection<S>(
     };
     // Register this connection's sink into the per-replica delivery table
     // BEFORE AddMember, so the actor's join catch-up reaches this socket.
-    sinks.insert(member_id, out_tx.clone());
+    sinks.insert(member_id, conn_gen, out_tx.clone());
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if group_handle
         .tx
@@ -180,7 +187,7 @@ async fn handle_connection<S>(
 
     // 6) drop membership + deregister the sink.
     let _ = group_tx.send(GroupMsg::RemoveMember { member_id }).await;
-    sinks.remove(member_id);
+    sinks.remove(member_id, conn_gen);
     let _ = session.clone().close(None).await;
 }
 

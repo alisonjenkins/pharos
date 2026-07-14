@@ -63,7 +63,7 @@ async fn persisted_snapshot_for(device: &str) -> (GroupId, String) {
     let h = GroupHandle::spawn_persistent(gid, 1_000, delivery, capture.clone(), None);
     let member = member_id_for_device(device);
     let (sink_tx, _sink_rx) = mpsc::channel(8);
-    sinks.insert(member, sink_tx);
+    sinks.insert(member, 1, sink_tx);
     let (rtx, rrx) = oneshot::channel();
     h.tx.send(GroupMsg::AddMember {
         member_id: member,
@@ -447,7 +447,7 @@ async fn leave_with_group_acknowledges_the_leaver() {
     );
 
     let member_sinks = MemberSinks::new();
-    member_sinks.insert(reg.member_id, sink_tx);
+    member_sinks.insert(reg.member_id, reg.gen, sink_tx);
     let registry =
         pharos_sync::GroupRegistry::spawn(Arc::new(LocalDelivery::new(member_sinks.clone())));
 

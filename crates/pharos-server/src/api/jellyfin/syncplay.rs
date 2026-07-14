@@ -165,7 +165,7 @@ async fn add_caller_to_group(
     let member_id = sess.member_id;
     // Register the socket's sink in the replica's delivery table before
     // AddMember, so the actor's join catch-up reaches it.
-    sinks.insert(member_id, sess.sink);
+    sinks.insert(member_id, sess.conn_gen, sess.sink);
     let (reply_tx, reply_rx) = oneshot::channel();
     if handle
         .tx

@@ -49,7 +49,7 @@ fn connect(hub: &SessionHub, device: &str, name: &str) -> Client {
 async fn add_to_group(hub: &SessionHub, sinks: &MemberSinks, handle: &GroupHandle, device: &str) {
     let sess = hub.resolve(device).unwrap();
     hub.attach_group(device, handle.clone());
-    sinks.insert(sess.member_id, sess.sink);
+    sinks.insert(sess.member_id, sess.conn_gen, sess.sink);
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .tx
@@ -327,7 +327,8 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
         "member id stable across reconnect"
     );
     let group = reg.group.expect("reconnect sees the existing group");
-    sinks.insert(b.member_id, hub.resolve("devB").unwrap().sink);
+    let s = hub.resolve("devB").unwrap();
+    sinks.insert(b.member_id, s.conn_gen, s.sink);
     group
         .tx
         .send(GroupMsg::ResyncMember {

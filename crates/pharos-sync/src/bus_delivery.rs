@@ -135,7 +135,7 @@ mod tests {
         spawn_ingress(bus.as_ref(), sinks_b.clone());
         let (tx, mut rx) = tmpsc::channel(8);
         let member = MemberId::new();
-        sinks_b.insert(member, tx);
+        sinks_b.insert(member, 1, tx);
 
         // Let B's ingress subscribe before A publishes.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -174,7 +174,7 @@ mod tests {
         let sinks = MemberSinks::new();
         let (tx, mut rx) = tmpsc::channel(8);
         let member = MemberId::new();
-        sinks.insert(member, tx);
+        sinks.insert(member, 1, tx);
 
         // BusDelivery over THIS replica's sinks — no spawn_ingress anywhere.
         let delivery = BusDelivery::new(bus.clone(), sinks.clone());
@@ -214,7 +214,7 @@ mod tests {
         spawn_ingress(bus.as_ref(), sinks.clone());
         let (tx, mut rx) = tmpsc::channel(8);
         let local_member = MemberId::new();
-        sinks.insert(local_member, tx);
+        sinks.insert(local_member, 1, tx);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let delivery = BusDelivery::new(bus.clone(), MemberSinks::new());
@@ -242,7 +242,7 @@ mod tests {
         spawn_ingress(bus.as_ref(), sinks.clone());
         let (tx, mut rx) = tmpsc::channel(16);
         let member = MemberId::new();
-        sinks.insert(member, tx);
+        sinks.insert(member, 1, tx);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let delivery = BusDelivery::new(bus.clone(), MemberSinks::new());

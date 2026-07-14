@@ -347,7 +347,7 @@ mod tests {
         // Add then remove the sole member → the actor empties + terminates.
         let (sink, _rx) = mpsc::channel(8);
         let mid = MemberId::new();
-        sinks.insert(mid, sink);
+        sinks.insert(mid, 1, sink);
         let (rtx, rrx) = oneshot::channel();
         h1.tx
             .send(GroupMsg::AddMember {
@@ -391,7 +391,7 @@ mod tests {
         let id = h1.group_id;
         let (sink, _rx) = mpsc::channel(8);
         let mid = MemberId::new();
-        sinks.insert(mid, sink);
+        sinks.insert(mid, 1, sink);
         let (rtx, rrx) = oneshot::channel();
         h1.tx
             .send(GroupMsg::AddMember {
