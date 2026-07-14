@@ -118,16 +118,37 @@ async fn ping(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
 }
 
 /// Add the caller (from the hub) to `handle` as a member. Shared by New + Join.
+/// Resolve a device to its socket session, briefly RETRYING to close a race:
+/// jellyfin-web opens `/socket` and then immediately POSTs `/SyncPlay/New` (or
+/// Join), but the socket's hub registration runs in a spawned task that can lag
+/// the HTTP handler by tens of ms. A single resolve then misses, the member is
+/// never added, the fresh group dies member-less, the client never receives
+/// GroupJoined, and its `enableSyncPlay → SetNewQueue → play` flow stalls with
+/// nothing ever playing (B54, live-observed). Poll for up to ~2 s; normally
+/// resolves on the first try.
+async fn resolve_with_retry(
+    hub: &SessionHub,
+    device_id: &str,
+) -> Option<pharos_sync::hub::ResolvedSession> {
+    for _ in 0..40 {
+        if let Some(s) = hub.resolve(device_id) {
+            return Some(s);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
 async fn add_caller_to_group(
     hub: &SessionHub,
     sinks: &MemberSinks,
     device_id: &str,
     handle: GroupHandle,
 ) {
-    let Some(sess) = hub.resolve(device_id) else {
+    let Some(sess) = resolve_with_retry(hub, device_id).await else {
         tracing::warn!(
             device_id = %device_id,
-            "syncplay: New/Join but no /socket registered for this deviceId — \
+            "syncplay: New/Join but no /socket registered for this deviceId after retry — \
              cannot add member (client must open /socket first)"
         );
         return;
@@ -637,6 +658,37 @@ mod tests {
         let token = stores.issue(uid, "t").await.unwrap();
         let state = web::Data::new(crate::state::AppState::new(stores, "t".into()));
         (state, token.0.expose().to_string())
+    }
+
+    #[actix_web::test]
+    async fn resolve_with_retry_wins_the_socket_registration_race() {
+        // B54 — New/Join can arrive just before the /socket registers (a
+        // spawned task). A single resolve misses and the group dies
+        // member-less; the retry must catch a registration that lands shortly
+        // after.
+        use pharos_sync::SessionHub;
+        use tokio::sync::mpsc;
+        let hub = SessionHub::new();
+        let dev = "user:dev-race";
+        // Register ~150ms late, as the socket task would.
+        let hub2 = hub.clone();
+        let dev2 = dev.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let (tx, _rx) = mpsc::channel(4);
+            hub2.register(dev2, "alison".into(), tx);
+        });
+        // Immediately (before registration) — a plain resolve misses…
+        assert!(hub.resolve(dev).is_none());
+        // …but the retry waits it out and succeeds.
+        let sess = resolve_with_retry(&hub, dev).await;
+        assert!(
+            sess.is_some(),
+            "retry must catch the late socket registration"
+        );
+        assert_eq!(sess.unwrap().name, "alison");
+        // A device that never registers still resolves to None (bounded wait).
+        assert!(resolve_with_retry(&hub, "user:never").await.is_none());
     }
 
     #[actix_web::test]
