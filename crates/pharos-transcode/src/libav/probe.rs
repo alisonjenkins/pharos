@@ -155,6 +155,9 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             album: ftags.album,
             album_artist: ftags.album_artist,
             genre: ftags.genre,
+            track_number: ftags.track.as_deref().and_then(leading_uint),
+            disc_number: ftags.disc.as_deref().and_then(leading_uint),
+            year: ftags.date.as_deref().and_then(leading_year),
             chapters,
             alternate_sources: Vec::new(),
         },
@@ -264,6 +267,9 @@ struct FormatTags {
     album: Option<String>,
     album_artist: Option<String>,
     genre: Option<String>,
+    track: Option<String>,
+    disc: Option<String>,
+    date: Option<String>,
 }
 
 fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
@@ -281,7 +287,29 @@ fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
             &["ALBUM_ARTIST", "ALBUMARTIST", "AlbumArtist"],
         ),
         genre: get("genre", &["GENRE", "Genre"]),
+        track: get("track", &["TRACK", "Track", "track_number"]),
+        disc: get("disc", &["DISC", "Disc", "disc_number", "DISCNUMBER"]),
+        date: get("date", &["DATE", "Date", "year", "YEAR"]),
     }
+}
+
+/// Parse the leading unsigned integer of a `track`/`disc` tag ("3", "3/12").
+fn leading_uint(s: &str) -> Option<u32> {
+    let digits: String = s
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// Leading 4-digit year of a `date` tag ("1999", "1999-06-22").
+fn leading_year(s: &str) -> Option<u32> {
+    let digits: String = s.trim().chars().take(4).collect();
+    (digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+        .filter(|y| (1000..=2999).contains(y))
 }
 
 fn extract_chapters(fmt: &ffi::AVFormatContext) -> Vec<MediaChapter> {

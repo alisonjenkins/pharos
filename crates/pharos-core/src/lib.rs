@@ -1250,6 +1250,19 @@ pub struct MediaProbe {
     pub album: Option<String>,
     pub album_artist: Option<String>,
     pub genre: Option<String>,
+    /// Track number within its disc (`track` tag; "3/12" forms parse the
+    /// leading integer). Drives album track ordering + the wire
+    /// `IndexNumber`. Defaulted so pre-existing rows deserialise.
+    #[serde(default)]
+    pub track_number: Option<u32>,
+    /// Disc number for multi-disc albums (`disc` tag) → wire
+    /// `ParentIndexNumber`; sorts ahead of `track_number`.
+    #[serde(default)]
+    pub disc_number: Option<u32>,
+    /// Release year (leading 4 digits of the `date`/`year` tag) → wire
+    /// `ProductionYear`; drives the PremiereDate/ProductionYear album sort.
+    #[serde(default)]
+    pub year: Option<u32>,
     /// Embedded chapter markers extracted by ffprobe `-show_chapters`.
     /// Each entry's `start_ms` lands on Jellyfin's `Chapters[].StartPositionTicks`.
     pub chapters: Vec<MediaChapter>,
@@ -1468,7 +1481,9 @@ pub struct ScanState {
 /// History:
 ///   1 — baseline: subtitle tracks, audio-track detail, embedded-font
 ///       MediaAttachments, chapters (the set present as of 2026-07).
-pub const PROBE_SCHEMA_VERSION: i64 = 1;
+// v2: audio tags gained track_number / disc_number / year (album track
+// ordering + album-year sort) — re-probe so music rows pick them up.
+pub const PROBE_SCHEMA_VERSION: i64 = 2;
 
 /// LIB-A4 — structured result of an incremental scan. Replaces the bare
 /// `usize` probed-count `scan_into` used to return so callers can broadcast
@@ -1583,6 +1598,11 @@ pub enum SortKey {
     CommunityRating,
     /// `Album` — case-folded `album` probe column.
     Album,
+    /// `ParentIndexNumber` — audio `disc_number` (multi-disc album order).
+    DiscNumber,
+    /// Audio `track_number` (within-disc order). Distinct from
+    /// [`SortKey::IndexNumber`], which is the EPISODE number column.
+    TrackNumber,
     /// `AlbumArtist` — case-folded `album_artist` probe column.
     AlbumArtist,
     /// `IndexNumber` — the episode number (`episode_number`).

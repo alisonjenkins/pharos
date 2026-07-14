@@ -229,6 +229,46 @@ struct FfprobeFormatTags {
     album_artist: Option<String>,
     #[serde(default, alias = "GENRE", alias = "Genre")]
     genre: Option<String>,
+    /// `track` is "3" or "3/12" depending on tagger; parse the leading int.
+    #[serde(default, alias = "TRACK", alias = "Track", alias = "track_number")]
+    track: Option<String>,
+    #[serde(
+        default,
+        alias = "DISC",
+        alias = "Disc",
+        alias = "disc_number",
+        alias = "DISCNUMBER"
+    )]
+    disc: Option<String>,
+    /// Vorbis `date`, ID3 `TYER`/`TDRC` normalise to `date`; some taggers
+    /// write `year`. Either way the leading 4 digits are the release year.
+    #[serde(
+        default,
+        alias = "DATE",
+        alias = "Date",
+        alias = "year",
+        alias = "YEAR"
+    )]
+    date: Option<String>,
+}
+
+/// Parse the leading unsigned integer of a `track`/`disc` tag ("3", "3/12").
+fn leading_uint(s: &str) -> Option<u32> {
+    let digits: String = s
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// Leading 4-digit year of a `date` tag ("1999", "1999-06-22").
+fn leading_year(s: &str) -> Option<u32> {
+    let digits: String = s.trim().chars().take(4).collect();
+    (digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+        .filter(|y| (1000..=2999).contains(y))
 }
 
 /// Public so the criterion bench in `benches/parse.rs` can call directly
@@ -406,6 +446,9 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             album: parsed.format.tags.album,
             album_artist: parsed.format.tags.album_artist,
             genre: parsed.format.tags.genre,
+            track_number: parsed.format.tags.track.as_deref().and_then(leading_uint),
+            disc_number: parsed.format.tags.disc.as_deref().and_then(leading_uint),
+            year: parsed.format.tags.date.as_deref().and_then(leading_year),
             chapters,
             // P34 — alternate editions enrichment lives in a
             // future scanner pass (sibling-file convention reader

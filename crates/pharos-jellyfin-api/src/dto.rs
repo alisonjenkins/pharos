@@ -1195,8 +1195,18 @@ impl BaseItemDto {
                 .series
                 .as_ref()
                 .and_then(|s| s.season_number.map(season_display_name)),
-            parent_index_number: item.series.as_ref().and_then(|s| s.season_number),
-            index_number: item.series.as_ref().and_then(|s| s.episode_number),
+            // Episodes: season/episode. Audio tracks: disc/track (drives
+            // jellyfin-web's album track list numbering + ordering).
+            parent_index_number: item
+                .series
+                .as_ref()
+                .and_then(|s| s.season_number)
+                .or(item.probe.disc_number),
+            index_number: item
+                .series
+                .as_ref()
+                .and_then(|s| s.episode_number)
+                .or(item.probe.track_number),
             // P13 — VideoRange is HDR-only when the probe says so.
             // Audio items + SDR videos skip the field entirely.
             video_range: if is_video && item.probe.is_hdr() {
@@ -1218,7 +1228,9 @@ impl BaseItemDto {
             production_year: item
                 .metadata
                 .production_year
-                .or_else(|| item.series.as_ref().and_then(|s| s.series_year)),
+                .or_else(|| item.series.as_ref().and_then(|s| s.series_year))
+                // Audio: the release-year tag (album sort + track detail).
+                .or(item.probe.year),
             premiere_date: item.metadata.premiere_date.map(format_iso8601),
         }
     }

@@ -73,6 +73,11 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 proptest::option::of("[A-Za-z0-9 ]{0,24}"),
                 proptest::option::of("[A-Za-z0-9 ]{0,24}"),
                 proptest::option::of("[A-Za-z0-9 ]{0,24}"),
+                // track / disc / year — the audio-tag columns must survive
+                // the store round-trip like every other probe field.
+                proptest::option::of(1u32..999),
+                proptest::option::of(1u32..99),
+                proptest::option::of(1900u32..2999),
             )
         })
         .prop_map(
@@ -82,6 +87,9 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 album,
                 album_artist,
                 genre,
+                track_number,
+                disc_number,
+                year,
             )| MediaProbe {
                 size_bytes: size,
                 duration_ms: dur,
@@ -107,6 +115,9 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 album,
                 album_artist,
                 genre,
+                track_number,
+                disc_number,
+                year,
                 chapters: Vec::new(),
                 alternate_sources: Vec::new(),
             },

@@ -18,7 +18,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     subtitle_tracks_json, attachments_json, artist, album, album_artist, genre, created_at, chapters_json, \
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
-    premiere_date, overview, tagline, provider_ids, series_folder, series_year";
+    premiere_date, overview, tagline, provider_ids, series_folder, series_year, track_number, disc_number, release_year";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -608,9 +608,9 @@ impl MediaStore for SqliteStore {
                 audio_tracks_json, attachments_json, \
                 community_rating, critic_rating, official_rating, production_year, \
                 premiere_date, overview, tagline, provider_ids, \
-                series_folder, series_year, title_fold) \
+                series_folder, series_year, track_number, disc_number, release_year, title_fold) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            title_fold = excluded.title_fold,
@@ -653,6 +653,9 @@ impl MediaStore for SqliteStore {
                                            provider_ids = excluded.provider_ids,
                                            series_folder = excluded.series_folder,
                                            series_year = excluded.series_year,
+                                           track_number = excluded.track_number,
+                                           disc_number = excluded.disc_number,
+                                           release_year = excluded.release_year,
                                            -- Preserve original
                                            -- created_at on rescans;
                                            -- COALESCE keeps existing
@@ -703,6 +706,9 @@ impl MediaStore for SqliteStore {
         .bind(provider_ids_json)
         .bind(series_folder)
         .bind(series_year.map(|v| v as i64))
+        .bind(p.track_number.map(|v| v as i64))
+        .bind(p.disc_number.map(|v| v as i64))
+        .bind(p.year.map(|v| v as i64))
         // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
         .bind(item.title.to_lowercase())
         .execute(&self.pool)
@@ -2531,6 +2537,9 @@ struct MediaRow {
     provider_ids: Option<String>,
     series_folder: Option<String>,
     series_year: Option<i64>,
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
+    release_year: Option<i64>,
 }
 
 impl MediaRow {
@@ -2565,6 +2574,9 @@ impl MediaRow {
             album: self.album,
             album_artist: self.album_artist,
             genre: self.genre,
+            track_number: self.track_number.and_then(|v| u32::try_from(v).ok()),
+            disc_number: self.disc_number.and_then(|v| u32::try_from(v).ok()),
+            year: self.release_year.and_then(|v| u32::try_from(v).ok()),
             chapters: crate::chapter_json::decode(self.chapters_json.as_deref()),
             // P34 — alternate editions land via a future scanner
             // enrichment pass. Today's persisted probes never carry
