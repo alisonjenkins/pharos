@@ -63,11 +63,11 @@ fn no_content() -> HttpResponse {
 /// / not in a group all collapse to a `204` no-op.
 async fn dispatch(
     hub: &SessionHub,
-    device_id: Option<&str>,
+    device_id: Option<String>,
     label: &str,
     make: impl FnOnce(MemberId) -> GroupMsg,
 ) -> HttpResponse {
-    match device_id {
+    match device_id.as_deref() {
         None => tracing::warn!(
             command = label,
             "syncplay: command with no deviceId — dropped"
@@ -111,8 +111,8 @@ async fn dispatch(
 /// effects: the member's liveness TTL refreshes (T83 ghost prune), and a
 /// group-less caller is answered with NotInGroup.
 async fn ping(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.device_id.as_deref(), "ping", |mid| {
-        GroupMsg::MemberPing { member_id: mid }
+    dispatch(&hub, auth.sync_key(), "ping", |mid| GroupMsg::MemberPing {
+        member_id: mid,
     })
     .await
 }
@@ -246,7 +246,7 @@ async fn new_group(
     registry: web::Data<GroupRegistry>,
     body: web::Bytes,
 ) -> HttpResponse {
-    let Some(dev) = auth.device_id.as_deref() else {
+    let Some(dev) = auth.sync_key() else {
         tracing::warn!("syncplay: New with no deviceId — cannot form a group");
         return no_content();
     };
@@ -257,7 +257,7 @@ async fn new_group(
     // Name the group from the request, else "<creator>'s Group".
     let name = parse_group_name(&body).unwrap_or_else(|| {
         let who = hub
-            .resolve(dev)
+            .resolve(&dev)
             .map(|s| s.name)
             .unwrap_or_else(|| "Watch".to_string());
         format!("{who}'s Group")
@@ -267,7 +267,7 @@ async fn new_group(
     // terminates the moment it processes a message and finds no members, so a
     // brand-new (member-less) group must receive AddMember before anything else
     // (e.g. SetGroupName) — otherwise it dies before the creator ever joins.
-    add_caller_to_group(&hub, &sinks, dev, handle.clone()).await;
+    add_caller_to_group(&hub, &sinks, &dev, handle.clone()).await;
     let _ = handle.tx.send(GroupMsg::SetGroupName { name }).await;
     no_content()
 }
@@ -279,7 +279,7 @@ async fn join_group(
     registry: web::Data<GroupRegistry>,
     body: web::Json<JoinGroupBody>,
 ) -> HttpResponse {
-    let Some(dev) = auth.device_id.as_deref() else {
+    let Some(dev) = auth.sync_key() else {
         return no_content();
     };
     let Ok(handle) = registry.get_or_create(GroupId(body.group_id)).await else {
@@ -287,14 +287,14 @@ async fn join_group(
         return no_content();
     };
     tracing::info!(device_id = %dev, group = %handle.group_id, "syncplay: Join group");
-    add_caller_to_group(&hub, &sinks, dev, handle).await;
+    add_caller_to_group(&hub, &sinks, &dev, handle).await;
     no_content()
 }
 
 async fn leave_group(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    if let Some(dev) = auth.device_id.as_deref() {
-        if let Some(sess) = hub.resolve(dev) {
-            if let Some(h) = hub.detach_group(dev) {
+    if let Some(dev) = auth.sync_key() {
+        if let Some(sess) = hub.resolve(&dev) {
+            if let Some(h) = hub.detach_group(&dev) {
                 let _ =
                     h.tx.send(GroupMsg::RemoveMember {
                         member_id: sess.member_id,
@@ -324,7 +324,7 @@ async fn set_new_queue(
 ) -> HttpResponse {
     let body = body.into_inner();
     let start_ms = body.start_position_ticks / POSITION_TICKS_PER_MS;
-    dispatch(&hub, auth.device_id.as_deref(), "setnewqueue", move |mid| {
+    dispatch(&hub, auth.sync_key(), "setnewqueue", move |mid| {
         GroupMsg::SetNewQueue {
             sender: mid,
             item_ids: body.playing_queue,
@@ -336,14 +336,14 @@ async fn set_new_queue(
 }
 
 async fn unpause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.device_id.as_deref(), "unpause", |mid| {
-        GroupMsg::Unpause { sender: mid }
+    dispatch(&hub, auth.sync_key(), "unpause", |mid| GroupMsg::Unpause {
+        sender: mid,
     })
     .await
 }
 
 async fn pause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.device_id.as_deref(), "pause", |mid| {
+    dispatch(&hub, auth.sync_key(), "pause", |mid| {
         GroupMsg::PauseShared { sender: mid }
     })
     .await
@@ -379,11 +379,9 @@ async fn seek(
             }
         });
     }
-    dispatch(&hub, auth.device_id.as_deref(), "seek", move |mid| {
-        GroupMsg::SeekTo {
-            sender: mid,
-            position_ms: pos,
-        }
+    dispatch(&hub, auth.sync_key(), "seek", move |mid| GroupMsg::SeekTo {
+        sender: mid,
+        position_ms: pos,
     })
     .await
 }
@@ -396,7 +394,7 @@ async fn buffering(
     let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
     let pli = body.playlist_item_id;
-    dispatch(&hub, auth.device_id.as_deref(), "buffering", move |mid| {
+    dispatch(&hub, auth.sync_key(), "buffering", move |mid| {
         GroupMsg::BufferingStart {
             member_id: mid,
             position_ms: pos,
@@ -414,7 +412,7 @@ async fn ready(
     let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
     let pli = body.playlist_item_id;
-    dispatch(&hub, auth.device_id.as_deref(), "ready", move |mid| {
+    dispatch(&hub, auth.sync_key(), "ready", move |mid| {
         GroupMsg::MemberReady {
             member_id: mid,
             position_ms: pos,
@@ -434,15 +432,12 @@ async fn set_ignore_wait(
     body: web::Json<IgnoreWaitBody>,
 ) -> HttpResponse {
     let ignore = body.ignore_wait;
-    dispatch(
-        &hub,
-        auth.device_id.as_deref(),
-        "setignorewait",
-        move |mid| GroupMsg::SetIgnoreWait {
+    dispatch(&hub, auth.sync_key(), "setignorewait", move |mid| {
+        GroupMsg::SetIgnoreWait {
             member_id: mid,
             ignore,
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -452,15 +447,12 @@ async fn set_playlist_item(
     body: web::Json<SetPlaylistItemBody>,
 ) -> HttpResponse {
     let pli = body.into_inner().playlist_item_id;
-    dispatch(
-        &hub,
-        auth.device_id.as_deref(),
-        "setplaylistitem",
-        move |mid| GroupMsg::SetPlaylistItem {
+    dispatch(&hub, auth.sync_key(), "setplaylistitem", move |mid| {
+        GroupMsg::SetPlaylistItem {
             sender: mid,
             playlist_item_id: pli,
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -473,7 +465,7 @@ async fn next_item(
     let pli = serde_json::from_slice::<NextItemBody>(&body)
         .unwrap_or_default()
         .playlist_item_id;
-    dispatch(&hub, auth.device_id.as_deref(), "nextitem", move |mid| {
+    dispatch(&hub, auth.sync_key(), "nextitem", move |mid| {
         GroupMsg::NextItem {
             sender: mid,
             playlist_item_id: pli,
@@ -490,15 +482,12 @@ async fn previous_item(
     let pli = serde_json::from_slice::<NextItemBody>(&body)
         .unwrap_or_default()
         .playlist_item_id;
-    dispatch(
-        &hub,
-        auth.device_id.as_deref(),
-        "previousitem",
-        move |mid| GroupMsg::PreviousItem {
+    dispatch(&hub, auth.sync_key(), "previousitem", move |mid| {
+        GroupMsg::PreviousItem {
             sender: mid,
             playlist_item_id: pli,
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -508,12 +497,9 @@ async fn set_repeat_mode(
     body: web::Json<ModeBody>,
 ) -> HttpResponse {
     let mode = body.into_inner().mode;
-    dispatch(
-        &hub,
-        auth.device_id.as_deref(),
-        "setrepeatmode",
-        move |mid| GroupMsg::SetRepeatMode { sender: mid, mode },
-    )
+    dispatch(&hub, auth.sync_key(), "setrepeatmode", move |mid| {
+        GroupMsg::SetRepeatMode { sender: mid, mode }
+    })
     .await
 }
 
@@ -523,12 +509,9 @@ async fn set_shuffle_mode(
     body: web::Json<ModeBody>,
 ) -> HttpResponse {
     let mode = body.into_inner().mode;
-    dispatch(
-        &hub,
-        auth.device_id.as_deref(),
-        "setshufflemode",
-        move |mid| GroupMsg::SetShuffleMode { sender: mid, mode },
-    )
+    dispatch(&hub, auth.sync_key(), "setshufflemode", move |mid| {
+        GroupMsg::SetShuffleMode { sender: mid, mode }
+    })
     .await
 }
 

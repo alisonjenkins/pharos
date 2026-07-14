@@ -120,7 +120,14 @@ async fn ws_entry(
     // `deviceId` (WS query string) is the key the HTTP SyncPlay handlers use to
     // reach this socket. Fall back to the member id when absent so a client
     // without one still gets a stable-per-connection key.
-    let device_id = device_id_from_query(req.query_string());
+    //
+    // B53 — fold the authenticated USER into the key. jellyfin-web derives its
+    // deviceId from the browser (identical across same-UA installs), so two
+    // different users on the same browser would otherwise collide into one
+    // SyncPlay member and fight over the socket (disconnect/reconnect war,
+    // observed live: Alison+Lace+Jana on Firefox). Must match
+    // `AuthSession::sync_key` on the HTTP command path exactly.
+    let device_id = device_id_from_query(req.query_string()).map(|d| format!("{user_id_str}:{d}"));
     actix_web::rt::spawn(handle_connection(
         session,
         stream,

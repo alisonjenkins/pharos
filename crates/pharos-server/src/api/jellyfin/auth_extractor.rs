@@ -53,6 +53,21 @@ pub struct AuthSession {
     pub device_id: Option<String>,
 }
 
+impl AuthSession {
+    /// The SyncPlay session key: the authenticated USER folded into the
+    /// deviceId. jellyfin-web derives its deviceId from the browser, so it's
+    /// IDENTICAL across same-UA installs — without the user, two DIFFERENT
+    /// people on the same browser (Alison + Lace on Firefox) collide into one
+    /// SyncPlay member and fight over the single socket (B53). This is ONLY
+    /// the group-membership identity; it never touches the segment cache key,
+    /// so same-content playback still shares one encode.
+    pub fn sync_key(&self) -> Option<String> {
+        self.device_id
+            .as_ref()
+            .map(|d| format!("{}:{}", self.user.id.0.simple(), d))
+    }
+}
+
 impl FromRequest for AuthSession {
     type Error = actix_web::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self, actix_web::Error>>>>;
@@ -273,6 +288,38 @@ mod tests {
 
     use super::*;
     use actix_web::test::TestRequest;
+
+    fn session(user_id: pharos_core::UserId, device: Option<&str>) -> AuthSession {
+        AuthSession {
+            user: pharos_core::User {
+                id: user_id,
+                name: "u".into(),
+                policy: pharos_core::UserPolicy::default(),
+                has_password: true,
+            },
+            device_id: device.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sync_key_separates_users_on_the_same_device() {
+        // B53 — jellyfin-web's deviceId is browser-derived (identical across
+        // same-UA installs). Two DIFFERENT users on the same deviceId must get
+        // DIFFERENT SyncPlay session keys, or they collide into one member and
+        // fight over the socket.
+        let alison = pharos_core::UserId::new();
+        let lace = pharos_core::UserId::new();
+        let dev = "browser-derived-device-id";
+        let ka = session(alison, Some(dev)).sync_key().unwrap();
+        let kl = session(lace, Some(dev)).sync_key().unwrap();
+        assert_ne!(ka, kl, "same device, different users must not collide");
+        // Same user + same device is STABLE (reconnect keeps the member).
+        assert_eq!(ka, session(alison, Some(dev)).sync_key().unwrap());
+        // No deviceId → no key (the anon path handles it).
+        assert!(session(alison, None).sync_key().is_none());
+        // The key embeds both halves.
+        assert!(ka.contains(&alison.0.simple().to_string()) && ka.contains(dev));
+    }
 
     #[test]
     fn parses_x_emby_token_header() {
