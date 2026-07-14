@@ -49,6 +49,8 @@ fn sort_key_column(key: SortKey) -> &'static str {
         SortKey::ProductionYear => "production_year",
         SortKey::CommunityRating => "community_rating",
         SortKey::Album => "LOWER(album)",
+        SortKey::DiscNumber => "disc_number",
+        SortKey::TrackNumber => "track_number",
         SortKey::AlbumArtist => "LOWER(album_artist)",
         SortKey::IndexNumber => "episode_number",
         SortKey::Id => "id",
