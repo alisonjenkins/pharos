@@ -10,6 +10,7 @@ publish.workspace = true
 dashmap.workspace = true
 pharos-core = { path = "../pharos-core" }
 pharos-transcode = { path = "../pharos-transcode", default-features = false }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "sync", "io-util", "fs"] }
 tracing.workspace = true

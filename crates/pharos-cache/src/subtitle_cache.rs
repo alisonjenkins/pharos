@@ -34,6 +34,11 @@ pub enum SubtitleKind {
     /// SubtitlesOctopus, which needs the raw ASS body — distinct cache key
     /// from `Embedded` (same index, different bytes).
     EmbeddedAss,
+    /// JSON `[(start_ms, end_ms), …]` on-screen event windows of an IMAGE
+    /// subtitle stream (codec-relative index) — drives per-segment burn
+    /// gating: segments with no event skip the overlay re-encode entirely.
+    /// Computed once per (file, mtime, track) by a whole-file demux scan.
+    EventWindows,
 }
 
 /// Cache key: source file + mtime stamps the input so any later edit
@@ -61,6 +66,30 @@ struct CacheState {
     access_counter: u64,
 }
 
+/// Where a track's event-window scan stands. Callers that see anything but
+/// `Known` burn conservatively (the pre-gating behaviour), so a missing /
+/// failed / still-running scan can never LOSE subtitles — gating only ever
+/// removes provably-empty burn windows.
+#[derive(Debug, Clone)]
+pub enum EventWindows {
+    /// Merged, sorted `(start_ms, end_ms)` on-screen intervals.
+    Known(Arc<Vec<(u64, u64)>>),
+    /// Not computed yet — a background scan was kicked off (first ask) or
+    /// is in flight; or the build has no libav pool. Burn conservatively.
+    Unknown,
+}
+
+/// In-flight / negative state of a window scan, keyed per (path, mtime,
+/// track). Separate from the byte LRU: entries are tiny and must not be
+/// evicted mid-scan.
+#[derive(Debug, Clone)]
+enum WinScan {
+    Pending,
+    /// Scan failed this boot (bad stream, worker error). Don't re-scan on
+    /// every segment; burn conservatively for the rest of the run.
+    Failed,
+}
+
 #[derive(Clone)]
 pub struct SubtitleCache {
     max_bytes: u64,
@@ -70,6 +99,12 @@ pub struct SubtitleCache {
     /// hot layer in front. `None` → memory-only (tests / minimal deployments).
     root: Option<PathBuf>,
     state: Arc<Mutex<CacheState>>,
+    /// Event-window scan bookkeeping (burn gating).
+    win_scans: Arc<Mutex<HashMap<Key, WinScan>>>,
+    /// Worker pool for the whole-file window scan (`ffmpeg-lib` builds; the
+    /// distroless image ships no ffprobe, so the scan must be in-process).
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pool: Option<pharos_transcode::worker::LibavWorkerPool>,
 }
 
 impl std::fmt::Debug for SubtitleCache {
@@ -88,6 +123,9 @@ impl SubtitleCache {
             max_entries,
             root: None,
             state: Arc::new(Mutex::new(CacheState::default())),
+            win_scans: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            pool: None,
         }
     }
 
@@ -96,6 +134,130 @@ impl SubtitleCache {
     pub fn with_disk(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = Some(root.into());
         self
+    }
+
+    /// Attach the shared libav worker pool — enables event-window scans
+    /// (burn gating). Without it every ask returns
+    /// [`EventWindows::Unknown`] and segments burn as before.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pub fn with_pool(mut self, pool: pharos_transcode::worker::LibavWorkerPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// On-screen event windows of the `rel_idx`-th subtitle stream (codec-
+    /// relative, `-map 0:s:N` convention). Non-blocking: a cache hit (memory
+    /// or disk) returns `Known`; the first miss kicks off ONE background
+    /// whole-file scan and returns `Unknown` — callers burn conservatively
+    /// until the scan lands (typically well within the first minutes of a
+    /// watch; persisted per (path, mtime, track) so it's a once-ever cost).
+    pub async fn image_sub_event_windows(
+        &self,
+        path: &Path,
+        mtime_secs: i64,
+        rel_idx: u32,
+    ) -> EventWindows {
+        if let Some(bytes) = self
+            .get(path, mtime_secs, rel_idx, SubtitleKind::EventWindows)
+            .await
+        {
+            match serde_json::from_slice::<Vec<(u64, u64)>>(&bytes) {
+                Ok(w) => return EventWindows::Known(Arc::new(w)),
+                Err(e) => {
+                    // Corrupt persisted JSON — treat as absent and rescan.
+                    tracing::warn!(error = %e, path = %path.display(), rel_idx,
+                        "corrupt subtitle event-window cache entry; rescanning");
+                }
+            }
+        }
+        let key = Key {
+            path: path.to_path_buf(),
+            mtime_secs,
+            stream_index: rel_idx,
+            kind: SubtitleKind::EventWindows,
+        };
+        {
+            let mut scans = self.win_scans.lock().await;
+            match scans.get(&key) {
+                Some(WinScan::Pending) | Some(WinScan::Failed) => return EventWindows::Unknown,
+                None => {
+                    scans.insert(key.clone(), WinScan::Pending);
+                }
+            }
+        }
+        self.spawn_window_scan(key);
+        EventWindows::Unknown
+    }
+
+    /// Kick off the background scan for `key`. Split out so the non-libav
+    /// build can stub it (no pool → mark Failed so we don't re-ask per
+    /// segment).
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    fn spawn_window_scan(&self, key: Key) {
+        let Some(pool) = self.pool.clone() else {
+            let scans = self.win_scans.clone();
+            tokio::spawn(async move {
+                scans.lock().await.insert(key, WinScan::Failed);
+            });
+            return;
+        };
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let res = pool
+                .subtitle_windows(key.path.clone(), key.stream_index)
+                .await;
+            match res {
+                Ok(windows) => {
+                    let n = windows.len();
+                    let json = match serde_json::to_vec(&windows) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "event-window serialize failed");
+                            cache.win_scans.lock().await.insert(key, WinScan::Failed);
+                            return;
+                        }
+                    };
+                    cache
+                        .store(
+                            &key.path,
+                            key.mtime_secs,
+                            key.stream_index,
+                            SubtitleKind::EventWindows,
+                            json,
+                        )
+                        .await;
+                    cache.win_scans.lock().await.remove(&key);
+                    tracing::info!(
+                        path = %key.path.display(),
+                        rel_idx = key.stream_index,
+                        windows = n,
+                        scan_ms = started.elapsed().as_millis() as u64,
+                        "subtitle event-window scan complete; burn gating active"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %key.path.display(),
+                        rel_idx = key.stream_index,
+                        scan_ms = started.elapsed().as_millis() as u64,
+                        "subtitle event-window scan failed; burning every segment for this track"
+                    );
+                    cache.win_scans.lock().await.insert(key, WinScan::Failed);
+                }
+            }
+        });
+    }
+
+    /// No pool in this build — mark the key Failed once so callers stop
+    /// re-asking; segments burn as before gating existed.
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+    fn spawn_window_scan(&self, key: Key) {
+        let scans = self.win_scans.clone();
+        tokio::spawn(async move {
+            scans.lock().await.insert(key, WinScan::Failed);
+        });
     }
 
     /// On-disk path for a key: `{root}/subtitles/{hash(path)}-{mtime}-{idx}-{k}.sub`.
@@ -110,6 +272,7 @@ impl SubtitleCache {
             SubtitleKind::Embedded => 'e',
             SubtitleKind::Sidecar => 's',
             SubtitleKind::EmbeddedAss => 'a',
+            SubtitleKind::EventWindows => 'w',
         };
         Some(root.join("subtitles").join(format!(
             "{ph:016x}-{}-{}-{k}.sub",
@@ -292,6 +455,52 @@ mod tests {
             .get(Path::new("/x"), 0, 0, SubtitleKind::Embedded)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_windows_round_trip_and_fail_open() {
+        // B46 — a stored timeline comes back Known; anything else (miss,
+        // no pool, scan pending/failed) is Unknown so the caller burns
+        // conservatively — gating must never LOSE a subtitle.
+        let cache = SubtitleCache::new(65_536, 64);
+        let p = Path::new("/media/movie.mkv");
+
+        // Unknown on first ask (kicks the background scan, which — with no
+        // pool attached — resolves to a once-per-boot Failed marker).
+        assert!(matches!(
+            cache.image_sub_event_windows(p, 7, 0).await,
+            EventWindows::Unknown
+        ));
+
+        // A stored timeline round-trips.
+        let windows: Vec<(u64, u64)> = vec![(2_000, 4_000), (14_000, 16_000)];
+        cache
+            .store(
+                p,
+                7,
+                0,
+                SubtitleKind::EventWindows,
+                serde_json::to_vec(&windows).unwrap(),
+            )
+            .await;
+        match cache.image_sub_event_windows(p, 7, 0).await {
+            EventWindows::Known(w) => assert_eq!(*w, windows),
+            other => panic!("expected Known, got {other:?}"),
+        }
+
+        // A different mtime is a different key (edited file → rescan).
+        assert!(matches!(
+            cache.image_sub_event_windows(p, 8, 0).await,
+            EventWindows::Unknown
+        ));
+        // Corrupt persisted bytes → Unknown (rescan path), not a panic.
+        cache
+            .store(p, 9, 0, SubtitleKind::EventWindows, b"not json".to_vec())
+            .await;
+        assert!(matches!(
+            cache.image_sub_event_windows(p, 9, 0).await,
+            EventWindows::Unknown
+        ));
     }
 
     #[tokio::test]
