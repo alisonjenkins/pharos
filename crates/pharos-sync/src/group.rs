@@ -48,6 +48,16 @@ pub const MAX_HALF_RTT_LEAD_MS: u64 = 2_000;
 /// but the wider window lets the common case resolve cleanly with everyone in.
 pub const READY_TIMEOUT_MS: u64 = 30_000;
 
+/// B55 — anti-wedge bound on the V19 buffering freeze. One member's
+/// `BufferingStart` pauses the whole group; if that member then buffers
+/// forever, or vanishes mid-buffer without a matching `BufferingEnd` (socket
+/// drop, tab close, crash), the group would stay frozen indefinitely. When the
+/// freeze has stood this long the actor force-clears every buffering flag and
+/// resumes; a member genuinely still buffering re-syncs via its own drift
+/// correction. Matches `READY_TIMEOUT_MS` — the buffering client's slow path
+/// is the same order of magnitude as a slow joiner's.
+pub const BUFFERING_MAX_MS: u64 = 30_000;
+
 /// T83 — how long a member may stay SILENT (no socket KeepAlive, no
 /// `/SyncPlay/Ping`, no command) before the group prunes it as a ghost.
 /// jellyfin-web KeepAlives every ~30s, so a live client refreshes several
@@ -551,6 +561,12 @@ struct GroupState {
     members: HashMap<MemberId, MemberRec>,
     leader: Option<MemberId>,
     group_paused_due_to_buffering: bool,
+    /// When the V19 buffering freeze started (monotonic; NOT persisted). Arms
+    /// the buffering anti-wedge deadline in the actor loop so a member that
+    /// buffers forever — or vanishes mid-buffer without a `BufferingEnd` —
+    /// can never freeze the group past `BUFFERING_MAX_MS`. `None` whenever the
+    /// group is not frozen for buffering. (B55.)
+    buffering_since: Option<tokio::time::Instant>,
     playback: PlaybackState,
     queue: PlayQueue,
     /// `Some` while the readiness gate is open (group is `Waiting`).
@@ -580,6 +596,7 @@ impl GroupState {
             members: HashMap::new(),
             leader: None,
             group_paused_due_to_buffering: false,
+            buffering_since: None,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
             waiting: None,
@@ -784,6 +801,7 @@ impl GroupState {
             anchor_server_ms: server_ms,
         };
         self.group_paused_due_to_buffering = false;
+        self.buffering_since = None;
         self.broadcast(ServerMsg::Play {
             at_server_ms: server_ms + self.lead_time_ms(),
             position_ms,
@@ -1012,6 +1030,14 @@ impl GroupState {
             .collect();
         self.leader = ps.leader;
         self.group_paused_due_to_buffering = ps.group_paused_due_to_buffering;
+        // B55 — a group hydrated mid-freeze restores members with cleared
+        // buffering flags (they re-report on reconnect), so the BufferingEnd
+        // auto-resume can never fire on its own. Re-arm the anti-wedge deadline
+        // (fresh, like the readiness gate below) so the new owner resumes
+        // instead of squatting frozen forever.
+        self.buffering_since = self
+            .group_paused_due_to_buffering
+            .then(tokio::time::Instant::now);
         self.playback = match ps.playback {
             PersistPlayback::Idle => PlaybackState::Idle,
             PersistPlayback::Playing {
@@ -1232,6 +1258,11 @@ impl GroupHandle {
                 // Arm the readiness-gate timeout only while waiting, so a
                 // silent/wedged member can never block the group forever.
                 let deadline = state.waiting.as_ref().map(|w| w.deadline);
+                // B55 — arm the buffering anti-wedge deadline only while the
+                // group is frozen for buffering.
+                let buffering_deadline = state
+                    .buffering_since
+                    .map(|t| t + std::time::Duration::from_millis(BUFFERING_MAX_MS));
                 tokio::select! {
                     maybe = rx.recv() => {
                         let Some(msg) = maybe else { break };
@@ -1263,6 +1294,36 @@ impl GroupHandle {
                             );
                         }
                         state.resolve_waiting();
+                        state.persist();
+                    }
+                    _ = async {
+                        // `buffering_deadline` is Some in this arm (guarded below).
+                        tokio::time::sleep_until(buffering_deadline.unwrap_or_else(tokio::time::Instant::now)).await
+                    }, if buffering_deadline.is_some() => {
+                        // B55 — the V19 buffering freeze has stood past
+                        // BUFFERING_MAX_MS: the buffering member is stuck or gone
+                        // without a BufferingEnd. Force-clear every buffering flag
+                        // and resume; a member still genuinely buffering re-syncs
+                        // via its own drift correction (same contract as the
+                        // readiness-gate anti-wedge above). Skip if a readiness
+                        // gate is mid-flight — that path owns the resume.
+                        tracing::warn!(
+                            group = %state.id,
+                            reason = "buffering anti-wedge timeout",
+                            "syncplay: buffering freeze timed out; resuming group"
+                        );
+                        for m in state.members.values_mut() {
+                            m.buffering = false;
+                        }
+                        if state.waiting.is_none() {
+                            let position_ms = state.current_position_ms();
+                            state.start_playing(position_ms, "Ready");
+                        } else {
+                            // A gate owns the resume; just disarm the freeze so
+                            // this arm doesn't spin.
+                            state.group_paused_due_to_buffering = false;
+                            state.buffering_since = None;
+                        }
                         state.persist();
                     }
                     _ = prune_tick.tick() => {
@@ -1360,6 +1421,20 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
         if w.pending.is_empty() && !state.members.is_empty() {
             state.resolve_waiting();
         }
+    }
+    // B55 — a departing member must not wedge the V19 buffering freeze either.
+    // If the group is frozen for buffering and the member that just left was
+    // the last one still buffering, lift the freeze now (same auto-resume as
+    // BufferingEnd) instead of waiting out the anti-wedge deadline. Skipped
+    // when a readiness gate is open — that path owns the resume.
+    if state.group_paused_due_to_buffering
+        && !state.members.is_empty()
+        && state.waiting.is_none()
+        && !state.members.values().any(|m| m.buffering)
+    {
+        tracing::info!(group = %state.id, "syncplay: buffering member left — lifting freeze");
+        let position_ms = state.current_position_ms();
+        state.start_playing(position_ms, "Ready");
     }
 }
 
@@ -1601,6 +1676,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if !state.group_paused_due_to_buffering && state.members.values().any(|m| m.buffering) {
                 tracing::info!(group = %state.id, member = %member_id, "syncplay: member buffering — freezing group (V19)");
                 state.group_paused_due_to_buffering = true;
+                // B55 — arm the anti-wedge deadline the moment the freeze
+                // engages so a member buffering forever (or vanishing mid-buffer
+                // without a BufferingEnd) can't hold the group past
+                // BUFFERING_MAX_MS.
+                state.buffering_since = Some(tokio::time::Instant::now());
                 let at_server_ms = state.server_ms_now() + MIN_LEAD_MS;
                 // Freeze playback state too, the same way LeaderPause does.
                 // Without this, `playback` stays `Playing` for the whole
@@ -2823,6 +2903,100 @@ mod tests {
         );
         let snap = snapshot_of(&h).await;
         assert_eq!(snap.play_state, GroupPlayState::Playing);
+    }
+
+    /// B55 — the SOLE buffering member disconnecting (socket drop / Leave) must
+    /// lift the V19 freeze immediately, not strand the rest of the group frozen
+    /// forever waiting on a BufferingEnd that will never come.
+    #[tokio::test]
+    async fn buffering_freeze_lifts_when_sole_buffering_member_leaves() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // m2 stalls → group freezes.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.play_state, GroupPlayState::Paused, "freeze engaged");
+
+        // m2 (the only buffering member) leaves WITHOUT a BufferingEnd. The
+        // remaining member must be resumed, not left frozen.
+        h.tx.send(GroupMsg::RemoveMember { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut m1_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m1_play = true;
+            }
+        }
+        assert!(
+            m1_play,
+            "sole buffering member leaving must resume the group"
+        );
+        assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// B55 — a member that buffers FOREVER (never sends BufferingEnd, never
+    /// disconnects) must not hold the group frozen past BUFFERING_MAX_MS: the
+    /// anti-wedge deadline force-clears the freeze and resumes.
+    #[tokio::test(start_paused = true)]
+    async fn buffering_freeze_times_out_via_anti_wedge() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // m2 stalls and never recovers.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "freeze engaged"
+        );
+
+        // Advance past the anti-wedge deadline; the loop wakes and resumes.
+        tokio::time::advance(Duration::from_millis(BUFFERING_MAX_MS + 1_000)).await;
+        tokio::task::yield_now().await;
+        let _ = snapshot_of(&h).await;
+        let mut m1_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m1_play = true;
+            }
+        }
+        assert!(
+            m1_play,
+            "buffering freeze must time out and resume the group"
+        );
+        assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
     }
 
     /// B27 guard-rail: a VOLUNTARY pause (someone pressed pause) must NOT be
