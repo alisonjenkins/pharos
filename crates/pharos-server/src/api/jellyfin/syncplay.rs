@@ -352,9 +352,33 @@ async fn pause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
 async fn seek(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<SeekBody>,
 ) -> HttpResponse {
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
+    // T87 — prewarm the target segments for every member's variant BEFORE
+    // dispatching: clients only apply the seek at `When` (lead time) and
+    // then re-buffer, so the transcodes get a multi-second head start and
+    // the slowest member's segments are ready (or nearly) when requested.
+    if let Some(handle) = auth
+        .device_id
+        .as_deref()
+        .and_then(|d| hub.resolve(d))
+        .and_then(|sess| sess.group)
+    {
+        let state = state.clone();
+        actix_web::rt::spawn(async move {
+            if let Some(snap) = handle.snapshot().await {
+                if let Some(mid) = snap
+                    .current_item_id
+                    .as_deref()
+                    .and_then(pharos_jellyfin_api::dto::parse_item_id)
+                {
+                    super::hls::prewarm_group_seek(&state, mid, pos);
+                }
+            }
+        });
+    }
     dispatch(&hub, auth.device_id.as_deref(), "seek", move |mid| {
         GroupMsg::SeekTo {
             sender: mid,

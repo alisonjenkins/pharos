@@ -448,6 +448,10 @@ pub struct GroupSnapshot {
     pub group_name: String,
     /// Member display names — the `Participants` the join dialog renders.
     pub participants: Vec<String>,
+    /// Wire item id of the queue entry currently playing (T87 — lets the
+    /// HTTP seek handler prewarm that item's segments). None on an empty
+    /// queue.
+    pub current_item_id: Option<String>,
 }
 
 struct MemberRec {
@@ -1898,6 +1902,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .into_iter()
                     .map(|s| s.name)
                     .collect(),
+                current_item_id: state
+                    .queue
+                    .items
+                    .get(state.queue.playing_index)
+                    .map(|e| e.item_id.clone()),
             };
             let _ = reply.send(snap);
         }
@@ -3640,5 +3649,24 @@ mod tests {
             got.is_some(),
             "post-When Readys must resolve the gate and broadcast Play"
         );
+    }
+
+    /// T87 — the snapshot names the currently-playing queue entry so the
+    /// HTTP seek handler can prewarm its segments.
+    #[tokio::test]
+    async fn snapshot_carries_current_item_id() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let _ = &sinks;
+        assert_eq!(snapshot_of(&h).await.current_item_id, None);
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        let _ = plis;
+        assert_eq!(snapshot_of(&h).await.current_item_id.as_deref(), Some("10"));
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(snapshot_of(&h).await.current_item_id.as_deref(), Some("11"));
     }
 }

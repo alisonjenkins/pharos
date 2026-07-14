@@ -9,7 +9,7 @@ use crate::{
 use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
 use pharos_discovery::live_tv::M3uXmltvBackend;
 use pharos_store_sqlx::ServerConfigStore;
-use pharos_transcode::FfmpegBackend;
+use pharos_transcode::{FfmpegBackend, TranscodeOptions};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -149,6 +149,15 @@ pub struct AppState {
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
     pub bus: broadcast::Sender<SocketBroadcast>,
+    /// T87 — the last segment-transcode options each PlaySessionId used,
+    /// keyed by play session. Lets the SyncPlay seek handler PREWARM the
+    /// target segments for every group member's exact variant (audio pick,
+    /// burned sub, codec) the moment the Seek command is dispatched — the
+    /// server knows the target seconds before any client applies the seek
+    /// at `When` and requests data. Bounded small (one entry per live play
+    /// session); cleared wholesale past a sanity cap.
+    pub segment_opts_hints:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, TranscodeOptions)>>>,
     /// P36 — clamped played-flag threshold (50–100) used by
     /// `Sessions/Playing/Stopped` to decide when an item flips to
     /// `played=true`. Surfaced here so handlers stay zero-allocation
@@ -438,6 +447,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
@@ -503,6 +513,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
@@ -695,6 +706,33 @@ impl AppState {
             added: added.iter().map(|id| id.to_string()).collect(),
             removed: removed.iter().map(|id| id.to_string()).collect(),
         });
+    }
+
+    /// T87 — record the transcode options a play session last used for a
+    /// segment, for SyncPlay seek prewarming.
+    pub fn note_segment_opts(&self, play_session_id: &str, media_id: u64, opts: &TranscodeOptions) {
+        if let Ok(mut m) = self.segment_opts_hints.lock() {
+            // Sanity cap: play sessions number in the tens; a runaway caller
+            // must not grow this unbounded.
+            if m.len() > 512 {
+                m.clear();
+            }
+            m.insert(play_session_id.to_string(), (media_id, opts.clone()));
+        }
+    }
+
+    /// T87 — every recorded (play-session, options) pair currently pointing
+    /// at `media_id`.
+    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<TranscodeOptions> {
+        self.segment_opts_hints
+            .lock()
+            .map(|m| {
+                m.values()
+                    .filter(|(mid, _)| *mid == media_id)
+                    .map(|(_, o)| o.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Fire a `UserDataChanged` event scoped to one user, carrying the

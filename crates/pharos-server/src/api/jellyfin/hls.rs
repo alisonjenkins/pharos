@@ -859,6 +859,11 @@ async fn serve_segment(
         }
     }
 
+    // T87 — remember this play session's exact variant for SyncPlay seek
+    // prewarming (same as the VP9 path).
+    if let Some(psid) = q.play_session_id.as_deref() {
+        state.note_segment_opts(psid, id_num, &opts);
+    }
     // P18 — stable ETag derived from cache key inputs. Same
     // `(media_id, seg, audio_idx, sub_idx, bitrate)` tuple drives the
     // disk cache, so the ETag implicitly invalidates whenever the
@@ -1463,6 +1468,11 @@ async fn vp9_segment(
         q.subtitle_stream_index,
     )
     .await;
+    // T87 — remember this play session's exact variant so a SyncPlay seek
+    // can prewarm its segments before the client even applies the command.
+    if let Some(psid) = q.play_session_id.as_deref() {
+        state.note_segment_opts(psid, item.id, &opts);
+    }
     // Warm the next few segments in the background so a fast / >1x client finds
     // them cached instead of stalling. Spawned BEFORE this segment's own
     // transcode so N and N+1.. queue together across the CPU pool.
@@ -1584,6 +1594,81 @@ fn prefetch_target_segments(base_seg: u32, total_segs: Option<u32>, ahead_count:
 /// segment just served — only the start position advances. No-op without a
 /// cache; bounded by the item's total segment count (from its probed
 /// duration) so it never transcodes past EOF.
+/// T87 — SyncPlay seek prewarm: start transcoding the segments at
+/// `position_ms` for EVERY play session currently streaming `media_id`, each
+/// with its own recorded variant (audio pick, burned sub, codec). Called the
+/// moment `/SyncPlay/Seek` is dispatched — the server knows the target
+/// seconds before any client applies the command at `When` and asks for
+/// data, so the slowest member's segments are cooking (or done) by then.
+/// VP9 sessions also get their audio-rendition session pre-seeked (B42).
+pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, position_ms: u64) {
+    let state = state.clone();
+    actix_web::rt::spawn(async move {
+        let Ok(item) = fetch_item(&state, media_id).await else {
+            return;
+        };
+        let variants = state.segment_opts_for_media(media_id);
+        if variants.is_empty() {
+            return;
+        }
+        let target = (position_ms as f64 / (SEGMENT_SECONDS * 1000.0)) as u32;
+        tracing::info!(
+            media.id = media_id,
+            target_seg = target,
+            variants = variants.len(),
+            "syncplay seek prewarm: warming target segments"
+        );
+        let total_segs = item
+            .probe
+            .duration_ms
+            .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32)
+            .unwrap_or(u32::MAX);
+        for opts in variants {
+            // Warm the LANDING segment and the two behind it, directly (the
+            // regular prefetch helper only warms base+1.. on the assumption
+            // the base itself is being served — here nothing serves it yet).
+            for seg in target..(target + 3).min(total_segs) {
+                let state = state.clone();
+                let item = item.clone();
+                let mut o = opts.clone();
+                let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+                o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
+                o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
+                actix_web::rt::spawn(async move {
+                    let Some(cache) = state.hls.as_ref() else {
+                        return;
+                    };
+                    let _ = cache
+                        .segment_bytes_keyed(
+                            item.id,
+                            seg,
+                            o.audio_source_stream_index,
+                            o.burn_subtitle_stream_index,
+                            &item.path,
+                            &o,
+                        )
+                        .await;
+                });
+            }
+            // VP9 (fMP4) sessions: pre-seek the audio-rendition session too —
+            // its whole-file encoder is what stalled deep seeks (B42).
+            if matches!(opts.container, pharos_transcode::Container::Fmp4) {
+                if let Some(cache) = state.hls.as_ref() {
+                    let _ = cache
+                        .ensure_audio_hls_covering(
+                            &item.path,
+                            media_id,
+                            opts.audio_source_stream_index,
+                            Some(128_000),
+                            target,
+                        )
+                        .await;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_segment_prefetch(
     state: &web::Data<AppState>,
     item: &pharos_core::MediaItem,
