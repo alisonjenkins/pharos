@@ -226,6 +226,35 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
 /// one-item-at-a-time.
 async fn run_sweep(ctx: GenCtx) {
     tokio::time::sleep(WARMUP).await;
+    // B39 — fast boot verify-pass: sprite sets generated before the
+    // completion marker existed (or partial sets from interrupted runs) are
+    // marker-less, so they no longer count as generated. Verifying against
+    // each item's expected sheet count is a cheap local-PVC readdir; complete
+    // legacy sets get their marker stamped (and re-advertise in DTOs within
+    // seconds of boot) while truncated ones fall through to regeneration.
+    if let Ok(items) = ctx.stores.list().await {
+        let mut verified = 0usize;
+        for item in items.iter().filter(|i| is_video(i)) {
+            for &width in &ctx.widths {
+                if ctx.cache.is_generated(item.id, width).await {
+                    continue;
+                }
+                if let Some(layout) = build_layout(&item.probe, width, ctx.interval_ms) {
+                    if ctx
+                        .cache
+                        .verify_and_mark_complete(item.id, width, layout.tile_count)
+                        .await
+                    {
+                        verified += 1;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            verified,
+            "trickplay sweep: boot verify-pass marked pre-existing complete sets"
+        );
+    }
     loop {
         let items = match ctx.stores.list().await {
             Ok(v) => v,

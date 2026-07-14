@@ -293,7 +293,24 @@ impl LibavWorkerPool {
 
         let job_id = JobId(self.inner.next_job.fetch_add(1, Ordering::Relaxed));
         let op_timeout = if is_heavy_op(&op) {
-            self.inner.heavy_op_timeout
+            // B39 — scale the heavy cap with the CONTENT duration. A fixed
+            // 900s killed trickplay for long movies partway through (a ~3h
+            // film decodes ~6-7× realtime over NFS ⇒ ~25 min needed): the op
+            // timed out, the partial sheet set stayed on disk, and the item
+            // showed grey previews past the truncation point. Duration/2
+            // assumes ≥2× realtime keyframe-only decode — generous even for
+            // busy NFS — while still bounding a genuinely hung worker.
+            let content_secs = match &op {
+                TinyOp::Trickplay {
+                    thumb_count,
+                    interval_ms,
+                    ..
+                } => (*thumb_count as u64).saturating_mul(*interval_ms) / 1000,
+                _ => 0,
+            };
+            self.inner
+                .heavy_op_timeout
+                .max(Duration::from_secs(content_secs / 2))
         } else {
             self.inner.op_timeout
         };

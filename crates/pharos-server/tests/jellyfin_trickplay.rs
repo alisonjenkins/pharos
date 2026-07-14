@@ -382,6 +382,9 @@ async fn http_get_item_emits_nested_trickplay() {
     std::fs::write(cache_dir.path().join(".gen_version"), "1").unwrap();
     std::fs::create_dir_all(cache_dir.path().join("7/320")).unwrap();
     std::fs::write(cache_dir.path().join("7/320/0.jpg"), b"jpg").unwrap();
+    // B39 — a set counts as generated only with the completion marker; a bare
+    // tile is treated as an interrupted (truncated) run.
+    std::fs::write(cache_dir.path().join("7/320/.complete"), b"").unwrap();
     let cache = TrickplayCache::new(cache_dir.path(), u64::MAX);
     let state = web::Data::new(
         AppState::new(stores, "srv".into())

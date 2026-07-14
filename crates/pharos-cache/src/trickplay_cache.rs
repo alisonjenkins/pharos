@@ -105,6 +105,15 @@ const TRICKPLAY_GEN_VERSION: u32 = 1;
 /// Name of the on-disk generation-version marker at the cache root.
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
+/// B39 — per-(media,width) completion marker, written INSIDE the sprite dir
+/// only after every sheet landed. Presence of tiles alone is NOT completeness:
+/// the libav worker writes sheets straight into the final dir, so an
+/// interrupted run (heavy-op timeout on a long movie, worker crash, pod
+/// restart mid-deploy) leaves a partial set that used to pass the tile-0
+/// "generated" probe forever — advertised trickplay, grey previews past the
+/// truncation point (observed live: Avatar, tiles ending at 1h39m58s).
+const COMPLETE_MARKER: &str = ".complete";
+
 #[derive(Debug)]
 struct EntryMeta {
     bytes: u64,
@@ -168,7 +177,10 @@ impl TrickplayCache {
                     else {
                         continue;
                     };
-                    if w.path().join("0.jpg").is_file() {
+                    // B39 — only a COMPLETE set counts; legacy/partial dirs
+                    // (no marker) are re-verified by the backfill against the
+                    // item's expected sheet count.
+                    if w.path().join(COMPLETE_MARKER).is_file() {
                         generated.insert((mid, wv));
                     }
                 }
@@ -296,6 +308,8 @@ impl TrickplayCache {
         }
 
         let bytes_written = self.generate(key, layout, source).await?;
+        // B39 — stamp completeness before advertising the set.
+        let _ = tokio::fs::write(self.key_dir(key).join(COMPLETE_MARKER), b"").await;
         self.generated.insert(key);
         self.record(key, bytes_written).await;
         self.maybe_evict().await;
@@ -331,19 +345,63 @@ impl TrickplayCache {
         }
     }
 
-    /// True when tile 0 for `(media_id, width)` is already on disk — the cheap
-    /// "already generated?" probe the background pre-generator uses to skip
-    /// finished items without re-deriving the layout.
+    /// True when the sprite set for `(media_id, width)` is COMPLETE on disk
+    /// (B39: the `.complete` marker, not mere tile presence — an interrupted
+    /// generation leaves tiles without the marker and must be re-attempted).
     pub async fn is_generated(&self, media_id: u64, width: u32) -> bool {
         if self.generated.contains(&(media_id, width)) {
             return true;
         }
-        let path = self.tile_path((media_id, width), 0);
+        let path = self.key_dir((media_id, width)).join(COMPLETE_MARKER);
         let on_disk = tokio::fs::try_exists(&path).await.unwrap_or(false);
         if on_disk {
             self.generated.insert((media_id, width));
         }
         on_disk
+    }
+
+    /// B39 — migration/self-heal for sets generated before the completion
+    /// marker existed (or whose marker was lost): if the on-disk sheets are
+    /// consistent with `expected_tile_count`, stamp the marker and count the
+    /// set complete; otherwise report false so the caller regenerates.
+    /// Tolerates ONE missing trailing sheet — VFR sources and rounded
+    /// container durations legitimately produce one fewer sheet than the
+    /// duration-derived estimate.
+    pub async fn verify_and_mark_complete(
+        &self,
+        media_id: u64,
+        width: u32,
+        expected_tile_count: u32,
+    ) -> bool {
+        let key: CacheKey = (media_id, width);
+        if self.generated.contains(&key) {
+            return true;
+        }
+        let dir = self.key_dir(key);
+        if !tokio::fs::try_exists(&dir.join("0.jpg"))
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let mut produced: u32 = 0;
+        for n in 0..expected_tile_count {
+            if tokio::fs::try_exists(&dir.join(format!("{n}.jpg")))
+                .await
+                .unwrap_or(false)
+            {
+                produced = n + 1;
+            } else {
+                break;
+            }
+        }
+        if produced + 1 >= expected_tile_count {
+            let _ = tokio::fs::write(dir.join(COMPLETE_MARKER), b"").await;
+            self.generated.insert(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// The subset of `widths` with tiles actually on disk for `media_id` —
@@ -384,7 +442,28 @@ impl TrickplayCache {
         if self.is_generated(media_id, layout.width).await {
             return Ok(false);
         }
+        // B39 — a marker-less set that matches the expected sheet count is a
+        // pre-marker (or marker-lost) COMPLETE set: stamp it instead of
+        // re-decoding the whole file.
+        if self
+            .verify_and_mark_complete(media_id, layout.width, layout.tile_count)
+            .await
+        {
+            let mut state = self.state.lock().await;
+            state.fetch_locks.remove(&key);
+            return Ok(false);
+        }
+        // Anything else on disk is a torn partial run (interrupted mid-write):
+        // wipe it so stale sheets never mix with the fresh set.
+        let dir = self.key_dir(key);
+        if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
         let bytes_written = self.generate(key, layout, source).await?;
+        // B39 — completion marker: written ONLY here, after every sheet
+        // landed. is_generated keys on this, so an interrupted run (timeout,
+        // crash, deploy) is re-attempted instead of serving grey previews.
+        let _ = tokio::fs::write(dir.join(COMPLETE_MARKER), b"").await;
         self.record(key, bytes_written).await;
         self.maybe_evict().await;
         let mut state = self.state.lock().await;
@@ -730,13 +809,19 @@ mod tests {
             .await
             .is_err());
 
-        // Seed a tile → hit returns it, and is_generated / ensure_generated
-        // both see it as present (ensure_generated is a no-op → Ok(false)).
+        // Seed a tile. B39: a bare tile WITHOUT the completion marker is NOT
+        // "generated" (it could be a truncated run) — but this layout expects
+        // exactly one sheet, so ensure_generated's verify path recognises the
+        // set as complete, stamps the marker, and no-ops (Ok(false)) instead
+        // of re-decoding.
         let dir = cache.key_dir((11, 320));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let payload = b"\xFF\xD8\xFF\xE0fakejpeg";
         tokio::fs::write(dir.join("0.jpg"), payload).await.unwrap();
-        assert!(cache.is_generated(11, 320).await);
+        assert!(
+            !cache.is_generated(11, 320).await,
+            "tiles without the completion marker must not count as generated (B39)"
+        );
         assert_eq!(
             cache
                 .tile_bytes_cached(11, 320, 0)
@@ -749,6 +834,57 @@ mod tests {
             .ensure_generated(11, layout, std::path::Path::new("/n"))
             .await
             .unwrap());
+        assert!(
+            cache.is_generated(11, 320).await,
+            "verify path must stamp the marker for a complete legacy set"
+        );
+    }
+
+    /// B39 — the Avatar failure: an interrupted generation leaves a TRUNCATED
+    /// sheet set (no completion marker). It must not count as generated, and
+    /// ensure_generated must wipe + re-attempt it rather than no-op.
+    #[tokio::test]
+    async fn truncated_sheet_set_is_regenerated_not_trusted() {
+        let td = TempDir::new().unwrap();
+        let cache = TrickplayCache::new(td.path(), 1 << 20).with_ffmpeg("/no/such/ffmpeg");
+        // 3000s / 10s = 300 thumbs = 3 sheets expected.
+        let layout = Layout::compute(3_000_000, 1920, 1080, 320, 10_000).unwrap();
+        assert_eq!(layout.tile_count, 3);
+        // Interrupted run: only sheet 0 landed.
+        let dir = cache.key_dir((12, 320));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("0.jpg"), b"partial")
+            .await
+            .unwrap();
+        assert!(
+            !cache.is_generated(12, 320).await,
+            "truncated set must not count as generated"
+        );
+        assert!(
+            !cache
+                .verify_and_mark_complete(12, 320, layout.tile_count)
+                .await,
+            "verify must reject a truncated set"
+        );
+        // ensure_generated must try to REGENERATE (broken ffmpeg → error, which
+        // proves it didn't trust the partial set).
+        assert!(cache
+            .ensure_generated(12, layout, std::path::Path::new("/n"))
+            .await
+            .is_err());
+
+        // A set one sheet short of the estimate (VFR tolerance) IS complete.
+        let dir = cache.key_dir((13, 320));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("0.jpg"), b"s0").await.unwrap();
+        tokio::fs::write(dir.join("1.jpg"), b"s1").await.unwrap();
+        assert!(
+            cache
+                .verify_and_mark_complete(13, 320, layout.tile_count)
+                .await,
+            "one missing trailing sheet is within VFR tolerance"
+        );
+        assert!(cache.is_generated(13, 320).await);
     }
 
     #[tokio::test]
