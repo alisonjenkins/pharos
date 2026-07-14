@@ -49,6 +49,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
+        TinyOp::Fingerprint { .. } => "fingerprint",
         _ => "other",
     }
 }
@@ -59,7 +60,10 @@ fn is_heavy_op(op: &TinyOp) -> bool {
         op,
         // SubtitleWindows demuxes the whole file (no decode) — NFS-bound,
         // minutes on a large movie, so it needs the heavy cap too.
-        TinyOp::Trickplay { .. } | TinyOp::Waveform { .. } | TinyOp::SubtitleWindows { .. }
+        TinyOp::Trickplay { .. }
+            | TinyOp::Waveform { .. }
+            | TinyOp::SubtitleWindows { .. }
+            | TinyOp::Fingerprint { .. }
     )
 }
 
@@ -293,6 +297,26 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Chromaprint-fingerprint an audio window (intro/outro detection).
+    pub async fn fingerprint(
+        &self,
+        input: impl Into<PathBuf>,
+        start_ms: u64,
+        dur_ms: u64,
+    ) -> Result<Vec<u32>, PoolError> {
+        let ev = self
+            .run(TinyOp::Fingerprint {
+                input: input.into(),
+                start_ms,
+                dur_ms,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::FingerprintResult { points, .. } => Ok(points),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Core request/reply: acquire a permit, check out (or spawn) a
     /// worker, run one op, and return the terminal `WorkerEvent`. A
     /// healthy worker is returned to the idle set; a broken one is dropped.
@@ -404,6 +428,7 @@ impl LibavWorkerPool {
                 WorkerEvent::ProbeResult { job_id: j, .. }
                 | WorkerEvent::WaveformResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
+                | WorkerEvent::FingerprintResult { job_id: j, .. }
                 | WorkerEvent::Done { job_id: j, .. }
                 | WorkerEvent::Failed { job_id: j, .. } => {
                     if *j != job_id {

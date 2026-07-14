@@ -313,7 +313,8 @@ impl Worker for ProcWorker {
                         WorkerEvent::Hello(_)
                         | WorkerEvent::ProbeResult { .. }
                         | WorkerEvent::WaveformResult { .. }
-                        | WorkerEvent::SubtitleWindowsResult { .. } => continue,
+                        | WorkerEvent::SubtitleWindowsResult { .. }
+                        | WorkerEvent::FingerprintResult { .. } => continue,
                     },
                 }
             }

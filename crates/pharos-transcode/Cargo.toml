@@ -15,6 +15,7 @@ libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 smallvec = { version = "1", features = ["serde"] }
+rusty-chromaprint = "0.3"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs", "time", "net"] }
 tokio-util.workspace = true

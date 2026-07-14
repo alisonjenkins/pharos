@@ -182,6 +182,14 @@ pub enum TinyOp {
     },
     /// Convert a SubRip sidecar to WebVTT, written to `out` → `Done`.
     SrtToWebvtt { input: PathBuf, out: PathBuf },
+    /// Chromaprint-fingerprint an audio window → `WorkerEvent::
+    /// FingerprintResult`. Decode-only (no encode); drives intro/outro
+    /// detection (ADR-0018). Whole-window decode → NFS-bound, heavy op.
+    Fingerprint {
+        input: PathBuf,
+        start_ms: u64,
+        dur_ms: u64,
+    },
     /// Scan one subtitle stream's packet timeline → merged on-screen
     /// windows (`WorkerEvent::SubtitleWindowsResult`). Demux-only (no
     /// decode); drives per-segment burn gating — event-free segments skip
@@ -253,6 +261,11 @@ pub enum WorkerEvent {
     SubtitleWindowsResult {
         job_id: JobId,
         windows: Vec<(u64, u64)>,
+    },
+    /// Reply to `TinyOp::Fingerprint` — chromaprint points (one per ~0.124 s).
+    FingerprintResult {
+        job_id: JobId,
+        points: Vec<u32>,
     },
 }
 

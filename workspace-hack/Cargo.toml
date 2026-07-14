@@ -38,6 +38,7 @@ itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
+num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
@@ -87,6 +88,7 @@ itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
+num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
