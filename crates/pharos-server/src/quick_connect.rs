@@ -121,6 +121,18 @@ impl QuickConnectRegistry {
                             mint_pending(device_id, device_name, app_name, app_version, &by_code);
                         by_code.insert(entry.code.clone(), entry.secret.clone());
                         by_secret.insert(entry.secret.clone(), entry.clone());
+                        // B62 — QC observability: the mint was a total blind spot
+                        // (no log), so a code/secret that later 404s couldn't be
+                        // correlated to its Initiate. Log code + secret PREFIX
+                        // (never the full secret) + device + the live pool size.
+                        tracing::info!(
+                            code = %entry.code,
+                            secret.prefix = %secret_prefix(&entry.secret),
+                            device.id = %entry.device_id,
+                            device.name = %entry.device_name,
+                            live_pending = by_secret.len(),
+                            "quickconnect: initiated (code minted)"
+                        );
                         let _ = reply.send(entry);
                     }
                     QcMsg::Authorize { code, by, reply } => {
@@ -131,6 +143,13 @@ impl QuickConnectRegistry {
                                 ok = true;
                             }
                         }
+                        tracing::info!(
+                            code = %code,
+                            authorized = ok,
+                            live_codes = by_code.len(),
+                            "quickconnect: authorize {}",
+                            if ok { "matched" } else { "UNKNOWN CODE" }
+                        );
                         let _ = reply.send(ok);
                     }
                     QcMsg::Connect { secret, reply } => {
@@ -139,19 +158,35 @@ impl QuickConnectRegistry {
                         // Connect (QcMsg::Consume), so the entry MUST survive
                         // this call — consuming here would delete the record
                         // before the finalize could find it.
-                        let _ = reply.send(by_secret.get(&secret).cloned());
+                        let hit = by_secret.get(&secret).cloned();
+                        tracing::debug!(
+                            secret.prefix = %secret_prefix(&secret),
+                            found = hit.is_some(),
+                            authenticated = hit.as_ref().map(|e| e.authorized_by.is_some()),
+                            live_pending = by_secret.len(),
+                            "quickconnect: connect poll"
+                        );
+                        let _ = reply.send(hit);
                     }
                     QcMsg::Consume { secret, reply } => {
                         // Single-shot: hand back + remove the record only once
                         // it's authorized. Unauthorized/unknown → None, entry
                         // left in place so the client can keep polling.
-                        let result = by_secret
-                            .get(&secret)
+                        let present = by_secret.get(&secret).cloned();
+                        let result = present
+                            .as_ref()
                             .and_then(|e| e.authorized_by.is_some().then(|| e.clone()));
                         if let Some(ref entry) = result {
                             by_secret.remove(&secret);
                             by_code.remove(&entry.code);
                         }
+                        tracing::info!(
+                            secret.prefix = %secret_prefix(&secret),
+                            secret_known = present.is_some(),
+                            was_authorized = present.as_ref().map(|e| e.authorized_by.is_some()),
+                            consumed = result.is_some(),
+                            "quickconnect: finalize (AuthenticateWithQuickConnect)"
+                        );
                         let _ = reply.send(result);
                     }
                     QcMsg::Gc => {}
@@ -240,6 +275,12 @@ fn generate_code() -> String {
 /// Crypto-style random secret. Uses `uuid::Uuid::new_v4().simple()`.
 fn generate_secret() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// First 8 chars of a secret, for correlating trace lines WITHOUT logging the
+/// full credential (a full secret in logs would be a bearer-token leak).
+fn secret_prefix(s: &str) -> &str {
+    &s[..s.len().min(8)]
 }
 
 #[cfg(test)]
