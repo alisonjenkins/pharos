@@ -192,7 +192,11 @@ async fn no_group_command_sends_not_in_group_to_the_caller() {
     // has no group for it — the exact post-restart state.
     let hub = SessionHub::new();
     let (sink_tx, mut sink_rx) = mpsc::channel(8);
-    hub.register("dev-restart".into(), "alison".into(), sink_tx);
+    hub.register(
+        format!("{}:dev-restart", uid.0.simple()),
+        "alison".into(),
+        sink_tx,
+    );
 
     let member_sinks = MemberSinks::new();
     let registry =
@@ -280,7 +284,11 @@ async fn ping_from_groupless_session_heals_with_not_in_group() {
     let state = web::Data::new(AppState::new(stores, "t".into()));
     let hub = SessionHub::new();
     let (sink_tx, mut sink_rx) = mpsc::channel(8);
-    hub.register("dev-pinger".into(), "lace".into(), sink_tx);
+    hub.register(
+        format!("{}:dev-pinger", uid.0.simple()),
+        "lace".into(),
+        sink_tx,
+    );
     let member_sinks = MemberSinks::new();
     let registry =
         pharos_sync::GroupRegistry::spawn(Arc::new(LocalDelivery::new(member_sinks.clone())));
@@ -432,7 +440,11 @@ async fn leave_with_group_acknowledges_the_leaver() {
 
     let hub = SessionHub::new();
     let (sink_tx, mut sink_rx) = mpsc::channel(32);
-    let reg = hub.register("dev-leaver".into(), "lace".into(), sink_tx.clone());
+    let reg = hub.register(
+        format!("{}:dev-leaver", uid.0.simple()),
+        "lace".into(),
+        sink_tx.clone(),
+    );
 
     let member_sinks = MemberSinks::new();
     member_sinks.insert(reg.member_id, sink_tx);
