@@ -1483,6 +1483,34 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             name,
             reply,
         } => {
+            // B57 — idempotent re-add: a duplicate New/Join for a member already
+            // in the roster (client retry, or the New/Join churn a socket race
+            // can trigger) must NOT reset the member's buffering/ignore_wait
+            // flags or fire a spurious "user joined" toast to everyone. Treat it
+            // as a reconnect: refresh name + liveness, re-send this member's own
+            // Joined + catch-up (so its fresh client re-syncs), and reply — but
+            // skip the roster-wide MemberJoined broadcast.
+            if let Some(rec) = state.members.get_mut(&member_id) {
+                rec.name = name.clone();
+                rec.last_seen = tokio::time::Instant::now();
+                let summaries = state.member_summaries();
+                let leader = state.leader.unwrap_or(member_id);
+                let _ = reply.send(Joined {
+                    group_id: state.id,
+                    leader,
+                    members: summaries.clone(),
+                });
+                state.send_one(
+                    member_id,
+                    ServerMsg::Joined {
+                        group_id: state.id,
+                        leader,
+                        members: summaries,
+                    },
+                );
+                state.send_catch_up(member_id);
+                return;
+            }
             let was_empty = state.members.is_empty();
             state.members.insert(
                 member_id,
@@ -1699,6 +1727,18 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.buffering = false;
             }
+            // B57 — a member the group is WAITING on (an Unpause opened a gate
+            // on the members that were buffering) signals its recovery with
+            // BufferingEnd, not Ready (ws-native / native clients). If the gate
+            // never counted BufferingEnd it could only clear via the 30s
+            // anti-wedge — a needless hang on every mid-buffer Unpause. Treat it
+            // like MemberReady: drop the member from the gate and resolve when
+            // it was the last holdout.
+            if let Some(w) = state.waiting.as_mut() {
+                if w.pending.remove(&member_id) && w.pending.is_empty() {
+                    state.resolve_waiting();
+                }
+            }
             // B27 — same auto-resume as the HTTP path's MemberReady: the
             // buffering-caused freeze lifts the moment the last buffering
             // member recovers (Jellyfin parity; ws-native clients report
@@ -1877,6 +1917,14 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             playing_index,
             start_position_ms,
         } => {
+            // B57 — an empty queue has nothing to play: setting it and opening a
+            // readiness gate would leave the group reporting Playing with no
+            // current item (a wedge that only a later non-empty queue clears).
+            // jellyfin-web never sends this, but a malformed/racing client could.
+            if item_ids.is_empty() {
+                tracing::warn!(group = %state.id, "syncplay: SetNewQueue with empty queue ignored");
+                return;
+            }
             state.queue.items = item_ids
                 .into_iter()
                 .map(|item_id| QueueEntry {
@@ -2996,6 +3044,121 @@ mod tests {
             m1_play,
             "buffering freeze must time out and resume the group"
         );
+        assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// B57 — a duplicate AddMember for a member already in the roster (New/Join
+    /// retry or churn) must be idempotent: preserve the member's buffering flag
+    /// and fire NO second "user joined" toast to the others.
+    #[tokio::test]
+    async fn duplicate_add_member_is_idempotent() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        // m2 is buffering → group frozen, buffering_member_count == 1.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // Re-add m2 (a duplicate join).
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(GroupMsg::AddMember {
+            member_id: m2,
+            name: "second".into(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        let _ = reply_rx.await;
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.member_count, 2, "no phantom third member");
+        assert_eq!(
+            snap.buffering_member_count, 1,
+            "re-add must NOT reset the buffering flag"
+        );
+        let mut dup_join = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::MemberJoined { .. }) {
+                dup_join = true;
+            }
+        }
+        assert!(!dup_join, "duplicate re-add must not toast a second join");
+    }
+
+    /// B57 — SetNewQueue with an empty queue is ignored (never leaves the group
+    /// reporting Playing with no current item).
+    #[tokio::test]
+    async fn empty_set_new_queue_is_ignored() {
+        let (h, _sinks, _rx, _m1) = fresh().await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: _m1,
+            item_ids: vec![],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(
+            snap.play_state,
+            GroupPlayState::Idle,
+            "empty queue must not start playback"
+        );
+    }
+
+    /// B57 — a member the group is WAITING on (Unpause opened a gate on the
+    /// buffering member) that recovers via BufferingEnd (not Ready) must resolve
+    /// the gate promptly, not hang until the 30s anti-wedge.
+    #[tokio::test]
+    async fn buffering_end_resolves_an_open_unpause_gate() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        // m2 buffers → freeze.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        // Leader presses play while m2 still buffers → gate opens on m2.
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "Unpause on a buffering member opens a gate"
+        );
+        while rx1.try_recv().is_ok() {}
+
+        // m2 recovers via BufferingEnd (ws-native signal) → gate must resolve.
+        h.tx.send(GroupMsg::BufferingEnd { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut m1_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m1_play = true;
+            }
+        }
+        assert!(m1_play, "BufferingEnd must resolve the gate and resume");
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
     }
 
