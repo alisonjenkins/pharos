@@ -511,7 +511,11 @@ fn build_args_for_device(
             // family -1" aborts the whole encode. Downmix to stereo: it's the
             // browser-safe layout for a progressive VP9/WebM stream anyway, and
             // avoids opus's finicky multichannel mapping entirely.
-            if matches!(c, AudioCodec::Opus) {
+            // B45 — AAC gets the same stereo downmix: re-encoding a 5.1
+            // source otherwise keeps 6 channels, and multichannel AAC is
+            // undecodable in Firefox's MSE (fatal bufferAppendError on the
+            // FIRST segment — playback never starts; Chrome tolerates it).
+            if matches!(c, AudioCodec::Opus | AudioCodec::Aac) {
                 a.push("-ac".into());
                 a.push("2".into());
             }
@@ -581,7 +585,18 @@ fn build_args_for_device(
     // current position): hls.js buffers the fragment at its raw PTS near 0
     // while the playhead sits at the resume position → permanent stall, and
     // the eventual user retry restarts the movie from 0:00.
+    // B45 — `-muxdelay 0` (+ preload) is REQUIRED for the offset to land on
+    // the grid: the mpegts muxer otherwise adds its default 1.4 s initial
+    // cue delay to every segment, so consecutive independently-transcoded
+    // segments each carry a +1.4 s skew relative to their EXTINF position.
+    // NOTE `-output_ts_offset` is inert under `-c:v copy` (ffmpeg 8.1) —
+    // which is one of the reasons the segmented path never stream-copies
+    // (see `build_segment_opts`); this block assumes a re-encode.
     if matches!(opts.container, Container::Mpegts) {
+        a.push("-muxdelay".into());
+        a.push("0".into());
+        a.push("-muxpreload".into());
+        a.push("0".into());
         if let Some(pos) = start {
             a.push("-output_ts_offset".into());
             a.push(format!("{pos:.3}"));
@@ -1026,5 +1041,30 @@ mod tests {
         o.container = Container::Mpegts;
         let a = build_args("/m/x.mkv", &o);
         assert!(!a.iter().any(|x| x == "-output_ts_offset"), "{a:?}");
+    }
+
+    #[test]
+    fn mpegts_zeroes_the_mux_delay() {
+        // B45 — without `-muxdelay 0` the mpegts muxer adds its default
+        // 1.4 s initial cue delay, skewing every independently-transcoded
+        // segment +1.4 s off its EXTINF grid position (the offset then
+        // anchors to the wrong base).
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(joined.contains("-muxdelay 0"), "{joined}");
+        assert!(joined.contains("-muxpreload 0"), "{joined}");
+    }
+
+    #[test]
+    fn aac_downmixes_to_stereo() {
+        // B45 — a 5.1 source re-encoded to AAC otherwise keeps 6 channels;
+        // multichannel AAC is undecodable in Firefox's MSE (fatal append
+        // error on the first segment — playback never starts).
+        let a = build_args("/m/x.mkv", &opts());
+        let joined = a.join(" ");
+        assert!(joined.contains("-c:a aac"), "{joined}");
+        assert!(joined.contains("-ac 2"), "{joined}");
     }
 }

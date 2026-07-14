@@ -149,7 +149,12 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// their true timeline position — mixing them in one hls.js session breaks
 /// buffering). A mismatch with the on-disk `.gen_version` wipes the cache at
 /// construction; segments regenerate on demand (cheap: only what's watched).
-const HLS_GEN_VERSION: u32 = 2;
+///
+/// v3 (B45): stream-copied mpegts segments abolished (PTS reset per segment,
+/// keyframe-sloppy durations, 6ch AAC) and re-encoded segments gained
+/// `-muxdelay 0` (old ones carry a +1.4 s skew) — every cached `.ts` from
+/// v2 is poisoned.
+const HLS_GEN_VERSION: u32 = 3;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {

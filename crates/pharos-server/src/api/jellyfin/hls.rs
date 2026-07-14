@@ -319,36 +319,22 @@ fn codecs_string(
 
 /// The codecs the HLS **segments** actually carry — the transcode OUTPUT,
 /// which is what the master playlist's `CODECS` attribute must advertise.
-/// `/master.m3u8` is always a transcode: an h264/hevc source is stream-copied
-/// (advertise it verbatim), anything else is re-encoded to H.264, and audio is
-/// (re-)encoded to AAC (see `build_segment_opts`). Advertising the *source*
-/// codec (e.g. `mpeg4` for a legacy AVI/DivX/Xvid rip) makes the browser's
-/// `MediaSource.isTypeSupported` reject the stream as unplayable *before* it
-/// fetches a single segment — surfacing as jellyfin-web's "Playback Error".
+/// `/master.m3u8` is always a transcode: EVERY source is re-encoded to
+/// H.264 + AAC (B45 — `build_segment_opts` never stream-copies on the
+/// segmented surface). Advertising the *source* codec (e.g. `mpeg4` for a
+/// legacy AVI/DivX/Xvid rip, or `hvc1` for an HEVC source) makes the
+/// browser's `MediaSource.isTypeSupported` reject the stream as unplayable
+/// *before* it fetches a single segment — surfacing as jellyfin-web's
+/// "Playback Error".
 fn hls_output_codecs_string(
-    src_video: Option<&str>,
-    src_profile: Option<&str>,
-    src_level: Option<u32>,
+    _src_video: Option<&str>,
+    _src_profile: Option<&str>,
+    _src_level: Option<u32>,
 ) -> String {
-    // The segment generator (`build_segment_opts`) forces H.264 output for
-    // every video HLS transcode — there is no HEVC/VP9/AV1 output encoder in
-    // this pipeline — so the ONLY source that appears verbatim in the segments
-    // is h264 (either stream-copied on the remux path or re-encoded h264→h264).
-    // An HEVC source is re-encoded to H.264, so advertising `hvc1` (as if it
-    // were copied) makes the browser reject the stream as un-decodable HEVC
-    // even though the bytes are H.264. Advertise avc1 for anything but h264.
-    let copied_h264 = matches!(
-        src_video.map(str::to_ascii_lowercase).as_deref(),
-        Some("h264" | "avc" | "avc1")
-    );
-    if copied_h264 {
-        // h264 in the segments → advertise avc1 with the source profile/level.
-        codecs_string(src_video, src_profile, src_level, Some("aac"))
-    } else {
-        // Re-encoded to H.264 (libx264 defaults). Advertise a conservative
-        // avc1 token; the source profile/level describe the discarded input.
-        codecs_string(Some("h264"), None, None, Some("aac"))
-    }
+    // Re-encoded to H.264 (libx264 defaults). Advertise a conservative
+    // avc1 token; the source codec/profile/level describe the discarded
+    // input, never the segment bytes.
+    codecs_string(Some("h264"), None, None, Some("aac"))
 }
 
 fn video_codec_token(codec: &str, profile: Option<&str>, level: Option<u32>) -> String {
@@ -1089,30 +1075,28 @@ fn build_segment_opts(
                     burn_subtitle_stream_index: subtitle_stream_index,
                 };
             }
-            // P9 — VideoRemux: copy video, transcode audio (or copy
-            // if codec already matches). Container always swaps to
-            // the profile target. Burn-in stripped (copy path can't
-            // filter).
-            Decision::VideoRemux {
-                target_container,
-                target_audio_codec,
-            } => {
-                let container =
-                    Container::from_name(&target_container).unwrap_or(Container::Mpegts);
-                let audio = target_audio_codec
-                    .as_deref()
-                    .and_then(AudioCodec::from_name)
-                    .or(Some(AudioCodec::Aac));
+            // P9/B45 — VideoRemux (video codec compatible, container/audio
+            // not) still RE-ENCODES on the segmented-HLS surface. `-c:v copy`
+            // per-segment HLS is structurally broken: ffmpeg can only cut on
+            // source keyframes, so segment durations diverge from the uniform
+            // EXTINF grid; `-output_ts_offset` is inert under stream copy
+            // (ffmpeg 8.1), so every segment restarts its timeline at ~0; and
+            // passthrough multichannel AAC is undecodable in Firefox's MSE.
+            // Chrome's hls.js happened to tolerate all three — Firefox fatals
+            // on the first append and playback never starts. Copy remux
+            // remains correct on the PROGRESSIVE /stream path (one continuous
+            // output, no per-segment cuts); it must never reach this one.
+            Decision::VideoRemux { .. } => {
                 return TranscodeOptions {
-                    container,
-                    video: Some(VideoCodec::Copy),
-                    audio,
-                    video_bitrate_bps: None,
+                    container: Container::Mpegts,
+                    video: Some(VideoCodec::H264),
+                    audio: Some(AudioCodec::Aac),
+                    video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
                     audio_bitrate_bps: Some(128_000),
                     start_position_ticks: start_ticks,
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
-                    burn_subtitle_stream_index: None,
+                    burn_subtitle_stream_index: subtitle_stream_index,
                 };
             }
             _ => {}
@@ -1120,46 +1104,23 @@ fn build_segment_opts(
     }
 
     // Fallback path: no session registered → conservative defaults.
-    // ONLY h264 may be stream-copied. The master playlist advertises `avc1`
-    // for every source EXCEPT a copied h264 (see `hls_output_codecs_string`),
-    // so the segments must be H.264 to match — copying an HEVC source here
-    // (as an earlier "mpegts-compatible" optimization did) produced HEVC
-    // segments under an avc1 manifest. Firefox/Safari can't decode HEVC and
-    // the codec mismatch broke hls.js with a fatal manifestParsingError; the
-    // codec-blind segment cache then served that HEVC segment to every client
-    // (including ones that DID transcode to h264). Re-encode anything but
-    // h264 to H.264.
-    let (video, video_bitrate_bps) = match item.probe.video_codec.as_deref() {
-        Some(c) if c.eq_ignore_ascii_case("h264") || c.eq_ignore_ascii_case("avc1") => {
-            // Copy + no -b:v cap (bitstream copies passthrough source bitrate).
-            // Subtitle burn-in is incompatible with `-c:v copy`, so the
-            // burn-in arg gets stripped in `build_args` already; we just
-            // don't pass a per-stream subtitle index.
-            (Some(VideoCodec::Copy), None)
-        }
-        _ => (
-            Some(VideoCodec::H264),
-            Some(target_video_bitrate(item.probe.bitrate_bps)),
-        ),
-    };
-    // When we copy video, burn-in is impossible (would require
-    // re-encode). Drop subtitle_stream_index in that case so the
-    // transcoder doesn't error.
-    let burn_subtitle_stream_index = if matches!(video, Some(VideoCodec::Copy)) {
-        None
-    } else {
-        subtitle_stream_index
-    };
+    // B45 — ALWAYS re-encode video, even an h264 source. An earlier
+    // optimization stream-copied h264 here, but `-c:v copy` per-segment HLS
+    // is structurally broken (keyframe-sloppy durations off the EXTINF grid,
+    // `-output_ts_offset` inert under copy so every segment restarts at
+    // PTS≈0, multichannel AAC passthrough Firefox can't decode) — see the
+    // VideoRemux arm above. Re-encode keeps every segment frame-exact on
+    // the shared timeline.
     TranscodeOptions {
         container: Container::Mpegts,
-        video,
+        video: Some(VideoCodec::H264),
         audio: Some(AudioCodec::Aac),
-        video_bitrate_bps,
+        video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
         audio_bitrate_bps: Some(128_000),
         start_position_ticks: start_ticks,
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: audio_stream_index,
-        burn_subtitle_stream_index,
+        burn_subtitle_stream_index: subtitle_stream_index,
     }
 }
 
@@ -2355,16 +2316,21 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn fallback_emits_copy_for_h264_source() {
-        // P6 — h264 in mpegts container needs no re-encode.
+    fn fallback_reencodes_even_h264_source() {
+        // B45 — `-c:v copy` per-segment HLS is structurally broken (PTS reset
+        // every segment because `-output_ts_offset` is inert under copy,
+        // keyframe-sloppy durations off the EXTINF grid, multichannel AAC
+        // passthrough Firefox can't decode). Even an h264 source re-encodes.
         let item = item_with_video_codec(Some("h264"));
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
         assert!(matches!(
             opts.video,
-            Some(pharos_transcode::VideoCodec::Copy)
+            Some(pharos_transcode::VideoCodec::H264)
         ));
-        // Copy = no -b:v cap (passthrough source bitrate).
-        assert!(opts.video_bitrate_bps.is_none());
+        assert!(
+            opts.video_bitrate_bps.is_some(),
+            "re-encode needs a -b:v cap"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -2389,12 +2355,45 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn fallback_strips_subtitle_burn_in_when_copying_video() {
-        // Burn-in needs re-encode; with `-c:v copy` it has to be a no-op.
-        // h264 is the codec that still copies in the fallback.
+    fn fallback_burns_image_subs_on_h264_source() {
+        // B45 — h264 sources re-encode now, so image-sub burn-in works on
+        // them too (it silently no-op'd under the old `-c:v copy` fallback).
         let item = item_with_video_codec(Some("h264"));
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
-        assert!(opts.burn_subtitle_stream_index.is_none());
+        assert_eq!(opts.burn_subtitle_stream_index, Some(0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn video_remux_session_reencodes_on_segment_surface() {
+        // B45 — a VideoRemux decision (copy-compatible video) must still
+        // re-encode on the segmented-HLS surface; `-c:v copy` segments are
+        // structurally broken (see build_segment_opts).
+        let item = item_with_video_codec(Some("h264"));
+        let session = crate::transcode_sessions::TranscodeSession {
+            media_id: item.id,
+            decision: crate::api::jellyfin::device_profile::Decision::VideoRemux {
+                target_container: "ts".into(),
+                target_audio_codec: Some("aac".into()),
+            },
+            source_probe: item.probe.clone(),
+        };
+        let opts = build_segment_opts(Some(session), &item, 0, 60_000_000, None, None);
+        assert!(matches!(
+            opts.video,
+            Some(pharos_transcode::VideoCodec::H264)
+        ));
+        assert!(
+            opts.video_bitrate_bps.is_some(),
+            "re-encode needs a -b:v cap"
+        );
+        assert!(matches!(
+            opts.audio,
+            Some(pharos_transcode::AudioCodec::Aac)
+        ));
+        assert!(matches!(
+            opts.container,
+            pharos_transcode::Container::Mpegts
+        ));
     }
 
     #[::core::prelude::v1::test]
