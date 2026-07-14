@@ -128,10 +128,15 @@
             cargoArtifacts = pharosDeps;
             cargoExtraArgs = "--workspace";
             cargoNextestExtraArgs = "--profile nix";
-            # Integration tests that shell out to real ffmpeg/synth fixtures are
+            # HEAVY ffmpeg integration tests (whole-file VP9 encodes etc.) are
             # `#[ignore]`d and skipped by a default nextest run; the in-process
             # libav paths + the ephemeral-port client-compat server run fine in
-            # the sandbox (loopback is up).
+            # the sandbox (loopback is up). ffmpeg-headless IS on PATH for the
+            # cheap BEHAVIORAL guards (e.g. mpegts_segment_timeline, ~1 s of
+            # lavfi synth): V30's lesson is that argv-string assertions pass
+            # even when the muxer ignores the flag, so those guards must run
+            # real ffmpeg in CI, not only in a devShell.
+            nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ [ pkgs.ffmpeg-headless ];
           }
         );
         # nextest doesn't run doctests — cover them separately (same deps).
