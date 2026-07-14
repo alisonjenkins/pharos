@@ -13,6 +13,7 @@
 
 pub mod backend;
 pub mod device;
+pub mod fingerprint;
 pub mod hwaccel;
 #[cfg(unix)]
 pub mod libav;
