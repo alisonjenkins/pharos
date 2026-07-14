@@ -9,7 +9,7 @@ use crate::{
 use pharos_cache::{HlsSegmentCache, ImageCache, SubtitleCache, TrickplayCache};
 use pharos_discovery::live_tv::M3uXmltvBackend;
 use pharos_store_sqlx::ServerConfigStore;
-use pharos_transcode::{FfmpegBackend, TranscodeOptions};
+use pharos_transcode::{FfmpegBackend, SegmentOpts};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -157,7 +157,7 @@ pub struct AppState {
     /// at `When` and requests data. Bounded small (one entry per live play
     /// session); cleared wholesale past a sanity cap.
     pub segment_opts_hints:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, TranscodeOptions)>>>,
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, SegmentOpts)>>>,
     /// P36 — clamped played-flag threshold (50–100) used by
     /// `Sessions/Playing/Stopped` to decide when an item flips to
     /// `played=true`. Surfaced here so handlers stay zero-allocation
@@ -710,7 +710,7 @@ impl AppState {
 
     /// T87 — record the transcode options a play session last used for a
     /// segment, for SyncPlay seek prewarming.
-    pub fn note_segment_opts(&self, play_session_id: &str, media_id: u64, opts: &TranscodeOptions) {
+    pub fn note_segment_opts(&self, play_session_id: &str, media_id: u64, opts: &SegmentOpts) {
         if let Ok(mut m) = self.segment_opts_hints.lock() {
             // Sanity cap: play sessions number in the tens; a runaway caller
             // must not grow this unbounded.
@@ -723,7 +723,7 @@ impl AppState {
 
     /// T87 — every recorded (play-session, options) pair currently pointing
     /// at `media_id`.
-    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<TranscodeOptions> {
+    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<SegmentOpts> {
         self.segment_opts_hints
             .lock()
             .map(|m| {

@@ -19,7 +19,10 @@ use crate::{
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
-use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
+use pharos_transcode::{
+    AudioCodec, Container, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
+    SegmentVideo, VideoCodec,
+};
 
 /// Segment length in seconds. 6 s matches Apple's HLS authoring spec
 /// recommendation and what most clients ask for; Jellyfin's own
@@ -912,7 +915,10 @@ async fn serve_segment(
     // across every GPU + CPU, crash-isolated worker) when available;
     // fall back to a direct inline ffmpeg otherwise.
     if let Some(sched) = state.transcode_scheduler.as_ref() {
-        match sched.submit_live(item.path.clone(), opts.clone()).await {
+        match sched
+            .submit_live(item.path.clone(), opts.to_transcode_options())
+            .await
+        {
             Ok(stream) => {
                 return Ok(HttpResponse::Ok()
                     .content_type(opts.container.content_type())
@@ -933,7 +939,7 @@ async fn serve_segment(
 
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
-        .transcode(&item.path, &opts)
+        .transcode(&item.path, &opts.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok(HttpResponse::Ok()
@@ -968,7 +974,7 @@ fn segment_etag(
     format!("W/\"seg-{h:016x}\"")
 }
 
-/// Resolve the per-segment `TranscodeOptions` for this request.
+/// Resolve the per-segment [`SegmentOpts`] for this request.
 ///
 /// When the play session was registered by `playback_info` (the
 /// common path — jellyfin-web POSTs PlaybackInfo before requesting
@@ -986,7 +992,7 @@ fn build_segment_opts(
     duration_ticks: u64,
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
-) -> TranscodeOptions {
+) -> SegmentOpts {
     use crate::api::jellyfin::device_profile::Decision;
 
     // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
@@ -1043,23 +1049,39 @@ fn build_segment_opts(
                     pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
                 );
                 let container = if is_video {
-                    Container::Mpegts
+                    SegmentContainer::Mpegts
                 } else {
-                    Container::from_name(&target_container).unwrap_or(Container::Mpegts)
+                    // V30 — the segment surface only carries segment
+                    // containers; a nominal mp4/webm profile target lowers
+                    // to mpegts (hls.js demuxes it regardless), fmp4 stays.
+                    match Container::from_name(&target_container) {
+                        Some(Container::Fmp4) => SegmentContainer::Fmp4,
+                        _ => SegmentContainer::Mpegts,
+                    }
                 };
                 let video = if is_video {
-                    Some(VideoCodec::H264)
+                    Some(SegmentVideo::H264)
                 } else {
-                    target_video_codec
+                    // V30 — only re-encodable segment codecs; anything else
+                    // (including a nominal "copy") lowers to H.264.
+                    match target_video_codec
                         .as_deref()
                         .and_then(VideoCodec::from_name)
-                        .or(Some(VideoCodec::H264))
+                    {
+                        Some(VideoCodec::Vp9) => Some(SegmentVideo::Vp9),
+                        _ => Some(SegmentVideo::H264),
+                    }
                 };
-                let audio = target_audio_codec
+                let audio = match target_audio_codec
                     .as_deref()
                     .and_then(AudioCodec::from_name)
-                    .or(Some(AudioCodec::Aac));
-                return TranscodeOptions {
+                {
+                    Some(AudioCodec::Opus) => Some(SegmentAudio::Opus),
+                    // Aac, or anything the segment surface can't carry
+                    // (mp3/flac/vorbis/copy) → AAC re-encode.
+                    _ => Some(SegmentAudio::Aac),
+                };
+                return SegmentOpts {
                     container,
                     video,
                     audio,
@@ -1087,10 +1109,10 @@ fn build_segment_opts(
             // remains correct on the PROGRESSIVE /stream path (one continuous
             // output, no per-segment cuts); it must never reach this one.
             Decision::VideoRemux { .. } => {
-                return TranscodeOptions {
-                    container: Container::Mpegts,
-                    video: Some(VideoCodec::H264),
-                    audio: Some(AudioCodec::Aac),
+                return SegmentOpts {
+                    container: SegmentContainer::Mpegts,
+                    video: Some(SegmentVideo::H264),
+                    audio: Some(SegmentAudio::Aac),
                     video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
                     audio_bitrate_bps: Some(128_000),
                     start_position_ticks: start_ticks,
@@ -1111,10 +1133,10 @@ fn build_segment_opts(
     // PTS≈0, multichannel AAC passthrough Firefox can't decode) — see the
     // VideoRemux arm above. Re-encode keeps every segment frame-exact on
     // the shared timeline.
-    TranscodeOptions {
-        container: Container::Mpegts,
-        video: Some(VideoCodec::H264),
-        audio: Some(AudioCodec::Aac),
+    SegmentOpts {
+        container: SegmentContainer::Mpegts,
+        video: Some(SegmentVideo::H264),
+        audio: Some(SegmentAudio::Aac),
         video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
         audio_bitrate_bps: Some(128_000),
         start_position_ticks: start_ticks,
@@ -1613,7 +1635,7 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
             }
             // VP9 (fMP4) sessions: pre-seek the audio-rendition session too —
             // its whole-file encoder is what stalled deep seeks (B42).
-            if matches!(opts.container, pharos_transcode::Container::Fmp4) {
+            if matches!(opts.container, SegmentContainer::Fmp4) {
                 if let Some(cache) = state.hls.as_ref() {
                     let _ = cache
                         .ensure_audio_hls_covering(
@@ -1634,7 +1656,7 @@ fn spawn_segment_prefetch(
     state: &web::Data<AppState>,
     item: &pharos_core::MediaItem,
     base_seg: u32,
-    opts: &TranscodeOptions,
+    opts: &SegmentOpts,
 ) {
     if state.hls.is_none() {
         return;
@@ -1701,7 +1723,7 @@ async fn check_session(state: &AppState, psid: Option<&str>) -> Result<(), actix
     Ok(())
 }
 
-/// Build the per-segment VP9/fMP4 `TranscodeOptions`. Always VP9 + Opus in a
+/// Build the per-segment VP9/fMP4 [`SegmentOpts`]. Always VP9 in a
 /// fragmented-mp4 container; the bitrate cap follows the negotiated session
 /// (if any) then the source-derived clamp.
 async fn vp9_segment_opts(
@@ -1714,7 +1736,7 @@ async fn vp9_segment_opts(
     // signature for the call sites.
     _audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
-) -> TranscodeOptions {
+) -> SegmentOpts {
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
@@ -1754,9 +1776,9 @@ async fn vp9_segment_opts(
             abs,
         )
     });
-    TranscodeOptions {
-        container: Container::Fmp4,
-        video: Some(VideoCodec::Vp9),
+    SegmentOpts {
+        container: SegmentContainer::Fmp4,
+        video: Some(SegmentVideo::Vp9),
         // Video segments are AUDIO-FREE (A/V-sync fix): audio is served as a
         // separate continuous-encode rendition (see vp9_audio_playlist), so it
         // carries no per-segment Opus preskip. `audio: None` → `-an`. This also
@@ -1803,7 +1825,7 @@ async fn vp9_segment_raw(
     state: &AppState,
     item: &pharos_core::MediaItem,
     seg: u32,
-    opts: &TranscodeOptions,
+    opts: &SegmentOpts,
 ) -> Result<Vec<u8>, actix_web::Error> {
     if let Some(cache) = state.hls.as_ref() {
         return cache
@@ -1819,7 +1841,10 @@ async fn vp9_segment_raw(
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));
     }
     if let Some(sched) = state.transcode_scheduler.as_ref() {
-        match sched.submit_live(item.path.clone(), opts.clone()).await {
+        match sched
+            .submit_live(item.path.clone(), opts.to_transcode_options())
+            .await
+        {
             Ok(stream) => return collect_stream(stream).await,
             Err(e) => {
                 tracing::warn!(error = %e, "vp9 scheduler live transcode failed; inline fallback")
@@ -1828,7 +1853,7 @@ async fn vp9_segment_raw(
     }
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
-        .transcode(&item.path, opts)
+        .transcode(&item.path, &opts.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     collect_stream(stream.into_stream()).await
@@ -2310,7 +2335,7 @@ mod tests {
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
         assert!(matches!(
             opts.video,
-            Some(pharos_transcode::VideoCodec::H264)
+            Some(pharos_transcode::SegmentVideo::H264)
         ));
         assert!(opts.video_bitrate_bps.is_some());
     }
@@ -2325,7 +2350,7 @@ mod tests {
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
         assert!(matches!(
             opts.video,
-            Some(pharos_transcode::VideoCodec::H264)
+            Some(pharos_transcode::SegmentVideo::H264)
         ));
         assert!(
             opts.video_bitrate_bps.is_some(),
@@ -2343,7 +2368,7 @@ mod tests {
             let item = item_with_video_codec(Some(codec));
             let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
             assert!(
-                matches!(opts.video, Some(pharos_transcode::VideoCodec::H264)),
+                matches!(opts.video, Some(pharos_transcode::SegmentVideo::H264)),
                 "codec {codec} must re-encode to H264, got {:?}",
                 opts.video,
             );
@@ -2380,7 +2405,7 @@ mod tests {
         let opts = build_segment_opts(Some(session), &item, 0, 60_000_000, None, None);
         assert!(matches!(
             opts.video,
-            Some(pharos_transcode::VideoCodec::H264)
+            Some(pharos_transcode::SegmentVideo::H264)
         ));
         assert!(
             opts.video_bitrate_bps.is_some(),
@@ -2388,11 +2413,11 @@ mod tests {
         );
         assert!(matches!(
             opts.audio,
-            Some(pharos_transcode::AudioCodec::Aac)
+            Some(pharos_transcode::SegmentAudio::Aac)
         ));
         assert!(matches!(
             opts.container,
-            pharos_transcode::Container::Mpegts
+            pharos_transcode::SegmentContainer::Mpegts
         ));
     }
 
@@ -2413,7 +2438,7 @@ mod tests {
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
         assert!(matches!(
             opts.video,
-            Some(pharos_transcode::VideoCodec::H264)
+            Some(pharos_transcode::SegmentVideo::H264)
         ));
     }
 

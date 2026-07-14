@@ -21,6 +21,7 @@ pub mod options;
 pub mod probe;
 pub mod protocol;
 pub mod scheduler;
+pub mod segment;
 #[cfg(unix)]
 pub mod worker;
 
@@ -31,6 +32,7 @@ pub use backend::SpawnBackend;
 pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, WaveformPoint};
 pub use hwaccel::HwAccel;
 pub use options::{AudioCodec, Container, TranscodeOptions, VideoCodec};
+pub use segment::{SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo};
 
 use bytes::Bytes;
 use std::path::{Path, PathBuf};

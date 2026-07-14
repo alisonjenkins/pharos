@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use pharos_transcode::{FfmpegTranscoder, TranscodeOptions, VideoCodec};
+use pharos_transcode::{FfmpegTranscoder, SegmentOpts, SegmentVideo, TranscodeOptions};
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, thiserror::Error)]
@@ -43,46 +43,53 @@ struct EntryMeta {
     last_used: u64,
 }
 
-/// Compound cache key:
-/// `(media_id, segment_index, audio_stream_index, subtitle_stream_index,
-///   video_bitrate_thousands)`.
-/// Audio + subtitle default to a 0 / off sentinel so the cache layout
-/// collapses for the common (no client override) case. Video bitrate
-/// is rounded to nearest kbps so floating-point negotiation jitter
-/// doesn't produce phantom variant files. `0` means "no override"
+/// Compound cache key. Audio + subtitle default to a 0 / off sentinel so
+/// the cache layout collapses for the common (no client override) case.
+/// Video bitrate is rounded to nearest kbps so floating-point negotiation
+/// jitter doesn't produce phantom variant files; `0` means "no override"
 /// (negotiator-supplied default).
-// Trailing `u32` is the video-codec tag (see `codec_tag`). Without it a
-// stream-COPIED segment (e.g. an HEVC source direct-remuxed) and a
-// RE-ENCODED H.264 segment for the same (media, seg, audio, sub, bitrate)
-// collided in the cache — the first writer won and served its codec to every
-// client, so an HEVC copy could be handed to an h264-only browser.
-type CacheKey = (u64, u32, u32, i32, u32, u32);
+///
+/// Named struct, not a tuple (B45-adjacent hardening): the previous
+/// 6-tuple `(u64, u32, u32, i32, u32, u32)` was positionally keyed — four
+/// same-typed numbers in a row, where one real collision bug already
+/// happened (codec-blind keys served an HEVC copy to h264-only clients)
+/// and any silent arg-order slip mis-keys the cache. Named fields make
+/// that class unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SegmentKey {
+    media_id: u64,
+    seg_index: u32,
+    /// 0 = default track (no client override).
+    audio_index: u32,
+    /// `NO_SUBTITLE` (-1) = no burn-in.
+    subtitle_index: i32,
+    /// kbps; 0 = negotiator default.
+    bitrate_kbps: u32,
+    /// See `codec_tag` — distinguishes output codec generations.
+    codec_tag: u32,
+}
 
 const NO_SUBTITLE: i32 = -1;
 
-/// Stable small tag distinguishing the output video codec so copy vs
-/// re-encode never share a cache entry.
-fn codec_tag(video: Option<VideoCodec>) -> u32 {
+/// Stable small tag distinguishing the output video codec so different
+/// codec outputs never share a cache entry.
+fn codec_tag(video: Option<SegmentVideo>) -> u32 {
     // Bumping a tag orphans every pre-existing cached segment for that codec
     // (LRU reclaims them) — the mechanism used whenever a change alters the
     // BYTES of a segment for a given (media, index) key. The cache key carries
     // no start time, so a boundary change is exactly such a case.
     //
-    // Latest bump (all re-encoded video, 2026-07-10): segment boundaries are
-    // now FRAME-ALIGNED (see hls::segment_start_secs). A stale segment cached
-    // on the old exact-6.0 s grid represents a slightly different time range
-    // than the new frame-aligned index, so serving it would reintroduce A/V
-    // drift on non-integer-fps sources. Orphan them all.
+    // Historical tags 1 (Copy), 9 (H265), 10 (Av1) retired with the
+    // `SegmentVideo` type (V30): the segmented surface can only emit H264 or
+    // VP9, and stream copy is unrepresentable. Tag values for the live
+    // codecs are preserved so a warm cache survives the type refactor.
     match video {
         None => 0,
-        Some(VideoCodec::Copy) => 1,
-        Some(VideoCodec::H264) => 8,
-        Some(VideoCodec::H265) => 9,
+        Some(SegmentVideo::H264) => 8,
         // 12 (was 7): VP9 fMP4 segments are now AUDIO-FREE (audio moved to a
         // separate continuous rendition, the A/V-sync fix) — orphan the old
         // muxed segments.
-        Some(VideoCodec::Vp9) => 12,
-        Some(VideoCodec::Av1) => 10,
+        Some(SegmentVideo::Vp9) => 12,
     }
 }
 
@@ -93,29 +100,29 @@ fn make_key(
     subtitle_index: Option<u32>,
     video_bitrate_bps: Option<u64>,
     video_codec_tag: u32,
-) -> CacheKey {
-    (
+) -> SegmentKey {
+    SegmentKey {
         media_id,
         seg_index,
-        audio_index.unwrap_or(0),
-        subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
-        video_bitrate_bps
+        audio_index: audio_index.unwrap_or(0),
+        subtitle_index: subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
+        bitrate_kbps: video_bitrate_bps
             .map(|b| (b / 1000).min(u32::MAX as u64) as u32)
             .unwrap_or(0),
-        video_codec_tag,
-    )
+        codec_tag: video_codec_tag,
+    }
 }
 
 #[derive(Debug, Default)]
 struct CacheState {
     /// Per-key locks. Held while a fetch is in flight so concurrent
     /// requests for the same segment don't race.
-    fetch_locks: HashMap<CacheKey, Arc<Mutex<()>>>,
+    fetch_locks: HashMap<SegmentKey, Arc<Mutex<()>>>,
     /// Per-directory locks deduplicating continuous-audio HLS sessions (the
     /// A/V-sync fix): the first request spawns the one ffmpeg producing the
     /// audio rendition; concurrent requests see it already running.
     audio_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
-    entries: HashMap<CacheKey, EntryMeta>,
+    entries: HashMap<SegmentKey, EntryMeta>,
     total_bytes: u64,
     access_counter: u64,
 }
@@ -238,7 +245,7 @@ impl HlsSegmentCache {
         media_id: u64,
         seg_index: u32,
         source: &Path,
-        opts: &TranscodeOptions,
+        opts: &SegmentOpts,
     ) -> Result<Vec<u8>, HlsCacheError> {
         self.segment_bytes_keyed(media_id, seg_index, None, None, source, opts)
             .await
@@ -249,6 +256,9 @@ impl HlsSegmentCache {
     /// audio track doesn't trample the previous track's cached
     /// segments. None values fall through to the default-track sentinel
     /// (audio=0, subtitle=-1).
+    /// V30 — this is the ONLY segment-mint entry point, and it accepts only
+    /// [`SegmentOpts`]: a stream-copied or progressive-container segment is
+    /// a compile error, not a code-review catch.
     pub async fn segment_bytes_keyed(
         &self,
         media_id: u64,
@@ -256,7 +266,7 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         subtitle_index: Option<u32>,
         source: &Path,
-        opts: &TranscodeOptions,
+        opts: &SegmentOpts,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let key = make_key(
             media_id,
@@ -312,7 +322,10 @@ impl HlsSegmentCache {
         // client will stall. Logged per miss so Loki/Tempo show exactly which
         // segments are slow and why (codec + subtitle burn are the usual cost).
         let started = std::time::Instant::now();
-        let timing = match self.write_segment(source, opts, &tmp).await {
+        let timing = match self
+            .write_segment(source, &opts.to_transcode_options(), &tmp)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
@@ -353,7 +366,14 @@ impl HlsSegmentCache {
 
     #[cfg(test)]
     fn segment_path(&self, media_id: u64, seg_index: u32) -> PathBuf {
-        self.segment_path_keyed((media_id, seg_index, 0, NO_SUBTITLE, 0, 0))
+        self.segment_path_keyed(SegmentKey {
+            media_id,
+            seg_index,
+            audio_index: 0,
+            subtitle_index: NO_SUBTITLE,
+            bitrate_kbps: 0,
+            codec_tag: 0,
+        })
     }
 
     /// Compose `{root}/{media_id}/{seg}.ts` for the default case
@@ -361,8 +381,15 @@ impl HlsSegmentCache {
     /// `{root}/{media_id}/{seg}-a{A}-s{S}-b{Bkbps}.ts` when any
     /// dimension diverges. Keeps the existing on-disk layout intact
     /// for warm caches that pre-date per-track + per-variant keys.
-    fn segment_path_keyed(&self, key: CacheKey) -> PathBuf {
-        let (media_id, seg_index, audio_index, subtitle_index, bitrate_k, codec_k) = key;
+    fn segment_path_keyed(&self, key: SegmentKey) -> PathBuf {
+        let SegmentKey {
+            media_id,
+            seg_index,
+            audio_index,
+            subtitle_index,
+            bitrate_kbps: bitrate_k,
+            codec_tag: codec_k,
+        } = key;
         // The codec tag is ALWAYS in the filename now. This deliberately
         // orphans any pre-existing codec-blind `{seg}.ts` files: some were
         // written by the old fallback that stream-copied HEVC into an avc1
@@ -713,7 +740,7 @@ impl HlsSegmentCache {
         )))
     }
 
-    async fn touch(&self, key: CacheKey) {
+    async fn touch(&self, key: SegmentKey) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -722,7 +749,7 @@ impl HlsSegmentCache {
         }
     }
 
-    async fn record(&self, key: CacheKey, bytes: u64) {
+    async fn record(&self, key: SegmentKey, bytes: u64) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -743,7 +770,7 @@ impl HlsSegmentCache {
     async fn maybe_evict(&self) {
         // Snapshot the (key, last_used) candidates outside the lock so
         // the disk delete doesn't hold the cache state.
-        let mut to_remove: Vec<(CacheKey, PathBuf)> = Vec::new();
+        let mut to_remove: Vec<(SegmentKey, PathBuf)> = Vec::new();
         {
             let mut state = self.state.lock().await;
             while state.total_bytes > self.max_bytes {
@@ -802,7 +829,17 @@ mod tests {
         }
         tokio::fs::write(&path, body).await.unwrap();
         cache
-            .record((media_id, seg, 0, NO_SUBTITLE, 0, 0), body.len() as u64)
+            .record(
+                SegmentKey {
+                    media_id,
+                    seg_index: seg,
+                    audio_index: 0,
+                    subtitle_index: NO_SUBTITLE,
+                    bitrate_kbps: 0,
+                    codec_tag: 0,
+                },
+                body.len() as u64,
+            )
             .await;
         cache.maybe_evict().await;
     }
@@ -812,8 +849,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
         force_insert(&cache, 7, 0, b"segment-bytes").await;
-        let opts = TranscodeOptions {
-            container: pharos_transcode::Container::Mpegts,
+        let opts = SegmentOpts {
+            container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: None,
             video_bitrate_bps: None,
@@ -834,8 +871,8 @@ mod tests {
     async fn miss_with_unavailable_ffmpeg_propagates_error() {
         let td = TempDir::new().unwrap();
         let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
-        let opts = TranscodeOptions {
-            container: pharos_transcode::Container::Mpegts,
+        let opts = SegmentOpts {
+            container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: None,
             video_bitrate_bps: None,
@@ -859,8 +896,8 @@ mod tests {
         force_insert(&cache, 7, 0, b"0123456789").await;
         force_insert(&cache, 7, 1, b"0123456789").await;
         // Touch seg 0 so it's more-recent than seg 1.
-        let opts = TranscodeOptions {
-            container: pharos_transcode::Container::Mpegts,
+        let opts = SegmentOpts {
+            container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: None,
             video_bitrate_bps: None,
@@ -897,8 +934,8 @@ mod tests {
         let counter = AtomicU32::new(0);
         let one = async {
             counter.fetch_add(1, Ordering::SeqCst);
-            let opts = TranscodeOptions {
-                container: pharos_transcode::Container::Mpegts,
+            let opts = SegmentOpts {
+                container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
                 audio: None,
                 video_bitrate_bps: None,
@@ -915,8 +952,8 @@ mod tests {
         };
         let (a, b) = tokio::join!(one, async {
             counter.fetch_add(1, Ordering::SeqCst);
-            let opts = TranscodeOptions {
-                container: pharos_transcode::Container::Mpegts,
+            let opts = SegmentOpts {
+                container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
                 audio: None,
                 video_bitrate_bps: None,
