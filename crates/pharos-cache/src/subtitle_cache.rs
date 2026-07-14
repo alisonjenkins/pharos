@@ -105,6 +105,12 @@ pub struct SubtitleCache {
     /// distroless image ships no ffprobe, so the scan must be in-process).
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     pool: Option<pharos_transcode::worker::LibavWorkerPool>,
+    /// Adaptive background-I/O gate (the server's shared semaphore, squeezed
+    /// to a trickle while a client streams). The window scan reads the WHOLE
+    /// source file over NFS — ungated it fights the very stream that
+    /// triggered it (observed live: burn segments ballooned 7-11 s → 46-56 s
+    /// while the scan crawled the file being played).
+    bg_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl std::fmt::Debug for SubtitleCache {
@@ -126,7 +132,16 @@ impl SubtitleCache {
             win_scans: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
             pool: None,
+            bg_gate: None,
         }
+    }
+
+    /// Attach the shared adaptive bg-I/O semaphore — every window scan takes
+    /// one permit for its whole run, so the whole-file NFS read yields to
+    /// live playback instead of starving it.
+    pub fn with_bg_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.bg_gate = Some(gate);
+        self
     }
 
     /// Persist extracted subtitles under `root` (the cache PVC) so the cost is
@@ -202,7 +217,13 @@ impl SubtitleCache {
             return;
         };
         let cache = self.clone();
+        let gate = self.bg_gate.clone();
         tokio::spawn(async move {
+            // Whole-file NFS read → background-I/O gated (yields to playback).
+            let _permit = match &gate {
+                Some(g) => g.clone().acquire_owned().await.ok(),
+                None => None,
+            };
             let started = std::time::Instant::now();
             let res = pool
                 .subtitle_windows(key.path.clone(), key.stream_index)

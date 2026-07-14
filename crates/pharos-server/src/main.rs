@@ -631,7 +631,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             tracing::info!(dir = %dir.display(), "subtitle cache persisting to disk");
             sub_cache = sub_cache.with_disk(dir);
         }
-        // Event-window scans (burn gating) share the resident libav pool.
+        // Event-window scans (burn gating) share the resident libav pool and
+        // yield to live playback via the adaptive bg-I/O gate (a whole-file
+        // NFS read ungated starves the very stream that triggered it).
+        let sub_cache = sub_cache.with_bg_gate(state.bg_io.clone());
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
         let sub_cache = sub_cache.with_pool(libav_pool.clone());
         state = state.with_subtitle_cache(sub_cache);

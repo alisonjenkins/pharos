@@ -263,10 +263,21 @@ pub(crate) async fn pre_extract_subtitles(
         return;
     };
     let mtime = mtime_secs(&item.path).await;
-    for t in &item.probe.subtitle_tracks {
+    for (sub_rel, t) in item.probe.subtitle_tracks.iter().enumerate() {
         let codec_lc = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
         if is_image_subtitle_codec(&codec_lc) {
-            continue; // burned into the transcode, never a sidecar file
+            // B46 — image subs never extract to a sidecar, but their EVENT
+            // WINDOWS drive per-segment burn gating. Kick the once-ever
+            // (file+mtime+track) scan here so it runs in the warm passes
+            // (scan-time / library warm-all / playback priority) instead of
+            // stalling a viewer's first play. Non-blocking: a miss spawns
+            // the background scan and returns immediately. The window key's
+            // rel index counts ALL subtitle streams (the `[0:s:N]` burn-map
+            // convention), hence the enumerate over the full track list.
+            let _ = cache
+                .image_sub_event_windows(&item.path, mtime, sub_rel as u32)
+                .await;
+            continue;
         }
         let is_ass = matches!(
             codec_lc.as_str(),
