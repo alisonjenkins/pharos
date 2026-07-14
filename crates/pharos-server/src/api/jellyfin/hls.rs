@@ -872,6 +872,10 @@ async fn serve_segment(
         }
     }
 
+    // B51 — the client's ACTUAL subtitle pick (codec-relative, pre-gate), so
+    // the prefetch caches the exact variant the client will request for
+    // upcoming segments (not this segment's gated value).
+    let wanted_burn = opts.burn_subtitle_stream_index;
     // B46 — strip the burn for segments the subtitle track provably leaves
     // empty. MUST run before the T87 hint, the ETag, the prefetch AND the
     // cache read: all of them key on the (post-gating) burn index.
@@ -918,7 +922,7 @@ async fn serve_segment(
         // Warm the next few segments so a fast / >1x client doesn't stall on
         // on-demand transcode (spawned before this segment's own read so they
         // pipeline across the CPU pool).
-        spawn_segment_prefetch(&state, &item, seg, &opts);
+        spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
         let bytes = cache
             .segment_bytes_keyed(
                 id_num,
@@ -1539,6 +1543,8 @@ async fn vp9_segment(
         q.subtitle_stream_index,
     )
     .await;
+    // B51 — the client's ACTUAL subtitle pick (pre-gate) for the prefetch.
+    let wanted_burn = opts.burn_subtitle_stream_index;
     // B46 — strip provably-empty burns BEFORE the hint/prefetch/cache read
     // (they all key on the burn index).
     {
@@ -1553,7 +1559,7 @@ async fn vp9_segment(
     // Warm the next few segments in the background so a fast / >1x client finds
     // them cached instead of stalling. Spawned BEFORE this segment's own
     // transcode so N and N+1.. queue together across the CPU pool.
-    spawn_segment_prefetch(&state, &item, seg, &opts);
+    spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
     // A/V-sync diagnostic (T-avsync): log each track's tfdt + content duration
     // so real playback reveals a per-segment gap/overlap or an audio-vs-video
@@ -1749,11 +1755,77 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
     });
 }
 
+/// How far ahead (in segments) the window-aware burn prefetch looks for the
+/// next subtitle-bearing segments, and how many it front-loads per request.
+/// B51 — burn segments encode ~2× slower than plain ones (overlay decode +
+/// composite; ~10 s per 6 s segment at the negotiated bitrate), and they
+/// cluster at dialogue. The shallow near-prefetch can't absorb a run of
+/// them, so the buffer drains exactly when a subtitle appears. Front-load
+/// the upcoming burn segments during the fast quiet stretches instead:
+/// ~2.5 min of lookahead, a few per request, topped up on every served
+/// segment as the horizon rolls forward.
+const PREFETCH_BURN_HORIZON_SEGS: u32 = 24;
+const PREFETCH_BURN_MAX: usize = 4;
+
+/// Prefetch one segment into the HLS cache with the client's REAL subtitle
+/// selection (`wanted_burn`, pre-gate), then gate it per THIS segment's
+/// window — so the cached bytes match the exact key the client will request.
+/// Spawned fire-and-forget.
+fn spawn_one_prefetch(
+    state: &web::Data<AppState>,
+    item: &pharos_core::MediaItem,
+    seg: u32,
+    opts: &SegmentOpts,
+    wanted_burn: Option<u32>,
+) {
+    let state = state.clone();
+    let item = item.clone();
+    let mut o = opts.clone();
+    // Same frame-aligned boundary the live handler uses, so the prefetched
+    // bytes are byte-identical to (and cache-key-match) the client's own
+    // eventual request for this segment.
+    let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+    o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
+    o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
+    // B51 — carry the client's ACTUAL subtitle pick, NOT the requesting
+    // segment's gated value. The old code cloned the served segment's opts,
+    // so while in a quiet (burn-gated-off) stretch every upcoming
+    // subtitle-bearing segment was prefetched WITHOUT the burn — a different
+    // cache key from what the client then requests WITH the sub, so it always
+    // missed and encoded live, hanging exactly when the subtitle appeared.
+    o.burn_subtitle_stream_index = wanted_burn;
+    // actix arbiter spawn: the future awaits I/O + the scheduler channel
+    // (the encode runs in the transcode worker pool, not here), so it
+    // yields the worker immediately and never blocks request handling.
+    actix_web::rt::spawn(async move {
+        // Gate for THIS segment's window (sparse tracks flip burn on/off
+        // between segments; the cache key follows the burn index).
+        gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
+        let Some(cache) = state.hls.as_ref() else {
+            return;
+        };
+        if let Err(e) = cache
+            .segment_bytes_keyed(
+                item.id,
+                seg,
+                o.audio_source_stream_index,
+                o.burn_subtitle_stream_index,
+                &item.path,
+                &o,
+            )
+            .await
+        {
+            tracing::debug!(media.id = item.id, seg, error = %e, "segment prefetch failed");
+        }
+    });
+}
+
 fn spawn_segment_prefetch(
     state: &web::Data<AppState>,
     item: &pharos_core::MediaItem,
     base_seg: u32,
     opts: &SegmentOpts,
+    wanted_burn: Option<u32>,
 ) {
     if state.hls.is_none() {
         return;
@@ -1762,42 +1834,88 @@ fn spawn_segment_prefetch(
         .probe
         .duration_ms
         .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32);
-    for seg in prefetch_target_segments(base_seg, total_segs, segment_prefetch_ahead()) {
-        let state = state.clone();
-        let item = item.clone();
-        let mut o = opts.clone();
-        // Same frame-aligned boundary the live handler uses, so the prefetched
-        // bytes are byte-identical to (and cache-key-match) the client's own
-        // eventual request for this segment.
-        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-        o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
-        o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
-        // actix arbiter spawn: the future awaits I/O + the scheduler channel
-        // (the encode runs in the transcode worker pool, not here), so it
-        // yields the worker immediately and never blocks request handling.
-        actix_web::rt::spawn(async move {
-            // B46 — re-gate for THIS segment's window (the base opts carry
-            // the requesting segment's burn decision; sparse tracks flip
-            // between segments, and the cache key follows the burn index).
-            gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
-            let Some(cache) = state.hls.as_ref() else {
-                return;
-            };
-            if let Err(e) = cache
-                .segment_bytes_keyed(
-                    item.id,
-                    seg,
-                    o.audio_source_stream_index,
-                    o.burn_subtitle_stream_index,
-                    &item.path,
-                    &o,
-                )
-                .await
-            {
-                tracing::debug!(media.id = item.id, seg, error = %e, "segment prefetch failed");
-            }
-        });
+    // Near shallow prefetch: the next few segments, all of them (fast).
+    let near = prefetch_target_segments(base_seg, total_segs, segment_prefetch_ahead());
+    let near_end = base_seg + segment_prefetch_ahead();
+    for seg in &near {
+        spawn_one_prefetch(state, item, *seg, opts, wanted_burn);
     }
+
+    // B51 — window-aware deep prefetch: when a subtitle is selected, look
+    // past the near window for the upcoming SLOW burn segments and front-
+    // load them, so a dialogue burst is already cached when the playhead
+    // reaches it. Only the burn segments (sparse) are deep-prefetched; the
+    // fast non-burn ones encode on demand.
+    let Some(burn_idx) = wanted_burn else {
+        return;
+    };
+    let Some(subs) = state.subtitles.clone() else {
+        return;
+    };
+    let state = state.clone();
+    let item = item.clone();
+    let opts = opts.clone();
+    actix_web::rt::spawn(async move {
+        let mtime = pharos_cache::subtitle_cache::mtime_secs(&item.path).await;
+        let windows = match subs
+            .image_sub_event_windows(&item.path, mtime, burn_idx)
+            .await
+        {
+            pharos_cache::subtitle_cache::EventWindows::Known(w) => w,
+            // Not scanned yet → nothing to front-load; the near prefetch
+            // still covers the immediate segments.
+            pharos_cache::subtitle_cache::EventWindows::Unknown => return,
+        };
+        let targets = burn_prefetch_targets(
+            near_end + 1,
+            base_seg + PREFETCH_BURN_HORIZON_SEGS,
+            total_segs,
+            &windows,
+            item.probe.frame_rate_mille,
+            PREFETCH_BURN_MAX,
+        );
+        for seg in &targets {
+            spawn_one_prefetch(&state, &item, *seg, &opts, wanted_burn);
+        }
+        if !targets.is_empty() {
+            tracing::debug!(
+                media.id = item.id,
+                base_seg,
+                burn_segments_prefetched = targets.len(),
+                "front-loaded upcoming subtitle-burn segments"
+            );
+        }
+    });
+}
+
+/// B51 — the segments in `[from_seg, to_seg]` that OVERLAP a subtitle event
+/// window (the slow burn segments), capped at `max`. Pure so the front-load
+/// selection is unit-tested without a running transcode. `windows` must be
+/// merged/sorted (the scan output).
+fn burn_prefetch_targets(
+    from_seg: u32,
+    to_seg: u32,
+    total_segs: Option<u32>,
+    windows: &[(u64, u64)],
+    fps_mille: Option<u32>,
+    max: usize,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    for seg in from_seg..=to_seg {
+        if total_segs.is_some_and(|t| seg >= t) {
+            break;
+        }
+        let (start_secs, dur_secs) = segment_time_range(seg, fps_mille);
+        let start_ms = ((start_secs * 1000.0) as u64).saturating_sub(BURN_GATE_PAD_MS);
+        let end_ms = ((start_secs + dur_secs) * 1000.0) as u64 + BURN_GATE_PAD_MS;
+        if pharos_transcode::subwin::any_window_overlaps(windows, start_ms, end_ms) {
+            out.push(seg);
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
 }
 
 async fn fetch_item(state: &AppState, id: u64) -> Result<pharos_core::MediaItem, actix_web::Error> {
@@ -2203,6 +2321,33 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401);
+    }
+
+    #[::core::prelude::v1::test]
+    fn burn_prefetch_picks_only_window_segments_capped() {
+        // 6 s segments, 24 fps. Windows placed in segment INTERIORS (away
+        // from the ±500 ms boundary pad, which is shared with the live gate
+        // so prefetch and playback produce identical cache keys): 68-70 s is
+        // inside segment 11 only; 122-124 s inside segment 20 only.
+        let windows = vec![(68_000, 70_000), (122_000, 124_000)];
+        let got = burn_prefetch_targets(3, 30, Some(200), &windows, Some(24_000), 4);
+        assert_eq!(got, vec![11, 20], "only the window-overlapping segments");
+
+        // Cap honoured: a dense dialogue run yields at most `max`.
+        let dense: Vec<(u64, u64)> = (0..20).map(|i| (i * 6_000, i * 6_000 + 6_000)).collect();
+        let got = burn_prefetch_targets(3, 30, Some(200), &dense, Some(24_000), 4);
+        assert_eq!(got.len(), 4, "front-load is bounded, got {got:?}");
+
+        // No windows in range → nothing (quiet stretch, near prefetch covers it).
+        let got = burn_prefetch_targets(3, 10, Some(200), &[(600_000, 606_000)], Some(24_000), 4);
+        assert!(got.is_empty());
+
+        // Never past EOF.
+        let got = burn_prefetch_targets(3, 30, Some(12), &[(66_000, 72_000)], Some(24_000), 4);
+        assert!(
+            got.iter().all(|&s| s < 12),
+            "past-EOF segment queued: {got:?}"
+        );
     }
 
     async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>, String) {
