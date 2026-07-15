@@ -1718,6 +1718,9 @@ async fn playback_info(
         audio_channels: probe.audio_channels,
         width: probe.width,
         height: probe.height,
+        video_bit_depth: pharos_jellyfin_api::device_profile::bit_depth_from_pix_fmt(
+            probe.pixel_format.as_deref(),
+        ),
     };
 
     // Consume the POST body once: the DeviceProfile drives negotiation, and

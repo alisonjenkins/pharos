@@ -110,6 +110,12 @@ pub struct SourceMedia {
     pub audio_channels: Option<u32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Luma bit depth (8 / 10 / 12), derived from the source `pix_fmt`.
+    /// Drives the `VideoBitDepth` CodecProfile condition — an 8-bit-only
+    /// decoder must NOT be handed a 10-bit HEVC/AV1 source for direct
+    /// play (it decodes to garbage or hard-fails). `None` = unknown →
+    /// the condition evaluates permissively.
+    pub video_bit_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -226,6 +232,11 @@ pub fn codec_profile_passes(
                     source_video_profile,
                     Some(cond.value.as_str()),
                 ),
+                "VideoBitDepth" => compare_numeric(
+                    &cond.condition,
+                    source.video_bit_depth.map(|n| n as i64),
+                    &cond.value,
+                ),
                 _ => true, // unknown property — permissive
             };
             if !ok {
@@ -234,6 +245,28 @@ pub fn codec_profile_passes(
         }
     }
     true
+}
+
+/// Derive luma bit depth from an ffprobe `pix_fmt` token. ffmpeg encodes
+/// depth as a `NN` suffix before the endianness marker — `yuv420p10le` → 10,
+/// `yuv444p12le` → 12, `p010le` → 10 — while plain 8-bit formats (`yuv420p`,
+/// `nv12`, `rgb24`) carry no suffix → 8. Unknown/empty → `None` (permissive).
+pub fn bit_depth_from_pix_fmt(pix_fmt: Option<&str>) -> Option<u32> {
+    let f = pix_fmt?.to_ascii_lowercase();
+    if f.is_empty() {
+        return None;
+    }
+    // Every >8-bit ffmpeg pix_fmt carries an explicit endianness suffix
+    // (`yuv420p10le`, `p010le`, `yuv444p12be`) — 8-bit formats never do. So a
+    // depth token is real ONLY when immediately followed by `le`/`be`. This
+    // deliberately does NOT match trailing digits in a format NAME
+    // (`nv12`, `nv21`, `nv16` are all 8-bit).
+    for depth in ["16", "14", "12", "10", "9"] {
+        if f.contains(&format!("{depth}le")) || f.contains(&format!("{depth}be")) {
+            return depth.parse().ok();
+        }
+    }
+    Some(8)
 }
 
 fn compare_numeric(op: &str, source: Option<i64>, raw_target: &str) -> bool {
@@ -732,5 +765,149 @@ mod tests {
         assert_eq!(p.direct_play_profiles.len(), 1);
         assert_eq!(p.direct_play_profiles[0].video_codec, "vp9");
         assert_eq!(p.max_streaming_bitrate, Some(4_000_000));
+    }
+
+    // ---- bit-depth derivation (B75) ----
+
+    #[test]
+    fn bit_depth_from_pix_fmt_covers_common_formats() {
+        let cases = [
+            (Some("yuv420p"), Some(8)),
+            (Some("yuvj420p"), Some(8)),
+            (Some("nv12"), Some(8)),
+            (Some("rgb24"), Some(8)),
+            (Some("yuv420p10le"), Some(10)),
+            (Some("yuv422p10le"), Some(10)),
+            (Some("yuv444p10le"), Some(10)),
+            (Some("p010le"), Some(10)),
+            (Some("yuv420p12le"), Some(12)),
+            (Some("yuv444p12be"), Some(12)),
+            (Some(""), None),
+            (None, None),
+        ];
+        for (pix, want) in cases {
+            assert_eq!(bit_depth_from_pix_fmt(pix), want, "pix_fmt {pix:?}");
+        }
+    }
+
+    // ---- device-category negotiation matrix (B75) ----
+    //
+    // The user's mandate: negotiate the CORRECT decision per DeviceProfile so
+    // we never hand a device a stream it can't decode (→ crash). One case per
+    // device class the deployment actually serves.
+
+    /// A 10-bit HEVC 1080p source (the "Alien"-style remux that OOM-killed the
+    /// TCL TV under the old force-transcode).
+    fn hevc_10bit_source() -> SourceMedia {
+        SourceMedia {
+            container: "mkv".into(),
+            video_codec: Some("hevc".into()),
+            audio_codec: Some("aac".into()),
+            bitrate_bps: Some(16_000_000),
+            is_video: true,
+            width: Some(1920),
+            height: Some(800),
+            video_bit_depth: Some(10),
+            ..Default::default()
+        }
+    }
+
+    fn hevc_8bit_source() -> SourceMedia {
+        SourceMedia {
+            video_bit_depth: Some(8),
+            ..hevc_10bit_source()
+        }
+    }
+
+    /// A modern TV that advertises HEVC (mkv) direct play, capped at 8-bit via
+    /// a CodecProfile VideoBitDepth<=8 condition (an 8-bit-only decoder).
+    fn hevc_8bit_only_tv_profile() -> DeviceProfile {
+        serde_json::from_str(
+            r#"{
+              "DirectPlayProfiles":[
+                {"Container":"mkv","Type":"Video","VideoCodec":"hevc","AudioCodec":"aac"}
+              ],
+              "CodecProfiles":[
+                {"Type":"Video","Codec":"hevc","Conditions":[
+                  {"Condition":"LessThanEqual","Property":"VideoBitDepth","Value":"8","IsRequired":true}
+                ]}
+              ],
+              "TranscodingProfiles":[
+                {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hevc_capable_tv_direct_plays_8bit_source() {
+        // TCL-style TV that CAN decode HEVC → direct play, no transcode.
+        let profile = hevc_8bit_only_tv_profile();
+        assert_eq!(
+            negotiate(&profile, &hevc_8bit_source()),
+            Decision::DirectPlay,
+            "8-bit HEVC on an HEVC-capable TV must direct-play"
+        );
+    }
+
+    #[test]
+    fn eight_bit_only_device_transcodes_10bit_hevc() {
+        // THE crash-prevention case: a 10-bit source on an 8-bit-only decoder
+        // must NOT direct-play (it would decode garbage / hard-fail). The
+        // VideoBitDepth<=8 CodecProfile condition forces a transcode.
+        let profile = hevc_8bit_only_tv_profile();
+        match negotiate(&profile, &hevc_10bit_source()) {
+            Decision::Transcode { .. } => {}
+            other => panic!("10-bit on 8-bit device must transcode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h264_only_device_transcodes_hevc() {
+        // A device that only lists h264 direct play (no HEVC) must transcode an
+        // HEVC source, never direct-play it.
+        let profile: DeviceProfile = serde_json::from_str(
+            r#"{
+              "DirectPlayProfiles":[
+                {"Container":"mp4","Type":"Video","VideoCodec":"h264","AudioCodec":"aac"}
+              ],
+              "TranscodingProfiles":[
+                {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        match negotiate(&profile, &hevc_8bit_source()) {
+            Decision::Transcode {
+                target_video_codec, ..
+            } => assert_eq!(target_video_codec.as_deref(), Some("h264")),
+            other => panic!("HEVC on an h264-only device must transcode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn over_bitrate_source_transcodes_even_when_codecs_match() {
+        // A bandwidth-limited client (low MaxStreamingBitrate) must transcode a
+        // high-bitrate source it could otherwise direct-play.
+        let profile: DeviceProfile = serde_json::from_str(
+            r#"{
+              "DirectPlayProfiles":[
+                {"Container":"mkv","Type":"Video","VideoCodec":"hevc","AudioCodec":"aac"}
+              ],
+              "TranscodingProfiles":[
+                {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+              ],
+              "MaxStreamingBitrate": 4000000
+            }"#,
+        )
+        .unwrap();
+        match negotiate(&profile, &hevc_8bit_source()) {
+            Decision::Transcode {
+                max_video_bitrate_bps,
+                ..
+            } => assert_eq!(max_video_bitrate_bps, Some(4_000_000)),
+            other => panic!("over-bitrate source must transcode, got {other:?}"),
+        }
     }
 }
