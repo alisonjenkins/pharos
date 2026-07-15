@@ -485,3 +485,32 @@ async fn client_log_document_returns_filename() {
         "returns a .log FileName, got {v}"
     );
 }
+
+// B67 — the path-less /Items/Latest alias (Android TV home "Latest" rows) must
+// resolve to the latest list, not fall through to /Items/{id} with id="latest"
+// (→ 400 "invalid id", which crashed the TV building its home screen).
+#[actix_web::test]
+async fn items_latest_alias_not_400() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items/Latest?includeItemTypes=Movie&limit=50&fields=Overview&fields=Genres")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "/Items/Latest must resolve, not 400 as an invalid item id"
+    );
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/Latest")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v.is_array(), "/Items/Latest returns a raw array");
+}

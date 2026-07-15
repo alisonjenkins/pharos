@@ -38,6 +38,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // `Filters2` don't match as an item id.
         .route("/items/filters", web::get().to(items_filters_legacy))
         .route("/items/filters2", web::get().to(items_filters2))
+        // B67 — path-less Latest alias (Android/Google-TV), BEFORE /items/{id}
+        // so `latest` doesn't parse as an item id (→ 400 "invalid id").
+        .route("/items/latest", web::get().to(items_latest))
         .route("/items/{id}", web::get().to(get_item))
         .route("/users/{user_id}/items", web::get().to(list_user_items))
         .route(
@@ -2214,6 +2217,29 @@ async fn list_user_items_latest(
     if user_path != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
+    latest_items(&state, &user, &q.into_inner()).await
+}
+
+/// `GET /Items/Latest` (B67) — the path-less Latest alias the Android/Google-TV
+/// app uses for its home "Latest" rows (jellyfin-web uses
+/// `/Users/{id}/Items/Latest`). pharos only had the path form, so `/Items/Latest`
+/// fell through to `/Items/{id}` with id="latest" → 400 "invalid id" → the TV
+/// crashed building the home screen. Derives the user from the bearer.
+async fn items_latest(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: CiQuery<ListQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    latest_items(&state, &user, &q.into_inner()).await
+}
+
+/// Shared core: the "Latest" items list (ParentId + IncludeItemTypes filtered),
+/// returned as a RAW `BaseItemDto` array (not the ItemsResult envelope).
+async fn latest_items(
+    state: &AppState,
+    user: &AuthUser,
+    q: &ListQuery,
+) -> Result<HttpResponse, actix_web::Error> {
     let all = state
         .list_items_cached()
         .await
@@ -2221,7 +2247,7 @@ async fn list_user_items_latest(
     // Honour ParentId so home-page "Latest" rows match the library
     // the user clicked into. Library / series / season ids all
     // resolve via the shared restrict_to_parent helper.
-    let scoped = restrict_to_parent(&state, &all, q.parent_id.as_deref()).await;
+    let scoped = restrict_to_parent(state, &all, q.parent_id.as_deref()).await;
     // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
     // row filters to Type=Movie.
     let typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
