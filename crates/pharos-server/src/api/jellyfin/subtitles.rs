@@ -518,9 +518,62 @@ async fn deliver_srt(
         .path
         .to_str()
         .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
-    // On-demand SRT fetch for the item a client is watching — playback priority,
-    // so it runs immediately rather than waiting behind the parked gate (V34).
-    let _permit = BgPermit::playback_priority();
+    let mtime = mtime_secs(&item.path).await;
+    let srt_response = |bytes: Vec<u8>| {
+        HttpResponse::Ok()
+            .content_type("application/x-subrip; charset=utf-8")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .body(bytes)
+    };
+
+    // T97/V36 — a cold SRT fetch is a whole-file NFS demux, and clients may
+    // re-request the same track. Persist it (disk-backed, like the vtt/ass
+    // paths) and single-flight the miss via the per-key lock, so it demuxes
+    // ONCE instead of once per fetch. On-demand for the watched item → the
+    // extract runs at playback priority (V34).
+    if let Some(cache) = state.subtitles.as_ref() {
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedSrt)
+            .await
+        {
+            return Ok(srt_response((*bytes).clone()));
+        }
+        let lock = cache
+            .lock(&item.path, mtime, stream_index, SubtitleKind::EmbeddedSrt)
+            .await;
+        let _guard = lock.lock().await;
+        if let Some(bytes) = cache
+            .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedSrt)
+            .await
+        {
+            return Ok(srt_response((*bytes).clone()));
+        }
+        let out =
+            run_ffmpeg_embedded_srt(input, stream_index, &BgPermit::playback_priority()).await?;
+        let stored = cache
+            .store(
+                &item.path,
+                mtime,
+                stream_index,
+                SubtitleKind::EmbeddedSrt,
+                out,
+            )
+            .await;
+        return Ok(srt_response((*stored).clone()));
+    }
+
+    // No cache configured (tests / minimal deploys): spawn per-fetch.
+    let out = run_ffmpeg_embedded_srt(input, stream_index, &BgPermit::playback_priority()).await?;
+    Ok(srt_response(out))
+}
+
+/// Extract one embedded subtitle stream as SubRip (`-c:s subrip -f srt`).
+async fn run_ffmpeg_embedded_srt(
+    input: &str,
+    stream_index: u32,
+    _permit: &BgPermit,
+) -> Result<Vec<u8>, actix_web::Error> {
+    let started = std::time::Instant::now();
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -546,10 +599,13 @@ async fn deliver_srt(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(HttpResponse::Ok()
-        .content_type("application/x-subrip; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
-        .body(out.stdout))
+    tracing::info!(
+        idx = stream_index,
+        bytes = out.stdout.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "subtitle srt extracted (ffmpeg, cold demux)"
+    );
+    Ok(out.stdout)
 }
 
 async fn stream_vtt(

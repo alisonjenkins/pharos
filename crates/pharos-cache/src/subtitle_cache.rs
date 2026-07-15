@@ -34,6 +34,10 @@ pub enum SubtitleKind {
     /// SubtitlesOctopus, which needs the raw ASS body — distinct cache key
     /// from `Embedded` (same index, different bytes).
     EmbeddedAss,
+    /// Embedded stream extracted as SubRip (`-c:s subrip -f srt`) for the
+    /// legacy `Stream.srt` delivery form — distinct bytes/key from the WebVTT
+    /// `Embedded` extraction of the same track.
+    EmbeddedSrt,
     /// JSON `[(start_ms, end_ms), …]` on-screen event windows of an IMAGE
     /// subtitle stream (codec-relative index) — drives per-segment burn
     /// gating: segments with no event skip the overlay re-encode entirely.
@@ -293,6 +297,7 @@ impl SubtitleCache {
             SubtitleKind::Embedded => 'e',
             SubtitleKind::Sidecar => 's',
             SubtitleKind::EmbeddedAss => 'a',
+            SubtitleKind::EmbeddedSrt => 'r',
             SubtitleKind::EventWindows => 'w',
         };
         Some(root.join("subtitles").join(format!(
@@ -599,6 +604,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.as_slice(), bytes.as_slice());
+    }
+
+    #[tokio::test]
+    async fn srt_kind_is_a_distinct_key_from_webvtt() {
+        // T97/B72: the SRT delivery form caches under its own key so it never
+        // collides with the WebVTT extraction of the SAME track (same index,
+        // different bytes).
+        let cache = SubtitleCache::new(1_024, 64);
+        cache
+            .store(
+                Path::new("/x"),
+                1,
+                3,
+                SubtitleKind::Embedded,
+                b"WEBVTT".to_vec(),
+            )
+            .await;
+        cache
+            .store(
+                Path::new("/x"),
+                1,
+                3,
+                SubtitleKind::EmbeddedSrt,
+                b"1\n00:00:00,000 --> 00:00:01,000\nhi\n".to_vec(),
+            )
+            .await;
+        let vtt = cache
+            .get(Path::new("/x"), 1, 3, SubtitleKind::Embedded)
+            .await
+            .unwrap();
+        let srt = cache
+            .get(Path::new("/x"), 1, 3, SubtitleKind::EmbeddedSrt)
+            .await
+            .unwrap();
+        assert_eq!(vtt.as_slice(), b"WEBVTT");
+        assert_ne!(vtt.as_slice(), srt.as_slice(), "SRT must not alias WebVTT");
     }
 
     #[tokio::test]
