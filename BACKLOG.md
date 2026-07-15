@@ -11,6 +11,34 @@ Live now: `main-1784114711-ed0b88e2d496` (B71). Single replica, 1/1.
 
 ## P0 — in-flight, must close soon
 
+### 0. ACTIVE BUG — native-TV direct-play 401 "missing token" (B72, diagnosing)
+- 2026-07-15: B71 confirmed working (subtitle indices now contiguous 0/1/2…;
+  no 1_000_000 sentinel). TV now gets PAST PlaybackInfo and reaches
+  `POST /sessions/playing` — then immediately `/sessions/playing/stopped`.
+- Root cause of the "crash": the ExoPlayer data-source client (UA
+  `okhttp/4.12.0`, distinct from the app's `Jellyfin Android TV/…` client and
+  WITHOUT its auth interceptor) requests the direct-play file
+  `GET /videos/{id}/stream?container=mp4&static=true&mediaSourceId=…` **6× and
+  each 401s "missing token"** — the URL carries no `api_key`, no PlaySessionId,
+  and (per audit) no auth header. All the app's OTHER calls auth fine.
+- pharos codec decision was `route:"direct"` (direct-play h264); MediaSource had
+  `SupportsDirectPlay/Stream:true`, `TranscodingUrl:null`. Real Jellyfin's
+  `GetVideoStream` has no `[Authorize]` override but still runs under the global
+  auth policy, so a truly tokenless request would 401 there too → the app must
+  normally send a token pharos isn't receiving.
+- **B72 diagnostic shipped** (`auth_extractor.rs`, env-gated on
+  PHAROS_LOG_ALL_REQUESTS): logs header names + truncated auth-header values for
+  any tokenless `/stream` request. Next: user retries Play on the TV → read the
+  "B72: token-less /stream request — header audit" line to see whether ExoPlayer
+  sends an auth header shape pharos doesn't parse, or none at all.
+- Candidate fixes once evidence lands: (a) if a header shape is unparsed, extend
+  extract_token; (b) if genuinely tokenless, pharos must embed the token in the
+  URL it hands the app (transcode path already does via TranscodingUrl w/
+  api_key) OR stop advertising direct-play to the native client so it takes the
+  authed transcode URL. Do NOT relax /stream auth (security).
+- ETag is emitted as `""` (empty) — likely harmless but noted; the app's URL had
+  `tag=` empty.
+
 ### 1. Confirm B71 fixed native-TV playback, then REVERT debug logging
 - B71 (`ed0b88e`) is deployed. It made sidecar subtitle stream indices
   contiguous (`sidecar_base_index(probe)`) instead of the `1_000_000` sentinel
