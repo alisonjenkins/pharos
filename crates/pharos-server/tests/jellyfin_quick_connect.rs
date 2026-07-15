@@ -188,6 +188,19 @@ async fn full_flow_finalizes_at_authenticatewithquickconnect() {
     let tok = v["AccessToken"].as_str().unwrap();
     assert!(!tok.is_empty());
     assert!(v["User"]["Id"].as_str().is_some(), "result carries User.Id");
+    // B63 — the AuthenticationResult's SessionInfo must carry the NON-nullable
+    // kotlin lists (PlayableMediaTypes, SupportedCommands). Omitting them made
+    // the Android/Google-TV SDK throw parsing this exact response → the TV
+    // showed "Unable to connect to server" despite the token being issued.
+    let si = &v["SessionInfo"];
+    assert!(
+        si["PlayableMediaTypes"].is_array(),
+        "SessionInfo.PlayableMediaTypes must be a (non-null) array"
+    );
+    assert!(
+        si["SupportedCommands"].is_array(),
+        "SessionInfo.SupportedCommands must be a (non-null) array"
+    );
 
     // The issued token actually authenticates.
     let req = test::TestRequest::get()

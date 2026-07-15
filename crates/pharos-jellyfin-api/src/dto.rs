@@ -1464,6 +1464,15 @@ pub struct SessionInfoDto {
     pub supports_media_control: bool,
     pub supports_remote_control: bool,
     pub has_custom_device_name: bool,
+    /// NON-nullable lists in the jellyfin-sdk-kotlin `SessionInfoDto`
+    /// (`playableMediaTypes: List<MediaType>`, `supportedCommands:
+    /// List<GeneralCommandType>` — no `?`). Omitting them made the Android/
+    /// Google-TV SDK throw while parsing the AuthenticationResult of the Quick
+    /// Connect finalize, surfaced on the TV as "Unable to connect to server"
+    /// even though the server issued the token fine. Empty lists satisfy the
+    /// non-null contract (B63); jellyfin-web ignored their absence.
+    pub playable_media_types: Vec<String>,
+    pub supported_commands: Vec<String>,
 }
 
 /// Pick a container string for the wire response. ffprobe reports

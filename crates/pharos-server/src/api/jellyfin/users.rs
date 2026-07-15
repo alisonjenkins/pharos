@@ -300,6 +300,10 @@ async fn authenticate_by_name(
             supports_media_control: false,
             supports_remote_control: false,
             has_custom_device_name: false,
+            // Non-null in the kotlin SDK; valid MediaType enum values. Empty
+            // SupportedCommands is a valid non-null list (B63).
+            playable_media_types: vec!["Video".into(), "Audio".into(), "Photo".into()],
+            supported_commands: Vec::new(),
         },
         user: UserDto::from_domain(&user, &state.server_id),
         access_token: token.0.expose().to_string(),
@@ -394,6 +398,10 @@ async fn authenticate_with_quick_connect(
             supports_media_control: false,
             supports_remote_control: false,
             has_custom_device_name: false,
+            // Non-null in the kotlin SDK; valid MediaType enum values. Empty
+            // SupportedCommands is a valid non-null list (B63).
+            playable_media_types: vec!["Video".into(), "Audio".into(), "Photo".into()],
+            supported_commands: Vec::new(),
         },
         user: UserDto::from_domain(&user, &state.server_id),
         access_token: token.0.expose().to_string(),
