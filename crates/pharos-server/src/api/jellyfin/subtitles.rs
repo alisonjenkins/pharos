@@ -264,6 +264,13 @@ pub(crate) async fn pre_extract_subtitles(
         return;
     };
     let mtime = mtime_secs(&item.path).await;
+
+    // Collect the text tracks still needing extraction — skip image subs and
+    // anything already cached — so the whole item demuxes in ONE source open
+    // (V36) rather than a whole-file NFS read PER track. B72 / Supergirl-S01E03:
+    // ~10 text tracks × ~500s cold demux each, serialized, saturating NFS and
+    // starving live playback. Batching collapses that to a single open pass.
+    let mut pending: Vec<PendingTrack> = Vec::new();
     for t in item.probe.subtitle_tracks.iter() {
         let codec_lc = t.codec.as_deref().unwrap_or("").to_ascii_lowercase();
         if is_image_subtitle_codec(&codec_lc) {
@@ -293,25 +300,116 @@ pub(crate) async fn pre_extract_subtitles(
         {
             continue;
         }
-        // Map the actix `Error` (not `Send`) to a `String` before the
-        // `store().await` below, so this future stays `Send` for `tokio::spawn`.
-        let extracted = if is_ass {
-            run_ffmpeg_embedded_ass(input, t.stream_index).await
-        } else {
-            run_ffmpeg_embedded(input, t.stream_index).await
+        pending.push(PendingTrack {
+            stream_index: t.stream_index,
+            kind,
+            // ass carries styling verbatim; everything else → webvtt.
+            muxer: if is_ass { "ass" } else { "webvtt" },
+        });
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    // One temp dir for the item; per-track files inside. `tempfile` names the
+    // dir randomly, so two concurrent warm passes of the same item never share
+    // scratch paths (V36 "fixed scratch paths are per-caller-unique").
+    let tmp = match tempfile::Builder::new().prefix("pharos-subx-").tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = item.id, "subtitle batch tempdir failed");
+            return;
         }
-        .map_err(|e| e.to_string());
-        match extracted {
-            Ok(bytes) => {
+    };
+    let mut batch: Vec<BatchTrack> = Vec::with_capacity(pending.len());
+    for p in &pending {
+        batch.push(BatchTrack {
+            stream_index: p.stream_index,
+            muxer: p.muxer,
+            out: tmp
+                .path()
+                .join(format!("track-{}.{}", p.stream_index, p.muxer)),
+        });
+    }
+
+    let args = build_batch_extract_args(input, &batch);
+    let started = std::time::Instant::now();
+    let status = Command::new("ffmpeg").args(&args).output().await;
+    if let Err(e) = &status {
+        tracing::warn!(error = %e, media.id = item.id, "subtitle batch ffmpeg spawn failed");
+        return;
+    }
+
+    // Harvest whatever got written, REGARDLESS of overall exit status: ffmpeg
+    // writes each output progressively, so one poison stream must not lose the
+    // tracks that did extract — and we never re-open per track (no fallback
+    // loop, so a permanently-bad stream can't turn every warm pass back into N
+    // whole-file demuxes).
+    let mut ok = 0u32;
+    for (p, b) in pending.iter().zip(batch.iter()) {
+        match tokio::fs::read(&b.out).await {
+            Ok(bytes) if !bytes.is_empty() => {
                 cache
-                    .store(&item.path, mtime, t.stream_index, kind, bytes)
+                    .store(&item.path, mtime, p.stream_index, p.kind, bytes)
                     .await;
+                ok += 1;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = item.id, idx = t.stream_index, "subtitle pre-extract failed");
+            _ => {
+                tracing::warn!(
+                    media.id = item.id,
+                    idx = p.stream_index,
+                    "subtitle track produced no output in batch demux"
+                );
             }
         }
     }
+    tracing::info!(
+        media.id = item.id,
+        tracks = pending.len(),
+        extracted = ok,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "subtitle batch extracted (one source open)"
+    );
+}
+
+/// A text subtitle track selected for batch extraction.
+struct PendingTrack {
+    stream_index: u32,
+    kind: SubtitleKind,
+    muxer: &'static str,
+}
+
+/// One track's slot in a batch ffmpeg invocation: its stream index, target
+/// muxer, and the temp file its demuxed bytes are written to.
+struct BatchTrack {
+    stream_index: u32,
+    muxer: &'static str,
+    out: std::path::PathBuf,
+}
+
+/// Build the args for ONE ffmpeg invocation that opens `input` a SINGLE time
+/// and demuxes every track in `tracks` to its own output file (V36). The source
+/// is opened once no matter how many tracks — the whole point of batching. Pure
+/// so the "one `-i`" invariant is unit-testable without running ffmpeg.
+fn build_batch_extract_args(input: &str, tracks: &[BatchTrack]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-i".into(),
+        input.into(),
+    ];
+    for t in tracks {
+        args.push("-map".into());
+        args.push(format!("0:{}", t.stream_index));
+        args.push("-c:s".into());
+        args.push(t.muxer.into());
+        args.push("-f".into());
+        args.push(t.muxer.into());
+        args.push(t.out.to_string_lossy().into_owned());
+    }
+    args
 }
 
 /// Extract one embedded subtitle stream verbatim as ASS.
@@ -1342,6 +1440,53 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn batch_extract_opens_source_once_for_all_tracks() {
+        // V36 / B72: N text tracks must demux in ONE source open, never a loop
+        // of whole-file NFS reads. The arg builder is the structural guarantee —
+        // exactly one `-i input`, then one -map/-c:s/-f/output group per track.
+        let tracks = vec![
+            BatchTrack {
+                stream_index: 2,
+                muxer: "webvtt",
+                out: "/tmp/a.webvtt".into(),
+            },
+            BatchTrack {
+                stream_index: 3,
+                muxer: "ass",
+                out: "/tmp/b.ass".into(),
+            },
+            BatchTrack {
+                stream_index: 5,
+                muxer: "webvtt",
+                out: "/tmp/c.webvtt".into(),
+            },
+        ];
+        let args = build_batch_extract_args("/media/show.mkv", &tracks);
+        // Exactly one input open regardless of track count — the whole point.
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "-i").count(),
+            1,
+            "batch must open the source exactly once, got {args:?}"
+        );
+        let i = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(args[i + 1], "/media/show.mkv");
+        // One -map per track, each followed by its codec/muxer/output.
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-map").count(), 3);
+        for t in &tracks {
+            let m = args
+                .iter()
+                .position(|a| *a == format!("0:{}", t.stream_index))
+                .unwrap_or_else(|| panic!("stream {} not mapped in {args:?}", t.stream_index));
+            assert_eq!(args[m - 1], "-map");
+            assert_eq!(args[m + 1], "-c:s");
+            assert_eq!(args[m + 2], t.muxer);
+            assert_eq!(args[m + 3], "-f");
+            assert_eq!(args[m + 4], t.muxer);
+            assert_eq!(args[m + 5], t.out.to_string_lossy());
+        }
+    }
 
     #[test]
     fn sidecar_language_parsed_from_filename() {
