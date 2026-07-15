@@ -389,3 +389,62 @@ async fn playback_reports_nudge_trickplay_priority() {
         "progress must nudge with decimal id"
     );
 }
+
+// B65 — the Android/Google-TV app POSTs /Sessions/Capabilities with its
+// capabilities as QUERY params and NO body. A required web::Json 400'd it,
+// which crashed the TV ("Something went wrong") right after a successful Quick
+// Connect login. The body-less query form must succeed (204).
+#[actix_web::test]
+async fn capabilities_query_form_no_body_returns_204() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Sessions/Capabilities?playableMediaTypes=Video&playableMediaTypes=Audio&supportedCommands=MoveUp&supportedCommands=MoveDown&supportsMediaControl=true&supportsPersistentIdentifier=true")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        204,
+        "body-less query-param Capabilities must not 400 (TV crash)"
+    );
+}
+
+// The JSON-body form (/Sessions/Capabilities/Full) must still work.
+#[actix_web::test]
+async fn capabilities_full_json_body_still_returns_204() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Sessions/Capabilities/Full")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(r#"{"PlayableMediaTypes":["Video"],"SupportedCommands":["MoveUp"],"SupportsMediaControl":true}"#)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204, "JSON-body Capabilities/Full must work");
+}
+
+// B65 — the path-less /UserItems/Resume alias (Android TV) must resolve to the
+// resume list, not 404 (which left the TV home "Continue Watching" broken).
+#[actix_web::test]
+async fn user_items_resume_alias_returns_200() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/UserItems/Resume?limit=10")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "/UserItems/Resume alias must not 404");
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/UserItems/Resume")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["Items"].is_array(), "resume result carries Items array");
+}

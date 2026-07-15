@@ -48,6 +48,8 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/users/{user_id}/items/resume",
             web::get().to(list_user_items_resume),
         )
+        // B65 — the path-less alias the Android/Google-TV app uses.
+        .route("/useritems/resume", web::get().to(user_items_resume))
         .route(
             "/users/{user_id}/items/{item_id}",
             web::get().to(get_user_item),
@@ -4664,6 +4666,28 @@ async fn list_user_items_resume(
     if path.into_inner() != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
+    resume_items(&state, &user, &req).await
+}
+
+/// `GET /UserItems/Resume` (B65) — the newer, path-less Resume alias the
+/// Android/Google-TV app uses (jellyfin-web still uses
+/// `/Users/{id}/Items/Resume`). Derives the user from the bearer; pharos only
+/// registered the path form, so the TV's home-screen "Continue Watching" 404'd.
+async fn user_items_resume(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    req: actix_web::HttpRequest,
+) -> Result<impl Responder, actix_web::Error> {
+    resume_items(&state, &user, &req).await
+}
+
+/// Shared core: the resumable-items list, filtered by the `MediaTypes` query
+/// (Continue Watching/Listening/Reading rows), as a `BaseItemDto` result.
+async fn resume_items(
+    state: &AppState,
+    user: &AuthUser,
+    req: &actix_web::HttpRequest,
+) -> Result<HttpResponse, actix_web::Error> {
     // jellyfin-web renders three home rows — Continue Watching / Listening /
     // Reading — from the SAME endpoint, distinguished only by a `MediaTypes`
     // filter (`Video` / `Audio` / `Book`). Honour it, else every row shows the

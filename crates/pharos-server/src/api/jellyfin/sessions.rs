@@ -318,16 +318,82 @@ async fn playing_stopped(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Minimal, infallible percent-decode of a query value (`+`→space, `%XX`→byte).
+/// Dependency-free; capability values are plain ASCII but decode defensively.
+fn qs_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse `CapabilitiesBody` from the query string of the body-less
+/// `POST /Sessions/Capabilities`. Case-insensitive keys; repeated keys
+/// (`playableMediaTypes=Video&playableMediaTypes=Audio`) collect into a Vec.
+/// Never fails — an unparseable field is simply skipped (B65).
+fn caps_from_query(qs: &str) -> CapabilitiesBody {
+    let mut caps = CapabilitiesBody::default();
+    for pair in qs.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let val = qs_decode(v);
+        match k.to_ascii_lowercase().as_str() {
+            "playablemediatypes" => caps.playable_media_types.push(val),
+            "supportedcommands" => caps.supported_commands.push(val),
+            "maxstreamingbitrate" => caps.max_streaming_bitrate = val.parse().ok(),
+            "supportsmediacontrol" => {
+                caps.supports_media_control = val.eq_ignore_ascii_case("true")
+            }
+            "id" => caps.id = Some(val),
+            _ => {}
+        }
+    }
+    caps
+}
+
 async fn capabilities(
     state: web::Data<AppState>,
     user: AuthUser,
     req: HttpRequest,
-    body: web::Json<CapabilitiesBody>,
+    // B65 — `POST /Sessions/Capabilities` (non-Full) sends its fields as QUERY
+    // params with NO body (the Android/Google-TV app does this immediately
+    // after login: `?playableMediaTypes=Video&playableMediaTypes=Audio&...`).
+    // A required `web::Json<_>` 400'd it (no body to parse) → the TV crashed
+    // ("Something went wrong"). Make the body OPTIONAL and fall back to the
+    // query. `/Sessions/Capabilities/Full` still sends a JSON body → Some.
+    body: Option<web::Json<CapabilitiesBody>>,
 ) -> impl Responder {
     // P28 — persist client capabilities so the /Sessions snapshot
     // reflects them. jellyfin-web's remote-control screen reads the
     // resulting `SupportedCommands` to grey out unsupported buttons.
-    let body = body.into_inner();
+    let body = match body {
+        Some(b) => b.into_inner(),
+        None => caps_from_query(req.query_string()),
+    };
     // Session-id binding priority: explicit Id field → derive from
     // device-id in the Emby Authorization header (matches our
     // Started event session-id pattern: user.0.id + device-id hash).
