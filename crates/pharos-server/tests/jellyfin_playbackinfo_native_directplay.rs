@@ -1,16 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! B73 — native-player direct-play auth workaround.
+//! B75 — native-player direct-play via a capability token.
 //!
-//! A remote NON-web client (Jellyfin Android TV / mobile / Kodi) that would
-//! DirectPlay streams the file from `/videos/{id}/stream?static=true`, but its
+//! A remote NON-web client (Jellyfin Android TV / mobile / Kodi) that
+//! DirectPlays streams the file from `/videos/{id}/stream?static=true`, but its
 //! ExoPlayer/okhttp data source has no auth interceptor and builds that URL
-//! with NO token → 401 "missing token" → playback dies the instant it starts
-//! (confirmed live via the B72 header audit: authorization / x-emby-token /
-//! api_key all absent). pharos steers every non-web VIDEO direct-play onto the
-//! authed HLS transcode surface, whose TranscodingUrl embeds api_key, and drops
-//! SupportsDirectPlay/Stream to false so the client can't retry the tokenless
-//! direct URL. jellyfin-web keeps true direct-play (its `<video src>` carries
-//! api_key + it gets the JellyfinAuth cookie).
+//! with NO token (confirmed live via the B72 header audit + reading the SDK).
+//! The old B73 workaround force-transcoded every non-web client to dodge the
+//! 401 — wrong for every device that can decode the source, and on
+//! memory-tight TVs the needless transcode + HLS churn on seek got the app
+//! OOM-killed.
+//!
+//! B75 instead authenticates the native stream: the MediaSource `ETag` equals
+//! the PlaySessionId (a random uuid registered against this media id), and the
+//! Jellyfin SDK forwards it verbatim as `?tag=` on the `/stream` URL. So the
+//! native client KEEPS true direct play; the stream route authorizes the
+//! tokenless request by the tag→session→media_id binding. jellyfin-web is
+//! unchanged (its `<video src>` carries api_key + the JellyfinAuth cookie).
 
 use actix_web::{test, web, App};
 use pharos_core::{
@@ -79,15 +84,24 @@ async fn seed() -> (web::Data<AppState>, String) {
 const UA_ANDROID_TV: &str = "Jellyfin Android TV/0.19.9 via jellyfin-sdk-kotlin (OkHttp/4.12.0)";
 const UA_BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0";
 
-async fn playbackinfo(user_agent: &str) -> serde_json::Value {
+macro_rules! init_app {
+    ($state:expr) => {
+        test::init_service(
+            App::new()
+                .app_data($state)
+                .wrap(LowercasePath)
+                .configure(jellyfin::configure),
+        )
+        .await
+    };
+}
+
+#[actix_web::test]
+async fn native_client_keeps_direct_play_with_capability_etag() {
+    // Android TV: pharos now trusts the negotiator (DirectPlay) AND stamps a
+    // capability token into ETag so the tokenless native /stream authenticates.
     let (state, token) = seed().await;
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .wrap(LowercasePath)
-            .configure(jellyfin::configure),
-    )
-    .await;
+    let app = init_app!(state);
     let body = serde_json::json!({
         "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_DIRECTPLAY).unwrap()["DeviceProfile"],
     });
@@ -96,49 +110,119 @@ async fn playbackinfo(user_agent: &str) -> serde_json::Value {
         test::TestRequest::post()
             .uri("/Items/1/PlaybackInfo")
             .insert_header(("X-Emby-Token", token.as_str()))
-            .insert_header(("User-Agent", user_agent))
+            .insert_header(("User-Agent", UA_ANDROID_TV))
             .insert_header(("content-type", "application/json"))
             .set_payload(body.to_string())
             .to_request(),
     )
     .await;
-    serde_json::from_slice(&raw).unwrap()
-}
-
-#[actix_web::test]
-async fn native_client_directplay_is_steered_to_authed_hls() {
-    // Android TV: the tokenless-direct-URL path is dead, so pharos must NOT
-    // advertise direct play — it hands the authed HLS TranscodingUrl instead.
-    let v = playbackinfo(UA_ANDROID_TV).await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     let ms = &v["MediaSources"][0];
     assert_eq!(
         ms["SupportsDirectPlay"].as_bool(),
-        Some(false),
-        "native client must not be offered direct play (its ExoPlayer builds a \
-         tokenless /stream?static=true → 401)"
+        Some(true),
+        "native client keeps direct play (no needless transcode): {ms}"
     );
+    assert!(
+        ms["TranscodingUrl"].is_null(),
+        "direct-playing native client gets no TranscodingUrl: {:?}",
+        ms["TranscodingUrl"]
+    );
+    // The capability token: ETag == PlaySessionId, non-empty, and the SDK
+    // forwards it as ?tag= on the /stream URL.
+    let etag = ms["ETag"].as_str().unwrap_or_default();
+    assert!(!etag.is_empty(), "ETag capability token must be set: {ms}");
     assert_eq!(
-        ms["SupportsDirectStream"].as_bool(),
-        Some(false),
-        "and not direct stream either, or it retries the same tokenless URL"
+        Some(etag),
+        v["PlaySessionId"].as_str(),
+        "ETag must equal PlaySessionId so the registered session authorizes the stream"
     );
-    let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
-    assert!(
-        url.contains("/master.m3u8"),
-        "must fall onto the authed H.264 HLS surface, got {url:?}"
+}
+
+#[actix_web::test]
+async fn native_capability_etag_authorizes_tokenless_stream() {
+    // End-to-end: PlaybackInfo (authed) → grab ETag → GET /stream?tag=<etag>
+    // with NO token (exactly the native ExoPlayer request) must NOT 401.
+    let (state, token) = seed().await;
+    let app = init_app!(state);
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_DIRECTPLAY).unwrap()["DeviceProfile"],
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_ANDROID_TV))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let etag = v["MediaSources"][0]["ETag"].as_str().unwrap().to_string();
+
+    // No token, just the tag — the native ExoPlayer shape. The file doesn't
+    // exist on disk (seed path is fake) so a 404 is fine; the point is it must
+    // pass AUTH — never 401 "missing token".
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/videos/1/stream?static=true&tag={etag}"))
+            .insert_header(("User-Agent", "okhttp/4.12.0"))
+            .to_request(),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        actix_web::http::StatusCode::UNAUTHORIZED,
+        "a valid capability tag must authorize the tokenless native stream"
     );
-    assert!(
-        url.contains("api_key="),
-        "the TranscodingUrl MUST carry the token — that is the whole point: {url:?}"
+}
+
+#[actix_web::test]
+async fn wrong_tag_does_not_authorize_stream() {
+    // A tag that resolves to no session (or a different item) must NOT grant
+    // access — the capability is item-scoped and unguessable.
+    let (state, _token) = seed().await;
+    let app = init_app!(state);
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/videos/1/stream?static=true&tag=deadbeefdeadbeefdeadbeefdeadbeef")
+            .insert_header(("User-Agent", "okhttp/4.12.0"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::UNAUTHORIZED,
+        "an unregistered tag must be rejected"
     );
 }
 
 #[actix_web::test]
 async fn web_client_keeps_true_direct_play() {
     // jellyfin-web self-authenticates the direct URL (api_key in `<video src>`
-    // + JellyfinAuth cookie), so it must keep byte-served direct play — never
-    // forced onto a needless re-encode.
-    let v = playbackinfo(UA_BROWSER).await;
+    // + JellyfinAuth cookie), so it keeps byte-served direct play with no
+    // TranscodingUrl.
+    let (state, token) = seed().await;
+    let app = init_app!(state);
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_DIRECTPLAY).unwrap()["DeviceProfile"],
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_BROWSER))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     let ms = &v["MediaSources"][0];
     assert_eq!(
         ms["SupportsDirectPlay"].as_bool(),

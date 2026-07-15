@@ -20,7 +20,7 @@ use actix_web::{
     },
     web, HttpRequest, HttpResponse,
 };
-use pharos_core::{MediaItem, MediaStore};
+use pharos_core::{MediaItem, MediaStore, TokenStore};
 use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
@@ -42,9 +42,12 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 async fn head_video(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let media_id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    authorize_media(&state, &req, media_id).await?;
     head_response(&state, path.id_str()).await
 }
 
@@ -272,6 +275,64 @@ fn api_key_query_value(qs: &str) -> Option<String> {
     None
 }
 
+/// First value of query key `key` (case-insensitive), empty values skipped.
+fn query_value_ci(qs: &str, key: &str) -> Option<String> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case(key) && !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// B75 — authorize a direct-play `/videos/{id}/stream` request. Two accepted
+/// credentials:
+///
+/// 1. A normal token (Emby/`X-Emby-Token` header, `api_key` query, or the
+///    JellyfinAuth cookie) — the browser path (jellyfin-web) and any client
+///    with an auth interceptor.
+/// 2. A **capability token** the native Jellyfin apps forward. jellyfin-android-tv
+///    (and the mobile SDK) build the direct-play URL themselves and send NO
+///    credential at all — no header, no cookie, no `api_key` (their ExoPlayer
+///    OkHttp data-source has no auth interceptor; confirmed by B72 + reading
+///    the SDK). Real Jellyfin only survives this because its stream route is
+///    anonymous (item ids are random GUIDs). pharos ids are low-entropy, so an
+///    anonymous stream route would be enumerable. Instead we bind auth to the
+///    ONE server-controlled value the app always echoes back: the MediaSource
+///    `ETag`, which the SDK passes verbatim as `?tag=` (`getVideoStreamUrl(tag =
+///    mediaSource.eTag)`). `playback_info` stamps `ETag = PlaySessionId` — a
+///    random uuid registered against this media id in the session registry, and
+///    ONLY handed out in an authenticated PlaybackInfo response. A `tag` (or
+///    `PlaySessionId`) whose registered session is bound to THIS media id
+///    authorizes the stream; the token is unguessable, single-item-scoped, and
+///    time-limited — strictly tighter than upstream's anonymous-by-GUID.
+async fn authorize_media(
+    state: &AppState,
+    req: &HttpRequest,
+    media_id: pharos_core::MediaId,
+) -> Result<(), actix_web::Error> {
+    // 1. Normal credential.
+    if let Some(token) = crate::api::jellyfin::auth_extractor::extract_token(req) {
+        if state.stores.resolve(&token).await.is_ok() {
+            return Ok(());
+        }
+    }
+    // 2. Capability token forwarded by a native app (tag == our ETag).
+    let qs = req.query_string();
+    for key in ["tag", "PlaySessionId"] {
+        if let Some(cap) = query_value_ci(qs, key) {
+            if let Ok(Some(session)) = state.transcode_sessions.get(&cap).await {
+                if session.media_id == media_id {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err(error::ErrorUnauthorized("missing token"))
+}
+
 fn parse_max_audio_channels(qs: &str) -> Option<u32> {
     for kv in qs.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
@@ -285,10 +346,12 @@ fn parse_max_audio_channels(qs: &str) -> Option<u32> {
 
 async fn stream_video(
     state: web::Data<AppState>,
-    _user: AuthUser,
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let media_id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    authorize_media(&state, &req, media_id).await?;
     // A `.webm` extension WITHOUT `Static=true` is a progressive transcode
     // request. jellyfin-web routes browsers whose MSE can't decode H.264
     // (e.g. some Firefox/Zen builds) here, since pharos's HLS surface only

@@ -1736,44 +1736,26 @@ async fn playback_info(
     };
     let decision = negotiate(&profile, &source);
 
-    // B73 — native-player direct-play auth workaround. A remote NON-web client
-    // (Android TV / mobile / Kodi) that DirectPlays streams the file from
-    // `/videos/{id}/stream?static=true` — but its ExoPlayer/okhttp data source
-    // has no auth interceptor and builds that URL with NO token (confirmed by
-    // B72: authorization / x-emby-token / api_key all absent) → 401 "missing
-    // token" → playback dies the instant it starts. Real Jellyfin survives only
-    // because its client appends api_key; ours doesn't, and we can't change the
-    // app. jellyfin-web is unaffected: its `<video src>` carries api_key and it
-    // picks up the JellyfinAuth cookie (P24). So steer every non-web VIDEO
-    // direct-play onto the authed HLS surface — the TranscodingUrl pharos mints
-    // embeds api_key + PlaySessionId (the exact path a browser streams over).
-    // Forcing the Transcode shape drops BOTH SupportsDirectPlay and
-    // SupportsDirectStream to false so the client can't retry the tokenless
-    // direct URL. Cost: an already-h264 source re-encodes instead of
-    // byte-serving (the segmented-HLS surface cannot stream-copy — see the
-    // VideoRemux arm in hls.rs), accepted to make the TV reliable; a cheaper
-    // authed copy-remux endpoint is tracked in BACKLOG.
-    // Browser vs native player is the User-Agent: a browser (jellyfin-web) sends
-    // `Mozilla/…`; a native app's media stack sends `Jellyfin Android TV/…` /
-    // `okhttp/…` / `Dart/…`. Only the browser self-authenticates a direct URL
-    // (api_key in `<video src>` + JellyfinAuth cookie), so only it keeps direct
-    // play. Unknown/absent UA → treat as native (the authed HLS path always
-    // works; a needless transcode is strictly safer than a 401).
+    // B75 — native direct-play now authenticates via a capability token (the
+    // MediaSource ETag = PlaySessionId, which the SDK forwards as `?tag=`; the
+    // stream route validates it against the registered session — see
+    // `stream::authorize_media`). So we no longer force a transcode on native
+    // clients: `negotiate()` already picked the correct per-DeviceProfile shape
+    // (DirectPlay when the client can decode the source, transcode otherwise).
+    // Forcing a transcode here (the old B73 workaround) was WRONG for every
+    // device that can direct-play — it re-encoded needlessly and, on
+    // memory-tight TVs, the extra transcode + HLS churn on seek got the app
+    // OOM-killed. Trust the negotiator.
+    //
+    // `is_web_client` still distinguishes the browser (self-authenticating
+    // `<video src>` with api_key + JellyfinAuth cookie) from a native app for
+    // the resume-offset handling below (B74): only native players replay the
+    // TranscodingUrl verbatim and need StartTimeTicks baked into it.
     let is_web_client = req
         .headers()
         .get(actix_web::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.contains("Mozilla"));
-    let decision = if is_video && !is_web_client && decision.is_direct() {
-        Decision::Transcode {
-            target_container: "ts".into(),
-            target_video_codec: Some("h264".into()),
-            target_audio_codec: Some("aac".into()),
-            max_video_bitrate_bps: None,
-        }
-    } else {
-        decision
-    };
 
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
     // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
@@ -2055,23 +2037,25 @@ async fn playback_info(
         "playbackinfo: codec decision"
     );
 
-    // Register the negotiated Decision so HLS segment generation
-    // honours the target codec / container / bitrate cap. Only
-    // matters when we actually emitted a TranscodingUrl; direct play
-    // skips this so the cache doesn't bloat with no-op entries.
-    if transcoding_url.is_some() {
-        let _ = state
-            .transcode_sessions
-            .insert(
-                play_session_id.clone(),
-                crate::transcode_sessions::TranscodeSession {
-                    media_id: id,
-                    decision: decision.clone(),
-                    source_probe: probe.clone(),
-                },
-            )
-            .await;
-    }
+    // Register the negotiated Decision under this PlaySessionId. For a
+    // transcode the HLS segment generator reads it back to honour the target
+    // codec / container / bitrate cap. For DIRECT PLAY we still register it
+    // (B75): the session doubles as the stream capability token — the ETag we
+    // hand back equals this PlaySessionId, and `stream::authorize_media`
+    // authorizes the tokenless native `/stream?tag=…` request by resolving the
+    // session and matching its media_id. The registry self-expires (5 min
+    // in-memory / 6 h durable), so no-op direct-play entries don't accumulate.
+    let _ = state
+        .transcode_sessions
+        .insert(
+            play_session_id.clone(),
+            crate::transcode_sessions::TranscodeSession {
+                media_id: id,
+                decision: decision.clone(),
+                source_probe: probe.clone(),
+            },
+        )
+        .await;
 
     let sidecars = discover_sidecars(&item.path).await;
     let sidecar_langs: Vec<Option<String>> = sidecars
@@ -2152,7 +2136,12 @@ async fn playback_info(
         "Type": "Default",
         "Container": advertised_container,
         "IsRemote": false,
-        "ETag": "",
+        // B75 — ETag doubles as the direct-play capability token. The native
+        // SDK echoes it verbatim as `?tag=` on the tokenless `/stream` URL, and
+        // `stream::authorize_media` accepts it when it resolves to this item's
+        // registered session. Equal to PlaySessionId (random uuid); only ever
+        // disclosed in this authenticated PlaybackInfo response.
+        "ETag": play_session_id,
         "RunTimeTicks": probe.run_time_ticks(),
         "Size": probe.size_bytes,
         "Name": item.title,
