@@ -65,12 +65,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/devices", web::delete().to(delete_device))
         .route("/devices/info", web::get().to(devices_list))
         .route("/devices/options", web::post().to(device_options))
-        // MediaSegments (intro/outro skip) — empty stub keeps the
-        // client's pre-playback fetch from cascading 404s.
-        .route(
-            "/mediasegments/{item_id}",
-            web::get().to(media_segments_stub),
-        );
+        // MediaSegments (Skip Intro / Skip Outro): serves the item's
+        // detected + chapter-derived segments in Jellyfin wire shape (T86).
+        .route("/mediasegments/{item_id}", web::get().to(media_segments));
 }
 
 #[derive(serde::Deserialize)]
@@ -637,13 +634,36 @@ async fn device_options(
     Ok(HttpResponse::NoContent().finish())
 }
 
-async fn media_segments_stub(
+/// `includeSegmentTypes` narrows the response to the segment Types the client
+/// has actions configured for (Jellyfin's `MediaSegments` query). Absent or
+/// empty → return every segment. `CiQuery` snake_cases the key, so the plain
+/// field name binds both the SDK's camelCase and PascalCase forms.
+#[derive(serde::Deserialize, Default)]
+struct SegmentTypesQuery {
+    #[serde(default)]
+    include_segment_types: Option<String>,
+}
+
+async fn media_segments(
     state: web::Data<AppState>,
     _user: AuthUser,
     path: web::Path<String>,
+    q: CiQuery<SegmentTypesQuery>,
 ) -> impl Responder {
     let item_id = path.into_inner();
-    let items = build_media_segments(&state, &item_id).await;
+    let mut items = build_media_segments(&state, &item_id).await;
+    // Honour `includeSegmentTypes` (comma-joined). A non-empty allow-list keeps
+    // only those Types; an absent/blank param returns everything.
+    if let Some(raw) = q.0.include_segment_types.as_deref() {
+        let allow: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !allow.is_empty() {
+            items.retain(|seg| allow.iter().any(|a| *a == seg.kind.to_ascii_lowercase()));
+        }
+    }
     let total = items.len() as u32;
     HttpResponse::Ok().json(serde_json::json!({
         "Items": items,
