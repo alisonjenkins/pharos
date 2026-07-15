@@ -2091,6 +2091,38 @@ mod tests {
             ids.sort_unstable();
             Ok(ids)
         }
+        async fn people_needing_images(
+            &self,
+            limit: i64,
+        ) -> DomainResult<Vec<pharos_core::Person>> {
+            let links = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut out = Vec::new();
+            for people in links.values() {
+                for p in people {
+                    let has_http = p
+                        .thumb
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with("http://") || t.starts_with("https://"));
+                    if has_http || !seen.insert(p.name.clone()) {
+                        continue;
+                    }
+                    out.push(pharos_core::Person {
+                        id: 0,
+                        wire_id: pharos_core::person_wire_id(&p.name),
+                        name: p.name.clone(),
+                        sort_name: None,
+                        provider_ids: p.provider_ids.clone(),
+                        thumb_url: p.thumb.clone(),
+                    });
+                }
+            }
+            out.truncate(limit.max(0) as usize);
+            Ok(out)
+        }
         async fn people_for_item(
             &self,
             item: MediaId,

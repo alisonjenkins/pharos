@@ -686,6 +686,23 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state.bg_io.clone(),
         libav_pool.clone(),
     );
+    // T81 — resolve real cast portraits from TMDB when a key is configured.
+    // Gated on the key: with none, this library's people rows keep their
+    // legacy (unreachable) thumb paths and the /Persons image route 404s to a
+    // placeholder, exactly as before. Provide the key out-of-band via
+    // `PHAROS_TMDB_API_KEY` (a k8s Secret env var), never config.toml.
+    match cfg.tmdb.api_key.as_deref() {
+        Some(key) if !key.is_empty() => {
+            pharos_server::person_image_backfill::spawn(
+                state.stores.clone(),
+                state.bg_io.clone(),
+                pharos_server::tmdb::TmdbClient::new(key.to_string()),
+            );
+        }
+        _ => {
+            tracing::info!("T81 person-image backfill disabled (no [tmdb].api_key)");
+        }
+    }
     // Cap the extracted-image cache. Unlike the trickplay/HLS caches it has no
     // in-line eviction, so on a large library posters/backdrops/thumbs/scaled
     // artwork can slowly fill the shared cache volume. A periodic janitor

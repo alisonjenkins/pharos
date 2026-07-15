@@ -414,6 +414,13 @@ impl PersonStore for AnyStore {
         }
     }
 
+    async fn people_needing_images(&self, limit: i64) -> DomainResult<Vec<Person>> {
+        match self {
+            AnyStore::Sqlite(s) => s.people_needing_images(limit).await,
+            AnyStore::Postgres(p) => p.people_needing_images(limit).await,
+        }
+    }
+
     async fn item_ids_for_person(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
         match self {
             AnyStore::Sqlite(s) => s.item_ids_for_person(wire_id).await,

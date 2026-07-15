@@ -1528,6 +1528,44 @@ impl PersonStore for SqliteStore {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn people_needing_images(&self, limit: i64) -> DomainResult<Vec<Person>> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT id, name, sort_name, wire_id, provider_ids, thumb_url \
+             FROM people \
+             WHERE thumb_url IS NULL \
+                OR (thumb_url NOT LIKE 'http://%' AND thumb_url NOT LIKE 'https://%') \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, name, sort_name, wire_id, provider_ids, thumb_url)| Person {
+                    id,
+                    name,
+                    sort_name,
+                    wire_id,
+                    provider_ids,
+                    thumb_url,
+                },
+            )
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn item_ids_for_person(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
         let rows = sqlx::query_as::<_, (i64,)>(
             "SELECT DISTINCT ip.item_id FROM item_people ip \

@@ -9,6 +9,7 @@ pub mod library_watch;
 pub mod middleware;
 pub mod obs;
 pub mod parental;
+pub mod person_image_backfill;
 pub mod quick_connect;
 pub mod router;
 #[cfg(unix)]
@@ -19,5 +20,6 @@ pub mod state;
 pub mod sync_distributed;
 pub mod sync_recovery;
 pub mod sync_resolver;
+pub mod tmdb;
 pub mod transcode_sessions;
 pub mod trickplay_backfill;

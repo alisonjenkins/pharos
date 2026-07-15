@@ -13,6 +13,21 @@ pub struct Config {
     /// default table (see [`crate::parental::ParentalRatingMap`]).
     #[serde(default)]
     pub parental: ParentalConfig,
+    /// T81 — optional TMDB integration for cast-portrait enrichment. Absent /
+    /// no `api_key` → the person-image backfill never spawns (feature off).
+    #[serde(default)]
+    pub tmdb: TmdbConfig,
+}
+
+/// `[tmdb]` — TMDB (themoviedb.org) integration. Only `api_key` matters
+/// today; it gates the T81 person-image backfill. Supply it via
+/// `PHAROS_TMDB_API_KEY` (a k8s Secret env var) rather than committing it to
+/// `config.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct TmdbConfig {
+    /// TMDB v3 API key. `None` (the default) disables the feature.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// `[parental]` — override the official-rating → score mapping used to enforce
@@ -418,7 +433,7 @@ impl Config {
 
     /// Override fields from environment vars. Prefix `PHAROS_`.
     /// Recognized: `PHAROS_BIND`, `PHAROS_LOG_LEVEL`, `PHAROS_OTLP_ENDPOINT`,
-    /// `PHAROS_DATABASE_URL`.
+    /// `PHAROS_DATABASE_URL`, `PHAROS_TMDB_API_KEY`.
     pub fn apply_env(mut self) -> Self {
         if let Ok(v) = std::env::var("PHAROS_BIND") {
             self.server.bind = v;
@@ -434,6 +449,16 @@ impl Config {
         // — so no credential lands in git. Overrides `[database].url`.
         if let Ok(v) = std::env::var("PHAROS_DATABASE_URL") {
             self.database.url = v;
+        }
+        // T81 — the TMDB key is a secret; inject it from a k8s Secret env var
+        // rather than committing it to config.toml. A blank value counts as
+        // unset so an empty Secret leaves the feature off. Overrides
+        // `[tmdb].api_key`.
+        if let Ok(v) = std::env::var("PHAROS_TMDB_API_KEY") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.tmdb.api_key = Some(v.to_string());
+            }
         }
         self
     }

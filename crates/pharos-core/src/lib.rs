@@ -636,6 +636,17 @@ pub trait PersonStore: Send + Sync {
         &self,
         item: MediaId,
     ) -> impl std::future::Future<Output = DomainResult<Vec<ItemPerson>>> + Send;
+
+    /// T81 — people whose portrait is unresolved: `thumb_url` is NULL or a
+    /// non-`http(s)` legacy path (this library's NFO `<actor><thumb>` values
+    /// are all unreachable local metadata paths). The person-image backfill
+    /// pulls these (newest-first by id, capped at `limit`) to resolve real
+    /// portraits from TMDB. A resolved `http(s)` `thumb_url` excludes the row
+    /// from the next pull, so the backfill is self-terminating.
+    fn people_needing_images(
+        &self,
+        limit: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Person>>> + Send;
 }
 
 /// LIB-C3 — a studio entity row (one per distinct production/network
