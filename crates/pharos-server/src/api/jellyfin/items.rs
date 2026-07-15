@@ -278,10 +278,8 @@ async fn build_facet_base(
         ParentResolution::All | ParentResolution::Empty => {}
     }
     if let Some(types) = q.include_item_types.as_deref() {
-        let wanted: Vec<pharos_core::MediaKind> = types
-            .split(',')
-            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
-            .collect();
+        let wanted: Vec<pharos_core::MediaKind> =
+            types.split(',').filter_map(MediaKind::from_wire).collect();
         if !wanted.is_empty() {
             mq.kinds = wanted;
         }
@@ -2389,10 +2387,7 @@ async fn latest_items(
 
 fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
     let Some(s) = include else { return items };
-    let wanted: Vec<MediaKind> = s
-        .split(',')
-        .filter_map(|t| jellyfin_type_to_kind(t.trim()))
-        .collect();
+    let wanted: Vec<MediaKind> = s.split(',').filter_map(MediaKind::from_wire).collect();
     if wanted.is_empty() {
         return items;
     }
@@ -2868,7 +2863,7 @@ async fn list_playlists_page(
 /// A `/Items` request that asks ONLY for MusicAlbum rows. pharos stores no
 /// album entity — albums are synthesised by grouping audio rows — so this
 /// short-circuits to [`list_music_albums_page`] the same way BoxSet /
-/// Playlist requests do. (`jellyfin_type_to_kind` has no MusicAlbum mapping,
+/// Playlist requests do. (`MediaKind::from_wire` has no MusicAlbum mapping,
 /// so without the short-circuit the type filter silently DROPPED nothing and
 /// the request returned every kind — jellyfin-web's "More From {artist}"
 /// rail rendered TV shows + movies under a music album.)
@@ -3615,10 +3610,8 @@ fn build_media_query(
 
     // IncludeItemTypes → kinds.
     if let Some(types) = q.include_item_types.as_deref() {
-        let wanted: Vec<pharos_core::MediaKind> = types
-            .split(',')
-            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
-            .collect();
+        let wanted: Vec<pharos_core::MediaKind> =
+            types.split(',').filter_map(MediaKind::from_wire).collect();
         if !wanted.is_empty() {
             mq.kinds = wanted;
         }
@@ -3680,10 +3673,7 @@ fn build_media_query(
         f.genre_probe_token = Some(token.clone());
     }
     if let Some(types) = q.exclude_item_types.as_deref() {
-        f.exclude_kinds = types
-            .split(',')
-            .filter_map(|s| jellyfin_type_to_kind(s.trim()))
-            .collect();
+        f.exclude_kinds = types.split(',').filter_map(MediaKind::from_wire).collect();
     }
     if let Some(raw) = q.media_types.as_deref() {
         let want_audio = raw
@@ -4283,18 +4273,6 @@ async fn restrict_to_parent(
     }
     // Unknown id — render an empty library.
     Vec::new()
-}
-
-fn jellyfin_type_to_kind(s: &str) -> Option<MediaKind> {
-    // Case-insensitive — some clients send lowercase (Finamp's
-    // `audio`), real Jellyfin accepts both. Server-side ascii-fold
-    // is fine: these are all ASCII identifiers.
-    match s.to_ascii_lowercase().as_str() {
-        "movie" => Some(MediaKind::Movie),
-        "episode" => Some(MediaKind::Episode),
-        "audio" => Some(MediaKind::Audio),
-        _ => None,
-    }
 }
 
 /// xorshift64 Fisher–Yates. Deterministic for a given seed — same

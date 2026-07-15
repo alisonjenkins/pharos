@@ -435,15 +435,7 @@ fn parse_include_item_types(s: Option<&str>) -> Option<Vec<MediaKind>> {
     if raw.is_empty() {
         return None;
     }
-    let kinds: Vec<MediaKind> = raw
-        .split(',')
-        .filter_map(|t| match t.trim() {
-            "Movie" => Some(MediaKind::Movie),
-            "Episode" => Some(MediaKind::Episode),
-            "Audio" => Some(MediaKind::Audio),
-            _ => None,
-        })
-        .collect();
+    let kinds: Vec<MediaKind> = raw.split(',').filter_map(MediaKind::from_wire).collect();
     if kinds.is_empty() {
         None
     } else {
