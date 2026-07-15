@@ -2200,13 +2200,20 @@ async fn playback_info(
         }));
     }
 
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    let response = serde_json::json!({
         "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
         // P4 — top-level resume offset. jellyfin-web reads this when
         // it didn't keep a local copy of UserData.PlaybackPositionTicks.
         "StartPositionTicks": resume_ticks,
-    })))
+    });
+    // B70 — the native TV crashes PARSING this 200; log the exact body (gated
+    // by PHAROS_LOG_ALL_REQUESTS) so the offending field can be diffed vs the
+    // kotlin model, since the client sends no usable crash report.
+    if std::env::var("PHAROS_LOG_ALL_REQUESTS").as_deref() == Ok("1") {
+        tracing::info!(media.id = id, body = %response, "playbackinfo response");
+    }
+    Ok(HttpResponse::Ok().json(response))
 }
 
 async fn list_user_items_latest(
