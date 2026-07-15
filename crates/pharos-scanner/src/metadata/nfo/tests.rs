@@ -141,6 +141,65 @@ async fn movie_nfo_maps_all_common_fields() {
 }
 
 #[tokio::test]
+async fn audio_track_ignores_album_nfo_title_and_year() {
+    // An `album.nfo` describes the ALBUM. Folding its `<title>` (the album
+    // name) / `<year>` (a reissue year) into a track made every song share
+    // the album name + wrong year (B-music). Audio must consult only a
+    // track-level sidecar, so a bare `album.nfo` contributes nothing here.
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("02 Stars.mp3");
+    std::fs::write(
+        dir.path().join("album.nfo"),
+        r#"<?xml version="1.0"?>
+<album>
+  <title>Stars</title>
+  <year>2008</year>
+  <premiered>2008-01-01</premiered>
+</album>
+"#,
+    )
+    .unwrap();
+
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Audio,
+        probe: &p,
+        series: None,
+    };
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    // album.nfo is NOT consulted for the track: no title/year leak.
+    assert_eq!(r.title, None);
+    assert_eq!(r.production_year, None);
+}
+
+#[tokio::test]
+async fn audio_track_still_reads_its_own_sidecar_nfo() {
+    // A genuine per-track `<track>.nfo` IS honoured (track-scoped metadata).
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("02 Stars.mp3");
+    std::fs::write(
+        dir.path().join("02 Stars.nfo"),
+        r#"<?xml version="1.0"?>
+<musicvideo>
+  <title>Stars (Live)</title>
+</musicvideo>
+"#,
+    )
+    .unwrap();
+
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Audio,
+        probe: &p,
+        series: None,
+    };
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    assert_eq!(r.title.as_deref(), Some("Stars (Live)"));
+}
+
+#[tokio::test]
 async fn movie_falls_back_to_movie_nfo_in_dir() {
     let dir = tempdir().unwrap();
     let media = dir.path().join("feature.mkv");

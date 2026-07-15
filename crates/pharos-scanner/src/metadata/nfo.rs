@@ -142,14 +142,16 @@ fn nfo_candidates(req: &MetadataRequest<'_>) -> Vec<PathBuf> {
             }
         }
         MediaKind::Audio => {
-            // Best-effort: track-level sidecar, then album/artist NFOs in
-            // the track's directory.
+            // ONLY the track-level sidecar (`<track>.nfo`). `album.nfo` /
+            // `artist.nfo` describe the *album* / *artist*, not the track:
+            // folding their `<title>` (the album name) / `<year>` (a reissue
+            // year) into every track made all songs share the album name and
+            // the wrong year (B-music). Per-track identity comes from the
+            // embedded ID3/Vorbis tags (probe.title, probe.year) instead;
+            // directory NFOs will feed real album/artist entities in a later
+            // slice, not the track rows.
             if let Some(p) = sibling_nfo(req.path) {
                 out.push(p);
-            }
-            if let Some(d) = dir {
-                out.push(d.join("album.nfo"));
-                out.push(d.join("artist.nfo"));
             }
         }
     }
