@@ -5,8 +5,45 @@ canonical tracker; this file surfaces the *in-flight* + *recurring* items that
 are easy to lose across context resets. Cross-refs SPEC where a §T row already
 exists.
 
-Live now: `main-1784121423-7097d22a2735` (B73). Single replica, 1/1.
-Pending deploy: B75 + bit-depth + logDir (commits `685ddd9`, `9d91fb5`, `5e4ef45`).
+Live now: `main-1784134461-5cb617cca947` (B75). Single replica, 1/1.
+Pending deploy: image-resize (`d496e8e`) + music-metadata fix (below).
+
+---
+
+## P0 — music library metadata (fix landed, needs deploy + rescan)
+
+Reported: album view shows every track with the SAME name, wrong year
+(Simply Red "Stars" showed 2008, is 1991), no album art. Ground-truthed via
+`ffprobe` on the media PVC (`/media/Music/Simply Red/Stars`):
+- Each mp3 has the CORRECT embedded `title` (01="Something Got Me Started");
+  pharos never read `format.tags.title` AND the folder's `album.nfo`
+  `<title>Stars</title>` (the ALBUM name) was folded into EVERY track by the
+  NFO provider → all songs became "Stars".
+- `date=2008` (reissue) but `TDOR=1991-10` (original) sat unread in the tags;
+  pharos used `date`.
+- `folder.jpg` exists + the image endpoint serves it (200), but
+  `synth_album_dto` advertised `ImageTags:{}` so clients never fetched it.
+
+Fixes (3 atomic commits):
+1. Scanner reads embedded `title` (ID3 `TIT2`/Vorbis `TITLE`) → track name;
+   `year` now prefers original-release (`TDOR`/`ORIGINALDATE`) over `date`.
+   Both backends (libav default + spawn). `PROBE_SCHEMA_VERSION` 2→3 so the
+   boot scan auto-re-probes every row (no `--force`).
+2. Audio NFO resolution consults ONLY the track-level sidecar `.nfo` —
+   `album.nfo`/`artist.nfo` no longer clobber per-track title/year.
+3. `synth_album_dto` advertises a Primary `ImageTags` entry (endpoint already
+   resolves synth album id → child cover).
+
+DEPLOY + VERIFY: after the image rolls, the boot scan re-probes ~13k rows
+(paced by the adaptive I/O gate — expect load for a while). Then confirm on
+"Stars": 10 distinct track names, ProductionYear 1991, album cover renders.
+
+STILL OPEN — artist "More like this" spam: reported the artist view spams the
+artist's albums in "More like this". NOT reproduced via web (`/Items/{artist}/
+Similar` → 0; discography → 1). Hypothesis: the native-TV artist screen was
+rendering the 10 identically-named "Stars" tracks (looked like the album 10×);
+the title fix likely resolves it. If it persists post-deploy, capture the
+exact native-client request (adb logcat / mitm) — do not guess.
 
 ---
 
