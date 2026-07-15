@@ -23,6 +23,7 @@ pub mod trickplay;
 pub mod user_data;
 pub mod users;
 pub mod waveform;
+pub mod wire;
 
 // Phase A — DTO + serde leaf-crate extraction. Modules now live in
 // `pharos-jellyfin-api`; re-exported here so existing call sites

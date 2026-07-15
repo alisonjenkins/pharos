@@ -41,6 +41,22 @@ pub struct SystemInfoDto {
     pub system_architecture: &'static str,
 }
 
+/// The UNAUTHENTICATED `/System/Info/Public` probe every client hits at boot
+/// (the kotlin SDK's `PublicSystemInfo`). A strict subset of SystemInfo with no
+/// server-internal paths (V9). Typed so the boot handshake can't silently drop
+/// a field a client keys on.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PublicSystemInfoDto {
+    pub id: String,
+    pub server_name: String,
+    pub version: String,
+    pub product_name: &'static str,
+    pub operating_system: &'static str,
+    pub local_address: String,
+    pub startup_wizard_completed: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct AuthenticateByNameRequest {

@@ -327,15 +327,18 @@ async fn system_info_public(
     let server_name = branding
         .server_name
         .unwrap_or_else(|| state.server_name.clone());
-    HttpResponse::Ok().json(serde_json::json!({
-        "Id": state.server_id,
-        "ServerName": server_name,
-        "Version": ADVERTISED_JELLYFIN_VERSION,
-        "ProductName": "Jellyfin Server",
-        "OperatingSystem": std::env::consts::OS,
-        "LocalAddress": derive_local_address(&req),
-        "StartupWizardCompleted": true,
-    }))
+    // Typed DTO + SIMD (sonic-rs) serialization — replaces the hand-built
+    // json! so every wire field is compile-visible and auditable (the
+    // json!→DTO sweep; kotlin-strictness class B13/B63/B64).
+    crate::api::jellyfin::wire::json(&pharos_jellyfin_api::dto::PublicSystemInfoDto {
+        id: state.server_id.clone(),
+        server_name,
+        version: ADVERTISED_JELLYFIN_VERSION.to_string(),
+        product_name: "Jellyfin Server",
+        operating_system: std::env::consts::OS,
+        local_address: derive_local_address(&req),
+        startup_wizard_completed: true,
+    })
 }
 
 async fn system_info(
