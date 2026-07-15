@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -8,6 +9,21 @@ pub struct Config {
     pub media: MediaConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    /// T68 — optional parental-rating score table. Absent → the built-in US
+    /// default table (see [`crate::parental::ParentalRatingMap`]).
+    #[serde(default)]
+    pub parental: ParentalConfig,
+}
+
+/// `[parental]` — override the official-rating → score mapping used to enforce
+/// each user's `MaxParentalRating`. Empty (the default) selects the built-in
+/// US table.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct ParentalConfig {
+    /// `rating string → ordinal score`, e.g. `PG-13 = 13`. Only the ordering
+    /// vs `MaxParentalRating` matters.
+    #[serde(default)]
+    pub ratings: HashMap<String, i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

@@ -19,6 +19,10 @@ fn map_sqlx<E: std::fmt::Display>(e: E) -> AuthError {
     AuthError::Backend(e.to_string())
 }
 
+/// A `users` row as fetched by the user-store queries:
+/// `(id_bytes, name, password_hash, admin, policy_json)`.
+type UserRow = (Vec<u8>, String, String, i64, Option<String>);
+
 /// Serialize the extended policy fields to the `policy_json` column. The
 /// `admin` column stays the authoritative fast-path flag (indexed, read by the
 /// last-admin guard), so the JSON is the store for everything else.
@@ -66,7 +70,7 @@ impl UserStore for SqliteStore {
 
     #[tracing::instrument(skip(self), fields(user.name = %name))]
     async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
-        let row: Option<(Vec<u8>, String, String, i64, Option<String>)> = sqlx::query_as(
+        let row: Option<UserRow> = sqlx::query_as(
             "SELECT id, name, password_hash, admin, policy_json FROM users WHERE name = ?",
         )
         .bind(name)
@@ -81,7 +85,7 @@ impl UserStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
-        let row: Option<(Vec<u8>, String, String, i64, Option<String>)> = sqlx::query_as(
+        let row: Option<UserRow> = sqlx::query_as(
             "SELECT id, name, password_hash, admin, policy_json FROM users WHERE id = ?",
         )
         .bind(id_bytes)
@@ -95,7 +99,7 @@ impl UserStore for SqliteStore {
 
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> AuthResult<Vec<UserRecord>> {
-        let rows: Vec<(Vec<u8>, String, String, i64, Option<String>)> = sqlx::query_as(
+        let rows: Vec<UserRow> = sqlx::query_as(
             "SELECT id, name, password_hash, admin, policy_json FROM users \
              ORDER BY name COLLATE NOCASE",
         )
@@ -159,7 +163,7 @@ impl UserStore for SqliteStore {
     }
 }
 
-fn record_from_row(row: (Vec<u8>, String, String, i64, Option<String>)) -> AuthResult<UserRecord> {
+fn record_from_row(row: UserRow) -> AuthResult<UserRecord> {
     let uuid =
         Uuid::from_slice(&row.0).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
     Ok(UserRecord {

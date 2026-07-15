@@ -564,6 +564,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         .await?
         .with_media_roots(scan_roots.clone())
         .with_libraries(libraries);
+    // T68 — resolve the parental-rating score table (config override, else the
+    // built-in US default) backing per-user MaxParentalRating enforcement.
+    state.parental_ratings =
+        pharos_server::parental::ParentalRatingMap::from_config(&cfg.parental.ratings);
     // P48 — one resident libav worker pool shared by the image + trickplay
     // caches (and the scanner prober) in the `ffmpeg-lib` build. Tiny ops
     // run in-process in crash-isolated workers; the fork/exec is amortised.

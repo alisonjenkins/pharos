@@ -178,6 +178,53 @@ pub(crate) fn build(
             "media_items.library_id IN (SELECT id FROM libraries WHERE wire_id = {p})"
         ));
     }
+    // T68 — policy library restriction: intersect with the set of libraries
+    // the user is allowed to browse (AND-composed with any pivot above).
+    if !q.allowed_library_wire_ids.is_empty() {
+        let placeholders: Vec<String> = q
+            .allowed_library_wire_ids
+            .iter()
+            .map(|w| {
+                params.push(Param::Text(w.clone()));
+                ph(params.len())
+            })
+            .collect();
+        clauses.push(format!(
+            "media_items.library_id IN \
+             (SELECT id FROM libraries WHERE wire_id IN ({}))",
+            placeholders.join(", ")
+        ));
+    }
+    // T68 — policy parental restriction. An item passes when its official
+    // rating is within the user's max (its lowercased rating is in the allowed
+    // set), OR it is unrated (NULL/empty) and unrated items aren't blocked. An
+    // empty allowed set with block_unrated blocks everything rated/unrated
+    // alike (max below the lowest rating).
+    if let Some(parental) = &q.parental {
+        let rating_ok = if parental.allowed_ratings_lc.is_empty() {
+            "0 = 1".to_string()
+        } else {
+            let placeholders: Vec<String> = parental
+                .allowed_ratings_lc
+                .iter()
+                .map(|r| {
+                    params.push(Param::Text(r.clone()));
+                    ph(params.len())
+                })
+                .collect();
+            format!(
+                "(media_items.official_rating IS NOT NULL AND media_items.official_rating <> '' \
+                 AND LOWER(media_items.official_rating) IN ({}))",
+                placeholders.join(", ")
+            )
+        };
+        let unrated_ok = if parental.block_unrated {
+            "0 = 1"
+        } else {
+            "(media_items.official_rating IS NULL OR media_items.official_rating = '')"
+        };
+        clauses.push(format!("({rating_ok} OR {unrated_ok})"));
+    }
 
     // --- residual chip filters (LIB-B2) ---
     if q.filters.is_active() {

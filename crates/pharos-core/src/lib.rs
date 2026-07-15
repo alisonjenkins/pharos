@@ -1817,6 +1817,12 @@ pub struct MediaQuery {
     /// Items assigned the library carrying this `wire_id` (distinct from a
     /// [`ParentFilter::Library`] pivot so it can stack).
     pub library_wire_id: Option<String>,
+    /// T68 — user-policy library restriction. When non-empty, only items in
+    /// these library wire ids are returned (AND-composed with the pivot /
+    /// [`Self::library_wire_id`]). Empty = the user may see every library.
+    pub allowed_library_wire_ids: Vec<String>,
+    /// T68 — user-policy parental restriction. `None` = unrestricted.
+    pub parental: Option<ParentalScope>,
     /// Per-user-data predicates (favourite / played / resumable).
     pub user_data: UserDataQuery,
     /// The sort chain. Empty = the implicit `(Id, Asc)` order. The store
@@ -1831,6 +1837,19 @@ pub struct MediaQuery {
     /// into the single `query()` statement so no whole-library load + filter
     /// remains. All conjunctive (`AND`) with the rest of the query.
     pub filters: MediaFilters,
+}
+
+/// T68 — a user's resolved parental-control scope, applied as a query filter
+/// so page totals and offsets stay honest (vs post-filtering a page). Built
+/// from `UserPolicy.max_parental_rating` + the config rating table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParentalScope {
+    /// Official-rating strings (lowercased) whose configured score is within
+    /// the user's `max_parental_rating`. An item whose rating is not in this
+    /// set (scored above the max, or unknown to the table) is filtered.
+    pub allowed_ratings_lc: Vec<String>,
+    /// Whether unrated items (NULL / empty `official_rating`) are blocked.
+    pub block_unrated: bool,
 }
 
 /// LIB-B2 — the residual scalar / boolean `/Items` chip filters (the

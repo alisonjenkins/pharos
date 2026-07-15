@@ -239,6 +239,10 @@ pub struct AppState {
     /// a re-open / re-seek burst never re-decodes the whole source. Session-
     /// scoped (the endpoint is client-optional); see [`crate::api::jellyfin::waveform`].
     pub waveform: crate::api::jellyfin::waveform::WaveformCache,
+    /// T68 — official-rating → score table backing `MaxParentalRating`
+    /// enforcement. Defaults to the built-in US table; boot overrides it from
+    /// `[parental]` config when present.
+    pub parental_ratings: crate::parental::ParentalRatingMap,
 }
 
 /// Max recent activity entries retained in memory (T73).
@@ -470,6 +474,7 @@ impl AppState {
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             waveform: Default::default(),
+            parental_ratings: crate::parental::ParentalRatingMap::us_default(),
         }
     }
 
@@ -538,6 +543,7 @@ impl AppState {
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             waveform: Default::default(),
+            parental_ratings: crate::parental::ParentalRatingMap::us_default(),
         })
     }
 

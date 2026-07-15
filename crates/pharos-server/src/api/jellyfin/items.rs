@@ -3186,10 +3186,10 @@ async fn list_items(
     if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
         return Ok(resp);
     }
-    if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &q).await? {
+    if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &user.0.policy, &q).await? {
         return Ok(resp);
     }
-    let dto = run_items_list(&state, user.0.id, &q).await?;
+    let dto = run_items_list(&state, user.0.id, &user.0.policy, &q).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
 
@@ -3222,10 +3222,10 @@ async fn list_user_items(
     // its "Shows" view both issue this; without the collapse they'd render one
     // tile per episode instead of one per show, so a series like Code Geass
     // never appears as a browsable entry.
-    if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &q).await? {
+    if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &user.0.policy, &q).await? {
         return Ok(resp);
     }
-    let dto = run_items_list(&state, user.0.id, &q).await?;
+    let dto = run_items_list(&state, user.0.id, &user.0.policy, &q).await?;
     Ok(HttpResponse::Ok().json(dto))
 }
 
@@ -3242,6 +3242,7 @@ async fn list_user_items(
 async fn run_items_list(
     state: &AppState,
     user_id: UserId,
+    policy: &pharos_core::UserPolicy,
     q: &ListQuery,
 ) -> Result<ItemsResultDto, actix_web::Error> {
     let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
@@ -3256,7 +3257,11 @@ async fn run_items_list(
     }
 
     let is_random = sort_primary(q.sort_by.as_deref()) == SortPrimary::Random;
-    let mq = build_media_query(user_id, q, &parent, is_random);
+    let mut mq = build_media_query(user_id, q, &parent, is_random);
+    // T68 — narrow the query to what the user's policy permits (library
+    // allow-list + parental rating). Applied to the MediaQuery so page totals
+    // and offsets reflect the restricted set.
+    apply_policy_scope(&mut mq, policy, &state.parental_ratings);
 
     if is_random {
         // Byte-identical to the legacy in-memory Random path, where the
@@ -3554,6 +3559,35 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         "Album" => SortPrimary::Album,
         "ParentIndexNumber" | "IndexNumber" => SortPrimary::TrackOrder,
         _ => SortPrimary::Name,
+    }
+}
+
+/// T68 — narrow a built [`MediaQuery`] to what the requesting user's policy
+/// permits: the library allow-list (`EnabledFolders`) and the parental-rating
+/// ceiling (`MaxParentalRating`). Applied to the query (not a post-filter) so
+/// `TotalRecordCount` and paging stay honest. A no-op for an unrestricted
+/// (default) policy.
+fn apply_policy_scope(
+    mq: &mut pharos_core::MediaQuery,
+    policy: &pharos_core::UserPolicy,
+    ratings: &crate::parental::ParentalRatingMap,
+) {
+    if !policy.enable_all_folders {
+        mq.allowed_library_wire_ids = if policy.enabled_folders.is_empty() {
+            // Restricted to *no* library: a sentinel wire id that matches no
+            // row (an empty allow-list means "unrestricted" to the store).
+            vec!["\u{0}__none__".to_string()]
+        } else {
+            policy.enabled_folders.clone()
+        };
+    }
+    if let Some(max) = policy.max_parental_rating {
+        mq.parental = Some(pharos_core::ParentalScope {
+            allowed_ratings_lc: ratings.allowed_ratings_lc(max),
+            // Jellyfin's BlockUnratedItems is a per-type list; pharos applies it
+            // coarsely — any entry blocks unrated items for this user.
+            block_unrated: !policy.block_unrated_items.is_empty(),
+        });
     }
 }
 
@@ -4608,6 +4642,7 @@ fn name_matches_letter(name: &str, prefix_lower: &str) -> bool {
 async fn maybe_list_virtual_shows(
     state: &AppState,
     user_id: UserId,
+    policy: &pharos_core::UserPolicy,
     q: &ListQuery,
 ) -> Result<Option<HttpResponse>, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
@@ -4630,6 +4665,7 @@ async fn maybe_list_virtual_shows(
         }))));
     }
     let mut mq = build_media_query(user_id, q, &parent, true);
+    apply_policy_scope(&mut mq, policy, &state.parental_ratings);
     mq.kinds = vec![MediaKind::Episode];
     mq.limit = None;
     mq.start_index = 0;

@@ -209,7 +209,6 @@ async fn enforce_disabled_user_cannot_authenticate() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: EnabledFolders not enforced — restricted user sees all libraries (T68)"]
 async fn enforce_enabled_folders_filters_items() {
     let f = seed_rich().await;
     let g = guest(&f);
@@ -243,7 +242,6 @@ async fn enforce_enabled_folders_filters_items() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: MaxParentalRating not enforced — over-rated items still listed (T68)"]
 async fn enforce_max_parental_rating_filters_items() {
     let f = seed_rich().await;
     let g = guest(&f);

@@ -63,6 +63,11 @@ fn map_sqlx<E: std::fmt::Display>(e: E) -> AuthError {
     AuthError::Backend(e.to_string())
 }
 
+/// A `users` row as fetched by the user-store queries:
+/// `(id_bytes, name, password_hash, admin, policy_json)`. Postgres stores
+/// `admin` as `int4`, so the discriminant is `i32` (vs sqlite's `i64`).
+type PgUserRow = (Vec<u8>, String, String, i32, Option<String>);
+
 fn media_id_i64(id: MediaId) -> DomainResult<i64> {
     i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))
 }
@@ -2485,7 +2490,7 @@ impl UserStore for PostgresStore {
 
     #[tracing::instrument(skip(self), fields(user.name = %name))]
     async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
-        let row: Option<(Vec<u8>, String, String, i32, Option<String>)> = sqlx::query_as(
+        let row: Option<PgUserRow> = sqlx::query_as(
             "SELECT id, name, password_hash, admin, policy_json FROM users WHERE name = $1",
         )
         .bind(name)
@@ -2500,7 +2505,7 @@ impl UserStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
-        let row: Option<(Vec<u8>, String, String, i32, Option<String>)> = sqlx::query_as(
+        let row: Option<PgUserRow> = sqlx::query_as(
             "SELECT id, name, password_hash, admin, policy_json FROM users WHERE id = $1",
         )
         .bind(id_bytes)
@@ -2514,7 +2519,7 @@ impl UserStore for PostgresStore {
 
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> AuthResult<Vec<UserRecord>> {
-        let rows: Vec<(Vec<u8>, String, String, i32, Option<String>)> = sqlx::query_as(
+        let rows: Vec<PgUserRow> = sqlx::query_as(
             "SELECT id, name, password_hash, admin, policy_json FROM users ORDER BY LOWER(name)",
         )
         .fetch_all(&self.pool)
@@ -3156,7 +3161,7 @@ impl SyncGroupStore for PostgresStore {
     }
 }
 
-fn record_from_row(row: (Vec<u8>, String, String, i32, Option<String>)) -> AuthResult<UserRecord> {
+fn record_from_row(row: PgUserRow) -> AuthResult<UserRecord> {
     let uuid =
         Uuid::from_slice(&row.0).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
     Ok(UserRecord {

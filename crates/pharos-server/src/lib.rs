@@ -8,6 +8,7 @@ pub mod health;
 pub mod library_watch;
 pub mod middleware;
 pub mod obs;
+pub mod parental;
 pub mod quick_connect;
 pub mod router;
 #[cfg(unix)]
