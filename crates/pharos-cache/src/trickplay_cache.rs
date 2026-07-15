@@ -471,6 +471,173 @@ impl TrickplayCache {
         Ok(true)
     }
 
+    /// Generate the sprite set for EVERY width in `layouts` from a SINGLE source
+    /// decode (B72/T96/V36). The largest width is decoded from the source; each
+    /// smaller width is DERIVED by downscaling the master's sheets — a plain
+    /// image resize, EXACT because every width shares the same tile grid and
+    /// sheet count (`thumb_count`/`tile_count` depend only on duration+interval;
+    /// only the pixel size differs). This replaces a loop that re-read the whole
+    /// multi-GB NFS source once per width (3× for the default 320/640/1280).
+    /// Returns `true` if any width was (re)generated.
+    pub async fn ensure_generated_all(
+        &self,
+        media_id: u64,
+        layouts: &[Layout],
+        source: &Path,
+    ) -> Result<bool, TrickplayCacheError> {
+        let mut sorted: Vec<Layout> = layouts.to_vec();
+        sorted.sort_by_key(|l| std::cmp::Reverse(l.width));
+        let Some((master, rest)) = sorted.split_first() else {
+            return Ok(false);
+        };
+        // Master decodes from the source via the full single-width machinery
+        // (lock, verify-complete, wipe-partial, generate, marker, record).
+        let mut any = self.ensure_generated(media_id, *master, source).await?;
+        // Smaller widths derive from the master's on-disk sheets — no source
+        // re-decode. If the master isn't present (generate failed/declined),
+        // skip: the per-width on-demand path (`tile_bytes`) still self-heals.
+        if self.is_generated(media_id, master.width).await {
+            for target in rest {
+                any |= self
+                    .ensure_generated_derived(media_id, *master, *target)
+                    .await?;
+            }
+        }
+        Ok(any)
+    }
+
+    /// Materialise `target`'s sprite set by downscaling `master`'s sheets (no
+    /// source decode). Mirrors [`Self::ensure_generated`]'s dedup + completeness
+    /// bookkeeping so an interrupted derive re-runs instead of serving a partial.
+    async fn ensure_generated_derived(
+        &self,
+        media_id: u64,
+        master: Layout,
+        target: Layout,
+    ) -> Result<bool, TrickplayCacheError> {
+        let key: CacheKey = (media_id, target.width);
+        if self.is_generated(media_id, target.width).await {
+            return Ok(false);
+        }
+        let lock = {
+            let mut state = self.state.lock().await;
+            state
+                .fetch_locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        if self.is_generated(media_id, target.width).await {
+            return Ok(false);
+        }
+        // A marker-less but complete set (pre-marker / marker-lost) → just stamp.
+        if self
+            .verify_and_mark_complete(media_id, target.width, target.tile_count)
+            .await
+        {
+            let mut state = self.state.lock().await;
+            state.fetch_locks.remove(&key);
+            return Ok(false);
+        }
+        let dir = self.key_dir(key);
+        if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+        let bytes_written = self.derive(media_id, master, target).await?;
+        let _ = tokio::fs::write(dir.join(COMPLETE_MARKER), b"").await;
+        self.record(key, bytes_written).await;
+        self.maybe_evict().await;
+        let mut state = self.state.lock().await;
+        state.fetch_locks.remove(&key);
+        Ok(true)
+    }
+
+    /// Downscale every `{n}.jpg` sheet of `master` into `target`'s width. The
+    /// whole tiled sheet is scaled by `target.width / master.width`, so each of
+    /// the 100 thumbnails in the grid scales to the target thumbnail size — the
+    /// grid is preserved, no re-decode. Returns the total bytes written.
+    async fn derive(
+        &self,
+        media_id: u64,
+        master: Layout,
+        target: Layout,
+    ) -> Result<u64, TrickplayCacheError> {
+        let master_dir = self.key_dir((media_id, master.width));
+        let dir = self.key_dir((media_id, target.width));
+        tokio::fs::create_dir_all(&dir).await?;
+        // Sheet pixel width = per-thumbnail width × grid columns.
+        let target_sheet_px = target.width.saturating_mul(TILE_GRID);
+        let mut total: u64 = 0;
+        let mut n: u32 = 0;
+        loop {
+            let src = master_dir.join(format!("{n}.jpg"));
+            if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
+                break;
+            }
+            let out = dir.join(format!("{n}.jpg"));
+            self.scale_sheet(&src, target_sheet_px, &out).await?;
+            if let Ok(meta) = tokio::fs::metadata(&out).await {
+                total = total.saturating_add(meta.len());
+            }
+            n += 1;
+        }
+        if n == 0 {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            return Err(TrickplayCacheError::UnknownDuration);
+        }
+        Ok(total)
+    }
+
+    /// Scale one already-tiled sprite sheet JPEG to `width_px` wide (aspect
+    /// preserved), writing a fresh JPEG to `out`. Resident libav worker in prod,
+    /// else a one-shot ffmpeg scale — either way it decodes a single still, not
+    /// the source media.
+    async fn scale_sheet(
+        &self,
+        src: &Path,
+        width_px: u32,
+        out: &Path,
+    ) -> Result<(), TrickplayCacheError> {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        if let Some(pool) = &self.pool {
+            return pool
+                .extract_image(src.to_path_buf(), None, width_px, 5, out.to_path_buf())
+                .await
+                .map_err(|e| TrickplayCacheError::Ffmpeg(-1, format!("libav sheet scale: {e}")));
+        }
+        let status = Command::new(&self.ffmpeg_bin)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-i")
+            .arg(src)
+            .arg("-vf")
+            .arg(format!("scale={width_px}:-2:flags=fast_bilinear"))
+            // Full-range for mjpeg (image2), same as the master generate path.
+            .arg("-pix_fmt")
+            .arg("yuvj420p")
+            .arg("-q:v")
+            .arg("5")
+            .arg(out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| TrickplayCacheError::Spawn(e.to_string()))?;
+        if !status.status.success() {
+            let stderr = String::from_utf8_lossy(&status.stderr).into_owned();
+            return Err(TrickplayCacheError::Ffmpeg(
+                status.status.code().unwrap_or(-1),
+                stderr,
+            ));
+        }
+        Ok(())
+    }
+
     /// Run ffmpeg to populate every tile under `{root}/{media}/{width}/`.
     /// Stages into a sibling `.tmp/` dir and atomic-renames each file
     /// into place so a torn write never serves a partial sprite.
@@ -722,6 +889,25 @@ mod tests {
         assert_eq!(l.height, 180);
         assert_eq!(l.thumb_count, 9);
         assert_eq!(l.tile_count, 1);
+    }
+
+    #[test]
+    fn sheet_count_is_width_independent_so_derive_is_exact() {
+        // B72/T96: ensure_generated_all decodes the largest width and downscales
+        // the rest. That is EXACT only because every width shares the same tile
+        // grid + sheet count (they depend on duration+interval, NOT width) — a
+        // 1280 sheet scaled by 320/1280 is byte-for-byte the 320 sheet's layout.
+        let dur = 37 * 60 * 1000; // 37 min
+        let a = Layout::compute(dur, 1920, 1080, 1280, 10_000).unwrap();
+        let b = Layout::compute(dur, 1920, 1080, 640, 10_000).unwrap();
+        let c = Layout::compute(dur, 1920, 1080, 320, 10_000).unwrap();
+        assert_eq!(a.thumb_count, b.thumb_count);
+        assert_eq!(b.thumb_count, c.thumb_count);
+        assert_eq!(a.tile_count, b.tile_count);
+        assert_eq!(b.tile_count, c.tile_count);
+        // Pixel dims DO differ — that's all the derive rescales.
+        assert!(a.width > b.width && b.width > c.width);
+        assert!(a.height > b.height && b.height > c.height);
     }
 
     #[test]

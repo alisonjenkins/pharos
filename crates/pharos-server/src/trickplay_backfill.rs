@@ -300,37 +300,44 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
     if !is_video(item) {
         return;
     }
-    for &width in &ctx.widths {
-        if ctx.cache.is_generated(item.id, width).await {
-            continue;
-        }
-        let Some(layout) = build_layout(&item.probe, width, ctx.interval_ms) else {
-            continue;
-        };
+    // All configured widths from ONE source decode (B72/T96): the largest width
+    // decodes the source; the rest downscale-derive from its sheets. Previously
+    // this looped, re-reading the whole multi-GB NFS source once per width.
+    let layouts: Vec<_> = ctx
+        .widths
+        .iter()
+        .filter_map(|&width| build_layout(&item.probe, width, ctx.interval_ms))
+        .collect();
+    if !layouts.is_empty() {
         // Throttle to the adaptive gate: hold a background-I/O permit across the
-        // decode so bulk generation runs at bounded concurrency (yielding NFS +
-        // CPU headroom to live streams) yet keeps making progress even while
-        // someone is watching. The actively-watched seed bypasses it entirely.
-        // Release the permit before the cooldown so the next item can start.
+        // whole batch (master decode + derives) so bulk generation runs at
+        // bounded concurrency (yielding NFS + CPU headroom to live streams) yet
+        // keeps making progress even while someone is watching. The
+        // actively-watched seed bypasses it entirely. Release before the
+        // cooldown so the next item can start.
         let generated = {
             let _permit = acquire_gate(bypass_gate, &ctx.bg_io).await;
             ctx.cache
-                .ensure_generated(item.id, layout, &item.path)
+                .ensure_generated_all(item.id, &layouts, &item.path)
                 .await
         };
         match generated {
             Ok(true) => {
-                tracing::info!(media.id = item.id, width, "trickplay pre-generated");
+                tracing::info!(
+                    media.id = item.id,
+                    widths = layouts.len(),
+                    "trickplay pre-generated"
+                );
                 // Cool down only after real work so re-scans stay fast — but
-                // never on the actively-watched seed: its remaining widths (and
-                // the next episode behind it) should follow immediately.
+                // never on the actively-watched seed: the next episode behind it
+                // should follow immediately.
                 if !bypass_gate {
                     tokio::time::sleep(COOLDOWN).await;
                 }
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(error = %e, media.id = item.id, width, "trickplay generation failed");
+                tracing::warn!(error = %e, media.id = item.id, "trickplay generation failed");
             }
         }
     }
