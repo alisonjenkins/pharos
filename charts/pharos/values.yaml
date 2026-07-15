@@ -99,7 +99,10 @@ config:
   obs:
     logLevel: "info"
     otlpEndpoint: null
-    logDir: null
+    # Persist client-log / crash-report uploads (POST /ClientLog/Document, B66)
+    # onto the cache PVC so the native Android-TV app's "Send logs to server"
+    # lands on disk (readable via /System/Logs) instead of only the log stream.
+    logDir: /var/lib/pharos/cache/logs
     # B68 — log EVERY request (not just errors) so a strict client crashing on
     # a 200 response body can be traced to the exact endpoint. Temporary debug
     # aid; set false once the Android-TV crash is diagnosed.
