@@ -11,7 +11,30 @@ Live now: `main-1784114711-ed0b88e2d496` (B71). Single replica, 1/1.
 
 ## P0 — in-flight, must close soon
 
-### 0. ACTIVE BUG — native-TV direct-play 401 "missing token" (B72, diagnosing)
+### 0b. FOLLOW-UP — cheaper authed path for native direct-play (post-B73)
+- B73 fixes the native-TV 401 by steering non-web video direct-play onto the
+  authed HLS transcode surface — but the segmented-HLS path RE-ENCODES (it
+  cannot per-segment stream-copy; see the VideoRemux arm in hls.rs). So an
+  already-h264 source that a browser byte-serves now costs a full h264 encode
+  for the TV. Fine for 1-2 concurrent on the 16-vCPU box (B12 budget), wasteful
+  at scale. Follow-up: expose an AUTHED progressive copy-remux endpoint (the
+  progressive `/videos/{id}/stream` CAN `-c copy` per the hls.rs comment) and
+  point the native TranscodingUrl at it → zero re-encode, still authed. Or
+  better: find why the app omits the token on the direct URL (app source
+  unavailable) and restore true byte-serve direct play (zero CPU).
+
+### 0. ACTIVE BUG — native-TV direct-play 401 "missing token" (FIXED by B73)
+- STATUS 2026-07-15: root cause found + fixed (pending deploy + on-device
+  confirm). B72 header audit proved ExoPlayer's data-source client
+  (`okhttp/4.12.0`, `icy-metadata`) sends the direct-play file request with
+  ZERO auth (authorization / x-emby-token / api_key all `<absent>`), so
+  `/videos/{id}/stream?static=true` 401s "missing token" and playback stops the
+  instant it starts. B73 (`items.rs`): non-web VIDEO direct-play is overridden
+  to a Transcode decision → the client gets an authed HLS TranscodingUrl
+  (api_key embedded) and SupportsDirectPlay/Stream both false so it can't retry
+  the tokenless URL. Web keeps true direct-play (UA `Mozilla` → is_web_client).
+  Guard: tests/jellyfin_playbackinfo_native_directplay.rs.
+- Original diagnosis notes retained below for context.
 - 2026-07-15: B71 confirmed working (subtitle indices now contiguous 0/1/2…;
   no 1_000_000 sentinel). TV now gets PAST PlaybackInfo and reaches
   `POST /sessions/playing` — then immediately `/sessions/playing/stopped`.
