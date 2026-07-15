@@ -1260,6 +1260,11 @@ fn playback_qs(req: &HttpRequest) -> String {
                 parts.push(format!("AudioStreamIndex={v}"));
             } else if k.eq_ignore_ascii_case("SubtitleStreamIndex") {
                 parts.push(format!("SubtitleStreamIndex={v}"));
+            } else if k.eq_ignore_ascii_case("StartTimeTicks") {
+                // B74 — forward the resume offset from master → variant playlist
+                // so `render_variant_playlist` can emit `EXT-X-START:TIME-OFFSET`
+                // (P18). Without this the native app resumes at 0:00.
+                parts.push(format!("StartTimeTicks={v}"));
             }
         }
     }

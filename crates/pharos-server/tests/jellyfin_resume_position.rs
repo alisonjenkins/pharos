@@ -102,6 +102,66 @@ async fn playback_info_emits_resume_position_on_both_top_and_media_source() {
 }
 
 #[actix_web::test]
+async fn native_transcoding_url_carries_resume_offset_but_web_does_not() {
+    // B74 — a native player (Android TV / ExoPlayer) plays the TranscodingUrl
+    // verbatim and doesn't client-seek a transcode, so the resume offset must
+    // ride the URL as StartTimeTicks (else it resumes at 0:00). jellyfin-web
+    // self-seeks in the full VOD playlist, so its URL must stay clean.
+    let (state, token) = seed(false, 12_000_000_000).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let call = |ua: Option<&'static str>| {
+        let mut r = test::TestRequest::post()
+            .uri("/Items/7/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("content-type", "application/json"));
+        if let Some(ua) = ua {
+            r = r.insert_header(("User-Agent", ua));
+        }
+        r.set_payload(r#"{"DeviceProfile":{}}"#).to_request()
+    };
+
+    // Native (Android TV UA): TranscodingUrl must carry StartTimeTicks.
+    let body = test::call_and_read_body(
+        &app,
+        call(Some(
+            "Jellyfin Android TV/0.19.9 via jellyfin-sdk-kotlin (OkHttp/4.12.0)",
+        )),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        url.contains("StartTimeTicks=12000000000"),
+        "native resume offset must ride the TranscodingUrl: {url:?}"
+    );
+
+    // Web (browser UA): no StartTimeTicks — jellyfin-web self-seeks.
+    let body = test::call_and_read_body(
+        &app,
+        call(Some(
+            "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+        )),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let url = v["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !url.contains("StartTimeTicks"),
+        "web URL must stay clean (it self-seeks): {url:?}"
+    );
+}
+
+#[actix_web::test]
 async fn playback_info_emits_zero_resume_when_item_is_played() {
     // Jellyfin convention: played=true means "watched already";
     // resume offset gets zeroed so playback restarts from 0.

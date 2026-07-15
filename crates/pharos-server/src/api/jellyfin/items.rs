@@ -1999,6 +1999,20 @@ async fn playback_info(
             _ => None,
         }
     };
+    // B74 — native players (Android TV / ExoPlayer) use the TranscodingUrl
+    // verbatim and do NOT client-seek a transcode, so a resume must ride the
+    // URL as `StartTimeTicks` (real Jellyfin does exactly this). Web self-seeks
+    // in the full VOD playlist + carries its own resume via the top-level
+    // StartPositionTicks, so its URL is left untouched. On the native side this
+    // reaches `render_variant_playlist` (via playback_qs, B74) which emits
+    // `EXT-X-START:TIME-OFFSET` → the player lands at the resume point instead
+    // of 0:00 (deep segments transcode as fast as seg 0 — input seek).
+    let transcoding_url = match transcoding_url {
+        Some(u) if !is_web_client && resume_ticks > 0 && !u.contains("StartTimeTicks") => {
+            Some(format!("{u}&StartTimeTicks={resume_ticks}"))
+        }
+        other => other,
+    };
     // P9 — emitted container reflects the negotiated target when remuxing.
     let advertised_container = match &decision {
         Decision::VideoRemux {
