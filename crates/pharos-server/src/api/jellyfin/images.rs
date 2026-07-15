@@ -110,6 +110,7 @@ async fn get_image(
         0,
         false,
         parse_image_format(req.query_string()),
+        requested_width(req.query_string()),
     )
     .await
 }
@@ -126,6 +127,7 @@ async fn head_image(
         0,
         true,
         parse_image_format(req.query_string()),
+        requested_width(req.query_string()),
     )
     .await
 }
@@ -142,6 +144,7 @@ async fn get_image_indexed(
         path.image_index,
         false,
         parse_image_format(req.query_string()),
+        requested_width(req.query_string()),
     )
     .await
 }
@@ -158,6 +161,7 @@ async fn head_image_indexed(
         path.image_index,
         true,
         parse_image_format(req.query_string()),
+        requested_width(req.query_string()),
     )
     .await
 }
@@ -211,6 +215,7 @@ async fn serve_image(
     index: u32,
     head_only: bool,
     format: ImageFormat,
+    req_width: Option<u32>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
@@ -282,7 +287,7 @@ async fn serve_image(
     // which matches Jellyfin's own season fallback.
     if synth_id && index == 0 {
         if let Some(local) = season_sidecar_path(&item, id_str, role).await {
-            return serve_local_artwork(&local, role, head_only, format, state).await;
+            return serve_local_artwork(&local, role, head_only, format, state, req_width).await;
         }
     }
     // LIB-D5 — local-sidecar-first resolution. D4 records artwork
@@ -301,7 +306,7 @@ async fn serve_image(
     // public image route on a stale row).
     if index == 0 {
         if let Some(local) = local_artwork_path(state, id, role).await {
-            return serve_local_artwork(&local, role, head_only, format, state).await;
+            return serve_local_artwork(&local, role, head_only, format, state, req_width).await;
         }
     }
     // An audio track has no video frames, so Backdrop / Thumb can only ever
@@ -336,6 +341,18 @@ async fn serve_image(
             );
             return Ok(HttpResponse::NotFound().body(""));
         }
+    };
+    // Downscale to the client-requested display width (capped per role) before
+    // serving. The extracted/stored cache jpeg is full source resolution (a
+    // 1080p video frame, a full-size embedded cover); shipping that for a
+    // `fillWidth=300` grid tile made the client decode a multi-MB bitmap per
+    // item → a RAM-tight TV's LMK SIGKILL'd the app on scroll. `scaled_artwork`
+    // caches per-width (keyed on path+mtime+width) and no-ops small inputs, so
+    // this is a one-time encode per (image, width). Logo/Banner/Art/Disc return
+    // None (alpha PNGs a JPEG rescale would wreck) → served untouched.
+    let jpeg_path = match effective_width(role, req_width) {
+        Some(width) => cache.scaled_artwork(&jpeg_path, width).await,
+        None => jpeg_path,
     };
     // P46 + P48 — optional re-encode to webp / avif via the
     // FfmpegBackend trait (was a direct Command::new in P46; routed
@@ -597,18 +614,16 @@ async fn serve_local_artwork(
     head_only: bool,
     format: ImageFormat,
     state: &AppState,
+    req_width: Option<u32>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    // Downscale big poster/fanart sidecars to a display-appropriate width and
-    // serve the cached copy — a full-res multi-MB sidecar read off NFS was
-    // costing 1-4s per tile in a library grid. Only opaque photographic roles
-    // are scaled; Logo/Banner/Art/Disc are usually small PNGs with alpha that
-    // a JPEG re-encode would wreck, so they pass through untouched.
-    let target_width: Option<u32> = match role {
-        ImageRole::Primary => Some(480),
-        ImageRole::Thumb => Some(640),
-        ImageRole::Backdrop => Some(1280),
-        _ => None,
-    };
+    // Downscale big poster/fanart sidecars to the client-requested display width
+    // (capped per role) and serve the cached copy — a full-res multi-MB sidecar
+    // read off NFS was costing 1-4s per tile in a library grid AND made the
+    // client decode a giant bitmap (the home-screen scroll OOM). Only opaque
+    // photographic roles are scaled; Logo/Banner/Art/Disc are usually small
+    // PNGs with alpha that a JPEG re-encode would wreck, so they pass through
+    // untouched (`effective_width` → None).
+    let target_width: Option<u32> = effective_width(role, req_width);
     let scaled;
     let path = match (target_width, state.images.as_ref()) {
         (Some(width), Some(cache)) => {
@@ -703,6 +718,62 @@ fn parse_image_format(qs: &str) -> ImageFormat {
         }
     }
     ImageFormat::Jpeg
+}
+
+/// The display width the client asked the image to be delivered at. jellyfin's
+/// clients request grid thumbnails with `fillWidth`/`fillHeight` (and older /
+/// alternate shapes `maxWidth`/`maxHeight`/`width`/`height`) — e.g. an Android
+/// TV home row asks for `fillWidth=300`. pharos previously ignored these and
+/// shipped the full-resolution artwork (a 1280-wide backdrop, a 480×720
+/// poster), so the client decoded a multi-MB bitmap per tile; scrolling a
+/// library / home screen piled up graphics memory and, on a RAM-tight TV, the
+/// LMK SIGKILL'd the app. Honour the request so the wire + decoded bitmap match
+/// what's shown.
+///
+/// Width-type params win (the scaler is width-driven, aspect preserved); a
+/// height-only request falls back to using the height as the width bound —
+/// imprecise but still caps memory, and the client rescales for display. `0`
+/// / unparseable values are ignored (Jellyfin treats them as "unset").
+fn requested_width(qs: &str) -> Option<u32> {
+    let mut width_kind: Option<u32> = None;
+    let mut height_kind: Option<u32> = None;
+    for kv in qs.split('&') {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        let Ok(n) = v.parse::<u32>() else { continue };
+        if n == 0 {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("fillWidth")
+            || k.eq_ignore_ascii_case("maxWidth")
+            || k.eq_ignore_ascii_case("width")
+        {
+            // Smallest requested width wins — several params may be present.
+            width_kind = Some(width_kind.map_or(n, |c| c.min(n)));
+        } else if k.eq_ignore_ascii_case("fillHeight")
+            || k.eq_ignore_ascii_case("maxHeight")
+            || k.eq_ignore_ascii_case("height")
+        {
+            height_kind = Some(height_kind.map_or(n, |c| c.min(n)));
+        }
+    }
+    width_kind.or(height_kind)
+}
+
+/// Cap a client-requested width by the role's sane maximum so a client asking
+/// for a huge size can't force a giant re-encode, while a smaller request (the
+/// common grid-thumbnail case) is honoured exactly. `None` role cap (Logo /
+/// Banner / Art / Disc — small alpha PNGs a JPEG rescale would wreck) means
+/// "don't rescale": return None so the original is served untouched.
+fn effective_width(role: ImageRole, requested: Option<u32>) -> Option<u32> {
+    let cap = match role {
+        ImageRole::Primary => 480,
+        ImageRole::Thumb => 640,
+        ImageRole::Backdrop => 1280,
+        _ => return None,
+    };
+    Some(requested.map_or(cap, |w| w.min(cap)))
 }
 
 /// P46 + P48 — transcode the cached jpeg into a sibling `.{ext}`
@@ -821,6 +892,43 @@ mod tests {
             ImageFormat::Jpeg
         ));
         assert!(matches!(parse_image_format(""), ImageFormat::Jpeg));
+    }
+
+    #[::core::prelude::v1::test]
+    fn requested_width_parses_jellyfin_size_params() {
+        // The Android TV home row asks for fillWidth=300.
+        assert_eq!(
+            requested_width("fillWidth=300&fillHeight=450&tag=x"),
+            Some(300)
+        );
+        assert_eq!(requested_width("maxWidth=250"), Some(250));
+        assert_eq!(requested_width("width=200"), Some(200));
+        // Height-only falls back to the height value as the width bound.
+        assert_eq!(requested_width("fillHeight=450"), Some(450));
+        // Width-type wins over height-type when both present.
+        assert_eq!(requested_width("fillHeight=450&fillWidth=300"), Some(300));
+        // Smallest width wins when several are given.
+        assert_eq!(requested_width("maxWidth=600&fillWidth=300"), Some(300));
+        // Zero / unparseable / absent → None (Jellyfin treats as unset).
+        assert_eq!(requested_width("fillWidth=0"), None);
+        assert_eq!(requested_width("fillWidth=abc"), None);
+        assert_eq!(requested_width("tag=x&quality=90"), None);
+        assert_eq!(requested_width(""), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn effective_width_caps_by_role_and_honours_smaller_requests() {
+        // A 300px grid request is honoured exactly (below every cap).
+        assert_eq!(effective_width(ImageRole::Primary, Some(300)), Some(300));
+        assert_eq!(effective_width(ImageRole::Backdrop, Some(300)), Some(300));
+        // An oversized request is capped at the role max.
+        assert_eq!(effective_width(ImageRole::Primary, Some(4000)), Some(480));
+        assert_eq!(effective_width(ImageRole::Backdrop, Some(4000)), Some(1280));
+        // No request → the role's default cap (prior behaviour).
+        assert_eq!(effective_width(ImageRole::Thumb, None), Some(640));
+        // Alpha roles never rescale (JPEG re-encode would wreck them).
+        assert_eq!(effective_width(ImageRole::Logo, Some(300)), None);
+        assert_eq!(effective_width(ImageRole::Banner, None), None);
     }
 
     async fn seed_state() -> web::Data<crate::state::AppState> {
