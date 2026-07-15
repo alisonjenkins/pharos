@@ -189,6 +189,14 @@ async fn direct_play_omits_transcoding_sub_protocol() {
     let req = test::TestRequest::post()
         .uri("/Items/3/PlaybackInfo")
         .insert_header(("X-Emby-Token", token.as_str()))
+        // A browser UA: this "http" sub-protocol invariant is jellyfin-web's
+        // direct-play path. B73 steers NON-web clients off direct play (their
+        // ExoPlayer builds a tokenless /stream → 401), so a native UA here
+        // would transcode instead; the invariant is exercised on the browser.
+        .insert_header((
+            "User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+        ))
         .insert_header(("content-type", "application/json"))
         .set_payload(
             r#"{"DeviceProfile":{
