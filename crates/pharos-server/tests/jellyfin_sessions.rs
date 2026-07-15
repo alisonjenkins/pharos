@@ -448,3 +448,40 @@ async fn user_items_resume_alias_returns_200() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v["Items"].is_array(), "resume result carries Items array");
 }
+
+// B66 — /ClientLog/Document must STORE + surface the uploaded crash/log report
+// (previously a 204 discard) and return a ClientLogDocumentResponseDto.
+#[actix_web::test]
+async fn client_log_document_returns_filename() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/ClientLog/Document")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("content-type", "text/plain"))
+        .insert_header((
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="Jellyfin Android TV", Device="Chromecast", DeviceId="d", Version="0.19""#,
+        ))
+        .set_payload("FATAL EXCEPTION: main\n  at org.jellyfin...")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "crash-report upload must be accepted");
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/ClientLog/Document")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_payload("second report")
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v["FileName"]
+            .as_str()
+            .map(|s| s.ends_with(".log"))
+            .unwrap_or(false),
+        "returns a .log FileName, got {v}"
+    );
+}

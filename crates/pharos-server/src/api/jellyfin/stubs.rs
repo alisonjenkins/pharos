@@ -7,8 +7,9 @@
 //! exposes mutable state — they're shaped to make the client render
 //! "nothing configured" without throwing.
 
-use crate::api::jellyfin::auth_extractor::AuthUser;
-use actix_web::{web, HttpResponse, Responder};
+use crate::api::jellyfin::auth_extractor::{auth_header_from_request, AuthUser};
+use crate::state::AppState;
+use actix_web::{web, HttpRequest, HttpResponse, Responder};
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     cfg
@@ -43,10 +44,58 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Wall-clock + uptime — jellyfin-web hits /GetUtcTime to skew
         // its session timer. Server uses this clock; we publish ours.
         .route("/getutctime", web::get().to(get_utc_time))
-        // Client-side log POSTs — accept + discard.
-        .route("/clientlog/document", web::post().to(no_content))
+        // Client-side log / CRASH-report uploads — store + surface (B66).
+        .route("/clientlog/document", web::post().to(client_log_document))
         // Stay-alive ping while playback is active.
         .route("/sessions/playing/ping", web::post().to(no_content));
+}
+
+/// `POST /ClientLog/Document` (B66) — a client (notably the native Android/TV
+/// app) uploads a log or CRASH report as the raw request body. Previously
+/// discarded (204 stub), which is why the Android TV's "crash report was sent"
+/// had nothing on the server. Now surfaced in the SERVER log stream (kubectl /
+/// Loki — where we actually read it) and, when a log dir is configured, written
+/// to `<log_dir>/clientlog/`. Returns the filename (Jellyfin's
+/// `ClientLogDocumentResponseDto`). Auth is best-effort (a crashing client may
+/// not send a full header) — the report always lands.
+async fn client_log_document(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Bytes,
+) -> impl Responder {
+    let auth = auth_header_from_request(&req);
+    let client = auth.client.clone().unwrap_or_else(|| "client".into());
+    let device = auth.device.clone().unwrap_or_default();
+    let version = auth.version.clone().unwrap_or_default();
+    let text = String::from_utf8_lossy(&body);
+    // Cap the inline body so a huge upload can't flood the log; the full report
+    // still lands on disk when a log dir is set.
+    const INLINE_CAP: usize = 16 * 1024;
+    let snippet: String = text.chars().take(INLINE_CAP).collect();
+    let truncated = snippet.len() < text.len();
+    tracing::warn!(
+        client = %client, device = %device, version = %version,
+        bytes = body.len(), truncated,
+        "client log / crash report:\n{snippet}"
+    );
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let safe_client: String = client
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let file_name = format!("{ts}_{safe_client}.log");
+    if let Some(dir) = &state.log_dir {
+        let cl = dir.join("clientlog");
+        if tokio::fs::create_dir_all(&cl).await.is_ok() {
+            let _ = tokio::fs::write(cl.join(&file_name), body.as_ref()).await;
+        }
+    }
+    crate::api::jellyfin::wire::json(&pharos_jellyfin_api::dto::ClientLogDocumentResponseDto {
+        file_name,
+    })
 }
 
 async fn empty_array(_user: AuthUser) -> impl Responder {

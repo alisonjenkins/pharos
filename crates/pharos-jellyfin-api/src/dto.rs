@@ -41,6 +41,15 @@ pub struct SystemInfoDto {
     pub system_architecture: &'static str,
 }
 
+/// Response of `POST /ClientLog/Document` (Jellyfin `ClientLogDocumentResponseDto`).
+/// The client uploads a log / crash report; the server stores it and returns the
+/// filename it was written under.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ClientLogDocumentResponseDto {
+    pub file_name: String,
+}
+
 /// The UNAUTHENTICATED `/System/Info/Public` probe every client hits at boot
 /// (the kotlin SDK's `PublicSystemInfo`). A strict subset of SystemInfo with no
 /// server-internal paths (V9). Typed so the boot handshake can't silently drop
