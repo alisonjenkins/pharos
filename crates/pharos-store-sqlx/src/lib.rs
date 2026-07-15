@@ -61,6 +61,10 @@ pub mod audio_track_json;
 // JSON adapter for MediaMetadata.provider_ids (LIB-C9). Same pattern.
 pub mod provider_ids_json;
 
+// JSON adapter for the Vec<String> metadata columns —
+// production_locations + trailers (T67). Same pattern.
+pub mod string_list_json;
+
 // LIB-B1 — backend-agnostic SQL builder for MediaStore::query(). Shared by
 // both backends (only the placeholder token + null-limit token differ).
 #[cfg(any(feature = "sqlite", feature = "postgres"))]

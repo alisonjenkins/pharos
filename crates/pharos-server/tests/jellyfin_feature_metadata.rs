@@ -127,7 +127,6 @@ async fn item_external_urls_populated() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: RemoteTrailers never populated (T67)"]
 async fn item_remote_trailers_populated() {
     let f = seed_rich().await;
     let d = rich_detail(&f).await;
@@ -138,7 +137,6 @@ async fn item_remote_trailers_populated() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: ProductionLocations never populated (T67)"]
 async fn item_production_locations_populated() {
     let f = seed_rich().await;
     let d = rich_detail(&f).await;

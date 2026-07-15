@@ -27,9 +27,10 @@
 //! `criticrating` → `critic_rating`, `mpaa` / `certification` →
 //! `official_rating`, repeated `<genre>` → genres, repeated `<studio>` →
 //! studios, repeated `<tag>` → tags, `<set>` / `<collection>` →
-//! collections, `<actor>` → people (Actor), `<director>` / `<credits>` →
-//! people, `<uniqueid type=...>` / `<id>` / `<imdbid>` → provider_ids,
-//! `<thumb>` / `<fanart>` → artwork.
+//! collections, repeated `<country>` → production_locations, repeated
+//! `<trailer>` → trailers, `<actor>` → people (Actor), `<director>` /
+//! `<credits>` → people, `<uniqueid type=...>` / `<id>` / `<imdbid>` →
+//! provider_ids, `<thumb>` / `<fanart>` → artwork.
 //!
 //! ## V6 tolerance
 //! Missing/extra/unknown elements are ignored. An **absent** NFO yields
@@ -186,6 +187,8 @@ fn fold_under(acc: &mut MetadataResult, under: MetadataResult) {
     extend_str(&mut acc.studios, under.studios);
     extend_str(&mut acc.tags, under.tags);
     extend_str(&mut acc.collections, under.collections);
+    extend_str(&mut acc.production_locations, under.production_locations);
+    extend_str(&mut acc.trailers, under.trailers);
     for p in under.people {
         if !acc
             .people
@@ -231,8 +234,6 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
     cfg.check_end_names = false;
 
     let mut result = MetadataResult::default();
-    // The text of the element we're currently inside (last `<tag>` opened).
-    let mut cur_tag: Vec<u8> = Vec::new();
     // Original-title fallback (only applied to `title` if `<title>` absent).
     let mut original_title: Option<String> = None;
     // Pending actor being assembled across child elements.
@@ -250,6 +251,13 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
     // so the nested `<name>` routes to collections (outside <set> a bare
     // `<name>` has no top-level meaning).
     let mut in_set = false;
+    // Text of the current element, accumulated across the (possibly several)
+    // Text + GeneralRef events quick-xml 0.41 emits for one element — an entity
+    // like `&amp;` arrives as its own `GeneralRef` event that SPLITS the
+    // surrounding literal text, so a URL like `…?a=1&amp;b=2` (Kodi `<trailer>`)
+    // must be reassembled here or it fragments into two values. Applied once on
+    // the element's `End`.
+    let mut cur_text = String::new();
     let mut buf = Vec::new();
 
     loop {
@@ -273,7 +281,7 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                     }
                     _ => {}
                 }
-                cur_tag = tag;
+                cur_text.clear();
             }
             Ok(Event::Empty(e)) => {
                 // Self-closing elements (e.g. `<thumb url="..."/>` is rare;
@@ -299,32 +307,48 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                 }
             }
             Ok(Event::Text(t)) => {
-                // quick-xml 0.41 split the old `BytesText::unescape` into two
-                // steps: `decode` (charset → str) then `escape::unescape`
-                // (resolve XML entities). Tolerate a bad entity/encoding in
-                // one node by skipping it.
-                let Ok(decoded) = t.decode() else { continue };
-                let Ok(unescaped) = quick_xml::escape::unescape(&decoded) else {
-                    continue;
-                };
-                let text = unescaped.trim().to_string();
-                if text.is_empty() {
-                    continue;
+                // Accumulate the literal run (charset-decoded). Entities in this
+                // node arrive separately as `GeneralRef`; a `decode` failure on a
+                // bad-encoding node just drops that run (V6 tolerance).
+                if let Ok(decoded) = t.decode() {
+                    cur_text.push_str(&decoded);
                 }
-                apply_text(
-                    &cur_tag,
-                    &text,
-                    &mut result,
-                    &mut original_title,
-                    &mut actor,
-                    &mut uniqueid_type,
-                    in_ratings,
-                    in_set,
-                );
+            }
+            Ok(Event::GeneralRef(r)) => {
+                // Re-insert the character an entity/char-ref stands for so the
+                // element's text reassembles intact (`&amp;` → `&`, `&#48;` →
+                // `0`). Unknown named entities are dropped (V6 tolerance).
+                if let Ok(Some(c)) = r.resolve_char_ref() {
+                    cur_text.push(c);
+                } else if let Ok(name) = r.decode() {
+                    match name.as_ref() {
+                        "amp" => cur_text.push('&'),
+                        "lt" => cur_text.push('<'),
+                        "gt" => cur_text.push('>'),
+                        "quot" => cur_text.push('"'),
+                        "apos" => cur_text.push('\''),
+                        _ => {}
+                    }
+                }
             }
             Ok(Event::End(e)) => {
                 let name = e.local_name();
                 let tag = name.as_ref().to_ascii_lowercase();
+                // Apply the element's fully-accumulated text (keyed by the
+                // closing tag) before running the block-scope bookkeeping below.
+                let text = cur_text.trim();
+                if !text.is_empty() {
+                    apply_text(
+                        &tag,
+                        text,
+                        &mut result,
+                        &mut original_title,
+                        &mut actor,
+                        &mut uniqueid_type,
+                        in_ratings,
+                        in_set,
+                    );
+                }
                 match tag.as_slice() {
                     b"actor" => {
                         if let Some(b) = actor.take() {
@@ -338,7 +362,7 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                     b"uniqueid" => uniqueid_type = None,
                     _ => {}
                 }
-                cur_tag.clear();
+                cur_text.clear();
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -432,6 +456,9 @@ fn apply_text(
         b"genre" => push_unique(&mut result.genres, text),
         b"studio" => push_unique(&mut result.studios, text),
         b"tag" => push_unique(&mut result.tags, text),
+        // T67 — `<country>` → ProductionLocations, `<trailer>` → RemoteTrailers.
+        b"country" => push_unique(&mut result.production_locations, text),
+        b"trailer" => push_unique(&mut result.trailers, text),
         b"set" | b"collection" => push_unique(&mut result.collections, text),
         b"director" => result.people.push(PersonRef {
             name: text.to_string(),

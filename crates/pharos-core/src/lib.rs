@@ -87,6 +87,12 @@ pub struct MediaMetadata {
     pub tagline: Option<String>,
     /// External provider ids → Jellyfin `ProviderIds` map.
     pub provider_ids: ProviderIds,
+    /// Production countries (Kodi NFO `<country>`) → Jellyfin
+    /// `ProductionLocations` (an array of country names). Empty when none.
+    pub production_locations: Vec<String>,
+    /// Trailer URLs (Kodi NFO `<trailer>`) → Jellyfin `RemoteTrailers`
+    /// (`[{Url, Name}]`). Empty when none.
+    pub trailers: Vec<String>,
 }
 
 /// LIB-C9 — external metadata-provider identifiers. Persisted as a JSON
@@ -307,6 +313,10 @@ pub struct MetadataResult {
     pub people: Vec<PersonRef>,
     pub tags: Vec<String>,
     pub collections: Vec<String>,
+    /// Production countries (NFO `<country>`) → `MediaMetadata::production_locations`.
+    pub production_locations: Vec<String>,
+    /// Trailer URLs (NFO `<trailer>`) → `MediaMetadata::trailers`.
+    pub trailers: Vec<String>,
     pub provider_ids: ProviderIds,
     pub artwork: Vec<ArtworkRef>,
 }

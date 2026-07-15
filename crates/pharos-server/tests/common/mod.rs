@@ -122,6 +122,8 @@ pub async fn seed_rich() -> Fixture {
                     tmdb: Some("55555".into()),
                     ..Default::default()
                 },
+                production_locations: vec!["USA".into()],
+                trailers: vec!["https://youtu.be/dQw4w9WgXcQ".into()],
                 ..Default::default()
             },
             ..Default::default()

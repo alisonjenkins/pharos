@@ -22,6 +22,9 @@ const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
   <genre>Sci-Fi</genre>
   <studio>Warner Bros.</studio>
   <tag>cyberpunk</tag>
+  <country>USA</country>
+  <country>Australia</country>
+  <trailer>plugin://plugin.video.youtube/?action=play_video&amp;videoid=m8e-FF8MsqU</trailer>
   <set>The Matrix Collection</set>
   <uniqueid type="tmdb">603</uniqueid>
   <uniqueid type="imdb">tt0133093</uniqueid>
@@ -110,6 +113,12 @@ async fn movie_nfo_maps_all_common_fields() {
     assert_eq!(r.studios, vec!["Warner Bros."]);
     assert_eq!(r.tags, vec!["cyberpunk"]);
     assert_eq!(r.collections, vec!["The Matrix Collection"]);
+    // T67 — repeated <country> → production_locations; <trailer> → trailers.
+    assert_eq!(r.production_locations, vec!["USA", "Australia"]);
+    assert_eq!(
+        r.trailers,
+        vec!["plugin://plugin.video.youtube/?action=play_video&videoid=m8e-FF8MsqU"]
+    );
     assert_eq!(r.provider_ids.tmdb.as_deref(), Some("603"));
     assert_eq!(r.provider_ids.imdb.as_deref(), Some("tt0133093"));
 

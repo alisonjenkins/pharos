@@ -315,6 +315,8 @@ async fn metadata_roundtrips_through_store() {
             imdb: Some("tt0133093".into()),
             ..Default::default()
         },
+        production_locations: vec!["USA".into(), "Australia".into()],
+        trailers: vec!["https://youtu.be/m8e-FF8MsqU".into()],
     };
     s.put(it.clone()).await.unwrap();
     let got = s.get(7).await.unwrap();

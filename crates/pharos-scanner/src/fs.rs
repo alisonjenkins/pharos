@@ -961,6 +961,8 @@ fn merge_metadata_into_item(item: &mut MediaItem, meta: MetadataResult) -> Merge
         people,
         tags,
         collections,
+        production_locations,
+        trailers,
         provider_ids,
         artwork,
     } = meta;
@@ -986,6 +988,12 @@ fn merge_metadata_into_item(item: &mut MediaItem, meta: MetadataResult) -> Merge
     set_some(&mut md.provider_ids.tvdb, provider_ids.tvdb);
     set_some(&mut md.provider_ids.imdb, provider_ids.imdb);
     set_some(&mut md.provider_ids.mbid, provider_ids.mbid);
+    // T67 — production countries (`ProductionLocations`) + trailer URLs
+    // (`RemoteTrailers`) live directly on the metadata (Vec<String>), not a
+    // join. The resolver already merged/deduped across NFO layers; normalise
+    // (trim + drop blanks) once more so a stray blank never reaches the wire.
+    md.production_locations = normalise_list(production_locations);
+    md.trailers = normalise_list(trailers);
 
     // Genre union: probe column first (stable order), then NFO tags.
     let probe_genres = item
@@ -1032,6 +1040,18 @@ fn set_some<T>(slot: &mut Option<T>, value: Option<T>) {
     if value.is_some() {
         *slot = value;
     }
+}
+
+/// Trim, drop blanks, and de-dup (preserving order) a resolved string list.
+fn normalise_list(items: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for s in items {
+        let s = s.trim().to_string();
+        if !s.is_empty() && !out.iter().any(|e| e == &s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// LIB-D7 — persist resolved artwork refs via [`MediaStore::set_artwork`],

@@ -18,7 +18,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     subtitle_tracks_json, attachments_json, artist, album, album_artist, genre, created_at, chapters_json, \
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
-    premiere_date, overview, tagline, provider_ids, series_folder, series_year, track_number, disc_number, release_year";
+    premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
+    series_folder, series_year, track_number, disc_number, release_year";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -588,6 +589,8 @@ impl MediaStore for SqliteStore {
         let chapters_json = crate::chapter_json::encode(&p.chapters);
         let m = &item.metadata;
         let provider_ids_json = crate::provider_ids_json::encode(&m.provider_ids);
+        let production_locations_json = crate::string_list_json::encode(&m.production_locations);
+        let trailers_json = crate::string_list_json::encode(&m.trailers);
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -608,9 +611,10 @@ impl MediaStore for SqliteStore {
                 audio_tracks_json, attachments_json, \
                 community_rating, critic_rating, official_rating, production_year, \
                 premiere_date, overview, tagline, provider_ids, \
+                production_locations_json, trailers_json, \
                 series_folder, series_year, track_number, disc_number, release_year, title_fold) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            title_fold = excluded.title_fold,
@@ -651,6 +655,8 @@ impl MediaStore for SqliteStore {
                                            overview = excluded.overview,
                                            tagline = excluded.tagline,
                                            provider_ids = excluded.provider_ids,
+                                           production_locations_json = excluded.production_locations_json,
+                                           trailers_json = excluded.trailers_json,
                                            series_folder = excluded.series_folder,
                                            series_year = excluded.series_year,
                                            track_number = excluded.track_number,
@@ -704,6 +710,8 @@ impl MediaStore for SqliteStore {
         .bind(m.overview.as_deref())
         .bind(m.tagline.as_deref())
         .bind(provider_ids_json)
+        .bind(production_locations_json)
+        .bind(trailers_json)
         .bind(series_folder)
         .bind(series_year.map(|v| v as i64))
         .bind(p.track_number.map(|v| v as i64))
@@ -2658,6 +2666,8 @@ struct MediaRow {
     overview: Option<String>,
     tagline: Option<String>,
     provider_ids: Option<String>,
+    production_locations_json: Option<String>,
+    trailers_json: Option<String>,
     series_folder: Option<String>,
     series_year: Option<i64>,
     track_number: Option<i64>,
@@ -2729,6 +2739,10 @@ impl MediaRow {
             overview: self.overview,
             tagline: self.tagline,
             provider_ids: crate::provider_ids_json::decode(self.provider_ids.as_deref()),
+            production_locations: crate::string_list_json::decode(
+                self.production_locations_json.as_deref(),
+            ),
+            trailers: crate::string_list_json::decode(self.trailers_json.as_deref()),
         };
         Ok(MediaItem {
             id,

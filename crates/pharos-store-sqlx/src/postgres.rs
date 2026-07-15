@@ -34,7 +34,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     subtitle_tracks_json, attachments_json, artist, album, album_artist, genre, created_at, chapters_json, \
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
-    premiere_date, overview, tagline, provider_ids, series_folder, series_year, track_number, disc_number, release_year";
+    premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
+    series_folder, series_year, track_number, disc_number, release_year";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -559,6 +560,8 @@ impl MediaStore for PostgresStore {
         let chapters_json = crate::chapter_json::encode(&p.chapters);
         let m = &item.metadata;
         let provider_ids_json = crate::provider_ids_json::encode(&m.provider_ids);
+        let production_locations_json = crate::string_list_json::encode(&m.production_locations);
+        let trailers_json = crate::string_list_json::encode(&m.trailers);
         let created_at = item.created_at.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -579,11 +582,13 @@ impl MediaStore for PostgresStore {
                 community_rating, critic_rating, official_rating, production_year, \
                 premiere_date, overview, tagline, provider_ids, \
                 series_folder, series_year, title_fold, attachments_json, \
-                track_number, disc_number, release_year) \
+                track_number, disc_number, release_year, \
+                production_locations_json, trailers_json) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
-                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
+                     $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, \
+                     $48, $49)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             title_fold = EXCLUDED.title_fold,
@@ -629,6 +634,8 @@ impl MediaStore for PostgresStore {
                                             track_number = EXCLUDED.track_number,
                                             disc_number = EXCLUDED.disc_number,
                                             release_year = EXCLUDED.release_year,
+                                            production_locations_json = EXCLUDED.production_locations_json,
+                                            trailers_json = EXCLUDED.trailers_json,
                                             created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
@@ -679,6 +686,8 @@ impl MediaStore for PostgresStore {
         .bind(p.track_number.map(|v| v as i32))
         .bind(p.disc_number.map(|v| v as i32))
         .bind(p.year.map(|v| v as i32))
+        .bind(production_locations_json)
+        .bind(trailers_json)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -2812,6 +2821,8 @@ struct MediaRow {
     overview: Option<String>,
     tagline: Option<String>,
     provider_ids: Option<String>,
+    production_locations_json: Option<String>,
+    trailers_json: Option<String>,
     series_folder: Option<String>,
     series_year: Option<i32>,
     track_number: Option<i32>,
@@ -2879,6 +2890,10 @@ impl MediaRow {
             overview: self.overview,
             tagline: self.tagline,
             provider_ids: crate::provider_ids_json::decode(self.provider_ids.as_deref()),
+            production_locations: crate::string_list_json::decode(
+                self.production_locations_json.as_deref(),
+            ),
+            trailers: crate::string_list_json::decode(self.trailers_json.as_deref()),
         };
         Ok(MediaItem {
             id,

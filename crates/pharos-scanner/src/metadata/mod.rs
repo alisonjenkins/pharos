@@ -136,6 +136,8 @@ fn merge_into(acc: &mut MetadataResult, next: MetadataResult) {
         people,
         tags,
         collections,
+        production_locations,
+        trailers,
         provider_ids,
         artwork,
     } = next;
@@ -155,6 +157,8 @@ fn merge_into(acc: &mut MetadataResult, next: MetadataResult) {
     extend_dedup(&mut acc.studios, studios);
     extend_dedup(&mut acc.tags, tags);
     extend_dedup(&mut acc.collections, collections);
+    extend_dedup(&mut acc.production_locations, production_locations);
+    extend_dedup(&mut acc.trailers, trailers);
     extend_people(&mut acc.people, people);
     extend_artwork(&mut acc.artwork, artwork);
 }

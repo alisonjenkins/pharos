@@ -1226,9 +1226,9 @@ impl BaseItemDto {
             tags: vec![],
             studios: vec![],
             people: vec![],
-            production_locations: vec![],
+            production_locations: item.metadata.production_locations.clone(),
             provider_ids: provider_ids_map(&item.metadata.provider_ids),
-            remote_trailers: vec![],
+            remote_trailers: remote_trailers(item),
             chapters: item
                 .probe
                 .chapters
@@ -1370,6 +1370,18 @@ fn external_urls(item: &pharos_core::MediaItem) -> Vec<serde_json::Value> {
         );
     }
     out
+}
+
+/// T67 — build `BaseItemDto.RemoteTrailers` (jellyfin-web's "Trailer" button)
+/// from the item's trailer URLs (Kodi NFO `<trailer>`). Jellyfin's `MediaUrl`
+/// shape is `{Url, Name}`; a single generic "Trailer" name matches what real
+/// Jellyfin emits when the source carries no per-trailer title.
+fn remote_trailers(item: &pharos_core::MediaItem) -> Vec<serde_json::Value> {
+    item.metadata
+        .trailers
+        .iter()
+        .map(|url| serde_json::json!({ "Url": url, "Name": "Trailer" }))
+        .collect()
 }
 
 /// LIB-C9 — project core [`ProviderIds`](pharos_core::ProviderIds) into
@@ -2258,6 +2270,7 @@ mod tests {
                     imdb: Some("tt0133093".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..Default::default()
         };
