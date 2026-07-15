@@ -1733,6 +1733,45 @@ async fn playback_info(
     };
     let decision = negotiate(&profile, &source);
 
+    // B73 — native-player direct-play auth workaround. A remote NON-web client
+    // (Android TV / mobile / Kodi) that DirectPlays streams the file from
+    // `/videos/{id}/stream?static=true` — but its ExoPlayer/okhttp data source
+    // has no auth interceptor and builds that URL with NO token (confirmed by
+    // B72: authorization / x-emby-token / api_key all absent) → 401 "missing
+    // token" → playback dies the instant it starts. Real Jellyfin survives only
+    // because its client appends api_key; ours doesn't, and we can't change the
+    // app. jellyfin-web is unaffected: its `<video src>` carries api_key and it
+    // picks up the JellyfinAuth cookie (P24). So steer every non-web VIDEO
+    // direct-play onto the authed HLS surface — the TranscodingUrl pharos mints
+    // embeds api_key + PlaySessionId (the exact path a browser streams over).
+    // Forcing the Transcode shape drops BOTH SupportsDirectPlay and
+    // SupportsDirectStream to false so the client can't retry the tokenless
+    // direct URL. Cost: an already-h264 source re-encodes instead of
+    // byte-serving (the segmented-HLS surface cannot stream-copy — see the
+    // VideoRemux arm in hls.rs), accepted to make the TV reliable; a cheaper
+    // authed copy-remux endpoint is tracked in BACKLOG.
+    // Browser vs native player is the User-Agent: a browser (jellyfin-web) sends
+    // `Mozilla/…`; a native app's media stack sends `Jellyfin Android TV/…` /
+    // `okhttp/…` / `Dart/…`. Only the browser self-authenticates a direct URL
+    // (api_key in `<video src>` + JellyfinAuth cookie), so only it keeps direct
+    // play. Unknown/absent UA → treat as native (the authed HLS path always
+    // works; a needless transcode is strictly safer than a 401).
+    let is_web_client = req
+        .headers()
+        .get(actix_web::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ua| ua.contains("Mozilla"));
+    let decision = if is_video && !is_web_client && decision.is_direct() {
+        Decision::Transcode {
+            target_container: "ts".into(),
+            target_video_codec: Some("h264".into()),
+            target_audio_codec: Some("aac".into()),
+            max_video_bitrate_bps: None,
+        }
+    } else {
+        decision
+    };
+
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
     // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
     // their Media Source Extensions frequently CANNOT decode H.264
