@@ -178,6 +178,18 @@ const SOURCES: &[Source] = &[
         video: "h264",
         audio: "aac",
     }, // webm/h264 (the trap)
+    Source {
+        id: 7,
+        container: "matroska,webm",
+        video: "h264",
+        audio: "eac3",
+    }, // B77 — the Supergirl shape: h264 + 6ch eac3 in Matroska
+    Source {
+        id: 8,
+        container: "matroska,webm",
+        video: "vp9",
+        audio: "opus",
+    }, // B77 — webm-codec Matroska: the re-label DirectStream case
 ];
 
 fn build_app(
@@ -235,6 +247,7 @@ async fn browser_codec_routing_matrix() {
                 (4, WebmVp9),    // mpeg4 → webm
                 (5, DirectPlay), // av1 plays natively → keep direct
                 (6, WebmVp9),    // webm/h264 (the trap) → force webm, NOT direct-play
+                (7, WebmVp9),    // h264+eac3 mkv → h264 forces webm (audio→opus too)
             ],
         ),
         (
@@ -248,6 +261,15 @@ async fn browser_codec_routing_matrix() {
                 (4, HlsH264),    // mpeg4 → transcode
                 (5, HlsH264),    // no av1 → transcode
                 (6, HlsH264),    // webm/h264 no direct rule → transcode
+                (7, HlsH264),    // h264+eac3 mkv → transcode (safari has no webm)
+            ],
+        ),
+        (
+            "chrome",
+            UA_CHROME,
+            PROFILE_CHROME,
+            &[
+                (7, HlsH264), // h264+eac3 mkv → transcode (chrome can't decode eac3)
             ],
         ),
     ];
@@ -301,5 +323,61 @@ async fn browser_codec_routing_matrix() {
         failures.is_empty(),
         "routing mismatches:\n  {}",
         failures.join("\n  ")
+    );
+}
+
+/// B77 — `SupportsDirectStream` must reflect whether pharos's VERBATIM `/stream`
+/// file is playable as-is for this client. pharos does not remux on that path,
+/// so a remux decision (VideoRemux/AudioRemux) may only advertise DirectStream
+/// when `deliver_stream`'s webm re-label makes the raw file play; otherwise the
+/// client must transcode via the TranscodingUrl.
+#[actix_web::test]
+async fn direct_stream_only_advertised_when_raw_file_plays() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+
+    let playback = |id: u64, profile: &'static str, ua: &'static str| {
+        let app = &app;
+        let token = token.clone();
+        async move {
+            let body = test::call_and_read_body(
+                app,
+                test::TestRequest::post()
+                    .uri(&format!("/Items/{id}/PlaybackInfo"))
+                    .insert_header(("X-Emby-Token", token.as_str()))
+                    .insert_header(("User-Agent", ua))
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload(profile.to_string())
+                    .to_request(),
+            )
+            .await;
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v["MediaSources"][0].clone()
+        }
+    };
+
+    // (7) h264 + eac3 Matroska on Chrome (no VP9 force): Chrome can't decode
+    // eac3, so it's a remux decision whose raw file is unplayable → DirectStream
+    // MUST be false, and a TranscodingUrl MUST be present so the client can
+    // actually play it. This is the h264+eac3-on-browser breakage.
+    let ms = playback(7, PROFILE_CHROME, UA_CHROME).await;
+    assert_eq!(
+        ms["SupportsDirectStream"].as_bool(),
+        Some(false),
+        "h264+eac3 mkv is not playable raw → must not advertise DirectStream: {ms}"
+    );
+    assert!(
+        ms["TranscodingUrl"].as_str().is_some_and(|u| !u.is_empty()),
+        "a non-direct-streamable remux MUST carry a TranscodingUrl fallback: {ms}"
+    );
+
+    // (8) vp9 + opus Matroska on Chrome: the webm re-label makes the verbatim
+    // file play as video/webm, and Chrome lists a webm/vp9 direct-play profile →
+    // DirectStream stays advertised (no needless transcode).
+    let ms = playback(8, PROFILE_CHROME, UA_CHROME).await;
+    assert_eq!(
+        ms["SupportsDirectStream"].as_bool(),
+        Some(true),
+        "vp9+opus mkv re-labels to video/webm → DirectStream must stay on: {ms}"
     );
 }

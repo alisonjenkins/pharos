@@ -178,10 +178,14 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(
-        v["MediaSources"][0]["SupportsDirectStream"]
-            .as_bool()
-            .unwrap_or(false),
+    // B77 — this source is h264 + ac3 in Matroska: pharos's verbatim `/stream`
+    // serves raw Matroska (browser rejects the container) with ac3 audio it
+    // can't decode, so DirectStream must NOT be advertised — the client takes
+    // the TranscodingUrl instead. (A webm-codec Matroska would keep DirectStream
+    // via the re-label; covered in browser_codec_matrix.)
+    assert_eq!(
+        v["MediaSources"][0]["SupportsDirectStream"].as_bool(),
+        Some(false),
         "{v}"
     );
     assert_eq!(

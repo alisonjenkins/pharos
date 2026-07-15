@@ -1835,13 +1835,56 @@ async fn playback_info(
         && !(decision.is_direct() && source_firefox_native);
 
     let direct_play = decision.is_direct() && !force_webm;
-    // P9 — VideoRemux supports DirectStream too: video copies + audio
-    // remuxes, so the client gets a fast-mux container without a full
-    // re-encode. Suppressed when we force a Firefox WebM transcode.
+    // B77 — `SupportsDirectStream` promises the raw `/stream` file is playable
+    // AS-IS: pharos's `/stream` serves the source verbatim (no container remux,
+    // no audio transcode — the only massaging is `deliver_stream`'s webm
+    // re-label). So it's true ONLY when the file genuinely plays for THIS
+    // client: a real DirectPlay, OR a webm-codec Matroska (VP8/9/AV1 + Opus/
+    // Vorbis) that the re-label serves as `video/webm` to a client that decodes
+    // VP9. A VideoRemux/AudioRemux of anything else — the h264+eac3/ac3/dts
+    // Matroska that dominates the library — is NOT playable raw (browser rejects
+    // the container/audio), so it must transcode via the TranscodingUrl below.
+    // Advertising DirectStream for it handed the client an unplayable stream
+    // with (for AudioRemux) no URL to fall back to. Native players that CAN play
+    // such files declare it in their profile → DirectPlay, unaffected.
+    let webm_relabel_playable = {
+        let lc = |c: &Option<String>| c.as_deref().map(|s| s.to_ascii_lowercase());
+        let v = lc(&source.video_codec);
+        let a = lc(&source.audio_codec);
+        let cont = source.container.to_ascii_lowercase();
+        let matroska = cont.contains("matroska") || cont.contains("webm") || cont.contains("mkv");
+        // The client can actually consume the re-labelled `video/webm` when it
+        // lists a webm DirectPlayProfile covering the source's video codec — the
+        // precise "would this play if the container were webm" test, so a
+        // vp9-in-matroska on a webm-capable client still direct-streams rather
+        // than needlessly transcoding.
+        let client_plays_webm_video = source.video_codec.as_deref().is_some_and(|sv| {
+            profile.direct_play_profiles.iter().any(|p| {
+                (p.kind.is_empty() || p.kind.eq_ignore_ascii_case("Video"))
+                    && p.container
+                        .split(',')
+                        .any(|c| c.trim().eq_ignore_ascii_case("webm"))
+                    && p.video_codec
+                        .split(',')
+                        .any(|c| c.trim().eq_ignore_ascii_case(sv))
+            })
+        });
+        matroska
+            && client_plays_webm_video
+            && matches!(
+                v.as_deref(),
+                Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
+            )
+            // Audio must be webm-legal too, else the re-labelled video/webm
+            // plays video but the browser can't decode the audio track.
+            && matches!(a.as_deref(), Some("opus" | "vorbis") | None)
+    };
     let supports_direct_stream = !force_webm
         && (direct_play
-            || matches!(decision, Decision::AudioRemux { .. })
-            || matches!(decision, Decision::VideoRemux { .. }));
+            || (matches!(
+                decision,
+                Decision::VideoRemux { .. } | Decision::AudioRemux { .. }
+            ) && webm_relabel_playable));
     // Forward the client's audio/subtitle track selection into the VP9 HLS
     // URL — jellyfin-web re-requests PlaybackInfo with these when the user
     // switches tracks. The VP9 segment handler maps them into ffmpeg (audio
@@ -1980,6 +2023,20 @@ async fn playback_info(
                 // Remux copies video (no burn possible) but the AUDIO pick
                 // must still ride along (B41).
                 "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
+            )),
+            // B77 — a VIDEO AudioRemux (compatible video, undecodable audio)
+            // drives the same HLS master as VideoRemux: the segment surface
+            // re-encodes to h264 + aac (a `-c:v copy` segment stream is
+            // structurally broken, see hls.rs/B45), giving the client audio it
+            // can actually decode. Without this the client got DirectStream'd
+            // raw eac3/ac3/dts and no URL to fall back to.
+            Decision::AudioRemux { .. } if is_video => Some(format!(
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
+            )),
+            // Audio-only source whose codec the client can't direct-play →
+            // the universal audio endpoint remuxes to the negotiated target.
+            Decision::AudioRemux { .. } => Some(format!(
+                "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}"
             )),
             _ => None,
         }
