@@ -24,6 +24,11 @@ pub struct ImageCache {
     /// resident worker instead of forking ffmpeg per thumbnail.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     pool: Option<pharos_transcode::worker::LibavWorkerPool>,
+    /// B72/T95 — per-key single-flight. A library grid fires many requests for
+    /// the same missing poster at once; without this each ran its own ffmpeg
+    /// extract AND raced on the shared `.jpg.tmp` scratch path. String keys
+    /// namespace the three fill sites (`fetch:`/`scale:`/`attach:`).
+    locks: std::sync::Arc<crate::single_flight::KeyedLocks<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +134,16 @@ fn noart_sentinel(out_path: &Path) -> PathBuf {
     out_path.with_extension("noart")
 }
 
+/// A per-caller-unique scratch basename (V36). A fixed name lets two concurrent
+/// batches collide on one temp dir; pid + a monotonic counter guarantee no two
+/// calls in this process (or across replicas sharing the cache PVC) collide.
+fn unique_scratch_name(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}.{}.{n}.tmp", std::process::id())
+}
+
 impl ImageCache {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -137,6 +152,7 @@ impl ImageCache {
             seek_seconds: 30,
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
             pool: None,
+            locks: std::sync::Arc::new(crate::single_flight::KeyedLocks::new()),
         }
     }
 
@@ -206,6 +222,19 @@ impl ImageCache {
         if !role.is_extractable() {
             return Err(ImageCacheError::UploadOnly);
         }
+        // B72/T95 — single-flight the miss: a library grid fires many requests
+        // for the same missing poster at once. Without this each ran its own
+        // ffmpeg extract AND wrote the SAME `.jpg.tmp` concurrently (corruption
+        // before the atomic rename). Serialize per (id, role, index); the first
+        // fills, the rest re-check and hit the warm file.
+        let lock = self
+            .locks
+            .lock(format!("fetch:{id}:{role:?}:{index}"))
+            .await;
+        let _guard = lock.lock().await;
+        if tokio::fs::try_exists(&out_path).await.unwrap_or(false) {
+            return Ok(out_path);
+        }
         // Negative cache: a prior extract proved this source has no image for
         // this role (e.g. a coverless audio file). Short-circuit to NoContent
         // without re-spawning ffmpeg — jellyfin-web re-requests these on every
@@ -269,6 +298,14 @@ impl ImageCache {
         let key = h.finish();
         let dir = self.root.join("scaled");
         let out = dir.join(format!("{key:016x}-w{width}.jpg"));
+        if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+            return out;
+        }
+        // Single-flight per (source, mtime, width): a grid re-uses the same
+        // sidecar for every visible tile, so concurrent scalers otherwise raced
+        // on one `.jpg.tmp` (T95/V36).
+        let lock = self.locks.lock(format!("scale:{key:016x}:w{width}")).await;
+        let _guard = lock.lock().await;
         if tokio::fs::try_exists(&out).await.unwrap_or(false) {
             return out;
         }
@@ -437,10 +474,33 @@ impl ImageCache {
                 return Ok(dir);
             }
         }
+        // B72/T95 — single-flight per item: two concurrent warms of the same
+        // item (e.g. the trickplay backfill and an on-demand font fetch) each
+        // wiped + rebuilt the shared batch scratch dir, so one could delete the
+        // other's in-flight dump. Serialize per id, then re-check the fast path.
+        let lock = self.locks.lock(format!("attach:{id}")).await;
+        let _guard = lock.lock().await;
+        if !indices.is_empty() {
+            let mut all = true;
+            for &idx in indices {
+                if !tokio::fs::try_exists(dir.join(idx.to_string()))
+                    .await
+                    .unwrap_or(false)
+                {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return Ok(dir);
+            }
+        }
         tokio::fs::create_dir_all(&dir).await?;
         // Extract into a scratch dir in one pass, then move each file into
         // place (atomic per file) so a concurrent reader never sees a partial.
-        let tmp = dir.join(".batch.tmp");
+        // The scratch name is per-caller-unique (V36) as a second line of
+        // defence: even without the lock, two batches never share a temp dir.
+        let tmp = dir.join(unique_scratch_name(".batch"));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await?;
         // One cold source open dumps every font. Timed so the ASS "Fetching

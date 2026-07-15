@@ -19,10 +19,12 @@
 
 pub mod hls_cache;
 pub mod image_cache;
+pub mod single_flight;
 pub mod subtitle_cache;
 pub mod trickplay_cache;
 
 pub use hls_cache::HlsSegmentCache;
 pub use image_cache::{ImageCache, ImageRole};
+pub use single_flight::KeyedLocks;
 pub use subtitle_cache::SubtitleCache;
 pub use trickplay_cache::TrickplayCache;
