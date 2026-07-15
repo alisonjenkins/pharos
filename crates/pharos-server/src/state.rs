@@ -235,6 +235,10 @@ pub struct AppState {
     /// `ActivityLogEntry` JSON. `next_activity_id` hands out monotonic ids.
     pub activity_log: Arc<std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
     pub next_activity_id: Arc<std::sync::atomic::AtomicI64>,
+    /// T97/B72 — in-memory memo + single-flight for computed audio waveforms, so
+    /// a re-open / re-seek burst never re-decodes the whole source. Session-
+    /// scoped (the endpoint is client-optional); see [`crate::api::jellyfin::waveform`].
+    pub waveform: crate::api::jellyfin::waveform::WaveformCache,
 }
 
 /// Max recent activity entries retained in memory (T73).
@@ -465,6 +469,7 @@ impl AppState {
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            waveform: Default::default(),
         }
     }
 
@@ -532,6 +537,7 @@ impl AppState {
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            waveform: Default::default(),
         })
     }
 
