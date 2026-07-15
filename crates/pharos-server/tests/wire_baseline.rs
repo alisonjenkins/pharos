@@ -449,7 +449,13 @@ async fn baseline_devices_envelope_keys() {
     let (state, token, uid) = seed().await;
     state
         .stores
-        .set_policy(uid, UserPolicy { admin: true })
+        .set_policy(
+            uid,
+            UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let app = test::init_service(build_app(state)).await;

@@ -4,6 +4,7 @@
 //! prepared by the auth backend.
 
 use crate::SecretString;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,14 +28,98 @@ impl std::fmt::Display for UserId {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A user's full permission set (T68). Mirrors the load-bearing fields of
+/// Jellyfin's C# `UserPolicy`. Persisted as a JSON blob (`users.policy_json`)
+/// alongside the fast-path `admin` column; the DTO layer maps it to the wire
+/// `UserPolicyDto`.
+///
+/// Not `Copy` (carries `Vec`s / `String`), and not `Eq` (`AccessSchedule`
+/// hours are `f64`). [`Default`] is hand-written to be fully permissive so a
+/// freshly-created user is unrestricted — matching the values pharos hardcoded
+/// before the field set grew (so default users' wire output is unchanged).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UserPolicy {
     pub admin: bool,
+    /// A disabled user cannot authenticate (enforced in the auth backend).
+    pub is_disabled: bool,
+    /// Hidden users are omitted from the login user-picker.
+    pub is_hidden: bool,
+    /// When `true` the user sees every library; when `false` only the
+    /// libraries whose wire id is in [`Self::enabled_folders`].
+    pub enable_all_folders: bool,
+    /// Library wire ids the user may browse when `!enable_all_folders`.
+    pub enabled_folders: Vec<String>,
+    /// Max allowed parental-rating score (see the config rating table). `None`
+    /// = unrestricted. An item whose rating scores above this is filtered.
+    pub max_parental_rating: Option<i32>,
+    /// Item types whose unrated members are blocked (e.g. `["Movie"]`).
+    pub block_unrated_items: Vec<String>,
+    /// Items carrying any of these tags are hidden from the user.
+    pub blocked_tags: Vec<String>,
+    /// When non-empty, only items carrying one of these tags are shown.
+    pub allowed_tags: Vec<String>,
+    /// Time windows during which the user may access the server.
+    pub access_schedules: Vec<AccessSchedule>,
+    /// `0` = unlimited concurrent sessions.
+    pub max_active_sessions: i32,
+    /// `-1` = unlimited failed attempts before lockout.
+    pub login_attempts_before_lockout: i32,
+    /// `0` = no remote bitrate cap.
+    pub remote_client_bitrate_limit: i32,
+    pub enable_live_tv_access: bool,
+    pub enable_content_downloading: bool,
+    /// Jellyfin `SyncPlayUserAccessType`: `CreateAndJoinGroups` | `JoinGroups`
+    /// | `None`.
+    pub sync_play_access: String,
+}
+
+impl Default for UserPolicy {
+    fn default() -> Self {
+        Self {
+            admin: false,
+            is_disabled: false,
+            is_hidden: false,
+            enable_all_folders: true,
+            enabled_folders: Vec::new(),
+            max_parental_rating: None,
+            block_unrated_items: Vec::new(),
+            blocked_tags: Vec::new(),
+            allowed_tags: Vec::new(),
+            access_schedules: Vec::new(),
+            max_active_sessions: 0,
+            login_attempts_before_lockout: -1,
+            remote_client_bitrate_limit: 0,
+            enable_live_tv_access: true,
+            enable_content_downloading: true,
+            sync_play_access: "CreateAndJoinGroups".to_string(),
+        }
+    }
+}
+
+/// A recurring weekly access window (Jellyfin `AccessSchedule`). Hours are
+/// fractional (`8.5` = 08:30) to match jellyfin-web's serialization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccessSchedule {
+    pub day_of_week: String,
+    pub start_hour: f64,
+    pub end_hour: f64,
+}
+
+impl Default for AccessSchedule {
+    fn default() -> Self {
+        Self {
+            day_of_week: "Everyday".to_string(),
+            start_hour: 0.0,
+            end_hour: 24.0,
+        }
+    }
 }
 
 /// Public user projection — no password hash. Safe to send to clients
 /// (after additional auth checks at the API layer).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct User {
     pub id: UserId,
     pub name: String,
@@ -203,7 +288,10 @@ mod tests {
             id: UserId::new(),
             name: "ali".into(),
             password_hash: SecretString::new("$argon2id$..."),
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         };
         let user = rec.into_user();
         assert_eq!(user.name, "ali");

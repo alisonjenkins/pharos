@@ -2464,13 +2464,16 @@ impl UserStore for PostgresStore {
     async fn create(&self, record: UserRecord) -> AuthResult<()> {
         let id_bytes = record.id.0.as_bytes().to_vec();
         let admin: i32 = if record.policy.admin { 1 } else { 0 };
+        let policy_json = crate::auth_sqlite::policy_to_json(&record.policy);
         let res = sqlx::query(
-            "INSERT INTO users (id, name, password_hash, admin) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO users (id, name, password_hash, admin, policy_json) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(id_bytes)
         .bind(&record.name)
         .bind(record.password_hash.expose())
         .bind(admin)
+        .bind(policy_json)
         .execute(&self.pool)
         .await;
         match res {
@@ -2482,12 +2485,13 @@ impl UserStore for PostgresStore {
 
     #[tracing::instrument(skip(self), fields(user.name = %name))]
     async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
-        let row: Option<(Vec<u8>, String, String, i32)> =
-            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE name = $1")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i32, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -2496,12 +2500,13 @@ impl UserStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
-        let row: Option<(Vec<u8>, String, String, i32)> =
-            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE id = $1")
-                .bind(id_bytes)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i32, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users WHERE id = $1",
+        )
+        .bind(id_bytes)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -2509,11 +2514,12 @@ impl UserStore for PostgresStore {
 
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> AuthResult<Vec<UserRecord>> {
-        let rows: Vec<(Vec<u8>, String, String, i32)> =
-            sqlx::query_as("SELECT id, name, password_hash, admin FROM users ORDER BY LOWER(name)")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let rows: Vec<(Vec<u8>, String, String, i32, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users ORDER BY LOWER(name)",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         rows.into_iter().map(record_from_row).collect()
     }
 
@@ -2535,8 +2541,10 @@ impl UserStore for PostgresStore {
     async fn set_policy(&self, id: UserId, policy: UserPolicy) -> AuthResult<()> {
         let id_bytes = id.0.as_bytes().to_vec();
         let admin: i32 = if policy.admin { 1 } else { 0 };
-        let res = sqlx::query("UPDATE users SET admin = $1 WHERE id = $2")
+        let policy_json = crate::auth_sqlite::policy_to_json(&policy);
+        let res = sqlx::query("UPDATE users SET admin = $1, policy_json = $2 WHERE id = $3")
             .bind(admin)
+            .bind(policy_json)
             .bind(id_bytes)
             .execute(&self.pool)
             .await
@@ -3148,14 +3156,14 @@ impl SyncGroupStore for PostgresStore {
     }
 }
 
-fn record_from_row(row: (Vec<u8>, String, String, i32)) -> AuthResult<UserRecord> {
+fn record_from_row(row: (Vec<u8>, String, String, i32, Option<String>)) -> AuthResult<UserRecord> {
     let uuid =
         Uuid::from_slice(&row.0).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
     Ok(UserRecord {
         id: UserId(uuid),
         name: row.1,
         password_hash: SecretString::new(row.2),
-        policy: UserPolicy { admin: row.3 != 0 },
+        policy: crate::auth_sqlite::policy_from_parts(row.3 as i64, row.4.as_deref()),
     })
 }
 

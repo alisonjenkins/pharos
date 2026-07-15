@@ -109,7 +109,6 @@ async fn localization_parental_ratings_nonempty() {
 // ---- backlog T68: persist the full policy field set ----
 
 #[actix_web::test]
-#[ignore = "gap: IsDisabled dropped on write / hardcoded false on read (T68)"]
 async fn policy_roundtrip_is_disabled() {
     let f = seed_rich().await;
     let g = guest(&f);
@@ -121,7 +120,6 @@ async fn policy_roundtrip_is_disabled() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: IsHidden dropped on write / hardcoded false on read (T68)"]
 async fn policy_roundtrip_is_hidden() {
     let f = seed_rich().await;
     let g = guest(&f);
@@ -130,7 +128,6 @@ async fn policy_roundtrip_is_hidden() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: EnableAllFolders/EnabledFolders not modelled (T68)"]
 async fn policy_roundtrip_enabled_folders() {
     let f = seed_rich().await;
     let g = guest(&f);
@@ -142,7 +139,6 @@ async fn policy_roundtrip_enabled_folders() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: parental control (MaxParentalRating/Blocked+AllowedTags/AccessSchedules) not modelled (T68)"]
 async fn policy_roundtrip_parental() {
     let f = seed_rich().await;
     let g = guest(&f);
@@ -160,7 +156,6 @@ async fn policy_roundtrip_parental() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: session limits (MaxActiveSessions/LoginAttemptsBeforeLockout/RemoteClientBitrateLimit) not modelled (T68)"]
 async fn policy_roundtrip_session_limits() {
     let f = seed_rich().await;
     let g = guest(&f);
@@ -176,7 +171,6 @@ async fn policy_roundtrip_session_limits() {
 }
 
 #[actix_web::test]
-#[ignore = "gap: EnableLiveTvAccess/EnableContentDownloading/SyncPlayAccess dropped on write (T68)"]
 async fn policy_roundtrip_feature_flags() {
     let f = seed_rich().await;
     let g = guest(&f);

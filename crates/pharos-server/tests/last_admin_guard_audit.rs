@@ -28,7 +28,10 @@ async fn seed_single_admin() -> (web::Data<AppState>, UserId, String) {
             id: admin,
             name: "admin".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -107,7 +110,10 @@ async fn admin_can_demote_self_when_another_admin_exists() {
             id: UserId::new(),
             name: "second".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

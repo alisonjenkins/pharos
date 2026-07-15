@@ -38,7 +38,10 @@ fn user_record(name: &str, admin: bool) -> UserRecord {
         id: UserId::new(),
         name: name.into(),
         password_hash: SecretString::new("$argon2id$fake"),
-        policy: UserPolicy { admin },
+        policy: UserPolicy {
+            admin,
+            ..Default::default()
+        },
     }
 }
 

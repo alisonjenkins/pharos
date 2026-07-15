@@ -229,7 +229,23 @@ impl UserDto {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// A recurring weekly access window (Jellyfin `AccessSchedule`). `Id`/`UserId`
+/// are Jellyfin bookkeeping pharos doesn't persist, so they're omitted (the
+/// wire tolerates their absence — jellyfin-web reads DayOfWeek/StartHour/EndHour).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AccessScheduleDto {
+    pub day_of_week: String,
+    pub start_hour: f64,
+    pub end_hour: f64,
+}
+
+/// The full policy wire object. Deserialized on `POST /Users/{id}/Policy` and
+/// serialized on every `UserDto`. [`Default`] is the permissive
+/// [`UserPolicy::default`] projection so a partial POST body (Jellyfin treats a
+/// policy write as a whole-object REPLACE) fills missing fields permissively
+/// rather than zeroing them.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UserPolicyDto {
     pub is_administrator: bool,
@@ -276,26 +292,44 @@ pub struct UserPolicyDto {
     /// always serializes the default provider ids (B64).
     pub authentication_provider_id: String,
     pub password_reset_provider_id: String,
+    // T68 — library-access + parental-control fields. jellyfin-web's
+    // dashboard writes all of these; pharos persists them in `policy_json`
+    // and enforces EnabledFolders + MaxParentalRating on the item-listing path.
+    /// Library wire ids the user may browse when `!enable_all_folders`.
+    pub enabled_folders: Vec<String>,
+    /// Nullable max parental-rating score; `null` = unrestricted.
+    pub max_parental_rating: Option<i32>,
+    /// Item types whose unrated members are blocked (Jellyfin `UnratedItem`).
+    pub block_unrated_items: Vec<String>,
+    pub blocked_tags: Vec<String>,
+    pub allowed_tags: Vec<String>,
+    pub access_schedules: Vec<AccessScheduleDto>,
+}
+
+impl Default for UserPolicyDto {
+    fn default() -> Self {
+        Self::from_domain(&UserPolicy::default())
+    }
 }
 
 impl UserPolicyDto {
     pub fn from_domain(p: &UserPolicy) -> Self {
         Self {
             is_administrator: p.admin,
-            is_hidden: false,
-            is_disabled: false,
+            is_hidden: p.is_hidden,
+            is_disabled: p.is_disabled,
             enable_remote_access: true,
             enable_media_playback: true,
             enable_audio_playback_transcoding: true,
             enable_video_playback_transcoding: true,
             enable_playback_remuxing: true,
             enable_content_deletion: p.admin,
-            enable_content_downloading: true,
+            enable_content_downloading: p.enable_content_downloading,
             enable_sync_transcoding: true,
             enable_media_conversion: true,
             enable_all_devices: true,
             enable_all_channels: true,
-            enable_all_folders: true,
+            enable_all_folders: p.enable_all_folders,
             enable_public_sharing: false,
             enable_collection_management: p.admin,
             enable_subtitle_management: p.admin,
@@ -304,22 +338,66 @@ impl UserPolicyDto {
             enable_remote_control_of_other_users: p.admin,
             enable_shared_device_control: true,
             enable_live_tv_management: p.admin,
-            enable_live_tv_access: true,
+            enable_live_tv_access: p.enable_live_tv_access,
             force_remote_source_transcoding: false,
             invalid_login_attempt_count: 0,
-            // Jellyfin's defaults: -1 = unlimited attempts, 0 = unlimited
-            // sessions / no bitrate cap.
-            login_attempts_before_lockout: -1,
-            max_active_sessions: 0,
-            remote_client_bitrate_limit: 0,
-            // Everyone may create + join watch-together groups (personal server).
-            sync_play_access: "CreateAndJoinGroups".to_string(),
+            login_attempts_before_lockout: p.login_attempts_before_lockout,
+            max_active_sessions: p.max_active_sessions,
+            remote_client_bitrate_limit: p.remote_client_bitrate_limit,
+            sync_play_access: p.sync_play_access.clone(),
             // Real Jellyfin's default provider ids — any non-empty string
             // satisfies the kotlin non-null contract (B64).
             authentication_provider_id:
                 "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_string(),
             password_reset_provider_id:
                 "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_string(),
+            enabled_folders: p.enabled_folders.clone(),
+            max_parental_rating: p.max_parental_rating,
+            block_unrated_items: p.block_unrated_items.clone(),
+            blocked_tags: p.blocked_tags.clone(),
+            allowed_tags: p.allowed_tags.clone(),
+            access_schedules: p
+                .access_schedules
+                .iter()
+                .map(|s| AccessScheduleDto {
+                    day_of_week: s.day_of_week.clone(),
+                    start_hour: s.start_hour,
+                    end_hour: s.end_hour,
+                })
+                .collect(),
+        }
+    }
+
+    /// Project an inbound `POST /Users/{id}/Policy` body onto the domain
+    /// [`UserPolicy`]. Jellyfin treats a policy write as a whole-object
+    /// replace, so every modelled field is taken from the body (missing ones
+    /// having been permissively filled by [`Default`]).
+    pub fn to_domain(&self) -> UserPolicy {
+        UserPolicy {
+            admin: self.is_administrator,
+            is_disabled: self.is_disabled,
+            is_hidden: self.is_hidden,
+            enable_all_folders: self.enable_all_folders,
+            enabled_folders: self.enabled_folders.clone(),
+            max_parental_rating: self.max_parental_rating,
+            block_unrated_items: self.block_unrated_items.clone(),
+            blocked_tags: self.blocked_tags.clone(),
+            allowed_tags: self.allowed_tags.clone(),
+            access_schedules: self
+                .access_schedules
+                .iter()
+                .map(|s| pharos_core::AccessSchedule {
+                    day_of_week: s.day_of_week.clone(),
+                    start_hour: s.start_hour,
+                    end_hour: s.end_hour,
+                })
+                .collect(),
+            max_active_sessions: self.max_active_sessions,
+            login_attempts_before_lockout: self.login_attempts_before_lockout,
+            remote_client_bitrate_limit: self.remote_client_bitrate_limit,
+            enable_live_tv_access: self.enable_live_tv_access,
+            enable_content_downloading: self.enable_content_downloading,
+            sync_play_access: self.sync_play_access.clone(),
         }
     }
 }

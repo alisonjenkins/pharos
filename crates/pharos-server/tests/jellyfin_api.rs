@@ -22,7 +22,10 @@ async fn seed_state() -> web::Data<AppState> {
             id: UserId::new(),
             name: "ali".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

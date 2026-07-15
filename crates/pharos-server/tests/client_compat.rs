@@ -41,7 +41,10 @@ async fn boot_server() -> (TestServer, String) {
             id: uid,
             name: "ali".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

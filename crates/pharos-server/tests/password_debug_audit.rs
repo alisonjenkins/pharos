@@ -51,7 +51,10 @@ async fn admin_create_user_response_never_echoes_password() {
             id: admin_id,
             name: "admin".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

@@ -36,7 +36,10 @@ async fn seed_with_canary_token() -> (web::Data<AppState>, String) {
             id: uid,
             name: "u".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

@@ -20,7 +20,10 @@ async fn seed(admin_flag: bool) -> (web::Data<AppState>, String, UserId) {
             id: uid,
             name: "boss".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: admin_flag },
+            policy: UserPolicy {
+                admin: admin_flag,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -255,7 +258,10 @@ async fn system_logs_lists_files_in_log_dir() {
             id: uid,
             name: "boss".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

@@ -19,19 +19,42 @@ fn map_sqlx<E: std::fmt::Display>(e: E) -> AuthError {
     AuthError::Backend(e.to_string())
 }
 
+/// Serialize the extended policy fields to the `policy_json` column. The
+/// `admin` column stays the authoritative fast-path flag (indexed, read by the
+/// last-admin guard), so the JSON is the store for everything else.
+pub(crate) fn policy_to_json(policy: &UserPolicy) -> String {
+    serde_json::to_string(policy).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Rebuild a [`UserPolicy`] from the `admin` column + optional `policy_json`.
+/// A NULL / malformed blob (pre-migration rows, or a user created before the
+/// field set grew) yields a permissive [`UserPolicy::default`]; the `admin`
+/// column always wins so the two never disagree.
+pub(crate) fn policy_from_parts(admin: i64, json: Option<&str>) -> UserPolicy {
+    let mut policy = json
+        .and_then(|s| serde_json::from_str::<UserPolicy>(s).ok())
+        .unwrap_or_default();
+    policy.admin = admin != 0;
+    policy
+}
+
 impl UserStore for SqliteStore {
     #[tracing::instrument(skip(self, record), fields(user.name = %record.name))]
     async fn create(&self, record: UserRecord) -> AuthResult<()> {
         let id_bytes = record.id.0.as_bytes().to_vec();
         let admin: i64 = if record.policy.admin { 1 } else { 0 };
-        let res =
-            sqlx::query("INSERT INTO users (id, name, password_hash, admin) VALUES (?, ?, ?, ?)")
-                .bind(id_bytes)
-                .bind(&record.name)
-                .bind(record.password_hash.expose())
-                .bind(admin)
-                .execute(self.pool())
-                .await;
+        let policy_json = policy_to_json(&record.policy);
+        let res = sqlx::query(
+            "INSERT INTO users (id, name, password_hash, admin, policy_json) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id_bytes)
+        .bind(&record.name)
+        .bind(record.password_hash.expose())
+        .bind(admin)
+        .bind(policy_json)
+        .execute(self.pool())
+        .await;
         match res {
             Ok(_) => Ok(()),
             Err(sqlx::Error::Database(e)) if e.message().contains("UNIQUE") => {
@@ -43,12 +66,13 @@ impl UserStore for SqliteStore {
 
     #[tracing::instrument(skip(self), fields(user.name = %name))]
     async fn lookup_by_name(&self, name: &str) -> AuthResult<UserRecord> {
-        let row: Option<(Vec<u8>, String, String, i64)> =
-            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE name = ?")
-                .bind(name)
-                .fetch_optional(self.pool())
-                .await
-                .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -57,12 +81,13 @@ impl UserStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
-        let row: Option<(Vec<u8>, String, String, i64)> =
-            sqlx::query_as("SELECT id, name, password_hash, admin FROM users WHERE id = ?")
-                .bind(id_bytes)
-                .fetch_optional(self.pool())
-                .await
-                .map_err(map_sqlx)?;
+        let row: Option<(Vec<u8>, String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users WHERE id = ?",
+        )
+        .bind(id_bytes)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(map_sqlx)?;
         row.map(record_from_row)
             .transpose()?
             .ok_or(AuthError::UserNotFound)
@@ -70,8 +95,9 @@ impl UserStore for SqliteStore {
 
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> AuthResult<Vec<UserRecord>> {
-        let rows: Vec<(Vec<u8>, String, String, i64)> = sqlx::query_as(
-            "SELECT id, name, password_hash, admin FROM users ORDER BY name COLLATE NOCASE",
+        let rows: Vec<(Vec<u8>, String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users \
+             ORDER BY name COLLATE NOCASE",
         )
         .fetch_all(self.pool())
         .await
@@ -100,8 +126,10 @@ impl UserStore for SqliteStore {
     async fn set_policy(&self, id: UserId, policy: UserPolicy) -> AuthResult<()> {
         let id_bytes = id.0.as_bytes().to_vec();
         let admin: i64 = if policy.admin { 1 } else { 0 };
-        let res = sqlx::query("UPDATE users SET admin = ? WHERE id = ?")
+        let policy_json = policy_to_json(&policy);
+        let res = sqlx::query("UPDATE users SET admin = ?, policy_json = ? WHERE id = ?")
             .bind(admin)
+            .bind(policy_json)
             .bind(id_bytes)
             .execute(self.pool())
             .await
@@ -131,14 +159,14 @@ impl UserStore for SqliteStore {
     }
 }
 
-fn record_from_row(row: (Vec<u8>, String, String, i64)) -> AuthResult<UserRecord> {
+fn record_from_row(row: (Vec<u8>, String, String, i64, Option<String>)) -> AuthResult<UserRecord> {
     let uuid =
         Uuid::from_slice(&row.0).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
     Ok(UserRecord {
         id: UserId(uuid),
         name: row.1,
         password_hash: SecretString::new(row.2),
-        policy: UserPolicy { admin: row.3 != 0 },
+        policy: policy_from_parts(row.3, row.4.as_deref()),
     })
 }
 

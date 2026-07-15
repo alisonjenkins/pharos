@@ -61,7 +61,10 @@ async fn seed() -> Fixture {
             id: admin_id,
             name: "admin".into(),
             password_hash: auth.hash_password(&admin_pw).unwrap(),
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

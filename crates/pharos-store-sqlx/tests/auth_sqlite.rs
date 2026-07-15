@@ -13,7 +13,10 @@ fn record(name: &str, hash: &str, admin: bool) -> UserRecord {
         id: UserId::new(),
         name: name.into(),
         password_hash: SecretString::new(hash),
-        policy: UserPolicy { admin },
+        policy: UserPolicy {
+            admin,
+            ..Default::default()
+        },
     }
 }
 

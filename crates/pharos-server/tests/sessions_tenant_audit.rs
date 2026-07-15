@@ -136,7 +136,10 @@ async fn admin_bearer_sees_every_session() {
             id: admin_uid,
             name: "admin".into(),
             password_hash: hash.clone(),
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

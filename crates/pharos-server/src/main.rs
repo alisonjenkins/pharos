@@ -179,7 +179,10 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         id: UserId::new(),
         name: "playwright".into(),
         password_hash: hash,
-        policy: UserPolicy { admin: true },
+        policy: UserPolicy {
+            admin: true,
+            ..Default::default()
+        },
     };
     if let Err(e) = stores.create(user).await {
         if !matches!(e, pharos_core::AuthError::Conflict) {
@@ -411,7 +414,10 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
         id: UserId::new(),
         name: "playwright".into(),
         password_hash: hash,
-        policy: UserPolicy { admin: true },
+        policy: UserPolicy {
+            admin: true,
+            ..Default::default()
+        },
     };
     match stores.create(user).await {
         Ok(()) => {

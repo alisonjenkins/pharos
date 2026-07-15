@@ -23,7 +23,10 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
             id: uid,
             name: "ali".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -341,7 +344,10 @@ async fn seed_show() -> (web::Data<AppState>, String, UserId) {
             id: uid,
             name: "ali".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();

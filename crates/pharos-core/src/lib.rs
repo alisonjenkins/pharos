@@ -5,8 +5,8 @@ pub mod auth;
 pub mod secret;
 
 pub use auth::{
-    AuthBackend, AuthError, AuthResult, AuthToken, TokenRecord, TokenStore, User, UserId,
-    UserPolicy, UserRecord, UserStore,
+    AccessSchedule, AuthBackend, AuthError, AuthResult, AuthToken, TokenRecord, TokenStore, User,
+    UserId, UserPolicy, UserRecord, UserStore,
 };
 pub use secret::SecretString;
 

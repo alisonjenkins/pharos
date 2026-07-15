@@ -68,7 +68,10 @@ impl<U: UserStore> BuiltinAuth<U> {
             id: UserId::new(),
             name: name.to_string(),
             password_hash: hash,
-            policy: UserPolicy { admin },
+            policy: UserPolicy {
+                admin,
+                ..Default::default()
+            },
         };
         match self.users.create(record).await {
             Ok(()) => Ok(CreateUserOutcome::Created),

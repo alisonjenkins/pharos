@@ -342,9 +342,7 @@ async fn set_user_policy(
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let target = parse_user_id(&path.into_inner())?;
-    let policy = UserPolicy {
-        admin: body.is_administrator,
-    };
+    let policy = body.to_domain();
     // Symmetric to the self-delete guard: refuse a self-demotion if
     // it would leave zero admins. Otherwise the dashboard is bricked.
     if target == user.0.id && !policy.admin {

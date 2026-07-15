@@ -118,9 +118,16 @@ where
     let listed = UserStore::list(&store).await.unwrap();
     assert!(listed.iter().any(|u| u.id == uid));
 
-    UserStore::set_policy(&store, uid, UserPolicy { admin: true })
-        .await
-        .unwrap();
+    UserStore::set_policy(
+        &store,
+        uid,
+        UserPolicy {
+            admin: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let got_admin = UserStore::get(&store, uid).await.unwrap();
     assert!(got_admin.policy.admin, "set_policy must flip admin flag");
 

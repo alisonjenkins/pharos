@@ -61,7 +61,10 @@ pub async fn seed_rich() -> Fixture {
             id: admin_id,
             name: "ali".into(),
             password_hash: hash.clone(),
-            policy: UserPolicy { admin: true },
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -71,7 +74,10 @@ pub async fn seed_rich() -> Fixture {
             id: user_id,
             name: "guest".into(),
             password_hash: hash,
-            policy: UserPolicy { admin: false },
+            policy: UserPolicy {
+                admin: false,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
