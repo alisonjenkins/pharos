@@ -94,6 +94,13 @@ impl<U: UserStore> AuthBackend for BuiltinAuth<U> {
         self.argon
             .verify_password(password.expose().as_bytes(), &parsed)
             .map_err(|_| AuthError::InvalidCredentials)?;
+        // T68 — a disabled user must not authenticate even with valid
+        // credentials. Checked after the password verify so a disabled account
+        // is indistinguishable from a wrong password (no account-state
+        // enumeration): both yield InvalidCredentials → 401.
+        if record.policy.is_disabled {
+            return Err(AuthError::InvalidCredentials);
+        }
         Ok(record.into_user())
     }
 }

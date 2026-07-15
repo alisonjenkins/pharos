@@ -188,7 +188,6 @@ async fn policy_roundtrip_feature_flags() {
 // ---- backlog T68: enforce the policy (behaviour, not just echo) ----
 
 #[actix_web::test]
-#[ignore = "gap: IsDisabled not enforced — disabled user can still authenticate (T68)"]
 async fn enforce_disabled_user_cannot_authenticate() {
     let f = seed_rich().await;
     let g = guest(&f);
