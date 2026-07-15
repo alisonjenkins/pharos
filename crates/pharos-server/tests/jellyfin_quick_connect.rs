@@ -11,6 +11,106 @@ use pharos_server::{
     state::{AppState, Stores},
 };
 
+/// Deserialize an `/Users/AuthenticateWithQuickConnect` response body into
+/// structs that mirror the jellyfin-sdk-kotlin models' NON-nullable properties.
+/// Every field is required (no `Option`), so `serde` fails if pharos omits any
+/// field the kotlin SDK marks non-null — the exact failure mode behind the
+/// Android-TV "Unable to connect to server" (B63/B64). Fields the kotlin model
+/// makes nullable or defaulted are simply not listed here (unknown fields are
+/// ignored). Panics on a mismatch, with the serde error naming the field.
+fn kotlin_strict_auth_result(body: &[u8]) {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct KtAuthResult {
+        access_token: String,
+        server_id: String,
+        user: KtUser,
+        session_info: KtSession,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct KtUser {
+        id: String, // kotlin UUID; dashless-hex is accepted by the SDK serializer
+        policy: KtPolicy,
+        configuration: KtConfig,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct KtPolicy {
+        is_administrator: bool,
+        is_hidden: bool,
+        is_disabled: bool,
+        enable_user_preference_access: bool,
+        enable_remote_control_of_other_users: bool,
+        enable_shared_device_control: bool,
+        enable_remote_access: bool,
+        enable_live_tv_management: bool,
+        enable_live_tv_access: bool,
+        enable_media_playback: bool,
+        enable_audio_playback_transcoding: bool,
+        enable_video_playback_transcoding: bool,
+        enable_playback_remuxing: bool,
+        force_remote_source_transcoding: bool,
+        enable_content_deletion: bool,
+        enable_content_downloading: bool,
+        enable_sync_transcoding: bool,
+        enable_media_conversion: bool,
+        enable_all_devices: bool,
+        enable_all_channels: bool,
+        enable_all_folders: bool,
+        invalid_login_attempt_count: i64,
+        login_attempts_before_lockout: i64,
+        max_active_sessions: i64,
+        enable_public_sharing: bool,
+        remote_client_bitrate_limit: i64,
+        authentication_provider_id: String,
+        password_reset_provider_id: String,
+        sync_play_access: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct KtConfig {
+        play_default_audio_track: bool,
+        display_missing_episodes: bool,
+        grouped_folders: Vec<String>,
+        subtitle_mode: String,
+        display_collections_view: bool,
+        enable_local_password: bool,
+        ordered_views: Vec<String>,
+        latest_items_excludes: Vec<String>,
+        my_media_excludes: Vec<String>,
+        hide_played_in_latest: bool,
+        remember_audio_selections: bool,
+        remember_subtitle_selections: bool,
+        enable_next_episode_auto_play: bool,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct KtSession {
+        user_id: String,
+        last_activity_date: String,
+        last_playback_check_in: String,
+        is_active: bool,
+        supports_media_control: bool,
+        supports_remote_control: bool,
+        has_custom_device_name: bool,
+        playable_media_types: Vec<String>,
+        supported_commands: Vec<String>,
+    }
+    if let Err(e) = serde_json::from_slice::<KtAuthResult>(body) {
+        panic!(
+            "AuthenticationResult is missing a kotlin-required (non-null) field: {e}\nbody: {}",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
 async fn seed_admin() -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
@@ -188,19 +288,13 @@ async fn full_flow_finalizes_at_authenticatewithquickconnect() {
     let tok = v["AccessToken"].as_str().unwrap();
     assert!(!tok.is_empty());
     assert!(v["User"]["Id"].as_str().is_some(), "result carries User.Id");
-    // B63 — the AuthenticationResult's SessionInfo must carry the NON-nullable
-    // kotlin lists (PlayableMediaTypes, SupportedCommands). Omitting them made
-    // the Android/Google-TV SDK throw parsing this exact response → the TV
-    // showed "Unable to connect to server" despite the token being issued.
-    let si = &v["SessionInfo"];
-    assert!(
-        si["PlayableMediaTypes"].is_array(),
-        "SessionInfo.PlayableMediaTypes must be a (non-null) array"
-    );
-    assert!(
-        si["SupportedCommands"].is_array(),
-        "SessionInfo.SupportedCommands must be a (non-null) array"
-    );
+    // B63/B64 — replicate the jellyfin-sdk-kotlin (Android/Google TV) parser:
+    // deserialize the finalize AuthenticationResult into structs whose fields
+    // mirror the kotlin model's NON-nullable properties (no `?`). serde errors
+    // on any missing one — exactly what made the TV throw "Unable to connect to
+    // server" while the server had already issued the token. Any future DTO
+    // that drops a kotlin-required field fails HERE instead of on a device.
+    kotlin_strict_auth_result(&body);
 
     // The issued token actually authenticates.
     let req = test::TestRequest::get()

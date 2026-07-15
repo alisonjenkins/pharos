@@ -185,6 +185,13 @@ pub struct UserPolicyDto {
     /// grants access, so an absent/None value makes "create a group" a no-op.
     /// `String` (not `&'static str`) because the DTO also derives `Deserialize`.
     pub sync_play_access: String,
+    /// Non-null `String`s in the jellyfin-sdk-kotlin `UserPolicy` (no `?`).
+    /// pharos omitted them, so the Android/Google-TV SDK threw parsing
+    /// `UserDto.policy` inside the Quick Connect finalize's AuthenticationResult
+    /// → "Unable to connect to server" despite a valid token. Real Jellyfin
+    /// always serializes the default provider ids (B64).
+    pub authentication_provider_id: String,
+    pub password_reset_provider_id: String,
 }
 
 impl UserPolicyDto {
@@ -223,6 +230,12 @@ impl UserPolicyDto {
             remote_client_bitrate_limit: 0,
             // Everyone may create + join watch-together groups (personal server).
             sync_play_access: "CreateAndJoinGroups".to_string(),
+            // Real Jellyfin's default provider ids — any non-empty string
+            // satisfies the kotlin non-null contract (B64).
+            authentication_provider_id:
+                "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_string(),
+            password_reset_provider_id:
+                "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_string(),
         }
     }
 }
