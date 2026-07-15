@@ -5,76 +5,63 @@ canonical tracker; this file surfaces the *in-flight* + *recurring* items that
 are easy to lose across context resets. Cross-refs SPEC where a §T row already
 exists.
 
-Live now: `main-1784114711-ed0b88e2d496` (B71). Single replica, 1/1.
+Live now: `main-1784121423-7097d22a2735` (B73). Single replica, 1/1.
+Pending deploy: B75 + bit-depth + logDir (commits `685ddd9`, `9d91fb5`, `5e4ef45`).
 
 ---
 
 ## P0 — in-flight, must close soon
 
-### 0b. FOLLOW-UP — cheaper authed path for native direct-play (post-B73)
-- B73 fixes the native-TV 401 by steering non-web video direct-play onto the
-  authed HLS transcode surface — but the segmented-HLS path RE-ENCODES (it
-  cannot per-segment stream-copy; see the VideoRemux arm in hls.rs). So an
-  already-h264 source that a browser byte-serves now costs a full h264 encode
-  for the TV. Fine for 1-2 concurrent on the 16-vCPU box (B12 budget), wasteful
-  at scale. Follow-up: expose an AUTHED progressive copy-remux endpoint (the
-  progressive `/videos/{id}/stream` CAN `-c copy` per the hls.rs comment) and
-  point the native TranscodingUrl at it → zero re-encode, still authed. Or
-  better: find why the app omits the token on the direct URL (app source
-  unavailable) and restore true byte-serve direct play (zero CPU).
+### 0. Native-TV playback — FIXED via B75 (pending deploy + on-device confirm)
+- FULL root-cause chain (adb logcat on the TCL "Smart TV Pro", Android 12,
+  jellyfin-android-tv 0.19.9):
+  - The "crash on seek" was **not** a crash: the app is **SIGKILL'd (signal 9)**
+    by TCL's `TGuardMemoryManager` under memory pressure (2.4 GB TV), then
+    relaunched + killed again = the "3 crashes". No Java exception, no segfault.
+  - Amplifier was B73 itself: it force-transcoded a source the TV can DIRECT-PLAY
+    (HEVC 1080p, "Alien", 16 Mbps + 55 external sub tracks). The needless
+    HEVC→H.264 transcode + per-seek HLS teardown/realloc tipped the tight RAM
+    over → OOM kill.
+- Why B73 existed: native apps send the `/videos/{id}/stream?static=true` request
+  with ZERO credentials — no header, no cookie, no api_key (B72 audit + reading
+  jellyfin-sdk-kotlin: the ExoPlayer OkHttp data-source has no auth interceptor;
+  `getVideoStreamUrl` never adds api_key). Real Jellyfin's stream route is
+  anonymous (random-GUID ids); pharos ids are low-entropy so anonymous = enumerable.
+- **B75 fix** (`9d91fb5`): authenticate the native stream via a capability token
+  instead of forcing a transcode. `getVideoStreamUrl(tag = mediaSource.eTag)`
+  forwards ETag verbatim as `?tag=`, so pharos stamps `ETag = PlaySessionId`
+  (random uuid, registered in transcode_sessions against the media id, direct-play
+  sessions now registered too). `stream::authorize_media` accepts a normal token
+  OR a `tag`/`PlaySessionId` bound to the requested item — unguessable,
+  single-item, time-limited. B73 override DELETED → trust `negotiate()`.
+  Guard: tests/jellyfin_playbackinfo_native_directplay.rs (native keeps DirectPlay;
+  tokenless `?tag=` authorizes end-to-end; wrong tag rejected).
+- **Bit-depth hardening** (`685ddd9`): `negotiate()` now enforces the
+  `VideoBitDepth` CodecProfile condition (was silently permissive) so an
+  8-bit-only decoder transcodes a 10-bit source instead of direct-playing garbage.
+- ON-DEVICE CONFIRM STILL NEEDED once deployed: play the "Alien"-style HEVC item,
+  seek → must NOT crash (now direct-plays, in-place seek, zero transcode).
 
-### 0. ACTIVE BUG — native-TV direct-play 401 "missing token" (FIXED by B73)
-- STATUS 2026-07-15: root cause found + fixed (pending deploy + on-device
-  confirm). B72 header audit proved ExoPlayer's data-source client
-  (`okhttp/4.12.0`, `icy-metadata`) sends the direct-play file request with
-  ZERO auth (authorization / x-emby-token / api_key all `<absent>`), so
-  `/videos/{id}/stream?static=true` 401s "missing token" and playback stops the
-  instant it starts. B73 (`items.rs`): non-web VIDEO direct-play is overridden
-  to a Transcode decision → the client gets an authed HLS TranscodingUrl
-  (api_key embedded) and SupportsDirectPlay/Stream both false so it can't retry
-  the tokenless URL. Web keeps true direct-play (UA `Mozilla` → is_web_client).
-  Guard: tests/jellyfin_playbackinfo_native_directplay.rs.
-- Original diagnosis notes retained below for context.
-- 2026-07-15: B71 confirmed working (subtitle indices now contiguous 0/1/2…;
-  no 1_000_000 sentinel). TV now gets PAST PlaybackInfo and reaches
-  `POST /sessions/playing` — then immediately `/sessions/playing/stopped`.
-- Root cause of the "crash": the ExoPlayer data-source client (UA
-  `okhttp/4.12.0`, distinct from the app's `Jellyfin Android TV/…` client and
-  WITHOUT its auth interceptor) requests the direct-play file
-  `GET /videos/{id}/stream?container=mp4&static=true&mediaSourceId=…` **6× and
-  each 401s "missing token"** — the URL carries no `api_key`, no PlaySessionId,
-  and (per audit) no auth header. All the app's OTHER calls auth fine.
-- pharos codec decision was `route:"direct"` (direct-play h264); MediaSource had
-  `SupportsDirectPlay/Stream:true`, `TranscodingUrl:null`. Real Jellyfin's
-  `GetVideoStream` has no `[Authorize]` override but still runs under the global
-  auth policy, so a truly tokenless request would 401 there too → the app must
-  normally send a token pharos isn't receiving.
-- **B72 diagnostic shipped** (`auth_extractor.rs`, env-gated on
-  PHAROS_LOG_ALL_REQUESTS): logs header names + truncated auth-header values for
-  any tokenless `/stream` request. Next: user retries Play on the TV → read the
-  "B72: token-less /stream request — header audit" line to see whether ExoPlayer
-  sends an auth header shape pharos doesn't parse, or none at all.
-- Candidate fixes once evidence lands: (a) if a header shape is unparsed, extend
-  extract_token; (b) if genuinely tokenless, pharos must embed the token in the
-  URL it hands the app (transcode path already does via TranscodingUrl w/
-  api_key) OR stop advertising direct-play to the native client so it takes the
-  authed transcode URL. Do NOT relax /stream auth (security).
-- ETag is emitted as `""` (empty) — likely harmless but noted; the app's URL had
-  `tag=` empty.
+### 0a. FOLLOW-UP — sub-track sideload memory on tight TVs (parity gap, not a bug)
+- Even with direct-play, jellyfin-android-tv `VideoManager.setMediaStreamInfo`
+  attaches EVERY `DeliveryMethod=External` subtitle (55 for "Alien") into one
+  ExoPlayer MergingMediaSource **upfront**. Real Jellyfin does the same (no cap),
+  so this is upstream-parity, but it's real RAM on a 2.4 GB TV. If OOM persists
+  after B75, consider capping advertised External subs for memory-constrained
+  native clients (diverges from Jellyfin — do only if proven necessary).
 
-### 1. Confirm B71 fixed native-TV playback, then REVERT debug logging
-- B71 (`ed0b88e`) is deployed. It made sidecar subtitle stream indices
-  contiguous (`sidecar_base_index(probe)`) instead of the `1_000_000` sentinel
-  that crashed the positional kotlin player on PlaybackInfo. **Not yet
-  confirmed on-device** — user must press Play on the Android TV.
-- Debug request-logging is STILL ON in prod. Turn OFF once playback confirmed:
-  - `charts/pharos/values.yaml:106` → `logAllRequests: false`
+### 1. REVERT debug logging (once B75 confirmed on-device)
+- Debug request-logging STILL ON in prod. Turn OFF once playback confirmed:
+  - `charts/pharos/values.yaml` obs.logAllRequests → `false`
   - `crates/pharos-server/src/api/jellyfin/items.rs:~2213` — remove the B70
     PlaybackInfo-response-body log block (`PHAROS_LOG_ALL_REQUESTS == "1"`).
+  - B72 header-audit block in `auth_extractor.rs` can also go now (root cause found).
   - bump `charts/pharos/Chart.yaml` version (Flux reconcileStrategy=ChartVersion).
   - obs.rs `log_all_requests()` gate can stay (harmless, opt-in).
-- This is the last step of the QC/kotlin crash cascade (B61–B71). Only turn it
-  off AFTER the user confirms a clean play; the body log is the diagnostic.
+- Only turn off AFTER the user confirms a clean play + seek.
+- NOTE: `logDir` now set to the cache PVC (`5e4ef45`) so client-log / manual
+  "Submit logs" uploads persist — but android-tv crashes go to tracepot (external
+  ACRA), never the server, so use adb logcat for native crashes.
 
 ---
 
