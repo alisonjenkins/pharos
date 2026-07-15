@@ -41,6 +41,46 @@ pub struct SystemInfoDto {
     pub system_architecture: &'static str,
 }
 
+/// A Jellyfin `MediaSegmentDto` (Skip Intro/Outro). `Id` is typed as a `UUID`
+/// by the kotlin SDK — a non-UUID string (the old `"{item_id}:{idx}"`) crashes
+/// the strict client during playback. `new()` derives a DETERMINISTIC uuid from
+/// (item_id, key) so it's stable across requests AND always a valid UUID —
+/// making the malformed-id state unrepresentable (B69).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSegmentDto {
+    pub id: String,
+    pub item_id: String,
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+    #[serde(rename = "Type")]
+    pub kind: String,
+}
+
+impl MediaSegmentDto {
+    /// Fixed UUIDv5 namespace for deriving a segment's stable id.
+    const NS: uuid::Uuid = uuid::Uuid::from_u128(0x6d65_6469_6173_6567_6d65_6e74_7635_0001);
+
+    pub fn new(
+        item_id: &str,
+        key: &str,
+        start_ticks: u64,
+        end_ticks: u64,
+        kind: impl Into<String>,
+    ) -> Self {
+        let id = uuid::Uuid::new_v5(&Self::NS, format!("{item_id}:{key}").as_bytes())
+            .simple()
+            .to_string();
+        Self {
+            id,
+            item_id: item_id.to_string(),
+            start_ticks,
+            end_ticks,
+            kind: kind.into(),
+        }
+    }
+}
+
 /// Response of `POST /ClientLog/Document` (Jellyfin `ClientLogDocumentResponseDto`).
 /// The client uploads a log / crash report; the server stores it and returns the
 /// filename it was written under.
@@ -1885,6 +1925,23 @@ pub fn build_media_attachments(
 mod tests {
     use super::*;
     use pharos_core::MediaProbe;
+
+    #[test]
+    fn media_segment_id_is_a_deterministic_uuid() {
+        // B69 — the kotlin SDK types MediaSegmentDto.Id as UUID; a non-UUID
+        // string crashes the strict client. new() must always yield a valid,
+        // stable uuid.
+        let a = MediaSegmentDto::new("00000000000000000000000000000abc", "0", 0, 10, "Intro");
+        let b = MediaSegmentDto::new("00000000000000000000000000000abc", "0", 0, 10, "Intro");
+        assert_eq!(a.id, b.id, "deterministic across calls");
+        assert!(
+            uuid::Uuid::parse_str(&a.id).is_ok(),
+            "Id must be a valid UUID, got {}",
+            a.id
+        );
+        let c = MediaSegmentDto::new("00000000000000000000000000000abc", "d1", 0, 10, "Outro");
+        assert_ne!(a.id, c.id, "distinct key → distinct id");
+    }
 
     #[test]
     fn wire_item_ids_are_guid_shaped_and_round_trip() {

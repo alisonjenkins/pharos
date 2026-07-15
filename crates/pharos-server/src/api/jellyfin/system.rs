@@ -658,8 +658,12 @@ async fn media_segments_stub(
 ///
 /// Heuristic-only: titles matching common patterns are classified;
 /// everything else is ignored.
-async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json::Value> {
+async fn build_media_segments(
+    state: &AppState,
+    item_id: &str,
+) -> Vec<pharos_jellyfin_api::dto::MediaSegmentDto> {
     use pharos_core::MediaStore;
+    use pharos_jellyfin_api::dto::MediaSegmentDto;
     let Some(id) = pharos_jellyfin_api::dto::parse_item_id(item_id) else {
         return Vec::new();
     };
@@ -686,13 +690,13 @@ async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json
         } else {
             start_ticks.saturating_add(30_000_000_000) // 30s fallback
         };
-        out.push(serde_json::json!({
-            "Id": format!("{item_id}:{idx}"),
-            "ItemId": item_id,
-            "StartTicks": start_ticks,
-            "EndTicks": end_ticks,
-            "Type": seg_type,
-        }));
+        out.push(MediaSegmentDto::new(
+            item_id,
+            &idx.to_string(),
+            start_ticks,
+            end_ticks,
+            seg_type,
+        ));
     }
     // T86 — union the auto-DETECTED segments (audio-fingerprint intro/outro,
     // black-frame credits) the backfill persisted, skipping any Type a chapter
@@ -704,13 +708,13 @@ async fn build_media_segments(state: &AppState, item_id: &str) -> Vec<serde_json
             if seen_types.contains(t) {
                 continue;
             }
-            out.push(serde_json::json!({
-                "Id": format!("{item_id}:d{di}"),
-                "ItemId": item_id,
-                "StartTicks": seg.start_ms.saturating_mul(10_000),
-                "EndTicks": seg.end_ms.saturating_mul(10_000),
-                "Type": t,
-            }));
+            out.push(MediaSegmentDto::new(
+                item_id,
+                &format!("d{di}"),
+                seg.start_ms.saturating_mul(10_000),
+                seg.end_ms.saturating_mul(10_000),
+                t,
+            ));
         }
     }
     out

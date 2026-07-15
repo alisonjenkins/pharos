@@ -990,7 +990,10 @@ async fn list_tags(
                 "Id": tc.tag.wire_id,
                 "Name": tc.tag.name,
                 "ServerId": state.server_id,
-                "Type": "Tag",
+                // B69 — "Tag" is NOT a kotlin BaseItemKind (it crashes the strict
+                // SDK's enum decode). A tag surfaces as a browsable Folder of its
+                // tagged items — a valid BaseItemKind. IsFolder already true.
+                "Type": "Folder",
                 "MediaType": "Unknown",
                 "IsFolder": true,
                 "ChildCount": tc.item_count,

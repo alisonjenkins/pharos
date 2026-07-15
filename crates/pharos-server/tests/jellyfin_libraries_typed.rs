@@ -140,7 +140,9 @@ async fn media_folders_emits_typed_collection_type() {
     let items = v["Items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["CollectionType"], "movies");
-    assert_eq!(items[1]["CollectionType"], "mixed");
+    // B69 — a mixed library carries a NULL CollectionType ("mixed" is not a
+    // valid kotlin BaseItemDto CollectionType enum value).
+    assert_eq!(items[1]["CollectionType"], serde_json::Value::Null);
     // The library Id matches the stable wire id.
     assert_eq!(
         items[0]["Id"].as_str().unwrap(),
@@ -203,7 +205,8 @@ async fn single_root_legacy_config_still_works_without_libraries() {
     let v = get_json(state, token.0.expose(), "/Library/MediaFolders").await;
     let items = v["Items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["CollectionType"], "mixed");
+    // B69 — mixed → null (not the invalid "mixed" enum string).
+    assert_eq!(items[0]["CollectionType"], serde_json::Value::Null);
     assert_eq!(
         items[0]["Id"].as_str().unwrap(),
         library_id_for_root(std::path::Path::new("/media/single"))

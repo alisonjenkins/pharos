@@ -99,7 +99,8 @@ async fn tags_list_emits_rows_with_wire_id_and_counts() {
     assert_eq!(names, vec!["1080p", "cyberpunk"]);
     let hd = &items[0];
     assert_eq!(hd["Id"].as_str().unwrap(), tag_id_for("1080p"));
-    assert_eq!(hd["Type"].as_str().unwrap(), "Tag");
+    // B69 — "Tag" is not a valid kotlin BaseItemKind; a tag surfaces as a Folder.
+    assert_eq!(hd["Type"].as_str().unwrap(), "Folder");
     assert!(hd["IsFolder"].as_bool().unwrap());
     assert_eq!(hd["ChildCount"].as_u64().unwrap(), 2);
     let cp = &items[1];
