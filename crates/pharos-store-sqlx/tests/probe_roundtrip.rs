@@ -111,6 +111,9 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 subtitle_tracks: subs,
                 audio_tracks: Vec::new(),
                 attachments: Vec::new(),
+                // `title` is scan-transient (not a persisted column); it
+                // always reloads as None, so the roundtrip fixes it here.
+                title: None,
                 artist,
                 album,
                 album_artist,

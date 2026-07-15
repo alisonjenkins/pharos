@@ -2847,6 +2847,10 @@ impl MediaRow {
             ),
             audio_tracks: crate::audio_track_json::decode(self.audio_tracks_json.as_deref()),
             attachments: crate::attachment_json::decode(self.attachments_json.as_deref()),
+            // Scan-transient: the embedded track title is folded into the
+            // `media_items.title` column, not stored on the probe. See the
+            // sqlite store's `into_domain` for the rationale.
+            title: None,
             artist: self.artist,
             album: self.album,
             album_artist: self.album_artist,

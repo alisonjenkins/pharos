@@ -215,6 +215,11 @@ struct FfprobeFormat {
 /// canonical form (artist / album / album_artist / genre / title).
 #[derive(Debug, Default, Deserialize)]
 struct FfprobeFormatTags {
+    /// Embedded track title (`TIT2` in ID3, `TITLE` in Vorbis/FLAC, `©nam`
+    /// in MP4). The authoritative song name — the scanner prefers it over
+    /// the filename stem so tracks keep their real names.
+    #[serde(default, alias = "TITLE", alias = "Title")]
+    title: Option<String>,
     #[serde(default, alias = "ARTIST", alias = "Artist")]
     artist: Option<String>,
     #[serde(default, alias = "ALBUM", alias = "Album")]
@@ -242,6 +247,8 @@ struct FfprobeFormatTags {
     disc: Option<String>,
     /// Vorbis `date`, ID3 `TYER`/`TDRC` normalise to `date`; some taggers
     /// write `year`. Either way the leading 4 digits are the release year.
+    /// For reissues this is the *reissue* year, not the original — see
+    /// `original_date` below, which wins when present.
     #[serde(
         default,
         alias = "DATE",
@@ -250,6 +257,21 @@ struct FfprobeFormatTags {
         alias = "YEAR"
     )]
     date: Option<String>,
+    /// Original-release date — ID3v2.4 `TDOR` (`TORY` on v2.3), Vorbis
+    /// `ORIGINALDATE`/`ORIGINALYEAR`. On a remaster/reissue the plain
+    /// `date` is the reissue year (e.g. 2008) while this carries the real
+    /// first-release year (e.g. 1991). Preferred as the item's year so
+    /// albums sort + display by original release like Jellyfin does.
+    #[serde(
+        default,
+        alias = "TDOR",
+        alias = "TORY",
+        alias = "originaldate",
+        alias = "ORIGINALDATE",
+        alias = "originalyear",
+        alias = "ORIGINALYEAR"
+    )]
+    original_date: Option<String>,
 }
 
 /// Parse the leading unsigned integer of a `track`/`disc` tag ("3", "3/12").
@@ -442,13 +464,22 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             subtitle_tracks,
             audio_tracks,
             attachments,
+            title: parsed.format.tags.title.filter(|t| !t.trim().is_empty()),
             artist: parsed.format.tags.artist,
             album: parsed.format.tags.album,
             album_artist: parsed.format.tags.album_artist,
             genre: parsed.format.tags.genre,
             track_number: parsed.format.tags.track.as_deref().and_then(leading_uint),
             disc_number: parsed.format.tags.disc.as_deref().and_then(leading_uint),
-            year: parsed.format.tags.date.as_deref().and_then(leading_year),
+            // Prefer the original-release year over the (possibly reissue)
+            // `date` tag so a 2008 remaster of a 1991 album shows 1991.
+            year: parsed
+                .format
+                .tags
+                .original_date
+                .as_deref()
+                .and_then(leading_year)
+                .or_else(|| parsed.format.tags.date.as_deref().and_then(leading_year)),
             chapters,
             // P34 — alternate editions enrichment lives in a
             // future scanner pass (sibling-file convention reader
@@ -623,6 +654,42 @@ mod tests {
         assert_eq!(p.audio_codec.as_deref(), Some("mp3"));
         assert_eq!(p.audio_channels, Some(2));
         assert_eq!(p.sample_rate, Some(44100));
+    }
+
+    #[test]
+    fn parse_audio_reads_embedded_title_and_prefers_original_year() {
+        // A 2008 reissue of a 1991 album: `date` is the reissue year, `TDOR`
+        // the original. The item must surface the original (1991) and the
+        // embedded track title, NOT the album folder name.
+        let json = br#"{
+            "streams": [{"codec_type": "audio", "codec_name": "mp3",
+                         "channels": 2, "sample_rate": "44100"}],
+            "format": {"format_name": "mp3", "duration": "248.0",
+                       "tags": {"title": "Something Got Me Started",
+                                "album": "Stars", "artist": "Simply Red",
+                                "track": "1/10", "date": "2008",
+                                "TDOR": "1991-10"}}
+        }"#;
+        let p = parse_ffprobe_output(json).unwrap().probe;
+        assert_eq!(p.title.as_deref(), Some("Something Got Me Started"));
+        assert_eq!(p.album.as_deref(), Some("Stars"));
+        assert_eq!(p.track_number, Some(1));
+        // Original release year wins over the 2008 reissue `date`.
+        assert_eq!(p.year, Some(1991));
+    }
+
+    #[test]
+    fn parse_audio_falls_back_to_date_when_no_original_year() {
+        let json = br#"{
+            "streams": [{"codec_type": "audio", "codec_name": "flac"}],
+            "format": {"format_name": "flac",
+                       "tags": {"DATE": "2015-06-01", "TITLE": ""}}
+        }"#;
+        let p = parse_ffprobe_output(json).unwrap().probe;
+        // No original-date tag → the plain `date` year is used.
+        assert_eq!(p.year, Some(2015));
+        // A blank title tag is treated as absent (falls back to filename).
+        assert_eq!(p.title, None);
     }
 
     #[test]

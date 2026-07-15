@@ -843,11 +843,27 @@ impl<P: Prober> FsScanner<P> {
     async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
         match self.prober.probe(&path).await {
             Ok(info) => {
-                let title = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                // Audio: the embedded track title (ID3/Vorbis TITLE) is the
+                // authoritative song name — a filename stem is often just a
+                // track number ("02 Stars") or the album name. Fall back to
+                // the stem when the file carries no title tag. Video keeps
+                // the stem (the NFO/clean resolver refines it later).
+                let stem = || {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                };
+                let title = match info.kind {
+                    MediaKind::Audio => info
+                        .probe
+                        .title
+                        .clone()
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(stem),
+                    _ => stem(),
+                };
                 // Stat the file so MediaProbe.size_bytes is set even when
                 // ffprobe didn't report `format.size` (some containers).
                 let mut probe = info.probe;
@@ -2447,6 +2463,9 @@ mod tests {
         // LIB-C4 — when set, every probed item carries this genre string
         // so the scanner's link-on-write path can be asserted.
         genre: Option<String>,
+        // When set, audio probes carry this embedded track title so the
+        // "embedded title beats filename stem" path can be asserted.
+        audio_title: Option<String>,
     }
 
     impl Prober for FakeProber {
@@ -2466,6 +2485,11 @@ mod tests {
                 kind,
                 probe: pharos_core::MediaProbe {
                     genre: self.genre.clone(),
+                    title: if kind == MediaKind::Audio {
+                        self.audio_title.clone()
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
             })
@@ -2508,6 +2532,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audio_title_prefers_embedded_tag_over_filename_stem() {
+        // The file is named by track number; its embedded title is the real
+        // song name. The scanner must use the embedded title (B-music: songs
+        // were all inheriting the album-folder name from the filename/NFO).
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "02 Stars.flac").await;
+        let prober = FakeProber {
+            audio_title: Some("Something Got Me Started".into()),
+            ..Default::default()
+        };
+        let items = FsScanner::new(prober).scan(td.path()).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, MediaKind::Audio);
+        assert_eq!(items[0].title, "Something Got Me Started");
+    }
+
+    #[tokio::test]
+    async fn audio_without_embedded_title_falls_back_to_stem() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "02 Stars.flac").await;
+        // No embedded title → the filename stem is the fallback.
+        let items = FsScanner::new(FakeProber::default())
+            .scan(td.path())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "02 Stars");
+    }
+
+    #[tokio::test]
     async fn empty_dir_returns_empty() {
         let td = TempDir::new().unwrap();
         let s = FsScanner::new(FakeProber::default());
@@ -2535,6 +2589,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             force_fail_for: Some("bad".into()),
             genre: None,
+            ..Default::default()
         };
         let s = FsScanner::new(prober.clone());
         let items = s.scan(td.path()).await.unwrap();
@@ -3174,6 +3229,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             force_fail_for: Some("bad".into()),
             genre: None,
+            ..Default::default()
         };
         let s = FsScanner::new(prober.clone()).with_probe_concurrency(4);
         let store = MemStore::default();

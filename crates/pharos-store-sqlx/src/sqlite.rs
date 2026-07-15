@@ -2693,6 +2693,12 @@ impl MediaRow {
             ),
             audio_tracks: crate::audio_track_json::decode(self.audio_tracks_json.as_deref()),
             attachments: crate::attachment_json::decode(self.attachments_json.as_deref()),
+            // `probe.title` (embedded track title) is scan-transient: the
+            // scanner folds it into the persisted `media_items.title` column
+            // (the display name), so it is not stored on the probe itself.
+            // Reconstructed rows carry `None` here — no consumer reads it
+            // post-scan.
+            title: None,
             artist: self.artist,
             album: self.album,
             album_artist: self.album_artist,

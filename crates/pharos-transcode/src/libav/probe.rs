@@ -151,13 +151,20 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             subtitle_tracks,
             audio_tracks,
             attachments,
+            title: ftags.title.filter(|t| !t.trim().is_empty()),
             artist: ftags.artist,
             album: ftags.album,
             album_artist: ftags.album_artist,
             genre: ftags.genre,
             track_number: ftags.track.as_deref().and_then(leading_uint),
             disc_number: ftags.disc.as_deref().and_then(leading_uint),
-            year: ftags.date.as_deref().and_then(leading_year),
+            // Prefer the original-release year (TDOR / ORIGINALDATE) over the
+            // possibly-reissue `date` tag so remasters show the real year.
+            year: ftags
+                .original_date
+                .as_deref()
+                .and_then(leading_year)
+                .or_else(|| ftags.date.as_deref().and_then(leading_year)),
             chapters,
             alternate_sources: Vec::new(),
         },
@@ -263,6 +270,7 @@ fn stream_tags(st: &ffi::AVStream) -> StreamMeta {
 
 #[derive(Default)]
 struct FormatTags {
+    title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
     album_artist: Option<String>,
@@ -270,6 +278,8 @@ struct FormatTags {
     track: Option<String>,
     disc: Option<String>,
     date: Option<String>,
+    /// Original-release date (ID3 `TDOR`/`TORY`, Vorbis `ORIGINALDATE`).
+    original_date: Option<String>,
 }
 
 fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
@@ -280,6 +290,7 @@ fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
         dict_get(fmt.metadata, k).or_else(|| alts.iter().find_map(|a| dict_get(fmt.metadata, a)))
     };
     FormatTags {
+        title: get("title", &["TITLE", "Title"]),
         artist: get("artist", &["ARTIST", "Artist"]),
         album: get("album", &["ALBUM", "Album"]),
         album_artist: get(
@@ -290,6 +301,16 @@ fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
         track: get("track", &["TRACK", "Track", "track_number"]),
         disc: get("disc", &["DISC", "Disc", "disc_number", "DISCNUMBER"]),
         date: get("date", &["DATE", "Date", "year", "YEAR"]),
+        original_date: get(
+            "originaldate",
+            &[
+                "ORIGINALDATE",
+                "originalyear",
+                "ORIGINALYEAR",
+                "TDOR",
+                "TORY",
+            ],
+        ),
     }
 }
 

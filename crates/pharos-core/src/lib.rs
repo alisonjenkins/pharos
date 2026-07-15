@@ -1246,6 +1246,14 @@ pub struct MediaProbe {
     /// Common audio-file format tags (`title` / `artist` / `album` /
     /// `album_artist` / `genre`). Populated by FfmpegProber from
     /// ffprobe's `format.tags`. None when the file lacks the tag.
+    ///
+    /// `title` is the embedded track title (ID3 `TIT2` / Vorbis `TITLE`).
+    /// It is the authoritative song name for an Audio item — the scanner
+    /// prefers it over the filename stem so tracks don't inherit the
+    /// album-folder name. Defaulted so rows written before it existed
+    /// deserialise cleanly.
+    #[serde(default)]
+    pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
     pub album_artist: Option<String>,
@@ -1483,7 +1491,11 @@ pub struct ScanState {
 ///       MediaAttachments, chapters (the set present as of 2026-07).
 // v2: audio tags gained track_number / disc_number / year (album track
 // ordering + album-year sort) — re-probe so music rows pick them up.
-pub const PROBE_SCHEMA_VERSION: i64 = 2;
+// v3: audio gained the embedded `title` tag (authoritative track name over
+// the filename stem) and `year` now prefers the original-release tag
+// (ID3 `TDOR` / Vorbis `ORIGINALDATE`) over the reissue `date` — re-probe
+// so music rows get real per-track names + original years.
+pub const PROBE_SCHEMA_VERSION: i64 = 3;
 
 /// T86/ADR-0018 — bump when the intro/outro detection ALGORITHM changes in a
 /// way that invalidates stored segments or fingerprints. A season whose stored
