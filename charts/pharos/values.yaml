@@ -100,6 +100,10 @@ config:
     logLevel: "info"
     otlpEndpoint: null
     logDir: null
+    # B68 — log EVERY request (not just errors) so a strict client crashing on
+    # a 200 response body can be traced to the exact endpoint. Temporary debug
+    # aid; set false once the Android-TV crash is diagnosed.
+    logAllRequests: true
   media:
     # Plain roots (each becomes a "mixed" library named after its basename).
     roots:

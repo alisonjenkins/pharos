@@ -29,12 +29,44 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
         tracing_actix_web::DefaultRootSpanBuilder::on_request_end(span, outcome);
         if let Ok(resp) = outcome {
             let status = resp.status().as_u16();
+            let _e = logged.enter();
             if status >= 400 {
-                let _e = logged.enter();
                 tracing::warn!(status, "http request completed with error status");
+            } else if log_all_requests() {
+                // B68 — a strict client (jellyfin-sdk-kotlin: Android/Google TV)
+                // can crash PARSING a 200 response (a missing kotlin-required
+                // field), leaving zero error logs and no crash report on the
+                // server. Since 2xx are normally silent, opt-in full request
+                // logging surfaces the exact endpoint sequence so the crashing
+                // 200 can be identified. Enable via PHAROS_LOG_ALL_REQUESTS=1.
+                let req = resp.request();
+                let ua = req
+                    .headers()
+                    .get(actix_web::http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                tracing::info!(
+                    status,
+                    method = %req.method(),
+                    path = %req.path(),
+                    ua,
+                    "http request"
+                );
             }
         }
     }
+}
+
+/// Opt-in flag (env `PHAROS_LOG_ALL_REQUESTS`) to log EVERY request, not just
+/// errors — read once, cached. Off by default (2xx stay silent). Used to debug
+/// a strict client crashing on a 200 response body (B68).
+fn log_all_requests() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PHAROS_LOG_ALL_REQUESTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

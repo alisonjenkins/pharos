@@ -99,6 +99,10 @@ spec:
               value: {{ .Values.config.server.bind | quote }}
             - name: PHAROS_LOG_LEVEL
               value: {{ .Values.config.obs.logLevel | quote }}
+            {{- if .Values.config.obs.logAllRequests }}
+            - name: PHAROS_LOG_ALL_REQUESTS
+              value: "1"
+            {{- end }}
             {{- if .Values.config.obs.otlpEndpoint }}
             - name: PHAROS_OTLP_ENDPOINT
               value: {{ .Values.config.obs.otlpEndpoint | quote }}
