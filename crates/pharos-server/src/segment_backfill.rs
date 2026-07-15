@@ -136,38 +136,28 @@ async fn analyze_season(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
         let Some(dur_ms) = ep.probe.duration_ms else {
             continue;
         };
-        // Intro head window.
+        // Intro head + credits tail windows (each analysed only when ≥15s).
         let intro_len = ((dur_ms as f64 * INTRO_ANALYSIS_FRACTION) as u64).min(INTRO_MAX_MS);
-        if intro_len >= 15_000 {
-            if let Some(points) =
-                fingerprint_cached(ctx, ep, FingerprintKind::Intro, 0, intro_len).await
-            {
-                intro_fps.push(EpisodeFingerprint {
-                    id: ep.id,
-                    points,
-                    window_offset_secs: 0.0,
-                });
-            }
-        }
-        // Credits tail window.
         let credits_start = dur_ms.saturating_sub(CREDITS_WINDOW_MS);
         let credits_len = dur_ms - credits_start;
-        if credits_len >= 15_000 {
-            if let Some(points) = fingerprint_cached(
-                ctx,
-                ep,
-                FingerprintKind::Credits,
-                credits_start,
-                credits_len,
-            )
-            .await
-            {
-                credit_fps.push(EpisodeFingerprint {
-                    id: ep.id,
-                    points,
-                    window_offset_secs: credits_start as f64 / 1000.0,
-                });
-            }
+        let intro_win = (intro_len >= 15_000).then_some((0u64, intro_len));
+        let credits_win = (credits_len >= 15_000).then_some((credits_start, credits_len));
+
+        // B72/T96 — resolve both from ONE container open when both are cold.
+        let (intro_pts, credit_pts) = fingerprint_episode(ctx, ep, intro_win, credits_win).await;
+        if let Some(points) = intro_pts {
+            intro_fps.push(EpisodeFingerprint {
+                id: ep.id,
+                points,
+                window_offset_secs: 0.0,
+            });
+        }
+        if let Some(points) = credit_pts {
+            credit_fps.push(EpisodeFingerprint {
+                id: ep.id,
+                points,
+                window_offset_secs: credits_start as f64 / 1000.0,
+            });
         }
     }
 
@@ -218,39 +208,106 @@ async fn analyze_season(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
     wrote
 }
 
-/// A cached fingerprint at the current schema, else compute it on the pool
-/// (bg-IO gated) and cache it. `None` on a fingerprint failure.
-async fn fingerprint_cached(
+/// Resolve an episode's intro + credits fingerprints, computing any that aren't
+/// already cached. When BOTH windows are cold, they're fingerprinted from a
+/// SINGLE container open (B72/T96) instead of opening the (NFS) source twice.
+/// Each tuple element is `Some` only when its window was requested AND yielded
+/// a non-empty fingerprint. `intro`/`credits` are `(start_ms, dur_ms)`.
+async fn fingerprint_episode(
+    ctx: &Ctx,
+    ep: &MediaItem,
+    intro: Option<(u64, u64)>,
+    credits: Option<(u64, u64)>,
+) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+    // Cache hits first — never recompute a window already at the current schema.
+    let mut intro_pts = match intro {
+        Some(_) => cached_fp(ctx, ep, FingerprintKind::Intro).await,
+        None => None,
+    };
+    let mut credit_pts = match credits {
+        Some(_) => cached_fp(ctx, ep, FingerprintKind::Credits).await,
+        None => None,
+    };
+    let need_intro = intro.filter(|_| intro_pts.is_none());
+    let need_credits = credits.filter(|_| credit_pts.is_none());
+
+    match (need_intro, need_credits) {
+        (Some(iw), Some(cw)) => {
+            // Both cold → one open, two windows. Gate against live playback.
+            let _permit = acquire_gate(&ctx.bg_io).await;
+            match ctx
+                .pool
+                .fingerprint_multi(ep.path.clone(), vec![iw, cw])
+                .await
+            {
+                Ok(v) if v.len() == 2 => {
+                    let mut it = v.into_iter();
+                    let i = it.next().unwrap_or_default();
+                    let c = it.next().unwrap_or_default();
+                    intro_pts = store_fp(ctx, ep, FingerprintKind::Intro, i).await;
+                    credit_pts = store_fp(ctx, ep, FingerprintKind::Credits, c).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, media.id = ep.id, "segment backfill: paired fingerprint failed");
+                }
+            }
+        }
+        (Some(w), None) => {
+            intro_pts = compute_fp(ctx, ep, FingerprintKind::Intro, w).await;
+        }
+        (None, Some(w)) => {
+            credit_pts = compute_fp(ctx, ep, FingerprintKind::Credits, w).await;
+        }
+        (None, None) => {}
+    }
+    (intro_pts, credit_pts)
+}
+
+/// A cached fingerprint for `kind` at the current schema, if present.
+async fn cached_fp(ctx: &Ctx, ep: &MediaItem, kind: FingerprintKind) -> Option<Vec<u32>> {
+    ctx.stores
+        .episode_fingerprint_for(ep.id, kind, SEGMENT_SCHEMA_VERSION)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Persist a computed fingerprint (skipping empties, which mean "no usable
+/// audio"), returning it for immediate use.
+async fn store_fp(
     ctx: &Ctx,
     ep: &MediaItem,
     kind: FingerprintKind,
-    start_ms: u64,
-    dur_ms: u64,
+    points: Vec<u32>,
 ) -> Option<Vec<u32>> {
-    if let Ok(Some(points)) = ctx
-        .stores
-        .episode_fingerprint_for(ep.id, kind, SEGMENT_SCHEMA_VERSION)
-        .await
-    {
-        return Some(points);
+    if points.is_empty() {
+        return None;
     }
-    // Whole-window decode → gate against live playback.
-    let _permit = acquire_gate(&ctx.bg_io).await;
-    let points = match ctx
-        .pool
-        .fingerprint(ep.path.clone(), start_ms, dur_ms)
-        .await
-    {
-        Ok(p) if !p.is_empty() => p,
-        Ok(_) => return None,
-        Err(e) => {
-            tracing::debug!(error = %e, media.id = ep.id, ?kind, "segment backfill: fingerprint failed");
-            return None;
-        }
-    };
     let _ = ctx
         .stores
         .set_episode_fingerprint(ep.id, kind, &points, SEGMENT_SCHEMA_VERSION)
         .await;
     Some(points)
+}
+
+/// Compute + cache a single window (the one-cold-window path). Gated.
+async fn compute_fp(
+    ctx: &Ctx,
+    ep: &MediaItem,
+    kind: FingerprintKind,
+    (start_ms, dur_ms): (u64, u64),
+) -> Option<Vec<u32>> {
+    let _permit = acquire_gate(&ctx.bg_io).await;
+    match ctx
+        .pool
+        .fingerprint(ep.path.clone(), start_ms, dur_ms)
+        .await
+    {
+        Ok(p) => store_fp(ctx, ep, kind, p).await,
+        Err(e) => {
+            tracing::debug!(error = %e, media.id = ep.id, ?kind, "segment backfill: fingerprint failed");
+            None
+        }
+    }
 }

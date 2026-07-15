@@ -19,11 +19,42 @@ use std::path::Path;
 
 /// Fingerprint `dur_ms` of audio starting at `start_ms` into `src`.
 pub fn fingerprint_window(src: &Path, start_ms: u64, dur_ms: u64) -> Result<Vec<u32>, FrameError> {
+    Ok(fingerprint_windows(src, &[(start_ms, dur_ms)])?
+        .pop()
+        .unwrap_or_default())
+}
+
+/// Fingerprint several `(start_ms, dur_ms)` windows of `src` from a SINGLE
+/// container open (B72/T96): intro-head + credits-tail detection wants two
+/// windows per episode, and opening the (NFS-backed) container twice re-reads
+/// its header/index. Open once, then decode each window into its own
+/// fingerprint (a fresh decoder per window, since sending EOF to finish one
+/// window would poison a shared decoder). Returns one point vector per window,
+/// in order.
+pub fn fingerprint_windows(
+    src: &Path,
+    windows: &[(u64, u64)],
+) -> Result<Vec<Vec<u32>>, FrameError> {
     ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    let mut ictx = format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
+    let mut out = Vec::with_capacity(windows.len());
+    for &(start_ms, dur_ms) in windows {
+        out.push(fingerprint_one(&mut ictx, start_ms, dur_ms)?);
+    }
+    Ok(out)
+}
+
+/// Fingerprint one window on an ALREADY-OPEN container. Rebuilds the decoder +
+/// resampler per call (cheap, in-memory) so successive windows on the same
+/// `ictx` don't share poisoned decoder state.
+fn fingerprint_one(
+    ictx: &mut format::context::Input,
+    start_ms: u64,
+    dur_ms: u64,
+) -> Result<Vec<u32>, FrameError> {
     if dur_ms == 0 {
         return Err(FrameError::Other("dur_ms = 0".into()));
     }
-    let mut ictx = format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
     // Build the (owned) decoder inside a block so the stream's immutable
     // borrow of `ictx` ends before the mutable `ictx.seek` below.
     let (stream_index, tb_num, tb_den, mut decoder) = {

@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pharos_transcode::fingerprint::align::{compare, sample_duration_secs, AlignConfig};
-use pharos_transcode::libav::fingerprint::fingerprint_window;
+use pharos_transcode::libav::fingerprint::{fingerprint_window, fingerprint_windows};
 use std::process::Command;
 
 /// A distinctive 25 s "intro": a frequency sweep chromaprint can fingerprint
@@ -92,6 +92,39 @@ fn make_episode(
         .unwrap();
     assert!(st.success(), "episode concat failed");
     out
+}
+
+#[test]
+fn batched_windows_match_separate_single_opens() {
+    // B72/T96: fingerprinting two windows from ONE container open must yield
+    // byte-identical results to two separate single-window opens — otherwise
+    // the intro/outro backfill would drift when it batches. Build a 60s file:
+    // a distinctive intro at 0-25s, then distinct tail audio, and fingerprint a
+    // head window + a tail window both ways.
+    let dir = tempfile::tempdir().unwrap();
+    let intro = dir.path().join("intro.wav");
+    make_intro(&intro);
+    let ep = make_episode(dir.path(), "ep", &intro, 0.0, 35.0); // 25s intro + 35s tail
+
+    let head = (0u64, 20_000u64);
+    let tail = (30_000u64, 20_000u64);
+
+    let single_head = fingerprint_window(&ep, head.0, head.1).unwrap();
+    let single_tail = fingerprint_window(&ep, tail.0, tail.1).unwrap();
+
+    let batched = fingerprint_windows(&ep, &[head, tail]).unwrap();
+    assert_eq!(batched.len(), 2, "one point vector per requested window");
+    assert_eq!(
+        batched[0], single_head,
+        "batched head window must equal a standalone single-open fingerprint"
+    );
+    assert_eq!(
+        batched[1], single_tail,
+        "batched tail window must equal a standalone single-open fingerprint"
+    );
+    // Sanity: the windows are genuinely different audio, so their fingerprints
+    // must differ (otherwise the equality above is vacuous).
+    assert_ne!(single_head, single_tail);
 }
 
 #[test]

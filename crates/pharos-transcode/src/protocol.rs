@@ -190,6 +190,14 @@ pub enum TinyOp {
         start_ms: u64,
         dur_ms: u64,
     },
+    /// Chromaprint several `(start_ms, dur_ms)` windows of one source from a
+    /// SINGLE container open (B72/T96) → `WorkerEvent::FingerprintMultiResult`.
+    /// Intro-head + credits-tail detection needs two windows per episode;
+    /// batching them avoids re-reading the NFS container header/index twice.
+    FingerprintMulti {
+        input: PathBuf,
+        windows: Vec<(u64, u64)>,
+    },
     /// Scan one subtitle stream's packet timeline → merged on-screen
     /// windows (`WorkerEvent::SubtitleWindowsResult`). Demux-only (no
     /// decode); drives per-segment burn gating — event-free segments skip
@@ -266,6 +274,12 @@ pub enum WorkerEvent {
     FingerprintResult {
         job_id: JobId,
         points: Vec<u32>,
+    },
+    /// Reply to `TinyOp::FingerprintMulti` — one point vector per requested
+    /// window, in the order they were requested.
+    FingerprintMultiResult {
+        job_id: JobId,
+        points: Vec<Vec<u32>>,
     },
 }
 

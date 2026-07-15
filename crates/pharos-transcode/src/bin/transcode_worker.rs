@@ -399,6 +399,12 @@ fn handle_tiny(
             Ok(points) => WorkerEvent::FingerprintResult { job_id, points },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::FingerprintMulti { input, windows } => {
+            match libav::fingerprint::fingerprint_windows(&input, &windows) {
+                Ok(points) => WorkerEvent::FingerprintMultiResult { job_id, points },
+                Err(e) => frame_err(job_id, e),
+            }
+        }
     }
 }
 

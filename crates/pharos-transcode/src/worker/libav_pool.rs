@@ -50,6 +50,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::Waveform { .. } => "waveform",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
         TinyOp::Fingerprint { .. } => "fingerprint",
+        TinyOp::FingerprintMulti { .. } => "fingerprint_multi",
         _ => "other",
     }
 }
@@ -64,6 +65,7 @@ fn is_heavy_op(op: &TinyOp) -> bool {
             | TinyOp::Waveform { .. }
             | TinyOp::SubtitleWindows { .. }
             | TinyOp::Fingerprint { .. }
+            | TinyOp::FingerprintMulti { .. }
     )
 }
 
@@ -317,6 +319,27 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Chromaprint several `(start_ms, dur_ms)` windows from ONE container open
+    /// (B72/T96). Returns one point vector per window, in order. Used by the
+    /// season intro/outro backfill to fingerprint an episode's head + tail
+    /// without opening the source twice.
+    pub async fn fingerprint_multi(
+        &self,
+        input: impl Into<PathBuf>,
+        windows: Vec<(u64, u64)>,
+    ) -> Result<Vec<Vec<u32>>, PoolError> {
+        let ev = self
+            .run(TinyOp::FingerprintMulti {
+                input: input.into(),
+                windows,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::FingerprintMultiResult { points, .. } => Ok(points),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Core request/reply: acquire a permit, check out (or spawn) a
     /// worker, run one op, and return the terminal `WorkerEvent`. A
     /// healthy worker is returned to the idle set; a broken one is dropped.
@@ -429,6 +452,7 @@ impl LibavWorkerPool {
                 | WorkerEvent::WaveformResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
+                | WorkerEvent::FingerprintMultiResult { job_id: j, .. }
                 | WorkerEvent::Done { job_id: j, .. }
                 | WorkerEvent::Failed { job_id: j, .. } => {
                     if *j != job_id {
