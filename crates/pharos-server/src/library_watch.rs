@@ -367,16 +367,17 @@ async fn warm_item_subtitles(state: &AppState, ids: Vec<u64>, throttle: bool, wh
         let stores = state.stores.clone();
         // The adaptive gate replaces both the old fixed warm-concurrency cap
         // and the all-or-nothing playback quiet-gate: it bounds concurrency
-        // AND yields to playback, in one primitive.
-        let bg = throttle.then(|| state.bg_io.clone());
+        // AND yields to playback, in one primitive. A sweep warm is METERED
+        // (`throttle`); the single actively-played item bypasses. `BgPermit`
+        // makes that choice by-signature so `pre_extract_subtitles` cannot run
+        // ungated (V34).
+        let gate = state.bg_io.clone();
         tasks.push(tokio::spawn(async move {
-            let _permit = match &bg {
-                Some(sem) => sem.clone().acquire_owned().await.ok(),
-                None => None,
-            };
+            let permit = crate::bg_io::BgPermit::acquire_or_bypass(!throttle, &gate).await;
             match stores.get(id).await {
                 Ok(item) if !item.probe.subtitle_tracks.is_empty() => {
-                    crate::api::jellyfin::subtitles::pre_extract_subtitles(&cache, &item).await;
+                    crate::api::jellyfin::subtitles::pre_extract_subtitles(&cache, &item, &permit)
+                        .await;
                 }
                 _ => {}
             }

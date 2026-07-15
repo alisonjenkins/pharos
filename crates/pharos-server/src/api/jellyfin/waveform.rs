@@ -61,7 +61,14 @@ async fn get_waveform(
     let total_samples = (duration_ms as u64).saturating_mul(sample_rate as u64) / 1_000;
     let samples_per_bin = (total_samples / bins as u64).max(1);
 
-    let peaks = run_astats(input, samples_per_bin, bins).await?;
+    // On-demand waveform for the item being viewed — playback priority (V34).
+    let peaks = run_astats(
+        input,
+        samples_per_bin,
+        bins,
+        &crate::bg_io::BgPermit::playback_priority(),
+    )
+    .await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "DurationMs": duration_ms,
         "Bins": peaks.len(),
@@ -89,6 +96,7 @@ async fn run_astats(
     input: &str,
     samples_per_bin: u64,
     target_bins: u32,
+    _permit: &crate::bg_io::BgPermit,
 ) -> Result<Vec<f32>, actix_web::Error> {
     let filter = format!(
         "aresample=async=1,aformat=channel_layouts=mono,asetnsamples={samples_per_bin},astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level"

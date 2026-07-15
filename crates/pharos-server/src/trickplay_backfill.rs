@@ -339,8 +339,11 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
     if let Some(sc) = ctx.subtitles.as_ref() {
         if !item.probe.subtitle_tracks.is_empty() {
             {
-                let _permit = acquire_gate(bypass_gate, &ctx.bg_io).await;
-                crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item).await;
+                // Same acquire/bypass choice as `acquire_gate`, but as a
+                // `BgPermit` so `pre_extract_subtitles` proves it gated (V34).
+                let permit =
+                    crate::bg_io::BgPermit::acquire_or_bypass(bypass_gate, &ctx.bg_io).await;
+                crate::api::jellyfin::subtitles::pre_extract_subtitles(sc, item, &permit).await;
             }
             if !bypass_gate {
                 tokio::time::sleep(COOLDOWN).await;

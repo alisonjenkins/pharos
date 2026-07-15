@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod bg_io;
 pub mod cli;
 pub mod config;
 pub mod dlna;

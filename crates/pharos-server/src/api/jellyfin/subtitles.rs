@@ -18,7 +18,7 @@
 //! starting at `1_000_000` so their numeric IDs never collide with
 //! real ffprobe stream indices.
 
-use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use crate::{api::jellyfin::auth_extractor::AuthUser, bg_io::BgPermit, state::AppState};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
 use pharos_core::MediaStore;
@@ -234,7 +234,8 @@ async fn deliver_ass(
         {
             return Ok(ass_body((*bytes).clone()));
         }
-        let out = run_ffmpeg_embedded_ass(input, stream_index).await?;
+        let out =
+            run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await?;
         let stored = cache
             .store(
                 &item.path,
@@ -246,7 +247,7 @@ async fn deliver_ass(
             .await;
         return Ok(ass_body((*stored).clone()));
     }
-    let out = run_ffmpeg_embedded_ass(input, stream_index).await?;
+    let out = run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await?;
     Ok(ass_body(out))
 }
 
@@ -259,6 +260,7 @@ async fn deliver_ass(
 pub(crate) async fn pre_extract_subtitles(
     cache: &pharos_cache::SubtitleCache,
     item: &pharos_core::MediaItem,
+    _permit: &BgPermit,
 ) {
     let Some(input) = item.path.to_str() else {
         return;
@@ -416,6 +418,7 @@ fn build_batch_extract_args(input: &str, tracks: &[BatchTrack]) -> Vec<String> {
 async fn run_ffmpeg_embedded_ass(
     input: &str,
     stream_index: u32,
+    _permit: &BgPermit,
 ) -> Result<Vec<u8>, actix_web::Error> {
     let started = std::time::Instant::now();
     let out = Command::new("ffmpeg")
@@ -515,6 +518,9 @@ async fn deliver_srt(
         .path
         .to_str()
         .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+    // On-demand SRT fetch for the item a client is watching — playback priority,
+    // so it runs immediately rather than waiting behind the parked gate (V34).
+    let _permit = BgPermit::playback_priority();
     let out = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -690,7 +696,7 @@ async fn deliver_vtt(
         {
             return Ok(vtt_response((*bytes).clone(), style_lossy, &style));
         }
-        let out = run_ffmpeg_embedded(input, stream_index).await?;
+        let out = run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await?;
         let stored = cache
             .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
             .await;
@@ -700,7 +706,7 @@ async fn deliver_vtt(
     // No cache configured — fall back to the original spawn-per-fetch
     // path. (Default config keeps the cache on; this branch only
     // fires for tests / minimal deployments.)
-    let out = run_ffmpeg_embedded(input, stream_index).await?;
+    let out = run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await?;
     Ok(vtt_response(out, style_lossy, &style))
 }
 
@@ -829,13 +835,13 @@ async fn resolve_vtt_bytes(
             idx = stream_index,
             "subtitle cache MISS — extracting on the request path"
         );
-        let out = run_ffmpeg_embedded(input, stream_index).await?;
+        let out = run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await?;
         let stored = cache
             .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
             .await;
         return Ok((*stored).clone());
     }
-    run_ffmpeg_embedded(input, stream_index).await
+    run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await
 }
 
 /// Parse a WebVTT document into jellyfin's `{ "TrackEvents": [...] }` JSON.
@@ -1024,7 +1030,11 @@ fn vtt_response(mut body: Vec<u8>, style_lossy: bool, style: &SubtitleStyle) -> 
     builder.body(body)
 }
 
-async fn run_ffmpeg_embedded(input: &str, stream_index: u32) -> Result<Vec<u8>, actix_web::Error> {
+async fn run_ffmpeg_embedded(
+    input: &str,
+    stream_index: u32,
+    _permit: &BgPermit,
+) -> Result<Vec<u8>, actix_web::Error> {
     // Cold subtitle extraction opens the whole (often multi-GB, NFS-backed)
     // source to demux one text stream — the dominant cost of a first Stream.vtt
     // / Stream.js fetch. Timed so a slow first-fetch is visible in traces.
