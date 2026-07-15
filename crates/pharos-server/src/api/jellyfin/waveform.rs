@@ -213,7 +213,7 @@ mod tests {
         let key: WaveKey = (42, 1000, 256);
         assert!(cache.get(&key).await.is_none(), "cold key must miss");
         let stored = cache.store(key, vec![0.1, 0.2, 0.3]).await;
-        let hit = cache.get(&key).await.expect("warm key must hit");
+        let hit = cache.get(&key).await.unwrap(); // warm key must hit
         assert_eq!(hit.as_slice(), stored.as_slice());
         // A different bin count is a distinct output → still a miss.
         assert!(cache.get(&(42, 1000, 128)).await.is_none());
