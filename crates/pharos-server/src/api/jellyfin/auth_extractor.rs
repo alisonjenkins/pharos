@@ -177,6 +177,40 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             }
         }
     }
+    // B72 (temporary, gated) — the native-TV ExoPlayer data-source client
+    // (`okhttp/…` UA, no app auth interceptor) 401s the direct-play
+    // `/videos/{id}/stream?static=true` with "missing token". Log exactly what
+    // auth material (if any) it DID send so we can see whether the token rides
+    // a header shape we don't parse, or is absent entirely. Names always; the
+    // auth-bearing header values (which ARE the credential) only truncated.
+    if std::env::var("PHAROS_LOG_ALL_REQUESTS").as_deref() == Ok("1")
+        && req.path().to_ascii_lowercase().contains("/stream")
+    {
+        let names: Vec<&str> = req.headers().keys().map(|k| k.as_str()).collect();
+        let auth_preview = |name: &str| -> String {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    let n = v.len();
+                    if n <= 12 {
+                        format!("<{n}B>")
+                    } else {
+                        format!("{}…{} ({n}B)", &v[..6], &v[n - 4..])
+                    }
+                })
+                .unwrap_or_else(|| "<absent>".into())
+        };
+        tracing::warn!(
+            path = %req.path(),
+            query = %req.query_string(),
+            header_names = ?names,
+            authorization = %auth_preview("Authorization"),
+            x_emby_authorization = %auth_preview("X-Emby-Authorization"),
+            x_emby_token = %auth_preview("X-Emby-Token"),
+            "B72: token-less /stream request — header audit"
+        );
+    }
     None
 }
 
