@@ -22,10 +22,63 @@ use actix_web::{
 };
 use pharos_core::{MediaItem, MediaStore, TokenStore};
 use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 /// Jellyfin 100-ns ticks per second.
 const TICKS_PER_SECOND: u64 = 10_000_000;
+
+/// Wraps a response body so the shared `playback_activity` clock is restamped
+/// as bytes ACTUALLY flow to the client (V35). A single long GET — direct-play
+/// `stream.mp4`, resume-from-offset, progressive webm, or an audio remux — thus
+/// keeps the `bg_io` regulator parked for the WHOLE stream, not just the 12s
+/// window after the request line (all a once-per-request stamp bought). B72: the
+/// regulator was blind to every non-webm delivery path, so background sweeps ran
+/// at full `BG_IO_MAX` during direct playback and starved live reads.
+struct MeteredBody<B> {
+    inner: B,
+    clock: Arc<AtomicI64>,
+}
+
+impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for MeteredBody<B> {
+    type Error = B::Error;
+
+    fn size(&self) -> actix_web::body::BodySize {
+        self.inner.size()
+    }
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<actix_web::web::Bytes, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_next(cx);
+        if let Poll::Ready(Some(Ok(_))) = &polled {
+            // Bytes just went out — mark playback live NOW. Cheap relaxed store.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            this.clock.store(now, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+/// Route a delivery response's body through [`MeteredBody`] so the playback
+/// clock keeps ticking for the stream's whole lifetime (V35). Every direct-play
+/// / resume / progressive / audio delivery return value passes through here.
+fn meter_body(resp: HttpResponse, clock: Arc<AtomicI64>) -> HttpResponse {
+    resp.map_body(|_, body| {
+        actix_web::body::BoxBody::new(MeteredBody {
+            inner: body,
+            clock: clock.clone(),
+        })
+    })
+}
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths; `LowercasePath` middleware
@@ -125,6 +178,8 @@ async fn audio_universal(
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Audio playback is live too — stamp on entry, meter the body below (V35).
+    state.note_playback_activity();
     let item = load_item(&state, path.id_str()).await?;
     let qs = req.query_string();
     let acceptable = parse_audio_codec_list(qs);
@@ -159,7 +214,14 @@ async fn audio_universal(
         .find(|c| matches!(c.to_ascii_lowercase().as_str(), "aac"))
         .cloned()
         .unwrap_or_else(|| "aac".to_string());
-    audio_remux(&item, &target, bitrate, max_channels).await
+    audio_remux(
+        &item,
+        &target,
+        bitrate,
+        max_channels,
+        state.playback_activity.clone(),
+    )
+    .await
 }
 
 async fn audio_remux(
@@ -167,6 +229,7 @@ async fn audio_remux(
     target_codec: &str,
     bitrate_bps: Option<u64>,
     max_channels: Option<u32>,
+    clock: Arc<AtomicI64>,
 ) -> Result<HttpResponse, actix_web::Error> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -226,9 +289,12 @@ async fn audio_remux(
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
-    Ok(HttpResponse::Ok()
-        .content_type(content_type)
-        .body(actix_web::body::BodyStream::new(stream)))
+    Ok(meter_body(
+        HttpResponse::Ok()
+            .content_type(content_type)
+            .body(actix_web::body::BodyStream::new(stream)),
+        clock,
+    ))
 }
 
 fn parse_audio_codec_list(qs: &str) -> Vec<String> {
@@ -427,12 +493,16 @@ async fn stream_transcoded_webm(
     // Route through the load-balancing scheduler (crash-isolated worker,
     // spread across every GPU + CPU). Inline ffmpeg is only a last-resort
     // fallback when the scheduler genuinely declines (pool saturated).
+    let clock = state.playback_activity.clone();
     if let Some(sched) = state.transcode_scheduler.as_ref() {
         match sched.submit_live(item.path.clone(), opts.clone()).await {
             Ok(stream) => {
-                return Ok(HttpResponse::Ok()
-                    .content_type("video/webm")
-                    .streaming(stream));
+                return Ok(meter_body(
+                    HttpResponse::Ok()
+                        .content_type("video/webm")
+                        .streaming(stream),
+                    clock,
+                ));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "scheduler webm live transcode declined; inline fallback");
@@ -444,9 +514,12 @@ async fn stream_transcoded_webm(
         .transcode(&item.path, &opts)
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("webm transcode: {e}")))?;
-    Ok(HttpResponse::Ok()
-        .content_type("video/webm")
-        .streaming(stream.into_stream()))
+    Ok(meter_body(
+        HttpResponse::Ok()
+            .content_type("video/webm")
+            .streaming(stream.into_stream()),
+        clock,
+    ))
 }
 
 /// Parse an unsigned integer query param (case-insensitive key).
@@ -490,13 +563,18 @@ async fn deliver_stream(
     req: &HttpRequest,
     id_str: &str,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Direct-play is live playback too. Stamp on entry so the bg_io regulator
+    // parks immediately, and route the body through `meter_body` so it STAYS
+    // parked for the whole stream (V35) — B72's regulator-blind root.
+    state.note_playback_activity();
+    let clock = state.playback_activity.clone();
     let item = load_item(state, id_str).await?;
     let has_range = req.headers().contains_key(header::RANGE);
     let start_ticks = parse_start_time_ticks(req.query_string());
 
     if !has_range && start_ticks > 0 {
         if let Some(offset) = byte_offset_from_ticks(&item, start_ticks).await {
-            return serve_from_offset(&item, offset, req).await;
+            return serve_from_offset(&item, offset, req, clock).await;
         }
     }
 
@@ -542,7 +620,7 @@ async fn deliver_stream(
             resp.headers_mut().insert(header::SET_COOKIE, hv);
         }
     }
-    Ok(resp)
+    Ok(meter_body(resp, clock))
 }
 
 fn parse_start_time_ticks(qs: &str) -> u64 {
@@ -596,6 +674,7 @@ async fn serve_from_offset(
     item: &MediaItem,
     offset: u64,
     req: &HttpRequest,
+    clock: Arc<AtomicI64>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // P25 — conditional GET. When the client's cached snapshot is
     // still current per `If-Modified-Since`, short-circuit with 304.
@@ -670,7 +749,7 @@ async fn serve_from_offset(
     if remaining > 16 * 1024 * 1024 {
         resp.headers_mut().remove(header::CONTENT_LENGTH);
     }
-    Ok(resp)
+    Ok(meter_body(resp, clock))
 }
 
 async fn load_item(state: &AppState, id_str: &str) -> Result<MediaItem, actix_web::Error> {
@@ -718,6 +797,31 @@ mod tests {
             created_at: None,
             metadata: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn metered_body_stamps_clock_as_bytes_flow() {
+        // V35 / B72: the body wrapper must restamp the playback clock every time
+        // a chunk actually flows, so a long single GET keeps the bg_io regulator
+        // parked for the whole stream — not just the request line.
+        use actix_web::body::MessageBody;
+        let clock = Arc::new(AtomicI64::new(0));
+        let body = MeteredBody {
+            inner: actix_web::web::Bytes::from_static(b"payload"),
+            clock: clock.clone(),
+        };
+        assert_eq!(
+            clock.load(Ordering::Relaxed),
+            0,
+            "no bytes have flowed yet → clock must be unstamped"
+        );
+        let mut body = std::pin::pin!(body);
+        let chunk = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+        assert!(chunk.is_some(), "expected a data chunk to flow");
+        assert!(
+            clock.load(Ordering::Relaxed) > 0,
+            "clock must stamp once bytes flow (V35)"
+        );
     }
 
     #[tokio::test]
