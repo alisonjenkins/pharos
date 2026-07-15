@@ -27,10 +27,10 @@ use tokio::process::Command;
 /// Sidecar streams get indices starting at this offset so they never
 /// collide with ffprobe-reported embedded indices (which top out
 /// around 100 even for absurd files).
-// SIDECAR_BASE_INDEX moved to `pharos_jellyfin_api::dto` in Phase A.2.
-// Re-exported here so `crate::api::jellyfin::subtitles::SIDECAR_BASE_INDEX`
-// still resolves for any historical caller.
-pub use pharos_jellyfin_api::dto::SIDECAR_BASE_INDEX;
+// B71 — the sidecar base is now PER-ITEM (contiguous, one past the highest real
+// ffprobe index) instead of a fixed 1_000_000 sentinel, so sidecar wire indices
+// are real positions the strict kotlin players don't crash on.
+pub use pharos_jellyfin_api::dto::sidecar_base_index;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths.
@@ -199,8 +199,9 @@ async fn deliver_ass(
     };
 
     // Sidecar → raw passthrough (it's already an .ass/.ssa file on disk).
-    if stream_index >= SIDECAR_BASE_INDEX {
-        let offset = (stream_index - SIDECAR_BASE_INDEX) as usize;
+    let sidecar_base = sidecar_base_index(&item.probe);
+    if stream_index >= sidecar_base {
+        let offset = (stream_index - sidecar_base) as usize;
         let sidecars = discover_sidecars(&item.path).await;
         let Some((sidecar_path, _)) = sidecars.into_iter().nth(offset) else {
             return Err(error::ErrorNotFound("no sidecar at that index"));
@@ -510,8 +511,9 @@ async fn deliver_vtt(
     })?;
 
     // Sidecar lookups first — they're free (no ffmpeg spawn).
-    if stream_index >= SIDECAR_BASE_INDEX {
-        let offset = (stream_index - SIDECAR_BASE_INDEX) as usize;
+    let sidecar_base = sidecar_base_index(&item.probe);
+    if stream_index >= sidecar_base {
+        let offset = (stream_index - sidecar_base) as usize;
         let sidecars = discover_sidecars(&item.path).await;
         let Some((sidecar_path, kind)) = sidecars.into_iter().nth(offset) else {
             return Err(error::ErrorNotFound("no sidecar at that index"));
@@ -678,8 +680,9 @@ async fn resolve_vtt_bytes(
     item: &pharos_core::MediaItem,
     stream_index: u32,
 ) -> Result<Vec<u8>, actix_web::Error> {
-    if stream_index >= SIDECAR_BASE_INDEX {
-        let offset = (stream_index - SIDECAR_BASE_INDEX) as usize;
+    let sidecar_base = sidecar_base_index(&item.probe);
+    if stream_index >= sidecar_base {
+        let offset = (stream_index - sidecar_base) as usize;
         let sidecars = discover_sidecars(&item.path).await;
         let Some((path, kind)) = sidecars.into_iter().nth(offset) else {
             return Err(error::ErrorNotFound("no sidecar at that index"));

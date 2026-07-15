@@ -4,11 +4,30 @@
 use pharos_core::{User, UserPolicy};
 use serde::{Deserialize, Serialize};
 
-/// Sidecar subtitle streams numbered starting here so their indices
-/// never collide with real ffprobe stream indices (which start at 0
-/// and are typically single-digit). Lifted here in Phase A.2 so the
-/// DTO crate is self-contained.
-pub const SIDECAR_BASE_INDEX: u32 = 1_000_000;
+/// The wire index at which THIS item's sidecar subtitle streams begin: one past
+/// the highest real ffprobe stream index (video is 0). B71 — the old fixed
+/// `1_000_000` base made sidecar `MediaStream.Index` a sparse sentinel; the
+/// jellyfin-sdk-kotlin players (Android/Google TV) treat `Index` POSITIONALLY
+/// and crash (out-of-bounds) on it, whereas jellyfin-web tolerated the gap.
+/// A per-item contiguous base keeps every emitted index a REAL, small,
+/// collision-free position — computed identically by the stream builder and the
+/// subtitle-fetch handler so they always agree.
+pub fn sidecar_base_index(probe: &pharos_core::MediaProbe) -> u32 {
+    let max_audio = probe
+        .audio_tracks
+        .iter()
+        .map(|t| t.stream_index)
+        .max()
+        .unwrap_or(0);
+    let max_sub = probe
+        .subtitle_tracks
+        .iter()
+        .map(|t| t.stream_index)
+        .max()
+        .unwrap_or(0);
+    // Video is index 0; sidecars start one past the highest real index.
+    max_audio.max(max_sub) + 1
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -1816,9 +1835,11 @@ pub fn build_media_streams_with_subtitles(
                     display_title: None,
                 });
             }
-            // Sidecars: stream_index = SIDECAR_BASE + offset.
+            // Sidecars: contiguous, one past the highest real ffprobe index
+            // (B71 — never the old sparse 1_000_000 sentinel).
+            let sidecar_base = sidecar_base_index(probe);
             for offset in 0..ctx.sidecar_count {
-                let idx = SIDECAR_BASE_INDEX + offset;
+                let idx = sidecar_base + offset;
                 let lang = ctx
                     .sidecar_langs
                     .get(offset as usize)
@@ -2177,6 +2198,41 @@ mod tests {
         );
         assert!(ass.is_text_subtitle_stream);
         assert!(ass.supports_external_stream);
+    }
+
+    #[test]
+    fn sidecar_subtitle_indices_are_contiguous_not_a_sentinel() {
+        // B71 — sidecar subtitle wire indices must be REAL, small, contiguous
+        // positions (one past the highest real ffprobe index), never the old
+        // 1_000_000 sentinel: the kotlin Android/TV players treat MediaStream
+        // .Index positionally and crash out-of-bounds on a sparse index.
+        let probe = MediaProbe {
+            video_codec: Some("h264".into()),
+            audio_tracks: vec![pharos_core::AudioTrack {
+                stream_index: 1,
+                ..Default::default()
+            }],
+            // No embedded subs → all subtitles are sidecars.
+            subtitle_tracks: vec![],
+            ..Default::default()
+        };
+        assert_eq!(sidecar_base_index(&probe), 2, "one past audio index 1");
+        let ctx = SubtitleStreamCtx {
+            item_id: 0x2a,
+            sidecar_count: 3,
+            sidecar_langs: vec![Some("eng".into()), Some("spa".into()), None],
+        };
+        let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
+        let subs: Vec<u32> = streams
+            .iter()
+            .filter(|s| s.kind == "Subtitle")
+            .map(|s| s.index)
+            .collect();
+        assert_eq!(subs, vec![2, 3, 4], "contiguous after the real streams");
+        assert!(
+            streams.iter().all(|s| s.index < 1000),
+            "no stream carries the old 1_000_000 sentinel index"
+        );
     }
 
     #[test]
