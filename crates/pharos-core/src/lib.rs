@@ -565,6 +565,12 @@ pub struct ItemPerson {
     pub character: Option<String>,
     pub kind: PersonKind,
     pub sort_order: Option<u32>,
+    /// T79 — the person's resolved portrait URL (`people.thumb_url`), carried
+    /// so the cast-list DTO can advertise a `PrimaryImageTag` ONLY when a
+    /// servable image exists (jellyfin-web then requests the photo via the
+    /// T77 `/Items/{personWireId}/Images/Primary` route). `None` / a legacy
+    /// non-`http` path → no tag, so no 404 churn for portrait-less cast.
+    pub thumb_url: Option<String>,
 }
 
 /// LIB-C2 — people (cast & crew) as first-class entities. Split from

@@ -1152,12 +1152,23 @@ impl BaseItemDto {
                     .filter(|c| !c.is_empty())
                     .or_else(|| p.role.clone().filter(|r| !r.is_empty()))
                     .unwrap_or_default();
+                // T79 — advertise a PrimaryImageTag ONLY when the person has a
+                // servable portrait (an `http(s)` thumb_url resolved by T81).
+                // A NULL / legacy-local-path thumb → no tag, so jellyfin-web
+                // never requests a photo that would 404. The tag is derived
+                // from the url so it changes when the portrait does (cache-bust);
+                // pharos's image route serves by wire id and ignores its value.
+                let primary_image_tag = p
+                    .thumb_url
+                    .as_deref()
+                    .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+                    .map(person_image_tag_for);
                 PersonDto {
                     name: p.name.clone(),
                     id: p.wire_id.clone(),
                     role,
                     kind: p.kind.as_str(),
-                    primary_image_tag: None,
+                    primary_image_tag,
                 }
             })
             .collect();
@@ -1511,6 +1522,17 @@ pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, 
 pub fn image_tag_for(item_id: u64, role: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let h = xxh3_64(format!("img:{item_id}:{role}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+    format!("{h:016x}")
+}
+
+/// T79 — a stable hex tag for a person's portrait, derived from its resolved
+/// url so it rotates when the portrait changes (cache-busting) yet stays
+/// stable across renders of the same url. pharos's `/Items/{personWireId}/
+/// Images/Primary` route serves by wire id and ignores the tag value — the
+/// tag's only job is to be present + stable so jellyfin-web requests the photo.
+pub fn person_image_tag_for(thumb_url: &str) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let h = xxh3_64(thumb_url.as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}")
 }
 
@@ -2772,5 +2794,64 @@ mod trickplay_helper_tests {
             super::BaseItemDto::from_domain(&movie, "srv").backdrop_image_tags,
             vec![super::image_tag_for(1, "backdrop")]
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod person_image_tag_tests {
+    use super::BaseItemDto;
+    use pharos_core::{ItemPerson, MediaItem, MediaKind, PersonKind};
+
+    fn person(name: &str, thumb: Option<&str>) -> ItemPerson {
+        ItemPerson {
+            name: name.to_string(),
+            wire_id: pharos_core::person_wire_id(name),
+            role: None,
+            character: Some("Self".to_string()),
+            kind: PersonKind::Actor,
+            sort_order: Some(0),
+            thumb_url: thumb.map(str::to_string),
+        }
+    }
+
+    fn movie() -> MediaItem {
+        MediaItem {
+            id: 1,
+            kind: MediaKind::Movie,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn primary_image_tag_only_for_http_thumb() {
+        let people = [
+            person("Has Photo", Some("https://image.tmdb.org/t/p/w300/x.jpg")),
+            person("Legacy Path", Some("/config/metadata/People/l.jpg")),
+            person("No Thumb", None),
+        ];
+        let dto = BaseItemDto::from_domain(&movie(), "srv").with_people(&people);
+
+        assert!(
+            dto.people[0].primary_image_tag.is_some(),
+            "http(s) portrait advertises a tag"
+        );
+        assert_eq!(
+            dto.people[1].primary_image_tag, None,
+            "legacy local path advertises no tag (would 404)"
+        );
+        assert_eq!(
+            dto.people[2].primary_image_tag, None,
+            "portrait-less cast advertises no tag"
+        );
+    }
+
+    #[test]
+    fn tag_is_stable_per_url_and_differs_across_urls() {
+        let a1 = super::person_image_tag_for("https://cdn/a.jpg");
+        let a2 = super::person_image_tag_for("https://cdn/a.jpg");
+        let b = super::person_image_tag_for("https://cdn/b.jpg");
+        assert_eq!(a1, a2, "same url → same tag (stable across renders)");
+        assert_ne!(a1, b, "different url → different tag (cache-bust)");
     }
 }

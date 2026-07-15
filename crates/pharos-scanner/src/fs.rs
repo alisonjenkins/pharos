@@ -2143,6 +2143,7 @@ mod tests {
                             character: p.character.clone(),
                             kind: p.kind,
                             sort_order: p.sort_order,
+                            thumb_url: p.thumb.clone(),
                         })
                         .collect()
                 })

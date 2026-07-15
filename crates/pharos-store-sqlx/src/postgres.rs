@@ -1482,27 +1482,39 @@ impl PersonStore for PostgresStore {
     #[tracing::instrument(skip(self))]
     async fn people_for_item(&self, item: MediaId) -> DomainResult<Vec<ItemPerson>> {
         let item_i64 = media_id_i64(item)?;
-        let rows =
-            sqlx::query_as::<_, (String, String, String, Option<String>, String, Option<i32>)>(
-                "SELECT p.name, p.wire_id, ip.role, ip.character, ip.person_kind, ip.sort_order \
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<i32>,
+                Option<String>,
+            ),
+        >(
+            "SELECT p.name, p.wire_id, ip.role, ip.character, ip.person_kind, ip.sort_order, \
+                 p.thumb_url \
              FROM item_people ip JOIN people p ON p.id = ip.person_id \
              WHERE ip.item_id = $1 \
              ORDER BY ip.sort_order IS NULL, ip.sort_order, p.name",
-            )
-            .bind(item_i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        )
+        .bind(item_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(rows
             .into_iter()
             .map(
-                |(name, wire_id, role, character, kind, sort_order)| ItemPerson {
+                |(name, wire_id, role, character, kind, sort_order, thumb_url)| ItemPerson {
                     name,
                     wire_id,
                     role: Some(role).filter(|r| !r.is_empty()),
                     character,
                     kind: PersonKind::parse(&kind),
                     sort_order: sort_order.map(|n| n.max(0) as u32),
+                    thumb_url,
                 },
             )
             .collect())
