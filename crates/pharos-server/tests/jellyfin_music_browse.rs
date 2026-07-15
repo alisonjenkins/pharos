@@ -247,6 +247,15 @@ async fn artist_children_are_albums_plus_loose_tracks() {
     assert_eq!(items[0]["ChildCount"], 2);
     assert_eq!(items[0]["ProductionYear"], 1999);
     assert_eq!(items[0]["AlbumArtists"][0]["Name"], "Limp Bizkit");
+    // A synth album MUST advertise a Primary image tag, else clients never
+    // request the cover and album cards render blank (B-music). The image
+    // endpoint resolves the tag to a child track's artwork.
+    let primary = items[0]["ImageTags"]["Primary"].as_str();
+    assert!(
+        primary.is_some_and(|t| !t.is_empty()),
+        "synth album must advertise a non-empty Primary ImageTag, got {:?}",
+        items[0]["ImageTags"]
+    );
 }
 
 #[actix_web::test]

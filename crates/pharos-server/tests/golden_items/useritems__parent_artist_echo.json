@@ -12,7 +12,9 @@
       "ChildCount": 2,
       "Genres": [],
       "Id": "080477e50c7a1f08080477e50c7a1f08",
-      "ImageTags": {},
+      "ImageTags": {
+        "Primary": "7b2198bdd8b19ed1"
+      },
       "IsFolder": true,
       "MediaType": "Unknown",
       "Name": "Echo Album",

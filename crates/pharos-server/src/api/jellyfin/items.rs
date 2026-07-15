@@ -2889,15 +2889,27 @@ fn aggregate_albums(items: &[MediaItem], keep: impl Fn(&MediaItem) -> bool) -> V
 /// the year + child count the detail rails render).
 fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
+    let album_id = album_id_for(&a.name);
+    // Advertise a Primary image tag so clients actually request the cover.
+    // The album image endpoint resolves a synth album id to a child track's
+    // artwork (embedded cover or sidecar folder.jpg); without a tag in
+    // ImageTags jellyfin-web / the native apps never fetch it, so album
+    // cards + the album header rendered blank. The tag value is only a
+    // cache-buster — a stable hash of the album id keeps it deterministic.
+    let primary_tag = {
+        use xxhash_rust::xxh3::xxh3_64;
+        let h = xxh3_64(album_id.as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF;
+        format!("{h:016x}")
+    };
     let mut v = serde_json::json!({
-        "Id": album_id_for(&a.name),
+        "Id": album_id,
         "Name": a.name,
         "ServerId": state.server_id,
         "Type": "MusicAlbum",
         "MediaType": "Unknown",
         "IsFolder": true,
         "ChildCount": a.child_count,
-        "ImageTags": {},
+        "ImageTags": { "Primary": primary_tag },
         "BackdropImageTags": [],
         "Genres": [], "Tags": [],
     });
