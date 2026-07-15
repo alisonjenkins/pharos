@@ -2330,6 +2330,33 @@ fn synth_views_body(state: &AppState) -> serde_json::Value {
     })
 }
 
+/// Complete `UserData` (Jellyfin `UserItemDataDto`) for a synthesised folder /
+/// stub item. B68 — the kotlin SDK requires playbackPositionTicks / playCount /
+/// isFavorite / played (non-null) PLUS key (String) + itemId (UUID); a partial
+/// object (just Played/PlayCount) made the Android/Google-TV app CRASH parsing
+/// the parent (e.g. a library CollectionFolder in /UserViews), with no server
+/// error and no crash report — a 200 the client couldn't deserialize.
+fn folder_user_data(item_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 0,
+        "IsFavorite": false,
+        "Played": false,
+        "Key": item_id,
+        "ItemId": item_id,
+    })
+}
+
+/// A `CollectionType` the kotlin SDK's enum accepts, else `null`. Jellyfin's
+/// enum has no "mixed" — a mixed-content library carries a NULL CollectionType,
+/// and emitting the string "mixed" crashes the strict client's enum decode (B68).
+fn wire_collection_type(ct: &str) -> serde_json::Value {
+    match ct {
+        "mixed" | "" => serde_json::Value::Null,
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
 fn library_views(state: &AppState) -> Vec<serde_json::Value> {
     // LIB-C1 — prefer the typed libraries reconciled from config (each
     // carries its own CollectionType). The wire_id is the same
@@ -2345,10 +2372,10 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
                     "Name": lib.name,
                     "ServerId": state.server_id,
                     "Type": "CollectionFolder",
-                    "CollectionType": lib.kind.collection_type(),
+                    "CollectionType": wire_collection_type(lib.kind.collection_type()),
                     "MediaType": "Unknown",
                     "IsFolder": true,
-                    "UserData": { "Played": false, "PlayCount": 0 },
+                    "UserData": folder_user_data(&lib.wire_id),
                 })
             })
             .collect();
@@ -2374,10 +2401,10 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
                 "Name": name,
                 "ServerId": state.server_id,
                 "Type": "CollectionFolder",
-                "CollectionType": "mixed",
+                "CollectionType": serde_json::Value::Null,
                 "MediaType": "Unknown",
                 "IsFolder": true,
-                "UserData": { "Played": false, "PlayCount": 0 },
+                "UserData": folder_user_data(&id),
             })
         })
         .collect()
@@ -2389,10 +2416,10 @@ fn all_media_placeholder(server_id: &str) -> serde_json::Value {
         "Name": "All Media",
         "ServerId": server_id,
         "Type": "CollectionFolder",
-        "CollectionType": "mixed",
+        "CollectionType": serde_json::Value::Null,
         "MediaType": "Unknown",
         "IsFolder": true,
-        "UserData": { "Played": false, "PlayCount": 0 },
+        "UserData": folder_user_data("00000000000000000000000000000000"),
     })
 }
 
@@ -4637,7 +4664,7 @@ fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::
         "MediaType": "Unknown",
         "IsFolder": true,
         "CanPlay": false,
-        "UserData": { "Played": false, "PlayCount": 0 },
+        "UserData": folder_user_data(&id),
         // Empty array fields jellyfin-web spreads over.
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
         "ProductionLocations": [], "RemoteTrailers": [], "Chapters": [],
@@ -4676,7 +4703,7 @@ fn season_dto(
         "SeriesName": series.series_name,
         "SeriesId": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
         "IndexNumber": season_number,
-        "UserData": { "Played": false, "PlayCount": 0 },
+        "UserData": folder_user_data(&id),
         "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
         "ImageTags": { "Primary": tag }, "BackdropImageTags": [], "ProviderIds": {},
     })

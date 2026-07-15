@@ -514,3 +514,49 @@ async fn items_latest_alias_not_400() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.is_array(), "/Items/Latest returns a raw array");
 }
+
+// B68 — the Android/Google-TV app CRASHED (200, no error, no crash report)
+// parsing /UserViews: each CollectionFolder's UserData was a PARTIAL object
+// ({Played,PlayCount}) but the kotlin UserItemDataDto requires 6 non-null
+// fields, and CollectionType "mixed" is not a valid enum value. Guard the
+// full shape of every view.
+#[actix_web::test]
+async fn userviews_items_carry_kotlin_complete_userdata() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/UserViews")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().expect("Items array");
+    assert!(!items.is_empty(), "at least the placeholder view");
+    for it in items {
+        assert!(it["Id"].is_string(), "view has Id");
+        assert!(it["Type"].is_string(), "view has Type");
+        // CollectionType must be null or a string — never the invalid "mixed".
+        assert_ne!(
+            it["CollectionType"],
+            serde_json::json!("mixed"),
+            "CollectionType 'mixed' is not a valid kotlin enum value"
+        );
+        let ud = &it["UserData"];
+        for k in [
+            "PlaybackPositionTicks",
+            "PlayCount",
+            "IsFavorite",
+            "Played",
+            "Key",
+            "ItemId",
+        ] {
+            assert!(
+                !ud[k].is_null() && ud.get(k).is_some(),
+                "UserData.{k} is a kotlin-required (non-null) field, got {ud}"
+            );
+        }
+    }
+}
