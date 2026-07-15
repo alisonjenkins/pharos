@@ -44,6 +44,15 @@ extraEnv: []
 #        name: pharos-db-app
 #        key: uri
 
+# ── T81 person-image backfill (TMDB). When apiKey.secretName is set, the key
+#    is injected as PHAROS_TMDB_API_KEY from that Secret and pharos resolves
+#    real cast portraits from TMDB (public image CDN, served via a 302). Leave
+#    secretName empty to keep the feature off.
+tmdb:
+  apiKey:
+    secretName: ""      # e.g. "pharos-tmdb"
+    secretKey: "api-key"
+
 # ── pharos config.toml, rendered into a ConfigMap mounted at
 #    /etc/pharos/config.toml. Optional fields are omitted when null/empty.
 config:

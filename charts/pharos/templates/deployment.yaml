@@ -112,6 +112,15 @@ spec:
             # Postgres password never lands in config.toml / git).
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            {{- if .Values.tmdb.apiKey.secretName }}
+            # T81 — TMDB key from a Secret (never config.toml/git). Enables the
+            # person-image backfill; absent → the feature stays off.
+            - name: PHAROS_TMDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tmdb.apiKey.secretName }}
+                  key: {{ .Values.tmdb.apiKey.secretKey | default "api-key" }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8096
