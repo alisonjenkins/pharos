@@ -564,6 +564,66 @@ pub struct SynthItemDto {
     pub user_data: Option<UserItemDataDto>,
 }
 
+/// A library `CollectionFolder` (the `/UserViews` + `/Library/MediaFolders`
+/// home rows). Embeds the B68-critical folder `UserData` (typed). `Type` is a
+/// valid BaseItemKind; `CollectionType` is nullable (null for a mixed library)
+/// and ALWAYS on the wire. Typed per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CollectionFolderDto {
+    pub id: String,
+    pub name: String,
+    pub server_id: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub collection_type: Option<String>,
+    pub media_type: &'static str,
+    pub is_folder: bool,
+    pub user_data: UserItemDataDto,
+}
+
+/// A synthesised `Series` or `Season` folder (pharos stores no Series/Season
+/// entity — they're derived from episode `SeriesInfo`). Near-full `BaseItemDto`
+/// with the empty spread-target arrays jellyfin-web expects + the B68 folder
+/// `UserData`. Typed per B78/V38. Series-only fields (production_locations /
+/// remote_trailers / chapters / production_year) and Season-only fields
+/// (series_name / series_id / index_number) are optional-and-omitted on the
+/// other kind.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SeriesFolderDto {
+    pub id: String,
+    pub name: String,
+    pub server_id: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub media_type: &'static str,
+    pub is_folder: bool,
+    pub can_play: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_number: Option<u32>,
+    pub user_data: UserItemDataDto,
+    pub genres: Vec<String>,
+    pub genre_items: Vec<NameGuidPairDto>,
+    pub tags: Vec<String>,
+    pub studios: Vec<NameGuidPairDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_locations: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_trailers: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chapters: Option<Vec<ChapterInfoDto>>,
+    pub image_tags: std::collections::BTreeMap<String, String>,
+    pub backdrop_image_tags: Vec<String>,
+    pub provider_ids: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<i32>,
+}
+
 impl SynthItemDto {
     /// A bare synth folder (`Id`, `Name`, `ServerId`, `Type`, `MediaType`
     /// "Unknown", `IsFolder` true) — the Genre/Studio/Tag shape. Callers add

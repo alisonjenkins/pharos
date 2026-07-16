@@ -12,8 +12,9 @@ use crate::{
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
-            BaseItemDto, ItemsResultDto, MediaSourceInfoDto, NameGuidPairDto,
-            PlaybackInfoResponseDto, SubtitleStreamCtx, SynthItemDto,
+            BaseItemDto, CollectionFolderDto, ItemsResultDto, MediaSourceInfoDto, NameGuidPairDto,
+            PlaybackInfoResponseDto, SeriesFolderDto, SubtitleStreamCtx, SynthItemDto,
+            UserItemDataDto,
         },
         subtitles::discover_sidecars,
     },
@@ -655,21 +656,20 @@ async fn music_similar(
         b.0.cmp(&a.0)
             .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
     });
-    let items: Vec<serde_json::Value> = scored
+    let items: Vec<SynthItemDto> = scored
         .iter()
         .take(q.limit as usize)
-        .map(|(_, n)| {
-            serde_json::json!({
-                "Id": artist_id_for(n),
-                "Name": n,
-                "ServerId": state.server_id,
-                "Type": "MusicArtist",
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ImageTags": {},
-                "BackdropImageTags": [],
-                "Genres": [], "Tags": [],
-            })
+        .map(|(_, n)| SynthItemDto {
+            image_tags: Some(Default::default()),
+            backdrop_image_tags: Some(Vec::new()),
+            genres: Some(Vec::new()),
+            tags: Some(Vec::new()),
+            ..SynthItemDto::folder(
+                artist_id_for(n),
+                n.clone(),
+                state.server_id.clone(),
+                "MusicArtist",
+            )
         })
         .collect();
     let total = items.len() as u32;
@@ -2378,22 +2378,6 @@ fn synth_views_body(state: &AppState) -> serde_json::Value {
     })
 }
 
-/// Complete `UserData` (Jellyfin `UserItemDataDto`) for a synthesised folder /
-/// stub item. B68 — the kotlin SDK requires playbackPositionTicks / playCount /
-/// isFavorite / played (non-null) PLUS key (String) + itemId (UUID); a partial
-/// object (just Played/PlayCount) made the Android/Google-TV app CRASH parsing
-/// the parent (e.g. a library CollectionFolder in /UserViews), with no server
-/// error and no crash report — a 200 the client couldn't deserialize.
-fn folder_user_data(item_id: &str) -> serde_json::Value {
-    // B78/V38 — typed DTO, not a json! literal, so the kotlin-required field
-    // set (B68) stays complete by construction. to_value on a fixed struct is
-    // infallible; Null-fallback only for the impossible error.
-    serde_json::to_value(pharos_jellyfin_api::dto::UserItemDataDto::folder(
-        item_id, false, 0, false,
-    ))
-    .unwrap_or(serde_json::Value::Null)
-}
-
 /// A `CollectionType` the kotlin SDK's enum accepts, else `null`. Jellyfin's
 /// enum has no "mixed" — a mixed-content library carries a NULL CollectionType,
 /// and emitting the string "mixed" crashes the strict client's enum decode (B68).
@@ -2414,16 +2398,20 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
         return libraries
             .iter()
             .map(|lib| {
-                serde_json::json!({
-                    "Id": lib.wire_id,
-                    "Name": lib.name,
-                    "ServerId": state.server_id,
-                    "Type": "CollectionFolder",
-                    "CollectionType": wire_collection_type(lib.kind.collection_type()),
-                    "MediaType": "Unknown",
-                    "IsFolder": true,
-                    "UserData": folder_user_data(&lib.wire_id),
+                // B78/V38 — typed CollectionFolderDto (embeds the B68 UserData).
+                serde_json::to_value(CollectionFolderDto {
+                    id: lib.wire_id.clone(),
+                    name: lib.name.clone(),
+                    server_id: state.server_id.clone(),
+                    kind: "CollectionFolder",
+                    collection_type: wire_collection_type(lib.kind.collection_type())
+                        .as_str()
+                        .map(str::to_string),
+                    media_type: "Unknown",
+                    is_folder: true,
+                    user_data: UserItemDataDto::folder(&lib.wire_id, false, 0, false),
                 })
+                .unwrap_or(serde_json::Value::Null)
             })
             .collect();
     }
@@ -2443,31 +2431,34 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("Media")
                 .to_string();
-            serde_json::json!({
-                "Id": id,
-                "Name": name,
-                "ServerId": state.server_id,
-                "Type": "CollectionFolder",
-                "CollectionType": serde_json::Value::Null,
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "UserData": folder_user_data(&id),
+            serde_json::to_value(CollectionFolderDto {
+                id: id.clone(),
+                name,
+                server_id: state.server_id.clone(),
+                kind: "CollectionFolder",
+                collection_type: None,
+                media_type: "Unknown",
+                is_folder: true,
+                user_data: UserItemDataDto::folder(&id, false, 0, false),
             })
+            .unwrap_or(serde_json::Value::Null)
         })
         .collect()
 }
 
 fn all_media_placeholder(server_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "Id": "00000000000000000000000000000000",
-        "Name": "All Media",
-        "ServerId": server_id,
-        "Type": "CollectionFolder",
-        "CollectionType": serde_json::Value::Null,
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "UserData": folder_user_data("00000000000000000000000000000000"),
+    const ALL_MEDIA_ID: &str = "00000000000000000000000000000000";
+    serde_json::to_value(CollectionFolderDto {
+        id: ALL_MEDIA_ID.to_string(),
+        name: "All Media".to_string(),
+        server_id: server_id.to_string(),
+        kind: "CollectionFolder",
+        collection_type: None,
+        media_type: "Unknown",
+        is_folder: true,
+        user_data: UserItemDataDto::folder(ALL_MEDIA_ID, false, 0, false),
     })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// 32-char hex id derived from the canonical root path — same input →
@@ -2893,26 +2884,31 @@ fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
         let h = xxh3_64(album_id.as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF;
         format!("{h:016x}")
     };
-    let mut v = serde_json::json!({
-        "Id": album_id,
-        "Name": a.name,
-        "ServerId": state.server_id,
-        "Type": "MusicAlbum",
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "ChildCount": a.child_count,
-        "ImageTags": { "Primary": primary_tag },
-        "BackdropImageTags": [],
-        "Genres": [], "Tags": [],
-    });
-    if let Some(y) = a.year {
-        v["ProductionYear"] = serde_json::json!(y);
-    }
-    if let Some(artist) = a.album_artist.as_deref() {
-        v["AlbumArtist"] = serde_json::Value::String(artist.to_string());
-        v["AlbumArtists"] = serde_json::json!([{ "Name": artist, "Id": artist_id_for(artist) }]);
-    }
-    v
+    let mut image_tags = std::collections::BTreeMap::new();
+    image_tags.insert("Primary".to_string(), primary_tag);
+    // B78/V38 — typed SynthItemDto, serialized to keep the Value return.
+    serde_json::to_value(SynthItemDto {
+        child_count: Some(a.child_count),
+        production_year: a.year.map(|y| y as i32),
+        album_artist: a.album_artist.clone(),
+        album_artists: a.album_artist.as_deref().map(|artist| {
+            vec![NameGuidPairDto {
+                name: artist.to_string(),
+                id: artist_id_for(artist),
+            }]
+        }),
+        image_tags: Some(image_tags),
+        backdrop_image_tags: Some(Vec::new()),
+        genres: Some(Vec::new()),
+        tags: Some(Vec::new()),
+        ..SynthItemDto::folder(
+            album_id,
+            a.name.clone(),
+            state.server_id.clone(),
+            "MusicAlbum",
+        )
+    })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// Sort synthesised albums per the request: the music rails ask for
@@ -4262,23 +4258,30 @@ async fn synth_album_or_artist(
                 .clone()
                 .or_else(|| i.probe.artist.clone())
         });
-        let mut v = serde_json::json!({
-            "Id": id_str,
-            "Name": name,
-            "ServerId": state.server_id,
-            "Type": "MusicAlbum",
-            "MediaType": "Unknown",
-            "IsFolder": true,
-            "ChildCount": tracks.len(),
-            "ImageTags": {},
-            "BackdropImageTags": [],
-            "Genres": [], "Tags": [],
-        });
+        // B78/V38 — typed SynthItemDto.
+        let mut it = SynthItemDto {
+            child_count: Some(tracks.len() as u32),
+            image_tags: Some(Default::default()),
+            backdrop_image_tags: Some(Vec::new()),
+            genres: Some(Vec::new()),
+            tags: Some(Vec::new()),
+            ..SynthItemDto::folder(
+                id_str.to_string(),
+                name.to_string(),
+                state.server_id.clone(),
+                "MusicAlbum",
+            )
+        };
         if let Some(a) = artist {
-            v["AlbumArtist"] = serde_json::Value::String(a.clone());
-            v["AlbumArtists"] = serde_json::json!([{ "Name": a, "Id": artist_id_for(&a) }]);
+            it.album_artists = Some(vec![NameGuidPairDto {
+                name: a.clone(),
+                id: artist_id_for(&a),
+            }]);
+            it.album_artist = Some(a);
         }
-        return Ok(Some(v));
+        return Ok(Some(
+            serde_json::to_value(it).unwrap_or(serde_json::Value::Null),
+        ));
     }
     let artists = state
         .stores
@@ -4286,17 +4289,22 @@ async fn synth_album_or_artist(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     if let Some(name) = artists.iter().find(|n| artist_id_for(n) == id_str) {
-        return Ok(Some(serde_json::json!({
-            "Id": id_str,
-            "Name": name,
-            "ServerId": state.server_id,
-            "Type": "MusicArtist",
-            "MediaType": "Unknown",
-            "IsFolder": true,
-            "ImageTags": {},
-            "BackdropImageTags": [],
-            "Genres": [], "Tags": [],
-        })));
+        // B78/V38 — typed SynthItemDto.
+        return Ok(Some(
+            serde_json::to_value(SynthItemDto {
+                image_tags: Some(Default::default()),
+                backdrop_image_tags: Some(Vec::new()),
+                genres: Some(Vec::new()),
+                tags: Some(Vec::new()),
+                ..SynthItemDto::folder(
+                    id_str.to_string(),
+                    name.to_string(),
+                    state.server_id.clone(),
+                    "MusicArtist",
+                )
+            })
+            .unwrap_or(serde_json::Value::Null),
+        ));
     }
     Ok(None)
 }
@@ -4733,28 +4741,38 @@ fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::
     // pharos has no stored Series row, so `/Items/{id}/Images/Primary` resolves
     // the synth id to a representative episode's frame (see images.rs). The tag
     // value is only a cache-buster; the stable id keeps client URLs constant.
-    let tag = &id;
-    let mut dto = serde_json::json!({
-        "Id": id,
-        "Name": series.series_name,
-        "ServerId": server_id,
-        "Type": "Series",
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "CanPlay": false,
-        "UserData": folder_user_data(&id),
-        // Empty array fields jellyfin-web spreads over.
-        "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
-        "ProductionLocations": [], "RemoteTrailers": [], "Chapters": [],
-        "ImageTags": { "Primary": tag, "Thumb": tag },
-        "BackdropImageTags": [tag], "ProviderIds": {},
-    });
-    // LIB-C11 — surface the folder-parsed year so jellyfin-web can tell
-    // same-name shows apart in the Series view.
-    if let (Some(obj), Some(year)) = (dto.as_object_mut(), series.series_year) {
-        obj.insert("ProductionYear".into(), serde_json::json!(year));
-    }
-    dto
+    // B78/V38 — typed SeriesFolderDto. The Primary/Thumb/Backdrop tags are the
+    // stable id (a cache-buster; images.rs resolves the synth id to a
+    // representative episode frame). LIB-C11 — surface the folder-parsed year so
+    // jellyfin-web tells same-name shows apart.
+    let mut image_tags = std::collections::BTreeMap::new();
+    image_tags.insert("Primary".to_string(), id.clone());
+    image_tags.insert("Thumb".to_string(), id.clone());
+    serde_json::to_value(SeriesFolderDto {
+        name: series.series_name.clone(),
+        server_id: server_id.to_string(),
+        kind: "Series",
+        media_type: "Unknown",
+        is_folder: true,
+        can_play: false,
+        series_name: None,
+        series_id: None,
+        index_number: None,
+        user_data: UserItemDataDto::folder(&id, false, 0, false),
+        genres: Vec::new(),
+        genre_items: Vec::new(),
+        tags: Vec::new(),
+        studios: Vec::new(),
+        production_locations: Some(Vec::new()),
+        remote_trailers: Some(Vec::new()),
+        chapters: Some(Vec::new()),
+        image_tags,
+        backdrop_image_tags: vec![id.clone()],
+        provider_ids: std::collections::BTreeMap::new(),
+        production_year: series.series_year.map(|y| y as i32),
+        id,
+    })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 fn season_dto(
@@ -4769,22 +4787,37 @@ fn season_dto(
         &series.series_name,
         season_number,
     );
-    let tag = &id;
-    serde_json::json!({
-        "Id": id,
-        "Name": season_name,
-        "ServerId": server_id,
-        "Type": "Season",
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "CanPlay": false,
-        "SeriesName": series.series_name,
-        "SeriesId": series_id_for_key(series.series_folder.as_deref(), &series.series_name),
-        "IndexNumber": season_number,
-        "UserData": folder_user_data(&id),
-        "Genres": [], "GenreItems": [], "Tags": [], "Studios": [],
-        "ImageTags": { "Primary": tag }, "BackdropImageTags": [], "ProviderIds": {},
+    // B78/V38 — typed SeriesFolderDto (Season kind).
+    let mut image_tags = std::collections::BTreeMap::new();
+    image_tags.insert("Primary".to_string(), id.clone());
+    serde_json::to_value(SeriesFolderDto {
+        name: season_name.to_string(),
+        server_id: server_id.to_string(),
+        kind: "Season",
+        media_type: "Unknown",
+        is_folder: true,
+        can_play: false,
+        series_name: Some(series.series_name.clone()),
+        series_id: Some(series_id_for_key(
+            series.series_folder.as_deref(),
+            &series.series_name,
+        )),
+        index_number: Some(season_number),
+        user_data: UserItemDataDto::folder(&id, false, 0, false),
+        genres: Vec::new(),
+        genre_items: Vec::new(),
+        tags: Vec::new(),
+        studios: Vec::new(),
+        production_locations: None,
+        remote_trailers: None,
+        chapters: None,
+        image_tags,
+        backdrop_image_tags: Vec::new(),
+        provider_ids: std::collections::BTreeMap::new(),
+        production_year: None,
+        id,
     })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 async fn list_user_items_resume(

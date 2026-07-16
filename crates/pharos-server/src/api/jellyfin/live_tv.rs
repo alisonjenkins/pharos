@@ -77,6 +77,50 @@ async fn info(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
     }))
 }
 
+/// Jellyfin LiveTV `Channel` item (`BaseItemDto`, `Type` "Channel"). Typed per
+/// B78/V38. `IsFolder`/`ImageTags` appear only in the list rows, so they're
+/// optional-and-omitted on the single-channel detail.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveTvChannelDto {
+    id: String,
+    name: String,
+    channel_number: String,
+    #[serde(rename = "Type")]
+    kind: &'static str,
+    media_type: &'static str,
+    server_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_folder: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_tags: Option<std::collections::BTreeMap<String, String>>,
+    /// Nullable in Jellyfin — always on the wire (null when the channel has no
+    /// group), so NOT skipped.
+    channel_group_name: Option<String>,
+}
+
+/// Jellyfin LiveTV `Program` (EPG) item (`BaseItemDto`, `Type` "Program").
+/// Typed per B78/V38.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveTvProgramDto {
+    id: String,
+    name: String,
+    overview: Option<String>,
+    channel_id: String,
+    #[serde(rename = "Type")]
+    kind: &'static str,
+    server_id: String,
+    start_date: String,
+    end_date: String,
+    is_live: bool,
+    is_kids: bool,
+    is_movie: bool,
+    is_news: bool,
+    is_series: bool,
+    is_sports: bool,
+}
+
 async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
     let Some(backend) = state.live_tv.as_ref() else {
         return HttpResponse::Ok().json(empty_items_result_value());
@@ -86,24 +130,24 @@ async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder
         Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
     };
     let server_id = state.server_id.clone();
-    let items: Vec<serde_json::Value> = chs
+    let items: Vec<LiveTvChannelDto> = chs
         .into_iter()
         .map(|c| {
-            serde_json::json!({
-                "Id": c.id,
-                "Name": c.name,
-                "ChannelNumber": c.number,
-                "Type": "Channel",
-                "MediaType": "Video",
-                "ServerId": server_id,
-                "IsFolder": false,
-                "ImageTags": if c.logo_url.is_some() {
-                    serde_json::json!({ "Primary": c.id })
-                } else {
-                    serde_json::json!({})
-                },
-                "ChannelGroupName": c.group_title,
-            })
+            let mut image_tags = std::collections::BTreeMap::new();
+            if c.logo_url.is_some() {
+                image_tags.insert("Primary".to_string(), c.id.clone());
+            }
+            LiveTvChannelDto {
+                id: c.id,
+                name: c.name,
+                channel_number: c.number,
+                kind: "Channel",
+                media_type: "Video",
+                server_id: server_id.clone(),
+                is_folder: Some(false),
+                image_tags: Some(image_tags),
+                channel_group_name: c.group_title,
+            }
         })
         .collect();
     let total = items.len() as u32;
@@ -130,15 +174,17 @@ async fn channel(
     let Some(ch) = chs.into_iter().find(|c| c.id == id) else {
         return HttpResponse::NotFound().body("");
     };
-    HttpResponse::Ok().json(serde_json::json!({
-        "Id": ch.id,
-        "Name": ch.name,
-        "ChannelNumber": ch.number,
-        "Type": "Channel",
-        "MediaType": "Video",
-        "ServerId": state.server_id,
-        "ChannelGroupName": ch.group_title,
-    }))
+    HttpResponse::Ok().json(LiveTvChannelDto {
+        id: ch.id,
+        name: ch.name,
+        channel_number: ch.number,
+        kind: "Channel",
+        media_type: "Video",
+        server_id: state.server_id.clone(),
+        is_folder: None,
+        image_tags: None,
+        channel_group_name: ch.group_title,
+    })
 }
 
 async fn stream(
@@ -204,25 +250,23 @@ async fn programs(
         Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
     };
     let server_id = state.server_id.clone();
-    let items: Vec<serde_json::Value> = programs
+    let items: Vec<LiveTvProgramDto> = programs
         .into_iter()
-        .map(|p| {
-            serde_json::json!({
-                "Id": format!("{}-{}", p.channel_id, p.start_unix_ms),
-                "Name": p.title,
-                "Overview": p.description,
-                "ChannelId": p.channel_id,
-                "Type": "Program",
-                "ServerId": server_id,
-                "StartDate": unix_ms_to_iso8601(p.start_unix_ms),
-                "EndDate": unix_ms_to_iso8601(p.end_unix_ms),
-                "IsLive": false,
-                "IsKids": false,
-                "IsMovie": false,
-                "IsNews": false,
-                "IsSeries": false,
-                "IsSports": false,
-            })
+        .map(|p| LiveTvProgramDto {
+            id: format!("{}-{}", p.channel_id, p.start_unix_ms),
+            name: p.title,
+            overview: p.description,
+            channel_id: p.channel_id.clone(),
+            kind: "Program",
+            server_id: server_id.clone(),
+            start_date: unix_ms_to_iso8601(p.start_unix_ms),
+            end_date: unix_ms_to_iso8601(p.end_unix_ms),
+            is_live: false,
+            is_kids: false,
+            is_movie: false,
+            is_news: false,
+            is_series: false,
+            is_sports: false,
         })
         .collect();
     let total = items.len() as u32;
