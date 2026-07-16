@@ -233,22 +233,44 @@ async fn display_preferences(
     Ok(HttpResponse::Ok().json(body))
 }
 
+/// Jellyfin `DisplayPreferencesDto` — native clients read this at startup.
+/// Typed per B78/V38 (the stored-override path stays arbitrary JSON, so
+/// `default_prefs` serializes the typed default to a `Value`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DisplayPreferencesDto {
+    id: String,
+    view_type: &'static str,
+    sort_by: &'static str,
+    remember_indexing: bool,
+    primary_image_height: u32,
+    primary_image_width: u32,
+    custom_prefs: std::collections::HashMap<String, String>,
+    scroll_direction: &'static str,
+    show_backdrop: bool,
+    remember_sorting: bool,
+    sort_order: &'static str,
+    show_sidebar: bool,
+    client: String,
+}
+
 fn default_prefs(id: &str, client: &str) -> serde_json::Value {
-    serde_json::json!({
-        "Id": id,
-        "ViewType": "",
-        "SortBy": "SortName",
-        "RememberIndexing": false,
-        "PrimaryImageHeight": 0,
-        "PrimaryImageWidth": 0,
-        "CustomPrefs": {},
-        "ScrollDirection": "Vertical",
-        "ShowBackdrop": true,
-        "RememberSorting": false,
-        "SortOrder": "Ascending",
-        "ShowSidebar": false,
-        "Client": client,
+    serde_json::to_value(DisplayPreferencesDto {
+        id: id.to_string(),
+        view_type: "",
+        sort_by: "SortName",
+        remember_indexing: false,
+        primary_image_height: 0,
+        primary_image_width: 0,
+        custom_prefs: std::collections::HashMap::new(),
+        scroll_direction: "Vertical",
+        show_backdrop: true,
+        remember_sorting: false,
+        sort_order: "Ascending",
+        show_sidebar: false,
+        client: client.to_string(),
     })
+    .unwrap_or_else(|_| serde_json::json!({}))
 }
 
 async fn display_preferences_update(

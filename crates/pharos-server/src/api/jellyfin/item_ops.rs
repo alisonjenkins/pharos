@@ -220,22 +220,47 @@ async fn get_lyrics(
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
     let lines = read_lrc_sidecar(&item.path).unwrap_or_default();
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "Metadata": {},
-        "Lyrics": lines,
-    })))
+    // B78/V38 — typed LyricDto, not a json! literal.
+    Ok(HttpResponse::Ok().json(LyricDto {
+        metadata: LyricMetadataDto {},
+        lyrics: lines,
+    }))
+}
+
+/// Jellyfin `LyricDto` (`GET /Audio/{id}/Lyrics`). `Metadata` is an all-nullable
+/// `LyricMetadata` — an empty `{}` deserializes cleanly on strict clients.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LyricDto {
+    metadata: LyricMetadataDto,
+    lyrics: Vec<LyricLineDto>,
+}
+
+/// Empty `LyricMetadata` — serializes to `{}`.
+#[derive(serde::Serialize)]
+struct LyricMetadataDto {}
+
+/// One `LyricLine`: `Start` in Jellyfin ticks (100 ns).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LyricLineDto {
+    text: String,
+    start: u64,
 }
 
 /// Read + parse an `.lrc` sidecar (same stem as the media file). Returns the
 /// synced lines as Jellyfin `LyricLine` objects, or `None` when no sidecar
 /// exists / it can't be read. Malformed lines are skipped.
-fn read_lrc_sidecar(media_path: &std::path::Path) -> Option<Vec<serde_json::Value>> {
+fn read_lrc_sidecar(media_path: &std::path::Path) -> Option<Vec<LyricLineDto>> {
     let lrc = media_path.with_extension("lrc");
     let text = std::fs::read_to_string(&lrc).ok()?;
-    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut out: Vec<LyricLineDto> = Vec::new();
     for line in text.lines() {
         if let Some((ticks, content)) = parse_lrc_line(line) {
-            out.push(serde_json::json!({ "Text": content, "Start": ticks }));
+            out.push(LyricLineDto {
+                text: content,
+                start: ticks,
+            });
         }
     }
     Some(out)
