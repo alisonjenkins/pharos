@@ -70,11 +70,46 @@ async fn channel_image_primary(
 
 async fn info(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
     let enabled = state.live_tv.is_some();
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "IsEnabled": enabled,
-        "Services": if enabled { vec!["M3U/XMLTV"] } else { vec![] },
-        "EnabledUsers": [],
-    }))
+    // B78/V38 — `Services` is `List<LiveTvServiceInfo>` in the SDK, NOT a list
+    // of strings: a native client fails `LiveTvInfo` decode on the old
+    // `["M3U/XMLTV"]` shape. Emit one properly-typed service entry when live-tv
+    // is configured (Status/HasUpdateAvailable/IsVisible are all no-default).
+    let services = if enabled {
+        vec![LiveTvServiceInfoDto {
+            name: "M3U/XMLTV",
+            status: "Ok",
+            has_update_available: false,
+            is_visible: true,
+        }]
+    } else {
+        Vec::new()
+    };
+    crate::api::jellyfin::wire::json(&LiveTvInfoDto {
+        is_enabled: enabled,
+        services,
+        enabled_users: Vec::new(),
+    })
+}
+
+/// Jellyfin `LiveTvInfo`. `Services` is `List<LiveTvServiceInfo>` (objects) and
+/// `IsEnabled` is no-default; typed per B78/V38.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveTvInfoDto {
+    is_enabled: bool,
+    services: Vec<LiveTvServiceInfoDto>,
+    enabled_users: Vec<String>,
+}
+
+/// Jellyfin `LiveTvServiceInfo`. `Status` (enum `Ok`/`Unavailable`),
+/// `HasUpdateAvailable`, and `IsVisible` are all no-default in the SDK.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveTvServiceInfoDto {
+    name: &'static str,
+    status: &'static str,
+    has_update_available: bool,
+    is_visible: bool,
 }
 
 /// Jellyfin LiveTV `Channel` item (`BaseItemDto`, `Type` "Channel"). Typed per
