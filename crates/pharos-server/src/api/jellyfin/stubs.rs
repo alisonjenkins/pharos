@@ -175,11 +175,20 @@ async fn get_utc_time() -> impl Responder {
         .unwrap_or(0);
     let iso = crate::api::jellyfin::dto::format_iso8601_ms(ms);
     // `/GetUtcTime` is unauthenticated — jellyfin-web hits it before
-    // the user has a token to skew its internal clock.
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "RequestReceptionTime": iso,
-        "ResponseTransmissionTime": iso,
-    }))
+    // the user has a token to skew its internal clock. Both fields are
+    // no-default in the SDK's `UtcTimeResponse`; typed per B78/V38.
+    crate::api::jellyfin::wire::json(&UtcTimeResponseDto {
+        request_reception_time: iso.clone(),
+        response_transmission_time: iso,
+    })
+}
+
+/// Jellyfin `UtcTimeResponse` (`GET /GetUtcTime`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct UtcTimeResponseDto {
+    request_reception_time: String,
+    response_transmission_time: String,
 }
 
 #[cfg(test)]
