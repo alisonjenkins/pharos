@@ -90,19 +90,40 @@ async fn bitrate_test(q: CiQuery<BitrateTestQuery>) -> impl Responder {
 }
 
 async fn system_configuration() -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "EnableMetrics": true,
-        "EnableNormalizedItemByNameIds": true,
-        "EnableCaseSensitiveItemIds": true,
-        "EnableExternalContentInSuggestions": false,
-        "DisableLiveTvChannelUserDataName": true,
-        "ServerName": "pharos",
-        "UICulture": "en-US",
-        "PreferredMetadataLanguage": "en",
-        "MetadataCountryCode": "US",
-        "QuickConnectAvailable": true,
-        "StartupWizardCompleted": true,
-    }))
+    // Faithful-partial `ServerConfiguration` (V38): the exact subset pharos
+    // reports. jellyfin-web tolerates the omitted fields; typed here so the
+    // shape is compile-visible. `UICulture` keeps its SDK acronym casing via
+    // an explicit rename (PascalCase would emit "UiCulture").
+    crate::api::jellyfin::wire::json(&ServerConfigurationDto {
+        enable_metrics: true,
+        enable_normalized_item_by_name_ids: true,
+        enable_case_sensitive_item_ids: true,
+        enable_external_content_in_suggestions: false,
+        disable_live_tv_channel_user_data_name: true,
+        server_name: "pharos",
+        ui_culture: "en-US",
+        preferred_metadata_language: "en",
+        metadata_country_code: "US",
+        quick_connect_available: true,
+        startup_wizard_completed: true,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ServerConfigurationDto {
+    enable_metrics: bool,
+    enable_normalized_item_by_name_ids: bool,
+    enable_case_sensitive_item_ids: bool,
+    enable_external_content_in_suggestions: bool,
+    disable_live_tv_channel_user_data_name: bool,
+    server_name: &'static str,
+    #[serde(rename = "UICulture")]
+    ui_culture: &'static str,
+    preferred_metadata_language: &'static str,
+    metadata_country_code: &'static str,
+    quick_connect_available: bool,
+    startup_wizard_completed: bool,
 }
 
 /// Default objects for the dashboard's named config sub-sections. pharos
@@ -114,50 +135,56 @@ async fn system_configuration_named(
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let key = path.into_inner().to_ascii_lowercase();
+    // Faithful-partial config sub-sections (V38): typed defaults serialized to
+    // a Value so the persisted-overlay merge below still applies. Acronym
+    // fields (UPnP / IPv4 / IPv6 / RemoteIPFilter) carry explicit renames.
     let mut body = match key.as_str() {
-        "network" => serde_json::json!({
-            "BaseUrl": "",
-            "EnableHttps": false,
-            "RequireHttps": false,
-            "InternalHttpPort": 8096,
-            "InternalHttpsPort": 8920,
-            "PublicHttpPort": 8096,
-            "PublicHttpsPort": 8920,
-            "AutoDiscovery": false,
-            "EnableUPnP": false,
-            "EnableRemoteAccess": true,
-            "EnableIPv4": true,
-            "EnableIPv6": false,
-            "IgnoreVirtualInterfaces": true,
-            "EnablePublishedServerUriByRequest": false,
-            "LocalNetworkSubnets": [],
-            "LocalNetworkAddresses": [],
-            "KnownProxies": [],
-            "RemoteIPFilter": [],
-            "IsRemoteIPFilterBlacklist": false,
-            "PublishedServerUriBySubnet": [],
-            "VirtualInterfaceNames": ["veth"],
-        }),
-        "livetv" => serde_json::json!({
-            "GuideDays": null,
-            "EnableMovieProviders": true,
-            "RecordingPath": "",
-            "MovieRecordingPath": "",
-            "SeriesRecordingPath": "",
-            "EnableRecordingSubfolders": false,
-            "EnableOriginalAudioWithEncodedRecordings": false,
-            "TunerHosts": [],
-            "ListingProviders": [],
-        }),
-        "encoding" => serde_json::json!({
-            "EncodingThreadCount": -1,
-            "HardwareAccelerationType": "none",
-            "EnableThrottling": false,
-            "TranscodingTempPath": "",
-            "AllowHevcEncoding": true,
-        }),
+        "network" => serde_json::to_value(NetworkConfigurationDto {
+            base_url: "",
+            enable_https: false,
+            require_https: false,
+            internal_http_port: 8096,
+            internal_https_port: 8920,
+            public_http_port: 8096,
+            public_https_port: 8920,
+            auto_discovery: false,
+            enable_upnp: false,
+            enable_remote_access: true,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ignore_virtual_interfaces: true,
+            enable_published_server_uri_by_request: false,
+            local_network_subnets: Vec::new(),
+            local_network_addresses: Vec::new(),
+            known_proxies: Vec::new(),
+            remote_ip_filter: Vec::new(),
+            is_remote_ip_filter_blacklist: false,
+            published_server_uri_by_subnet: Vec::new(),
+            virtual_interface_names: vec!["veth"],
+        })
+        .unwrap_or_default(),
+        "livetv" => serde_json::to_value(LiveTvOptionsDto {
+            guide_days: None,
+            enable_movie_providers: true,
+            recording_path: "",
+            movie_recording_path: "",
+            series_recording_path: "",
+            enable_recording_subfolders: false,
+            enable_original_audio_with_encoded_recordings: false,
+            tuner_hosts: Vec::new(),
+            listing_providers: Vec::new(),
+        })
+        .unwrap_or_default(),
+        "encoding" => serde_json::to_value(EncodingOptionsDto {
+            encoding_thread_count: -1,
+            hardware_acceleration_type: "none",
+            enable_throttling: false,
+            transcoding_temp_path: "",
+            allow_hevc_encoding: true,
+        })
+        .unwrap_or_default(),
         // Unknown key → an empty object (still valid JSON the form can read).
-        _ => serde_json::json!({}),
+        _ => serde_json::Value::Object(serde_json::Map::new()),
     };
     // T72 — overlay any persisted section blob on the shaped defaults so a
     // dashboard change (POST to the same key) is reflected here and survives
@@ -180,15 +207,84 @@ async fn system_configuration_named(
     Ok(crate::api::jellyfin::wire::json(&body))
 }
 
+/// Faithful-partial `NetworkConfiguration` default (V38).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkConfigurationDto {
+    base_url: &'static str,
+    enable_https: bool,
+    require_https: bool,
+    internal_http_port: u16,
+    internal_https_port: u16,
+    public_http_port: u16,
+    public_https_port: u16,
+    auto_discovery: bool,
+    #[serde(rename = "EnableUPnP")]
+    enable_upnp: bool,
+    enable_remote_access: bool,
+    #[serde(rename = "EnableIPv4")]
+    enable_ipv4: bool,
+    #[serde(rename = "EnableIPv6")]
+    enable_ipv6: bool,
+    ignore_virtual_interfaces: bool,
+    enable_published_server_uri_by_request: bool,
+    local_network_subnets: Vec<&'static str>,
+    local_network_addresses: Vec<&'static str>,
+    known_proxies: Vec<&'static str>,
+    #[serde(rename = "RemoteIPFilter")]
+    remote_ip_filter: Vec<&'static str>,
+    #[serde(rename = "IsRemoteIPFilterBlacklist")]
+    is_remote_ip_filter_blacklist: bool,
+    published_server_uri_by_subnet: Vec<&'static str>,
+    virtual_interface_names: Vec<&'static str>,
+}
+
+/// Faithful-partial `LiveTvOptions` default (V38). `GuideDays` is nullable.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LiveTvOptionsDto {
+    guide_days: Option<u32>,
+    enable_movie_providers: bool,
+    recording_path: &'static str,
+    movie_recording_path: &'static str,
+    series_recording_path: &'static str,
+    enable_recording_subfolders: bool,
+    enable_original_audio_with_encoded_recordings: bool,
+    tuner_hosts: Vec<&'static str>,
+    listing_providers: Vec<&'static str>,
+}
+
+/// Faithful-partial `EncodingOptions` default (V38). `EncodingThreadCount` is
+/// a signed `-1` ("auto") in the SDK.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct EncodingOptionsDto {
+    encoding_thread_count: i32,
+    hardware_acceleration_type: &'static str,
+    enable_throttling: bool,
+    transcoding_temp_path: &'static str,
+    allow_hevc_encoding: bool,
+}
+
 async fn empty_backup_list() -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!([]))
+    // `GET /Backups` — an empty `List<BackupInfo>`. Typed empty vec (V38).
+    crate::api::jellyfin::wire::json(&Vec::<serde_json::Value>::new())
 }
 
 async fn system_storage() -> impl Responder {
     // `SystemStorageInfo` shape — jellyfin-web maps over `.Folders`. Empty is
     // valid (renders "no data" rather than throwing). pharos doesn't surface
     // per-folder free/used space yet.
-    crate::api::jellyfin::wire::json(&serde_json::json!({ "Folders": [] }))
+    crate::api::jellyfin::wire::json(&SystemStorageInfoDto {
+        folders: Vec::new(),
+    })
+}
+
+/// The `.Folders`-shaped storage response jellyfin-web reads. Typed (V38).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct SystemStorageInfoDto {
+    folders: Vec<serde_json::Value>,
 }
 
 async fn system_endpoint() -> impl Responder {
@@ -480,15 +576,28 @@ impl Culture {
 }
 
 async fn localization_countries(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!([
-        {
-            "Name": "US",
-            "DisplayName": "United States",
-            "TwoLetterISORegionName": "US",
-            "ThreeLetterISORegionName": "USA",
-        }
-    ]))
+    crate::api::jellyfin::wire::json(&COUNTRIES)
 }
+
+/// Jellyfin `CountryInfo`. The `ISO` acronym fields keep SDK casing via
+/// explicit renames (PascalCase would emit "TwoLetterIsoRegionName").
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct CountryInfoDto {
+    name: &'static str,
+    display_name: &'static str,
+    #[serde(rename = "TwoLetterISORegionName")]
+    two_letter_iso_region_name: &'static str,
+    #[serde(rename = "ThreeLetterISORegionName")]
+    three_letter_iso_region_name: &'static str,
+}
+
+const COUNTRIES: &[CountryInfoDto] = &[CountryInfoDto {
+    name: "US",
+    display_name: "United States",
+    two_letter_iso_region_name: "US",
+    three_letter_iso_region_name: "USA",
+}];
 
 /// `GET /Localization/ParentalRatings` — the rating catalogue jellyfin-web's
 /// user-policy editor loads for its "maximum allowed rating" picker. Each
@@ -534,10 +643,21 @@ const PARENTAL_RATINGS: &[ParentalRating] = &[
 ];
 
 async fn localization_options(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!([
-        { "Name": "English (US)", "Value": "en-US" },
-    ]))
+    crate::api::jellyfin::wire::json(&LOCALIZATION_OPTIONS)
 }
+
+/// Jellyfin `LocalizationOption` (`{ Name, Value }`). Typed (V38).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LocalizationOptionDto {
+    name: &'static str,
+    value: &'static str,
+}
+
+const LOCALIZATION_OPTIONS: &[LocalizationOptionDto] = &[LocalizationOptionDto {
+    name: "English (US)",
+    value: "en-US",
+}];
 
 /// `GET /Devices` + `/Devices/Info` — admin dashboard's device list.
 /// Aggregated from the token store: each issued token is one device
@@ -557,7 +677,7 @@ async fn devices_list(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut items: Vec<DeviceInfoLite> = Vec::new();
     for u in users {
         let tokens = state
             .stores
@@ -574,23 +694,33 @@ async fn devices_list(
                 .flatten()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| t.device_id.clone());
-            items.push(serde_json::json!({
-                "Id": t.device_id,
-                "Name": display_name,
-                "AppName": "Jellyfin",
-                "AppVersion": "0",
-                "LastUserId": u.id.0.simple().to_string(),
-                "LastUserName": u.name,
-                "DateLastActivity": "1970-01-01T00:00:00.0000000Z",
-            }));
+            items.push(DeviceInfoLite {
+                id: t.device_id,
+                name: display_name,
+                app_name: "Jellyfin",
+                app_version: "0",
+                last_user_id: u.id.0.simple().to_string(),
+                last_user_name: u.name.clone(),
+                date_last_activity: "1970-01-01T00:00:00.0000000Z",
+            });
         }
     }
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
+}
+
+/// Faithful-partial `DeviceInfo` element for the admin device list (V38). The
+/// SDK's `Capabilities` object is omitted — jellyfin-web tolerates its absence.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeviceInfoLite {
+    id: String,
+    name: String,
+    app_name: &'static str,
+    app_version: &'static str,
+    last_user_id: String,
+    last_user_name: String,
+    date_last_activity: &'static str,
 }
 
 #[derive(Debug, Default, Deserialize)]
