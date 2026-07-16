@@ -502,11 +502,98 @@ pub struct BaseItemDto {
     pub premiere_date: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct NameGuidPairDto {
     pub name: String,
     pub id: String,
+}
+
+/// A SYNTHESISED browse item — Genre / Studio / Tag(Folder) / MusicArtist /
+/// MusicAlbum / BoxSet / Playlist / Person / LiveTv channel & program. pharos
+/// stores none of these as real `MediaItem`s (they're aggregated from tags or
+/// grouped rows), so their `BaseItemDto` was hand-rolled as a `serde_json::json!`
+/// literal per endpoint. This one typed struct replaces all of them (B78/V38):
+/// `Id`+`Type` are mandatory (the only kotlin-required fields — `Type` must be a
+/// valid `BaseItemKind`, e.g. Tag→"Folder" per B69); every richer field is
+/// optional and OMITTED when `None`, so each call site sets exactly the fields
+/// its former literal emitted (empty `{}`/`[]` collections included, via
+/// `Some(empty)`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SynthItemDto {
+    pub id: String,
+    pub name: String,
+    pub server_id: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub media_type: String,
+    pub is_folder: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_delete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premiere_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_number: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Empty `{}` map when `Some`; omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tags: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backdrop_image_tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genres: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_artist: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_artists: Option<Vec<NameGuidPairDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist_items: Option<Vec<NameGuidPairDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data: Option<UserItemDataDto>,
+}
+
+impl SynthItemDto {
+    /// A bare synth folder (`Id`, `Name`, `ServerId`, `Type`, `MediaType`
+    /// "Unknown", `IsFolder` true) — the Genre/Studio/Tag shape. Callers add
+    /// richer fields on the returned value as needed.
+    pub fn folder(id: String, name: String, server_id: String, kind: &'static str) -> Self {
+        Self {
+            id,
+            name,
+            server_id,
+            kind,
+            media_type: "Unknown".to_string(),
+            is_folder: true,
+            child_count: None,
+            can_delete: None,
+            collection_type: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            index_number: None,
+            parent_id: None,
+            image_tags: None,
+            backdrop_image_tags: None,
+            genres: None,
+            tags: None,
+            album_artist: None,
+            album_artists: None,
+            artist_items: None,
+            user_data: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -905,7 +992,7 @@ pub struct ReplayGainDto {
     pub album_gain: Option<f32>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItemDataDto {
     /// Non-nullable Guid in the C# DTO — always on the wire from real

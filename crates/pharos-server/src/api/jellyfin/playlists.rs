@@ -19,6 +19,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaStore, PlaylistStore};
+use pharos_jellyfin_api::dto::SynthItemDto;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -251,19 +252,24 @@ pub(crate) fn playlist_dto(
     playlist: &pharos_core::Playlist,
     child_count: u32,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "Id": playlist.wire_id,
-        "Name": playlist.name,
-        "ServerId": state.server_id,
-        "Type": "Playlist",
-        "MediaType": playlist.media_type,
-        "IsFolder": true,
-        "ChildCount": child_count,
-        "CanDelete": true,
-        "ImageTags": {},
-        "BackdropImageTags": [],
-        "Genres": [], "Tags": [],
+    // B78/V38 — typed SynthItemDto (built then serialized to keep this helper's
+    // Value return so callers are unchanged).
+    serde_json::to_value(SynthItemDto {
+        media_type: playlist.media_type.to_string(),
+        child_count: Some(child_count),
+        can_delete: Some(true),
+        image_tags: Some(Default::default()),
+        backdrop_image_tags: Some(Vec::new()),
+        genres: Some(Vec::new()),
+        tags: Some(Vec::new()),
+        ..SynthItemDto::folder(
+            playlist.wire_id.clone(),
+            playlist.name.clone(),
+            state.server_id.clone(),
+            "Playlist",
+        )
     })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// Split a comma-separated id list, trimming blanks. Used for `EntryIds`

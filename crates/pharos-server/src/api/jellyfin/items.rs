@@ -12,8 +12,8 @@ use crate::{
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
-            BaseItemDto, ItemsResultDto, MediaSourceInfoDto, PlaybackInfoResponseDto,
-            SubtitleStreamCtx,
+            BaseItemDto, ItemsResultDto, MediaSourceInfoDto, NameGuidPairDto,
+            PlaybackInfoResponseDto, SubtitleStreamCtx, SynthItemDto,
         },
         subtitles::discover_sidecars,
     },
@@ -758,18 +758,16 @@ async fn list_genres(
         .genres_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<serde_json::Value> = rows
+    let items: Vec<SynthItemDto> = rows
         .iter()
-        .map(|gc| {
-            serde_json::json!({
-                "Id": gc.genre.wire_id,
-                "Name": gc.genre.name,
-                "ServerId": state.server_id,
-                "Type": "Genre",
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ChildCount": gc.item_count,
-            })
+        .map(|gc| SynthItemDto {
+            child_count: Some(gc.item_count),
+            ..SynthItemDto::folder(
+                gc.genre.wire_id.clone(),
+                gc.genre.name.clone(),
+                state.server_id.clone(),
+                "Genre",
+            )
         })
         .collect();
     let total = items.len() as u32;
@@ -817,20 +815,19 @@ async fn list_artists(
         }
     }
     names.sort();
-    let items: Vec<serde_json::Value> = names
+    let items: Vec<SynthItemDto> = names
         .iter()
-        .map(|n| {
-            serde_json::json!({
-                "Id": artist_id_for(n),
-                "Name": n,
-                "ServerId": state.server_id,
-                "Type": "MusicArtist",
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ImageTags": {},
-                "BackdropImageTags": [],
-                "Genres": [], "Tags": [],
-            })
+        .map(|n| SynthItemDto {
+            image_tags: Some(Default::default()),
+            backdrop_image_tags: Some(Vec::new()),
+            genres: Some(Vec::new()),
+            tags: Some(Vec::new()),
+            ..SynthItemDto::folder(
+                artist_id_for(n),
+                n.clone(),
+                state.server_id.clone(),
+                "MusicArtist",
+            )
         })
         .collect();
     let total = items.len() as u32;
@@ -889,29 +886,29 @@ async fn list_albums(
     }
     let mut names: Vec<&String> = albums.keys().collect();
     names.sort();
-    let items: Vec<serde_json::Value> = names
+    let items: Vec<SynthItemDto> = names
         .into_iter()
         .map(|n| {
             let artist = albums.get(n).and_then(|a| a.clone());
-            let mut v = serde_json::json!({
-                "Id": album_id_for(n),
-                "Name": n,
-                "ServerId": state.server_id,
-                "Type": "MusicAlbum",
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ImageTags": {},
-                "BackdropImageTags": [],
-                "Genres": [], "Tags": [],
-            });
-            if let Some(a) = artist {
-                v["AlbumArtist"] = serde_json::Value::String(a.clone());
-                v["AlbumArtists"] = serde_json::json!([{
-                    "Name": a,
-                    "Id": artist_id_for(&a),
-                }]);
+            SynthItemDto {
+                image_tags: Some(Default::default()),
+                backdrop_image_tags: Some(Vec::new()),
+                genres: Some(Vec::new()),
+                tags: Some(Vec::new()),
+                album_artist: artist.clone(),
+                album_artists: artist.as_ref().map(|a| {
+                    vec![NameGuidPairDto {
+                        name: a.clone(),
+                        id: artist_id_for(a),
+                    }]
+                }),
+                ..SynthItemDto::folder(
+                    album_id_for(n),
+                    n.clone(),
+                    state.server_id.clone(),
+                    "MusicAlbum",
+                )
             }
-            v
         })
         .collect();
     let total = items.len() as u32;
@@ -942,18 +939,16 @@ async fn list_studios(
         .studios_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<serde_json::Value> = rows
+    let items: Vec<SynthItemDto> = rows
         .iter()
-        .map(|sc| {
-            serde_json::json!({
-                "Id": sc.studio.wire_id,
-                "Name": sc.studio.name,
-                "ServerId": state.server_id,
-                "Type": "Studio",
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ChildCount": sc.item_count,
-            })
+        .map(|sc| SynthItemDto {
+            child_count: Some(sc.item_count),
+            ..SynthItemDto::folder(
+                sc.studio.wire_id.clone(),
+                sc.studio.name.clone(),
+                state.server_id.clone(),
+                "Studio",
+            )
         })
         .collect();
     let total = items.len() as u32;
@@ -982,21 +977,19 @@ async fn list_tags(
         .tags_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<serde_json::Value> = rows
+    let items: Vec<SynthItemDto> = rows
         .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "Id": tc.tag.wire_id,
-                "Name": tc.tag.name,
-                "ServerId": state.server_id,
-                // B69 — "Tag" is NOT a kotlin BaseItemKind (it crashes the strict
-                // SDK's enum decode). A tag surfaces as a browsable Folder of its
-                // tagged items — a valid BaseItemKind. IsFolder already true.
-                "Type": "Folder",
-                "MediaType": "Unknown",
-                "IsFolder": true,
-                "ChildCount": tc.item_count,
-            })
+        // B69 — "Tag" is NOT a kotlin BaseItemKind (crashes the strict SDK's
+        // enum decode). A tag surfaces as a browsable "Folder" of its tagged
+        // items — a valid BaseItemKind.
+        .map(|tc| SynthItemDto {
+            child_count: Some(tc.item_count),
+            ..SynthItemDto::folder(
+                tc.tag.wire_id.clone(),
+                tc.tag.name.clone(),
+                state.server_id.clone(),
+                "Folder",
+            )
         })
         .collect();
     let total = items.len() as u32;
@@ -1122,25 +1115,25 @@ async fn get_person(
 /// a headshot URL is recorded, advertise a `Primary` image tag so the
 /// client requests `/Items/{id}/Images/Primary`.
 fn person_dto(state: &AppState, person: pharos_core::Person, item_count: u32) -> serde_json::Value {
-    let mut image_tags = serde_json::Map::new();
+    // A stable tag derived from the wire id; the image branch resolves the
+    // recorded thumb_url for this person id. Empty map (no headshot) still emits
+    // "ImageTags": {} to match the prior literal.
+    let mut image_tags = std::collections::BTreeMap::new();
     if person.thumb_url.is_some() {
-        // A stable tag derived from the wire id; the image branch resolves
-        // the recorded thumb_url for this person id.
-        image_tags.insert(
-            "Primary".to_string(),
-            serde_json::Value::String(person.wire_id.clone()),
-        );
+        image_tags.insert("Primary".to_string(), person.wire_id.clone());
     }
-    serde_json::json!({
-        "Id": person.wire_id,
-        "Name": person.name,
-        "ServerId": state.server_id,
-        "Type": "Person",
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "ChildCount": item_count,
-        "ImageTags": serde_json::Value::Object(image_tags),
+    // B78/V38 — typed SynthItemDto, serialized to keep the Value return.
+    serde_json::to_value(SynthItemDto {
+        child_count: Some(item_count),
+        image_tags: Some(image_tags),
+        ..SynthItemDto::folder(
+            person.wire_id.clone(),
+            person.name.clone(),
+            state.server_id.clone(),
+            "Person",
+        )
     })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// `GET /Collections` — LIB-C5: collections / box sets as entity rows.
@@ -1319,23 +1312,27 @@ fn collection_dto(
     collection: &pharos_core::Collection,
     item_count: u32,
 ) -> serde_json::Value {
-    let mut v = serde_json::json!({
-        "Id": collection.wire_id,
-        "Name": collection.name,
-        "ServerId": state.server_id,
-        "Type": "BoxSet",
-        "CollectionType": "boxsets",
-        "MediaType": "Unknown",
-        "IsFolder": true,
-        "ChildCount": item_count,
-        "ImageTags": {},
-        "BackdropImageTags": [],
-        "Genres": [], "Tags": [],
-    });
-    if let Some(o) = collection.overview.as_deref().filter(|s| !s.is_empty()) {
-        v["Overview"] = serde_json::Value::String(o.to_string());
-    }
-    v
+    // B78/V38 — typed SynthItemDto, serialized to keep the Value return.
+    serde_json::to_value(SynthItemDto {
+        child_count: Some(item_count),
+        collection_type: Some("boxsets"),
+        overview: collection
+            .overview
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        image_tags: Some(Default::default()),
+        backdrop_image_tags: Some(Vec::new()),
+        genres: Some(Vec::new()),
+        tags: Some(Vec::new()),
+        ..SynthItemDto::folder(
+            collection.wire_id.clone(),
+            collection.name.clone(),
+            state.server_id.clone(),
+            "BoxSet",
+        )
+    })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 #[derive(Debug, Deserialize)]
