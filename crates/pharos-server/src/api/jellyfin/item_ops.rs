@@ -40,6 +40,57 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 /// options, and the item's current content type. pharos serves the same
 /// static option catalogue everywhere; the per-item bits (ContentType) are
 /// derived from the item's kind.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ContentTypeOptionDto {
+    name: &'static str,
+    value: &'static str,
+}
+
+const CONTENT_TYPE_OPTIONS: &[ContentTypeOptionDto] = &[
+    ContentTypeOptionDto {
+        name: "Movies",
+        value: "movies",
+    },
+    ContentTypeOptionDto {
+        name: "Shows",
+        value: "tvshows",
+    },
+    ContentTypeOptionDto {
+        name: "Music",
+        value: "music",
+    },
+];
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct CountryInfoDto {
+    name: &'static str,
+    display_name: &'static str,
+    #[serde(rename = "TwoLetterISORegionName")]
+    two_letter_iso_region_name: &'static str,
+    #[serde(rename = "ThreeLetterISORegionName")]
+    three_letter_iso_region_name: &'static str,
+}
+
+const METADATA_EDITOR_COUNTRIES: &[CountryInfoDto] = &[CountryInfoDto {
+    name: "US",
+    display_name: "United States",
+    two_letter_iso_region_name: "US",
+    three_letter_iso_region_name: "USA",
+}];
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct MetadataEditorInfoDto {
+    content_type: &'static str,
+    content_type_options: &'static [ContentTypeOptionDto],
+    cultures: &'static [crate::api::jellyfin::system::Culture],
+    countries: &'static [CountryInfoDto],
+    parental_rating_options: &'static [()],
+    external_id_infos: &'static [ExternalIdInfo],
+}
+
 async fn metadata_editor(
     state: web::Data<AppState>,
     _user: AuthUser,
@@ -56,21 +107,14 @@ async fn metadata_editor(
         pharos_core::MediaKind::Episode => "tvshows",
         pharos_core::MediaKind::Audio => "music",
     };
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "ContentType": content_type,
-        "ContentTypeOptions": [
-            { "Name": "Movies", "Value": "movies" },
-            { "Name": "Shows",  "Value": "tvshows" },
-            { "Name": "Music",  "Value": "music" },
-        ],
-        "Cultures": crate::api::jellyfin::system::LOCALIZATION_CULTURES,
-        "Countries": [
-            { "Name": "US", "DisplayName": "United States",
-              "TwoLetterISORegionName": "US", "ThreeLetterISORegionName": "USA" }
-        ],
-        "ParentalRatingOptions": [],
-        "ExternalIdInfos": EXTERNAL_ID_INFOS,
-    })))
+    Ok(crate::api::jellyfin::wire::json(&MetadataEditorInfoDto {
+        content_type,
+        content_type_options: CONTENT_TYPE_OPTIONS,
+        cultures: crate::api::jellyfin::system::LOCALIZATION_CULTURES,
+        countries: METADATA_EDITOR_COUNTRIES,
+        parental_rating_options: &[],
+        external_id_infos: EXTERNAL_ID_INFOS,
+    }))
 }
 
 /// The external metadata id fields the editor exposes. `UrlFormatString`'s
@@ -180,12 +224,20 @@ async fn set_content_type(
 /// image providers, so the result is an empty, well-shaped
 /// `RemoteImageResult` (200, not 404) — the same as stock Jellyfin with no
 /// providers.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoteImageResultDto {
+    images: &'static [()],
+    total_record_count: u32,
+    providers: &'static [()],
+}
+
 async fn remote_images(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Images": [],
-        "TotalRecordCount": 0,
-        "Providers": [],
-    }))
+    crate::api::jellyfin::wire::json(&RemoteImageResultDto {
+        images: &[],
+        total_record_count: 0,
+        providers: &[],
+    })
 }
 
 /// `GET /Items/{id}/RemoteImages/Providers` — the configured image
