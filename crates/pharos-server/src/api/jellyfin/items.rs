@@ -1739,6 +1739,26 @@ fn client_is_remote(req: &actix_web::HttpRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// B80 (Lace incident, 2026-07-16) — true when the negotiator picked DirectPlay
+/// for a Matroska-container source destined for a BROWSER that cannot actually
+/// play the re-labelled `video/webm` stream (`webm_relabel_playable` is false).
+/// A browser's `<video>`/MSE has no Matroska demuxer, so pharos would advertise
+/// `SupportsDirectStream` with NO `TranscodingUrl` fallback and strand the
+/// client (av1-in-mkv → ~11 min PlaybackInfo-retry hang). When this holds,
+/// `playback_info` downgrades the decision to a transcode so a fallback URL is
+/// emitted. Native players declare real Matroska support in their profile →
+/// their DirectPlay is genuine and `is_web_client` is false, so they are
+/// unaffected.
+fn browser_matroska_direct_unplayable(
+    is_web_client: bool,
+    is_video: bool,
+    decision_is_direct: bool,
+    source_is_matroska: bool,
+    webm_relabel_playable: bool,
+) -> bool {
+    is_web_client && is_video && decision_is_direct && source_is_matroska && !webm_relabel_playable
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1863,6 +1883,83 @@ async fn playback_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.contains("Mozilla"));
 
+    // Whether the raw `/stream` file (re-labelled `video/webm` by
+    // `deliver_stream`) genuinely plays in a browser: a webm-legal Matroska
+    // (VP8/9/AV1 + Opus/Vorbis) whose codecs the client lists under a webm
+    // DirectPlayProfile. Computed HERE — ahead of the DirectPlay/force-webm gate
+    // — so the B80 hang fix below can consult it; it also drives
+    // `SupportsDirectStream` further down.
+    let webm_relabel_playable = {
+        let lc = |c: &Option<String>| c.as_deref().map(|s| s.to_ascii_lowercase());
+        let v = lc(&source.video_codec);
+        let a = lc(&source.audio_codec);
+        let cont = source.container.to_ascii_lowercase();
+        let matroska = cont.contains("matroska") || cont.contains("webm") || cont.contains("mkv");
+        // The client can actually consume the re-labelled `video/webm` when it
+        // lists a webm DirectPlayProfile covering the source's video codec — the
+        // precise "would this play if the container were webm" test, so a
+        // vp9-in-matroska on a webm-capable client still direct-streams rather
+        // than needlessly transcoding.
+        let client_plays_webm_video = source.video_codec.as_deref().is_some_and(|sv| {
+            profile.direct_play_profiles.iter().any(|p| {
+                (p.kind.is_empty() || p.kind.eq_ignore_ascii_case("Video"))
+                    && p.container
+                        .split(',')
+                        .any(|c| c.trim().eq_ignore_ascii_case("webm"))
+                    && p.video_codec
+                        .split(',')
+                        .any(|c| c.trim().eq_ignore_ascii_case(sv))
+            })
+        });
+        matroska
+            && client_plays_webm_video
+            && matches!(
+                v.as_deref(),
+                Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
+            )
+            // Audio must be webm-legal too, else the re-labelled video/webm
+            // plays video but the browser can't decode the audio track.
+            && matches!(a.as_deref(), Some("opus" | "vorbis") | None)
+    };
+    // B80 (Lace incident, 2026-07-16) — a browser's <video>/MSE cannot demux a
+    // raw Matroska container. When the negotiator returned DirectPlay for a
+    // Matroska source to a browser that CANNOT play the `video/webm` relabel
+    // (e.g. AV1 + AAC, or h264-in-mkv), advertising SupportsDirectStream with NO
+    // TranscodingUrl stranded the client: jellyfin-web silently retried
+    // PlaybackInfo for ~11 min (Supergirl S01E05, av1-in-mkv) before recovering.
+    // Downgrade to a transcode so a fallback URL is emitted and
+    // SupportsDirectStream resolves false. The generic H.264/AAC target is
+    // refined downstream — a Linux-Firefox that can't decode H.264 is redirected
+    // onto the VP9 surface by the `force_webm` path below, which now (decision no
+    // longer direct) fires. The connection-aware ceiling rides along so a remote
+    // viewer keeps its WAN cap.
+    // Gate on the Matroska/MKV token, NOT bare "webm". A genuine WebM container
+    // (ffprobe "webm") is natively browser-playable and the client lists it
+    // explicitly — trust it. The relabel hazard is specifically Matroska (.mkv,
+    // ffprobe "matroska" / "matroska,webm"): pharos serves it verbatim relabelled
+    // `video/webm`, which only survives when the streams are webm-legal
+    // (`webm_relabel_playable`). Lace's av1-in-mkv probed as "matroska,webm".
+    let source_is_matroska = {
+        let cont = source.container.to_ascii_lowercase();
+        cont.contains("matroska") || cont.contains("mkv")
+    };
+    let decision = if browser_matroska_direct_unplayable(
+        is_web_client,
+        is_video,
+        decision.is_direct(),
+        source_is_matroska,
+        webm_relabel_playable,
+    ) {
+        Decision::Transcode {
+            target_container: "ts".into(),
+            target_video_codec: Some("h264".into()),
+            target_audio_codec: Some("aac".into()),
+            max_video_bitrate_bps: remote_ceiling,
+        }
+    } else {
+        decision
+    };
+
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
     // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
     // their Media Source Extensions frequently CANNOT decode H.264
@@ -1953,38 +2050,6 @@ async fn playback_info(
     // Advertising DirectStream for it handed the client an unplayable stream
     // with (for AudioRemux) no URL to fall back to. Native players that CAN play
     // such files declare it in their profile → DirectPlay, unaffected.
-    let webm_relabel_playable = {
-        let lc = |c: &Option<String>| c.as_deref().map(|s| s.to_ascii_lowercase());
-        let v = lc(&source.video_codec);
-        let a = lc(&source.audio_codec);
-        let cont = source.container.to_ascii_lowercase();
-        let matroska = cont.contains("matroska") || cont.contains("webm") || cont.contains("mkv");
-        // The client can actually consume the re-labelled `video/webm` when it
-        // lists a webm DirectPlayProfile covering the source's video codec — the
-        // precise "would this play if the container were webm" test, so a
-        // vp9-in-matroska on a webm-capable client still direct-streams rather
-        // than needlessly transcoding.
-        let client_plays_webm_video = source.video_codec.as_deref().is_some_and(|sv| {
-            profile.direct_play_profiles.iter().any(|p| {
-                (p.kind.is_empty() || p.kind.eq_ignore_ascii_case("Video"))
-                    && p.container
-                        .split(',')
-                        .any(|c| c.trim().eq_ignore_ascii_case("webm"))
-                    && p.video_codec
-                        .split(',')
-                        .any(|c| c.trim().eq_ignore_ascii_case(sv))
-            })
-        });
-        matroska
-            && client_plays_webm_video
-            && matches!(
-                v.as_deref(),
-                Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
-            )
-            // Audio must be webm-legal too, else the re-labelled video/webm
-            // plays video but the browser can't decode the audio track.
-            && matches!(a.as_deref(), Some("opus" | "vorbis") | None)
-    };
     let supports_direct_stream = !force_webm
         && (direct_play
             || (matches!(
@@ -5847,6 +5912,41 @@ mod remote_ip_tests {
         ] {
             assert!(!remote(s), "{s} must be treated as local");
         }
+    }
+}
+
+#[cfg(test)]
+mod browser_matroska_fallback_tests {
+    use super::browser_matroska_direct_unplayable;
+
+    #[test]
+    fn downgrades_only_an_unplayable_browser_matroska_directplay() {
+        // The Lace case (B80): browser + video + DirectPlay verdict + Matroska
+        // source + NOT webm-relabel-playable (av1 + non-webm audio) → downgrade.
+        assert!(browser_matroska_direct_unplayable(
+            true, true, true, true, false
+        ));
+        // Webm-legal Matroska (vp9/av1 + opus, client lists webm) → keep direct.
+        assert!(!browser_matroska_direct_unplayable(
+            true, true, true, true, true
+        ));
+        // Native app that declared real Matroska DirectPlay → keep (not a web
+        // client; its `<video>`-less player demuxes Matroska for real).
+        assert!(!browser_matroska_direct_unplayable(
+            false, true, true, true, false
+        ));
+        // Non-Matroska container (mp4/av1 a browser plays natively) → keep.
+        assert!(!browser_matroska_direct_unplayable(
+            true, true, true, false, false
+        ));
+        // Already transcoding (not a DirectPlay verdict) → nothing to downgrade.
+        assert!(!browser_matroska_direct_unplayable(
+            true, true, false, true, false
+        ));
+        // Audio-only source → unaffected.
+        assert!(!browser_matroska_direct_unplayable(
+            true, false, true, true, false
+        ));
     }
 }
 
