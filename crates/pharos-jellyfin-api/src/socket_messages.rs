@@ -222,6 +222,22 @@ pub struct UserDataChangeInfo {
     pub user_data_list: Vec<serde_json::Value>,
 }
 
+/// Jellyfin `LibraryChangedMessage.Data` (`LibraryUpdateInfo`). Every one of
+/// the seven fields is no-default (non-nullable `List`/`Boolean`) in the kotlin
+/// SDK — a native client that subscribes to `LibraryChanged` fails the whole
+/// message on any omission (jellyfin-web tolerates absence). Typed per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LibraryUpdateInfoData {
+    pub folders_added_to: Vec<String>,
+    pub folders_removed_from: Vec<String>,
+    pub items_added: Vec<String>,
+    pub items_removed: Vec<String>,
+    pub items_updated: Vec<String>,
+    pub collection_folders: Vec<String>,
+    pub is_empty: bool,
+}
+
 /// Jellyfin `SendCommand` payload (a `SyncPlayCommand` message). The client
 /// drops any command whose `PlaylistItemId` doesn't match its current queue
 /// item and dedups on `Command`+`PlaylistItemId`, so those fields must stay

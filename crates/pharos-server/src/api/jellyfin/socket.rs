@@ -8,9 +8,9 @@
 use super::auth_extractor::AuthUser;
 use super::socket_messages::{
     CommandData, GeneralCommandMessageData, GroupInfoData, GroupStateUpdate, GroupUpdateData,
-    Inbound, NowPlayingItemLite, Outbound, PlayQueueUpdate, PlayStateMessageData,
-    QueuePlaylistItem, SessionPlayStateLite, SessionsBroadcastEntry, SyncPlayJoinData,
-    SyncPlayPlayData, SyncPlaySeekData, UserDataChangeInfo,
+    Inbound, LibraryUpdateInfoData, NowPlayingItemLite, Outbound, PlayQueueUpdate,
+    PlayStateMessageData, QueuePlaylistItem, SessionPlayStateLite, SessionsBroadcastEntry,
+    SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData, UserDataChangeInfo,
 };
 use crate::state::{AppState, SocketBroadcast};
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -728,17 +728,20 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             // reads to refresh surgically. `IsEmpty` mirrors Jellyfin: true
             // only when nothing at all changed (a bare cache-bust hint).
             let is_empty = added.is_empty() && removed.is_empty();
+            // B78/V38 — typed LibraryUpdateInfo (all 7 fields no-default in the
+            // kotlin SDK; a native LibraryChanged subscriber fails on omission).
             Some(Outbound::new(
                 "LibraryChanged",
-                serde_json::json!({
-                    "FoldersAddedTo": [],
-                    "FoldersRemovedFrom": [],
-                    "ItemsAdded": added,
-                    "ItemsRemoved": removed,
-                    "ItemsUpdated": [],
-                    "CollectionFolders": [],
-                    "IsEmpty": is_empty,
-                }),
+                serde_json::to_value(LibraryUpdateInfoData {
+                    folders_added_to: Vec::new(),
+                    folders_removed_from: Vec::new(),
+                    items_added: added,
+                    items_removed: removed,
+                    items_updated: Vec::new(),
+                    collection_folders: Vec::new(),
+                    is_empty,
+                })
+                .ok()?,
             ))
         }
         SocketBroadcast::UserDataChanged { user_id, entries } => Some(Outbound::new(
@@ -905,9 +908,18 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["MessageType"], "LibraryChanged");
-        // Jellyfin's LibraryChanged payload exposes these arrays even when empty.
-        assert!(v["Data"]["ItemsUpdated"].is_array());
-        assert!(v["Data"]["ItemsAdded"].is_array());
+        // B78/V38 — kotlin LibraryUpdateInfo has NO defaulted fields: all seven
+        // must be present or a native LibraryChanged subscriber fails the frame.
+        for f in [
+            "FoldersAddedTo",
+            "FoldersRemovedFrom",
+            "ItemsAdded",
+            "ItemsRemoved",
+            "ItemsUpdated",
+            "CollectionFolders",
+        ] {
+            assert!(v["Data"][f].is_array(), "{f} must be a present array");
+        }
         // A bare hint (no deltas) reports IsEmpty = true.
         assert_eq!(v["Data"]["IsEmpty"], true);
     }
