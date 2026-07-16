@@ -2444,14 +2444,13 @@ fn synth_views_body(state: &AppState) -> serde_json::Value {
 /// the parent (e.g. a library CollectionFolder in /UserViews), with no server
 /// error and no crash report — a 200 the client couldn't deserialize.
 fn folder_user_data(item_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "PlaybackPositionTicks": 0,
-        "PlayCount": 0,
-        "IsFavorite": false,
-        "Played": false,
-        "Key": item_id,
-        "ItemId": item_id,
-    })
+    // B78/V38 — typed DTO, not a json! literal, so the kotlin-required field
+    // set (B68) stays complete by construction. to_value on a fixed struct is
+    // infallible; Null-fallback only for the impossible error.
+    serde_json::to_value(pharos_jellyfin_api::dto::UserItemDataDto::folder(
+        item_id, false, 0, false,
+    ))
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// A `CollectionType` the kotlin SDK's enum accepts, else `null`. Jellyfin's

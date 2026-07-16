@@ -840,6 +840,27 @@ impl UserItemDataDto {
             },
         }
     }
+
+    /// UserData for a SYNTHETIC folder / stub whose id is a wire STRING (not a
+    /// numeric [`pharos_core::MediaId`]) — a library `CollectionFolder`, a
+    /// Series/Season, an album aggregate. Emits the full kotlin-required field
+    /// set (B68) with a folder's zeroed resume position. Typed (not a
+    /// `serde_json::json!` literal) so the required set can't silently drift
+    /// and re-crash a strict native client (B78/V38).
+    pub fn folder(item_id: &str, played: bool, play_count: u32, is_favorite: bool) -> Self {
+        Self {
+            item_id: item_id.to_string(),
+            played,
+            play_count,
+            playback_position_ticks: 0,
+            played_percentage: 0.0,
+            is_favorite,
+            likes: None,
+            rating: None,
+            key: item_id.to_string(),
+            last_played_date: None,
+        }
+    }
 }
 
 /// Minimal ISO-8601 (Z) formatter for the `LastPlayedDate` field —
