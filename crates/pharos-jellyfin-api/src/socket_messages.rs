@@ -125,6 +125,46 @@ pub struct PlayQueueUpdate {
     pub repeat_mode: String,
 }
 
+/// Jellyfin `SessionInfoDto.NowPlayingItem` — the minimal `BaseItemDto` a
+/// `Sessions` socket broadcast carries. jellyfin-web (loose JS) tolerates a
+/// bare `{ "Id": … }`, but the jellyfin-sdk-kotlin `BaseItemDto` deserializer
+/// hard-REQUIRES its only two no-default fields, `Id` + `Type`; a `Type`-less
+/// object throws `kotlinx.serialization.MissingFieldException` and CRASHES the
+/// native Android TV client (B78). Both fields are mandatory here — that is
+/// exactly why this is a typed struct and not a `serde_json::json!` literal
+/// (the raw literal bypassed the kotlin-DTO audit that owns this contract).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct NowPlayingItemLite {
+    pub id: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+}
+
+/// `SessionInfoDto.PlayState` subset a `Sessions` broadcast patches in place.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SessionPlayStateLite {
+    pub position_ticks: u64,
+    pub is_paused: bool,
+}
+
+/// One `SessionInfoDto` entry of a `Sessions` socket broadcast (P10 — the
+/// minimal patch jellyfin-web's "Currently Watching" sidebar + native remote
+/// screens apply by `Id`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SessionsBroadcastEntry {
+    pub id: String,
+    pub user_id: String,
+    /// Nullable in the kotlin `SessionInfoDto`; OMITTED (not null-with-Id) when
+    /// the item's kind couldn't be resolved — never emit a `NowPlayingItem`
+    /// without a `Type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_playing_item: Option<NowPlayingItemLite>,
+    pub play_state: SessionPlayStateLite,
+}
+
 /// Jellyfin `SendCommand` payload (a `SyncPlayCommand` message). The client
 /// drops any command whose `PlaylistItemId` doesn't match its current queue
 /// item and dedups on `Command`+`PlaylistItemId`, so those fields must stay

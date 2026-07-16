@@ -1474,6 +1474,20 @@ impl MediaKind {
             _ => None,
         }
     }
+
+    /// The Jellyfin `BaseItemKind` wire token (`BaseItemDto.Type`) for this
+    /// kind — PascalCase, the inverse of [`Self::from_wire`]. Distinct from
+    /// [`Self::as_str`], which is the lowercase internal token. The kotlin
+    /// `BaseItemDto` deserializer hard-REQUIRES `Type` on every item, so this
+    /// is the single canonical projection every wire builder must use — a
+    /// mis-cased or omitted value crashes strict native clients.
+    pub fn base_item_kind(self) -> &'static str {
+        match self {
+            MediaKind::Movie => "Movie",
+            MediaKind::Episode => "Episode",
+            MediaKind::Audio => "Audio",
+        }
+    }
 }
 
 impl std::str::FromStr for MediaKind {

@@ -7,8 +7,9 @@
 
 use super::auth_extractor::AuthUser;
 use super::socket_messages::{
-    CommandData, GroupInfoData, GroupStateUpdate, GroupUpdateData, Inbound, Outbound,
-    PlayQueueUpdate, QueuePlaylistItem, SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData,
+    CommandData, GroupInfoData, GroupStateUpdate, GroupUpdateData, Inbound, NowPlayingItemLite,
+    Outbound, PlayQueueUpdate, QueuePlaylistItem, SessionPlayStateLite, SessionsBroadcastEntry,
+    SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData,
 };
 use crate::state::{AppState, SocketBroadcast};
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -795,20 +796,32 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             session_id,
             user_id,
             item_id,
+            item_kind,
             position_ticks,
             is_paused,
-        } => Some(Outbound::new(
-            "Sessions",
-            serde_json::json!([{
-                "Id": session_id,
-                "UserId": user_id,
-                "NowPlayingItem": { "Id": item_id },
-                "PlayState": {
-                    "PositionTicks": position_ticks,
-                    "IsPaused": is_paused,
+        } => {
+            // Only stamp a NowPlayingItem when we know its kind: the kotlin
+            // BaseItemDto REQUIRES `Type`, so a kind-less item is omitted
+            // (nullable field) rather than sent Type-less (which crashes the
+            // native Android TV client — B78).
+            let now_playing_item = item_kind.map(|k| NowPlayingItemLite {
+                id: item_id,
+                kind: k.base_item_kind(),
+            });
+            let entry = SessionsBroadcastEntry {
+                id: session_id,
+                user_id,
+                now_playing_item,
+                play_state: SessionPlayStateLite {
+                    position_ticks,
+                    is_paused,
                 },
-            }]),
-        )),
+            };
+            Some(Outbound::new(
+                "Sessions",
+                serde_json::to_value([entry]).ok()?,
+            ))
+        }
     }
 }
 
@@ -948,6 +961,7 @@ mod tests {
             session_id: "s-1".into(),
             user_id: "u-1".into(),
             item_id: "42".into(),
+            item_kind: Some(pharos_core::MediaKind::Episode),
             position_ticks: 12_345_000,
             is_paused: true,
         })
@@ -958,8 +972,29 @@ mod tests {
         assert_eq!(v["Data"][0]["Id"], "s-1");
         assert_eq!(v["Data"][0]["UserId"], "u-1");
         assert_eq!(v["Data"][0]["NowPlayingItem"]["Id"], "42");
+        // B78 — the kotlin BaseItemDto REQUIRES `Type`; a Type-less
+        // NowPlayingItem crashes the native Android TV client.
+        assert_eq!(v["Data"][0]["NowPlayingItem"]["Type"], "Episode");
         assert_eq!(v["Data"][0]["PlayState"]["PositionTicks"], 12_345_000);
         assert_eq!(v["Data"][0]["PlayState"]["IsPaused"], true);
+    }
+
+    #[test]
+    fn translate_playback_progress_omits_now_playing_item_when_kind_unknown() {
+        // B78 — an unresolved kind must NOT emit a `Type`-less NowPlayingItem
+        // (that crashes strict clients); the nullable field is omitted instead.
+        let out = translate_broadcast(SocketBroadcast::PlaybackProgress {
+            session_id: "s-1".into(),
+            user_id: "u-1".into(),
+            item_id: "42".into(),
+            item_kind: None,
+            position_ticks: 1,
+            is_paused: false,
+        })
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert!(v["Data"][0]["NowPlayingItem"].is_null());
     }
 
     #[test]

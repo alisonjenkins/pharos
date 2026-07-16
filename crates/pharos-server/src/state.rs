@@ -88,6 +88,11 @@ pub enum SocketBroadcast {
         session_id: String,
         user_id: String,
         item_id: String,
+        /// Resolved kind of `item_id`, so the `Sessions` broadcast can stamp
+        /// the kotlin-REQUIRED `NowPlayingItem.Type`. `None` when the item
+        /// couldn't be resolved — the broadcast then omits `NowPlayingItem`
+        /// rather than emit a `Type`-less one that crashes strict clients.
+        item_kind: Option<pharos_core::MediaKind>,
         position_ticks: u64,
         is_paused: bool,
     },
@@ -786,6 +791,7 @@ impl AppState {
         session_id: &str,
         user_id: &str,
         item_id: &str,
+        item_kind: Option<pharos_core::MediaKind>,
         position_ticks: u64,
         is_paused: bool,
     ) {
@@ -793,6 +799,7 @@ impl AppState {
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
             item_id: item_id.to_string(),
+            item_kind,
             position_ticks,
             is_paused,
         });

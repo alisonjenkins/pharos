@@ -182,10 +182,18 @@ async fn playing_progress(
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         // P10 — fan out to /socket subscribers so the Currently
         // Watching sidebar updates live without polling.
+        // Resolve the item's kind so the broadcast can stamp the
+        // kotlin-REQUIRED `NowPlayingItem.Type` (a Type-less BaseItemDto
+        // throws MissingFieldException and crashes native Android TV — B78).
+        let item_kind = match pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
+            Some(id) => state.stores.get(id).await.ok().map(|m| m.kind),
+            None => None,
+        };
         state.notify_playback_progress(
             &session_id,
             &user.0.id.0.simple().to_string(),
             &item_id_str,
+            item_kind,
             position_ticks,
             body.is_paused,
         );
