@@ -432,7 +432,7 @@ pub struct BaseItemDto {
     pub production_locations: Vec<String>,
     pub provider_ids: serde_json::Map<String, serde_json::Value>,
     pub remote_trailers: Vec<serde_json::Value>,
-    pub chapters: Vec<serde_json::Value>,
+    pub chapters: Vec<ChapterInfoDto>,
     pub trickplay: serde_json::Map<String, serde_json::Value>,
     pub external_urls: Vec<serde_json::Value>,
     pub image_tags: serde_json::Map<String, serde_json::Value>,
@@ -605,7 +605,7 @@ pub struct MediaSourceInfoDto {
     pub is_infinite_stream: bool,
     pub has_segments: bool,
     pub media_streams: Vec<MediaStreamDto>,
-    pub media_attachments: Vec<serde_json::Value>,
+    pub media_attachments: Vec<MediaAttachmentDto>,
     pub bitrate: Option<u64>,
     pub video_type: &'static str,
     pub default_audio_stream_index: Option<u32>,
@@ -1467,18 +1467,12 @@ impl BaseItemDto {
                 .probe
                 .chapters
                 .iter()
-                .map(|c| {
+                .map(|c| ChapterInfoDto {
+                    name: c.title.clone(),
                     // `StartPositionTicks` is Jellyfin's 100-ns unit
                     // (10_000 ticks / ms).
-                    let ticks = c.start_ms.saturating_mul(10_000);
-                    serde_json::json!({
-                        "Name": c.title,
-                        "StartPositionTicks": ticks,
-                        // Non-nullable DateTime in C# ChapterInfo; real
-                        // Jellyfin emits DateTime.MinValue when the chapter
-                        // has no extracted image. Strict SDKs require it.
-                        "ImageDateModified": "0001-01-01T00:00:00.0000000Z",
-                    })
+                    start_position_ticks: c.start_ms.saturating_mul(10_000),
+                    image_date_modified: "0001-01-01T00:00:00.0000000Z",
                 })
                 .collect(),
             trickplay: serde_json::Map::new(),
@@ -2176,24 +2170,46 @@ pub fn build_media_streams_with_subtitles(
 /// Build a MediaSource's `MediaAttachments` array — one entry per embedded
 /// attachment (fonts). Each carries a `DeliveryUrl` jellyfin-web fetches and
 /// hands to SubtitlesOctopus so ASS/SSA subtitles render with the right fonts.
+/// Jellyfin `ChapterInfo` embedded in a `BaseItemDto`. `ImageDateModified` is a
+/// non-nullable DateTime in C# (DateTime.MinValue when no chapter image);
+/// strict SDKs require it. Typed per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ChapterInfoDto {
+    pub name: String,
+    pub start_position_ticks: u64,
+    pub image_date_modified: &'static str,
+}
+
+/// Jellyfin `MediaAttachment` (embedded font / cover in a `MediaSourceInfo`).
+/// Typed per B78/V38. jellyfin-web's ASS renderer + native players fetch the
+/// `DeliveryUrl` to pull embedded subtitle fonts.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaAttachmentDto {
+    pub index: u32,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub codec: Option<String>,
+    pub delivery_url: String,
+}
+
 pub fn build_media_attachments(
     item_id: pharos_core::MediaId,
     attachments: &[pharos_core::MediaAttachment],
-) -> Vec<serde_json::Value> {
+) -> Vec<MediaAttachmentDto> {
     attachments
         .iter()
-        .map(|a| {
-            serde_json::json!({
-                "Index": a.stream_index,
-                "FileName": a.filename,
-                "MimeType": a.mime_type,
-                "Codec": a.codec,
-                "DeliveryUrl": format!(
-                    "/Videos/{id}/{id}/Attachments/{idx}",
-                    id = wire_item_id(item_id),
-                    idx = a.stream_index,
-                ),
-            })
+        .map(|a| MediaAttachmentDto {
+            index: a.stream_index,
+            file_name: a.filename.clone(),
+            mime_type: a.mime_type.clone(),
+            codec: a.codec.clone(),
+            delivery_url: format!(
+                "/Videos/{id}/{id}/Attachments/{idx}",
+                id = wire_item_id(item_id),
+                idx = a.stream_index,
+            ),
         })
         .collect()
 }
@@ -2322,13 +2338,16 @@ mod tests {
         ];
         let out = build_media_attachments(42, &atts);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0]["Index"], 7);
-        assert_eq!(out[0]["FileName"], "Arial.ttf");
-        assert_eq!(out[0]["MimeType"], "application/x-truetype-font");
-        assert_eq!(out[0]["Codec"], "ttf");
-        assert_eq!(out[0]["DeliveryUrl"], "/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Attachments/7");
-        assert_eq!(out[1]["Index"], 8);
-        assert_eq!(out[1]["DeliveryUrl"], "/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Attachments/8");
+        assert_eq!(out[0].index, 7);
+        assert_eq!(out[0].file_name.as_deref(), Some("Arial.ttf"));
+        assert_eq!(
+            out[0].mime_type.as_deref(),
+            Some("application/x-truetype-font")
+        );
+        assert_eq!(out[0].codec.as_deref(), Some("ttf"));
+        assert_eq!(out[0].delivery_url, "/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Attachments/7");
+        assert_eq!(out[1].index, 8);
+        assert_eq!(out[1].delivery_url, "/Videos/0000000000000000000000000000002a/0000000000000000000000000000002a/Attachments/8");
     }
 
     #[test]
