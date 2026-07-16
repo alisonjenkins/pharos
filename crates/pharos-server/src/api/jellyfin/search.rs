@@ -13,7 +13,7 @@
 
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
-use actix_web::{error, web, HttpResponse, Responder};
+use actix_web::{error, web, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use serde::{Deserialize, Serialize};
 
@@ -319,7 +319,7 @@ async fn search_hints(
         hints[start..end].to_vec()
     };
 
-    Ok(HttpResponse::Ok().json(SearchHintsResult {
+    Ok(crate::api::jellyfin::wire::json(&SearchHintsResult {
         search_hints: page,
         total_record_count: total,
     }))
@@ -329,7 +329,9 @@ async fn search_suggestions(
     state: web::Data<crate::state::AppState>,
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(HttpResponse::Ok().json(build_suggestions(&state, user.0.id, 12).await?))
+    Ok(crate::api::jellyfin::wire::json(
+        &build_suggestions(&state, user.0.id, 12).await?,
+    ))
 }
 
 /// `/Users/{user_id}/Suggestions` — jellyfin-web fetches this on the
@@ -344,7 +346,9 @@ async fn user_suggestions(
     if path.into_inner() != bearer {
         return Err(error::ErrorForbidden("user mismatch"));
     }
-    Ok(HttpResponse::Ok().json(build_suggestions(&state, user.0.id, 12).await?))
+    Ok(crate::api::jellyfin::wire::json(
+        &build_suggestions(&state, user.0.id, 12).await?,
+    ))
 }
 
 /// Build a random-sample suggestion result balanced across kinds.

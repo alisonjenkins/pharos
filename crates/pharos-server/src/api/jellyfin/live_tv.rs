@@ -70,7 +70,7 @@ async fn channel_image_primary(
 
 async fn info(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
     let enabled = state.live_tv.is_some();
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "IsEnabled": enabled,
         "Services": if enabled { vec!["M3U/XMLTV"] } else { vec![] },
         "EnabledUsers": [],
@@ -123,7 +123,7 @@ struct LiveTvProgramDto {
 
 async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
     let Some(backend) = state.live_tv.as_ref() else {
-        return HttpResponse::Ok().json(empty_items_result_value());
+        return crate::api::jellyfin::wire::json(&empty_items_result_value());
     };
     let chs = match backend.channels().await {
         Ok(v) => v,
@@ -151,7 +151,7 @@ async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder
         })
         .collect();
     let total = items.len() as u32;
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -174,7 +174,7 @@ async fn channel(
     let Some(ch) = chs.into_iter().find(|c| c.id == id) else {
         return HttpResponse::NotFound().body("");
     };
-    HttpResponse::Ok().json(LiveTvChannelDto {
+    crate::api::jellyfin::wire::json(&LiveTvChannelDto {
         id: ch.id,
         name: ch.name,
         channel_number: ch.number,
@@ -232,7 +232,7 @@ async fn programs(
     q: CiQuery<ProgramsQuery>,
 ) -> impl Responder {
     let Some(backend) = state.live_tv.as_ref() else {
-        return HttpResponse::Ok().json(empty_items_result_value());
+        return crate::api::jellyfin::wire::json(&empty_items_result_value());
     };
     let now_ms = unix_ms_now();
     let start_ms = q
@@ -270,7 +270,7 @@ async fn programs(
         })
         .collect();
     let total = items.len() as u32;
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -278,7 +278,7 @@ async fn programs(
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(empty_items_result_value())
+    crate::api::jellyfin::wire::json(&empty_items_result_value())
 }
 
 fn empty_items_result_value() -> serde_json::Value {

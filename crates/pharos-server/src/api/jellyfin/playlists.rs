@@ -76,7 +76,9 @@ async fn create_playlist(
         .create_playlist(name, Some(&owner), media_type, &ids)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "Id": playlist.wire_id })))
+    Ok(crate::api::jellyfin::wire::json(
+        &serde_json::json!({ "Id": playlist.wire_id }),
+    ))
 }
 
 /// `GET /Playlists/{id}` — the playlist header as a `Playlist` folder item.
@@ -98,7 +100,9 @@ async fn get_playlist(
         .await
         .map(|e| e.len() as u32)
         .unwrap_or(0);
-    Ok(HttpResponse::Ok().json(playlist_dto(&state, &playlist, count)))
+    Ok(crate::api::jellyfin::wire::json(&playlist_dto(
+        &state, &playlist, count,
+    )))
 }
 
 /// `GET /Playlists/{id}/Items` — the members in curated order, each tagged
@@ -150,7 +154,7 @@ async fn playlist_items(
             }
         }
     }
-    Ok(HttpResponse::Ok().json(value))
+    Ok(crate::api::jellyfin::wire::json(&value))
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -144,7 +144,7 @@ where
     let entry =
         serde_json::to_value(&dto).map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     state.notify_user_data_changed(&user_id.0.simple().to_string(), vec![entry]);
-    Ok(HttpResponse::Ok().json(dto))
+    Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
 /// B36 — mark-played / favourite on a synthetic series or season id:
@@ -217,7 +217,7 @@ where
     .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     entries.push(folder_val.clone());
     state.notify_user_data_changed(&user_id.0.simple().to_string(), entries);
-    Ok(HttpResponse::Ok().json(folder_val))
+    Ok(crate::api::jellyfin::wire::json(&folder_val))
 }
 
 fn now_unix() -> i64 {

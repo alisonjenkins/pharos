@@ -578,7 +578,7 @@ async fn list_groups(
         // Actor unreachable: return empty rather than 500 so the UI
         // renders an "no active groups" pane instead of an error.
         let empty: Vec<GroupInfoDto> = vec![];
-        return HttpResponse::Ok().json(empty);
+        return crate::api::jellyfin::wire::json(&empty);
     };
     let mut out = Vec::with_capacity(handles.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -622,7 +622,7 @@ async fn list_groups(
             }
         }
     }
-    HttpResponse::Ok().json(out)
+    crate::api::jellyfin::wire::json(&out)
 }
 
 async fn no_op_204(_user: AuthUser) -> impl Responder {

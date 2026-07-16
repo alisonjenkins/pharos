@@ -114,7 +114,7 @@ async fn list_sessions(
         let bearer = user.0.id.0.simple().to_string();
         snap.into_iter().filter(|s| s.user_id == bearer).collect()
     };
-    Ok(HttpResponse::Ok().json(filtered))
+    Ok(crate::api::jellyfin::wire::json(&filtered))
 }
 
 async fn playing_started(

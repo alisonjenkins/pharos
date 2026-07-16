@@ -170,7 +170,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": [],
         "TotalRecordCount": 0,
         "StartIndex": 0,
@@ -222,7 +222,7 @@ async fn items_counts(
             genres.insert(n);
         }
     }
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "MovieCount": movies,
         "SeriesCount": series.len() as u32,
         "EpisodeCount": episodes,
@@ -308,7 +308,7 @@ async fn items_filters_legacy(
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::FacetRequest;
     let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
-        return Ok(HttpResponse::Ok().json(serde_json::json!({
+        return Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
             "Genres": [], "Tags": [], "OfficialRatings": [], "Years": [],
         })));
     };
@@ -330,7 +330,7 @@ async fn items_filters_legacy(
         .iter()
         .filter_map(|f| f.value.parse::<i64>().ok())
         .collect();
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Genres": genres,
         "Tags": tags,
         "OfficialRatings": ratings,
@@ -356,7 +356,7 @@ async fn items_filters2(
                          "Years": [], "OfficialRatings": [] },
     });
     let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
-        return Ok(HttpResponse::Ok().json(empty));
+        return Ok(crate::api::jellyfin::wire::json(&empty));
     };
     let req = FacetRequest::default();
     let facets = state
@@ -387,7 +387,7 @@ async fn items_filters2(
         .iter()
         .filter_map(|f| f.value.parse::<i64>().ok())
         .collect();
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Genres": name_guid(&facets.genres),
         "Studios": name_guid(&facets.studios),
         "Tags": tags,
@@ -451,7 +451,7 @@ async fn items_similar(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let Some(target) = all.iter().find(|i| i.id == id) else {
-        return Ok(HttpResponse::Ok().json(serde_json::json!({
+        return Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
             "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
         })));
     };
@@ -488,7 +488,7 @@ async fn items_similar(
         .collect();
     fill_parent_ids(&state, &mut dtos, &picks);
     let total = dtos.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": dtos,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -507,7 +507,7 @@ async fn music_similar(
 ) -> Result<HttpResponse, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     let empty = || {
-        HttpResponse::Ok().json(serde_json::json!({
+        crate::api::jellyfin::wire::json(&serde_json::json!({
             "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
         }))
     };
@@ -598,7 +598,7 @@ async fn music_similar(
             .map(|(_, a)| synth_album_dto(state, a))
             .collect();
         let total = items.len() as u32;
-        return Ok(HttpResponse::Ok().json(serde_json::json!({
+        return Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
             "Items": items, "TotalRecordCount": total, "StartIndex": 0,
         })));
     }
@@ -673,7 +673,7 @@ async fn music_similar(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items, "TotalRecordCount": total, "StartIndex": 0,
     })))
 }
@@ -771,7 +771,7 @@ async fn list_genres(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -831,7 +831,7 @@ async fn list_artists(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -912,7 +912,7 @@ async fn list_albums(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -952,7 +952,7 @@ async fn list_studios(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -993,7 +993,7 @@ async fn list_tags(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -1077,7 +1077,7 @@ async fn list_persons(
         .map(|pc| person_dto(&state, pc.person.clone(), pc.item_count))
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -1107,7 +1107,9 @@ async fn get_person(
         .await
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
-    Ok(HttpResponse::Ok().json(person_dto(&state, person, count)))
+    Ok(crate::api::jellyfin::wire::json(&person_dto(
+        &state, person, count,
+    )))
 }
 
 /// Shared Person item JSON. The Jellyfin Person item is an `IsFolder`
@@ -1157,7 +1159,7 @@ async fn list_collections(
         .map(|cc| collection_dto(&state, &cc.collection, cc.item_count))
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -1253,7 +1255,11 @@ async fn create_collection(
         .await
         .map(|m| m.len() as u32)
         .unwrap_or(ids.len() as u32);
-    Ok(HttpResponse::Ok().json(collection_dto(&state, &collection, count)))
+    Ok(crate::api::jellyfin::wire::json(&collection_dto(
+        &state,
+        &collection,
+        count,
+    )))
 }
 
 /// `POST /Collections/{id}/Items` — LIB-C5 manual CRUD: add the `Ids`
@@ -1445,7 +1451,7 @@ async fn shows_next_up(
         .collect();
     let total = dtos.len() as u32;
     let _ = q.user_id; // kept for future per-user scoping
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": dtos,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -1584,7 +1590,7 @@ async fn shows_episodes(
         })
         .collect();
     let _ = q.user_id.as_deref();
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": dtos,
         "TotalRecordCount": total,
         "StartIndex": start as u32,
@@ -1627,7 +1633,7 @@ async fn shows_seasons(
         .map(|(n, series)| season_dto(&state.server_id, series, *n, &season_display_name(*n)))
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -2254,7 +2260,7 @@ async fn playback_info(
         let body = serde_json::to_string(&response).unwrap_or_default();
         tracing::info!(media.id = id, %body, "playbackinfo response");
     }
-    Ok(HttpResponse::Ok().json(response))
+    Ok(crate::api::jellyfin::wire::json(&response))
 }
 
 async fn list_user_items_latest(
@@ -2323,7 +2329,7 @@ async fn latest_items(
         })
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
-    Ok(HttpResponse::Ok().json(dtos))
+    Ok(crate::api::jellyfin::wire::json(&dtos))
 }
 
 fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
@@ -2343,7 +2349,7 @@ async fn user_views(
     _user: AuthUser,
     _path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(HttpResponse::Ok().json(synth_views_body(&state)))
+    Ok(crate::api::jellyfin::wire::json(&synth_views_body(&state)))
 }
 
 #[derive(serde::Deserialize)]
@@ -2358,7 +2364,7 @@ async fn user_views_query(
     _user: AuthUser,
     _q: CiQuery<UserViewsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(HttpResponse::Ok().json(synth_views_body(&state)))
+    Ok(crate::api::jellyfin::wire::json(&synth_views_body(&state)))
 }
 
 /// Synthesise a `Folder`/`CollectionFolder` view per configured
@@ -2478,7 +2484,7 @@ async fn media_folders(
 ) -> Result<impl Responder, actix_web::Error> {
     let views = library_views(&state);
     let count = views.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": views,
         "TotalRecordCount": count,
         "StartIndex": 0,
@@ -3025,7 +3031,7 @@ async fn maybe_list_music(
             .skip(start)
             .take(q.limit as usize)
             .collect();
-        return Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+        return Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
             "Items": page,
             "TotalRecordCount": total,
             "StartIndex": q.start_index,
@@ -3094,7 +3100,7 @@ async fn maybe_list_music(
         .take(q.limit as usize)
         .map(|a| synth_album_dto(state, a))
         .collect();
-    Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+    Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": page,
         "TotalRecordCount": total,
         "StartIndex": q.start_index,
@@ -3108,11 +3114,15 @@ async fn list_items(
 ) -> Result<impl Responder, actix_web::Error> {
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
-        return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+        return Ok(crate::api::jellyfin::wire::json(
+            &list_boxsets_page(&state, &q).await?,
+        ));
     }
     // T70 — Playlist-only listing comes from the playlists entity table.
     if playlist_only_request(&q) {
-        return Ok(HttpResponse::Ok().json(list_playlists_page(&state, user.0.id, &q).await?));
+        return Ok(crate::api::jellyfin::wire::json(
+            &list_playlists_page(&state, user.0.id, &q).await?,
+        ));
     }
     if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
         return Ok(resp);
@@ -3121,7 +3131,7 @@ async fn list_items(
         return Ok(resp);
     }
     let dto = run_items_list(&state, user.0.id, &user.0.policy, &q).await?;
-    Ok(HttpResponse::Ok().json(dto))
+    Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
 async fn list_user_items(
@@ -3138,11 +3148,15 @@ async fn list_user_items(
     }
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
-        return Ok(HttpResponse::Ok().json(list_boxsets_page(&state, &q).await?));
+        return Ok(crate::api::jellyfin::wire::json(
+            &list_boxsets_page(&state, &q).await?,
+        ));
     }
     // T70 — Playlist-only listing comes from the playlists entity table.
     if playlist_only_request(&q) {
-        return Ok(HttpResponse::Ok().json(list_playlists_page(&state, user.0.id, &q).await?));
+        return Ok(crate::api::jellyfin::wire::json(
+            &list_playlists_page(&state, user.0.id, &q).await?,
+        ));
     }
     if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
         return Ok(resp);
@@ -3157,7 +3171,7 @@ async fn list_user_items(
         return Ok(resp);
     }
     let dto = run_items_list(&state, user.0.id, &user.0.policy, &q).await?;
-    Ok(HttpResponse::Ok().json(dto))
+    Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
 /// LIB-B2 — the single `/Items` + `/Users/{u}/Items` list path, routed
@@ -4346,15 +4360,17 @@ async fn fetch_item_dto(
     if numeric_id.is_none() {
         // T-fix-7 follow-up: synthesised library CollectionFolder ids.
         if let Some(view) = library_view_for_id(state, id_str) {
-            return Ok(HttpResponse::Ok().json(view));
+            return Ok(crate::api::jellyfin::wire::json(&view));
         }
         if id_str == "00000000000000000000000000000000" {
-            return Ok(HttpResponse::Ok().json(all_media_placeholder(&state.server_id)));
+            return Ok(crate::api::jellyfin::wire::json(&all_media_placeholder(
+                &state.server_id,
+            )));
         }
         // T-fix-18: synth Series + Season DTOs derived from any Episode item
         // whose series_id / season_id matches (one `store.list()`).
         if let Some(view) = synth_series_or_season(state, id_str).await? {
-            return Ok(HttpResponse::Ok().json(view));
+            return Ok(crate::api::jellyfin::wire::json(&view));
         }
         // LIB-C5 — a collection wire id resolves to its BoxSet BaseItemDto so
         // `/Items/{id}` on a box set returns the folder item.
@@ -4371,7 +4387,11 @@ async fn fetch_item_dto(
                 .await
                 .map(|m| m.len() as u32)
                 .unwrap_or(0);
-            return Ok(HttpResponse::Ok().json(collection_dto(state, &collection, count)));
+            return Ok(crate::api::jellyfin::wire::json(&collection_dto(
+                state,
+                &collection,
+                count,
+            )));
         }
         // T70 — a playlist wire id resolves to its Playlist BaseItemDto so
         // `/Items/{id}` on a playlist returns the folder item.
@@ -4388,11 +4408,9 @@ async fn fetch_item_dto(
                 .await
                 .map(|e| e.len() as u32)
                 .unwrap_or(0);
-            return Ok(
-                HttpResponse::Ok().json(crate::api::jellyfin::playlists::playlist_dto(
-                    state, &playlist, count,
-                )),
-            );
+            return Ok(crate::api::jellyfin::wire::json(
+                &crate::api::jellyfin::playlists::playlist_dto(state, &playlist, count),
+            ));
         }
         // B32 — synth MusicAlbum / MusicArtist ids. Every list surface
         // (grids, a track's AlbumId/ArtistItems) emits these, and
@@ -4401,7 +4419,7 @@ async fn fetch_item_dto(
         // detail view aborted before the play button was wired). Same
         // one-way-hash recovery as `resolve_parent_filter`.
         if let Some(view) = synth_album_or_artist(state, id_str).await? {
-            return Ok(HttpResponse::Ok().json(view));
+            return Ok(crate::api::jellyfin::wire::json(&view));
         }
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
@@ -4468,8 +4486,8 @@ async fn fetch_item_dto(
             }
         }
     };
-    Ok(HttpResponse::Ok().json(
-        BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
+    Ok(crate::api::jellyfin::wire::json(
+        &BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
             .with_trickplay(
                 &item.probe,
                 &state.generated_trickplay_widths(item.id),
@@ -4584,7 +4602,7 @@ async fn maybe_list_virtual_shows(
     // narrows to that show before collapsing.
     let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
     if matches!(parent, ParentResolution::Empty) {
-        return Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+        return Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
             "Items": [],
             "TotalRecordCount": 0,
             "StartIndex": q.start_index,
@@ -4681,7 +4699,7 @@ async fn maybe_list_virtual_shows(
     } else {
         items.drain(start..end).collect()
     };
-    Ok(Some(HttpResponse::Ok().json(serde_json::json!({
+    Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": page,
         "TotalRecordCount": total,
         "StartIndex": q.start_index,
@@ -4908,7 +4926,7 @@ async fn resume_items(
             )
         })
         .collect();
-    Ok(HttpResponse::Ok().json(ItemsResultDto {
+    Ok(crate::api::jellyfin::wire::json(&ItemsResultDto {
         items: dtos,
         total_record_count: total,
         start_index: 0,
@@ -4969,7 +4987,7 @@ async fn virtual_folders(
             .await,
         );
     }
-    Ok(HttpResponse::Ok().json(folders))
+    Ok(crate::api::jellyfin::wire::json(&folders))
 }
 
 /// T69 — build one `VirtualFolderInfo` as JSON, overlaying the library's
@@ -5414,7 +5432,7 @@ async fn libraries_available_options(_user: AuthUser) -> impl Responder {
             "DefaultImageOptions": [],
         })
     };
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "MetadataSavers": [
             { "Name": "Nfo", "DefaultEnabled": false }
         ],
@@ -5481,7 +5499,7 @@ async fn environment_directory_contents(
             .unwrap_or("")
             .cmp(b["Name"].as_str().unwrap_or(""))
     });
-    Ok(HttpResponse::Ok().json(out))
+    Ok(crate::api::jellyfin::wire::json(&out))
 }
 
 /// Reload the typed-library set from the store into `AppState`, re-stamping

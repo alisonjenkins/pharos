@@ -56,7 +56,7 @@ async fn metadata_editor(
         pharos_core::MediaKind::Episode => "tvshows",
         pharos_core::MediaKind::Audio => "music",
     };
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "ContentType": content_type,
         "ContentTypeOptions": [
             { "Name": "Movies", "Value": "movies" },
@@ -181,7 +181,7 @@ async fn set_content_type(
 /// `RemoteImageResult` (200, not 404) — the same as stock Jellyfin with no
 /// providers.
 async fn remote_images(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Images": [],
         "TotalRecordCount": 0,
         "Providers": [],
@@ -191,7 +191,7 @@ async fn remote_images(_user: AuthUser, _path: web::Path<String>) -> impl Respon
 /// `GET /Items/{id}/RemoteImages/Providers` — the configured image
 /// providers (none).
 async fn remote_image_providers(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::Value::Array(vec![]))
+    crate::api::jellyfin::wire::json(&serde_json::Value::Array(vec![]))
 }
 
 /// `GET /Items/{id}/RemoteSearch/Subtitles/{lang}` — remote subtitle
@@ -201,7 +201,7 @@ async fn remote_subtitle_search(
     _user: AuthUser,
     _path: web::Path<(String, String)>,
 ) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::Value::Array(vec![]))
+    crate::api::jellyfin::wire::json(&serde_json::Value::Array(vec![]))
 }
 
 /// `GET /Audio/{id}/Lyrics` — serve time-synced lyrics from an `.lrc`
@@ -221,7 +221,7 @@ async fn get_lyrics(
     })?;
     let lines = read_lrc_sidecar(&item.path).unwrap_or_default();
     // B78/V38 — typed LyricDto, not a json! literal.
-    Ok(HttpResponse::Ok().json(LyricDto {
+    Ok(crate::api::jellyfin::wire::json(&LyricDto {
         metadata: LyricMetadataDto {},
         lyrics: lines,
     }))
@@ -330,5 +330,5 @@ async fn instant_mix(
     }
     let total = mix.len() as u32;
     let page = items::build_items_page(&state, user.0.id, &mix, total, 0).await?;
-    Ok(HttpResponse::Ok().json(page))
+    Ok(crate::api::jellyfin::wire::json(&page))
 }

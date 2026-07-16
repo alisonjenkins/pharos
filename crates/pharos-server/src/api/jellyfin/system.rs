@@ -90,7 +90,7 @@ async fn bitrate_test(q: CiQuery<BitrateTestQuery>) -> impl Responder {
 }
 
 async fn system_configuration() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "EnableMetrics": true,
         "EnableNormalizedItemByNameIds": true,
         "EnableCaseSensitiveItemIds": true,
@@ -177,22 +177,22 @@ async fn system_configuration_named(
             }
         }
     }
-    Ok(HttpResponse::Ok().json(body))
+    Ok(crate::api::jellyfin::wire::json(&body))
 }
 
 async fn empty_backup_list() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!([]))
+    crate::api::jellyfin::wire::json(&serde_json::json!([]))
 }
 
 async fn system_storage() -> impl Responder {
     // `SystemStorageInfo` shape — jellyfin-web maps over `.Folders`. Empty is
     // valid (renders "no data" rather than throwing). pharos doesn't surface
     // per-folder free/used space yet.
-    HttpResponse::Ok().json(serde_json::json!({ "Folders": [] }))
+    crate::api::jellyfin::wire::json(&serde_json::json!({ "Folders": [] }))
 }
 
 async fn system_endpoint() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "IsLocal": true,
         "IsInNetwork": true,
     }))
@@ -230,7 +230,7 @@ async fn display_preferences(
         }
         None => default_prefs(&dp_id, &q.client),
     };
-    Ok(HttpResponse::Ok().json(body))
+    Ok(crate::api::jellyfin::wire::json(&body))
 }
 
 /// Jellyfin `DisplayPreferencesDto` — native clients read this at startup.
@@ -370,7 +370,7 @@ async fn system_info(
     let server_name = branding
         .server_name
         .unwrap_or_else(|| state.server_name.clone());
-    HttpResponse::Ok().json(SystemInfoDto {
+    crate::api::jellyfin::wire::json(&SystemInfoDto {
         id: state.server_id.clone(),
         server_name,
         version: ADVERTISED_JELLYFIN_VERSION.to_string(),
@@ -407,7 +407,7 @@ async fn system_info(
 /// user needs an exotic locale they can type it into the prefs view's
 /// text field (which is the canonical source of truth).
 async fn localization_cultures(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(LOCALIZATION_CULTURES)
+    crate::api::jellyfin::wire::json(&LOCALIZATION_CULTURES)
 }
 
 pub(crate) const LOCALIZATION_CULTURES: &[Culture] = &[
@@ -471,7 +471,7 @@ impl Culture {
 }
 
 async fn localization_countries(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!([
+    crate::api::jellyfin::wire::json(&serde_json::json!([
         {
             "Name": "US",
             "DisplayName": "United States",
@@ -490,7 +490,7 @@ async fn localization_countries(_user: AuthUser) -> impl Responder {
 /// real libraries carry. Reference data only: serving it does not by itself
 /// enforce any rating limit (T68 enforcement is separate).
 async fn localization_parental_ratings(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(PARENTAL_RATINGS)
+    crate::api::jellyfin::wire::json(&PARENTAL_RATINGS)
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -525,7 +525,7 @@ const PARENTAL_RATINGS: &[ParentalRating] = &[
 ];
 
 async fn localization_options(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!([
+    crate::api::jellyfin::wire::json(&serde_json::json!([
         { "Name": "English (US)", "Value": "en-US" },
     ]))
 }
@@ -577,7 +577,7 @@ async fn devices_list(
         }
     }
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -687,7 +687,7 @@ async fn media_segments(
         }
     }
     let total = items.len() as u32;
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,

@@ -100,11 +100,11 @@ async fn client_log_document(
 
 async fn empty_array(_user: AuthUser) -> impl Responder {
     let empty: Vec<serde_json::Value> = Vec::new();
-    HttpResponse::Ok().json(empty)
+    crate::api::jellyfin::wire::json(&empty)
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": [],
         "TotalRecordCount": 0,
         "StartIndex": 0,
@@ -116,7 +116,7 @@ async fn no_content() -> impl Responder {
 }
 
 async fn notifications_summary(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "UnreadCount": 0,
         "TotalRecordCount": 0,
         "Notifications": [],
@@ -124,7 +124,7 @@ async fn notifications_summary(_user: AuthUser) -> impl Responder {
 }
 
 async fn notifications_user(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": [],
         "TotalRecordCount": 0,
     }))
@@ -136,7 +136,7 @@ async fn auth_providers(user: AuthUser) -> Result<actix_web::HttpResponse, actix
     // Single built-in provider so the dashboard's auth-provider
     // dropdown isn't empty. Matches jellyfin-web's expected shape
     // (`Name` + `Id`).
-    Ok(HttpResponse::Ok().json(serde_json::json!([
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!([
         {
             "Name": "Default",
             "Id": "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
@@ -145,7 +145,7 @@ async fn auth_providers(user: AuthUser) -> Result<actix_web::HttpResponse, actix
 }
 
 async fn theme_media(_user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "ThemeVideosResult": {
             "Items": [],
             "TotalRecordCount": 0,
@@ -180,7 +180,7 @@ async fn get_utc_time() -> impl Responder {
     let iso = crate::api::jellyfin::dto::format_iso8601_ms(ms);
     // `/GetUtcTime` is unauthenticated — jellyfin-web hits it before
     // the user has a token to skew its internal clock.
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "RequestReceptionTime": iso,
         "ResponseTransmissionTime": iso,
     }))

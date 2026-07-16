@@ -62,11 +62,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 /// empty array — clients drop to the manual login form.
 async fn public_users() -> impl Responder {
     let empty: Vec<serde_json::Value> = Vec::new();
-    HttpResponse::Ok().json(empty)
+    crate::api::jellyfin::wire::json(&empty)
 }
 
 async fn quick_connect_enabled() -> impl Responder {
-    HttpResponse::Ok().json(true)
+    crate::api::jellyfin::wire::json(&true)
 }
 
 /// `/QuickConnect/Initiate` — unauthenticated. Returns a fresh
@@ -105,7 +105,7 @@ async fn quick_connect_initiate(
     // B78/V38 — typed QuickConnectResultDto (kotlin-required DeviceName/AppName/
     // AppVersion + a real ISO-8601 DateAdded); echoed from the caller's
     // X-Emby-Authorization header.
-    Ok(HttpResponse::Ok().json(QuickConnectResultDto {
+    Ok(crate::api::jellyfin::wire::json(&QuickConnectResultDto {
         code: entry.code,
         secret: entry.secret,
         device_id: entry.device_id,
@@ -165,7 +165,7 @@ async fn quick_connect_authorize(
     if !ok {
         return Err(actix_web::error::ErrorNotFound("unknown code"));
     }
-    Ok(HttpResponse::Ok().json(true))
+    Ok(crate::api::jellyfin::wire::json(&true))
 }
 
 /// `/QuickConnect/Connect?secret=…` — poll endpoint (Jellyfin's
@@ -207,7 +207,7 @@ async fn quick_connect_connect(
     // THIS response's `Secret`. DeviceName/AppName/AppVersion + DateAdded are
     // kotlin-required; omitting them made the TV's 5 s poll fail deserialization
     // so the code vanished before the user could type it.
-    Ok(HttpResponse::Ok().json(QuickConnectResultDto {
+    Ok(crate::api::jellyfin::wire::json(&QuickConnectResultDto {
         code: entry.code,
         secret: entry.secret,
         device_id: entry.device_id,
@@ -221,7 +221,7 @@ async fn quick_connect_connect(
 
 async fn branding_configuration(state: web::Data<AppState>) -> impl Responder {
     let cfg = state.effective_branding().await;
-    HttpResponse::Ok().json(serde_json::json!({
+    crate::api::jellyfin::wire::json(&serde_json::json!({
         "LoginDisclaimer": cfg.login_disclaimer.unwrap_or_default(),
         "CustomCss": cfg.custom_css.clone().unwrap_or_default(),
         "SplashscreenEnabled": false,
@@ -307,7 +307,7 @@ async fn authenticate_by_name(
         access_token: token.0.expose().to_string(),
         server_id: state.server_id.clone(),
     };
-    Ok(HttpResponse::Ok().json(result))
+    Ok(crate::api::jellyfin::wire::json(&result))
 }
 
 #[derive(serde::Deserialize)]
@@ -405,11 +405,11 @@ async fn authenticate_with_quick_connect(
         access_token: token.0.expose().to_string(),
         server_id: state.server_id.clone(),
     };
-    Ok(HttpResponse::Ok().json(result))
+    Ok(crate::api::jellyfin::wire::json(&result))
 }
 
 async fn me(state: web::Data<AppState>, user: AuthUser) -> impl Responder {
-    HttpResponse::Ok().json(user_dto_with_config(&state, &user.0).await)
+    crate::api::jellyfin::wire::json(&user_dto_with_config(&state, &user.0).await)
 }
 
 async fn user_by_id(
@@ -422,7 +422,9 @@ async fn user_by_id(
     if requested != bearer_id {
         return Err(actix_web::error::ErrorForbidden("user mismatch"));
     }
-    Ok(HttpResponse::Ok().json(user_dto_with_config(&state, &user.0).await))
+    Ok(crate::api::jellyfin::wire::json(
+        &user_dto_with_config(&state, &user.0).await,
+    ))
 }
 
 /// Build a `UserDto` overriding the default `Configuration` block

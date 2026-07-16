@@ -119,7 +119,7 @@ async fn get_waveform(
         }
     };
     let peaks: &[f32] = &peaks;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "DurationMs": duration_ms,
         "Bins": peaks.len(),
         "Peaks": peaks,

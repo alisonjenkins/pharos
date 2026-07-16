@@ -105,7 +105,7 @@ async fn list_api_keys(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
@@ -128,7 +128,7 @@ async fn create_api_key(
         .issue(user.0.id, &device_id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "AppName": app_name,
         "AccessToken": token.0.expose(),
         "Id": device_id,
@@ -172,7 +172,7 @@ fn iso8601_from_unix(secs: i64) -> String {
 
 async fn empty_array(_user: AuthUser) -> impl Responder {
     let empty: Vec<serde_json::Value> = Vec::new();
-    HttpResponse::Ok().json(empty)
+    crate::api::jellyfin::wire::json(&empty)
 }
 
 /// T74 — `GET /ScheduledTasks`. Advertise pharos's real background jobs as
@@ -198,7 +198,7 @@ async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
             "Triggers": [],
         })
     }
-    HttpResponse::Ok().json(serde_json::json!([
+    crate::api::jellyfin::wire::json(&serde_json::json!([
         task(
             "refresh-library",
             "RefreshLibrary",
@@ -242,7 +242,7 @@ async fn activity_log_entries(
     let start = q.start_index.unwrap_or(0);
     let limit = q.limit.unwrap_or(100).min(1000);
     let (total, items) = state.activity_entries(start, limit);
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
         "Items": items,
         "TotalRecordCount": total,
         "StartIndex": start,
@@ -263,7 +263,7 @@ async fn list_users(
         .iter()
         .map(|u| UserDto::from_domain(&u.clone().into_user(), &state.server_id))
         .collect();
-    Ok(HttpResponse::Ok().json(dtos))
+    Ok(crate::api::jellyfin::wire::json(&dtos))
 }
 
 #[derive(Deserialize)]
@@ -312,7 +312,7 @@ async fn create_user(
     }
     let dto = UserDto::from_domain(&record.into_user(), &state.server_id);
     state.notify_library_changed();
-    Ok(HttpResponse::Ok().json(dto))
+    Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
 async fn delete_user(
@@ -588,11 +588,17 @@ async fn system_logs(
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let Some(dir) = state.log_dir.as_ref() else {
-        return Ok(HttpResponse::Ok().json(Vec::<serde_json::Value>::new()));
+        return Ok(crate::api::jellyfin::wire::json(
+            &Vec::<serde_json::Value>::new(),
+        ));
     };
     let entries = match std::fs::read_dir(dir) {
         Ok(it) => it,
-        Err(_) => return Ok(HttpResponse::Ok().json(Vec::<serde_json::Value>::new())),
+        Err(_) => {
+            return Ok(crate::api::jellyfin::wire::json(
+                &Vec::<serde_json::Value>::new(),
+            ))
+        }
     };
     let mut out: Vec<serde_json::Value> = Vec::new();
     for entry in entries.flatten() {
@@ -621,7 +627,7 @@ async fn system_logs(
             .unwrap_or("")
             .cmp(a["DateModified"].as_str().unwrap_or(""))
     });
-    Ok(HttpResponse::Ok().json(out))
+    Ok(crate::api::jellyfin::wire::json(&out))
 }
 
 #[derive(Debug, Deserialize)]
