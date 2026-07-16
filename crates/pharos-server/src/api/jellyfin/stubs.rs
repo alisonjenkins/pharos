@@ -111,19 +111,47 @@ async fn no_content() -> impl Responder {
     HttpResponse::NoContent().finish()
 }
 
+/// Jellyfin `NotificationsSummaryDto` (`GET /Notifications`). No SDK model
+/// exists for this endpoint — mirrors the current emitted shape.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NotificationsSummaryDto {
+    unread_count: u32,
+    total_record_count: u32,
+    notifications: &'static [()],
+}
+
 async fn notifications_summary(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "UnreadCount": 0,
-        "TotalRecordCount": 0,
-        "Notifications": [],
-    }))
+    crate::api::jellyfin::wire::json(&NotificationsSummaryDto {
+        unread_count: 0,
+        total_record_count: 0,
+        notifications: &[],
+    })
+}
+
+/// Jellyfin `NotificationResult` (`GET /Notifications/{userId}`). No SDK
+/// model exists for this endpoint — mirrors the current emitted shape (just
+/// `Items`/`TotalRecordCount`, no `StartIndex`).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NotificationResultDto {
+    items: &'static [()],
+    total_record_count: u32,
 }
 
 async fn notifications_user(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-    }))
+    crate::api::jellyfin::wire::json(&NotificationResultDto {
+        items: &[],
+        total_record_count: 0,
+    })
+}
+
+/// One `AuthenticationProviderInfo` entry (`GET /Auth/Providers`).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct AuthProviderInfoDto {
+    name: &'static str,
+    id: &'static str,
 }
 
 async fn auth_providers(user: AuthUser) -> Result<actix_web::HttpResponse, actix_web::Error> {
@@ -132,35 +160,38 @@ async fn auth_providers(user: AuthUser) -> Result<actix_web::HttpResponse, actix
     // Single built-in provider so the dashboard's auth-provider
     // dropdown isn't empty. Matches jellyfin-web's expected shape
     // (`Name` + `Id`).
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!([
-        {
-            "Name": "Default",
-            "Id": "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
-        }
-    ])))
+    Ok(crate::api::jellyfin::wire::json(&[AuthProviderInfoDto {
+        name: "Default",
+        id: "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider",
+    }]))
+}
+
+/// One `Items`/`TotalRecordCount`/`StartIndex`/`OwnerId` envelope, as emitted
+/// three times (video/song/soundtrack) by `GET /Items/{id}/ThemeMedia`.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ThemeMediaResultDto {
+    items: &'static [()],
+    total_record_count: u32,
+    start_index: u32,
+    owner_id: &'static str,
+}
+
+/// `AllThemeMediaResult` (`GET /Items/{id}/ThemeMedia`).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct AllThemeMediaResultDto {
+    theme_videos_result: ThemeMediaResultDto,
+    theme_songs_result: ThemeMediaResultDto,
+    soundtrack_songs_result: ThemeMediaResultDto,
 }
 
 async fn theme_media(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "ThemeVideosResult": {
-            "Items": [],
-            "TotalRecordCount": 0,
-            "StartIndex": 0,
-            "OwnerId": "",
-        },
-        "ThemeSongsResult": {
-            "Items": [],
-            "TotalRecordCount": 0,
-            "StartIndex": 0,
-            "OwnerId": "",
-        },
-        "SoundtrackSongsResult": {
-            "Items": [],
-            "TotalRecordCount": 0,
-            "StartIndex": 0,
-            "OwnerId": "",
-        },
-    }))
+    crate::api::jellyfin::wire::json(&AllThemeMediaResultDto {
+        theme_videos_result: ThemeMediaResultDto::default(),
+        theme_songs_result: ThemeMediaResultDto::default(),
+        soundtrack_songs_result: ThemeMediaResultDto::default(),
+    })
 }
 
 async fn get_utc_time() -> impl Responder {
