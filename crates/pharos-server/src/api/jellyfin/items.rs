@@ -12,7 +12,8 @@ use crate::{
         device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
-            BaseItemDto, ItemsResultDto, SubtitleStreamCtx,
+            BaseItemDto, ItemsResultDto, MediaSourceInfoDto, PlaybackInfoResponseDto,
+            SubtitleStreamCtx,
         },
         subtitles::discover_sidecars,
     },
@@ -2182,60 +2183,31 @@ async fn playback_info(
         None => "http",
     };
 
-    let primary_source = serde_json::json!({
-        "Id": id_str,
-        // V9: media file paths never leak to clients. Jellyfin's
-        // own server omits this for non-admins; pharos omits it
-        // wholesale — playback uses the StreamUrl / DirectStreamUrl
-        // the client already has, not the on-disk path.
-        "Type": "Default",
-        "Container": advertised_container,
-        "IsRemote": false,
-        // B75 — ETag doubles as the direct-play capability token. The native
-        // SDK echoes it verbatim as `?tag=` on the tokenless `/stream` URL, and
-        // `stream::authorize_media` accepts it when it resolves to this item's
-        // registered session. Equal to PlaySessionId (random uuid); only ever
-        // disclosed in this authenticated PlaybackInfo response.
-        "ETag": play_session_id,
-        "RunTimeTicks": probe.run_time_ticks(),
-        "Size": probe.size_bytes,
-        "Name": item.title,
-        "Protocol": "File",
-        "SupportsDirectPlay": direct_play,
-        "SupportsDirectStream": supports_direct_stream,
-        "SupportsTranscoding": true,
-        "TranscodingUrl": transcoding_url,
-        "TranscodingSubProtocol": transcoding_sub_protocol,
-        "RequiresOpening": false,
-        "RequiresClosing": false,
-        "RequiresLooping": false,
-        "SupportsProbing": true,
-        // Required (non-nullable) fields in jellyfin-sdk-kotlin's
-        // MediaSourceInfo — the native Android/TV apps fail the WHOLE
-        // response if any is absent ("Unable to resolve playback info").
-        // Values match what real Jellyfin emits for a plain library file.
-        "ReadAtNativeFramerate": false,
-        "IgnoreDts": false,
-        "IgnoreIndex": false,
-        "GenPtsInput": false,
-        "IsInfiniteStream": false,
-        "HasSegments": false,
-        "MediaStreams": streams,
-        "MediaAttachments": media_attachments.clone(),
-        "Bitrate": probe.bitrate_bps,
-        "VideoType": "VideoFile",
-        "DefaultAudioStreamIndex": default_audio_stream_index,
-        "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
-        // P17 — playback tuning hints. Defaults match Jellyfin's
-        // own server: 3 s prebuffer, 2 s HLS analyze window,
-        // stereo cap for transcoded audio.
-        "BufferMs": 3000u32,
-        "AnalyzeDurationMs": 2_000_000u32,
-        "TranscodingMaxAudioChannels": 2u32,
-        // P4 — resume offset. Mirrors the top-level field for
-        // clients that read the MediaSource directly.
-        "StartPositionTicks": resume_ticks,
-    });
+    // B78/V38 — typed MediaSourceInfoDto (not a json! literal): the constant /
+    // required fields (V9 path-omission, the B13 non-null value set, the
+    // never-null TranscodingSubProtocol enum, P17 tuning hints) live in
+    // `MediaSourceInfoDto::default()`; only the item-specific fields are set
+    // here. `ETag` (B75) doubles as the direct-play capability token equal to
+    // PlaySessionId, disclosed only in this authenticated response.
+    let primary_source = MediaSourceInfoDto {
+        id: id_str.clone(),
+        container: advertised_container.clone(),
+        e_tag: play_session_id.clone(),
+        run_time_ticks: probe.run_time_ticks(),
+        size: probe.size_bytes,
+        name: item.title.clone(),
+        supports_direct_play: direct_play,
+        supports_direct_stream,
+        transcoding_url,
+        transcoding_sub_protocol,
+        media_streams: streams.clone(),
+        media_attachments: media_attachments.clone(),
+        bitrate: probe.bitrate_bps,
+        default_audio_stream_index,
+        default_subtitle_stream_index,
+        start_position_ticks: resume_ticks,
+        ..Default::default()
+    };
 
     // P34 — additional editions probed for this item. We don't
     // re-run negotiation per alternate (a scanner-side enrichment
@@ -2252,66 +2224,38 @@ async fn playback_info(
             .container
             .clone()
             .unwrap_or_else(|| advertised_container.clone());
-        media_sources.push(serde_json::json!({
-            "Id": alt_id,
-            "Type": "Default",
-            "Container": alt_container,
-            "IsRemote": false,
-            "ETag": "",
-            "RunTimeTicks": alt.duration_ms.map(|ms| ms.saturating_mul(10_000)),
-            "Size": alt.size_bytes.or(probe.size_bytes),
-            // P34 — `Name` carries the edition label so jellyfin-web's
-            // version dropdown renders "Director's Cut" / "Extended"
-            // alongside the primary's title.
-            "Name": alt.name.clone().unwrap_or_else(|| item.title.clone()),
-            "Protocol": "File",
-            // Alternates default to transcode-only until scanner-side
-            // negotiation lands. Safer than asserting direct-play of
-            // a file we haven't actually negotiated against.
-            "SupportsDirectPlay": false,
-            "SupportsDirectStream": false,
-            "SupportsTranscoding": true,
-            "TranscodingUrl": Option::<String>::None,
-            // Non-nullable enum in the kotlin SDK — see primary source.
-            "TranscodingSubProtocol": "http",
-            "RequiresOpening": false,
-            "RequiresClosing": false,
-            "RequiresLooping": false,
-            "SupportsProbing": true,
-            "ReadAtNativeFramerate": false,
-            "IgnoreDts": false,
-            "IgnoreIndex": false,
-            "GenPtsInput": false,
-            "IsInfiniteStream": false,
-            "HasSegments": false,
-            // Reuse the primary's stream list — alternates today
-            // don't carry independent stream enrichment. Future
-            // scanner work fills this per-source.
-            "MediaStreams": streams,
-            "MediaAttachments": media_attachments.clone(),
-            "Bitrate": alt.bitrate_bps.or(probe.bitrate_bps),
-            "VideoType": "VideoFile",
-            "DefaultAudioStreamIndex": default_audio_stream_index,
-            "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
-            "BufferMs": 3000u32,
-            "AnalyzeDurationMs": 2_000_000u32,
-            "TranscodingMaxAudioChannels": 2u32,
-            "StartPositionTicks": 0u64,
-        }));
+        // Alternates default to transcode-only (SupportsDirect* false,
+        // TranscodingUrl None, "http" sub-protocol, 0 resume) until
+        // scanner-side negotiation lands — all from `Default`. `Name` carries
+        // the edition label (P34); streams/attachments reuse the primary's.
+        media_sources.push(MediaSourceInfoDto {
+            id: alt_id,
+            container: alt_container,
+            run_time_ticks: alt.duration_ms.map(|ms| ms.saturating_mul(10_000)),
+            size: alt.size_bytes.or(probe.size_bytes),
+            name: alt.name.clone().unwrap_or_else(|| item.title.clone()),
+            media_streams: streams.clone(),
+            media_attachments: media_attachments.clone(),
+            bitrate: alt.bitrate_bps.or(probe.bitrate_bps),
+            default_audio_stream_index,
+            default_subtitle_stream_index,
+            ..Default::default()
+        });
     }
 
-    let response = serde_json::json!({
-        "MediaSources": media_sources,
-        "PlaySessionId": play_session_id,
-        // P4 — top-level resume offset. jellyfin-web reads this when
-        // it didn't keep a local copy of UserData.PlaybackPositionTicks.
-        "StartPositionTicks": resume_ticks,
-    });
+    // P4 — top-level resume offset. jellyfin-web reads this when it didn't keep
+    // a local copy of UserData.PlaybackPositionTicks.
+    let response = PlaybackInfoResponseDto {
+        media_sources,
+        play_session_id: play_session_id.clone(),
+        start_position_ticks: resume_ticks,
+    };
     // B70 — the native TV crashes PARSING this 200; log the exact body (gated
     // by PHAROS_LOG_ALL_REQUESTS) so the offending field can be diffed vs the
     // kotlin model, since the client sends no usable crash report.
     if std::env::var("PHAROS_LOG_ALL_REQUESTS").as_deref() == Ok("1") {
-        tracing::info!(media.id = id, body = %response, "playbackinfo response");
+        let body = serde_json::to_string(&response).unwrap_or_default();
+        tracing::info!(media.id = id, %body, "playbackinfo response");
     }
     Ok(HttpResponse::Ok().json(response))
 }

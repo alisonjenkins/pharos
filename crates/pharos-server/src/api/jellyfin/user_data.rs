@@ -208,18 +208,16 @@ where
     // Folder-level DTO: ItemId/Key are the synthetic id so the detail
     // page (which matches on Key) picks it up. B78/V38 — typed DTO, not a
     // json! literal, so the kotlin-required UserData field set stays complete.
-    let folder_dto = UserItemDataDto::folder(
-        &id_str,
+    let folder_val = serde_json::to_value(UserItemDataDto::folder(
+        id_str,
         folder_data.played,
         folder_data.play_count,
         folder_data.is_favorite,
-    );
-    entries.push(
-        serde_json::to_value(&folder_dto)
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?,
-    );
+    ))
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    entries.push(folder_val.clone());
     state.notify_user_data_changed(&user_id.0.simple().to_string(), entries);
-    Ok(HttpResponse::Ok().json(folder_dto))
+    Ok(HttpResponse::Ok().json(folder_val))
 }
 
 fn now_unix() -> i64 {

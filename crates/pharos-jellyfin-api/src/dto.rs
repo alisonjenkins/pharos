@@ -565,7 +565,111 @@ pub struct MediaSourceLiteDto {
     pub e_tag: String,
 }
 
-#[derive(Debug, Serialize)]
+/// The FULL `MediaSourceInfo` a `/Items/{id}/PlaybackInfo` response carries —
+/// the exact object B70 traced the native Android/Google-TV app CRASHING while
+/// parsing. Superset of [`MediaSourceLiteDto`] (item-embedded) with the
+/// transcode-negotiation + playback-tuning fields. Typed (not a
+/// `serde_json::json!` literal) per B78/V38 so the kotlin-required field set
+/// (B13 — the non-null value fields + the non-null `TranscodingSubProtocol`
+/// enum) can't silently regress. Nullable fields serialize as `null` (matching
+/// the previous literal's exact wire shape).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSourceInfoDto {
+    pub id: String,
+    #[serde(rename = "Type")]
+    pub kind: &'static str,
+    pub container: String,
+    pub is_remote: bool,
+    #[serde(rename = "ETag")]
+    pub e_tag: String,
+    pub run_time_ticks: Option<u64>,
+    pub size: Option<u64>,
+    pub name: String,
+    pub protocol: &'static str,
+    pub supports_direct_play: bool,
+    pub supports_direct_stream: bool,
+    pub supports_transcoding: bool,
+    pub transcoding_url: Option<String>,
+    /// Non-nullable `MediaStreamProtocol` enum in the SDKs — "http"/"hls",
+    /// NEVER null (a null fails the whole native deserialization, B13).
+    pub transcoding_sub_protocol: &'static str,
+    pub requires_opening: bool,
+    pub requires_closing: bool,
+    pub requires_looping: bool,
+    pub supports_probing: bool,
+    pub read_at_native_framerate: bool,
+    pub ignore_dts: bool,
+    pub ignore_index: bool,
+    pub gen_pts_input: bool,
+    pub is_infinite_stream: bool,
+    pub has_segments: bool,
+    pub media_streams: Vec<MediaStreamDto>,
+    pub media_attachments: Vec<serde_json::Value>,
+    pub bitrate: Option<u64>,
+    pub video_type: &'static str,
+    pub default_audio_stream_index: Option<u32>,
+    pub default_subtitle_stream_index: Option<u32>,
+    pub buffer_ms: u32,
+    pub analyze_duration_ms: u32,
+    pub transcoding_max_audio_channels: u32,
+    pub start_position_ticks: u64,
+}
+
+impl Default for MediaSourceInfoDto {
+    /// The constant / never-varying fields real Jellyfin emits for a plain
+    /// library file; call sites override only the item-specific ones via
+    /// `..Default::default()`.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: "Default",
+            container: String::new(),
+            is_remote: false,
+            e_tag: String::new(),
+            run_time_ticks: None,
+            size: None,
+            name: String::new(),
+            protocol: "File",
+            supports_direct_play: false,
+            supports_direct_stream: false,
+            supports_transcoding: true,
+            transcoding_url: None,
+            transcoding_sub_protocol: "http",
+            requires_opening: false,
+            requires_closing: false,
+            requires_looping: false,
+            supports_probing: true,
+            read_at_native_framerate: false,
+            ignore_dts: false,
+            ignore_index: false,
+            gen_pts_input: false,
+            is_infinite_stream: false,
+            has_segments: false,
+            media_streams: Vec::new(),
+            media_attachments: Vec::new(),
+            bitrate: None,
+            video_type: "VideoFile",
+            default_audio_stream_index: None,
+            default_subtitle_stream_index: None,
+            buffer_ms: 3000,
+            analyze_duration_ms: 2_000_000,
+            transcoding_max_audio_channels: 2,
+            start_position_ticks: 0,
+        }
+    }
+}
+
+/// `/Items/{id}/PlaybackInfo` response envelope. Typed per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackInfoResponseDto {
+    pub media_sources: Vec<MediaSourceInfoDto>,
+    pub play_session_id: String,
+    pub start_position_ticks: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MediaStreamDto {
     #[serde(rename = "Type")]
@@ -772,7 +876,7 @@ fn fill_display_titles(streams: &mut [MediaStreamDto]) {
 /// P37 — wire shape for `MediaStream.ReplayGain`. Floats are in dB
 /// (centidecibels divided by 100). Both fields skip when absent so
 /// clients fall back to unity gain rather than -infinity.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ReplayGainDto {
     #[serde(skip_serializing_if = "Option::is_none")]
