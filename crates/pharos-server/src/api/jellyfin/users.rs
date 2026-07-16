@@ -1,7 +1,10 @@
 use crate::{
     api::jellyfin::{
         auth_extractor::{auth_header_from_request, AuthUser},
-        dto::{AuthenticateByNameRequest, AuthenticationResultDto, SessionInfoDto, UserDto},
+        dto::{
+            AuthenticateByNameRequest, AuthenticationResultDto, QuickConnectResultDto,
+            SessionInfoDto, UserDto,
+        },
     },
     state::AppState,
 };
@@ -99,20 +102,19 @@ async fn quick_connect_initiate(
     // (jellyfin-sdk-kotlin) deserializes it as a DateTime, and an empty string
     // fails to parse — which makes the app treat Quick Connect as unavailable
     // and grey out the button. An empty/omitted value silently breaks it.
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "Code": entry.code,
-        "Secret": entry.secret,
-        "DeviceId": entry.device_id,
-        // DeviceName / AppName / AppVersion are non-null strings in Jellyfin's
-        // QuickConnectResult; the Android/Google TV app's kotlin SDK rejects the
-        // whole response if they're missing (→ greys out the button). Echo them
-        // from the caller's `X-Emby-Authorization` header.
-        "DeviceName": entry.device_name,
-        "AppName": entry.app_name,
-        "AppVersion": entry.app_version,
-        "Authenticated": false,
-        "DateAdded": pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
-    })))
+    // B78/V38 — typed QuickConnectResultDto (kotlin-required DeviceName/AppName/
+    // AppVersion + a real ISO-8601 DateAdded); echoed from the caller's
+    // X-Emby-Authorization header.
+    Ok(HttpResponse::Ok().json(QuickConnectResultDto {
+        code: entry.code,
+        secret: entry.secret,
+        device_id: entry.device_id,
+        device_name: entry.device_name,
+        app_name: entry.app_name,
+        app_version: entry.app_version,
+        authenticated: false,
+        date_added: pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
+    }))
 }
 
 /// Case-INSENSITIVE lookup of a single query-string parameter. Jellyfin's
@@ -200,25 +202,21 @@ async fn quick_connect_connect(
     let Some(entry) = entry else {
         return Err(actix_web::error::ErrorNotFound("unknown or expired secret"));
     };
-    // `Secret` MUST be echoed: jellyfin-web's login loop passes `data.Secret`
-    // (this response's field, not the one it kept) to the finalize call.
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "Code": entry.code,
-        "Secret": entry.secret,
-        "DeviceId": entry.device_id,
-        // B61 — the poll response is a FULL QuickConnectResult, same shape as
-        // Initiate. DeviceName/AppName/AppVersion are non-null strings the
-        // Android/Google-TV kotlin SDK requires: omitting them (as this handler
-        // did) made the TV's 5s poll fail deserialization, so the code vanished
-        // seconds after Initiate showed it — before the user could type it.
-        "DeviceName": entry.device_name,
-        "AppName": entry.app_name,
-        "AppVersion": entry.app_version,
-        "Authenticated": entry.authorized_by.is_some(),
-        // Non-nullable DateTime in the C# QuickConnectResult — the kotlin
-        // SDK (Android TV) rejects the poll response without it.
-        "DateAdded": pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
-    })))
+    // B61/B78/V38 — the poll response is a FULL QuickConnectResult (same typed
+    // shape as Initiate). `Secret` MUST be echoed: jellyfin-web finalizes with
+    // THIS response's `Secret`. DeviceName/AppName/AppVersion + DateAdded are
+    // kotlin-required; omitting them made the TV's 5 s poll fail deserialization
+    // so the code vanished before the user could type it.
+    Ok(HttpResponse::Ok().json(QuickConnectResultDto {
+        code: entry.code,
+        secret: entry.secret,
+        device_id: entry.device_id,
+        device_name: entry.device_name,
+        app_name: entry.app_name,
+        app_version: entry.app_version,
+        authenticated: entry.authorized_by.is_some(),
+        date_added: pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
+    }))
 }
 
 async fn branding_configuration(state: web::Data<AppState>) -> impl Responder {

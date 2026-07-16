@@ -669,6 +669,26 @@ pub struct PlaybackInfoResponseDto {
     pub start_position_ticks: u64,
 }
 
+/// Jellyfin `QuickConnectResult` — returned by `/QuickConnect/Initiate` and the
+/// `/QuickConnect/Connect` poll. The kotlin SDK (Android/Google TV) requires
+/// the non-null `DeviceName`/`AppName`/`AppVersion` strings and a real ISO-8601
+/// `DateAdded` DateTime; a missing field or empty date fails the 5 s poll and
+/// the TV silently greys out / drops the code before the user can type it
+/// (B61). Typed per B78/V38. `Secret` MUST be echoed — jellyfin-web's login
+/// loop finalizes with THIS response's `Secret`, not the one it kept.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct QuickConnectResultDto {
+    pub code: String,
+    pub secret: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub app_name: String,
+    pub app_version: String,
+    pub authenticated: bool,
+    pub date_added: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MediaStreamDto {
