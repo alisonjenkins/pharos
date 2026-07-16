@@ -192,10 +192,19 @@ async fn system_storage() -> impl Responder {
 }
 
 async fn system_endpoint() -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "IsLocal": true,
-        "IsInNetwork": true,
-    }))
+    // `EndpointInfo` — both fields no-default in the SDK; typed per B78/V38.
+    crate::api::jellyfin::wire::json(&EndpointInfoDto {
+        is_local: true,
+        is_in_network: true,
+    })
+}
+
+/// Jellyfin `EndpointInfo` (`GET /System/Endpoint`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct EndpointInfoDto {
+    is_local: bool,
+    is_in_network: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,11 +696,7 @@ async fn media_segments(
         }
     }
     let total = items.len() as u32;
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    }))
+    crate::api::jellyfin::wire::query_result(items, total, 0)
 }
 
 /// Walk the item's chapter list and project intro / outro / recap
