@@ -74,6 +74,18 @@ struct CreateApiKeyQuery {
     app: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ApiKeyDto {
+    app_name: String,
+    // Jellyfin clients display DateCreated only — they
+    // never see the raw token after issuance.
+    date_created: String,
+    // `device_id` doubles as the stable id for DELETE.
+    access_token: &'static str,
+    id: String,
+}
+
 async fn list_api_keys(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -84,7 +96,7 @@ async fn list_api_keys(
         .tokens_for(user.0.id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<serde_json::Value> = tokens
+    let items: Vec<ApiKeyDto> = tokens
         .into_iter()
         .filter(|t| t.device_id.starts_with(API_KEY_PREFIX))
         .map(|t| {
@@ -93,23 +105,25 @@ async fn list_api_keys(
                 .strip_prefix(API_KEY_PREFIX)
                 .unwrap_or(&t.device_id)
                 .to_string();
-            serde_json::json!({
-                "AppName": app_name,
-                // Jellyfin clients display DateCreated only — they
-                // never see the raw token after issuance.
-                "DateCreated": iso8601_from_unix(t.issued_at_unix_secs),
-                // `device_id` doubles as the stable id for DELETE.
-                "AccessToken": "",
-                "Id": t.device_id,
-            })
+            ApiKeyDto {
+                app_name,
+                date_created: iso8601_from_unix(t.issued_at_unix_secs),
+                access_token: "",
+                id: t.device_id,
+            }
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct CreatedApiKeyDto {
+    app_name: String,
+    access_token: String,
+    id: String,
+    date_created: String,
 }
 
 async fn create_api_key(
@@ -128,17 +142,18 @@ async fn create_api_key(
         .issue(user.0.id, &device_id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "AppName": app_name,
-        "AccessToken": token.0.expose(),
-        "Id": device_id,
-        "DateCreated": iso8601_from_unix(
+    let dto = CreatedApiKeyDto {
+        app_name: app_name.to_string(),
+        access_token: token.0.expose().to_string(),
+        id: device_id,
+        date_created: iso8601_from_unix(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
         ),
-    })))
+    };
+    Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
 async fn revoke_api_key(
@@ -182,23 +197,45 @@ async fn empty_array(_user: AuthUser) -> impl Responder {
 /// rather than the Jellyfin trigger model, so each is advertised `Idle` with an
 /// interval trigger and no manual execution wired yet — enough for the panel to
 /// list them; per-task Start/Stop is a later increment.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ScheduledTaskDto {
+    name: &'static str,
+    state: &'static str,
+    id: &'static str,
+    key: &'static str,
+    description: &'static str,
+    category: &'static str,
+    is_hidden: bool,
+    is_enabled: bool,
+    current_progress_percentage: Option<f64>,
+    last_execution_result: Option<()>,
+    triggers: &'static [()],
+}
+
 async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
-    fn task(id: &str, key: &str, name: &str, desc: &str, category: &str) -> serde_json::Value {
-        serde_json::json!({
-            "Name": name,
-            "State": "Idle",
-            "Id": id,
-            "Key": key,
-            "Description": desc,
-            "Category": category,
-            "IsHidden": false,
-            "IsEnabled": true,
-            "CurrentProgressPercentage": serde_json::Value::Null,
-            "LastExecutionResult": serde_json::Value::Null,
-            "Triggers": [],
-        })
+    fn task(
+        id: &'static str,
+        key: &'static str,
+        name: &'static str,
+        desc: &'static str,
+        category: &'static str,
+    ) -> ScheduledTaskDto {
+        ScheduledTaskDto {
+            name,
+            state: "Idle",
+            id,
+            key,
+            description: desc,
+            category,
+            is_hidden: false,
+            is_enabled: true,
+            current_progress_percentage: None,
+            last_execution_result: None,
+            triggers: &[],
+        }
     }
-    crate::api::jellyfin::wire::json(&serde_json::json!([
+    crate::api::jellyfin::wire::json(&[
         task(
             "refresh-library",
             "RefreshLibrary",
@@ -220,7 +257,7 @@ async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
             "Pre-extracts embedded text subtitle tracks to the subtitle cache for fast delivery.",
             "Library",
         ),
-    ]))
+    ])
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -242,11 +279,11 @@ async fn activity_log_entries(
     let start = q.start_index.unwrap_or(0);
     let limit = q.limit.unwrap_or(100).min(1000);
     let (total, items) = state.activity_entries(start, limit);
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": start,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(
+        items,
+        total as u32,
+        start as u32,
+    ))
 }
 
 async fn list_users(
@@ -580,6 +617,14 @@ fn parse_user_id(s: &str) -> Result<UserId, actix_web::Error> {
         .map_err(|_| error::ErrorBadRequest("invalid user id"))
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LogFileDto {
+    name: String,
+    size: u64,
+    date_modified: String,
+}
+
 /// `/System/Logs` — list regular files in `[obs].log_dir`. Returns
 /// `[]` when log_dir is unset. Admin-only.
 async fn system_logs(
@@ -588,19 +633,13 @@ async fn system_logs(
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let Some(dir) = state.log_dir.as_ref() else {
-        return Ok(crate::api::jellyfin::wire::json(
-            &Vec::<serde_json::Value>::new(),
-        ));
+        return Ok(crate::api::jellyfin::wire::json(&Vec::<LogFileDto>::new()));
     };
     let entries = match std::fs::read_dir(dir) {
         Ok(it) => it,
-        Err(_) => {
-            return Ok(crate::api::jellyfin::wire::json(
-                &Vec::<serde_json::Value>::new(),
-            ))
-        }
+        Err(_) => return Ok(crate::api::jellyfin::wire::json(&Vec::<LogFileDto>::new())),
     };
-    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut out: Vec<LogFileDto> = Vec::new();
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -615,18 +654,13 @@ async fn system_logs(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mtime_iso = crate::api::jellyfin::dto::format_iso8601(mtime_secs);
-        out.push(serde_json::json!({
-            "Name": name,
-            "Size": size,
-            "DateModified": mtime_iso,
-        }));
+        out.push(LogFileDto {
+            name,
+            size,
+            date_modified: mtime_iso,
+        });
     }
-    out.sort_by(|a, b| {
-        b["DateModified"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(a["DateModified"].as_str().unwrap_or(""))
-    });
+    out.sort_by(|a, b| b.date_modified.cmp(&a.date_modified));
     Ok(crate::api::jellyfin::wire::json(&out))
 }
 
