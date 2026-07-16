@@ -77,6 +77,9 @@ pub enum SocketBroadcast {
     /// freeform JSON the receiving client interprets per command.
     SessionCommand {
         session_id: String,
+        /// The user issuing the command — becomes the wire `ControllingUserId`
+        /// (a NON-null UUID for GeneralCommand / PlayRequest; B79). 32-hex form.
+        controlling_user_id: String,
         command: String,
         arg: serde_json::Value,
     },
@@ -775,9 +778,16 @@ impl AppState {
 
     /// Fire a `SessionCommand` event for one target session.
     /// Receivers ignore commands not addressed to them.
-    pub fn notify_session_command(&self, session_id: &str, command: &str, arg: serde_json::Value) {
+    pub fn notify_session_command(
+        &self,
+        session_id: &str,
+        controlling_user_id: &str,
+        command: &str,
+        arg: serde_json::Value,
+    ) {
         let _ = self.bus.send(SocketBroadcast::SessionCommand {
             session_id: session_id.to_string(),
+            controlling_user_id: controlling_user_id.to_string(),
             command: command.to_string(),
             arg,
         });

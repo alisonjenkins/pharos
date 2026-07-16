@@ -432,7 +432,7 @@ async fn capabilities(
 /// the receiving WS handler decides how to interpret it.
 async fn session_playstate_command(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<(String, String)>,
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
@@ -440,7 +440,8 @@ async fn session_playstate_command(
     let arg = body
         .map(|b| b.into_inner())
         .unwrap_or(serde_json::json!({}));
-    state.notify_session_command(&session_id, &canonical_command(&command), arg);
+    let controlling = user.0.id.0.simple().to_string();
+    state.notify_session_command(&session_id, &controlling, &canonical_command(&command), arg);
     HttpResponse::NoContent().finish()
 }
 
@@ -449,7 +450,7 @@ async fn session_playstate_command(
 /// shape as PlayState; the target client filters on the command name.
 async fn session_general_command(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<(String, String)>,
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
@@ -457,7 +458,8 @@ async fn session_general_command(
     let arg = body
         .map(|b| b.into_inner())
         .unwrap_or(serde_json::json!({}));
-    state.notify_session_command(&session_id, &canonical_command(&command), arg);
+    let controlling = user.0.id.0.simple().to_string();
+    state.notify_session_command(&session_id, &controlling, &canonical_command(&command), arg);
     HttpResponse::NoContent().finish()
 }
 
@@ -508,7 +510,7 @@ fn title_case(s: &str) -> String {
 /// the receiving client kicks off playback.
 async fn session_play_request(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
@@ -516,6 +518,9 @@ async fn session_play_request(
     let arg = body
         .map(|b| b.into_inner())
         .unwrap_or(serde_json::json!({}));
-    state.notify_session_command(&session_id, "Play", arg);
+    let controlling = user.0.id.0.simple().to_string();
+    // "Play" is a distinct MessageType (PlayRequest), not a PlaystateCommand —
+    // the socket translator routes it accordingly (B79).
+    state.notify_session_command(&session_id, &controlling, "Play", arg);
     HttpResponse::NoContent().finish()
 }

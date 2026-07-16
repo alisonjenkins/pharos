@@ -8,7 +8,7 @@
 use super::auth_extractor::AuthUser;
 use super::socket_messages::{
     CommandData, GeneralCommandMessageData, GroupInfoData, GroupStateUpdate, GroupUpdateData,
-    Inbound, LibraryUpdateInfoData, NowPlayingItemLite, Outbound, PlayQueueUpdate,
+    Inbound, LibraryUpdateInfoData, NowPlayingItemLite, Outbound, PlayQueueUpdate, PlayRequestData,
     PlayStateMessageData, QueuePlaylistItem, SessionPlayStateLite, SessionsBroadcastEntry,
     SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData, UserDataChangeInfo,
 };
@@ -761,44 +761,10 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
         )),
         SocketBroadcast::SessionCommand {
             session_id,
+            controlling_user_id,
             command,
             arg,
-        } => Some(if is_playstate_command(&command) {
-            // PlayState family — playback transport
-            // (Play/Pause/Unpause/Stop/Seek/NextTrack/PreviousTrack/
-            // Rewind/FastForward/PlayPause).
-            // jellyfin-web's playback engine listens for this MessageType.
-            Outbound::new(
-                "PlayState",
-                serde_json::to_value(PlayStateMessageData {
-                    controlling_user_id: "",
-                    session_id,
-                    command,
-                    seek_position_ticks: arg
-                        .get("SeekPositionTicks")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                })
-                .ok()?,
-            )
-        } else {
-            // GeneralCommand family — display, volume, mute, fullscreen.
-            // Jellyfin's wire shape nests `Arguments` for string args
-            // (DisplayMessage, DisplayContent) and surfaces well-known
-            // numeric args (`Volume`) at the top of the Arguments map.
-            // We pass the full `arg` value through so clients that
-            // expect specific keys can still find them.
-            Outbound::new(
-                "GeneralCommand",
-                serde_json::to_value(GeneralCommandMessageData {
-                    controlling_user_id: "",
-                    session_id,
-                    name: command,
-                    arguments: arg,
-                })
-                .ok()?,
-            )
-        }),
+        } => translate_session_command(session_id, controlling_user_id, command, arg),
         // P10 — minimal Sessions payload carrying just the session
         // that changed. jellyfin-web's Currently Watching sidebar +
         // remote-control screens listen for this MessageType and
@@ -852,19 +818,180 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
     }
 }
 
+/// Translate a relayed session command into the correct Jellyfin cast
+/// MessageType. B79 — a strict cast target (jellyfin-sdk-kotlin) decodes each
+/// message's Data into a typed model whose command/name field is a kotlin
+/// ENUM: an out-of-set value fails the whole `kotlinx.serialization` decode and
+/// kills the app. So route by the real Jellyfin taxonomy and DROP anything that
+/// isn't a valid member rather than emit a poisoned enum:
+/// - `Play` → the dedicated `Play` message (`PlayRequest`), never a
+///   PlaystateCommand (which has no `Play` member — the original crash).
+/// - a valid `PlaystateCommand` → `PlayState`.
+/// - a valid `GeneralCommandType` → `GeneralCommand` (with a UUID
+///   `ControllingUserId` and a `Map<String,String>` `Arguments`).
+/// - anything else → `None` (dropped, logged).
+fn translate_session_command(
+    session_id: String,
+    controlling_user_id: String,
+    command: String,
+    arg: serde_json::Value,
+) -> Option<Outbound> {
+    if command == "Play" {
+        let play_command = arg
+            .get("PlayCommand")
+            .and_then(|v| v.as_str())
+            .filter(|c| is_play_command(c))
+            .unwrap_or("PlayNow")
+            .to_string();
+        let item_ids = arg.get("ItemIds").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
+        let start_position_ticks = arg
+            .get("StartPositionTicks")
+            .and_then(serde_json::Value::as_i64);
+        return Some(Outbound::new(
+            "Play",
+            serde_json::to_value(PlayRequestData {
+                item_ids,
+                start_position_ticks,
+                play_command,
+                controlling_user_id,
+                session_id,
+            })
+            .ok()?,
+        ));
+    }
+    if is_playstate_command(&command) {
+        // jellyfin-web's playback engine + a native cast target both listen for
+        // this MessageType; Command is a valid PlaystateCommand member.
+        return Some(Outbound::new(
+            "PlayState",
+            serde_json::to_value(PlayStateMessageData {
+                controlling_user_id,
+                session_id,
+                command,
+                seek_position_ticks: arg
+                    .get("SeekPositionTicks")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })
+            .ok()?,
+        ));
+    }
+    if is_general_command(&command) {
+        // GeneralCommand family — display, volume, mute, fullscreen, …
+        return Some(Outbound::new(
+            "GeneralCommand",
+            serde_json::to_value(GeneralCommandMessageData {
+                controlling_user_id,
+                session_id,
+                name: command,
+                arguments: string_arguments(&arg),
+            })
+            .ok()?,
+        ));
+    }
+    tracing::warn!(
+        command = %command,
+        "dropping session command: not a PlaystateCommand / GeneralCommandType / Play (B79)"
+    );
+    None
+}
+
+/// Coerce an arbitrary arg object into a kotlin `Map<String,String>`
+/// (`GeneralCommand.Arguments`): each scalar value becomes its string form;
+/// null / nested object / array values are dropped (Jellyfin arguments are
+/// always string-valued, and a non-string value fails the strict decode).
+fn string_arguments(arg: &serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(obj) = arg.as_object() {
+        for (k, v) in obj {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            map.insert(k.clone(), serde_json::Value::String(s));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Exact `PlaystateCommand` enum members (jellyfin-sdk-kotlin). NB: `Play` is
+/// NOT here — it is a separate `Play` message (B79).
 fn is_playstate_command(cmd: &str) -> bool {
     matches!(
         cmd,
-        "Play"
+        "Stop"
             | "Pause"
             | "Unpause"
-            | "PlayPause"
-            | "Stop"
             | "Seek"
             | "NextTrack"
             | "PreviousTrack"
             | "Rewind"
             | "FastForward"
+            | "PlayPause"
+    )
+}
+
+/// Exact `PlayCommand` enum members (the `PlayRequest.PlayCommand` field).
+fn is_play_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "PlayNow" | "PlayNext" | "PlayLast" | "PlayInstantMix" | "PlayShuffle"
+    )
+}
+
+/// Exact `GeneralCommandType` enum members (jellyfin-sdk-kotlin).
+fn is_general_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "MoveUp"
+            | "MoveDown"
+            | "MoveLeft"
+            | "MoveRight"
+            | "PageUp"
+            | "PageDown"
+            | "PreviousLetter"
+            | "NextLetter"
+            | "ToggleOsd"
+            | "ToggleContextMenu"
+            | "Select"
+            | "Back"
+            | "TakeScreenshot"
+            | "SendKey"
+            | "SendString"
+            | "GoHome"
+            | "GoToSettings"
+            | "VolumeUp"
+            | "VolumeDown"
+            | "Mute"
+            | "Unmute"
+            | "ToggleMute"
+            | "SetVolume"
+            | "SetAudioStreamIndex"
+            | "SetSubtitleStreamIndex"
+            | "ToggleFullscreen"
+            | "DisplayContent"
+            | "GoToSearch"
+            | "DisplayMessage"
+            | "SetRepeatMode"
+            | "ChannelUp"
+            | "ChannelDown"
+            | "Guide"
+            | "ToggleStats"
+            | "PlayMediaSource"
+            | "PlayTrailers"
+            | "SetShuffleQueue"
+            | "PlayState"
+            | "PlayNext"
+            | "ToggleOsdMenu"
+            | "Play"
+            | "SetMaxStreamingBitrate"
+            | "SetPlaybackOrder"
     )
 }
 
@@ -1049,6 +1176,7 @@ mod tests {
     fn translate_session_command_emits_playstate_outbound() {
         let out = translate_broadcast(SocketBroadcast::SessionCommand {
             session_id: "s-1".into(),
+            controlling_user_id: "abc123".into(),
             command: "Pause".into(),
             arg: serde_json::json!({}),
         })
@@ -1058,14 +1186,15 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["SessionId"], "s-1");
         assert_eq!(v["Data"]["Command"], "Pause");
-        // Empty ControllingUserId for server-originated commands.
-        assert_eq!(v["Data"]["ControllingUserId"], "");
+        // The issuing user rides through as ControllingUserId.
+        assert_eq!(v["Data"]["ControllingUserId"], "abc123");
     }
 
     #[test]
     fn translate_session_command_passes_seek_position_ticks_through() {
         let out = translate_broadcast(SocketBroadcast::SessionCommand {
             session_id: "s-1".into(),
+            controlling_user_id: "abc123".into(),
             command: "Seek".into(),
             arg: serde_json::json!({ "SeekPositionTicks": 9876543 }),
         })
@@ -1079,6 +1208,7 @@ mod tests {
     fn translate_session_command_routes_general_commands_as_general_command() {
         let out = translate_broadcast(SocketBroadcast::SessionCommand {
             session_id: "s-1".into(),
+            controlling_user_id: "abc123".into(),
             command: "SetVolume".into(),
             arg: serde_json::json!({ "Volume": 60 }),
         })
@@ -1087,17 +1217,75 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["Name"], "SetVolume");
-        assert_eq!(v["Data"]["Arguments"]["Volume"], 60);
+        assert_eq!(v["Data"]["ControllingUserId"], "abc123");
+        // B79 — Arguments is a Map<String,String>: the numeric Volume is
+        // coerced to a string so the kotlin decode doesn't fail.
+        assert_eq!(v["Data"]["Arguments"]["Volume"], "60");
     }
 
     #[test]
     fn translate_session_command_togglemute_is_general_not_playstate() {
         let out = translate_broadcast(SocketBroadcast::SessionCommand {
             session_id: "s-2".into(),
+            controlling_user_id: "abc123".into(),
             command: "ToggleMute".into(),
             arg: serde_json::json!({}),
         })
         .unwrap();
         assert_eq!(out.message_type, "GeneralCommand");
+    }
+
+    #[test]
+    fn translate_session_command_play_is_its_own_message_not_playstate() {
+        // B79 — "Play" is NOT a PlaystateCommand member; it must go out as the
+        // dedicated Play (PlayRequest) message with a valid PlayCommand + a
+        // ControllingUserId, or a native cast target crashes decoding the enum.
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-9".into(),
+            controlling_user_id: "user-uuid".into(),
+            command: "Play".into(),
+            arg: serde_json::json!({
+                "ItemIds": ["aa", "bb"],
+                "StartPositionTicks": 500,
+                "PlayCommand": "PlayNow",
+            }),
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "Play");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["PlayCommand"], "PlayNow");
+        assert_eq!(v["Data"]["ControllingUserId"], "user-uuid");
+        assert_eq!(v["Data"]["ItemIds"][0], "aa");
+        assert_eq!(v["Data"]["StartPositionTicks"], 500);
+    }
+
+    #[test]
+    fn translate_session_command_play_defaults_invalid_playcommand_to_playnow() {
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-9".into(),
+            controlling_user_id: "u".into(),
+            command: "Play".into(),
+            arg: serde_json::json!({ "PlayCommand": "Bogus" }),
+        })
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        // A non-member PlayCommand is replaced, never forwarded (B79).
+        assert_eq!(v["Data"]["PlayCommand"], "PlayNow");
+    }
+
+    #[test]
+    fn translate_session_command_unknown_command_is_dropped_not_poisoned() {
+        // B79 — an arbitrary command is neither a PlaystateCommand nor a
+        // GeneralCommandType member, so it must be DROPPED, not emitted as an
+        // invalid enum that fails the whole kotlinx decode.
+        let out = translate_broadcast(SocketBroadcast::SessionCommand {
+            session_id: "s-1".into(),
+            controlling_user_id: "u".into(),
+            command: "TotallyMadeUp".into(),
+            arg: serde_json::json!({}),
+        });
+        assert!(out.is_none());
     }
 }

@@ -185,14 +185,15 @@ pub struct SessionsBroadcastEntry {
     pub play_state: SessionPlayStateLite,
 }
 
-/// Jellyfin `PlaystateMessage.Data` — a remote transport command pushed to a
-/// controlled session. `Command` is a `PlaystateCommand` enum on the kotlin
-/// side; the emitter must only place a valid member here (B79). Typed (not a
-/// json! literal) per B78/V38.
+/// Jellyfin `PlaystateMessage.Data` (`PlaystateRequest`) — a remote transport
+/// command pushed to a controlled session. `Command` is a `PlaystateCommand`
+/// enum on the kotlin side; the emitter must only place a valid member here
+/// (B79 — `Play` is NOT a member; it goes out as a `Play` message instead).
+/// `ControllingUserId` is a nullable String in the SDK. Typed per B78/V38.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlayStateMessageData {
-    pub controlling_user_id: &'static str,
+    pub controlling_user_id: String,
     pub session_id: String,
     pub command: String,
     /// `arg["SeekPositionTicks"]` — a number, or `Null` when absent (kotlin
@@ -200,16 +201,37 @@ pub struct PlayStateMessageData {
     pub seek_position_ticks: serde_json::Value,
 }
 
-/// Jellyfin `GeneralCommandMessage.Data` — a display/volume/etc command pushed
-/// to a controlled session. `Name` is a `GeneralCommandType` enum on the kotlin
-/// side (B79). Typed per B78/V38.
+/// Jellyfin `GeneralCommandMessage.Data` (`GeneralCommand`) — a display/volume/
+/// etc command pushed to a controlled session. `Name` is a `GeneralCommandType`
+/// enum (the emitter must only place a valid member — B79). `ControllingUserId`
+/// is a NON-null `UUID` and `Arguments` is a `Map<String,String>` in the SDK, so
+/// a native cast-target fails decode on an empty id or non-string arg values
+/// (B79). Typed per B78/V38.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct GeneralCommandMessageData {
-    pub controlling_user_id: &'static str,
+    pub controlling_user_id: String,
     pub session_id: String,
     pub name: String,
+    /// A JSON object whose values are ALL strings (kotlin `Map<String,String>`).
     pub arguments: serde_json::Value,
+}
+
+/// Jellyfin `PlayMessage.Data` (`PlayRequest`) — "play these items here", the
+/// dedicated cast MessageType (NOT a `PlaystateCommand`; that was the B79 crash
+/// — `Play` was wrongly emitted as a PlayState command). `PlayCommand` (enum
+/// PlayNow/PlayNext/PlayLast/…) and `ControllingUserId` (UUID) are no-default in
+/// the SDK; `ItemIds`/`StartPositionTicks` are nullable and omitted when absent.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlayRequestData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_position_ticks: Option<i64>,
+    pub play_command: String,
+    pub controlling_user_id: String,
+    pub session_id: String,
 }
 
 /// Jellyfin `UserDataChangedMessage.Data` (`UserDataChangeInfo`) — the wrapper
