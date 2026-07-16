@@ -151,11 +151,7 @@ async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder
         })
         .collect();
     let total = items.len() as u32;
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    }))
+    crate::api::jellyfin::wire::query_result(items, total, 0)
 }
 
 async fn channel(
@@ -270,11 +266,7 @@ async fn programs(
         })
         .collect();
     let total = items.len() as u32;
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    }))
+    crate::api::jellyfin::wire::query_result(items, total, 0)
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
@@ -282,11 +274,12 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
 }
 
 fn empty_items_result_value() -> serde_json::Value {
-    serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0,
+    serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
+        items: Vec::<serde_json::Value>::new(),
+        total_record_count: 0,
+        start_index: 0,
     })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 fn unix_ms_now() -> u64 {

@@ -1342,10 +1342,20 @@ pub fn format_iso8601_ms(unix_ms: i64) -> String {
     )
 }
 
+/// Jellyfin `BaseItemDtoQueryResult` — the paged-list envelope every browse /
+/// search / list endpoint returns. All three fields are no-default (required)
+/// in the kotlin SDK (`Items: List<BaseItemDto>`, `TotalRecordCount: Int`,
+/// `StartIndex: Int`); a native client fails the whole page on any omission,
+/// so the wire form must always carry all three (B78/V38).
+///
+/// Generic over the element type (default `BaseItemDto`) so synth pages whose
+/// rows are `SynthItemDto` — or already-serialized `serde_json::Value` — reuse
+/// the same envelope instead of a hand-built `json!` literal. `T` is inferred
+/// from `items` at every call site; the default only names the common case.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ItemsResultDto {
-    pub items: Vec<BaseItemDto>,
+pub struct ItemsResultDto<T = BaseItemDto> {
+    pub items: Vec<T>,
     pub total_record_count: u32,
     pub start_index: u32,
 }

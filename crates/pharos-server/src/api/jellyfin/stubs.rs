@@ -104,11 +104,7 @@ async fn empty_array(_user: AuthUser) -> impl Responder {
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0,
-    }))
+    crate::api::jellyfin::wire::query_result(Vec::<serde_json::Value>::new(), 0, 0)
 }
 
 async fn no_content() -> impl Responder {

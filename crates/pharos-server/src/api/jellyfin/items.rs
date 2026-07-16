@@ -170,11 +170,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 }
 
 async fn empty_items_result(_user: AuthUser) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0,
-    }))
+    crate::api::jellyfin::wire::query_result(Vec::<serde_json::Value>::new(), 0, 0)
 }
 
 /// `GET /Items/Counts` — Jellyfin clients render a "library stats"
@@ -451,9 +447,11 @@ async fn items_similar(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let Some(target) = all.iter().find(|i| i.id == id) else {
-        return Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-            "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
-        })));
+        return Ok(crate::api::jellyfin::wire::query_result(
+            Vec::<serde_json::Value>::new(),
+            0,
+            0,
+        ));
     };
     // Score every other item by overlap with the target.
     let mut scored: Vec<(u32, &MediaItem)> = all
@@ -488,11 +486,7 @@ async fn items_similar(
         .collect();
     fill_parent_ids(&state, &mut dtos, &picks);
     let total = dtos.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": dtos,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(dtos, total, 0))
 }
 
 /// "More Like This" for the synth MusicAlbum / MusicArtist detail pages.
@@ -506,11 +500,7 @@ async fn music_similar(
     q: &SimilarQuery,
 ) -> Result<HttpResponse, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
-    let empty = || {
-        crate::api::jellyfin::wire::json(&serde_json::json!({
-            "Items": [], "TotalRecordCount": 0, "StartIndex": 0,
-        }))
-    };
+    let empty = || crate::api::jellyfin::wire::query_result(Vec::<serde_json::Value>::new(), 0, 0);
     let all = state
         .list_items_cached()
         .await
@@ -598,9 +588,7 @@ async fn music_similar(
             .map(|(_, a)| synth_album_dto(state, a))
             .collect();
         let total = items.len() as u32;
-        return Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-            "Items": items, "TotalRecordCount": total, "StartIndex": 0,
-        })));
+        return Ok(crate::api::jellyfin::wire::query_result(items, total, 0));
     }
 
     // Artist target?
@@ -673,9 +661,7 @@ async fn music_similar(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items, "TotalRecordCount": total, "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// Score `candidate` for similarity to `target`. Higher = more
@@ -771,11 +757,7 @@ async fn list_genres(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// `GET /Artists` — aggregate artist + album_artist tags. Each
@@ -831,11 +813,7 @@ async fn list_artists(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// `GET /Albums` — aggregate distinct album names. Each entry
@@ -912,11 +890,7 @@ async fn list_albums(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// `GET /Studios` — LIB-C3: studios (production companies / TV networks)
@@ -952,11 +926,7 @@ async fn list_studios(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// `GET /Tags` — LIB-C6: tags (free-form labels) as entity rows. Lists
@@ -993,11 +963,7 @@ async fn list_tags(
         })
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// `POST /Items/{id}/Tags` — LIB-C6 manual mutation: add the `Tags` to the
@@ -1077,11 +1043,7 @@ async fn list_persons(
         .map(|pc| person_dto(&state, pc.person.clone(), pc.item_count))
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// `GET /Persons/{id}` — LIB-C2: a single Person item resolved by its
@@ -1159,11 +1121,7 @@ async fn list_collections(
         .map(|cc| collection_dto(&state, &cc.collection, cc.item_count))
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// Manual-CRUD create/add/remove query: `Name` (create only) + `Ids`
@@ -1451,11 +1409,7 @@ async fn shows_next_up(
         .collect();
     let total = dtos.len() as u32;
     let _ = q.user_id; // kept for future per-user scoping
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": dtos,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(dtos, total, 0))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1590,11 +1544,11 @@ async fn shows_episodes(
         })
         .collect();
     let _ = q.user_id.as_deref();
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": dtos,
-        "TotalRecordCount": total,
-        "StartIndex": start as u32,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(
+        dtos,
+        total,
+        start as u32,
+    ))
 }
 
 /// `GET /Shows/{id}/Seasons` — the distinct seasons of a series as synthetic
@@ -1633,11 +1587,7 @@ async fn shows_seasons(
         .map(|(n, series)| season_dto(&state.server_id, series, *n, &season_display_name(*n)))
         .collect();
     let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2377,11 +2327,12 @@ async fn user_views_query(
 fn synth_views_body(state: &AppState) -> serde_json::Value {
     let views = library_views(state);
     let count = views.len() as u32;
-    serde_json::json!({
-        "Items": views,
-        "TotalRecordCount": count,
-        "StartIndex": 0,
+    serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
+        items: views,
+        total_record_count: count,
+        start_index: 0,
     })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// A `CollectionType` the kotlin SDK's enum accepts, else `null`. Jellyfin's
@@ -2484,11 +2435,7 @@ async fn media_folders(
 ) -> Result<impl Responder, actix_web::Error> {
     let views = library_views(&state);
     let count = views.len() as u32;
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": views,
-        "TotalRecordCount": count,
-        "StartIndex": 0,
-    })))
+    Ok(crate::api::jellyfin::wire::query_result(views, count, 0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2734,11 +2681,14 @@ async fn list_boxsets_page(
     let total = all.len() as u32;
     let start = q.start_index as usize;
     let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.limit as usize).collect();
-    Ok(serde_json::json!({
-        "Items": page,
-        "TotalRecordCount": total,
-        "StartIndex": q.start_index,
-    }))
+    Ok(
+        serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
+            items: page,
+            total_record_count: total,
+            start_index: q.start_index,
+        })
+        .unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// T70 — an `?IncludeItemTypes=Playlist` request (with no media kinds
@@ -2790,11 +2740,14 @@ async fn list_playlists_page(
     let total = all.len() as u32;
     let start = q.start_index as usize;
     let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.limit as usize).collect();
-    Ok(serde_json::json!({
-        "Items": page,
-        "TotalRecordCount": total,
-        "StartIndex": q.start_index,
-    }))
+    Ok(
+        serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
+            items: page,
+            total_record_count: total,
+            start_index: q.start_index,
+        })
+        .unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// A `/Items` request that asks ONLY for MusicAlbum rows. pharos stores no
@@ -3031,11 +2984,11 @@ async fn maybe_list_music(
             .skip(start)
             .take(q.limit as usize)
             .collect();
-        return Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
-            "Items": page,
-            "TotalRecordCount": total,
-            "StartIndex": q.start_index,
-        }))));
+        return Ok(Some(crate::api::jellyfin::wire::query_result(
+            page,
+            total,
+            q.start_index,
+        )));
     }
 
     // Album-only listing. Artist-role filters (synth-id sets — recovered by
@@ -3100,11 +3053,11 @@ async fn maybe_list_music(
         .take(q.limit as usize)
         .map(|a| synth_album_dto(state, a))
         .collect();
-    Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": page,
-        "TotalRecordCount": total,
-        "StartIndex": q.start_index,
-    }))))
+    Ok(Some(crate::api::jellyfin::wire::query_result(
+        page,
+        total,
+        q.start_index,
+    )))
 }
 
 async fn list_items(
@@ -4602,11 +4555,11 @@ async fn maybe_list_virtual_shows(
     // narrows to that show before collapsing.
     let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
     if matches!(parent, ParentResolution::Empty) {
-        return Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
-            "Items": [],
-            "TotalRecordCount": 0,
-            "StartIndex": q.start_index,
-        }))));
+        return Ok(Some(crate::api::jellyfin::wire::query_result(
+            Vec::<serde_json::Value>::new(),
+            0,
+            q.start_index,
+        )));
     }
     let mut mq = build_media_query(user_id, q, &parent, true);
     apply_policy_scope(&mut mq, policy, &state.parental_ratings);
@@ -4699,11 +4652,11 @@ async fn maybe_list_virtual_shows(
     } else {
         items.drain(start..end).collect()
     };
-    Ok(Some(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Items": page,
-        "TotalRecordCount": total,
-        "StartIndex": q.start_index,
-    }))))
+    Ok(Some(crate::api::jellyfin::wire::query_result(
+        page,
+        total,
+        q.start_index,
+    )))
 }
 
 async fn synth_series_or_season(

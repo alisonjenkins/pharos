@@ -409,11 +409,14 @@ async fn build_suggestions(
         })
         .collect();
     let total = dtos.len() as u32;
-    Ok(serde_json::json!({
-        "Items": dtos,
-        "TotalRecordCount": total,
-        "StartIndex": 0,
-    }))
+    Ok(
+        serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
+            items: dtos,
+            total_record_count: total,
+            start_index: 0,
+        })
+        .unwrap_or(serde_json::Value::Null),
+    )
 }
 
 fn pseudo_seed() -> u64 {

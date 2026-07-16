@@ -39,6 +39,24 @@ pub fn json<T: Serialize>(v: &T) -> HttpResponse {
     }
 }
 
+/// Serialize a paged-list response as a Jellyfin `BaseItemDtoQueryResult`
+/// envelope (`Items` / `TotalRecordCount` / `StartIndex`). Wraps the typed
+/// [`ItemsResultDto`] so no browse/list/search handler hand-builds the
+/// envelope as a `json!` literal that could drop one of the three
+/// kotlin-required fields (B78/V38). `T` is inferred from `items` —
+/// `BaseItemDto`, `SynthItemDto`, or already-serialized `serde_json::Value`.
+pub fn query_result<T: Serialize>(
+    items: Vec<T>,
+    total_record_count: u32,
+    start_index: u32,
+) -> HttpResponse {
+    json(&pharos_jellyfin_api::dto::ItemsResultDto {
+        items,
+        total_record_count,
+        start_index,
+    })
+}
+
 /// Cap on a JSON request body (defensive; Jellyfin bodies are small — the
 /// largest is a DeviceProfile at a few KB).
 const MAX_BODY: usize = 2 * 1024 * 1024;
