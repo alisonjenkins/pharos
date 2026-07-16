@@ -165,6 +165,43 @@ pub struct SessionsBroadcastEntry {
     pub play_state: SessionPlayStateLite,
 }
 
+/// Jellyfin `PlaystateMessage.Data` — a remote transport command pushed to a
+/// controlled session. `Command` is a `PlaystateCommand` enum on the kotlin
+/// side; the emitter must only place a valid member here (B79). Typed (not a
+/// json! literal) per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlayStateMessageData {
+    pub controlling_user_id: &'static str,
+    pub session_id: String,
+    pub command: String,
+    /// `arg["SeekPositionTicks"]` — a number, or `Null` when absent (kotlin
+    /// `PlayStateMessage.SeekPositionTicks` is nullable Long).
+    pub seek_position_ticks: serde_json::Value,
+}
+
+/// Jellyfin `GeneralCommandMessage.Data` — a display/volume/etc command pushed
+/// to a controlled session. `Name` is a `GeneralCommandType` enum on the kotlin
+/// side (B79). Typed per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct GeneralCommandMessageData {
+    pub controlling_user_id: &'static str,
+    pub session_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Jellyfin `UserDataChangedMessage.Data` (`UserDataChangeInfo`) — the wrapper
+/// around a list of already-typed [`crate::dto::UserItemDataDto`] entries
+/// (serialized to Value upstream). Typed wrapper per B78/V38.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserDataChangeInfo {
+    pub user_id: String,
+    pub user_data_list: Vec<serde_json::Value>,
+}
+
 /// Jellyfin `SendCommand` payload (a `SyncPlayCommand` message). The client
 /// drops any command whose `PlaylistItemId` doesn't match its current queue
 /// item and dedups on `Command`+`PlaylistItemId`, so those fields must stay

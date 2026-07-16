@@ -7,9 +7,10 @@
 
 use super::auth_extractor::AuthUser;
 use super::socket_messages::{
-    CommandData, GroupInfoData, GroupStateUpdate, GroupUpdateData, Inbound, NowPlayingItemLite,
-    Outbound, PlayQueueUpdate, QueuePlaylistItem, SessionPlayStateLite, SessionsBroadcastEntry,
-    SyncPlayJoinData, SyncPlayPlayData, SyncPlaySeekData,
+    CommandData, GeneralCommandMessageData, GroupInfoData, GroupStateUpdate, GroupUpdateData,
+    Inbound, NowPlayingItemLite, Outbound, PlayQueueUpdate, PlayStateMessageData,
+    QueuePlaylistItem, SessionPlayStateLite, SessionsBroadcastEntry, SyncPlayJoinData,
+    SyncPlayPlayData, SyncPlaySeekData, UserDataChangeInfo,
 };
 use crate::state::{AppState, SocketBroadcast};
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -748,10 +749,12 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             // `IsFavorite`, `PlayedPercentage` … in place. A bare
             // `{ItemId}` stub matched nothing and carried no state, so
             // the UI never updated without a manual refresh.
-            serde_json::json!({
-                "UserId": user_id,
-                "UserDataList": entries,
-            }),
+            // B78/V38 — typed wrapper (entries already typed UserItemDataDto).
+            serde_json::to_value(UserDataChangeInfo {
+                user_id,
+                user_data_list: entries,
+            })
+            .ok()?,
         )),
         SocketBroadcast::SessionCommand {
             session_id,
@@ -764,12 +767,16 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             // jellyfin-web's playback engine listens for this MessageType.
             Outbound::new(
                 "PlayState",
-                serde_json::json!({
-                    "ControllingUserId": "",
-                    "SessionId": session_id,
-                    "Command": command,
-                    "SeekPositionTicks": arg.get("SeekPositionTicks").cloned(),
-                }),
+                serde_json::to_value(PlayStateMessageData {
+                    controlling_user_id: "",
+                    session_id,
+                    command,
+                    seek_position_ticks: arg
+                        .get("SeekPositionTicks")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                })
+                .ok()?,
             )
         } else {
             // GeneralCommand family — display, volume, mute, fullscreen.
@@ -780,12 +787,13 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             // expect specific keys can still find them.
             Outbound::new(
                 "GeneralCommand",
-                serde_json::json!({
-                    "ControllingUserId": "",
-                    "SessionId": session_id,
-                    "Name": command,
-                    "Arguments": arg,
-                }),
+                serde_json::to_value(GeneralCommandMessageData {
+                    controlling_user_id: "",
+                    session_id,
+                    name: command,
+                    arguments: arg,
+                })
+                .ok()?,
             )
         }),
         // P10 — minimal Sessions payload carrying just the session
