@@ -4993,7 +4993,7 @@ async fn virtual_folders(
             )
         })
         .collect();
-    let mut folders: Vec<serde_json::Value> = Vec::new();
+    let mut folders: Vec<VirtualFolderInfoDto> = Vec::new();
     if !libraries.is_empty() {
         for (name, root, ctype, wire) in libraries.iter() {
             folders.push(virtual_folder_json(&state, name, root, ctype, wire).await);
@@ -5025,6 +5025,20 @@ async fn virtual_folders(
     Ok(crate::api::jellyfin::wire::json(&folders))
 }
 
+/// `VirtualFolderInfo` — mirrors the current emitted subset. `library_options`
+/// stays a `serde_json::Value`: it's an operator-persisted blob merged with
+/// arbitrary stored keys at runtime (see [`virtual_folder_json`]), not a
+/// fixed wire shape.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct VirtualFolderInfoDto {
+    name: String,
+    locations: Vec<String>,
+    collection_type: &'static str,
+    item_id: String,
+    library_options: serde_json::Value,
+}
+
 /// T69 — build one `VirtualFolderInfo` as JSON, overlaying the library's
 /// persisted `LibraryOptions` (named_config key `libopts:{wire}`) on the
 /// shaped defaults and appending any operator-added extra `Locations`
@@ -5035,7 +5049,7 @@ async fn virtual_folder_json(
     root_path: &str,
     collection_type: &'static str,
     wire_id: &str,
-) -> serde_json::Value {
+) -> VirtualFolderInfoDto {
     let mut library_options = default_library_options();
     if let Ok(Some(raw)) = state
         .stores
@@ -5056,13 +5070,13 @@ async fn virtual_folder_json(
         locations.push(root_path.to_string());
     }
     locations.extend(library_extra_paths(state, wire_id).await);
-    serde_json::json!({
-        "Name": name,
-        "Locations": locations,
-        "CollectionType": collection_type,
-        "ItemId": wire_id,
-        "LibraryOptions": library_options,
-    })
+    VirtualFolderInfoDto {
+        name: name.to_string(),
+        locations,
+        collection_type,
+        item_id: wire_id.to_string(),
+        library_options,
+    }
 }
 
 /// The extra media paths an operator added to a library beyond its root
@@ -5080,26 +5094,50 @@ async fn library_extra_paths(state: &AppState, wire_id: &str) -> Vec<String> {
 }
 
 /// A shaped default `LibraryOptions` object — the fields jellyfin-web's
-/// library-settings form reads. Persisted overrides overlay this.
+/// library-settings form reads. Persisted overrides overlay this, so it is
+/// serialized to a Value; typed per B78/V38 (faithful-partial).
 fn default_library_options() -> serde_json::Value {
-    serde_json::json!({
-        "Enabled": true,
-        "EnablePhotos": true,
-        "EnableRealtimeMonitor": false,
-        "EnableChapterImageExtraction": false,
-        "ExtractChapterImagesDuringLibraryScan": false,
-        "EnableInternetProviders": false,
-        "SaveLocalMetadata": false,
-        "PreferredMetadataLanguage": "en",
-        "MetadataCountryCode": "US",
-        "SeasonZeroDisplayName": "Specials",
-        "AutomaticallyAddToCollection": false,
-        "MetadataSavers": [],
-        "DisabledLocalMetadataReaders": [],
-        "LocalMetadataReaderOrder": ["Nfo"],
-        "TypeOptions": [],
-        "PathInfos": [],
+    serde_json::to_value(LibraryOptionsDefaultDto {
+        enabled: true,
+        enable_photos: true,
+        enable_realtime_monitor: false,
+        enable_chapter_image_extraction: false,
+        extract_chapter_images_during_library_scan: false,
+        enable_internet_providers: false,
+        save_local_metadata: false,
+        preferred_metadata_language: "en",
+        metadata_country_code: "US",
+        season_zero_display_name: "Specials",
+        automatically_add_to_collection: false,
+        metadata_savers: Vec::new(),
+        disabled_local_metadata_readers: Vec::new(),
+        local_metadata_reader_order: vec!["Nfo"],
+        type_options: Vec::new(),
+        path_infos: Vec::new(),
     })
+    .unwrap_or_default()
+}
+
+/// Faithful-partial `LibraryOptions` default (V38).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LibraryOptionsDefaultDto {
+    enabled: bool,
+    enable_photos: bool,
+    enable_realtime_monitor: bool,
+    enable_chapter_image_extraction: bool,
+    extract_chapter_images_during_library_scan: bool,
+    enable_internet_providers: bool,
+    save_local_metadata: bool,
+    preferred_metadata_language: &'static str,
+    metadata_country_code: &'static str,
+    season_zero_display_name: &'static str,
+    automatically_add_to_collection: bool,
+    metadata_savers: Vec<serde_json::Value>,
+    disabled_local_metadata_readers: Vec<serde_json::Value>,
+    local_metadata_reader_order: Vec<&'static str>,
+    type_options: Vec<serde_json::Value>,
+    path_infos: Vec<serde_json::Value>,
 }
 
 /// `POST /Library/VirtualFolders` — the dashboard "Add Media Library" wizard.
@@ -5450,40 +5488,82 @@ async fn remove_media_path(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// One `MetadataSavers`/`MetadataReaders` entry.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct MetadataPluginInfoDto {
+    name: &'static str,
+    default_enabled: bool,
+}
+
+/// One `LibraryTypeOptions` entry — mirrors the current emitted subset.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LibraryTypeOptionsDto {
+    #[serde(rename = "Type")]
+    type_: &'static str,
+    metadata_fetchers: &'static [()],
+    metadata_fetcher_order: &'static [()],
+    image_fetchers: &'static [()],
+    image_fetcher_order: &'static [()],
+    supported_image_types: &'static [&'static str],
+    default_image_options: &'static [()],
+}
+
+const LIBRARY_SUPPORTED_IMAGE_TYPES: &[&str] = &["Primary", "Backdrop", "Logo", "Thumb", "Banner"];
+
+fn library_type_option(t: &'static str) -> LibraryTypeOptionsDto {
+    LibraryTypeOptionsDto {
+        type_: t,
+        metadata_fetchers: &[],
+        metadata_fetcher_order: &[],
+        image_fetchers: &[],
+        image_fetcher_order: &[],
+        supported_image_types: LIBRARY_SUPPORTED_IMAGE_TYPES,
+        default_image_options: &[],
+    }
+}
+
+/// `LibraryOptionsResultDto` — mirrors the current emitted subset.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LibraryOptionsResultDto {
+    metadata_savers: &'static [MetadataPluginInfoDto],
+    metadata_readers: &'static [MetadataPluginInfoDto],
+    subtitle_fetchers: &'static [()],
+    type_options: Vec<LibraryTypeOptionsDto>,
+}
+
+const LIBRARY_METADATA_SAVERS: &[MetadataPluginInfoDto] = &[MetadataPluginInfoDto {
+    name: "Nfo",
+    default_enabled: false,
+}];
+
+const LIBRARY_METADATA_READERS: &[MetadataPluginInfoDto] = &[MetadataPluginInfoDto {
+    name: "Nfo",
+    default_enabled: true,
+}];
+
 /// `GET /Libraries/AvailableOptions` (T69) — the fetcher / saver / per-type
 /// catalogue jellyfin-web's library-settings form populates its dropdowns
 /// from. pharos ships no ONLINE metadata/image providers (it reads local NFO +
 /// sidecar art), so the fetcher lists are empty; the shape is complete so the
 /// form renders. `Nfo` is advertised as the local metadata reader/saver.
 async fn libraries_available_options(_user: AuthUser) -> impl Responder {
-    let type_option = |t: &str| {
-        serde_json::json!({
-            "Type": t,
-            "MetadataFetchers": [],
-            "MetadataFetcherOrder": [],
-            "ImageFetchers": [],
-            "ImageFetcherOrder": [],
-            "SupportedImageTypes": ["Primary", "Backdrop", "Logo", "Thumb", "Banner"],
-            "DefaultImageOptions": [],
-        })
+    let result = LibraryOptionsResultDto {
+        metadata_savers: LIBRARY_METADATA_SAVERS,
+        metadata_readers: LIBRARY_METADATA_READERS,
+        subtitle_fetchers: &[],
+        type_options: vec![
+            library_type_option("Movie"),
+            library_type_option("Series"),
+            library_type_option("Season"),
+            library_type_option("Episode"),
+            library_type_option("MusicAlbum"),
+            library_type_option("MusicArtist"),
+        ],
     };
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "MetadataSavers": [
-            { "Name": "Nfo", "DefaultEnabled": false }
-        ],
-        "MetadataReaders": [
-            { "Name": "Nfo", "DefaultEnabled": true }
-        ],
-        "SubtitleFetchers": [],
-        "TypeOptions": [
-            type_option("Movie"),
-            type_option("Series"),
-            type_option("Season"),
-            type_option("Episode"),
-            type_option("MusicAlbum"),
-            type_option("MusicArtist"),
-        ],
-    }))
+    crate::api::jellyfin::wire::json(&result)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -5494,6 +5574,24 @@ struct DirectoryContentsQuery {
     include_directories: bool,
     #[serde(default)]
     include_files: bool,
+}
+
+/// `FileSystemEntryInfo.Type` — mirrors the current emitted subset (only the
+/// two variants the directory picker ever produces).
+#[derive(Debug, serde::Serialize)]
+enum FileSystemEntryTypeDto {
+    Directory,
+    File,
+}
+
+/// `FileSystemEntryInfo` — mirrors the current emitted subset.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FileSystemEntryInfoDto {
+    name: String,
+    path: String,
+    #[serde(rename = "Type")]
+    type_: FileSystemEntryTypeDto,
 }
 
 /// `GET /Environment/DirectoryContents?path=&includeDirectories=` (T69) — the
@@ -5509,7 +5607,7 @@ async fn environment_directory_contents(
     // Default to directories when neither flag is set (the picker's usual mode).
     let want_dirs = q.include_directories || !q.include_files;
     let want_files = q.include_files;
-    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut out: Vec<FileSystemEntryInfoDto> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(path) {
         for entry in rd.flatten() {
             let Ok(ft) = entry.file_type() else { continue };
@@ -5521,19 +5619,18 @@ async fn environment_directory_contents(
             if name.starts_with('.') {
                 continue; // hide dotfiles from the picker
             }
-            out.push(serde_json::json!({
-                "Name": name,
-                "Path": entry.path().to_string_lossy(),
-                "Type": if is_dir { "Directory" } else { "File" },
-            }));
+            out.push(FileSystemEntryInfoDto {
+                name,
+                path: entry.path().to_string_lossy().into_owned(),
+                type_: if is_dir {
+                    FileSystemEntryTypeDto::Directory
+                } else {
+                    FileSystemEntryTypeDto::File
+                },
+            });
         }
     }
-    out.sort_by(|a, b| {
-        a["Name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["Name"].as_str().unwrap_or(""))
-    });
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(crate::api::jellyfin::wire::json(&out))
 }
 
