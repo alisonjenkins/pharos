@@ -22,6 +22,7 @@ use crate::{api::jellyfin::auth_extractor::AuthUser, bg_io::BgPermit, state::App
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
 use pharos_core::MediaStore;
+use serde::Serialize;
 use tokio::process::Command;
 
 /// Sidecar streams get indices starting at this offset so they never
@@ -930,14 +931,39 @@ fn webvtt_to_track_events_json(vtt: &[u8]) -> String {
         if text.trim().is_empty() {
             continue;
         }
-        events.push(serde_json::json!({
-            "Id": events.len().to_string(),
-            "Text": text,
-            "StartPositionTicks": start,
-            "EndPositionTicks": end,
-        }));
+        events.push(SubtitleTrackEventDto {
+            id: events.len().to_string(),
+            text,
+            start_position_ticks: start,
+            end_position_ticks: end,
+        });
     }
-    serde_json::json!({ "TrackEvents": events }).to_string()
+    // B78/V38 — typed `SubtitleTrackInfo`/`SubtitleTrackEvent` rather than a
+    // raw json! literal. Serialization of these owned structs cannot fail; a
+    // valid empty envelope is the belt-and-braces fallback.
+    serde_json::to_string(&SubtitleTrackInfoDto {
+        track_events: events,
+    })
+    .unwrap_or_else(|_| r#"{"TrackEvents":[]}"#.to_string())
+}
+
+/// A single subtitle cue (Jellyfin `SubtitleTrackEvent`) in the Stream.js JSON
+/// the web player's SubtitleEngine reads. All four fields are non-nullable in
+/// the SDK model; typed per B78/V38.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct SubtitleTrackEventDto {
+    id: String,
+    text: String,
+    start_position_ticks: i64,
+    end_position_ticks: i64,
+}
+
+/// The Stream.js envelope (Jellyfin `SubtitleTrackInfo`) wrapping the cue list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct SubtitleTrackInfoDto {
+    track_events: Vec<SubtitleTrackEventDto>,
 }
 
 /// Parse a WebVTT timestamp (`HH:MM:SS.mmm` or `MM:SS.mmm`) to ticks
