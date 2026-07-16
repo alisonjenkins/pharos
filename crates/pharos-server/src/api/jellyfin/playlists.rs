@@ -77,8 +77,18 @@ async fn create_playlist(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(crate::api::jellyfin::wire::json(
-        &serde_json::json!({ "Id": playlist.wire_id }),
+        &PlaylistCreationResultDto {
+            id: playlist.wire_id,
+        },
     ))
+}
+
+/// Jellyfin `PlaylistCreationResult` — `Id` is the only field and is no-default
+/// in the SDK; typed per B78/V38.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PlaylistCreationResultDto {
+    id: String,
 }
 
 /// `GET /Playlists/{id}` — the playlist header as a `Playlist` folder item.
