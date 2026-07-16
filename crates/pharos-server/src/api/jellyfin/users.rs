@@ -221,11 +221,22 @@ async fn quick_connect_connect(
 
 async fn branding_configuration(state: web::Data<AppState>) -> impl Responder {
     let cfg = state.effective_branding().await;
-    crate::api::jellyfin::wire::json(&serde_json::json!({
-        "LoginDisclaimer": cfg.login_disclaimer.unwrap_or_default(),
-        "CustomCss": cfg.custom_css.clone().unwrap_or_default(),
-        "SplashscreenEnabled": false,
-    }))
+    // `BrandingOptions` — `SplashscreenEnabled` is the one no-default field in
+    // the SDK; `LoginDisclaimer`/`CustomCss` are nullable strings. Typed (V38).
+    crate::api::jellyfin::wire::json(&BrandingOptionsDto {
+        login_disclaimer: cfg.login_disclaimer.unwrap_or_default(),
+        custom_css: cfg.custom_css.clone().unwrap_or_default(),
+        splashscreen_enabled: false,
+    })
+}
+
+/// Jellyfin `BrandingOptions` (`GET /Branding/Configuration`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct BrandingOptionsDto {
+    login_disclaimer: String,
+    custom_css: String,
+    splashscreen_enabled: bool,
 }
 
 async fn branding_css(state: web::Data<AppState>) -> impl Responder {
