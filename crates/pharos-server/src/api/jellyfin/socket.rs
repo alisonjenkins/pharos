@@ -816,13 +816,29 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 id: item_id,
                 kind: k.base_item_kind(),
             });
+            // kotlin SessionInfoDto / PlayerStateInfo require these non-null
+            // fields (B78); real ISO-8601 timestamps, empty lists, valid enum
+            // members ("RepeatNone" / "Default").
+            let now_iso = pharos_jellyfin_api::dto::format_iso8601(unix_now_ms() / 1000);
             let entry = SessionsBroadcastEntry {
                 id: session_id,
                 user_id,
+                playable_media_types: Vec::new(),
+                last_activity_date: now_iso.clone(),
+                last_playback_check_in: now_iso,
+                is_active: true,
+                supports_media_control: false,
+                supports_remote_control: false,
+                has_custom_device_name: false,
+                supported_commands: Vec::new(),
                 now_playing_item,
                 play_state: SessionPlayStateLite {
                     position_ticks,
                     is_paused,
+                    can_seek: true,
+                    is_muted: false,
+                    repeat_mode: "RepeatNone",
+                    playback_order: "Default",
                 },
             };
             Some(Outbound::new(
@@ -985,6 +1001,18 @@ mod tests {
         assert_eq!(v["Data"][0]["NowPlayingItem"]["Type"], "Episode");
         assert_eq!(v["Data"][0]["PlayState"]["PositionTicks"], 12_345_000);
         assert_eq!(v["Data"][0]["PlayState"]["IsPaused"], true);
+        // B78 — kotlin PlayerStateInfo + SessionInfoDto require these non-null
+        // fields; a native client crashes on any missing one. Enums must be
+        // valid members.
+        assert_eq!(v["Data"][0]["PlayState"]["CanSeek"], true);
+        assert_eq!(v["Data"][0]["PlayState"]["IsMuted"], false);
+        assert_eq!(v["Data"][0]["PlayState"]["RepeatMode"], "RepeatNone");
+        assert_eq!(v["Data"][0]["PlayState"]["PlaybackOrder"], "Default");
+        assert_eq!(v["Data"][0]["IsActive"], true);
+        assert!(v["Data"][0]["LastActivityDate"].is_string());
+        assert!(v["Data"][0]["PlayableMediaTypes"].is_array());
+        assert!(v["Data"][0]["SupportedCommands"].is_array());
+        assert!(v["Data"][0]["HasCustomDeviceName"].is_boolean());
     }
 
     #[test]

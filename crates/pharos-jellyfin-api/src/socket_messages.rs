@@ -141,22 +141,42 @@ pub struct NowPlayingItemLite {
     pub kind: &'static str,
 }
 
-/// `SessionInfoDto.PlayState` subset a `Sessions` broadcast patches in place.
+/// `SessionInfoDto.PlayState` (kotlin `PlayerStateInfo`). Its no-default
+/// REQUIRED fields are `CanSeek`/`IsPaused`/`IsMuted`/`RepeatMode`/
+/// `PlaybackOrder` — a native client crashes on any missing one (B78). The
+/// two enums must be valid members (`RepeatNone` / `Default`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionPlayStateLite {
     pub position_ticks: u64,
     pub is_paused: bool,
+    pub can_seek: bool,
+    pub is_muted: bool,
+    pub repeat_mode: &'static str,
+    pub playback_order: &'static str,
 }
 
-/// One `SessionInfoDto` entry of a `Sessions` socket broadcast (P10 — the
-/// minimal patch jellyfin-web's "Currently Watching" sidebar + native remote
-/// screens apply by `Id`).
+/// One `SessionInfoDto` entry of a `Sessions` socket broadcast (P10 — the patch
+/// jellyfin-web's "Currently Watching" sidebar + native remote screens apply by
+/// `Id`). The kotlin `SessionInfoDto` REQUIRES the capability/timestamp/list
+/// fields below (no defaults) in addition to `UserId` — a native client crashes
+/// on any missing one (B78). Lists are emitted (possibly empty); DateTimes are
+/// real ISO-8601. The capability booleans are conservative defaults — a
+/// progress patch doesn't carry the session's registered capabilities (the
+/// registry does); false never over-advertises control pharos can't route.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionsBroadcastEntry {
     pub id: String,
     pub user_id: String,
+    pub playable_media_types: Vec<&'static str>,
+    pub last_activity_date: String,
+    pub last_playback_check_in: String,
+    pub is_active: bool,
+    pub supports_media_control: bool,
+    pub supports_remote_control: bool,
+    pub has_custom_device_name: bool,
+    pub supported_commands: Vec<&'static str>,
     /// Nullable in the kotlin `SessionInfoDto`; OMITTED (not null-with-Id) when
     /// the item's kind couldn't be resolved — never emit a `NowPlayingItem`
     /// without a `Type`.
