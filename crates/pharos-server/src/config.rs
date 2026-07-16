@@ -219,10 +219,34 @@ pub struct ServerConfig {
     /// this plus the in-flight drain. Default `10`.
     #[serde(default = "default_drain_grace_secs")]
     pub drain_grace_secs: u64,
+    /// Default video-bitrate ceiling (bps) applied to a TRANSCODE when the
+    /// client connects from a REMOTE (non-private, non-loopback) address.
+    ///
+    /// jellyfin-web's "Auto" quality advertises an enormous MaxStreamingBitrate
+    /// (effectively "unlimited"), so an uncapped transcode targets the source
+    /// bitrate up to the 12 Mbps encoder ceiling — fine on a LAN, but far more
+    /// than a home broadband uplink can sustain, so a remote viewer rebuffers
+    /// constantly (Lace incident, 2026-07-16: a 10 Mbps h264 source + a 34 Mbps
+    /// movie were transcoded at ~10–12 Mbps over WAN). Capping a remote session
+    /// to a WAN-friendly rate keeps playback smooth at a small quality cost.
+    ///
+    /// The cap is a CEILING, taken as the min with any explicit (lower) client
+    /// pick, so a viewer who manually selects 2 Mbps still gets 2 Mbps. LAN
+    /// clients are never capped by this. `0` disables it entirely (every client
+    /// falls back to the source/ceiling behaviour). Default 6 Mbps.
+    #[serde(default = "default_remote_default_bitrate_bps")]
+    pub remote_default_bitrate_bps: u64,
 }
 
 fn default_played_threshold_pct() -> u32 {
     90
+}
+
+fn default_remote_default_bitrate_bps() -> u64 {
+    // 6 Mbps — a WAN-friendly 1080p H.264 ceiling that most home uplinks +
+    // remote downlinks sustain without rebuffering, while still visibly better
+    // than the 3 Mbps 720p rung.
+    6_000_000
 }
 
 fn default_drain_grace_secs() -> u64 {

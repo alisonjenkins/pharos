@@ -1686,6 +1686,59 @@ struct PlaybackInfoBody {
     subtitle_stream_index: Option<i64>,
 }
 
+/// Parse an IP from either a bare address (X-Forwarded-For form) or a
+/// `host:port` / `[v6]:port` socket string (actix peer-addr form).
+fn parse_client_ip(s: &str) -> Option<std::net::IpAddr> {
+    let t = s.trim();
+    if let Ok(ip) = t.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    t.parse::<std::net::SocketAddr>().ok().map(|sa| sa.ip())
+}
+
+/// True when `ip` is a public (WAN) address — i.e. NOT loopback, private
+/// (RFC1918 / ULA), link-local, unspecified, or carrier-grade-NAT / mesh-VPN
+/// shared space (100.64/10, commonly Tailscale — treated as LAN-speed).
+fn ip_is_remote(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            // 100.64.0.0/10 — CGNAT / shared address space (Tailscale et al.).
+            let cgnat = v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]);
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || cgnat)
+        }
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped (::ffff:a.b.c.d) → judge by the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_remote(&std::net::IpAddr::V4(v4));
+            }
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
+            }
+            let seg0 = v6.segments()[0];
+            let ula = (seg0 & 0xfe00) == 0xfc00; // fc00::/7 unique-local
+            let link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+            !(ula || link_local)
+        }
+    }
+}
+
+/// Whether the request came from a remote (WAN) client, honouring the
+/// ingress's `X-Forwarded-For` (actix `realip_remote_addr`). An unresolvable
+/// address is treated as LOCAL — we never want to spuriously throttle a LAN
+/// viewer we simply couldn't parse.
+fn client_is_remote(req: &actix_web::HttpRequest) -> bool {
+    req.connection_info()
+        .realip_remote_addr()
+        .and_then(parse_client_ip)
+        .map(|ip| ip_is_remote(&ip))
+        .unwrap_or(false)
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1769,6 +1822,25 @@ async fn playback_info(
         None => (DeviceProfile::default(), None, None),
     };
     let decision = negotiate(&profile, &source);
+    // Connection-aware transcode ceiling (Lace incident, 2026-07-16). A remote
+    // client on jellyfin-web's "Auto" quality advertises an effectively-
+    // unlimited MaxStreamingBitrate, so `negotiate` leaves the transcode
+    // uncapped and the segment encoder targets the source bitrate up to its
+    // 12 Mbps ceiling — smooth on a LAN, but a home uplink can't sustain it and
+    // the viewer rebuffers. When the client is on a non-private address, clamp
+    // the transcode's ceiling to the configured WAN default (min with any lower
+    // explicit client pick). LAN clients — and `remote_default_bitrate_bps == 0`
+    // — are untouched. The clamp lives on the negotiated Decision so it flows
+    // through the registered session to every downstream surface: the HLS ladder
+    // filter, the `main` rendition, and the VP9 segment path all read the
+    // session's `max_video_bitrate_bps`.
+    let remote_ceiling: Option<u64> = (state.remote_default_bitrate_bps > 0
+        && client_is_remote(&req))
+    .then_some(state.remote_default_bitrate_bps);
+    let decision = match remote_ceiling {
+        Some(ceiling) => decision.clamp_video_bitrate(ceiling),
+        None => decision,
+    };
 
     // B75 — native direct-play now authenticates via a capability token (the
     // MediaSource ETag = PlaySessionId, which the SDK forwards as `?tag=`; the
@@ -2004,8 +2076,26 @@ async fn playback_info(
     // reports no reliable position for resume. Serving VP9 as fMP4 HLS (like
     // Jellyfin) gives hls.js a seekable VOD playlist — restoring seeking,
     // resume, and mid-playback track switching. SubProtocol resolves to "hls".
+    // Fix (Lace incident): bake the negotiated video-bitrate ceiling into the
+    // TranscodingUrl as `&VideoBitrate=` (real-Jellyfin convention). The
+    // segment surfaces already read the cap from the registered session, but
+    // the URL param rides `playback_qs` through master → variant → segment so
+    // the ceiling still applies if the session is GC'd (a cold segment hit) and
+    // on the re-encoding remux paths, which carry no cap in the Decision. Empty
+    // when there's no ceiling (LAN client / no client pick / non-transcode).
+    let video_bitrate_param = match &decision {
+        Decision::Transcode {
+            max_video_bitrate_bps: Some(bps),
+            ..
+        } => format!("&VideoBitrate={bps}"),
+        // A remote client remuxing (container/audio only) still RE-ENCODES video
+        // on the segmented-HLS surface (B45), so carry the connection ceiling.
+        _ => remote_ceiling
+            .map(|b| format!("&VideoBitrate={b}"))
+            .unwrap_or_default(),
+    };
     let vp9_hls_url = format!(
-        "/videos/{id_str}/vp9/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
+        "/videos/{id_str}/vp9/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
     );
     let transcoding_url = if force_webm {
         Some(vp9_hls_url.clone())
@@ -2044,7 +2134,7 @@ async fn playback_info(
             // segment handler (burn silently off) and an explicit audio track
             // fell back to the default.
             Decision::Transcode { .. } if is_video => Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
             )),
             // Audio transcode → the universal audio endpoint.
             Decision::Transcode { .. } => Some(format!(
@@ -2055,8 +2145,9 @@ async fn playback_info(
             // registered session and emits `-c:v copy`.
             Decision::VideoRemux { .. } => Some(format!(
                 // Remux copies video (no burn possible) but the AUDIO pick
-                // must still ride along (B41).
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
+                // must still ride along (B41). The segmented-HLS surface still
+                // re-encodes video (B45), so a remote ceiling rides too.
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
             )),
             // B77 — a VIDEO AudioRemux (compatible video, undecodable audio)
             // drives the same HLS master as VideoRemux: the segment surface
@@ -2065,7 +2156,7 @@ async fn playback_info(
             // can actually decode. Without this the client got DirectStream'd
             // raw eac3/ac3/dts and no URL to fall back to.
             Decision::AudioRemux { .. } if is_video => Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}"
+                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
             )),
             // Audio-only source whose codec the client can't direct-play →
             // the universal audio endpoint remuxes to the negotiated target.
@@ -5718,6 +5809,45 @@ pub(crate) fn spawn_scan(
         }
         state.notify_library_delta(&added, &removed);
     });
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod remote_ip_tests {
+    use super::{ip_is_remote, parse_client_ip};
+
+    fn remote(s: &str) -> bool {
+        ip_is_remote(&parse_client_ip(s).expect("parses"))
+    }
+
+    #[test]
+    fn public_addresses_are_remote() {
+        // The Lace incident's real client IP.
+        assert!(remote("62.169.136.4"));
+        assert!(remote("8.8.8.8"));
+        assert!(remote("2606:4700:4700::1111"));
+        // host:port and bracketed-v6:port forms parse too.
+        assert!(remote("62.169.136.4:54321"));
+        assert!(remote("[2606:4700:4700::1111]:443"));
+    }
+
+    #[test]
+    fn private_and_local_addresses_are_not_remote() {
+        for s in [
+            "127.0.0.1",       // loopback
+            "10.42.0.83",      // RFC1918 (the pod network)
+            "192.168.1.46",    // RFC1918
+            "172.16.5.9",      // RFC1918
+            "169.254.10.1",    // link-local
+            "100.100.20.30",   // CGNAT / Tailscale — treated as LAN-speed
+            "::1",             // v6 loopback
+            "fd00::1",         // v6 unique-local
+            "fe80::1",         // v6 link-local
+            "::ffff:10.0.0.5", // v4-mapped private
+        ] {
+            assert!(!remote(s), "{s} must be treated as local");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -154,6 +154,36 @@ impl Decision {
     pub fn is_direct(&self) -> bool {
         matches!(self, Decision::DirectPlay)
     }
+
+    /// Lower a transcode's video-bitrate ceiling to `ceiling_bps`, taking the
+    /// min with any cap already negotiated. A `None` existing cap (the client
+    /// sent no MaxStreamingBitrate, or "Auto") becomes `ceiling_bps`.
+    ///
+    /// Used to apply a connection-aware default (see the server's
+    /// `remote_default_bitrate_bps`): a remote client on "Auto" quality
+    /// advertises an effectively-unlimited MaxStreamingBitrate, so an uncapped
+    /// transcode targets the source/encoder ceiling — unplayable over a home
+    /// uplink. This only ever LOWERS the ceiling and is a no-op for non-
+    /// transcode decisions (DirectPlay / remux carry no encoder bitrate).
+    #[must_use]
+    pub fn clamp_video_bitrate(self, ceiling_bps: u64) -> Self {
+        match self {
+            Decision::Transcode {
+                target_container,
+                target_video_codec,
+                target_audio_codec,
+                max_video_bitrate_bps,
+            } => Decision::Transcode {
+                target_container,
+                target_video_codec,
+                target_audio_codec,
+                max_video_bitrate_bps: Some(
+                    max_video_bitrate_bps.map_or(ceiling_bps, |cap| cap.min(ceiling_bps)),
+                ),
+            },
+            other => other,
+        }
+    }
 }
 
 /// P27 — evaluate a CodecProfile's required conditions against the
@@ -496,6 +526,43 @@ fn pick_preferred_video_codec(csv: &str) -> Option<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_video_bitrate_lowers_and_fills_transcode_cap() {
+        let tc = |cap: Option<u64>| Decision::Transcode {
+            target_container: "ts".into(),
+            target_video_codec: Some("h264".into()),
+            target_audio_codec: Some("aac".into()),
+            max_video_bitrate_bps: cap,
+        };
+        let cap_of = |d: Decision| match d {
+            Decision::Transcode {
+                max_video_bitrate_bps,
+                ..
+            } => max_video_bitrate_bps,
+            _ => panic!("expected transcode"),
+        };
+        // No prior cap ("Auto") → ceiling fills it in.
+        assert_eq!(
+            cap_of(tc(None).clamp_video_bitrate(6_000_000)),
+            Some(6_000_000)
+        );
+        // A higher client cap is lowered to the ceiling.
+        assert_eq!(
+            cap_of(tc(Some(140_000_000)).clamp_video_bitrate(6_000_000)),
+            Some(6_000_000)
+        );
+        // An explicit LOWER client pick is honoured (never raised).
+        assert_eq!(
+            cap_of(tc(Some(2_000_000)).clamp_video_bitrate(6_000_000)),
+            Some(2_000_000)
+        );
+        // Non-transcode decisions are untouched.
+        assert_eq!(
+            Decision::DirectPlay.clamp_video_bitrate(6_000_000),
+            Decision::DirectPlay
+        );
+    }
 
     #[test]
     fn equals_any_string_splits_on_pipe() {

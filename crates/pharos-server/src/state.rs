@@ -174,6 +174,14 @@ pub struct AppState {
     /// B60 — when true, desktop Linux Firefox is served H.264 (shared encode)
     /// instead of the forced VP9/WebM path. Config `[server].linux_firefox_h264`.
     pub linux_firefox_h264: bool,
+    /// Connection-aware default transcode ceiling (bps) for REMOTE clients.
+    /// jellyfin-web's "Auto" quality advertises an effectively-unlimited
+    /// MaxStreamingBitrate, so a remote (WAN) transcode otherwise targets the
+    /// source/12 Mbps ceiling and rebuffers (Lace incident, 2026-07-16). When
+    /// non-zero and the client is on a non-private address, PlaybackInfo clamps
+    /// the negotiated cap to this value (min with any lower client pick). `0`
+    /// disables it. Config `[server].remote_default_bitrate_bps`.
+    pub remote_default_bitrate_bps: u64,
     /// P43 — inter-probe sleep in milliseconds for background
     /// `/Library/Refresh` passes. 0 disables rate-limiting. Surfaced
     /// here so the admin spawn reads the configured value without
@@ -469,6 +477,7 @@ impl AppState {
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
             linux_firefox_h264: false,
+            remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
@@ -538,6 +547,7 @@ impl AppState {
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
             linux_firefox_h264: false,
+            remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
@@ -561,6 +571,13 @@ impl AppState {
     /// played unreachable.
     pub fn with_linux_firefox_h264(mut self, on: bool) -> Self {
         self.linux_firefox_h264 = on;
+        self
+    }
+
+    /// Set the remote-client default transcode ceiling (bps). `0` disables
+    /// remote capping. See `remote_default_bitrate_bps`.
+    pub fn with_remote_default_bitrate_bps(mut self, bps: u64) -> Self {
+        self.remote_default_bitrate_bps = bps;
         self
     }
 

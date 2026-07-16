@@ -509,6 +509,28 @@ fn effective_video_bitrate(negotiated_cap: Option<u64>, source: Option<u64>) -> 
     bounded.clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS)
 }
 
+/// Min of two optional caps treating `None` as "no constraint". Used to fold
+/// the live-session cap together with a URL-carried `VideoBitrate` ceiling.
+fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+/// Fix (Lace incident): parse a `VideoBitrate=` ceiling from a request query
+/// string. PlaybackInfo bakes it into the transcode URL for remote clients and
+/// `playback_qs` rides it master → variant → segment, so the cap survives a
+/// GC'd session and reaches the remux re-encode paths (which carry no cap in
+/// the registered Decision). `0` / unparseable → `None`.
+fn qs_video_bitrate_cap(qs: &str) -> Option<u64> {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("VideoBitrate"))
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
 async fn master_playlist(
     state: web::Data<AppState>,
     _user: AuthUser,
@@ -518,7 +540,13 @@ async fn master_playlist(
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
     let qs = playback_qs(&req);
-    let bitrate_cap = extract_session_bitrate_cap(&state, &req).await;
+    // Fold the live-session cap together with any URL-carried `VideoBitrate`
+    // ceiling (Lace incident) so both the ladder filter AND the advertised
+    // `main` bandwidth reflect a remote client's connection ceiling.
+    let bitrate_cap = min_opt(
+        extract_session_bitrate_cap(&state, &req).await,
+        qs_video_bitrate_cap(req.query_string()),
+    );
 
     // Advertise the codecs the transcoded segments actually carry (H.264 +
     // AAC, or a stream-copied h264/hevc source) — NOT the raw source codec.
@@ -581,8 +609,10 @@ async fn master_playlist(
         .map(|(w, h)| w as f64 / h as f64);
 
     // Backwards-compat single-variant entry. Older players that
-    // ignore EXT-X-STREAM-INF iteration still pick the first one.
-    let baseline_bw = target_video_bitrate(item.source_bitrate_bps) + 128_000;
+    // ignore EXT-X-STREAM-INF iteration still pick the first one. Advertise the
+    // CAP-bounded bitrate (Lace incident) so hls.js ABR doesn't overshoot a
+    // remote client's ceiling when it picks this `main` rung.
+    let baseline_bw = effective_video_bitrate(bitrate_cap, item.source_bitrate_bps) + 128_000;
     let baseline_res = match (item.width, item.height) {
         (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
         _ => String::new(),
@@ -877,6 +907,17 @@ async fn serve_segment(
                 opts.burn_subtitle_stream_index = None;
             }
         }
+    }
+    // Fix (Lace incident): apply the URL-carried `VideoBitrate` ceiling as a
+    // hard min over whatever the session / variant / no-session fallback chose.
+    // Monotone (only ever lowers), so it caps the `main` rendition on a GC'd
+    // session and the remux re-encode paths — which carry no cap in the
+    // registered Decision — without disturbing the normal session-cap flow.
+    if let (Some(cap), Some(cur)) = (
+        qs_video_bitrate_cap(req.query_string()),
+        opts.video_bitrate_bps,
+    ) {
+        opts.video_bitrate_bps = Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
     }
 
     // B51 — the client's ACTUAL subtitle pick (codec-relative, pre-gate), so
@@ -1266,6 +1307,11 @@ fn playback_qs(req: &HttpRequest) -> String {
                 // so `render_variant_playlist` can emit `EXT-X-START:TIME-OFFSET`
                 // (P18). Without this the native app resumes at 0:00.
                 parts.push(format!("StartTimeTicks={v}"));
+            } else if k.eq_ignore_ascii_case("VideoBitrate") {
+                // Fix (Lace incident): forward the connection-aware bitrate
+                // ceiling master → variant → segment so it caps the encoder even
+                // when the live session is gone or the path re-encodes a remux.
+                parts.push(format!("VideoBitrate={v}"));
             }
         }
     }
@@ -1973,7 +2019,12 @@ async fn vp9_segment_opts(
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
     let start_ticks = Ticks::from_seconds(start_secs).0;
     let duration_ticks = Ticks::from_seconds(dur_secs).0;
-    let cap = extract_session_bitrate_cap(state, req).await;
+    // Fold the live-session cap with any URL-carried `VideoBitrate` ceiling
+    // (Lace incident) so a remote Firefox on VP9 is capped too.
+    let cap = min_opt(
+        extract_session_bitrate_cap(state, req).await,
+        qs_video_bitrate_cap(req.query_string()),
+    );
     // B50 — honour the client's negotiated cap, bounded by source + ceiling.
     let bitrate = effective_video_bitrate(cap, item.probe.bitrate_bps);
     // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
@@ -2465,6 +2516,31 @@ mod tests {
             effective_video_bitrate(Some(40_000_000), Some(100_000)),
             HLS_MIN_BITRATE_BPS
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn qs_video_bitrate_cap_parses_case_insensitively() {
+        assert_eq!(
+            qs_video_bitrate_cap("PlaySessionId=abc&VideoBitrate=6000000&api_key=x"),
+            Some(6_000_000)
+        );
+        // Case-insensitive key, as jellyfin clients vary the casing.
+        assert_eq!(
+            qs_video_bitrate_cap("videobitrate=4000000"),
+            Some(4_000_000)
+        );
+        // Absent, zero, and unparseable all yield None (no constraint).
+        assert_eq!(qs_video_bitrate_cap("PlaySessionId=abc"), None);
+        assert_eq!(qs_video_bitrate_cap("VideoBitrate=0"), None);
+        assert_eq!(qs_video_bitrate_cap("VideoBitrate=lots"), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn min_opt_folds_caps_treating_none_as_unbounded() {
+        assert_eq!(min_opt(Some(6_000_000), Some(2_000_000)), Some(2_000_000));
+        assert_eq!(min_opt(Some(6_000_000), None), Some(6_000_000));
+        assert_eq!(min_opt(None, Some(6_000_000)), Some(6_000_000));
+        assert_eq!(min_opt(None, None), None);
     }
 
     #[::core::prelude::v1::test]
