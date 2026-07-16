@@ -23,7 +23,7 @@ use crate::{
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
 use pharos_store_sqlx::ServerConfigStore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: paths registered in lowercase only — the `LowercasePath`
@@ -218,23 +218,44 @@ async fn items_counts(
             genres.insert(n);
         }
     }
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "MovieCount": movies,
-        "SeriesCount": series.len() as u32,
-        "EpisodeCount": episodes,
-        "ArtistCount": artists.len() as u32,
-        "ProgramCount": 0,
-        "TrailerCount": 0,
-        "SongCount": audio,
-        "AlbumCount": albums.len() as u32,
-        "MusicVideoCount": 0,
-        "BoxSetCount": 0,
-        "BookCount": 0,
-        "ItemCount": all.len() as u32,
-        // GenreCount isn't part of jellyfin-web's stats row but
-        // clients sometimes read it; cheap to include.
-        "GenreCount": genres.len() as u32,
-    })))
+    Ok(crate::api::jellyfin::wire::json(&ItemCountsDto {
+        movie_count: movies,
+        series_count: series.len() as u32,
+        episode_count: episodes,
+        artist_count: artists.len() as u32,
+        program_count: 0,
+        trailer_count: 0,
+        song_count: audio,
+        album_count: albums.len() as u32,
+        music_video_count: 0,
+        box_set_count: 0,
+        book_count: 0,
+        item_count: all.len() as u32,
+        // GenreCount isn't in the SDK's ItemCounts model, but clients
+        // sometimes read it and a strict client ignores unknown fields.
+        genre_count: genres.len() as u32,
+    }))
+}
+
+/// Jellyfin `ItemCounts` — the library "stats" strip. All twelve counts are
+/// no-default (required) `Int` in the kotlin SDK; typed per B78/V38 so none
+/// can be dropped. `GenreCount` is a tolerated pharos extension.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ItemCountsDto {
+    movie_count: u32,
+    series_count: u32,
+    episode_count: u32,
+    artist_count: u32,
+    program_count: u32,
+    trailer_count: u32,
+    song_count: u32,
+    album_count: u32,
+    music_video_count: u32,
+    box_set_count: u32,
+    book_count: u32,
+    item_count: u32,
+    genre_count: u32,
 }
 
 /// LIB-B5 — the `?ParentId=` / `?IncludeItemTypes=` / user-data scope a
@@ -254,6 +275,63 @@ struct FiltersQuery {
     #[serde(default)]
     #[allow(dead_code)]
     user_id: Option<String>,
+}
+
+/// `QueryFiltersLegacy` — flat facet-value arrays (no counts, no ids). Every
+/// field defaults to `[]` in the SDK, so nothing is crash-required, but typed
+/// per B78/V38 for a compile-checked shape.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct QueryFiltersLegacyDto<'a> {
+    genres: Vec<&'a str>,
+    tags: Vec<&'a str>,
+    official_ratings: Vec<&'a str>,
+    years: Vec<i64>,
+}
+
+/// A `NameGuidPair` facet element (`Genres` / `Studios` in `QueryFilters`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NameGuidFacetDto<'a> {
+    name: &'a str,
+    id: &'a str,
+}
+
+/// A facet value carrying its item count — the element type of the pharos
+/// `FacetCounts` extension (not part of the SDK `QueryFilters`; strict clients
+/// ignore the whole unknown block).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct CountedFacetDto<'a> {
+    name: &'a str,
+    id: &'a str,
+    count: u32,
+}
+
+/// The pharos `FacetCounts` extension object rolled into the `QueryFilters`
+/// (`Filters2`) response so a filter UI can render "Action (42)".
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FacetCountsDto<'a> {
+    genres: Vec<CountedFacetDto<'a>>,
+    studios: Vec<CountedFacetDto<'a>>,
+    tags: Vec<CountedFacetDto<'a>>,
+    years: Vec<CountedFacetDto<'a>>,
+    official_ratings: Vec<CountedFacetDto<'a>>,
+}
+
+/// `QueryFilters` (`Filters2`) — `Genres`/`Studios` as `NameGuidPair[]`, the
+/// rest as flat arrays, plus the pharos `FacetCounts` extension. All SDK
+/// fields default to `[]`; typed per B78/V38.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct QueryFiltersDto<'a> {
+    genres: Vec<NameGuidFacetDto<'a>>,
+    studios: Vec<NameGuidFacetDto<'a>>,
+    tags: Vec<&'a str>,
+    official_ratings: Vec<&'a str>,
+    years: Vec<i64>,
+    facet_counts: FacetCountsDto<'a>,
 }
 
 /// Build the base [`pharos_core::MediaQuery`] (parent + kind + user-data
@@ -304,9 +382,9 @@ async fn items_filters_legacy(
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::FacetRequest;
     let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
-        return Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-            "Genres": [], "Tags": [], "OfficialRatings": [], "Years": [],
-        })));
+        return Ok(crate::api::jellyfin::wire::json(
+            &QueryFiltersLegacyDto::default(),
+        ));
     };
     let req = FacetRequest::default();
     let facets = state
@@ -326,12 +404,12 @@ async fn items_filters_legacy(
         .iter()
         .filter_map(|f| f.value.parse::<i64>().ok())
         .collect();
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Genres": genres,
-        "Tags": tags,
-        "OfficialRatings": ratings,
-        "Years": years,
-    })))
+    Ok(crate::api::jellyfin::wire::json(&QueryFiltersLegacyDto {
+        genres,
+        tags,
+        official_ratings: ratings,
+        years,
+    }))
 }
 
 /// `GET /Items/Filters2` (`QueryFiltersDto` shape) — `Genres` + `Studios`
@@ -345,14 +423,9 @@ async fn items_filters2(
     user: AuthUser,
     q: CiQuery<FiltersQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    use pharos_core::{FacetRequest, FacetValue};
-    let empty = serde_json::json!({
-        "Genres": [], "Studios": [], "Tags": [], "OfficialRatings": [], "Years": [],
-        "FacetCounts": { "Genres": [], "Studios": [], "Tags": [],
-                         "Years": [], "OfficialRatings": [] },
-    });
+    use pharos_core::FacetRequest;
     let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
-        return Ok(crate::api::jellyfin::wire::json(&empty));
+        return Ok(crate::api::jellyfin::wire::json(&QueryFiltersDto::default()));
     };
     let req = FacetRequest::default();
     let facets = state
@@ -360,18 +433,6 @@ async fn items_filters2(
         .facets(&base, &req)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // NameGuidPair[] for the entity facets.
-    let name_guid = |fs: &[FacetValue]| -> Vec<serde_json::Value> {
-        fs.iter()
-            .map(|f| serde_json::json!({ "Name": f.value, "Id": f.wire_id }))
-            .collect()
-    };
-    // (value, count) buckets for the counts extension.
-    let counted = |fs: &[FacetValue]| -> Vec<serde_json::Value> {
-        fs.iter()
-            .map(|f| serde_json::json!({ "Name": f.value, "Id": f.wire_id, "Count": f.count }))
-            .collect()
-    };
     let tags: Vec<&str> = facets.tags.iter().map(|f| f.value.as_str()).collect();
     let ratings: Vec<&str> = facets
         .official_ratings
@@ -383,20 +444,41 @@ async fn items_filters2(
         .iter()
         .filter_map(|f| f.value.parse::<i64>().ok())
         .collect();
-    Ok(crate::api::jellyfin::wire::json(&serde_json::json!({
-        "Genres": name_guid(&facets.genres),
-        "Studios": name_guid(&facets.studios),
-        "Tags": tags,
-        "OfficialRatings": ratings,
-        "Years": years,
-        "FacetCounts": {
-            "Genres": counted(&facets.genres),
-            "Studios": counted(&facets.studios),
-            "Tags": counted(&facets.tags),
-            "Years": counted(&facets.years),
-            "OfficialRatings": counted(&facets.official_ratings),
+    Ok(crate::api::jellyfin::wire::json(&QueryFiltersDto {
+        genres: name_guid_facets(&facets.genres),
+        studios: name_guid_facets(&facets.studios),
+        tags,
+        official_ratings: ratings,
+        years,
+        facet_counts: FacetCountsDto {
+            genres: counted_facets(&facets.genres),
+            studios: counted_facets(&facets.studios),
+            tags: counted_facets(&facets.tags),
+            years: counted_facets(&facets.years),
+            official_ratings: counted_facets(&facets.official_ratings),
         },
-    })))
+    }))
+}
+
+/// `NameGuidPair[]` for the entity facets (`Genres` / `Studios`).
+fn name_guid_facets(fs: &[pharos_core::FacetValue]) -> Vec<NameGuidFacetDto<'_>> {
+    fs.iter()
+        .map(|f| NameGuidFacetDto {
+            name: &f.value,
+            id: &f.wire_id,
+        })
+        .collect()
+}
+
+/// `(value, id, count)` buckets for the pharos `FacetCounts` extension.
+fn counted_facets(fs: &[pharos_core::FacetValue]) -> Vec<CountedFacetDto<'_>> {
+    fs.iter()
+        .map(|f| CountedFacetDto {
+            name: &f.value,
+            id: &f.wire_id,
+            count: f.count,
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
