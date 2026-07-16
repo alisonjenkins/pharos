@@ -1,9 +1,8 @@
 //! Transcode option types. Independent of ffmpeg specifics so callers
 //! reason in terms of containers/codecs the wire protocol exposes.
 
+use pharos_core::time::Ticks;
 use serde::{Deserialize, Serialize};
-
-const JELLYFIN_TICKS_PER_SECOND: f64 = 10_000_000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Container {
@@ -185,13 +184,12 @@ impl TranscodeOptions {
         if self.start_position_ticks == 0 {
             None
         } else {
-            Some(self.start_position_ticks as f64 / JELLYFIN_TICKS_PER_SECOND)
+            Some(Ticks(self.start_position_ticks).seconds())
         }
     }
 
     pub fn duration_seconds(&self) -> Option<f64> {
-        self.duration_ticks
-            .map(|d| d as f64 / JELLYFIN_TICKS_PER_SECOND)
+        self.duration_ticks.map(|d| Ticks(d).seconds())
     }
 }
 

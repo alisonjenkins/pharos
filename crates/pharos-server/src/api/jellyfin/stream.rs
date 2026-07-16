@@ -28,8 +28,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
-/// Jellyfin 100-ns ticks per second.
-const TICKS_PER_SECOND: u64 = 10_000_000;
+use pharos_core::time::{Ticks, TICKS_PER_SECOND};
 
 /// Wraps a response body so the shared `playback_activity` clock is restamped
 /// as bytes ACTUALLY flow to the client (V35). A single long GET — direct-play
@@ -642,7 +641,7 @@ async fn byte_offset_from_ticks(item: &MediaItem, start_ticks: u64) -> Option<u6
         return Some(0);
     }
     let probe = &item.probe;
-    let duration_ticks = probe.duration_ms.map(|ms| ms.saturating_mul(10_000));
+    let duration_ticks = probe.duration_ms.map(|ms| Ticks::from_millis(ms).0);
 
     if let Some(bps) = probe.bitrate_bps {
         // bytes = ticks × bps / (8 × ticks_per_second)

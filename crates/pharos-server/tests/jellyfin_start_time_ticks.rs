@@ -18,7 +18,7 @@ use pharos_server::{
 };
 use tempfile::TempDir;
 
-const TICKS_PER_SECOND: u64 = 10_000_000;
+use pharos_core::time::TICKS_PER_SECOND;
 
 async fn seed(
     td: &std::path::Path,

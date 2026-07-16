@@ -16,7 +16,7 @@
 
 use std::process::Command;
 
-const TICKS_PER_SECOND: u64 = 10_000_000;
+use pharos_core::time::TICKS_PER_SECOND;
 
 fn ffmpeg() -> &'static str {
     "ffmpeg"

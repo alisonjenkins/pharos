@@ -28,7 +28,8 @@ use pharos_transcode::{
 /// recommendation and what most clients ask for; Jellyfin's own
 /// default is the same.
 const SEGMENT_SECONDS: f64 = 6.0;
-const TICKS_PER_SECOND: u64 = 10_000_000;
+
+use pharos_core::time::Ticks;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths; `LowercasePath` middleware
@@ -711,7 +712,7 @@ async fn render_variant_playlist(
     // straight there instead of scanning from segment 0.
     let start_ticks = parse_start_time_ticks_qs(req.query_string());
     if start_ticks > 0 {
-        let secs = start_ticks as f64 / TICKS_PER_SECOND as f64;
+        let secs = Ticks(start_ticks).seconds();
         body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
@@ -833,8 +834,8 @@ async fn serve_segment(
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-    let start_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
-    let duration_ticks = (dur_secs * TICKS_PER_SECOND as f64) as u64;
+    let start_ticks = Ticks::from_seconds(start_secs).0;
+    let duration_ticks = Ticks::from_seconds(dur_secs).0;
 
     // P2 — pull negotiated bitrate cap from the live session (if any)
     // so we can clamp the variant override below.
@@ -1468,7 +1469,7 @@ async fn vp9_variant(
     ));
     let start_ticks = parse_start_time_ticks_qs(req.query_string());
     if start_ticks > 0 {
-        let secs = start_ticks as f64 / TICKS_PER_SECOND as f64;
+        let secs = Ticks(start_ticks).seconds();
         body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
@@ -1726,8 +1727,8 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                 let item = item.clone();
                 let mut o = opts.clone();
                 let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-                o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
-                o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
+                o.start_position_ticks = Ticks::from_seconds(start_secs).0;
+                o.duration_ticks = Some(Ticks::from_seconds(dur_secs).0);
                 actix_web::rt::spawn(async move {
                     // B46 — gate per TARGET segment (the hinted opts carry the
                     // hinting segment's burn decision, not this one's).
@@ -1796,8 +1797,8 @@ fn spawn_one_prefetch(
     // bytes are byte-identical to (and cache-key-match) the client's own
     // eventual request for this segment.
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-    o.start_position_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
-    o.duration_ticks = Some((dur_secs * TICKS_PER_SECOND as f64) as u64);
+    o.start_position_ticks = Ticks::from_seconds(start_secs).0;
+    o.duration_ticks = Some(Ticks::from_seconds(dur_secs).0);
     // B51 — carry the client's ACTUAL subtitle pick, NOT the requesting
     // segment's gated value. The old code cloned the served segment's opts,
     // so while in a quiet (burn-gated-off) stretch every upcoming
@@ -1970,8 +1971,8 @@ async fn vp9_segment_opts(
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-    let start_ticks = (start_secs * TICKS_PER_SECOND as f64) as u64;
-    let duration_ticks = (dur_secs * TICKS_PER_SECOND as f64) as u64;
+    let start_ticks = Ticks::from_seconds(start_secs).0;
+    let duration_ticks = Ticks::from_seconds(dur_secs).0;
     let cap = extract_session_bitrate_cap(state, req).await;
     // B50 — honour the client's negotiated cap, bounded by source + ceiling.
     let bitrate = effective_video_bitrate(cap, item.probe.bitrate_bps);
