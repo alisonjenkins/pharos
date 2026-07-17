@@ -1567,7 +1567,16 @@ async fn shows_episodes(
     q: CiQuery<ShowsEpisodesQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
-    let series_id = path.into_inner();
+    // B85 — the Android TV kotlin SDK re-serialises the synth series/season
+    // ids dashed (`5fe55c65-1a0f-…`); every comparison below is against the
+    // dashless `series_id_for_key` / `season_id_for_key` hash, so canonicalise
+    // both the path series id and the `?SeasonId=` filter or the whole rail
+    // comes back empty (a show that won't open its season list, B85).
+    let series_id = canonical_wire_id(&path.into_inner()).into_owned();
+    let season_filter = q
+        .season_id
+        .as_deref()
+        .map(|s| canonical_wire_id(s).into_owned());
     let all = state
         .list_items_cached()
         .await
@@ -1588,7 +1597,7 @@ async fn shows_episodes(
             })
         })
         .filter(|(_, item)| {
-            let Some(want) = q.season_id.as_deref() else {
+            let Some(want) = season_filter.as_deref() else {
                 return true;
             };
             item.series.as_ref().is_some_and(|s| {
@@ -1661,7 +1670,9 @@ async fn shows_seasons(
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
     use std::collections::BTreeMap;
-    let series_id = path.into_inner();
+    // B85 — canonicalise the dashed synth id the kotlin SDK sends (else the
+    // season list is empty and the show won't open on Android TV).
+    let series_id = canonical_wire_id(&path.into_inner()).into_owned();
     let all = state
         .list_items_cached()
         .await
@@ -3488,20 +3499,23 @@ enum ParentResolution {
     Empty,
 }
 
-/// Canonicalise a client-supplied `ParentId` to pharos's stored wire form.
+/// Canonicalise a client-supplied wire id (`ParentId`, a `/Items/{id}` or
+/// `/Shows/{id}` path segment, a `SeasonId`, …) to pharos's stored form.
 ///
 /// pharos emits every id in the dashless 32-hex shape [`library_id_for_root`]
 /// and the synth-id hashers produce. jellyfin-web echoes that shape back
 /// verbatim, but jellyfin-sdk-kotlin (Android TV) round-trips every id through
 /// a `Uuid` type and re-serialises it dashed
-/// (`6dcaebce-be81-6e0b-6dca-ebcebe816e0b`). Every id comparison in the parent
-/// resolvers is against the dashless stored form, so a dashed id matches
-/// nothing and the browse falls to `Empty` — a blank "Movies" / "TV Shows"
-/// grid on Android TV while jellyfin-web works (B82). Strip the dashes of a
-/// canonical 8-4-4-4-12 hex UUID and lowercase; leave every other shape
-/// (dashless hex, legacy decimal, non-id garbage) untouched so no other branch
-/// changes behaviour.
-fn canonical_parent_id(pid: &str) -> std::borrow::Cow<'_, str> {
+/// (`6dcaebce-be81-6e0b-6dca-ebcebe816e0b`). Real ids are handled by
+/// [`parse_item_id`](pharos_jellyfin_api::dto::parse_item_id) (dashed-aware),
+/// but SYNTH ids (library / series / season / genre / collection …) are
+/// resolved by comparing the raw path/query string to the dashless
+/// `*_id_for_key` hash, so a dashed synth id matches nothing: the browse falls
+/// to `Empty` (B82) or a show won't open its season list / "Go to Series"
+/// dead-ends (B85). Strip the dashes of a canonical 8-4-4-4-12 hex UUID and
+/// lowercase; leave every other shape (dashless hex, legacy decimal, non-id
+/// garbage) untouched so no other branch changes behaviour.
+pub(crate) fn canonical_wire_id(pid: &str) -> std::borrow::Cow<'_, str> {
     let b = pid.as_bytes();
     let dashed_uuid = b.len() == 36
         && b[8] == b'-'
@@ -3545,7 +3559,7 @@ async fn resolve_parent_filter(
     };
     // B82 — accept the dashed UUID the kotlin SDK re-emits, not just the
     // dashless form jellyfin-web echoes.
-    let canonical = canonical_parent_id(pid);
+    let canonical = canonical_wire_id(pid);
     let pid: &str = canonical.as_ref();
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return Ok(ParentResolution::All);
@@ -4248,7 +4262,7 @@ async fn restrict_to_parent(
     };
     // B82 — accept the dashed UUID the kotlin SDK re-emits, not just the
     // dashless form jellyfin-web echoes.
-    let canonical = canonical_parent_id(pid);
+    let canonical = canonical_wire_id(pid);
     let pid: &str = canonical.as_ref();
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return items.to_vec();
@@ -4604,6 +4618,12 @@ async fn fetch_item_dto(
     id_str: &str,
     user_id: UserId,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // B85 — accept the dashed synth id the kotlin SDK sends: every synth /
+    // entity resolution below compares against the dashless stored form, so a
+    // dashed series/season/collection id would 404 the detail fetch and dead-end
+    // Android TV navigation ("Go to Series", opening a show).
+    let canonical = canonical_wire_id(id_str);
+    let id_str: &str = canonical.as_ref();
     // A real media item id is numeric; every synthesised / entity wire id
     // (library CollectionFolder, Series/Season, BoxSet collection) is 32-hex
     // and never parses as u64. Some of those resolutions scan the whole library
@@ -6014,25 +6034,25 @@ mod browser_matroska_fallback_tests {
 }
 
 #[cfg(test)]
-mod canonical_parent_id_tests {
-    use super::canonical_parent_id;
+mod canonical_wire_id_tests {
+    use super::canonical_wire_id;
 
     #[test]
     fn dashed_uuid_is_stripped_and_lowercased() {
         // The Android TV / kotlin-SDK shape (B82): dashed UUID → dashless
         // 32-hex, matching the wire_id pharos stores.
         assert_eq!(
-            canonical_parent_id("6dcaebce-be81-6e0b-6dca-ebcebe816e0b"),
+            canonical_wire_id("6dcaebce-be81-6e0b-6dca-ebcebe816e0b"),
             "6dcaebcebe816e0b6dcaebcebe816e0b"
         );
         // Uppercase dashed → lowercase dashless.
         assert_eq!(
-            canonical_parent_id("6DCAEBCE-BE81-6E0B-6DCA-EBCEBE816E0B"),
+            canonical_wire_id("6DCAEBCE-BE81-6E0B-6DCA-EBCEBE816E0B"),
             "6dcaebcebe816e0b6dcaebcebe816e0b"
         );
         // The dashed all-media placeholder normalises to the dashless sentinel.
         assert_eq!(
-            canonical_parent_id("00000000-0000-0000-0000-000000000000"),
+            canonical_wire_id("00000000-0000-0000-0000-000000000000"),
             "00000000000000000000000000000000"
         );
     }
@@ -6048,9 +6068,9 @@ mod canonical_parent_id_tests {
             "not-a-uuid-but-has-some-dashes-xx",  // wrong length / non-hex
             "gggggggg-gggg-gggg-gggg-gggggggggg", // 36 chars, dashes right, non-hex
         ] {
-            assert_eq!(canonical_parent_id(s), s, "{s} must be untouched");
+            assert_eq!(canonical_wire_id(s), s, "{s} must be untouched");
             assert!(
-                matches!(canonical_parent_id(s), std::borrow::Cow::Borrowed(_)),
+                matches!(canonical_wire_id(s), std::borrow::Cow::Borrowed(_)),
                 "{s} must not allocate"
             );
         }

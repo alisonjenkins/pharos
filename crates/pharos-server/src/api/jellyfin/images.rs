@@ -217,6 +217,11 @@ async fn serve_image(
     format: ImageFormat,
     req_width: Option<u32>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // B85 — accept the dashed synth/person id the kotlin SDK (Android TV) sends:
+    // person + Series/Season image resolution below compares the raw id to the
+    // dashless stored hash, so a dashed id 404'd all show/person artwork.
+    let canonical = crate::api::jellyfin::items::canonical_wire_id(id_str);
+    let id_str: &str = canonical.as_ref();
     let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
     };
