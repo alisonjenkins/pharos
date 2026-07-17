@@ -1810,6 +1810,12 @@ pub enum SortKey {
     AlbumArtist,
     /// `IndexNumber` — the episode number (`episode_number`).
     IndexNumber,
+    /// `ParentIndexNumber` for an EPISODE — the season number
+    /// (`season_number`). Distinct from [`SortKey::DiscNumber`], which is the
+    /// audio `ParentIndexNumber` (disc). The `SortBy=ParentIndexNumber` token
+    /// is type-overloaded in Jellyfin (season for episodes, disc for tracks);
+    /// the API picks the column by the query's kind/parent (B87).
+    SeasonNumber,
     /// Stable id order — the implicit final tiebreak on every sort, and the
     /// key for "no explicit sort" callers.
     Id,

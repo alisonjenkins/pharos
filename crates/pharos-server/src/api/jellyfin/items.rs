@@ -4020,13 +4020,42 @@ fn build_media_query(
             }
         }
         SortPrimary::TrackOrder => {
-            // Disc, then track, then name — the album track listing.
-            // Untagged rows (NULL disc/track) sort AFTER tagged ones in
-            // SQLite ASC? No — NULLs sort FIRST in SQLite ASC, LAST in
-            // Postgres ASC by default. The builder's expression is used
-            // verbatim, so accept the minor backend divergence for
-            // untagged rows: tagged albums order identically on both.
-            if descending {
+            // `SortBy=ParentIndexNumber,IndexNumber` is TYPE-OVERLOADED in
+            // Jellyfin: for an EPISODE it means (season, episode); for an
+            // AUDIO track it means (disc, track). The Android TV kotlin SDK
+            // sends this exact token for a season's episode list — mapping it
+            // to the audio disc/track columns (NULL for episodes) collapsed
+            // every episode to the Name/Id tiebreak, so a season came back
+            // alphabetised-by-title / hash-ordered, not by episode number
+            // (B87). Pick the column family by the query's kind/parent.
+            let episode_scoped = mq.kinds.iter().any(|k| matches!(k, MediaKind::Episode))
+                || matches!(
+                    mq.parent,
+                    Some(
+                        pharos_core::ParentFilter::Series { .. }
+                            | pharos_core::ParentFilter::Season { .. }
+                    )
+                );
+            // Untagged rows (NULL disc/track/season) sort FIRST in SQLite ASC,
+            // LAST in Postgres ASC — the builder emits the column verbatim, so
+            // accept the minor backend divergence for untagged rows; tagged
+            // rows order identically on both.
+            if episode_scoped {
+                if descending {
+                    vec![
+                        (SortKey::SeasonNumber, SortDir::Desc),
+                        (SortKey::IndexNumber, SortDir::Desc),
+                        (SortKey::Name, SortDir::Desc),
+                        (SortKey::Id, SortDir::Desc),
+                    ]
+                } else {
+                    vec![
+                        (SortKey::SeasonNumber, SortDir::Asc),
+                        (SortKey::IndexNumber, SortDir::Asc),
+                        (SortKey::Name, SortDir::Asc),
+                    ]
+                }
+            } else if descending {
                 vec![
                     (SortKey::DiscNumber, SortDir::Desc),
                     (SortKey::TrackNumber, SortDir::Desc),
@@ -6174,5 +6203,88 @@ mod alpha_picker_tests {
         assert!(name_matches_letter("3%", "#"));
         assert!(name_matches_letter("[REC]", "#"));
         assert!(!name_matches_letter("Angel", "#"));
+    }
+}
+
+/// B87 — `SortBy=ParentIndexNumber,IndexNumber` is type-overloaded: season
+/// then episode for EPISODES, disc then track for AUDIO tracks. The Android TV
+/// kotlin SDK sends this exact token for a season's episode list; mapping it to
+/// the audio disc/track columns (NULL for episodes) collapsed every episode to
+/// the title/id tiebreak — episodes came back alphabetised, not in air order.
+/// These guard that `build_media_query` picks the column family by kind/parent.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod episode_sort_tests {
+    use super::{build_media_query, ListQuery, ParentResolution};
+    use pharos_core::{ParentFilter, SortKey, UserId};
+
+    fn list_query(json: serde_json::Value) -> ListQuery {
+        serde_json::from_value(json).expect("valid ListQuery")
+    }
+
+    fn sort_keys(q: &ListQuery, parent: &ParentResolution) -> Vec<SortKey> {
+        let mq = build_media_query(UserId::new(), q, parent, false);
+        mq.sort.into_iter().map(|(k, _)| k).collect()
+    }
+
+    // The exact token the Android TV SDK sends for a season episode list.
+    const EPISODE_SORTBY: &str = "ParentIndexNumber,IndexNumber,SortName";
+
+    #[test]
+    fn episode_sortby_uses_season_then_episode_when_kind_is_episode() {
+        let q = list_query(serde_json::json!({
+            "sort_by": EPISODE_SORTBY,
+            "include_item_types": "Episode",
+        }));
+        let keys = sort_keys(&q, &ParentResolution::All);
+        assert_eq!(
+            &keys[..2],
+            &[SortKey::SeasonNumber, SortKey::IndexNumber],
+            "episodes must sort by (season, episode), not the audio disc/track columns: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&SortKey::DiscNumber) && !keys.contains(&SortKey::TrackNumber),
+            "episode sort must not touch the audio disc/track columns: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn episode_sortby_uses_season_then_episode_for_a_season_parent() {
+        // `/Items?parentId=<seasonId>` resolves to a Season pivot even without
+        // an explicit IncludeItemTypes — the parent alone must select episode
+        // ordering.
+        let q = list_query(serde_json::json!({ "sort_by": EPISODE_SORTBY }));
+        let parent = ParentResolution::Filter(ParentFilter::Season {
+            folder: None,
+            name: "Buffy".into(),
+            season: 2,
+        });
+        let keys = sort_keys(&q, &parent);
+        assert_eq!(
+            &keys[..2],
+            &[SortKey::SeasonNumber, SortKey::IndexNumber],
+            "a Season parent must order by (season, episode): {keys:?}"
+        );
+    }
+
+    #[test]
+    fn track_order_still_uses_disc_then_track_for_audio() {
+        // Regression guard: the SAME token in an album context must keep the
+        // audio disc/track ordering.
+        let q = list_query(serde_json::json!({
+            "sort_by": EPISODE_SORTBY,
+            "include_item_types": "Audio",
+        }));
+        let keys = sort_keys(
+            &q,
+            &ParentResolution::Filter(ParentFilter::Album {
+                name: "Album".into(),
+            }),
+        );
+        assert_eq!(
+            &keys[..2],
+            &[SortKey::DiscNumber, SortKey::TrackNumber],
+            "audio tracks must keep (disc, track) ordering: {keys:?}"
+        );
     }
 }
