@@ -1299,6 +1299,27 @@ pub struct MediaProbe {
     /// `ProductionYear`; drives the PremiereDate/ProductionYear album sort.
     #[serde(default)]
     pub year: Option<u32>,
+    /// B90 — embedded long-form synopsis (`synopsis`/`description`/`comment`/
+    /// `plot`/`summary` container tag) → the `embedded` metadata provider maps
+    /// it to Jellyfin `Overview` for files without a sidecar NFO. None when the
+    /// container carries no such tag. Defaulted so pre-B90 rows deserialise.
+    #[serde(default)]
+    pub synopsis: Option<String>,
+    /// B90 — embedded parental/content rating (`content_rating`/`rating`/
+    /// `mpaa`/`icra` tag) → `OfficialRating`. Defaulted for pre-B90 rows.
+    #[serde(default)]
+    pub content_rating: Option<String>,
+    /// B90 — embedded network / publisher / studio (`network`/`publisher`/
+    /// `studio` tag) → the `Studios` array. Defaulted for pre-B90 rows.
+    #[serde(default)]
+    pub network: Option<String>,
+    /// B90 — the full raw release/air date string (`date`/`originaldate`/
+    /// `creation_time` tag, e.g. `2003-09-22`) BEFORE it is reduced to `year`.
+    /// The `embedded` provider parses a full `YYYY-MM-DD` into Jellyfin
+    /// `PremiereDate`; a year-only value leaves PremiereDate unset. Defaulted
+    /// for pre-B90 rows.
+    #[serde(default)]
+    pub release_date: Option<String>,
     /// Embedded chapter markers extracted by ffprobe `-show_chapters`.
     /// Each entry's `start_ms` lands on Jellyfin's `Chapters[].StartPositionTicks`.
     pub chapters: Vec<MediaChapter>,
@@ -1578,7 +1599,13 @@ pub struct ScanState {
 // the filename stem) and `year` now prefers the original-release tag
 // (ID3 `TDOR` / Vorbis `ORIGINALDATE`) over the reissue `date` — re-probe
 // so music rows get real per-track names + original years.
-pub const PROBE_SCHEMA_VERSION: i64 = 3;
+// v4 (B90): the prober now extracts embedded descriptive tags —
+// `synopsis`/`description`/`comment` → synopsis, `content_rating`/`rating` →
+// content_rating, `network`/`publisher` → network, and the full raw
+// `release_date` — feeding the new `embedded` metadata provider (Overview /
+// OfficialRating / Studios / PremiereDate for sidecar-less files). Re-probe so
+// existing movie/episode rows pick up their embedded descriptions.
+pub const PROBE_SCHEMA_VERSION: i64 = 4;
 
 /// T86/ADR-0018 — bump when the intro/outro detection ALGORITHM changes in a
 /// way that invalidates stored segments or fingerprints. A season whose stored

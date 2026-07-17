@@ -272,6 +272,47 @@ struct FfprobeFormatTags {
         alias = "ORIGINALYEAR"
     )]
     original_date: Option<String>,
+    /// B90 — embedded long-form description → `Overview`.
+    #[serde(
+        default,
+        alias = "SYNOPSIS",
+        alias = "description",
+        alias = "DESCRIPTION",
+        alias = "comment",
+        alias = "COMMENT",
+        alias = "plot",
+        alias = "PLOT",
+        alias = "summary",
+        alias = "SUMMARY"
+    )]
+    synopsis: Option<String>,
+    /// B90 — embedded parental/content rating → `OfficialRating`.
+    #[serde(
+        default,
+        alias = "CONTENT_RATING",
+        alias = "rating",
+        alias = "RATING",
+        alias = "mpaa",
+        alias = "MPAA",
+        alias = "law_rating",
+        alias = "LAW_RATING",
+        alias = "icra"
+    )]
+    content_rating: Option<String>,
+    /// B90 — embedded network / publisher / studio → `Studios`.
+    #[serde(
+        default,
+        alias = "NETWORK",
+        alias = "publisher",
+        alias = "PUBLISHER",
+        alias = "studio",
+        alias = "STUDIO",
+        alias = "TVNetworkName"
+    )]
+    network: Option<String>,
+    /// B90 — MP4/Matroska container creation date, a `date` fallback.
+    #[serde(default, alias = "creation_time")]
+    creation_time: Option<String>,
 }
 
 /// Parse the leading unsigned integer of a `track`/`disc` tag ("3", "3/12").
@@ -480,6 +521,28 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
                 .as_deref()
                 .and_then(leading_year)
                 .or_else(|| parsed.format.tags.date.as_deref().and_then(leading_year)),
+            synopsis: parsed.format.tags.synopsis.filter(|s| !s.trim().is_empty()),
+            content_rating: parsed
+                .format
+                .tags
+                .content_rating
+                .filter(|s| !s.trim().is_empty()),
+            network: parsed.format.tags.network.filter(|s| !s.trim().is_empty()),
+            // Full raw date for PremiereDate; prefer original release, then the
+            // plain date, then the container creation_time.
+            release_date: parsed
+                .format
+                .tags
+                .original_date
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| parsed.format.tags.date.filter(|s| !s.trim().is_empty()))
+                .or_else(|| {
+                    parsed
+                        .format
+                        .tags
+                        .creation_time
+                        .filter(|s| !s.trim().is_empty())
+                }),
             chapters,
             // P34 — alternate editions enrichment lives in a
             // future scanner pass (sibling-file convention reader

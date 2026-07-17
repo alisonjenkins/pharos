@@ -629,7 +629,9 @@ fn normalise_certification(text: &str) -> String {
 /// Parse a Kodi date (`YYYY-MM-DD`, optionally with a time) into
 /// unix-seconds (UTC midnight of that date). Pure integer arithmetic — no
 /// chrono dependency. Returns `None` on an unparseable / out-of-range date.
-fn parse_date_unix(text: &str) -> Option<i64> {
+/// `pub(crate)` so the `embedded` provider reuses it for a container's raw
+/// `release_date` tag (B90).
+pub(crate) fn parse_date_unix(text: &str) -> Option<i64> {
     // Take the date portion before any whitespace/`T`.
     let date = text.split(|c: char| c == 'T' || c.is_whitespace()).next()?;
     let mut parts = date.split(['-', '/', '.']);

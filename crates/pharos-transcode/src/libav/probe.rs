@@ -165,6 +165,15 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
                 .as_deref()
                 .and_then(leading_year)
                 .or_else(|| ftags.date.as_deref().and_then(leading_year)),
+            synopsis: ftags.synopsis.filter(|s| !s.trim().is_empty()),
+            content_rating: ftags.content_rating.filter(|s| !s.trim().is_empty()),
+            network: ftags.network.filter(|s| !s.trim().is_empty()),
+            // Full raw date for PremiereDate (year-only values are handled by
+            // the provider). Prefer the original-release date over a reissue.
+            release_date: ftags
+                .original_date
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| ftags.date.filter(|s| !s.trim().is_empty())),
             chapters,
             alternate_sources: Vec::new(),
         },
@@ -280,6 +289,12 @@ struct FormatTags {
     date: Option<String>,
     /// Original-release date (ID3 `TDOR`/`TORY`, Vorbis `ORIGINALDATE`).
     original_date: Option<String>,
+    /// B90 — embedded long-form description → `Overview`.
+    synopsis: Option<String>,
+    /// B90 — embedded parental/content rating → `OfficialRating`.
+    content_rating: Option<String>,
+    /// B90 — embedded network / publisher / studio → `Studios`.
+    network: Option<String>,
 }
 
 fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
@@ -300,7 +315,7 @@ fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
         genre: get("genre", &["GENRE", "Genre"]),
         track: get("track", &["TRACK", "Track", "track_number"]),
         disc: get("disc", &["DISC", "Disc", "disc_number", "DISCNUMBER"]),
-        date: get("date", &["DATE", "Date", "year", "YEAR"]),
+        date: get("date", &["DATE", "Date", "year", "YEAR", "creation_time"]),
         original_date: get(
             "originaldate",
             &[
@@ -309,6 +324,49 @@ fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
                 "ORIGINALYEAR",
                 "TDOR",
                 "TORY",
+            ],
+        ),
+        // B90 — descriptive tags for video (movies/episodes). Containers vary:
+        // Matroska uses SYNOPSIS/DESCRIPTION/COMMENT, MP4/iTunes uses
+        // `synopsis`/`description`/`comment`, some rippers only fill `comment`.
+        synopsis: get(
+            "synopsis",
+            &[
+                "SYNOPSIS",
+                "description",
+                "DESCRIPTION",
+                "comment",
+                "COMMENT",
+                "plot",
+                "PLOT",
+                "summary",
+                "SUMMARY",
+            ],
+        ),
+        // Parental rating: Matroska `LAW_RATING`, MP4 iTunes `rating`/`mpaa`,
+        // ICRA. Kept as the raw string (e.g. "PG-13", "TV-14").
+        content_rating: get(
+            "content_rating",
+            &[
+                "CONTENT_RATING",
+                "rating",
+                "RATING",
+                "mpaa",
+                "MPAA",
+                "law_rating",
+                "LAW_RATING",
+                "icra",
+            ],
+        ),
+        network: get(
+            "network",
+            &[
+                "NETWORK",
+                "publisher",
+                "PUBLISHER",
+                "studio",
+                "STUDIO",
+                "TVNetworkName",
             ],
         ),
     }
