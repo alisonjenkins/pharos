@@ -31,7 +31,77 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/users/{user_id}/favoriteitems/{item_id}",
         web::delete().to(unmark_favorite),
+    )
+    // B84 — the userId-less variants the modern jellyfin-sdk-kotlin (Android
+    // TV / Google TV) calls: the user is the bearer, no `{userId}` segment.
+    // Without these a "mark watched" POST hit no route, and the SDK CRASHED
+    // the app trying to deserialize the error response as a UserItemDataDto.
+    .route("/userplayeditems/{item_id}", web::post().to(mark_played_me))
+    .route(
+        "/userplayeditems/{item_id}",
+        web::delete().to(unmark_played_me),
+    )
+    .route(
+        "/userfavoriteitems/{item_id}",
+        web::post().to(mark_favorite_me),
+    )
+    .route(
+        "/userfavoriteitems/{item_id}",
+        web::delete().to(unmark_favorite_me),
     );
+}
+
+/// The four UserData mutations, shared by the legacy `/Users/{userId}/…`
+/// routes and the modern userId-less `/UserPlayedItems|UserFavoriteItems/…`
+/// routes so the two families can never drift.
+fn op_mark_played(d: &mut UserItemData) {
+    d.played = true;
+    d.play_count = d.play_count.saturating_add(1);
+    d.last_played_position_ticks = 0;
+    d.last_played_at = now_unix();
+}
+fn op_unmark_played(d: &mut UserItemData) {
+    d.played = false;
+}
+fn op_mark_favorite(d: &mut UserItemData) {
+    d.is_favorite = true;
+}
+fn op_unmark_favorite(d: &mut UserItemData) {
+    d.is_favorite = false;
+}
+
+/// `POST /UserPlayedItems/{itemId}` — mark played for the bearer (no path
+/// userId). Same body shape (UserItemDataDto) as the legacy route.
+async fn mark_played_me(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    mutate(&state, user.0.id, &path.into_inner(), op_mark_played).await
+}
+
+async fn unmark_played_me(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    mutate(&state, user.0.id, &path.into_inner(), op_unmark_played).await
+}
+
+async fn mark_favorite_me(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    mutate(&state, user.0.id, &path.into_inner(), op_mark_favorite).await
+}
+
+async fn unmark_favorite_me(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    mutate(&state, user.0.id, &path.into_inner(), op_unmark_favorite).await
 }
 
 async fn mark_played(
@@ -41,13 +111,7 @@ async fn mark_played(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, |d| {
-        d.played = true;
-        d.play_count = d.play_count.saturating_add(1);
-        d.last_played_position_ticks = 0;
-        d.last_played_at = now_unix();
-    })
-    .await
+    mutate(&state, user.0.id, &item_id, op_mark_played).await
 }
 
 async fn unmark_played(
@@ -57,10 +121,7 @@ async fn unmark_played(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, |d| {
-        d.played = false;
-    })
-    .await
+    mutate(&state, user.0.id, &item_id, op_unmark_played).await
 }
 
 async fn mark_favorite(
@@ -70,10 +131,7 @@ async fn mark_favorite(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, |d| {
-        d.is_favorite = true;
-    })
-    .await
+    mutate(&state, user.0.id, &item_id, op_mark_favorite).await
 }
 
 async fn unmark_favorite(
@@ -83,10 +141,7 @@ async fn unmark_favorite(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, |d| {
-        d.is_favorite = false;
-    })
-    .await
+    mutate(&state, user.0.id, &item_id, op_unmark_favorite).await
 }
 
 fn require_bearer_match(user: &AuthUser, uid_path: &str) -> Result<(), actix_web::Error> {

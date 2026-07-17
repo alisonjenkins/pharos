@@ -84,6 +84,43 @@ async fn mark_played_sets_played_and_increments_count() {
 }
 
 #[actix_web::test]
+async fn userid_less_played_endpoint_marks_and_returns_dto() {
+    // B84 — the modern jellyfin-sdk-kotlin (Android TV / Google TV) calls the
+    // userId-less POST /UserPlayedItems/{id}; the user is the bearer. Missing
+    // this route 404'd and CRASHED the app on the error response. The id
+    // arrives as a dashed UUID (the SDK re-serialises ids dashed), so exercise
+    // that exact shape.
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    // 300 -> canonical dashless is 16 zeros + 000000000000012c; dashed form:
+    let dashed = "00000000-0000-0000-0000-00000000012c";
+    let req = test::TestRequest::post()
+        .uri(&format!("/UserPlayedItems/{dashed}"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Played"], true, "userId-less mark-played must succeed");
+    assert_eq!(v["PlayCount"], 1);
+    // DELETE unmarks via the same userId-less route.
+    let req = test::TestRequest::delete()
+        .uri("/UserPlayedItems/300")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Played"], false);
+    // Favourite variant too.
+    let req = test::TestRequest::post()
+        .uri("/UserFavoriteItems/302")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["IsFavorite"], true);
+}
+
+#[actix_web::test]
 async fn mark_played_is_idempotent_after_unmark() {
     let (state, token, uid) = seed().await;
     let app = test::init_service(build_app(state)).await;
