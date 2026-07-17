@@ -1690,8 +1690,10 @@ async fn shows_seasons(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // One representative SeriesInfo per season number (BTreeMap → ascending).
+    // One representative SeriesInfo per season number (BTreeMap → ascending),
+    // plus the episode count per season (B93 — the Season DTO's ChildCount).
     let mut seasons: BTreeMap<u32, &pharos_core::SeriesInfo> = BTreeMap::new();
+    let mut episode_counts: BTreeMap<u32, u32> = BTreeMap::new();
     for item in all.iter() {
         if !matches!(item.kind, MediaKind::Episode) {
             continue;
@@ -1706,10 +1708,19 @@ async fn shows_seasons(
             continue;
         };
         seasons.entry(n).or_insert(series);
+        *episode_counts.entry(n).or_insert(0) += 1;
     }
     let items: Vec<serde_json::Value> = seasons
         .iter()
-        .map(|(n, series)| season_dto(&state.server_id, series, *n, &season_display_name(*n)))
+        .map(|(n, series)| {
+            season_dto(
+                &state.server_id,
+                series,
+                *n,
+                &season_display_name(*n),
+                episode_counts.get(n).copied().unwrap_or(0),
+            )
+        })
         .collect();
     let total = items.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
@@ -4958,6 +4969,26 @@ async fn maybe_list_virtual_shows(
         .as_deref()
         .is_some_and(|o| o.eq_ignore_ascii_case("Descending"));
 
+    // B93 — child / recursive counts per key so the Series/Season folder DTOs
+    // advertise ChildCount (a series' seasons, a season's episodes). Computed
+    // over the FULL episode set (independent of the A-Z letter filter, which
+    // only decides which tiles show).
+    use std::collections::{HashMap, HashSet};
+    let mut series_seasons: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut series_eps: HashMap<String, u32> = HashMap::new();
+    let mut season_eps: HashMap<u32, u32> = HashMap::new();
+    for ep in &episodes {
+        let Some(series) = ep.series.as_ref() else {
+            continue;
+        };
+        let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+        *series_eps.entry(skey.clone()).or_insert(0) += 1;
+        if let Some(sn) = series.season_number {
+            series_seasons.entry(skey).or_default().insert(sn);
+            *season_eps.entry(sn).or_insert(0) += 1;
+        }
+    }
+
     // Build one representative DTO per distinct key, name-sorted.
     let mut reps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     match mode {
@@ -4973,16 +5004,19 @@ async fn maybe_list_virtual_shows(
                         continue;
                     }
                 }
+                let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
                 // Sort key: lowercase name for a stable case-insensitive order,
                 // with the folder-keyed id appended so same-name shows in
                 // distinct folders stay separate tiles.
-                let sort_key = format!(
-                    "{}\u{0}{}",
-                    series.series_name.to_ascii_lowercase(),
-                    series_id_for_key(series.series_folder.as_deref(), &series.series_name),
-                );
-                reps.entry(sort_key)
-                    .or_insert_with(|| series_dto(&state.server_id, series));
+                let sort_key = format!("{}\u{0}{}", series.series_name.to_ascii_lowercase(), skey);
+                let season_count = series_seasons
+                    .get(&skey)
+                    .map(|s| s.len() as u32)
+                    .unwrap_or(0);
+                let episode_count = series_eps.get(&skey).copied().unwrap_or(0);
+                reps.entry(sort_key).or_insert_with(|| {
+                    series_dto(&state.server_id, series, season_count, episode_count)
+                });
             }
         }
         ShowFolderKind::Season => {
@@ -4995,12 +5029,14 @@ async fn maybe_list_virtual_shows(
                 };
                 // Zero-padded season number → ascending numeric order.
                 let sort_key = format!("{season_n:06}");
+                let episode_count = season_eps.get(&season_n).copied().unwrap_or(0);
                 reps.entry(sort_key).or_insert_with(|| {
                     season_dto(
                         &state.server_id,
                         series,
                         season_n,
                         &season_display_name(season_n),
+                        episode_count,
                     )
                 });
             }
@@ -5043,7 +5079,29 @@ async fn synth_series_or_season(
             continue;
         };
         if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
-            return Ok(Some(series_dto(&state.server_id, series)));
+            // B93 — count the series' distinct seasons + total episodes so the
+            // detail DTO advertises ChildCount / RecursiveItemCount.
+            let mut seasons = std::collections::HashSet::new();
+            let mut episode_count = 0u32;
+            for e in all.iter() {
+                let Some(s) = e.series.as_ref() else {
+                    continue;
+                };
+                if matches!(e.kind, MediaKind::Episode)
+                    && series_id_for_key(s.series_folder.as_deref(), &s.series_name) == id_str
+                {
+                    episode_count += 1;
+                    if let Some(sn) = s.season_number {
+                        seasons.insert(sn);
+                    }
+                }
+            }
+            return Ok(Some(series_dto(
+                &state.server_id,
+                series,
+                seasons.len() as u32,
+                episode_count,
+            )));
         }
     }
     // Then: season match. We need (folder/series, season_number) so
@@ -5061,18 +5119,39 @@ async fn synth_series_or_season(
             season_n,
         ) == id_str
         {
+            // B93 — episodes in this season → the Season DTO's ChildCount.
+            let episode_count = all
+                .iter()
+                .filter(|e| {
+                    e.series
+                        .as_ref()
+                        .and_then(|s| {
+                            s.season_number.map(|n| {
+                                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n)
+                            })
+                        })
+                        .as_deref()
+                        == Some(id_str)
+                })
+                .count() as u32;
             return Ok(Some(season_dto(
                 &state.server_id,
                 series,
                 season_n,
                 &season_display_name(season_n),
+                episode_count,
             )));
         }
     }
     Ok(None)
 }
 
-fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::Value {
+fn series_dto(
+    server_id: &str,
+    series: &pharos_core::SeriesInfo,
+    season_count: u32,
+    episode_count: u32,
+) -> serde_json::Value {
     use crate::api::jellyfin::dto::series_id_for_key;
     let id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
     // Advertise a Primary + Thumb tag so jellyfin-web requests the poster.
@@ -5108,6 +5187,11 @@ fn series_dto(server_id: &str, series: &pharos_core::SeriesInfo) -> serde_json::
         backdrop_image_tags: vec![id.clone()],
         provider_ids: std::collections::BTreeMap::new(),
         production_year: series.series_year.map(|y| y as i32),
+        // B93 — a series' direct children are its seasons; recursive = episodes.
+        // Without ChildCount the Android TV app treats the show as empty.
+        child_count: Some(season_count),
+        recursive_item_count: Some(episode_count),
+        parent_id: None,
         id,
     })
     .unwrap_or(serde_json::Value::Null)
@@ -5118,6 +5202,7 @@ fn season_dto(
     series: &pharos_core::SeriesInfo,
     season_number: u32,
     season_name: &str,
+    episode_count: u32,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
     let id = season_id_for_key(
@@ -5153,6 +5238,15 @@ fn season_dto(
         backdrop_image_tags: Vec::new(),
         provider_ids: std::collections::BTreeMap::new(),
         production_year: None,
+        // B93 — a season's children are its episodes (ChildCount ==
+        // RecursiveItemCount); ParentId links back to the series. The Android TV
+        // app skips the episode fetch when a season advertises no ChildCount.
+        child_count: Some(episode_count),
+        recursive_item_count: Some(episode_count),
+        parent_id: Some(series_id_for_key(
+            series.series_folder.as_deref(),
+            &series.series_name,
+        )),
         id,
     })
     .unwrap_or(serde_json::Value::Null)

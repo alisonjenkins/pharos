@@ -622,6 +622,19 @@ pub struct SeriesFolderDto {
     pub provider_ids: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub production_year: Option<i32>,
+    /// B93 — child / recursive counts + parent link. Real Jellyfin advertises
+    /// these on Series and Season folders. The Android TV (Google TV) app treats
+    /// a Season carrying no `ChildCount` as childless and NEVER fetches its
+    /// episodes — the season list opens empty. jellyfin-web queries
+    /// `/Shows/{id}/Episodes` directly regardless, so it was unaffected.
+    /// `ChildCount` = direct children (a season's episodes / a series' seasons);
+    /// `RecursiveItemCount` = total episodes underneath.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive_item_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 impl SynthItemDto {
