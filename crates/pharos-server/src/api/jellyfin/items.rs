@@ -3469,6 +3469,42 @@ enum ParentResolution {
     Empty,
 }
 
+/// Canonicalise a client-supplied `ParentId` to pharos's stored wire form.
+///
+/// pharos emits every id in the dashless 32-hex shape [`library_id_for_root`]
+/// and the synth-id hashers produce. jellyfin-web echoes that shape back
+/// verbatim, but jellyfin-sdk-kotlin (Android TV) round-trips every id through
+/// a `Uuid` type and re-serialises it dashed
+/// (`6dcaebce-be81-6e0b-6dca-ebcebe816e0b`). Every id comparison in the parent
+/// resolvers is against the dashless stored form, so a dashed id matches
+/// nothing and the browse falls to `Empty` — a blank "Movies" / "TV Shows"
+/// grid on Android TV while jellyfin-web works (B82). Strip the dashes of a
+/// canonical 8-4-4-4-12 hex UUID and lowercase; leave every other shape
+/// (dashless hex, legacy decimal, non-id garbage) untouched so no other branch
+/// changes behaviour.
+fn canonical_parent_id(pid: &str) -> std::borrow::Cow<'_, str> {
+    let b = pid.as_bytes();
+    let dashed_uuid = b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && pid
+            .bytes()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit());
+    if dashed_uuid {
+        std::borrow::Cow::Owned(
+            pid.chars()
+                .filter(|&c| c != '-')
+                .map(|c| c.to_ascii_lowercase())
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(pid)
+    }
+}
+
 /// LIB-B2 — resolve a `?ParentId=` to a [`ParentResolution`] WITHOUT loading
 /// the item set. Mirrors the branch order of the legacy `restrict_to_parent`:
 /// library → series → season → artist → album → genre → person → studio →
@@ -3488,6 +3524,10 @@ async fn resolve_parent_filter(
     let Some(pid) = parent_id else {
         return Ok(ParentResolution::All);
     };
+    // B82 — accept the dashed UUID the kotlin SDK re-emits, not just the
+    // dashless form jellyfin-web echoes.
+    let canonical = canonical_parent_id(pid);
+    let pid: &str = canonical.as_ref();
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return Ok(ParentResolution::All);
     }
@@ -4187,6 +4227,10 @@ async fn restrict_to_parent(
     let Some(pid) = parent_id else {
         return items.to_vec();
     };
+    // B82 — accept the dashed UUID the kotlin SDK re-emits, not just the
+    // dashless form jellyfin-web echoes.
+    let canonical = canonical_parent_id(pid);
+    let pid: &str = canonical.as_ref();
     if pid.is_empty() || pid == "00000000000000000000000000000000" {
         return items.to_vec();
     }
@@ -5947,6 +5991,50 @@ mod browser_matroska_fallback_tests {
         assert!(!browser_matroska_direct_unplayable(
             true, false, true, true, false
         ));
+    }
+}
+
+#[cfg(test)]
+mod canonical_parent_id_tests {
+    use super::canonical_parent_id;
+
+    #[test]
+    fn dashed_uuid_is_stripped_and_lowercased() {
+        // The Android TV / kotlin-SDK shape (B82): dashed UUID → dashless
+        // 32-hex, matching the wire_id pharos stores.
+        assert_eq!(
+            canonical_parent_id("6dcaebce-be81-6e0b-6dca-ebcebe816e0b"),
+            "6dcaebcebe816e0b6dcaebcebe816e0b"
+        );
+        // Uppercase dashed → lowercase dashless.
+        assert_eq!(
+            canonical_parent_id("6DCAEBCE-BE81-6E0B-6DCA-EBCEBE816E0B"),
+            "6dcaebcebe816e0b6dcaebcebe816e0b"
+        );
+        // The dashed all-media placeholder normalises to the dashless sentinel.
+        assert_eq!(
+            canonical_parent_id("00000000-0000-0000-0000-000000000000"),
+            "00000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn non_dashed_shapes_pass_through_untouched() {
+        // jellyfin-web's dashless form — must NOT change (borrowed, not owned).
+        for s in [
+            "6dcaebcebe816e0b6dcaebcebe816e0b",   // dashless 32-hex
+            "00000000000000000000000000000000",   // all-media placeholder
+            "deadbeefdeadbeefdeadbeefdeadbeef",   // unknown dashless id
+            "12345",                              // legacy decimal id
+            "not-a-uuid-but-has-some-dashes-xx",  // wrong length / non-hex
+            "gggggggg-gggg-gggg-gggg-gggggggggg", // 36 chars, dashes right, non-hex
+        ] {
+            assert_eq!(canonical_parent_id(s), s, "{s} must be untouched");
+            assert!(
+                matches!(canonical_parent_id(s), std::borrow::Cow::Borrowed(_)),
+                "{s} must not allocate"
+            );
+        }
     }
 }
 

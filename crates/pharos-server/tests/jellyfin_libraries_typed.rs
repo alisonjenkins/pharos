@@ -181,6 +181,46 @@ async fn parent_id_library_resolves_only_that_librarys_items() {
     assert_eq!(titles, vec!["item-2"]);
 }
 
+/// B82 — the Android TV client (jellyfin-sdk-kotlin) round-trips every id
+/// through a `Uuid` and sends `ParentId` back **dashed**. pharos stores the
+/// dashless 32-hex wire_id, so a raw string compare missed it and the library
+/// grid came back empty while jellyfin-web (which echoes the dashless form)
+/// worked. The dashed id must resolve to exactly the same items as the
+/// dashless one.
+#[actix_web::test]
+async fn parent_id_dashed_uuid_resolves_same_as_dashless() {
+    let (state, token) = seed().await;
+    let movies = library_id_for_root(std::path::Path::new("/media/movies"));
+    assert_eq!(movies.len(), 32, "wire_id is dashless 32-hex");
+    // Re-serialise as the 8-4-4-4-12 dashed UUID the kotlin SDK emits.
+    let dashed = format!(
+        "{}-{}-{}-{}-{}",
+        &movies[0..8],
+        &movies[8..12],
+        &movies[12..16],
+        &movies[16..20],
+        &movies[20..32],
+    );
+    let v = get_json(
+        state,
+        &token,
+        &format!("/Items?ParentId={dashed}&Limit=100"),
+    )
+    .await;
+    let titles: Vec<&str> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["item-1"],
+        "dashed ParentId must resolve the Movies library, not an empty grid"
+    );
+    assert_eq!(v["TotalRecordCount"].as_u64(), Some(1));
+}
+
 #[actix_web::test]
 async fn single_root_legacy_config_still_works_without_libraries() {
     // The legacy path: no typed libraries wired, only media_roots → one
