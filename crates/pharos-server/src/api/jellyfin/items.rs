@@ -500,13 +500,15 @@ fn default_similar_limit() -> u32 {
 }
 
 /// `GET /Items/{id}/Similar` — "more like this" for the item-detail
-/// view. Heuristic, ordered by overlap score:
+/// view. Heuristic, ordered by overlap score. An item must share a REAL
+/// signal (same series / album / album_artist / genre / parent folder) to
+/// appear — same media-kind alone is only a tiebreak, never a qualifier, so
+/// a thin-metadata library returns a short/empty rail rather than an
+/// alphabetical dump of unrelated content (B83).
 ///
-/// - Episode → other episodes in the same Series (excluding self),
-///   then other episodes period.
+/// - Episode → other episodes in the same Series (excluding self).
 /// - Audio → tracks sharing album → album_artist → genre.
-/// - Movie → other Movies tagged with the same genre, falling
-///   through to other Movies sorted by title.
+/// - Movie → other Movies sharing a genre or the same folder/category.
 async fn items_similar(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -793,9 +795,26 @@ fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
             s += 20;
         }
     }
-    // Same kind — weak signal but stops Movies surfacing as similar
-    // to Audio tracks when no other field overlaps.
-    if target.kind == candidate.kind {
+    // Same immediate parent directory — in a mixed single-root library the
+    // user's folder layout is the most reliable "same content group" signal
+    // pharos has (movie files rarely carry embedded genre metadata). Two
+    // items sharing a folder (a film's parts/extras, or a flat category
+    // directory like `…/Movies/*`) are genuinely related; an unrelated
+    // `…/Training/*` clip is not. B83 — this keeps "More Like This" inside
+    // the target's category instead of leaking across it.
+    if let (Some(t), Some(c)) = (target.path.parent(), candidate.path.parent()) {
+        if !t.as_os_str().is_empty() && t == c {
+            s += 15;
+        }
+    }
+    // Same kind is a TIEBREAK, never a qualifier. A bare same-kind match
+    // (Movie vs Movie with no shared series/genre/folder) previously scored
+    // 5 and passed the `>0` gate in `items_similar`, turning "More Like This"
+    // into an alphabetical dump of every same-kind item in the library — a
+    // Movies film surfaced unrelated AWS training videos (B83). Only nudge
+    // items that ALREADY share a real signal so ties sort kind-first; an item
+    // with no real overlap stays at 0 and is filtered out.
+    if s > 0 && target.kind == candidate.kind {
         s = s.saturating_add(5);
     }
     s
@@ -6035,6 +6054,53 @@ mod canonical_parent_id_tests {
                 "{s} must not allocate"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod similarity_score_tests {
+    use super::similarity_score;
+    use pharos_core::{MediaItem, MediaKind};
+
+    fn movie(id: u64, path: &str, genre: Option<&str>) -> MediaItem {
+        let mut it = MediaItem {
+            id,
+            path: path.into(),
+            title: format!("m{id}"),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        it.probe.genre = genre.map(str::to_string);
+        it
+    }
+
+    #[test]
+    fn same_kind_alone_does_not_qualify() {
+        // B83 — "Back to the Future" vs an AWS training clip: both Movie kind,
+        // different folders, no shared genre. Must score 0 so it never appears
+        // in "More Like This" (the `>0` gate in items_similar drops it).
+        let bttf = movie(1, "/media/Movies/Back to the Future (1985)/bttf.mkv", None);
+        let aws = movie(2, "/media/Training/aws-intro/lesson1.mp4", None);
+        assert_eq!(similarity_score(&bttf, &aws), 0);
+    }
+
+    #[test]
+    fn shared_genre_qualifies_and_beats_same_folder() {
+        let bttf = movie(1, "/media/Movies/bttf.mkv", Some("Adventure"));
+        let other = movie(2, "/media/Movies/goonies.mkv", Some("Adventure"));
+        // genre(20) + same parent dir /media/Movies (15) + same-kind tiebreak(5).
+        assert_eq!(similarity_score(&bttf, &other), 40);
+    }
+
+    #[test]
+    fn same_folder_alone_qualifies() {
+        // Flat category layout, no genre metadata: co-located films still
+        // cluster (folder 15 + kind tiebreak 5), unrelated folders do not.
+        let a = movie(1, "/media/Movies/a.mkv", None);
+        let b = movie(2, "/media/Movies/b.mkv", None);
+        assert_eq!(similarity_score(&a, &b), 20);
+        let training = movie(3, "/media/Training/x.mp4", None);
+        assert_eq!(similarity_score(&a, &training), 0);
     }
 }
 
