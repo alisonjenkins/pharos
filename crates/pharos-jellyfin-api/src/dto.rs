@@ -1624,12 +1624,20 @@ impl BaseItemDto {
                 .probe
                 .chapters
                 .iter()
-                .map(|c| ChapterInfoDto {
+                .enumerate()
+                .map(|(idx, c)| ChapterInfoDto {
                     name: c.title.clone(),
                     // `StartPositionTicks` is Jellyfin's 100-ns unit
                     // (10_000 ticks / ms).
                     start_position_ticks: c.start_ms.saturating_mul(10_000),
                     image_date_modified: "0001-01-01T00:00:00.0000000Z",
+                    // B88 — advertise a per-chapter image so the client fetches
+                    // the on-demand frame. Audio has no video frames to extract.
+                    image_tag: if matches!(item.kind, pharos_core::MediaKind::Audio) {
+                        None
+                    } else {
+                        Some(image_tag_for(item.id, &format!("chapter:{idx}")))
+                    },
                 })
                 .collect(),
             trickplay: serde_json::Map::new(),
@@ -2336,6 +2344,14 @@ pub struct ChapterInfoDto {
     pub name: String,
     pub start_position_ticks: u64,
     pub image_date_modified: &'static str,
+    /// B88 — Jellyfin's nullable per-chapter image token. A client renders a
+    /// chapter thumbnail and fetches `/Items/{id}/Images/Chapter/{index}?tag=`
+    /// ONLY when this is non-null; `None` = no image (the client shows a plain
+    /// chapter row). pharos extracts the frame on demand at the chapter's
+    /// `start_ms`, so every video chapter gets a stable tag; audio (no frames)
+    /// gets `None`. The `/Images/Chapter/{index}` route serves by index and
+    /// ignores the tag value — the tag only needs to be present + stable.
+    pub image_tag: Option<String>,
 }
 
 /// Jellyfin `MediaAttachment` (embedded font / cover in a `MediaSourceInfo`).
@@ -2392,6 +2408,60 @@ mod tests {
         );
         let c = MediaSegmentDto::new("00000000000000000000000000000abc", "d1", 0, 10, "Outro");
         assert_ne!(a.id, c.id, "distinct key → distinct id");
+    }
+
+    #[test]
+    fn video_chapters_advertise_a_non_null_image_tag() {
+        // B88 — a chapter with a null ImageTag is invisible to the client: it
+        // never renders a thumbnail nor fetches /Items/{id}/Images/Chapter/{i}.
+        // Every VIDEO chapter must carry a stable, per-index non-null tag; AUDIO
+        // (no video frame to extract) must stay null.
+        let mut item = pharos_core::MediaItem {
+            id: 42,
+            kind: pharos_core::MediaKind::Movie,
+            ..Default::default()
+        };
+        item.probe.chapters = vec![
+            pharos_core::MediaChapter {
+                start_ms: 0,
+                end_ms: 300_000,
+                title: "Opening".into(),
+            },
+            pharos_core::MediaChapter {
+                start_ms: 300_000,
+                end_ms: 600_000,
+                title: "The Beach".into(),
+            },
+        ];
+        let dto = BaseItemDto::from_domain(&item, "srv");
+        assert_eq!(dto.chapters.len(), 2);
+        assert!(
+            dto.chapters
+                .iter()
+                .all(|c| c.image_tag.as_ref().is_some_and(|s| !s.is_empty())),
+            "every video chapter must advertise a non-null image tag: {:?}",
+            dto.chapters
+        );
+        assert_ne!(
+            dto.chapters[0].image_tag, dto.chapters[1].image_tag,
+            "per-index tags must differ so the client keys each thumbnail"
+        );
+
+        let mut audio = pharos_core::MediaItem {
+            id: 43,
+            kind: pharos_core::MediaKind::Audio,
+            ..Default::default()
+        };
+        audio.probe.chapters = vec![pharos_core::MediaChapter {
+            start_ms: 0,
+            end_ms: 1_000,
+            title: "Movement I".into(),
+        }];
+        let adto = BaseItemDto::from_domain(&audio, "srv");
+        assert_eq!(
+            adto.chapters[0].image_tag, None,
+            "audio chapters have no extractable frame → null tag"
+        );
     }
 
     #[test]
