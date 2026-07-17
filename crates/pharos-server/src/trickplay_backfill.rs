@@ -49,6 +49,12 @@ const COOLDOWN: Duration = Duration::from_secs(1);
 /// idle gate width so a permit freed mid-item is grabbed immediately.
 const SWEEP_CONCURRENCY: usize = 10;
 
+/// Width the Primary poster is pre-scaled to during warming. Mirrors
+/// `images::effective_width`'s Primary cap — the largest size a library-grid
+/// tile ever requests. A client asking for a smaller `fillWidth` re-derives
+/// cheaply from this cached copy (a local decode), never a fresh NFS extract.
+const GRID_PRIMARY_WIDTH: u32 = 480;
+
 /// Everything one generation op needs — cloned into both worker tasks.
 #[derive(Clone)]
 struct GenCtx {
@@ -294,8 +300,27 @@ fn is_video(item: &MediaItem) -> bool {
     matches!(item.kind, MediaKind::Movie | MediaKind::Episode)
 }
 
+/// The recorded local Primary sidecar (`poster.jpg` / `cover.jpg` discovered at
+/// scan) for an item, if one still exists on disk. Mirrors
+/// `images::local_artwork_path` but off the raw [`Stores`] — the warm worker has
+/// no `AppState`. `None` means the item has no sidecar poster, so its Primary is
+/// served from the ffmpeg-extract cache: the path worth pre-warming.
+async fn local_primary_sidecar(stores: &Stores, id: u64) -> Option<std::path::PathBuf> {
+    let rows = stores.artwork_for(id).await.ok()?;
+    let locator = rows
+        .into_iter()
+        .find(|(role, source, _)| source == "local" && role.eq_ignore_ascii_case("Primary"))
+        .map(|(_, _, locator)| locator)?;
+    let path = std::path::PathBuf::from(locator);
+    match tokio::fs::try_exists(&path).await {
+        Ok(true) => Some(path),
+        _ => None,
+    }
+}
+
 /// Pre-build one item's derived assets, skipping anything already cached:
-/// trickplay sprites for each configured width, then its text subtitles.
+/// trickplay sprites for each configured width, its text subtitles, its
+/// embedded fonts, then its Primary poster + grid-sized scale.
 async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
     if !is_video(item) {
         return;
@@ -378,6 +403,35 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
             if !bypass_gate {
                 tokio::time::sleep(COOLDOWN).await;
             }
+        }
+    }
+    // Warm the Primary poster + its grid-sized scale so the FIRST library-grid
+    // render is a pure disk read, not a per-tile cold cost. A freshly-scrolled
+    // Movies / TV grid fires one image request per item AT ONCE:
+    //   - a sidecar-less item pays a whole-file NFS seek + ffmpeg frame decode
+    //     (an extract storm that stalls the whole grid), and
+    //   - every poster is then decoded + downscaled to the tile width.
+    // Both are one-time + disk-cached (on the retained cache PVC), so pre-doing
+    // them here — gate-throttled like every other bulk op, idempotent (a warm
+    // poster costs one `stat`) — turns that first render warm. B89 already made
+    // REPEAT loads instant (Cache-Control + ETag); this closes the cold path.
+    if let Some(ic) = ctx.images.as_ref() {
+        let _permit = acquire_gate(bypass_gate, &ctx.bg_io).await;
+        // A sidecar poster is served + scaled directly, never through the
+        // extract cache — so scale THAT. Otherwise extract the embedded cover /
+        // frame first (the expensive NFS-bound step), then scale the result.
+        let source = match local_primary_sidecar(&ctx.stores, item.id).await {
+            Some(p) => Some(p),
+            // Sidecar-less: extract the embedded cover / frame (the expensive
+            // NFS-bound step). A coverless / unseekable source errors and is now
+            // negatively cached — `.ok()` drops it, nothing to scale.
+            None => ic.primary(item.id, item.kind, &item.path).await.ok(),
+        };
+        if let Some(src) = source {
+            ic.scaled_artwork(&src, GRID_PRIMARY_WIDTH).await;
+        }
+        if !bypass_gate {
+            tokio::time::sleep(COOLDOWN).await;
         }
     }
 }
@@ -537,5 +591,35 @@ mod tests {
         // A duplicate nudge (progress report every ~10s) is a no-op.
         enqueue_seed(3, &ctx, &mut done, &mut queue).await;
         assert_eq!(queue.len(), 3, "duplicate nudge must not re-enqueue");
+    }
+
+    /// Poster warming routes each item to the right cold path: an item with a
+    /// recorded local sidecar poster (present on disk) scales THAT and never
+    /// touches the ffmpeg-extract cache; an item with no row — or a row whose
+    /// file has since been deleted — resolves `None`, so warming falls through
+    /// to the (expensive, worth-pre-doing) frame extract.
+    #[tokio::test]
+    async fn local_primary_sidecar_distinguishes_extract_vs_sidecar() {
+        let stores = Stores::connect("sqlite::memory:").await.expect("stores");
+        stores.put(movie(1)).await.expect("put");
+        // No artwork row → sidecar-less → extract-warm path.
+        assert!(local_primary_sidecar(&stores, 1).await.is_none());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let poster = dir.path().join("poster.jpg");
+        tokio::fs::write(&poster, b"x").await.expect("write");
+        stores
+            .set_artwork(1, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .expect("set_artwork");
+        assert_eq!(
+            local_primary_sidecar(&stores, 1).await.as_deref(),
+            Some(poster.as_path()),
+            "present local sidecar resolves → scaled directly, no extract"
+        );
+
+        // Recorded-but-deleted sidecar → None → fall back to the extract warm.
+        tokio::fs::remove_file(&poster).await.expect("rm");
+        assert!(local_primary_sidecar(&stores, 1).await.is_none());
     }
 }
