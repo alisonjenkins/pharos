@@ -357,3 +357,45 @@ async fn similar_on_music_is_music_only() {
         "audio similar must be music only (class gate), got {got:?}"
     );
 }
+
+/// B92 — the Android TV kotlin SDK re-serialises every id DASHED. The music
+/// query filters (`AlbumArtistIds` / `ExcludeItemIds` via `id_set`) and the
+/// synth-id `/Items/{id}/Similar` path (`music_similar`) compared against the
+/// dashless `album_id_for` / `artist_id_for` hash, so a dashed id matched
+/// nothing — an empty "More From" rail and empty "More Like This". Canonicalise
+/// so the dashed forms resolve identically to the dashless.
+#[actix_web::test]
+async fn dashed_music_ids_resolve_in_filters_and_similar() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let dash = |s: String| {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &s[0..8],
+            &s[8..12],
+            &s[12..16],
+            &s[16..20],
+            &s[20..32],
+        )
+    };
+    let artist = dash(artist_id_for("Limp Bizkit"));
+    let album = dash(album_id_for("Significant Other"));
+    // "More From {artist}" — dashed AlbumArtistIds + ExcludeItemIds (id_set).
+    let items = get_items!(app, token, &format!("/Items?IncludeItemTypes=MusicAlbum&Recursive=true&ExcludeItemIds={album}&SortBy=PremiereDate,ProductionYear,SortName&SortOrder=Descending&AlbumArtistIds={artist}"));
+    assert_eq!(
+        names(&items),
+        vec!["MusicAlbum:Chocolate Starfish"],
+        "dashed AlbumArtistIds + ExcludeItemIds must resolve like dashless: {items:?}"
+    );
+    // "More Like This" — dashed synth album id (music_similar `wanted`).
+    let items = get_items!(
+        app,
+        token,
+        &format!("/Items/{album}/Similar?limit=12&ExcludeArtistIds={artist}")
+    );
+    let got = names(&items);
+    assert!(
+        got.contains(&"MusicAlbum:Sehnsucht".to_string()),
+        "dashed album Similar must resolve, got {got:?}"
+    );
+}

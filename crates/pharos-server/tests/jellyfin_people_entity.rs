@@ -155,6 +155,25 @@ async fn get_person_resolves_by_wire_id_and_404s_unknown() {
     assert_eq!(v["Name"].as_str().unwrap(), "Keanu Reeves");
     assert_eq!(v["Type"].as_str().unwrap(), "Person");
     assert_eq!(v["ChildCount"].as_u64().unwrap(), 2);
+    // B92 — the Android TV kotlin SDK re-serialises the person wire id DASHED;
+    // the store matches wire_id exactly, so a dashed id 404'd. It must resolve
+    // identically to the dashless form.
+    let dashless = person_id_for("Keanu Reeves");
+    let dashed = format!(
+        "{}-{}-{}-{}-{}",
+        &dashless[0..8],
+        &dashless[8..12],
+        &dashless[12..16],
+        &dashless[16..20],
+        &dashless[20..32],
+    );
+    let v = get_json(state.clone(), &token, &format!("/Persons/{dashed}")).await;
+    assert_eq!(
+        v["Name"].as_str().unwrap(),
+        "Keanu Reeves",
+        "dashed person id must resolve"
+    );
+    assert_eq!(v["ChildCount"].as_u64().unwrap(), 2);
     let status = get_status(state, &token, "/Persons/ffffffffffffffffffffffffffffffff").await;
     assert_eq!(status, 404, "unknown person id is not found");
 }

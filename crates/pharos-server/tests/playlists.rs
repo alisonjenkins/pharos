@@ -70,6 +70,23 @@ async fn playlist_full_lifecycle() {
     assert_eq!(hv["Id"], pid);
     assert_eq!(hv["ChildCount"], 2);
 
+    // B92 — the Android TV kotlin SDK re-serialises the playlist id DASHED; the
+    // store matches wire_id exactly, so a dashed id 404'd every playlist route.
+    // It must resolve identically to the dashless form.
+    let dashed = format!(
+        "{}-{}-{}-{}-{}",
+        &pid[0..8],
+        &pid[8..12],
+        &pid[12..16],
+        &pid[16..20],
+        &pid[20..32],
+    );
+    let (ds, dv) = get_json(&f, &format!("/Playlists/{dashed}")).await;
+    assert_eq!(ds, 200, "dashed playlist id must resolve");
+    assert_eq!(dv["Id"], pid);
+    let (dis, _) = get_json(&f, &format!("/Playlists/{dashed}/Items")).await;
+    assert_eq!(dis, 200, "dashed playlist items must resolve");
+
     // 3. Items in curated order, each with a PlaylistItemId.
     let list = items(&f, &pid).await;
     assert_eq!(list.len(), 2);

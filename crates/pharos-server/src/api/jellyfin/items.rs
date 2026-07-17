@@ -589,7 +589,9 @@ async fn music_similar(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let wanted = id_str.to_ascii_lowercase();
+    // B92 — canonicalise the dashed synth album/artist id the kotlin SDK sends
+    // so it matches the dashless `album_id_for`/`artist_id_for` hash below.
+    let wanted = canonical_wire_id(id_str).to_ascii_lowercase();
 
     // Genre tokens of a track ("Rock, Nu Metal" → {rock, nu metal}).
     fn genre_tokens(i: &MediaItem, out: &mut std::collections::HashSet<String>) {
@@ -1155,7 +1157,9 @@ async fn get_person(
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::PersonStore;
-    let wire_id = path.into_inner();
+    // B92 — canonicalise the dashed person wire id the kotlin SDK sends, else
+    // `/Persons/{id}` 404s (the person store matches wire_id exactly).
+    let wire_id = canonical_wire_id(&path.into_inner()).into_owned();
     let person = state
         .stores
         .person_by_wire_id(&wire_id)
@@ -1331,7 +1335,8 @@ async fn collection_items_add(
     q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
-    let wire_id = path.into_inner();
+    // B92 — canonicalise the dashed collection wire id the kotlin SDK sends.
+    let wire_id = canonical_wire_id(&path.into_inner()).into_owned();
     let ids = parse_id_csv(q.ids.as_deref());
     let added = state
         .stores
@@ -1354,7 +1359,8 @@ async fn collection_items_remove(
     q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
-    let wire_id = path.into_inner();
+    // B92 — canonicalise the dashed collection wire id the kotlin SDK sends.
+    let wire_id = canonical_wire_id(&path.into_inner()).into_owned();
     let ids = parse_id_csv(q.ids.as_deref());
     let removed = state
         .stores
@@ -1436,6 +1442,11 @@ async fn shows_next_up(
     // Group episodes by series; pick the lowest unwatched per series.
     use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::HashMap;
+    // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
+    let series_id_want = q
+        .series_id
+        .as_deref()
+        .map(|s| canonical_wire_id(s).into_owned());
     let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
     for (idx, item) in all.iter().enumerate() {
         if !matches!(item.kind, MediaKind::Episode) {
@@ -1446,7 +1457,9 @@ async fn shows_next_up(
         };
         // A Series-page request scopes to that series (`SeriesId`); the
         // home-screen row leaves it unset and gets one pick per series.
-        if let Some(want) = q.series_id.as_deref() {
+        // B92 — canonicalise the dashed `SeriesId` the Android TV Series page
+        // sends, else Next Up on that page comes back empty.
+        if let Some(want) = series_id_want.as_deref() {
             if series_id_for_key(series.series_folder.as_deref(), &series.series_name).as_str()
                 != want
             {
@@ -3041,12 +3054,16 @@ fn music_album_only_request(q: &ListQuery) -> bool {
 }
 
 /// Parse a comma-separated synth-id list into a set for hash matching.
+/// B92 — canonicalise each element (the kotlin SDK dashes every id) so a
+/// dashed `?ArtistIds=`/`AlbumArtistIds=`/`ContributingArtistIds=`/
+/// `ExcludeItemIds=`/`ExcludeArtistIds=` still matches the dashless
+/// `artist_id_for`/`album_id_for` hash; dashless ids pass through unchanged.
 fn id_set(raw: Option<&str>) -> std::collections::HashSet<String> {
     raw.map(|r| {
         r.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_ascii_lowercase())
+            .map(|s| canonical_wire_id(s).to_ascii_lowercase())
             .collect()
     })
     .unwrap_or_default()
