@@ -1167,6 +1167,30 @@ async fn shows_hierarchy_and_next_up_scope_to_one_series() {
     let v = get(format!("/Shows/{show_a}/Seasons")).await;
     assert_eq!(v["Items"].as_array().unwrap().len(), 1, "{v:?}");
     assert_eq!(v["Items"][0]["Type"], "Season");
+    // B93 — the season MUST advertise its episode count as ChildCount +
+    // RecursiveItemCount and link ParentId back to the series, else the Android
+    // TV app treats the season as childless and never fetches its episodes (the
+    // season opens empty). Show A season 1 has 2 episodes.
+    assert_eq!(
+        v["Items"][0]["ChildCount"], 2,
+        "season ChildCount = its episodes: {v:?}"
+    );
+    assert_eq!(v["Items"][0]["RecursiveItemCount"], 2);
+    assert_eq!(
+        v["Items"][0]["ParentId"], show_a,
+        "season ParentId links to series"
+    );
+    // The series detail advertises its season + episode counts too.
+    let sv = get(format!("/Items/{show_a}")).await;
+    assert_eq!(sv["Type"], "Series");
+    assert_eq!(
+        sv["ChildCount"], 1,
+        "series ChildCount = its 1 season: {sv:?}"
+    );
+    assert_eq!(
+        sv["RecursiveItemCount"], 2,
+        "series RecursiveItemCount = its 2 episodes"
+    );
 
     // NextUp scoped by SeriesId → only Show A (not Show B).
     let v = get(format!("/Shows/NextUp?SeriesId={show_a}")).await;
