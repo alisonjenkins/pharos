@@ -75,6 +75,25 @@ async fn seed() -> (web::Data<AppState>, String) {
         })
         .await
         .unwrap();
+    // B86 — an Audio track for the music direct-play auth test.
+    stores
+        .put(MediaItem {
+            id: 2,
+            path: "/m/2.mp3".into(),
+            title: "Track".into(),
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                duration_ms: Some(180_000),
+                bitrate_bps: Some(256_000),
+                container: Some("mp3".into()),
+                audio_codec: Some("mp3".into()),
+                audio_channels: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let state = web::Data::new(AppState::new(stores, "t".into()));
     (state, token.0.expose().to_string())
 }
@@ -177,6 +196,46 @@ async fn native_capability_etag_authorizes_tokenless_stream() {
         resp.status(),
         actix_web::http::StatusCode::UNAUTHORIZED,
         "a valid capability tag must authorize the tokenless native stream"
+    );
+}
+
+#[actix_web::test]
+async fn native_capability_etag_authorizes_tokenless_audio_stream() {
+    // B86 — music DirectPlay: the Android TV app fetches
+    // /Audio/{id}/stream?static=true&tag=<ETag> with NO token (ExoPlayer's raw
+    // fetch). stream_audio used the strict AuthUser extractor and 401'd, so no
+    // music played. It must authorize via the ETag capability like the video
+    // route (B75). File is fake on disk (404 ok); the point is it must NOT 401.
+    let (state, token) = seed().await;
+    let app = init_app!(state);
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_DIRECTPLAY).unwrap()["DeviceProfile"],
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/2/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_ANDROID_TV))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let etag = v["MediaSources"][0]["ETag"].as_str().unwrap().to_string();
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/audio/2/stream?static=true&tag={etag}"))
+            .insert_header(("User-Agent", "okhttp/4.12.0"))
+            .to_request(),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        actix_web::http::StatusCode::UNAUTHORIZED,
+        "a valid capability tag must authorize the tokenless native audio stream"
     );
 }
 

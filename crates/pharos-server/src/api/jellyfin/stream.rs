@@ -105,9 +105,17 @@ async fn head_video(
 
 async fn head_audio(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // B86 — native direct-play (Android TV / ExoPlayer) fetches the audio URL
+    // raw with the MediaSource ETag forwarded as `?tag=`, NOT a bearer header.
+    // Authorize via that capability (like stream_video/B75) instead of the
+    // strict AuthUser extractor, which 401'd every music DirectPlay so nothing
+    // played.
+    let media_id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    authorize_media(&state, &req, media_id).await?;
     head_response(&state, path.id_str()).await
 }
 
@@ -544,10 +552,15 @@ fn qs_flag(qs: &str, name: &str) -> bool {
 
 async fn stream_audio(
     state: web::Data<AppState>,
-    _user: AuthUser,
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // B86 — see head_audio: authorize via the ETag capability (`?tag=`), not a
+    // bearer, so a tokenless native direct-play GET works (matches
+    // stream_video/B75). Without this every music track 401'd and would not play.
+    let media_id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    authorize_media(&state, &req, media_id).await?;
     deliver_stream(&state, &req, path.id_str()).await
 }
 
