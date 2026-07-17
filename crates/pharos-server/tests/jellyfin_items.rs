@@ -1270,6 +1270,16 @@ async fn dashed_synth_series_id_resolves_across_show_routes() {
         "dashed series detail must resolve: {v:?}"
     );
     assert_eq!(v["Name"], "Buffy");
+    // B92 — the Series page's Next Up rail scopes by `?SeriesId=` (dashed from
+    // the SDK). Pre-B92 the raw compare missed → the rail came back empty.
+    let v = get(format!("/Shows/NextUp?SeriesId={dashed}")).await;
+    let items = v["Items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "dashed SeriesId must scope Next Up, not empty it: {v:?}"
+    );
+    assert_eq!(items[0]["SeriesName"], "Buffy");
 }
 
 // LIB-C11 — two same-name shows in DISTINCT folders must stay two
