@@ -35,7 +35,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
-    series_folder, series_year, track_number, disc_number, release_year";
+    series_folder, series_year, track_number, disc_number, release_year, \
+    synopsis, content_rating, network, release_date";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -588,12 +589,13 @@ impl MediaStore for PostgresStore {
                 premiere_date, overview, tagline, provider_ids, \
                 series_folder, series_year, title_fold, attachments_json, \
                 track_number, disc_number, release_year, \
-                production_locations_json, trailers_json) \
+                production_locations_json, trailers_json, \
+                synopsis, content_rating, network, release_date) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
                      $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, \
-                     $48, $49)
+                     $48, $49, $50, $51, $52, $53)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             title_fold = EXCLUDED.title_fold,
@@ -641,6 +643,10 @@ impl MediaStore for PostgresStore {
                                             release_year = EXCLUDED.release_year,
                                             production_locations_json = EXCLUDED.production_locations_json,
                                             trailers_json = EXCLUDED.trailers_json,
+                                            synopsis = EXCLUDED.synopsis,
+                                            content_rating = EXCLUDED.content_rating,
+                                            network = EXCLUDED.network,
+                                            release_date = EXCLUDED.release_date,
                                             created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)",
         )
         .bind(id_i64)
@@ -693,6 +699,10 @@ impl MediaStore for PostgresStore {
         .bind(p.year.map(|v| v as i32))
         .bind(production_locations_json)
         .bind(trailers_json)
+        .bind(p.synopsis.as_deref())
+        .bind(p.content_rating.as_deref())
+        .bind(p.network.as_deref())
+        .bind(p.release_date.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -2891,6 +2901,10 @@ struct MediaRow {
     track_number: Option<i32>,
     disc_number: Option<i32>,
     release_year: Option<i32>,
+    synopsis: Option<String>,
+    content_rating: Option<String>,
+    network: Option<String>,
+    release_date: Option<String>,
 }
 
 impl MediaRow {
@@ -2932,6 +2946,10 @@ impl MediaRow {
             track_number: self.track_number.and_then(|v| u32::try_from(v).ok()),
             disc_number: self.disc_number.and_then(|v| u32::try_from(v).ok()),
             year: self.release_year.and_then(|v| u32::try_from(v).ok()),
+            synopsis: self.synopsis,
+            content_rating: self.content_rating,
+            network: self.network,
+            release_date: self.release_date,
             chapters: crate::chapter_json::decode(self.chapters_json.as_deref()),
             // P34 — alternate editions enrichment lives in the
             // scanner; postgres rows today never carry them.

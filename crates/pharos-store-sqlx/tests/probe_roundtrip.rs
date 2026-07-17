@@ -78,6 +78,11 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 proptest::option::of(1u32..999),
                 proptest::option::of(1u32..99),
                 proptest::option::of(1900u32..2999),
+                // B90 embedded descriptive tags — must round-trip too.
+                proptest::option::of("[A-Za-z0-9 ]{0,40}"),
+                proptest::option::of("[A-Za-z0-9-]{0,8}"),
+                proptest::option::of("[A-Za-z0-9 ]{0,24}"),
+                proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}"),
             )
         })
         .prop_map(
@@ -90,6 +95,10 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 track_number,
                 disc_number,
                 year,
+                synopsis,
+                content_rating,
+                network,
+                release_date,
             )| MediaProbe {
                 size_bytes: size,
                 duration_ms: dur,
@@ -121,6 +130,10 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 track_number,
                 disc_number,
                 year,
+                synopsis,
+                content_rating,
+                network,
+                release_date,
                 chapters: Vec::new(),
                 alternate_sources: Vec::new(),
             },

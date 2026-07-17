@@ -13,7 +13,8 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::metadata::{
-    filename::FilenameProvider, nfo::NfoProvider, sidecar::SidecarArtworkProvider, MetadataResolver,
+    embedded::EmbeddedTagProvider, filename::FilenameProvider, nfo::NfoProvider,
+    sidecar::SidecarArtworkProvider, MetadataResolver,
 };
 
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
@@ -134,13 +135,15 @@ impl<P: Prober> std::fmt::Debug for FsScanner<P> {
 
 /// LIB-D7 — the default local-first provider set wired into every
 /// production scanner: the Kodi NFO reader (highest priority — a
-/// user-curated `.nfo` wins), sidecar artwork detection, and filename /
-/// folder conventions (lowest — a last-resort title/year guess). Online
-/// providers slot in later at lower priority than NFO.
+/// user-curated `.nfo` wins), sidecar artwork detection, embedded
+/// container-tag descriptions (B90), and filename / folder conventions
+/// (lowest — a last-resort title/year guess). Online providers slot in
+/// later at lower priority than NFO.
 fn default_resolver() -> MetadataResolver {
     MetadataResolver::new()
         .with_provider(NfoProvider::new())
         .with_provider(SidecarArtworkProvider::new())
+        .with_provider(EmbeddedTagProvider::new())
         .with_provider(FilenameProvider::new())
 }
 
@@ -2519,6 +2522,9 @@ mod tests {
         // When set, audio probes carry this embedded track title so the
         // "embedded title beats filename stem" path can be asserted.
         audio_title: Option<String>,
+        // B90 — when set, every probe carries this embedded synopsis so the
+        // embedded-tag provider → Overview wiring can be asserted.
+        synopsis: Option<String>,
     }
 
     impl Prober for FakeProber {
@@ -2543,6 +2549,7 @@ mod tests {
                     } else {
                         None
                     },
+                    synopsis: self.synopsis.clone(),
                     ..Default::default()
                 },
             })
@@ -2612,6 +2619,31 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "02 Stars");
+    }
+
+    #[tokio::test]
+    async fn embedded_synopsis_becomes_overview() {
+        // B90 — a movie with no sidecar NFO but an embedded synopsis tag must
+        // surface it as the item Overview, proving the embedded-tag provider is
+        // wired into the default resolver and its output persists through merge.
+        // Enrichment runs on the store-backed scan path (not the bare walk).
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "movie.mkv", b"aaaa").await;
+        let prober = FakeProber {
+            synopsis: Some("An embedded plot.".into()),
+            ..Default::default()
+        };
+        let store = MemStore::default();
+        FsScanner::new(prober)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let items = store.list().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].metadata.overview.as_deref(),
+            Some("An embedded plot.")
+        );
     }
 
     #[tokio::test]
