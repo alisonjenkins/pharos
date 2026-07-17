@@ -483,6 +483,46 @@ async fn mark_series_favorite_cascades_all_episodes() {
 }
 
 #[actix_web::test]
+async fn userid_less_mark_series_played_accepts_dashed_synth_id() {
+    // B91 — Android TV (jellyfin-sdk-kotlin) marks a whole show watched via the
+    // userId-less POST /UserPlayedItems/{id} with the synth SERIES id
+    // re-serialised DASHED. The cascade compared it against the dashless
+    // series_id_for_key hash → no match → 404, which the SDK can't deserialise →
+    // the app CRASHED. Exercise the exact shape: dashed id + userId-less route.
+    let (state, token, uid) = seed_show().await;
+    let app = test::init_service(build_app(state.clone())).await;
+    let series_id = pharos_jellyfin_api::dto::series_id_for_key(Some("/tv/Buffy"), "Buffy");
+    let dashed = format!(
+        "{}-{}-{}-{}-{}",
+        &series_id[0..8],
+        &series_id[8..12],
+        &series_id[12..16],
+        &series_id[16..20],
+        &series_id[20..32],
+    );
+    let req = test::TestRequest::post()
+        .uri(&format!("/UserPlayedItems/{dashed}"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "dashed synth series id must resolve, not 404-and-crash"
+    );
+    let body = test::read_body(resp).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Played"], true);
+    // Cascade reached every episode of the show.
+    for id in [400_u64, 401, 402] {
+        assert!(
+            state.stores.get_user_data(uid, id).await.unwrap().played,
+            "episode {id} must cascade to played"
+        );
+    }
+}
+
+#[actix_web::test]
 async fn unknown_synth_id_is_404_not_400() {
     // GUID-shaped id that matches no series/season — must 404 (item not
     // found), not 400: jellyfin-web treats 400 as a client bug.

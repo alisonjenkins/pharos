@@ -217,6 +217,15 @@ where
     F: Fn(&mut UserItemData),
 {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
+    // B91 — the Android TV kotlin SDK marks a whole show / season watched via
+    // `POST /UserPlayedItems/{id}` with the synth id re-serialised DASHED
+    // (`11a177ee-3a0e-0b8f-11a1-77ee3a0e0b8f`). Every comparison below is against
+    // the dashless `series_id_for_key` / `season_id_for_key` hash, so without
+    // canonicalising the dashed id never matches → the cascade found no episodes
+    // → 404, which the SDK can't deserialise → the app CRASHES (the B84 class).
+    // The same dashed-id sweep already fixed nav (B85) + parent lists (B82).
+    let canonical = crate::api::jellyfin::items::canonical_wire_id(id_str);
+    let id_str: &str = canonical.as_ref();
     let all = state
         .list_items_cached()
         .await
