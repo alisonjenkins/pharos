@@ -1106,6 +1106,99 @@ async fn shows_hierarchy_and_next_up_scope_to_one_series() {
     assert_eq!(items[0]["SeriesName"], "Show A");
 }
 
+// B85 — the Android TV kotlin SDK re-serialises the synth Series/Season ids
+// dashed. Every synth-id route resolves by comparing the raw id to the dashless
+// `*_id_for_key` hash, so a dashed id returned empty: a show that wouldn't open
+// its season list, "Go to Series" dead-ends, missing artwork. The dashed id
+// must resolve identically to the dashless one.
+#[actix_web::test]
+async fn dashed_synth_series_id_resolves_across_show_routes() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    for (id, ep) in [(1u64, 1u32), (2, 2)] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/m/TV/Buffy/Season 2/s02e0{ep}.mkv").into(),
+                title: format!("Buffy E{ep}"),
+                kind: MediaKind::Episode,
+                series: Some(pharos_core::SeriesInfo {
+                    series_name: "Buffy".into(),
+                    season_number: Some(2),
+                    episode_number: Some(ep),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+    let tok = token.0.expose().to_string();
+    let get = |uri: String| {
+        let tok = tok.clone();
+        let app = &app;
+        async move {
+            let body = test::call_and_read_body(
+                app,
+                test::TestRequest::get()
+                    .uri(&uri)
+                    .insert_header(("X-Emby-Token", tok))
+                    .to_request(),
+            )
+            .await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+    // Dashless SeriesId as pharos emits it, then the dashed UUID the kotlin SDK
+    // sends back.
+    let dashless = get("/Items/1".into()).await["SeriesId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(dashless.len(), 32);
+    let dashed = format!(
+        "{}-{}-{}-{}-{}",
+        &dashless[0..8],
+        &dashless[8..12],
+        &dashless[12..16],
+        &dashless[16..20],
+        &dashless[20..32],
+    );
+
+    // Episodes list resolves (would be empty pre-B85).
+    let v = get(format!("/Shows/{dashed}/Episodes")).await;
+    assert_eq!(
+        v["Items"].as_array().unwrap().len(),
+        2,
+        "dashed SeriesId must resolve the episode list: {v:?}"
+    );
+    // Seasons list resolves.
+    let v = get(format!("/Shows/{dashed}/Seasons")).await;
+    assert_eq!(v["Items"].as_array().unwrap().len(), 1, "{v:?}");
+    assert_eq!(v["Items"][0]["Type"], "Season");
+    // Series detail resolves (the "Go to Series" / open-show fetch).
+    let v = get(format!("/Items/{dashed}")).await;
+    assert_eq!(
+        v["Type"], "Series",
+        "dashed series detail must resolve: {v:?}"
+    );
+    assert_eq!(v["Name"], "Buffy");
+}
+
 // LIB-C11 — two same-name shows in DISTINCT folders must stay two
 // separate series in /Shows/NextUp with distinct, non-interleaved
 // episode picks and distinct SeriesIds carrying their own years. Before
