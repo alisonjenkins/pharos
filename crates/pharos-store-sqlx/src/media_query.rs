@@ -53,6 +53,7 @@ fn sort_key_column(key: SortKey) -> &'static str {
         SortKey::TrackNumber => "track_number",
         SortKey::AlbumArtist => "LOWER(album_artist)",
         SortKey::IndexNumber => "episode_number",
+        SortKey::SeasonNumber => "season_number",
         SortKey::Id => "id",
     }
 }

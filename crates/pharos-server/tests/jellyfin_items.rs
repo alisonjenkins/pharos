@@ -365,6 +365,79 @@ async fn include_item_types_season_collapses_into_season_tiles() {
     }
 }
 
+/// B87 — the Android TV kotlin SDK lists a season's episodes with
+/// `SortBy=ParentIndexNumber,IndexNumber,SortName`. That token used to resolve
+/// to the AUDIO disc/track columns (NULL for episodes), collapsing every
+/// episode to the title tiebreak → episodes came back alphabetised, not in air
+/// order (Buffy S02E20 shown right after S02E04). The titles here are
+/// deliberately REVERSE-alphabetical to episode number, so a title-order sort
+/// would flip them — the fix must return them by episode number.
+#[actix_web::test]
+async fn episode_list_sorts_by_air_order_not_title() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores
+        .issue(uid, "test")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string();
+    // Episode number ascending, but titles descending-alphabetical, so any
+    // fallthrough to the title/id tiebreak reorders them.
+    let titles = ["Zulu", "Yankee", "X-ray", "Whiskey"];
+    for (i, title) in titles.iter().enumerate() {
+        let epn = (i + 1) as u32;
+        stores
+            .put(MediaItem {
+                id: epn as u64,
+                path: format!("/tv/Buffy/S02E{epn:02}.mkv").into(),
+                title: (*title).into(),
+                kind: MediaKind::Episode,
+                series: Some(pharos_core::SeriesInfo {
+                    series_name: "Buffy".into(),
+                    season_number: Some(2),
+                    episode_number: Some(epn),
+                    series_folder: Some("/tv/Buffy".into()),
+                    series_year: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(stores, "test".into()));
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Episode&SortBy=ParentIndexNumber,IndexNumber,SortName")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let order: Vec<u64> = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["IndexNumber"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        order,
+        vec![1, 2, 3, 4],
+        "episodes must come back in air (episode-number) order, not by title: {v}"
+    );
+}
+
 #[actix_web::test]
 async fn virtual_folders_returns_synth_library() {
     let (state, token, _u) = seed().await;
