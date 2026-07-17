@@ -13,6 +13,85 @@ use pharos_cache::image_cache::{ImageCacheError, ImageRole};
 use pharos_core::MediaStore;
 use serde::Deserialize;
 
+/// B89 — how long a client may reuse a cached image without revalidating.
+/// pharos's image URLs are `(item, role)`-stable and carry a stable `?tag=`, so
+/// the bytes are safely cacheable; a moderate TTL keeps repeat gallery renders
+/// instant while a re-scan / uploaded poster is still picked up within the
+/// window. Before B89 image responses carried NO cache headers at all, so a
+/// grid client re-downloaded every poster on every render.
+const IMAGE_MAX_AGE_SECS: u32 = 604_800; // 7 days
+
+fn image_cache_control() -> String {
+    format!("private, max-age={IMAGE_MAX_AGE_SECS}")
+}
+
+/// A content ETag from the served file's length + mtime — stable while the
+/// cached bytes are, and rotates when the cache re-extracts / re-encodes.
+/// `None` if the file vanished (the caller then 404s on the body read).
+async fn file_etag(path: &std::path::Path) -> Option<String> {
+    let m = tokio::fs::metadata(path).await.ok()?;
+    let len = m.len();
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Some(format!("\"{len:x}-{mtime:x}\""))
+}
+
+/// True when the client's `If-None-Match` already holds the current `etag`.
+fn if_none_match_hit(if_none_match: Option<&str>, etag: Option<&str>) -> bool {
+    match (if_none_match, etag) {
+        (Some(inm), Some(etag)) => inm.split(',').map(str::trim).any(|t| t == etag || t == "*"),
+        _ => false,
+    }
+}
+
+/// The request's `If-None-Match` header value, if any (borrows `req`).
+fn if_none_match_of(req: &HttpRequest) -> Option<&str> {
+    req.headers()
+        .get(actix_web::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// B89 — serve an already-resolved cache/sidecar image file with client-cache
+/// headers: `Cache-Control` + a content `ETag`, a `304 Not Modified` when the
+/// client's `If-None-Match` still matches (so a lapsed cache revalidates
+/// cheaply), and the bytes otherwise (or just headers for a HEAD). A vanished
+/// file → 404. Centralising this is what makes every read path — extracted
+/// frame, scaled copy, webp/avif re-encode, local sidecar, chapter thumb —
+/// cacheable through one door.
+async fn deliver_image(
+    final_path: &std::path::Path,
+    content_type: &'static str,
+    head_only: bool,
+    if_none_match: Option<&str>,
+) -> HttpResponse {
+    use actix_web::http::header::{CACHE_CONTROL, ETAG};
+    let etag = file_etag(final_path).await;
+    if if_none_match_hit(if_none_match, etag.as_deref()) {
+        let mut resp = HttpResponse::NotModified();
+        resp.insert_header((CACHE_CONTROL, image_cache_control()));
+        if let Some(t) = &etag {
+            resp.insert_header((ETAG, t.clone()));
+        }
+        return resp.finish();
+    }
+    let mut resp = HttpResponse::Ok();
+    resp.content_type(content_type);
+    resp.insert_header((CACHE_CONTROL, image_cache_control()));
+    if let Some(t) = &etag {
+        resp.insert_header((ETAG, t.clone()));
+    }
+    if head_only {
+        return resp.finish();
+    }
+    match tokio::fs::read(final_path).await {
+        Ok(bytes) => resp.body(bytes),
+        Err(_) => HttpResponse::NotFound().body(""),
+    }
+}
+
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths. The `image_type` path param is
     // therefore also lowercased by `LowercasePath` — `ImageRole::from_str_ci`
@@ -57,6 +136,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 async fn get_chapter_image(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id_str, idx) = path.into_inner();
@@ -79,10 +159,9 @@ async fn get_chapter_image(
         .chapter(item.id, &item.path, idx, chapter.start_ms)
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("chapter image: {e}")))?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(format!("read chapter image: {e}")))?;
-    Ok(HttpResponse::Ok().content_type("image/jpeg").body(bytes))
+    // B89 — chapter thumbs are the heaviest per-item image after B88 turned
+    // them on; cache them client-side like every other artwork.
+    Ok(deliver_image(&path, "image/jpeg", false, if_none_match_of(&req)).await)
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +190,7 @@ async fn get_image(
         false,
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
+        if_none_match_of(&req),
     )
     .await
 }
@@ -128,6 +208,7 @@ async fn head_image(
         true,
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
+        if_none_match_of(&req),
     )
     .await
 }
@@ -145,6 +226,7 @@ async fn get_image_indexed(
         false,
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
+        if_none_match_of(&req),
     )
     .await
 }
@@ -162,6 +244,7 @@ async fn head_image_indexed(
         true,
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
+        if_none_match_of(&req),
     )
     .await
 }
@@ -208,6 +291,7 @@ async fn delete_image_indexed(
     remove_image(&state, &user, &path.id, &path.image_type, path.image_index).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_image(
     state: &AppState,
     id_str: &str,
@@ -216,6 +300,7 @@ async fn serve_image(
     head_only: bool,
     format: ImageFormat,
     req_width: Option<u32>,
+    if_none_match: Option<&str>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // B85 — accept the dashed synth/person id the kotlin SDK (Android TV) sends:
     // person + Series/Season image resolution below compares the raw id to the
@@ -292,7 +377,16 @@ async fn serve_image(
     // which matches Jellyfin's own season fallback.
     if synth_id && index == 0 {
         if let Some(local) = season_sidecar_path(&item, id_str, role).await {
-            return serve_local_artwork(&local, role, head_only, format, state, req_width).await;
+            return serve_local_artwork(
+                &local,
+                role,
+                head_only,
+                format,
+                state,
+                req_width,
+                if_none_match,
+            )
+            .await;
         }
     }
     // LIB-D5 — local-sidecar-first resolution. D4 records artwork
@@ -311,7 +405,16 @@ async fn serve_image(
     // public image route on a stale row).
     if index == 0 {
         if let Some(local) = local_artwork_path(state, id, role).await {
-            return serve_local_artwork(&local, role, head_only, format, state, req_width).await;
+            return serve_local_artwork(
+                &local,
+                role,
+                head_only,
+                format,
+                state,
+                req_width,
+                if_none_match,
+            )
+            .await;
         }
     }
     // An audio track has no video frames, so Backdrop / Thumb can only ever
@@ -381,14 +484,7 @@ async fn serve_image(
             }
         },
     };
-    if head_only {
-        return Ok(HttpResponse::Ok().content_type(content_type).finish());
-    }
-    let bytes = match tokio::fs::read(&final_path).await {
-        Ok(b) => b,
-        Err(_) => return Ok(HttpResponse::NotFound().body("")),
-    };
-    Ok(HttpResponse::Ok().content_type(content_type).body(bytes))
+    Ok(deliver_image(&final_path, content_type, head_only, if_none_match).await)
 }
 
 /// Resolve a synthesised Series/Season/Artist/Album wire id (a 32-hex hash,
@@ -613,6 +709,7 @@ fn content_type_for_ext(path: &std::path::Path) -> &'static str {
 /// into the cache directory (keyed by a hash of the sidecar path) so we
 /// never pollute the user's media folder. A transcode failure — or no
 /// cache to write into — falls back to the original sidecar bytes.
+#[allow(clippy::too_many_arguments)]
 async fn serve_local_artwork(
     path: &std::path::Path,
     role: ImageRole,
@@ -620,6 +717,7 @@ async fn serve_local_artwork(
     format: ImageFormat,
     state: &AppState,
     req_width: Option<u32>,
+    if_none_match: Option<&str>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // Downscale big poster/fanart sidecars to the client-requested display width
     // (capped per role) and serve the cached copy — a full-res multi-MB sidecar
@@ -659,13 +757,7 @@ async fn serve_local_artwork(
             }
         },
     };
-    if head_only {
-        return Ok(HttpResponse::Ok().content_type(content_type).finish());
-    }
-    match tokio::fs::read(&final_path).await {
-        Ok(bytes) => Ok(HttpResponse::Ok().content_type(content_type).body(bytes)),
-        Err(_) => Ok(HttpResponse::NotFound().body("")),
-    }
+    Ok(deliver_image(&final_path, content_type, head_only, if_none_match).await)
 }
 
 /// Transcode a local sidecar into `ext` (webp/avif), writing the output
@@ -1076,6 +1168,89 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), PNG_1X1, "served bytes must be the sidecar");
+    }
+
+    #[actix_web::test]
+    async fn served_image_carries_cache_control_and_etag() {
+        // B89 — a poster served with no Cache-Control/ETag made the gallery
+        // client re-download every tile on every render. A 200 must now carry a
+        // max-age Cache-Control and an ETag so the client caches it.
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let media_path = dir.path().join("movie.mkv");
+        let poster = dir.path().join("poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 55, &media_path).await;
+        state
+            .stores
+            .set_artwork(55, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/items/55/images/primary")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let cc = resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(cc.contains("max-age="), "must set a max-age: {cc:?}");
+        assert!(
+            resp.headers().get("etag").is_some(),
+            "must set an ETag for revalidation"
+        );
+    }
+
+    #[actix_web::test]
+    async fn matching_if_none_match_yields_304() {
+        // B89 — once the client holds the current ETag, a conditional request
+        // must revalidate to 304 (no body) rather than re-shipping the bytes.
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let poster = dir.path().join("poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 56, &dir.path().join("movie.mkv")).await;
+        state
+            .stores
+            .set_artwork(56, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let first = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/items/56/images/primary")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), 200);
+        let etag = first
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        let second = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/items/56/images/primary")
+                .insert_header(("If-None-Match", etag.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(second.status(), 304, "matching ETag must 304");
+        let body = test::read_body(second).await;
+        assert!(body.is_empty(), "304 must carry no body");
     }
 
     #[actix_web::test]
