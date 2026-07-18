@@ -596,6 +596,19 @@ async fn deliver_stream(
         .use_etag(true)
         .use_last_modified(true);
     let mut resp = file.into_response(req);
+    // B94 — Firefox's `<video>` opens playback with `Range: bytes=0-`, a range
+    // that spans the whole file. actix-files gates its 206 on `offset != 0 ||
+    // length != total` (named.rs:605), so it answers 200 while still stamping a
+    // Content-Range header. Firefox reads the 200 as "server ignores ranges"
+    // and marks the media non-seekable (seek bar inert / restarts at 0). Any
+    // response to a Range request that carries a Content-Range is partial by
+    // definition — promote it to 206 so the opening probe confirms seekability.
+    if has_range
+        && resp.status() == StatusCode::OK
+        && resp.headers().contains_key(header::CONTENT_RANGE)
+    {
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
     // A Matroska file carrying only WebM-legal codecs (VP8/VP9/AV1 + Opus/
     // Vorbis) is playable by browsers as `video/webm`, but `mime_guess` maps
     // the `.mkv` extension to `video/x-matroska`, which Firefox rejects

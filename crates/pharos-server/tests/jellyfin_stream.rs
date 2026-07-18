@@ -129,6 +129,34 @@ async fn range_request_returns_206_partial() {
     assert_eq!(body.as_ref(), &PAYLOAD[4..=9]);
 }
 
+// B94 — Firefox's `<video>` opens playback with `Range: bytes=0-`. That range
+// spans the whole file, and actix-files gates its 206 on `offset != 0 || length
+// != total`, so it answers 200 (while still stamping Content-Range). Firefox
+// reads the 200 as "server ignores ranges" and marks the media non-seekable.
+// deliver_stream must promote any full-file Range response to 206.
+#[actix_web::test]
+async fn full_file_range_bytes_zero_dash_returns_206() {
+    let (state, token, _td) = seed_with_file().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::get()
+        .uri("/Videos/42/stream")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("Range", "bytes=0-"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        206,
+        "Firefox's opening `bytes=0-` probe must get 206 or seeking is disabled"
+    );
+    assert!(
+        resp.headers().contains_key("content-range"),
+        "206 must carry Content-Range"
+    );
+    let body = test::read_body(resp).await;
+    assert_eq!(body.as_ref(), PAYLOAD);
+}
+
 #[actix_web::test]
 async fn audio_universal_streams_file() {
     let (state, token, _td) = seed_with_file().await;
