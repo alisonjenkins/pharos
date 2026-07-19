@@ -638,7 +638,9 @@ async fn dashboard_named_config_and_backup_sections_render() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.is_array(), "/Backup must be an array, got {v}");
 
-    // Dashboard landing page storage panel maps over `.Folders`.
+    // Dashboard "Paths" panel reads seven fixed named folder slots (NOT a
+    // `Folders` array); a missing slot renders a permanent spinner. Assert the
+    // slots are present with real byte figures the widget draws its bar from.
     let body = test::call_and_read_body(
         &app,
         test::TestRequest::get()
@@ -648,8 +650,22 @@ async fn dashboard_named_config_and_backup_sections_render() {
     )
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(
-        v["Folders"].is_array(),
-        "/System/Info/Storage needs Folders[]: {v}"
-    );
+    for slot in [
+        "CacheFolder",
+        "ImageCacheFolder",
+        "ProgramDataFolder",
+        "LogFolder",
+        "InternalMetadataFolder",
+        "TranscodingTempFolder",
+        "WebFolder",
+    ] {
+        assert!(
+            v[slot].is_object(),
+            "/System/Info/Storage needs {slot} object: {v}"
+        );
+        assert!(
+            v[slot]["UsedSpace"].is_number() && v[slot]["FreeSpace"].is_number(),
+            "{slot} needs numeric UsedSpace/FreeSpace: {v}"
+        );
+    }
 }
