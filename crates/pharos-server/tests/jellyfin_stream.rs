@@ -276,3 +276,34 @@ async fn stream_alt_extension_route_works() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
 }
+
+// B95 — Firefox HEAD-probes a progressive `<video>` source to learn whether the
+// server supports byte ranges before it will treat the media as seekable. The
+// DirectPlay URL jellyfin-web hands the browser carries an extension
+// (`stream.mp4`), but HEAD was registered ONLY on the extension-less
+// `/videos/{id}/stream`, so `HEAD /videos/{id}/stream.mp4` fell through to 404.
+// Firefox read that as "no range support" and collapsed `seekable` to
+// `buffered` — the user could only seek within already-downloaded bytes.
+#[actix_web::test]
+async fn head_alt_extension_route_advertises_ranges() {
+    let (state, token, _td) = seed_with_file().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::default()
+        .method(actix_web::http::Method::HEAD)
+        .uri("/Videos/42/stream.mp4")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "HEAD on the extensioned DirectPlay URL must succeed or Firefox marks it non-seekable"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes"),
+        "HEAD must advertise Accept-Ranges: bytes"
+    );
+}

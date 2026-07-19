@@ -85,6 +85,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/videos/{id}/stream", web::get().to(stream_video))
         .route("/videos/{id}/stream.{ext}", web::get().to(stream_video))
         .route("/videos/{id}/stream", web::head().to(head_video))
+        // B95 — Firefox HEAD-probes the extensioned DirectPlay URL
+        // (`stream.mp4`) to confirm range support before it treats the media
+        // as seekable. Without a HEAD handler here the probe 405'd and Firefox
+        // collapsed `seekable` to `buffered`.
+        .route("/videos/{id}/stream.{ext}", web::head().to(head_video))
         .route("/audio/{id}/stream", web::get().to(stream_audio))
         .route("/audio/{id}/stream", web::head().to(head_audio))
         // P11 — universal honours AudioCodec + MaxStreamingBitrate.
