@@ -960,6 +960,33 @@ impl MediaStore for SqliteStore {
         // sibling root sharing a string prefix (/media/movies vs
         // /media/movies-4k) is never swept; wildcards in the root are escaped.
         let like = crate::root_like_pattern(root_prefix);
+        // B98 — blast-radius guard. Count the candidates (and the root total)
+        // before deleting; if a partial mount listing makes the sweep look
+        // catastrophic, skip it rather than wipe the library.
+        let (unseen, total): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               COUNT(*) FILTER (WHERE last_seen_scan_id IS NULL OR last_seen_scan_id != ?), \
+               COUNT(*) \
+             FROM media_items WHERE path LIKE ? ESCAPE '\\'",
+        )
+        .bind(scan_id)
+        .bind(&like)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if crate::sweep_exceeds_guard(unseen.max(0) as u64, total.max(0) as u64) {
+            tracing::warn!(
+                scan_id,
+                unseen,
+                total,
+                root_prefix,
+                "sweep ABORTED (B98 guard): would delete {unseen}/{total} rows under this root \
+                 (> {:.0}% cap) — a mount likely under-reported the tree; skipping to protect the \
+                 library. A later complete scan reconciles genuine deletions.",
+                crate::SWEEP_MAX_DELETE_FRACTION * 100.0,
+            );
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query_as::<_, (i64,)>(
             "DELETE FROM media_items \
              WHERE (last_seen_scan_id IS NULL OR last_seen_scan_id != ?) \

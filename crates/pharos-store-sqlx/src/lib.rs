@@ -130,6 +130,58 @@ pub(crate) fn root_like_pattern(root: &str) -> String {
     out
 }
 
+/// B98 — mark-and-sweep blast-radius guard. A scan deletes every row under a
+/// root that it didn't observe this pass; if the media mount briefly
+/// under-reports a directory (an NFS export returning a short/empty listing
+/// with *no* error, so the walk's `walk_errors == 0` guard doesn't fire), a
+/// huge swathe of still-present files looks deleted and the sweep wipes the
+/// library. These bound how much one sweep may remove: the deletion must be
+/// BOTH a large fraction of the root AND a large absolute count before it's
+/// treated as suspicious and skipped. A genuine bulk delete (a removed series)
+/// is a small slice; a mount glitch is a cliff. Deletion is merely delayed —
+/// a later clean scan reconciles real removals.
+pub(crate) const SWEEP_MAX_DELETE_FRACTION: f64 = 0.25;
+/// Below this many candidate deletions the fraction cap does not apply, so
+/// small libraries / tests can still prune normally (deleting 3 of 5 is fine;
+/// deleting 8192 of 13972 is not).
+pub(crate) const SWEEP_GUARD_MIN_DELETIONS: u64 = 100;
+
+/// Decide whether a sweep that would delete `unseen` of `total` rows under a
+/// root is safe to apply. `true` = abort (too big; likely a partial listing).
+/// Shared by every store's `sweep_unseen` so sqlite and postgres agree.
+pub(crate) fn sweep_exceeds_guard(unseen: u64, total: u64) -> bool {
+    unseen >= SWEEP_GUARD_MIN_DELETIONS
+        && total > 0
+        && (unseen as f64) > (total as f64) * SWEEP_MAX_DELETE_FRACTION
+}
+
+#[cfg(test)]
+mod sweep_guard_tests {
+    use super::sweep_exceeds_guard;
+
+    #[test]
+    fn small_deletes_are_always_allowed() {
+        // Below the absolute floor, even a 100%-of-root delete is allowed.
+        assert!(!sweep_exceeds_guard(3, 5));
+        assert!(!sweep_exceeds_guard(99, 99));
+    }
+
+    #[test]
+    fn large_fraction_over_floor_is_blocked() {
+        // The B98 incident: 8192 of 13972 (~59%).
+        assert!(sweep_exceeds_guard(8192, 13972));
+        // Exactly at the fraction boundary is allowed; just over is blocked.
+        assert!(!sweep_exceeds_guard(250, 1000));
+        assert!(sweep_exceeds_guard(251, 1000));
+    }
+
+    #[test]
+    fn large_absolute_but_small_fraction_is_allowed() {
+        // 150 of 10000 (1.5%) — a real bulk delete, well under the cap.
+        assert!(!sweep_exceeds_guard(150, 10_000));
+    }
+}
+
 #[cfg(test)]
 mod root_like_tests {
     #![allow(clippy::unwrap_used)]

@@ -150,6 +150,56 @@ async fn sweep_unseen_deletes_only_unseen_under_root() {
     s.finish_scan(scan, 1, swept.len() as i64).await.unwrap();
 }
 
+// B98 — the mark-and-sweep must NOT wipe the library when a scan observes far
+// fewer files than exist (a mount that briefly under-reported the tree with no
+// error). Seed a large root, mark NOTHING seen, and assert the sweep refuses.
+#[tokio::test]
+async fn sweep_guard_blocks_catastrophic_mass_delete() {
+    let s = fresh().await;
+    for i in 1..=120u64 {
+        s.put(item(i, &format!("/big/f{i}.mkv"), "T", MediaKind::Movie))
+            .await
+            .unwrap();
+    }
+    // A scan that saw none of them (partial listing) — would delete all 120.
+    let scan = s.begin_scan(std::path::Path::new("/big")).await.unwrap();
+    let swept = s.sweep_unseen(scan, "/big").await.unwrap();
+    assert!(
+        swept.is_empty(),
+        "sweep must abort when it would delete >25% of a large root, got {} deletions",
+        swept.len()
+    );
+    // Every row must survive.
+    for i in 1..=120u64 {
+        assert!(s.get(i).await.is_ok(), "row {i} must survive the guarded sweep");
+    }
+}
+
+// The guard must NOT block a legitimate large-but-small-fraction delete (e.g. a
+// removed series in a big library): 120 of 500 (24%, over the 100 floor) is a
+// real deletion and must go through.
+#[tokio::test]
+async fn sweep_guard_allows_large_delete_under_the_fraction_cap() {
+    let s = fresh().await;
+    for i in 1..=500u64 {
+        s.put(item(i, &format!("/lib/f{i}.mkv"), "T", MediaKind::Movie))
+            .await
+            .unwrap();
+    }
+    let scan = s.begin_scan(std::path::Path::new("/lib")).await.unwrap();
+    // Mark 380 seen; 120 unseen = 24% (< 25% cap) → allowed.
+    for i in 1..=380u64 {
+        s.mark_seen(i, scan, 100, 10).await.unwrap();
+    }
+    let swept = s.sweep_unseen(scan, "/lib").await.unwrap();
+    assert_eq!(swept.len(), 120, "a 24% delete is under the cap and must apply");
+    assert!(s.get(1).await.is_ok(), "a seen row survives");
+    match s.get(400).await {
+        Err(DomainError::NotFound(400)) => {}
+        other => panic!("an unseen row should be deleted, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn sweep_is_root_scoped_and_never_touches_sibling_root() {
     // V10 / brief: sweeping root A must not delete a root-B item even
