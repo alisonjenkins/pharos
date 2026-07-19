@@ -153,6 +153,76 @@ async fn delete_other_user_succeeds() {
     assert_eq!(v.as_array().unwrap().len(), 1);
 }
 
+// B96 — the jellyfin-web dashboard user page GETs `/Users/{id}` for the user
+// being administered (not the signed-in admin). That must return the target
+// user's record; confining every caller to their own record 403'd it and the
+// page spun forever (no `.catch` in jellyfin-web).
+#[actix_web::test]
+async fn admin_can_get_another_users_profile() {
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    let create = test::TestRequest::post()
+        .uri("/Users/New")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .set_json(serde_json::json!({"Name":"matt","Password":"p"}))
+        .to_request();
+    let body = test::call_and_read_body(&app, create).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let matt_id = v["Id"].as_str().unwrap().to_string();
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{matt_id}"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "admin must read any user's profile");
+    let body = test::read_body(resp).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Name"], "matt");
+    assert_eq!(v["Id"], matt_id);
+}
+
+// A non-admin caller stays scoped to itself: GETting another user's profile is
+// still 403 (self-GET is covered by the client-compat flow).
+#[actix_web::test]
+async fn non_admin_cannot_get_another_users_profile() {
+    let (state, admin_token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    // Admin creates matt, then we authenticate as matt to get a non-admin token.
+    let create = test::TestRequest::post()
+        .uri("/Users/New")
+        .insert_header(("X-Emby-Token", admin_token.as_str()))
+        .set_json(serde_json::json!({"Name":"matt","Password":"p"}))
+        .to_request();
+    let body = test::call_and_read_body(&app, create).await;
+    let matt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let matt_id = matt["Id"].as_str().unwrap().to_string();
+
+    let auth = test::TestRequest::post()
+        .uri("/Users/AuthenticateByName")
+        .set_json(serde_json::json!({"Username":"matt","Pw":"p"}))
+        .to_request();
+    let body = test::call_and_read_body(&app, auth).await;
+    let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let matt_token = session["AccessToken"].as_str().unwrap().to_string();
+
+    // matt reading the admin ("boss") — a different user — must be forbidden.
+    let req = test::TestRequest::get()
+        .uri("/Users/00000000000000000000000000000001")
+        .insert_header(("X-Emby-Token", matt_token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 403);
+
+    // But matt reading matt is fine.
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{matt_id}"))
+        .insert_header(("X-Emby-Token", matt_token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+}
+
 #[actix_web::test]
 async fn set_user_policy_flips_admin_bit() {
     let (state, token, _uid) = seed(true).await;

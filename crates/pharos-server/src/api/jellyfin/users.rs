@@ -430,11 +430,31 @@ async fn user_by_id(
 ) -> Result<impl Responder, actix_web::Error> {
     let requested = path.into_inner();
     let bearer_id = user.0.id.0.simple().to_string();
-    if requested != bearer_id {
+    if requested == bearer_id {
+        return Ok(crate::api::jellyfin::wire::json(
+            &user_dto_with_config(&state, &user.0).await,
+        ));
+    }
+    // B96 — the jellyfin-web dashboard user page (profile / access / parental
+    // control) GETs `/Users/{id}` for the user being administered, which is not
+    // the signed-in admin. Confining every caller to their own record 403'd that
+    // fetch; jellyfin-web has no `.catch` on it, so the page spun forever.
+    // Admins may read any user; everyone else stays scoped to themselves.
+    if !user.0.policy.admin {
         return Err(actix_web::error::ErrorForbidden("user mismatch"));
     }
+    let uid = pharos_core::UserId(
+        Uuid::parse_str(&requested)
+            .map_err(|_| actix_web::error::ErrorBadRequest("invalid user id"))?,
+    );
+    let target = state
+        .stores
+        .get(uid)
+        .await
+        .map_err(|_| actix_web::error::ErrorNotFound("user not found"))?
+        .into_user();
     Ok(crate::api::jellyfin::wire::json(
-        &user_dto_with_config(&state, &user.0).await,
+        &user_dto_with_config(&state, &target).await,
     ))
 }
 
