@@ -2549,7 +2549,18 @@ async fn latest_items(
     let scoped = restrict_to_parent(state, &all, q.parent_id.as_deref()).await;
     // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
     // row filters to Type=Movie.
-    let typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
+    let mut typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
+    // B97 — "Latest" means most-recently-ADDED first (DateCreated desc). Without
+    // this sort the items came back in `list_items_cached` order (id/cache
+    // order), so a newly-scanned film — the one with the newest DateCreated —
+    // never surfaced in the home "Recently Added" row. Sort by `created_at`
+    // desc with id as a stable tiebreak; rows lacking a timestamp sort last.
+    typed.sort_by(|a, b| {
+        b.created_at
+            .unwrap_or(i64::MIN)
+            .cmp(&a.created_at.unwrap_or(i64::MIN))
+            .then(b.id.cmp(&a.id))
+    });
     let limit = q.limit.min(100) as usize;
     let page: Vec<MediaItem> = typed.into_iter().take(limit).collect();
     let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
