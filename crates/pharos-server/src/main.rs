@@ -743,6 +743,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state = state.with_live_tv(backend);
     }
     state = state.with_log_dir(cfg.obs.log_dir.clone());
+    // Dashboard storage panel (`GET /System/Info/Storage`) — report disk
+    // usage for the real configured cache/transcode/subtitle/log/web dirs.
+    // `program_data` is left unset (the handler falls back to the advertised
+    // data path); every unset slot statvfs's its advertised default's nearest
+    // existing ancestor, so the panel always shows real figures.
+    state = state.with_storage_folders(pharos_server::state::StorageFolders {
+        cache: cfg.server.image_cache_dir.clone(),
+        image_cache: cfg.server.image_cache_dir.clone(),
+        program_data: None,
+        log: cfg.obs.log_dir.clone(),
+        metadata: cfg.server.subtitle_cache_dir.clone(),
+        transcodes: cfg.server.transcode_cache_dir.clone(),
+        web: cfg.server.ui_dir.clone(),
+    });
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
     state = state.with_linux_firefox_h264(cfg.server.linux_firefox_h264);
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);

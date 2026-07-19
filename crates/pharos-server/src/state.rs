@@ -112,6 +112,24 @@ pub enum SocketBroadcast {
     },
 }
 
+/// Resolved on-disk directories the dashboard storage panel
+/// (`GET /System/Info/Storage`) reports free/used space for — one per
+/// Jellyfin folder slot. Populated from `[server]`/`[obs]` config at boot;
+/// all-`None` in tests, where the storage handler falls back to the
+/// advertised default paths (so the panel still renders real backing-disk
+/// figures instead of spinning). A `None` slot means "not separately
+/// configured" — the handler substitutes the advertised default path.
+#[derive(Clone, Default)]
+pub struct StorageFolders {
+    pub cache: Option<PathBuf>,
+    pub image_cache: Option<PathBuf>,
+    pub program_data: Option<PathBuf>,
+    pub log: Option<PathBuf>,
+    pub metadata: Option<PathBuf>,
+    pub transcodes: Option<PathBuf>,
+    pub web: Option<PathBuf>,
+}
+
 pub struct AppState {
     pub stores: Stores,
     pub auth: Auth,
@@ -161,6 +179,9 @@ pub struct AppState {
     /// Directory pharos surfaces log files from for the
     /// `/System/Logs` admin endpoint. None disables the surface.
     pub log_dir: Option<PathBuf>,
+    /// Resolved directories the dashboard storage panel reports disk
+    /// usage for (`GET /System/Info/Storage`). Set from config at boot.
+    pub storage_folders: StorageFolders,
     /// T-fix-Q1 — QuickConnect pending-request registry. Always
     /// available; the `/QuickConnect/Enabled` flag advertises true.
     pub quick_connect: crate::quick_connect::QuickConnectRegistry,
@@ -486,6 +507,7 @@ impl AppState {
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
+            storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
             server_name,
@@ -517,6 +539,13 @@ impl AppState {
     /// `/System/Logs` admin endpoint surfaces.
     pub fn with_log_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.log_dir = dir;
+        self
+    }
+
+    /// Builder: set the directories the dashboard storage panel reports
+    /// disk usage for (`GET /System/Info/Storage`).
+    pub fn with_storage_folders(mut self, folders: StorageFolders) -> Self {
+        self.storage_folders = folders;
         self
     }
 
@@ -557,6 +586,7 @@ impl AppState {
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
+            storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
             server_name,

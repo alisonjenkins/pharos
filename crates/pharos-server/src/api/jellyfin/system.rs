@@ -13,9 +13,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // PascalCase requests jellyfin-web sends onto these.
     cfg.route("/system/info", web::get().to(system_info))
         .route("/system/info/public", web::get().to(system_info_public))
-        // Dashboard landing page's storage panel. pharos doesn't track disk
-        // usage; an empty `Folders` list renders the panel cleanly (a 404 left
-        // it blank + logged an error).
+        // Dashboard "Paths" storage panel — real per-folder free/used disk
+        // figures (statvfs) in Jellyfin's fixed named-slot shape. An absent
+        // slot spins forever, so `system_storage` always emits all seven.
         .route("/system/info/storage", web::get().to(system_storage))
         .route("/system/configuration", web::get().to(system_configuration))
         // Named config sub-sections the dashboard fetches (Networking →
@@ -271,20 +271,110 @@ async fn empty_backup_list() -> impl Responder {
     crate::api::jellyfin::wire::json(&Vec::<serde_json::Value>::new())
 }
 
-async fn system_storage() -> impl Responder {
-    // `SystemStorageInfo` shape — jellyfin-web maps over `.Folders`. Empty is
-    // valid (renders "no data" rather than throwing). pharos doesn't surface
-    // per-folder free/used space yet.
-    crate::api::jellyfin::wire::json(&SystemStorageInfoDto {
-        folders: Vec::new(),
-    })
+async fn system_storage(state: web::Data<AppState>) -> impl Responder {
+    // `SystemStorageInfo` (`GET /System/Info/Storage`) — the dashboard "Paths"
+    // panel reads seven fixed folder slots by name (`CacheFolder`,
+    // `ImageCacheFolder`, …). For each it draws a `UsedSpace / (UsedSpace +
+    // FreeSpace)` bar — a MISSING slot renders an indeterminate spinner (the
+    // old empty-`Folders` stub left every card spinning at "? / ?"). We fill
+    // each slot with the configured directory (else its advertised default)
+    // and real `statvfs` figures for the disk backing it.
+    let f = &state.storage_folders;
+    let body = SystemStorageInfoDto {
+        cache_folder: folder_storage(f.cache.as_deref(), "/var/lib/pharos/cache"),
+        image_cache_folder: folder_storage(f.image_cache.as_deref(), "/var/lib/pharos/cache"),
+        program_data_folder: folder_storage(f.program_data.as_deref(), "/var/lib/pharos"),
+        log_folder: folder_storage(f.log.as_deref(), "/var/log/pharos"),
+        internal_metadata_folder: folder_storage(f.metadata.as_deref(), "/var/lib/pharos/metadata"),
+        transcoding_temp_folder: folder_storage(
+            f.transcodes.as_deref(),
+            "/var/lib/pharos/transcodes",
+        ),
+        web_folder: folder_storage(f.web.as_deref(), "/usr/share/jellyfin-web"),
+    };
+    crate::api::jellyfin::wire::json(&body)
 }
 
-/// The `.Folders`-shaped storage response jellyfin-web reads. Typed (V38).
+/// `SystemStorageInfo` — the seven fixed, named folder slots jellyfin-web's
+/// storage panel renders. A slot left `None` is drawn as a spinner, so we
+/// always emit every slot (V38 typed DTO).
 #[derive(serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct SystemStorageInfoDto {
-    folders: Vec<serde_json::Value>,
+    cache_folder: Option<FolderStorageDto>,
+    image_cache_folder: Option<FolderStorageDto>,
+    program_data_folder: Option<FolderStorageDto>,
+    log_folder: Option<FolderStorageDto>,
+    internal_metadata_folder: Option<FolderStorageDto>,
+    transcoding_temp_folder: Option<FolderStorageDto>,
+    web_folder: Option<FolderStorageDto>,
+}
+
+/// One folder's disk figures. jellyfin-web reads `Path` (label) plus
+/// `UsedSpace` and `FreeSpace`, drawing the bar as `Used / (Used + Free)`.
+/// It does NOT read a `TotalSpace` field — it derives total itself. Bytes,
+/// base-1024.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FolderStorageDto {
+    path: String,
+    free_space: u64,
+    used_space: u64,
+}
+
+/// Build a folder slot: report `configured` if set, else the advertised
+/// `fallback` path, with `statvfs` figures for the disk backing it. The
+/// `Path` string is always the intended dir (even if not yet created —
+/// like real Jellyfin); the figures come from the nearest existing
+/// ancestor so a not-yet-created cache dir still shows its volume's space.
+fn folder_storage(
+    configured: Option<&std::path::Path>,
+    fallback: &str,
+) -> Option<FolderStorageDto> {
+    let path = configured
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from(fallback));
+    let (free_space, used_space) = disk_free_used(&path)?;
+    Some(FolderStorageDto {
+        path: path.to_string_lossy().into_owned(),
+        free_space,
+        used_space,
+    })
+}
+
+/// `(free, used)` bytes for the filesystem backing `path`, walking up to the
+/// nearest existing ancestor (a configured-but-not-yet-created dir still
+/// resolves to its parent volume). `None` only if no ancestor exists or the
+/// syscall fails — the caller then omits the slot (spinner), which is the
+/// honest signal that we truly couldn't read the disk.
+#[cfg(unix)]
+fn disk_free_used(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut probe = path;
+    let existing = loop {
+        if probe.exists() {
+            break probe;
+        }
+        probe = probe.parent()?;
+    };
+    let c_path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated path; `st` is fully
+    // initialised by `statvfs` on success (return 0).
+    let (blocks, bavail, frsize) = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        (st.f_blocks as u64, st.f_bavail as u64, st.f_frsize as u64)
+    };
+    let total = blocks.saturating_mul(frsize);
+    let free = bavail.saturating_mul(frsize);
+    Some((free, total.saturating_sub(free)))
+}
+
+#[cfg(not(unix))]
+fn disk_free_used(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 async fn system_endpoint() -> impl Responder {
@@ -926,7 +1016,7 @@ pub(crate) fn classify_chapter_title(title: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod media_segments_tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -944,5 +1034,41 @@ mod media_segments_tests {
         );
         assert_eq!(classify_chapter_title("Chapter 4"), None);
         assert_eq!(classify_chapter_title("The Beach"), None);
+    }
+
+    #[test]
+    fn folder_storage_reports_real_figures_for_existing_dir() {
+        // The temp dir exists, so statvfs must succeed and report a real,
+        // non-empty backing filesystem (Used + Free > 0). This is what kills
+        // the dashboard spinner.
+        let dir = std::env::temp_dir();
+        let got = folder_storage(Some(&dir), "/nonexistent-fallback")
+            .expect("existing dir yields disk figures");
+        assert_eq!(got.path, dir.to_string_lossy());
+        assert!(
+            got.free_space + got.used_space > 0,
+            "backing filesystem must report a non-zero total"
+        );
+    }
+
+    #[test]
+    fn folder_storage_falls_back_to_ancestor_for_missing_dir() {
+        // A not-yet-created subdir under an existing root still resolves —
+        // figures come from the nearest existing ancestor, and Path is the
+        // intended (uncreated) dir, exactly like real Jellyfin.
+        let missing = std::env::temp_dir().join("pharos-nonexistent-cache-xyz/inner");
+        let got = folder_storage(Some(&missing), "/var/lib/pharos/cache")
+            .expect("nearest existing ancestor yields figures");
+        assert_eq!(got.path, missing.to_string_lossy());
+        assert!(got.free_space + got.used_space > 0);
+    }
+
+    #[test]
+    fn folder_storage_uses_advertised_fallback_when_unconfigured() {
+        // `None` configured dir → the advertised default path string is
+        // reported (its nearest existing ancestor backs the figures).
+        let got = folder_storage(None, "/var/lib/pharos/cache")
+            .expect("advertised fallback resolves to an existing ancestor");
+        assert_eq!(got.path, "/var/lib/pharos/cache");
     }
 }
