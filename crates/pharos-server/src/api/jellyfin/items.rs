@@ -6111,7 +6111,7 @@ pub(crate) fn spawn_scan_tracked(
     force: bool,
     refresh_item_id: Option<String>,
 ) {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let cancel = state
         .scan_tasks
         .try_start(crate::scan_tasks::TASK_REFRESH_LIBRARY);
@@ -6121,6 +6121,12 @@ pub(crate) fn spawn_scan_tracked(
         // multi-root "Scan All" advances 0→100 once, not once per root.
         let num_roots = roots.len().max(1) as f64;
         let completed_roots = std::sync::Arc::new(AtomicU64::new(0));
+        // The scanner checks this mid-root (per group + per probe) so DELETE
+        // /ScheduledTasks/Running stops a single-library scan promptly, not just
+        // between roots. Untracked runs get a private flag that never flips.
+        let cancel_flag = cancel
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(AtomicBool::new(false)));
         let sink: pharos_scanner::ProgressSink = {
             let st = state.clone();
             let item_id = refresh_item_id.clone();
@@ -6154,14 +6160,16 @@ pub(crate) fn spawn_scan_tracked(
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
                 .with_force(force)
-                .with_progress(sink);
+                .with_progress(sink)
+                .with_cancel(cancel_flag.clone());
         #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
         let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
             .with_rate_limit_ms(state.scan_rate_limit_ms)
             .with_probe_concurrency_opt(state.scan_probe_concurrency)
             .with_io_gate(state.bg_io.clone())
             .with_force(force)
-            .with_progress(sink);
+            .with_progress(sink)
+            .with_cancel(cancel_flag.clone());
         let mut added: Vec<pharos_core::MediaId> = Vec::new();
         let mut removed: Vec<pharos_core::MediaId> = Vec::new();
         let mut cancelled = false;

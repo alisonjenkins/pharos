@@ -158,6 +158,12 @@ pub struct FsScanner<P: Prober> {
     /// a caller can surface a scan bar. `None` (CLI scans, tests that don't
     /// assert progress) = no callbacks, zero overhead.
     progress: Option<ProgressSink>,
+    /// Cooperative cancellation flag. When set and flipped `true` mid-scan, the
+    /// walk stops queueing probes, drains no more of the probe stream, and —
+    /// critically — SKIPS the mark-and-sweep deletion pass (a partial run has
+    /// seen only a subset of what's on disk, so sweeping would prune every
+    /// not-yet-visited file). `None` (CLI/tests) = never cancels.
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<P: Prober> std::fmt::Debug for FsScanner<P> {
@@ -199,6 +205,7 @@ impl<P: Prober> FsScanner<P> {
             force: false,
             io_gate: None,
             progress: None,
+            cancel: None,
         }
     }
 
@@ -212,6 +219,7 @@ impl<P: Prober> FsScanner<P> {
             force: false,
             io_gate: None,
             progress: None,
+            cancel: None,
         }
     }
 
@@ -242,6 +250,16 @@ impl<P: Prober> FsScanner<P> {
     /// scans and most tests leave it unset.
     pub fn with_progress(mut self, sink: ProgressSink) -> Self {
         self.progress = Some(sink);
+        self
+    }
+
+    /// Attach a cooperative cancellation flag. Flip it `true` (from another
+    /// task) and the in-flight [`scan_into`](Self::scan_into) stops at its next
+    /// checkpoint (per group in phase 1, per probe result in phase 3) and skips
+    /// the deletion sweep so a partial run never prunes unvisited files. The
+    /// server wires this to the `DELETE /ScheduledTasks/Running/{id}` flag.
+    pub fn with_cancel(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(flag);
         self
     }
 
@@ -360,6 +378,16 @@ impl<P: Prober> FsScanner<P> {
         // A visible 0% the moment the task starts (before the first probe).
         emit(0);
 
+        // Cooperative cancellation: checked per group (phase 1) and per probe
+        // result (phase 3). Cloned so the check never re-borrows `self` while
+        // the probe stream does.
+        let cancel_flag = self.cancel.clone();
+        let is_cancelled = || {
+            cancel_flag
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        };
+
         // LIB-A5 — three phases:
         //   1. stat + skip  (sequential, cheap): unchanged files cost only a
         //      stat + scan_state read, never a probe slot.
@@ -392,6 +420,11 @@ impl<P: Prober> FsScanner<P> {
         const SEEN_FLUSH: usize = 512;
         let mut seen_batch: Vec<(pharos_core::MediaId, i64, u64)> = Vec::new();
         for (i, (primary, alts)) in groups.into_iter().enumerate() {
+            // Stop queueing work the moment cancellation is requested; the sweep
+            // below is skipped too, so the partial run prunes nothing.
+            if is_cancelled() {
+                break;
+            }
             // Groups fully resolved in phase 1 so far = those iterated that did
             // NOT defer to the probe stream (`pending`). Probed groups are
             // counted later, as their stream result lands (phase 3).
@@ -588,6 +621,12 @@ impl<P: Prober> FsScanner<P> {
             .buffer_unordered(self.probe_concurrency);
 
         while let Some((_id, sig, existed, fp, item, meta)) = stream.next().await {
+            // Cancellation: stop draining the probe stream. Already-written rows
+            // stay (each `put` is atomic); the sweep below is skipped so nothing
+            // is pruned. Remaining in-flight probes are dropped with the stream.
+            if is_cancelled() {
+                break;
+            }
             // Count every probe result (hit or miss) so progress reaches 100%
             // even when a file fails to probe (V6 — a miss writes nothing).
             probed_done += 1;
@@ -674,8 +713,15 @@ impl<P: Prober> FsScanner<P> {
         // library until the next scan re-adds it (the "disappearing media"
         // symptom). Skip the sweep this pass; a later clean scan reconciles
         // genuine deletions. (Deletion is merely delayed, never wrong.)
+        // A cancelled run has visited only a subset of disk, exactly like an
+        // incomplete walk — sweeping would prune every not-yet-seen file. Skip
+        // it; a later full scan reconciles genuine deletions.
+        let cancelled = is_cancelled();
         let root_prefix = root.to_string_lossy();
-        let swept = if walk_errors == 0 {
+        let swept = if cancelled {
+            tracing::info!(scan_id, "scan cancelled mid-run; skipping deletion sweep");
+            Vec::new()
+        } else if walk_errors == 0 {
             store.sweep_unseen(scan_id, &root_prefix).await?
         } else {
             tracing::warn!(
@@ -701,8 +747,11 @@ impl<P: Prober> FsScanner<P> {
         store.finish_scan(scan_id, seen, removed as i64).await?;
         // Terminal 100% — guarantees a final `processed == total` callback even
         // for an empty root (no groups, no probes) so the consumer's task state
-        // always lands on complete.
-        emit(total);
+        // always lands on complete. Suppressed on cancel: a stopped run did not
+        // reach 100%, so don't claim it did.
+        if !cancelled {
+            emit(total);
+        }
         Ok(outcome)
     }
 
@@ -3005,6 +3054,48 @@ mod tests {
             "final callback is complete: {seen:?}"
         );
         assert_eq!(last.percent(), 100.0, "final percent is 100: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_skips_sweep_and_prunes_nothing() {
+        use std::sync::atomic::AtomicBool;
+        // A pre-cancelled run must NOT delete rows for files it never got to
+        // visit — otherwise cancelling a scan would nuke the library. The sweep
+        // is skipped exactly like an incomplete walk.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.mkv", b"aaaa").await;
+        write_file(td.path(), "b.mkv", b"bbbb").await;
+        let store = MemStore::default();
+        assert_eq!(
+            FsScanner::new(FakeProber::default())
+                .scan_into(td.path(), &store)
+                .await
+                .unwrap()
+                .added
+                .len(),
+            2
+        );
+
+        // Remove a file on disk: a normal scan would sweep its row. A cancelled
+        // one must not.
+        tokio::fs::remove_file(td.path().join("a.mkv"))
+            .await
+            .unwrap();
+        let flag = Arc::new(AtomicBool::new(true));
+        let out = FsScanner::new(FakeProber::default())
+            .with_cancel(flag)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert!(
+            out.removed.is_empty(),
+            "cancelled scan must not sweep: {out:?}"
+        );
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            2,
+            "both rows survive a cancelled scan even though a.mkv is gone"
+        );
     }
 
     #[tokio::test]
