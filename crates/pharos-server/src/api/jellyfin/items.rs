@@ -5678,14 +5678,42 @@ async fn remove_virtual_folder(
 
 /// `POST /Items/{id}/Refresh` — the metadata-editor "Refresh" button + the
 /// context-menu "Refresh metadata". jellyfin-web re-fetches from providers;
-/// pharos has no online providers, so a refresh = re-PROBE the item's file
-/// (force-bypassing the incremental `(mtime,size)` skip) so a changed file or
-/// a probe-schema bump is picked up, plus a re-read of its NFO/sidecars. Kicks
-/// a background force-scan of the item's parent directory and returns 204.
+/// jellyfin-web's `Items/{id}/Refresh` query. The two knobs that decide whether
+/// a whole-library "Scan Library" does a fast incremental pass or a full
+/// re-probe: the default "Scan" mode sends `MetadataRefreshMode=Default` +
+/// `ReplaceAllMetadata=false` (pick up new/changed files only); "Replace all
+/// metadata" sends `FullRefresh` + `true` (re-probe every file). Keys are
+/// case-normalised by [`CiQuery`], so snake_case fields bind every casing.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+struct RefreshItemQuery {
+    metadata_refresh_mode: Option<String>,
+    replace_all_metadata: Option<bool>,
+}
+
+impl RefreshItemQuery {
+    /// A full re-probe (bypass the incremental `(mtime,size)` skip) only when
+    /// the client explicitly asked to replace all metadata / do a FullRefresh.
+    fn force(&self) -> bool {
+        self.replace_all_metadata.unwrap_or(false)
+            || self
+                .metadata_refresh_mode
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case("FullRefresh"))
+    }
+}
+
+/// pharos has no online providers, so a refresh = re-PROBE the item's file(s)
+/// so a changed file, a new file, or a probe-schema bump is picked up, plus a
+/// re-read of NFO/sidecars. A whole-library scan honours the client's refresh
+/// mode (incremental by default; full re-probe only on "replace all"); a single
+/// media item always force-re-probes its one file. Kicks a background scan and
+/// returns 204.
 async fn refresh_item(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
+    q: CiQuery<RefreshItemQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::MediaStore;
@@ -5698,8 +5726,9 @@ async fn refresh_item(
     // it to the library's root and force-scan just that root, streaming
     // RefreshProgress keyed by the library id so its card indicator fills.
     if let Some(root) = library_root_for_wire_id(&state, &raw) {
-        tracing::info!(library = %raw, root = %root.display(), "library refresh requested");
-        spawn_scan_tracked(state.into_inner(), vec![root], true, Some(raw));
+        let force = q.force();
+        tracing::info!(library = %raw, root = %root.display(), force, "library refresh requested");
+        spawn_scan_tracked(state.into_inner(), vec![root], force, Some(raw));
         return Ok(HttpResponse::NoContent().finish());
     }
 
@@ -6238,6 +6267,43 @@ mod remote_ip_tests {
         ] {
             assert!(!remote(s), "{s} must be treated as local");
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_item_query_tests {
+    use super::RefreshItemQuery;
+
+    fn q(mode: Option<&str>, replace: Option<bool>) -> RefreshItemQuery {
+        RefreshItemQuery {
+            metadata_refresh_mode: mode.map(str::to_string),
+            replace_all_metadata: replace,
+        }
+    }
+
+    #[test]
+    fn default_scan_is_incremental() {
+        // jellyfin-web's default "Scan Library": Default + false → NOT a full
+        // re-probe (fast; picks up only new/changed files).
+        assert!(!q(Some("Default"), Some(false)).force());
+        // Empty query (no knobs) also stays incremental.
+        assert!(!q(None, None).force());
+    }
+
+    #[test]
+    fn replace_all_or_full_refresh_forces() {
+        assert!(
+            q(Some("Default"), Some(true)).force(),
+            "ReplaceAllMetadata=true"
+        );
+        assert!(
+            q(Some("FullRefresh"), Some(false)).force(),
+            "FullRefresh mode"
+        );
+        assert!(
+            q(Some("fullrefresh"), None).force(),
+            "mode is case-insensitive"
+        );
     }
 }
 
