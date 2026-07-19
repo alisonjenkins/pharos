@@ -99,6 +99,17 @@ pub enum SocketBroadcast {
         position_ticks: u64,
         is_paused: bool,
     },
+    /// Library-scan progress for a single library/collection item. jellyfin-web's
+    /// legacy `emby-itemrefreshindicator` (the ring on a library card) listens
+    /// for this and fills by matching `ItemId`; `Progress` is a STRING percent
+    /// on the wire (the client does `parseFloat`). Fired by the tracked scan's
+    /// progress sink when a per-library "Scan Library" is in flight. Not
+    /// user-scoped — a library scan is not per-tenant private.
+    RefreshProgress {
+        item_id: String,
+        /// Percent `0.0..=100.0`; serialized as a string to match Jellyfin.
+        progress: f64,
+    },
 }
 
 pub struct AppState {
@@ -224,6 +235,12 @@ pub struct AppState {
     /// stream's segment reads — then reopens to [`BG_IO_MAX`] once playback is
     /// quiet. This is what lets a full force-rescan run DURING playback.
     pub bg_io: Arc<tokio::sync::Semaphore>,
+    /// Live scheduled-task progress (Jellyfin `ScheduledTasks` compat). A
+    /// library scan starts its task here and streams percent from the scanner's
+    /// progress callback; `GET /ScheduledTasks`, the `ScheduledTasksInfo` socket
+    /// push, and `POST/DELETE /ScheduledTasks/Running/{id}` all read/drive it so
+    /// jellyfin-web renders a real scan bar. See [`crate::scan_tasks`].
+    pub scan_tasks: Arc<crate::scan_tasks::ScanTasks>,
     /// Phase B2 — true when this replica holds background-work leadership
     /// (the Postgres advisory lock, or unconditionally under SQLite). The
     /// DB-writing background loops (library rescan, trickplay/subtitle warm,
@@ -485,6 +502,7 @@ impl AppState {
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
+            scan_tasks: Arc::new(crate::scan_tasks::ScanTasks::new()),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -555,6 +573,7 @@ impl AppState {
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
+            scan_tasks: Arc::new(crate::scan_tasks::ScanTasks::new()),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -829,6 +848,16 @@ impl AppState {
             item_kind,
             position_ticks,
             is_paused,
+        });
+    }
+
+    /// Fan out a `RefreshProgress` event for a library/collection item so
+    /// jellyfin-web's library-card refresh indicator fills as a scan runs.
+    /// `item_id` is the library's wire id; `progress` is `0.0..=100.0`.
+    pub fn notify_refresh_progress(&self, item_id: &str, progress: f64) {
+        let _ = self.bus.send(SocketBroadcast::RefreshProgress {
+            item_id: item_id.to_string(),
+            progress,
         });
     }
 }

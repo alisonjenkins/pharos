@@ -35,6 +35,18 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Parse a `ScheduledTasksInfoStart` frame's `Data` — Jellyfin sends the string
+/// `"<startDelayMs>,<intervalMs>"` (jellyfin-web uses `"1000,1000"`). Returns
+/// the push interval in ms, floored at 500 (so a misbehaving client can't make
+/// us spin), defaulting to 1000 when absent/unparseable.
+fn parse_tasks_info_interval(data: &serde_json::Value) -> u64 {
+    data.as_str()
+        .and_then(|s| s.split(',').nth(1))
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(1000)
+        .max(500)
+}
+
 /// Extract the `deviceId` query parameter from the `/socket` URL
 /// (`/socket?api_key=…&deviceId=…`). Jellyfin clients put it in the query
 /// string on the WS handshake; it is the stable session key the HTTP SyncPlay
@@ -235,6 +247,12 @@ async fn handle_connection<S>(
     let mut last_client_seen = Instant::now();
     const IDLE_DROP: std::time::Duration = std::time::Duration::from_secs(120);
 
+    // `ScheduledTasksInfo` push subscription. `None` until the client sends
+    // `ScheduledTasksInfoStart`; set to a ticking interval while subscribed so
+    // the dashboard's Scheduled Tasks panel animates a live scan bar without
+    // polling. Cleared on `ScheduledTasksInfoStop` / disconnect.
+    let mut tasks_info_tick: Option<tokio::time::Interval> = None;
+
     'pump: loop {
         tokio::select! {
             biased;
@@ -243,6 +261,26 @@ async fn handle_connection<S>(
                     break 'pump;
                 }
                 let out = Outbound::new("KeepAlive", serde_json::Value::Null);
+                if send_outbound(&mut session, &out).await.is_err() {
+                    break 'pump;
+                }
+            }
+            // Live scan-progress push. Only armed after ScheduledTasksInfoStart;
+            // when `None` this branch parks forever so it never fires. The
+            // interval's first tick is immediate, so a fresh subscription gets a
+            // snapshot at once.
+            _ = async {
+                match tasks_info_tick.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let out = Outbound::new(
+                    "ScheduledTasksInfo",
+                    serde_json::Value::Array(
+                        crate::api::jellyfin::admin::task_info_json(&state),
+                    ),
+                );
                 if send_outbound(&mut session, &out).await.is_err() {
                     break 'pump;
                 }
@@ -342,6 +380,24 @@ async fn handle_connection<S>(
                             {
                                 let _ = g.tx.send(GroupMsg::MemberPing { member_id }).await;
                             }
+                            continue 'pump;
+                        }
+                        // Scheduled-tasks live-progress subscription. Handled
+                        // inline (like KeepAlive) because it drives this socket's
+                        // per-connection ticker, which handle_inbound can't reach.
+                        if inbound.message_type == "ScheduledTasksInfoStart" {
+                            let interval_ms = parse_tasks_info_interval(&inbound.data);
+                            let mut iv = tokio::time::interval(
+                                std::time::Duration::from_millis(interval_ms),
+                            );
+                            iv.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Skip,
+                            );
+                            tasks_info_tick = Some(iv);
+                            continue 'pump;
+                        }
+                        if inbound.message_type == "ScheduledTasksInfoStop" {
+                            tasks_info_tick = None;
                             continue 'pump;
                         }
                         handle_inbound(
@@ -815,6 +871,16 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 serde_json::to_value([entry]).ok()?,
             ))
         }
+        // Library-card scan indicator. `Progress` is a STRING on the wire —
+        // jellyfin-web's emby-itemrefreshindicator does `parseFloat(Progress)`
+        // and only shows the ring while it is a non-zero numeric string.
+        SocketBroadcast::RefreshProgress { item_id, progress } => Some(Outbound::new(
+            "RefreshProgress",
+            serde_json::json!({
+                "ItemId": item_id,
+                "Progress": format!("{:.1}", progress.clamp(0.0, 100.0)),
+            }),
+        )),
     }
 }
 
@@ -1049,6 +1115,58 @@ mod tests {
         }
         // A bare hint (no deltas) reports IsEmpty = true.
         assert_eq!(v["Data"]["IsEmpty"], true);
+    }
+
+    #[test]
+    fn translate_refresh_progress_emits_string_percent() {
+        // jellyfin-web's emby-itemrefreshindicator does parseFloat(Data.Progress)
+        // — Progress MUST be a string, and ItemId must match the card's data-id.
+        let out = translate_broadcast(SocketBroadcast::RefreshProgress {
+            item_id: "abc123".into(),
+            progress: 42.47,
+        })
+        .unwrap();
+        assert_eq!(out.message_type, "RefreshProgress");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["MessageType"], "RefreshProgress");
+        assert_eq!(v["Data"]["ItemId"], "abc123");
+        // String, not number; one decimal place.
+        assert_eq!(v["Data"]["Progress"], "42.5");
+        assert!(v["Data"]["Progress"].is_string(), "Progress is a string");
+    }
+
+    #[test]
+    fn refresh_progress_clamps_out_of_range() {
+        let over = translate_broadcast(SocketBroadcast::RefreshProgress {
+            item_id: "x".into(),
+            progress: 150.0,
+        })
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&over).unwrap()).unwrap();
+        assert_eq!(v["Data"]["Progress"], "100.0");
+    }
+
+    #[test]
+    fn tasks_info_interval_parses_jellyfin_shape() {
+        // Jellyfin sends Data = "<startDelayMs>,<intervalMs>".
+        assert_eq!(
+            parse_tasks_info_interval(&serde_json::json!("1000,1000")),
+            1000
+        );
+        assert_eq!(
+            parse_tasks_info_interval(&serde_json::json!("0,2500")),
+            2500
+        );
+        // Floored at 500 so a client can't make the ticker spin.
+        assert_eq!(parse_tasks_info_interval(&serde_json::json!("0,10")), 500);
+        // Missing / malformed → default 1000.
+        assert_eq!(parse_tasks_info_interval(&serde_json::json!(null)), 1000);
+        assert_eq!(
+            parse_tasks_info_interval(&serde_json::json!("garbage")),
+            1000
+        );
     }
 
     #[test]

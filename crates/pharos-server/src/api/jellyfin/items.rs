@@ -5689,21 +5689,48 @@ async fn refresh_item(
 ) -> Result<impl Responder, actix_web::Error> {
     crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::MediaStore;
-    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+    let raw = path.into_inner();
+
+    // Case 1 — the id names a LIBRARY. jellyfin-web's per-library "Scan Library"
+    // button posts here with the library's ItemId, which is a synth wire id
+    // (`WireId::real()` → None). The old code parsed it as a media id, so it
+    // 400'd and NO scan ran — the reported "scan does nothing" symptom. Resolve
+    // it to the library's root and force-scan just that root, streaming
+    // RefreshProgress keyed by the library id so its card indicator fills.
+    if let Some(root) = library_root_for_wire_id(&state, &raw) {
+        tracing::info!(library = %raw, root = %root.display(), "library refresh requested");
+        spawn_scan_tracked(state.into_inner(), vec![root], true, Some(raw));
+        return Ok(HttpResponse::NoContent().finish());
+    }
+
+    // Case 2 — a real media item id: re-probe its parent directory (force). The
+    // walk skips unchanged siblings quickly; only the target (and any genuinely
+    // changed sibling) is re-read.
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&raw)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
-    // Scan the item's parent directory (force) so its file is re-probed. The
-    // walk skips unchanged siblings quickly; only the target (and any genuinely
-    // changed sibling) is re-read.
     let Some(dir) = item.path.parent().map(std::path::Path::to_path_buf) else {
         return Err(error::ErrorInternalServerError("item has no parent dir"));
     };
     tracing::info!(media.id = id, dir = %dir.display(), "item refresh requested");
-    spawn_scan(state.into_inner(), vec![dir], true);
+    spawn_scan_tracked(state.into_inner(), vec![dir], true, Some(raw));
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// Resolve a library's root directory from an incoming wire id, canonicalising
+/// both sides (the kotlin/web clients may send a dashed synth id — B82/B92) so
+/// the match holds regardless of dashes/casing. `None` when no library carries
+/// that id (the caller then treats the id as a media item).
+fn library_root_for_wire_id(state: &AppState, raw: &str) -> Option<std::path::PathBuf> {
+    let wanted = canonical_wire_id(raw).to_ascii_lowercase();
+    state
+        .libraries()
+        .iter()
+        .find(|l| canonical_wire_id(&l.wire_id).to_ascii_lowercase() == wanted)
+        .map(|l| std::path::PathBuf::from(&l.root_path))
 }
 
 /// Resolve a library's `wire_id` from its display name against the current set.
@@ -6036,12 +6063,51 @@ async fn reload_libraries_and_backfill(state: &AppState) -> Result<(), actix_web
 /// Spawn a background incremental scan of `roots` on the actix runtime, mirroring
 /// `/Library/Refresh`. Returns immediately; the `LibraryChanged` broadcast on
 /// completion lets connected clients invalidate their caches.
-pub(crate) fn spawn_scan(
+/// Spawn a background scan that drives the Jellyfin `RefreshLibrary` scheduled
+/// task: it reports live percent into [`AppState::scan_tasks`] — so `GET
+/// /ScheduledTasks` and the `ScheduledTasksInfo` socket push animate a progress
+/// bar — and, when `refresh_item_id` is set (a per-library "Scan Library"),
+/// fans `RefreshProgress` frames keyed by that library's item id so the legacy
+/// library-card indicator fills too.
+///
+/// If a scan is already running (the task is not `Idle`), this still scans — so
+/// an add-library or per-library refresh is never silently dropped — but does
+/// NOT drive the single shared task bar (two scans must not fight over one
+/// percent). `try_start` hands back the run's cancel flag; a `DELETE
+/// /ScheduledTasks/Running/{id}` sets it and the root loop stops after the
+/// current root (the finest cancellation granularity the scanner exposes).
+pub(crate) fn spawn_scan_tracked(
     state: std::sync::Arc<AppState>,
     roots: Vec<std::path::PathBuf>,
     force: bool,
+    refresh_item_id: Option<String>,
 ) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let cancel = state
+        .scan_tasks
+        .try_start(crate::scan_tasks::TASK_REFRESH_LIBRARY);
+    let tracked = cancel.is_some();
     actix_web::rt::spawn(async move {
+        // Overall percent folds each per-root fraction across all roots, so a
+        // multi-root "Scan All" advances 0→100 once, not once per root.
+        let num_roots = roots.len().max(1) as f64;
+        let completed_roots = std::sync::Arc::new(AtomicU64::new(0));
+        let sink: pharos_scanner::ProgressSink = {
+            let st = state.clone();
+            let item_id = refresh_item_id.clone();
+            let done = completed_roots.clone();
+            std::sync::Arc::new(move |p: pharos_scanner::ScanProgress| {
+                let overall =
+                    ((done.load(Ordering::Relaxed) as f64) * 100.0 + p.percent()) / num_roots;
+                // No-op when untracked: set_progress only moves a Running task.
+                st.scan_tasks
+                    .set_progress(crate::scan_tasks::TASK_REFRESH_LIBRARY, overall);
+                if let Some(id) = &item_id {
+                    st.notify_refresh_progress(id, overall);
+                }
+            })
+        };
+
         // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build probes
         // in-process via the resident libav worker (the distroless OCI image
         // ships no `ffprobe` binary, so `FfmpegProber` would fail every probe);
@@ -6058,16 +6124,26 @@ pub(crate) fn spawn_scan(
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
-                .with_force(force);
+                .with_force(force)
+                .with_progress(sink);
         #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
         let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
             .with_rate_limit_ms(state.scan_rate_limit_ms)
             .with_probe_concurrency_opt(state.scan_probe_concurrency)
             .with_io_gate(state.bg_io.clone())
-            .with_force(force);
+            .with_force(force)
+            .with_progress(sink);
         let mut added: Vec<pharos_core::MediaId> = Vec::new();
         let mut removed: Vec<pharos_core::MediaId> = Vec::new();
+        let mut cancelled = false;
         for root in &roots {
+            if let Some(flag) = &cancel {
+                if flag.load(Ordering::SeqCst) {
+                    cancelled = true;
+                    tracing::info!("scan: cancellation requested; stopping between roots");
+                    break;
+                }
+            }
             match scanner.scan_into(root, &state.stores).await {
                 Ok(outcome) => {
                     tracing::info!(
@@ -6076,27 +6152,54 @@ pub(crate) fn spawn_scan(
                         updated = outcome.updated.len(),
                         removed = outcome.removed.len(),
                         skipped = outcome.skipped,
-                        "add-library: root scanned"
+                        "scan: root scanned"
                     );
                     added.extend(outcome.added.iter().copied());
                     added.extend(outcome.updated.iter().copied());
                     removed.extend(outcome.removed.iter().copied());
                 }
                 Err(e) => {
-                    tracing::warn!(root = %root.display(), error = %e, "add-library: scan failed")
+                    tracing::warn!(root = %root.display(), error = %e, "scan: root scan failed")
                 }
             }
+            completed_roots.fetch_add(1, Ordering::Relaxed);
         }
         use pharos_core::LibraryStore;
         if let Err(e) = state.stores.backfill_library_ids().await {
-            tracing::warn!(error = %e, "add-library: post-scan backfill failed");
+            tracing::warn!(error = %e, "scan: post-scan library-id backfill failed");
         }
         // Reload the runtime set so newly-scanned items resolve under the lib.
         if let Ok(libs) = state.stores.libraries().await {
             state.set_libraries(libs);
         }
         state.notify_library_delta(&added, &removed);
+        if tracked {
+            let status = if cancelled {
+                crate::scan_tasks::CompletionStatus::Cancelled
+            } else {
+                crate::scan_tasks::CompletionStatus::Completed
+            };
+            state
+                .scan_tasks
+                .finish(crate::scan_tasks::TASK_REFRESH_LIBRARY, status);
+        }
+        // A terminal RefreshProgress so a per-library card settles at 100%
+        // instead of freezing on the last mid-scan frame.
+        if let Some(id) = &refresh_item_id {
+            state.notify_refresh_progress(id, 100.0);
+        }
     });
+}
+
+/// Back-compat entry point for scans with no per-item progress target: the
+/// add-library wizard and the legacy `POST /Library/Refresh`. Delegates to
+/// [`spawn_scan_tracked`] so these still animate the `RefreshLibrary` task bar.
+pub(crate) fn spawn_scan(
+    state: std::sync::Arc<AppState>,
+    roots: Vec<std::path::PathBuf>,
+    force: bool,
+) {
+    spawn_scan_tracked(state, roots, force, None);
 }
 
 #[cfg(test)]

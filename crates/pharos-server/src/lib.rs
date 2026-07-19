@@ -13,6 +13,7 @@ pub mod person_image_backfill;
 pub mod quick_connect;
 pub mod router;
 #[cfg(unix)]
+pub mod scan_tasks;
 pub mod segment_backfill;
 pub mod sessions;
 pub mod state;

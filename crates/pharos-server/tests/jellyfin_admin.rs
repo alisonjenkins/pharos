@@ -245,6 +245,114 @@ async fn scheduled_tasks_advertise_builtin_jobs() {
 }
 
 #[actix_web::test]
+async fn refresh_item_with_library_id_triggers_scan() {
+    // A per-library "Scan Library" posts POST /Items/{libraryId}/Refresh with a
+    // synth library wire id. Before the fix this 400'd (parse_item_id → None) and
+    // no scan ran. Now it resolves the library root, force-scans it, and streams
+    // RefreshProgress keyed by the library id.
+    use pharos_core::{Library, LibraryKind};
+    use pharos_server::state::SocketBroadcast;
+    let dir = tempfile::tempdir().unwrap();
+    let wire = "0123456789abcdef0123456789abcdef";
+    let (state, token, _uid) = seed(true).await;
+    state.set_libraries(vec![Library {
+        id: 1,
+        name: "Films".into(),
+        root_path: dir.path().to_string_lossy().into_owned(),
+        kind: LibraryKind::Movies,
+        wire_id: wire.into(),
+    }]);
+    let mut bus = state.bus.subscribe();
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri(&format!(
+            "/Items/{wire}/Refresh?Recursive=true&MetadataRefreshMode=Default"
+        ))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 204, "library refresh must trigger, not 400");
+    // The tracked scan streams RefreshProgress for the library id.
+    let mut saw_refresh_progress = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv()).await {
+            Ok(Ok(SocketBroadcast::RefreshProgress { item_id, .. })) => {
+                assert_eq!(item_id, wire);
+                saw_refresh_progress = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        saw_refresh_progress,
+        "a RefreshProgress broadcast must fan out"
+    );
+}
+
+#[actix_web::test]
+async fn refresh_item_unknown_id_still_400() {
+    // A non-library, non-media id is still a client error (regression guard: the
+    // library branch must not swallow genuinely-invalid ids).
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/Items/not-a-real-id/Refresh")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[actix_web::test]
+async fn scheduled_task_start_refresh_library_runs_and_stops() {
+    // "Scan All Libraries" in jellyfin-web starts the RefreshLibrary task via
+    // POST /ScheduledTasks/Running/{id}; DELETE cancels; an unknown id is 404.
+    use pharos_server::state::SocketBroadcast;
+    let (state, token, _uid) = seed(true).await;
+    let mut bus = state.bus.subscribe();
+    let app = test::init_service(build_app(state)).await;
+
+    let start = test::TestRequest::post()
+        .uri("/ScheduledTasks/Running/refresh-library")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert_eq!(test::call_service(&app, start).await.status(), 204);
+    // The scan (even over zero roots) completes with a LibraryChanged broadcast.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv())
+        .await
+        .expect("broadcast timeout")
+        .expect("recv");
+    assert!(matches!(msg, SocketBroadcast::LibraryChanged { .. }));
+
+    // DELETE is accepted (204) whether or not a run is live.
+    let stop = test::TestRequest::delete()
+        .uri("/ScheduledTasks/Running/refresh-library")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert_eq!(test::call_service(&app, stop).await.status(), 204);
+
+    // Unknown task id → 404.
+    let bogus = test::TestRequest::post()
+        .uri("/ScheduledTasks/Running/no-such-task")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert_eq!(test::call_service(&app, bogus).await.status(), 404);
+}
+
+#[actix_web::test]
+async fn scheduled_task_start_requires_admin() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/ScheduledTasks/Running/refresh-library")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 403);
+}
+
+#[actix_web::test]
 async fn system_logs_lists_files_in_log_dir() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("pharos.log"), b"hello\n").unwrap();

@@ -36,6 +36,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/library/refresh", web::post().to(library_refresh))
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(scheduled_tasks))
+        .route(
+            "/scheduledtasks/running/{id}",
+            web::post().to(start_scheduled_task),
+        )
+        .route(
+            "/scheduledtasks/running/{id}",
+            web::delete().to(stop_scheduled_task),
+        )
         .route("/plugins", web::get().to(empty_array))
         .route("/system/logs", web::get().to(system_logs))
         .route("/system/logs/log", web::get().to(system_logs_file))
@@ -197,9 +205,62 @@ async fn empty_array(_user: AuthUser) -> impl Responder {
 /// rather than the Jellyfin trigger model, so each is advertised `Idle` with an
 /// interval trigger and no manual execution wired yet — enough for the panel to
 /// list them; per-task Start/Stop is a later increment.
+/// Static identity + copy for one advertised task, independent of its live run
+/// state. Zipped with the [`crate::scan_tasks::ScanTasks`] snapshot to build
+/// each `TaskInfo`. Order matches [`crate::scan_tasks::ALL_TASK_IDS`].
+struct TaskDescriptor {
+    id: &'static str,
+    key: &'static str,
+    name: &'static str,
+    description: &'static str,
+    category: &'static str,
+}
+
+const TASK_DESCRIPTORS: [TaskDescriptor; 3] = [
+    TaskDescriptor {
+        id: crate::scan_tasks::TASK_REFRESH_LIBRARY,
+        key: "RefreshLibrary",
+        name: "Scan Media Library",
+        description: "Walks the media roots and updates the catalogue (incremental by (mtime,size) + probe schema version).",
+        category: "Library",
+    },
+    TaskDescriptor {
+        id: crate::scan_tasks::TASK_TRICKPLAY,
+        key: "TrickplayImages",
+        name: "Generate Trickplay Images",
+        description: "Pre-generates scrub-preview sprite sheets for video items.",
+        category: "Library",
+    },
+    TaskDescriptor {
+        id: crate::scan_tasks::TASK_EXTRACT_SUBTITLES,
+        key: "ExtractSubtitles",
+        name: "Extract Subtitles",
+        description: "Pre-extracts embedded text subtitle tracks to the subtitle cache for fast delivery.",
+        category: "Library",
+    },
+];
+
+/// Jellyfin `TaskResult` (a task's `LastExecutionResult`). `StartTimeUtc` /
+/// `EndTimeUtc` / `Status` are the fields jellyfin-web reads.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct ScheduledTaskDto {
+struct TaskResultDto {
+    start_time_utc: String,
+    end_time_utc: String,
+    status: &'static str,
+    name: &'static str,
+    key: &'static str,
+    id: &'static str,
+    error_message: Option<String>,
+    long_error_message: Option<String>,
+}
+
+/// Jellyfin `TaskInfo`. `State` + `CurrentProgressPercentage` drive the live
+/// scan bar; both progress and `LastExecutionResult` are always present (null
+/// when absent) to match Jellyfin, which never omits them.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct TaskInfoDto {
     name: &'static str,
     state: &'static str,
     id: &'static str,
@@ -209,55 +270,101 @@ struct ScheduledTaskDto {
     is_hidden: bool,
     is_enabled: bool,
     current_progress_percentage: Option<f64>,
-    last_execution_result: Option<()>,
+    last_execution_result: Option<TaskResultDto>,
     triggers: &'static [()],
 }
 
-async fn scheduled_tasks(_user: AuthUser) -> impl Responder {
-    fn task(
-        id: &'static str,
-        key: &'static str,
-        name: &'static str,
-        desc: &'static str,
-        category: &'static str,
-    ) -> ScheduledTaskDto {
-        ScheduledTaskDto {
-            name,
-            state: "Idle",
-            id,
-            key,
-            description: desc,
-            category,
-            is_hidden: false,
-            is_enabled: true,
-            current_progress_percentage: None,
-            last_execution_result: None,
-            triggers: &[],
+/// Build the live `TaskInfo[]` payload shared by `GET /ScheduledTasks` and the
+/// `ScheduledTasksInfo` socket push: each static descriptor merged with the
+/// task's current run-state from [`AppState::scan_tasks`].
+pub(crate) fn task_info_json(state: &AppState) -> Vec<serde_json::Value> {
+    let snaps = state.scan_tasks.snapshot();
+    TASK_DESCRIPTORS
+        .iter()
+        .map(|d| {
+            let snap = snaps.iter().find(|s| s.id == d.id);
+            let state_str = snap.map_or("Idle", |s| s.state.as_wire());
+            let progress = snap.and_then(|s| s.progress);
+            let last = snap.and_then(|s| s.last).map(|l| TaskResultDto {
+                start_time_utc: pharos_jellyfin_api::dto::format_iso8601_ms(l.start_ms),
+                end_time_utc: pharos_jellyfin_api::dto::format_iso8601_ms(l.end_ms),
+                status: l.status.as_wire(),
+                name: d.name,
+                key: d.key,
+                id: d.id,
+                error_message: None,
+                long_error_message: None,
+            });
+            let dto = TaskInfoDto {
+                name: d.name,
+                state: state_str,
+                id: d.id,
+                key: d.key,
+                description: d.description,
+                category: d.category,
+                is_hidden: false,
+                is_enabled: true,
+                current_progress_percentage: progress,
+                last_execution_result: last,
+                triggers: &[],
+            };
+            serde_json::to_value(dto).unwrap_or(serde_json::Value::Null)
+        })
+        .collect()
+}
+
+/// `GET /ScheduledTasks` — the dashboard's Scheduled Tasks panel + the "Scan All
+/// Libraries" button (which finds `Key == RefreshLibrary` here, then starts it
+/// via `POST /ScheduledTasks/Running/{id}`). Reports each task's live `State` +
+/// `CurrentProgressPercentage`. The `isHidden` query filter is accepted and
+/// ignored — no task pharos advertises is hidden.
+async fn scheduled_tasks(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    Ok(crate::api::jellyfin::wire::json(&task_info_json(&state)))
+}
+
+/// `POST /ScheduledTasks/Running/{taskId}` — start a task. jellyfin-web posts
+/// the `Id` it read from `GET /ScheduledTasks`. Only `RefreshLibrary` is
+/// startable on demand (it kicks a full-library scan that drives the task bar);
+/// the pre-generators run on their own schedule, so starting them is a no-op
+/// 204. An unknown id is a 404.
+async fn start_scheduled_task(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let id = path.into_inner();
+    match id.as_str() {
+        crate::scan_tasks::TASK_REFRESH_LIBRARY => {
+            let state = state.into_inner();
+            let roots = state.media_roots.clone();
+            tracing::info!(roots = roots.len(), "scheduled task start: RefreshLibrary");
+            crate::api::jellyfin::items::spawn_scan_tracked(state, roots, false, None);
+            Ok(HttpResponse::NoContent().finish())
         }
+        crate::scan_tasks::TASK_TRICKPLAY | crate::scan_tasks::TASK_EXTRACT_SUBTITLES => {
+            Ok(HttpResponse::NoContent().finish())
+        }
+        _ => Err(error::ErrorNotFound("unknown task")),
     }
-    crate::api::jellyfin::wire::json(&[
-        task(
-            "refresh-library",
-            "RefreshLibrary",
-            "Scan Media Library",
-            "Walks the media roots and updates the catalogue (incremental by (mtime,size) + probe schema version).",
-            "Library",
-        ),
-        task(
-            "trickplay-images",
-            "TrickplayImages",
-            "Generate Trickplay Images",
-            "Pre-generates scrub-preview sprite sheets for video items.",
-            "Library",
-        ),
-        task(
-            "extract-subtitles",
-            "ExtractSubtitles",
-            "Extract Subtitles",
-            "Pre-extracts embedded text subtitle tracks to the subtitle cache for fast delivery.",
-            "Library",
-        ),
-    ])
+}
+
+/// `DELETE /ScheduledTasks/Running/{taskId}` — request cancellation of a running
+/// task. Flips it to `Cancelling`; a running scan stops after its current root.
+async fn stop_scheduled_task(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let id = path.into_inner();
+    let signalled = state.scan_tasks.request_cancel(&id);
+    tracing::info!(task = %id, signalled, "scheduled task stop requested");
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[derive(Debug, Default, Deserialize)]
