@@ -171,7 +171,10 @@ async fn sweep_guard_blocks_catastrophic_mass_delete() {
     );
     // Every row must survive.
     for i in 1..=120u64 {
-        assert!(s.get(i).await.is_ok(), "row {i} must survive the guarded sweep");
+        assert!(
+            s.get(i).await.is_ok(),
+            "row {i} must survive the guarded sweep"
+        );
     }
 }
 
@@ -192,7 +195,11 @@ async fn sweep_guard_allows_large_delete_under_the_fraction_cap() {
         s.mark_seen(i, scan, 100, 10).await.unwrap();
     }
     let swept = s.sweep_unseen(scan, "/lib").await.unwrap();
-    assert_eq!(swept.len(), 120, "a 24% delete is under the cap and must apply");
+    assert_eq!(
+        swept.len(),
+        120,
+        "a 24% delete is under the cap and must apply"
+    );
     assert!(s.get(1).await.is_ok(), "a seen row survives");
     match s.get(400).await {
         Err(DomainError::NotFound(400)) => {}
