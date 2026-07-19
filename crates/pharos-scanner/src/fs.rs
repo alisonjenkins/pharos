@@ -85,6 +85,39 @@ pub enum PathUpdate {
     Skipped,
 }
 
+/// Live progress of an in-flight [`FsScanner::scan_into`] over one root:
+/// `processed` groups resolved so far out of `total` groups discovered by the
+/// walk. `processed == total` on completion. Feeds the Jellyfin-shaped scan
+/// progress surface (`ScheduledTasks.CurrentProgressPercentage` + the
+/// `RefreshProgress` socket message) so a client can render a live scan bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// Groups (primary + its alternate editions) fully resolved so far —
+    /// skipped-unchanged, moved/rebound, or probed-and-written.
+    pub processed: u64,
+    /// Total groups the directory walk discovered under this root. Known
+    /// up front (the walk completes before probing begins), so the fraction
+    /// is meaningful from the first callback.
+    pub total: u64,
+}
+
+impl ScanProgress {
+    /// Fraction complete as a `0.0..=100.0` percentage. `total == 0` (an empty
+    /// root) reports `100.0` — there is nothing to do, so the scan is done.
+    #[must_use]
+    pub fn percent(self) -> f64 {
+        if self.total == 0 {
+            return 100.0;
+        }
+        (self.processed as f64 / self.total as f64) * 100.0
+    }
+}
+
+/// Sink for [`ScanProgress`] callbacks. `Arc<dyn Fn>` so the scanner stays
+/// cheap to `Clone` and the server can fan a single closure (which stamps a
+/// shared atomic + broadcasts a socket message) across every root.
+pub type ProgressSink = std::sync::Arc<dyn Fn(ScanProgress) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct FsScanner<P: Prober> {
     prober: P,
@@ -120,6 +153,11 @@ pub struct FsScanner<P: Prober> {
     /// yet keeps making progress. `None` (CLI scans, tests) = full throttle,
     /// bounded only by `probe_concurrency`.
     io_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Optional live-progress sink. When set, [`scan_into`](Self::scan_into)
+    /// invokes it as groups resolve (throttled to integer-percent changes) so
+    /// a caller can surface a scan bar. `None` (CLI scans, tests that don't
+    /// assert progress) = no callbacks, zero overhead.
+    progress: Option<ProgressSink>,
 }
 
 impl<P: Prober> std::fmt::Debug for FsScanner<P> {
@@ -160,6 +198,7 @@ impl<P: Prober> FsScanner<P> {
             resolver: Arc::new(default_resolver()),
             force: false,
             io_gate: None,
+            progress: None,
         }
     }
 
@@ -172,6 +211,7 @@ impl<P: Prober> FsScanner<P> {
             resolver: Arc::new(default_resolver()),
             force: false,
             io_gate: None,
+            progress: None,
         }
     }
 
@@ -191,6 +231,17 @@ impl<P: Prober> FsScanner<P> {
     /// outright. See [`io_gate`](Self::io_gate). CLI scans leave it unset.
     pub fn with_io_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
         self.io_gate = Some(gate);
+        self
+    }
+
+    /// Attach a live-progress sink invoked as the scan resolves groups. The
+    /// scanner throttles calls to integer-percent changes (plus a final
+    /// `processed == total`), so the sink fires at most ~101 times per root
+    /// regardless of library size. The server wires this to a shared atomic +
+    /// the `RefreshProgress` / `ScheduledTasksInfo` socket broadcasts; CLI
+    /// scans and most tests leave it unset.
+    pub fn with_progress(mut self, sink: ProgressSink) -> Self {
+        self.progress = Some(sink);
         self
     }
 
@@ -285,6 +336,30 @@ impl<P: Prober> FsScanner<P> {
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
 
+        // Live-progress plumbing. `total` is known up front (the walk finished
+        // before we probe), so the fraction is meaningful from the first
+        // callback. The emitter throttles to integer-percent changes so a
+        // 13k-item library fires the sink ~101 times, not 13k. `None` sink
+        // (CLI/tests) compiles to a cheap no-op branch.
+        let total = groups.len() as u64;
+        let progress_sink = self.progress.clone();
+        let mut last_pct: i64 = -1;
+        let mut emit = |processed: u64| {
+            if let Some(sink) = &progress_sink {
+                // `checked_div` folds the empty-root (total == 0) guard into the
+                // division: no divisor → nothing to do → 100%.
+                let pct = (processed.min(total) * 100)
+                    .checked_div(total)
+                    .map_or(100, |p| p as i64);
+                if pct != last_pct {
+                    last_pct = pct;
+                    sink(ScanProgress { processed, total });
+                }
+            }
+        };
+        // A visible 0% the moment the task starts (before the first probe).
+        emit(0);
+
         // LIB-A5 — three phases:
         //   1. stat + skip  (sequential, cheap): unchanged files cost only a
         //      stat + scan_state read, never a probe slot.
@@ -316,7 +391,11 @@ impl<P: Prober> FsScanner<P> {
         // Chunked so the write lock is never held for a whole huge library.
         const SEEN_FLUSH: usize = 512;
         let mut seen_batch: Vec<(pharos_core::MediaId, i64, u64)> = Vec::new();
-        for (primary, alts) in groups {
+        for (i, (primary, alts)) in groups.into_iter().enumerate() {
+            // Groups fully resolved in phase 1 so far = those iterated that did
+            // NOT defer to the probe stream (`pending`). Probed groups are
+            // counted later, as their stream result lands (phase 3).
+            emit((i as u64).saturating_sub(pending.len() as u64));
             if seen_batch.len() >= SEEN_FLUSH {
                 store.mark_seen_batch(&seen_batch, scan_id).await?;
                 seen_batch.clear();
@@ -441,6 +520,12 @@ impl<P: Prober> FsScanner<P> {
         store.mark_seen_batch(&seen_batch, scan_id).await?;
         seen_batch.clear();
 
+        // Every group that skipped in phase 1 is now resolved; the remainder
+        // (`pending`) is what the probe stream still has to work through.
+        let phase1_done = total - pending.len() as u64;
+        emit(phase1_done);
+        let mut probed_done: u64 = 0;
+
         // Phase 2 + 3 — bounded-concurrency probe stream feeding a sequential
         // write consumer. `buffer_unordered` keeps at most `probe_concurrency`
         // probes in flight; results are awaited (in completion order) and the
@@ -503,6 +588,10 @@ impl<P: Prober> FsScanner<P> {
             .buffer_unordered(self.probe_concurrency);
 
         while let Some((_id, sig, existed, fp, item, meta)) = stream.next().await {
+            // Count every probe result (hit or miss) so progress reaches 100%
+            // even when a file fails to probe (V6 — a miss writes nothing).
+            probed_done += 1;
+            emit(phase1_done + probed_done);
             let Some(mut item) = item else { continue };
             let item_id = item.id;
             // LIB-D7 — merge resolved metadata onto the probe-built item
@@ -610,6 +699,10 @@ impl<P: Prober> FsScanner<P> {
             "incremental scan complete"
         );
         store.finish_scan(scan_id, seen, removed as i64).await?;
+        // Terminal 100% — guarantees a final `processed == total` callback even
+        // for an empty root (no groups, no probes) so the consumer's task state
+        // always lands on complete.
+        emit(total);
         Ok(outcome)
     }
 
@@ -2850,6 +2943,68 @@ mod tests {
         );
         // Rows are still present (skipped != deleted).
         assert_eq!(store.list().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn scan_progress_reports_from_zero_to_complete() {
+        use std::sync::Mutex;
+        // A first scan (all four files probed) and a second scan (all four
+        // skipped) must both drive the progress sink from 0 to processed==total,
+        // monotonically, with a constant total equal to the group count.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.mkv", b"aaaa").await;
+        write_file(td.path(), "b.mkv", b"bbbb").await;
+        write_file(td.path(), "show/s1/ep1.mkv", b"cccc").await;
+        write_file(td.path(), "show/s1/ep2.mkv", b"dddd").await;
+        let store = MemStore::default();
+
+        // Pass 1 — every file is probed (phase 3 drives progress).
+        let seen1: Arc<Mutex<Vec<ScanProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink1 = seen1.clone();
+        let out1 = FsScanner::new(FakeProber::default())
+            .with_progress(Arc::new(move |p: ScanProgress| {
+                sink1.lock().unwrap().push(p)
+            }))
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(out1.added.len(), 4, "first scan adds all four");
+        assert_scan_progress_completes(&seen1.lock().unwrap(), 4);
+
+        // Pass 2 — nothing changed on disk; every file skips in phase 1, yet
+        // progress must still reach 100% (the skip path drives progress too).
+        let seen2: Arc<Mutex<Vec<ScanProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink2 = seen2.clone();
+        let out2 = FsScanner::new(FakeProber::default())
+            .with_progress(Arc::new(move |p: ScanProgress| {
+                sink2.lock().unwrap().push(p)
+            }))
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(out2.skipped, 4, "second scan skips all four");
+        assert_scan_progress_completes(&seen2.lock().unwrap(), 4);
+    }
+
+    fn assert_scan_progress_completes(seen: &[ScanProgress], total: u64) {
+        assert!(!seen.is_empty(), "progress sink must fire at least once");
+        assert!(
+            seen.iter().all(|p| p.total == total),
+            "total constant = {total}: {seen:?}"
+        );
+        for w in seen.windows(2) {
+            assert!(
+                w[1].processed >= w[0].processed,
+                "processed must not go backwards: {seen:?}"
+            );
+        }
+        assert_eq!(seen[0].processed, 0, "first callback is 0%: {seen:?}");
+        let last = seen[seen.len() - 1];
+        assert_eq!(
+            last.processed, total,
+            "final callback is complete: {seen:?}"
+        );
+        assert_eq!(last.percent(), 100.0, "final percent is 100: {seen:?}");
     }
 
     #[tokio::test]

@@ -16,7 +16,8 @@ pub use detect::{detect_root_watchability, watchability_from_magic, RootWatchabi
 pub use ffmpeg::{parse_ffprobe_output, FfmpegProber};
 pub use fingerprint::{fingerprint, fingerprint_async};
 pub use fs::{
-    is_episode_path, parse_series_info, stable_id, FsScanner, PathUpdate, DEFAULT_EXTENSIONS,
+    is_episode_path, parse_series_info, stable_id, FsScanner, PathUpdate, ProgressSink,
+    ScanProgress, DEFAULT_EXTENSIONS,
 };
 #[cfg(feature = "libav-probe")]
 pub use libav_prober::LibavProber;
