@@ -157,6 +157,102 @@ async fn full_file_range_bytes_zero_dash_returns_206() {
     assert_eq!(body.as_ref(), PAYLOAD);
 }
 
+// Repro probe: a browser SEEK sends an OPEN-ENDED mid-file range (`bytes=N-`,
+// not the closed `bytes=4-9` the existing test covers) and echoes the opening
+// response's validator back as `If-Range`. If either shape yields a 200/full
+// body, the browser can only seek within what it has already buffered.
+#[actix_web::test]
+async fn seek_repro_open_ended_and_if_range() {
+    let (state, token, _td) = seed_with_file().await;
+    let app = test::init_service(build_app(state)).await;
+
+    // 1) Opening probe: `bytes=0-` — capture the validators the browser stores.
+    let open = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Videos/42/stream")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("Range", "bytes=0-"))
+            .to_request(),
+    )
+    .await;
+    let etag = open
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string());
+    let last_mod = open
+        .headers()
+        .get("last-modified")
+        .map(|v| v.to_str().unwrap().to_string());
+    let accept_ranges = open
+        .headers()
+        .get("accept-ranges")
+        .map(|v| v.to_str().unwrap().to_string());
+    eprintln!(
+        "OPEN status={} etag={etag:?} last_mod={last_mod:?} accept_ranges={accept_ranges:?}",
+        open.status()
+    );
+
+    // 2) Open-ended mid-file seek WITHOUT If-Range.
+    let seek = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Videos/42/stream")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("Range", "bytes=20-"))
+            .to_request(),
+    )
+    .await;
+    let seek_status = seek.status();
+    let seek_cr = seek
+        .headers()
+        .get("content-range")
+        .map(|v| v.to_str().unwrap().to_string());
+    let seek_body = test::read_body(seek).await;
+    eprintln!(
+        "SEEK(open-ended) status={seek_status} content-range={seek_cr:?} body_len={}",
+        seek_body.len()
+    );
+
+    // 3) Open-ended mid-file seek WITH matching If-Range (what a browser sends).
+    if let Some(validator) = etag.clone().or(last_mod.clone()) {
+        let cond = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/Videos/42/stream")
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .insert_header(("Range", "bytes=20-"))
+                .insert_header(("If-Range", validator.as_str()))
+                .to_request(),
+        )
+        .await;
+        let cond_status = cond.status();
+        let cond_body = test::read_body(cond).await;
+        eprintln!(
+            "SEEK(if-range={validator}) status={cond_status} body_len={}",
+            cond_body.len()
+        );
+        assert_eq!(
+            cond_status, 206,
+            "matching If-Range seek must be 206 from offset, else browser can only seek within buffered"
+        );
+        assert_eq!(cond_body.as_ref(), &PAYLOAD[20..]);
+    } else {
+        eprintln!("NO VALIDATOR on opening response — browser has no If-Range basis");
+    }
+
+    assert_eq!(
+        seek_status, 206,
+        "open-ended mid-file seek must be 206 from offset"
+    );
+    assert_eq!(seek_body.as_ref(), &PAYLOAD[20..]);
+    assert_eq!(
+        accept_ranges.as_deref(),
+        Some("bytes"),
+        "Accept-Ranges: bytes is the seekability signal"
+    );
+}
+
 #[actix_web::test]
 async fn audio_universal_streams_file() {
     let (state, token, _td) = seed_with_file().await;
