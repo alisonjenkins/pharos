@@ -36,7 +36,7 @@ use ffmpeg::{codec, encoder, format, media, Rational};
 /// Transcode `spec` entirely in-process. Returns bytes written for the
 /// FileDirect sink (0 for the Stdout/pipe sink, where the reader counts).
 pub fn transcode(spec: &JobSpec) -> Result<u64, WorkerError> {
-    ffmpeg::init().map_err(|e| WorkerError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| WorkerError::Other(format!("libav init: {e}")))?;
 
     let input_path = spec
         .input

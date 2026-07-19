@@ -133,7 +133,7 @@ where
     I: IntoIterator<Item = u64>,
     F: FnMut(&frame::Video) -> Result<bool, FrameError>,
 {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     let mut ictx = format::input(path).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
 
     let stream = ictx
@@ -259,7 +259,7 @@ pub fn filter_video<F>(
 where
     F: FnMut(&frame::Video) -> Result<bool, FrameError>,
 {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     let mut ictx = format::input(path).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
 
     let stream = ictx

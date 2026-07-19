@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// Write attachment stream `stream_index`'s bytes (the font file) to `out`.
 pub fn extract_attachment(src: &Path, stream_index: u32, out: &Path) -> Result<(), FrameError> {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     let ictx =
         ffmpeg::format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
     for stream in ictx.streams() {
@@ -43,7 +43,7 @@ pub fn extract_attachment(src: &Path, stream_index: u32, out: &Path) -> Result<(
 /// that. Returns the number of attachments written. Best-effort per stream: a
 /// stream with no data is skipped rather than failing the batch.
 pub fn extract_all_attachments(src: &Path, out_dir: &Path) -> Result<u32, FrameError> {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     let ictx =
         ffmpeg::format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
     std::fs::create_dir_all(out_dir)

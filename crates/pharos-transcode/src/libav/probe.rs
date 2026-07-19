@@ -36,7 +36,7 @@ impl std::fmt::Display for ProbeError {
 
 /// Probe `path` entirely in-process. Blocking.
 pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
-    ffmpeg::init().map_err(|e| ProbeError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| ProbeError::Other(format!("libav init: {e}")))?;
     let ictx =
         ffmpeg::format::input(path).map_err(|e| ProbeError::BadInput(format!("open: {e}")))?;
 

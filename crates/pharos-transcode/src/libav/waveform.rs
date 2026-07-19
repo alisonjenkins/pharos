@@ -20,7 +20,7 @@ pub fn waveform_rms(
     samples_per_bin: u64,
     target_bins: u32,
 ) -> Result<Vec<f32>, FrameError> {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     if samples_per_bin == 0 {
         return Err(FrameError::Other("samples_per_bin = 0".into()));
     }

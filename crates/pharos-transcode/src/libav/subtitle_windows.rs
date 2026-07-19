@@ -37,7 +37,7 @@ pub fn subtitle_event_windows(
     src: &Path,
     stream_rel_idx: u32,
 ) -> Result<Vec<WindowMs>, FrameError> {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     let mut ictx = format_input(src)?;
 
     // Resolve the codec-relative subtitle index to the absolute stream

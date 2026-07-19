@@ -35,7 +35,7 @@ pub fn fingerprint_windows(
     src: &Path,
     windows: &[(u64, u64)],
 ) -> Result<Vec<Vec<u32>>, FrameError> {
-    ffmpeg::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
+    crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
     let mut ictx = format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
     let mut out = Vec::with_capacity(windows.len());
     for &(start_ms, dur_ms) in windows {
