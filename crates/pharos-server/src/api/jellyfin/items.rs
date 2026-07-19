@@ -3990,12 +3990,32 @@ fn build_media_query(
         parent,
         ParentResolution::Filter(pharos_core::ParentFilter::Collection { .. })
     );
-    // A collection parent with no explicit SortBy keeps the curated order
-    // (the legacy `preserve_collection_order` set SortBy=None). The query
-    // builder already prepends the curated sort_order for a Collection pivot,
-    // so we leave `sort` empty in that case.
-    let effective_primary = if collection_parent && q.sort_by.is_none() {
-        SortPrimary::None
+    // B99 — an episode-scoped query (IncludeItemTypes=Episode, or a Series /
+    // Season parent) has no meaningful "SortName": ordering by episode TITLE
+    // alphabetises the season. Google TV pages a season via
+    // /Items?ParentId=<season>&IncludeItemTypes=Episode with NO SortBy, so it
+    // fell through to the SortName default and showed Neon Genesis Evangelion
+    // S1 as E7 "A Human Work", E3 "A Transfer", E18 "Ambivalence"… (alphabetical).
+    // Reused by the explicit-`ParentIndexNumber,IndexNumber` branch below.
+    let episode_scoped = mq.kinds.iter().any(|k| matches!(k, MediaKind::Episode))
+        || matches!(
+            mq.parent,
+            Some(
+                pharos_core::ParentFilter::Series { .. } | pharos_core::ParentFilter::Season { .. }
+            )
+        );
+    // With no explicit SortBy: a collection keeps its curated order (the query
+    // builder prepends the membership sort_order, so leave `sort` empty); an
+    // episode list defaults to (season, episode) — the same chain the explicit
+    // token resolves to; everything else keeps the SortName default.
+    let effective_primary = if q.sort_by.is_none() {
+        if collection_parent {
+            SortPrimary::None
+        } else if episode_scoped {
+            SortPrimary::TrackOrder
+        } else {
+            primary
+        }
     } else {
         primary
     };
@@ -4066,15 +4086,8 @@ fn build_media_query(
             // to the audio disc/track columns (NULL for episodes) collapsed
             // every episode to the Name/Id tiebreak, so a season came back
             // alphabetised-by-title / hash-ordered, not by episode number
-            // (B87). Pick the column family by the query's kind/parent.
-            let episode_scoped = mq.kinds.iter().any(|k| matches!(k, MediaKind::Episode))
-                || matches!(
-                    mq.parent,
-                    Some(
-                        pharos_core::ParentFilter::Series { .. }
-                            | pharos_core::ParentFilter::Season { .. }
-                    )
-                );
+            // (B87). Pick the column family by the query's kind/parent
+            // (`episode_scoped`, computed once above).
             // Untagged rows (NULL disc/track/season) sort FIRST in SQLite ASC,
             // LAST in Postgres ASC — the builder emits the column verbatim, so
             // accept the minor backend divergence for untagged rows; tagged
@@ -6563,6 +6576,53 @@ mod episode_sort_tests {
             &keys[..2],
             &[SortKey::SeasonNumber, SortKey::IndexNumber],
             "a Season parent must order by (season, episode): {keys:?}"
+        );
+    }
+
+    #[test]
+    fn episode_no_sortby_defaults_to_season_then_episode_when_kind_is_episode() {
+        // B99 — Google TV pages a season via
+        // /Items?ParentId=<season>&IncludeItemTypes=Episode with NO SortBy.
+        // The default must be episode order, not SortName (which alphabetises
+        // by TITLE: Evangelion S1 came back E7 "A Human Work", E3 "A Transfer",
+        // E18 "Ambivalence"…).
+        let q = list_query(serde_json::json!({ "include_item_types": "Episode" }));
+        let keys = sort_keys(&q, &ParentResolution::All);
+        assert_eq!(
+            &keys[..2],
+            &[SortKey::SeasonNumber, SortKey::IndexNumber],
+            "episode list with no SortBy must default to (season, episode): {keys:?}"
+        );
+    }
+
+    #[test]
+    fn episode_no_sortby_defaults_to_season_then_episode_for_a_season_parent() {
+        // The bare /Items?ParentId=<seasonId> the client also uses — the Season
+        // parent alone, with no SortBy, must still select episode ordering.
+        let q = list_query(serde_json::json!({}));
+        let parent = ParentResolution::Filter(ParentFilter::Season {
+            folder: None,
+            name: "Buffy".into(),
+            season: 2,
+        });
+        let keys = sort_keys(&q, &parent);
+        assert_eq!(
+            &keys[..2],
+            &[SortKey::SeasonNumber, SortKey::IndexNumber],
+            "a Season parent with no SortBy must default to (season, episode): {keys:?}"
+        );
+    }
+
+    #[test]
+    fn non_episode_no_sortby_still_defaults_to_name() {
+        // Regression: a plain library grid (movies) with no SortBy keeps
+        // SortName — the episode-order default must not leak to other kinds.
+        let q = list_query(serde_json::json!({ "include_item_types": "Movie" }));
+        let keys = sort_keys(&q, &ParentResolution::All);
+        assert_eq!(
+            keys.first(),
+            Some(&SortKey::Name),
+            "non-episode default must stay SortName: {keys:?}"
         );
     }
 
