@@ -127,6 +127,14 @@ struct CacheState {
     access_counter: u64,
 }
 
+/// Outcome of [`HlsSegmentCache::choose_audio_start_seg`]: reuse a session
+/// already covering the request, or spawn one starting at the given segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioStart {
+    Reuse,
+    Start(u32),
+}
+
 #[derive(Clone)]
 pub struct HlsSegmentCache {
     root: PathBuf,
@@ -543,6 +551,42 @@ impl HlsSegmentCache {
         }
     }
 
+    /// Decide which audio-rendition session serves `want_seg`. Pure so the
+    /// slow-swap / seek-coalescing policy is unit-testable without touching the
+    /// filesystem or spawning ffmpeg.
+    ///
+    /// - `from0_active`: a whole-file from-0 session is running or finished.
+    /// - `seek_progress`: highest segment index any running session has written.
+    ///
+    /// A fresh mid-file audio-track switch (new `-a{idx}` dir: no from-0
+    /// session, no progress) seeks straight to the playhead instead of the old
+    /// `want_seg <= LOOKAHEAD => 0` rule, which re-encoded 0→playhead over NFS
+    /// first — the "incredibly long swap" symptom (B106).
+    fn choose_audio_start_seg(
+        want_seg: u32,
+        from0_active: bool,
+        seek_progress: Option<u32>,
+    ) -> AudioStart {
+        // A from-0 session writes sequentially from 0, so it promptly covers
+        // only the near-start window — reuse it there rather than spawning a
+        // redundant seek session during ordinary early sequential play.
+        if from0_active && want_seg <= Self::AUDIO_SEEK_LOOKAHEAD_SEGS {
+            return AudioStart::Reuse;
+        }
+        // A running session has written up to `n_max`; a forward target within
+        // the lookahead window lands during the read poll.
+        if let Some(n_max) = seek_progress {
+            if want_seg >= n_max
+                && want_seg <= n_max.saturating_add(Self::AUDIO_SEEK_LOOKAHEAD_SEGS)
+            {
+                return AudioStart::Reuse;
+            }
+        }
+        // Otherwise start a session AT the playhead. Only a genuine
+        // start-of-file request uses the whole-file from-0 rendition.
+        AudioStart::Start(want_seg)
+    }
+
     /// Ensure an audio-rendition session exists whose output will cover
     /// `want_seg` promptly. `want_seg == 0` is the plain from-the-start
     /// session; a deep target spawns an additional session seeked to that
@@ -572,20 +616,18 @@ impl HlsSegmentCache {
         {
             return Ok(dir);
         }
-        // Pick the session start that serves this request.
-        let start_seg = if want_seg <= Self::AUDIO_SEEK_LOOKAHEAD_SEGS {
-            0
-        } else {
-            match Self::audio_session_progress(&dir).await {
-                // A session has written up to n_max; a target within the
-                // lookahead window will land during the read poll.
-                Some(n_max)
-                    if want_seg <= n_max.saturating_add(Self::AUDIO_SEEK_LOOKAHEAD_SEGS) =>
-                {
-                    return Ok(dir);
-                }
-                _ => want_seg,
-            }
+        // Pick the session start that serves this request. A from-0 session
+        // (running or finished) covers the near-start window; deeper — or a
+        // fresh mid-file audio-track switch — seeks straight to the playhead
+        // rather than re-encoding 0→playhead first (B106 slow-swap fix).
+        let from0_active = tokio::fs::try_exists(&playlist).await.unwrap_or(false)
+            || tokio::fs::try_exists(&dir.join(".running"))
+                .await
+                .unwrap_or(false);
+        let progress = Self::audio_session_progress(&dir).await;
+        let start_seg = match Self::choose_audio_start_seg(want_seg, from0_active, progress) {
+            AudioStart::Reuse => return Ok(dir),
+            AudioStart::Start(s) => s,
         };
         let running = dir.join(if start_seg == 0 {
             ".running".to_string()
@@ -1134,6 +1176,56 @@ mod tests {
         assert!(
             !joined.contains("6.000"),
             "nominal seg*6.0 anchor leaves the A/V skew: {joined}"
+        );
+    }
+
+    /// B106 — a fresh mid-file audio-track switch (new `-a{idx}` dir, no
+    /// running session) must spawn a SEEK session at the playhead, not the
+    /// whole-file from-0 re-encode. The old `want_seg <= LOOKAHEAD => 0` rule
+    /// meant any switch inside the first ~120 s waited for a full 0→playhead
+    /// Opus re-encode over NFS — the "incredibly long swap" symptom.
+    #[test]
+    fn shallow_switch_seeks_to_playhead_not_from_zero() {
+        // want_seg=15 (90 s in), nothing running yet → seek AT 15, not 0.
+        assert_eq!(
+            HlsSegmentCache::choose_audio_start_seg(15, false, None),
+            AudioStart::Start(15)
+        );
+    }
+
+    #[test]
+    fn play_from_start_uses_whole_file_from_zero_session() {
+        assert_eq!(
+            HlsSegmentCache::choose_audio_start_seg(0, false, None),
+            AudioStart::Start(0)
+        );
+    }
+
+    #[test]
+    fn sequential_early_play_reuses_running_from_zero_session() {
+        // from-0 session already running; a near-start segment lands during
+        // its sequential write → reuse, don't spawn a redundant seek session.
+        assert_eq!(
+            HlsSegmentCache::choose_audio_start_seg(3, true, None),
+            AudioStart::Reuse
+        );
+    }
+
+    #[test]
+    fn deep_seek_past_running_from_zero_spawns_seek_session() {
+        // B42 — from-0 crawls sequentially; a deep want must not stall waiting
+        // for it. A running seek session at 30 doesn't cover 100 either.
+        assert_eq!(
+            HlsSegmentCache::choose_audio_start_seg(100, true, Some(30)),
+            AudioStart::Start(100)
+        );
+    }
+
+    #[test]
+    fn segment_within_seek_session_lookahead_is_reused() {
+        assert_eq!(
+            HlsSegmentCache::choose_audio_start_seg(35, false, Some(30)),
+            AudioStart::Reuse
         );
     }
 }
