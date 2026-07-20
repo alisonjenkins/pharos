@@ -2,15 +2,17 @@
 //! Ground-truth: does the VP9-in-fMP4 HLS path actually switch AUDIO tracks?
 //!
 //! jellyfin-web's audio dropdown re-requests the stream with `AudioStreamIndex`
-//! set to the ABSOLUTE ffprobe stream index of the chosen track. The VP9
-//! segment handler must map that to the per-codec `-map 0:a:N` selector so the
-//! transcoded segment carries the RIGHT audio — not silently fall back to the
-//! default (first) track, which is the reported "audio switching does nothing"
-//! bug.
+//! set to the ABSOLUTE ffprobe stream index of the chosen track. On the VP9
+//! path the video segments are AUDIO-FREE; audio is a SEPARATE continuous
+//! rendition (`/videos/{id}/vp9/audio/...`) whose session must map that
+//! absolute index to the per-codec `-map 0:a:N` selector so the rendition
+//! carries the RIGHT audio — not silently fall back to the default (first)
+//! track, which is the reported "audio switching does nothing" bug.
 //!
-//! This drives the real handlers through a real transcode of a 2-audio-track
-//! source (track @300 Hz on absolute index 1, track @3000 Hz on index 2),
-//! then decodes each segment and measures which tone is actually present.
+//! This drives the real handlers through a real Opus transcode of a
+//! 2-audio-track source (track @300 Hz on absolute index 1, track @3000 Hz on
+//! index 2), fetching the audio rendition's `init.mp4` + `a0.m4s` for each
+//! selected index and measuring which tone is actually present.
 //!
 //! `#[ignore]` + ffmpeg-gated like the other real-transcode suites.
 
@@ -170,15 +172,17 @@ async fn vp9_audio_stream_index_selects_the_right_track() {
     let (state, token) = seed(clip, &td.path().join("cache")).await;
     let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
 
-    // For each audio track, fetch the shared init + segment 0 with that
-    // track selected, concatenate (what hls.js feeds MSE), and measure the
-    // 300 Hz vs 3000 Hz band energy. The SELECTED track's tone must dominate.
+    // For each audio track, fetch the AUDIO RENDITION's shared init + segment 0
+    // with that track selected, concatenate (what hls.js feeds the audio MSE
+    // buffer), and measure the 300 Hz vs 3000 Hz band energy. The SELECTED
+    // track's tone must dominate. The file handler polls up to ~5 s for the
+    // background session to produce each file.
     for (abs_idx, present, absent) in [(1u32, 300u32, 3000u32), (2u32, 3000u32, 300u32)] {
         let init = test::call_and_read_body(
             &app,
             test::TestRequest::get()
                 .uri(&format!(
-                    "/videos/42/vp9/init.mp4?api_key={token}&AudioStreamIndex={abs_idx}"
+                    "/videos/42/vp9/audio/init.mp4?api_key={token}&AudioStreamIndex={abs_idx}"
                 ))
                 .to_request(),
         )
@@ -187,11 +191,15 @@ async fn vp9_audio_stream_index_selects_the_right_track() {
             &app,
             test::TestRequest::get()
                 .uri(&format!(
-                    "/videos/42/vp9/0.m4s?api_key={token}&AudioStreamIndex={abs_idx}"
+                    "/videos/42/vp9/audio/a0.m4s?api_key={token}&AudioStreamIndex={abs_idx}"
                 ))
                 .to_request(),
         )
         .await;
+        assert!(
+            !init.is_empty() && !seg.is_empty(),
+            "AudioStreamIndex={abs_idx}: audio rendition produced no init/segment"
+        );
         let mut media = init.to_vec();
         media.extend_from_slice(&seg);
 
@@ -201,7 +209,7 @@ async fn vp9_audio_stream_index_selects_the_right_track() {
             e_present > e_absent + 12.0,
             "AudioStreamIndex={abs_idx}: expected the {present} Hz tone to dominate \
              (present {e_present:.1} dB vs absent {absent} Hz {e_absent:.1} dB). A <12 dB gap \
-             means the handler served the DEFAULT audio track instead of the selected one."
+             means the rendition served the DEFAULT audio track instead of the selected one."
         );
     }
 }
