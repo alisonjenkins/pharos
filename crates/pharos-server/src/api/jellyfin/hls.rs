@@ -1507,7 +1507,13 @@ async fn vp9_audio_playlist(
         return Err(error::ErrorNotFound("no cache"));
     };
     cache
-        .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
+        .ensure_audio_hls(
+            &item.path,
+            media_id,
+            audio_rel,
+            Some(128_000),
+            item.probe.frame_rate_mille,
+        )
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     // B103 — take duration through `load_hls_item`, which falls back to a live
@@ -1529,8 +1535,14 @@ async fn vp9_audio_playlist(
         "#EXT-X-MAP:URI=\"/videos/{id}/vp9/audio/init.mp4?{qs}\"\n"
     ));
     for seg in 0..segment_count {
-        let remaining = (duration - seg as f64 * SEGMENT_SECONDS).clamp(0.01, SEGMENT_SECONDS);
-        body.push_str(&format!("#EXTINF:{remaining:.3},\n"));
+        // B105 — frame-align the EXTINF grid to the video variant
+        // (`segment_time_range`) so the audio playlist advertises the same
+        // segment boundaries the video does; a uniform 6.0 grid drifts against
+        // the frame-snapped video timeline on a non-integer-fps source.
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+        let remaining = (duration - start_secs).max(0.01);
+        let len = dur_secs.min(remaining);
+        body.push_str(&format!("#EXTINF:{len:.3},\n"));
         body.push_str(&format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}\n"));
     }
     body.push_str("#EXT-X-ENDLIST\n");
@@ -1569,7 +1581,14 @@ async fn vp9_audio_file(
         .and_then(|r| r.parse::<u32>().ok())
         .unwrap_or(0);
     let dir = cache
-        .ensure_audio_hls_covering(&item.path, media_id, audio_rel, Some(128_000), want_seg)
+        .ensure_audio_hls_covering(
+            &item.path,
+            media_id,
+            audio_rel,
+            Some(128_000),
+            want_seg,
+            item.probe.frame_rate_mille,
+        )
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     let bytes = cache
@@ -1912,6 +1931,7 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             opts.audio_source_stream_index,
                             Some(128_000),
                             target,
+                            item.probe.frame_rate_mille,
                         )
                         .await;
                 }
