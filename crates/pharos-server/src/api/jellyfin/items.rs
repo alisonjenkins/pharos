@@ -16,7 +16,8 @@ use crate::{
             PlaybackInfoResponseDto, SeriesFolderDto, SubtitleStreamCtx, SynthItemDto,
             UserItemDataDto,
         },
-        subtitles::discover_sidecars,
+        subtitle_delivery::{decide_subtitle_delivery, SubtitleDelivery},
+        subtitles::{discover_sidecars, is_image_subtitle_codec},
     },
     state::AppState,
 };
@@ -1813,6 +1814,37 @@ fn browser_matroska_direct_unplayable(
     is_web_client && is_video && decision_is_direct && source_is_matroska && !webm_relabel_playable
 }
 
+/// Extract `key`'s value from a raw query string, case-insensitively,
+/// treating an empty value as absent (same rule the audio/subtitle
+/// track-selection forwarding in `playback_info` uses).
+fn query_param<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
+    query_string
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
+        .filter(|v| !v.is_empty())
+}
+
+/// The subtitle track this playback will act on: the client's explicit pick
+/// (query `SubtitleStreamIndex` or body), else the default-disposition
+/// track, else `None`. `-1` (off) → `None`. The single source of truth for
+/// "which subtitle applies", shared by the burn-forward predicate and the
+/// DirectPlay-downgrade predicate below.
+fn resolve_selected_subtitle(
+    explicit_index: Option<i64>,
+    probe: &pharos_core::MediaProbe,
+) -> Option<&pharos_core::SubtitleTrack> {
+    match explicit_index {
+        Some(n) if n >= 0 => probe
+            .subtitle_tracks
+            .iter()
+            .find(|t| i64::from(t.stream_index) == n),
+        Some(_) => None, // explicit "off" (-1, or any other negative)
+        None => probe.subtitle_tracks.iter().find(|t| t.is_default),
+    }
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1899,6 +1931,15 @@ async fn playback_info(
         subtitle_profiles = ?profile.subtitle_profiles,
         "playbackinfo: client subtitle profiles"
     );
+    // The client's explicit SubtitleStreamIndex pick — query string wins,
+    // falling back to the POST body (jellyfin-web's track-switch reload
+    // sends it only in the body). Resolved once, early, so both the
+    // DirectPlay burn-downgrade below and the URL-forward predicate further
+    // down act on the exact same pick — see `resolve_selected_subtitle`.
+    let explicit_subtitle_index: Option<i64> =
+        query_param(req.query_string(), "SubtitleStreamIndex")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .or(body_subtitle_index);
     let decision = negotiate(&profile, &source);
     // Connection-aware transcode ceiling (Lace incident, 2026-07-16). A remote
     // client on jellyfin-web's "Auto" quality advertises an effectively-
@@ -2017,6 +2058,30 @@ async fn playback_info(
     } else {
         decision
     };
+
+    // Resolve which embedded TEXT subs this client can't render externally
+    // (its SubtitleProfile lacks an External/Embed/Hls entry for that
+    // format) — those must advertise Encode so the client requests the burn
+    // transcode instead of trying to render the raw ASS itself (black bars
+    // on Android/TV, which never declares ass External). Also incidentally
+    // covers image subs (decide_subtitle_delivery always burns those), which
+    // is harmless — `build_media_streams_with_subtitles` only consults this
+    // set for TEXT tracks. Relocated here (was computed just before the DTO
+    // build) so it's available to the downgrade below AND the URL-forward
+    // predicate further down, not just the MediaStreams ctx.
+    let mut burn_text_indices = std::collections::BTreeSet::new();
+    for track in &probe.subtitle_tracks {
+        if decide_subtitle_delivery(track.codec.as_deref(), &profile.subtitle_profiles)
+            == SubtitleDelivery::Burn
+        {
+            burn_text_indices.insert(track.stream_index);
+        }
+    }
+
+    // The subtitle track this playback will act on (explicit pick, else the
+    // container's default) — the single source of truth the URL-forward
+    // predicate further down consults (Task 4).
+    let selected_sub = resolve_selected_subtitle(explicit_subtitle_index, probe);
 
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
     // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
@@ -2146,51 +2211,26 @@ async fn playback_info(
         // Subtitle "off" (-1) is meaningful to the segment handler (it clears
         // any prior burn-in) — forward it, unlike an absent value.
         //
-        // Only forward a POSITIVE index when the selected track is an IMAGE
-        // subtitle (PGS/VOBSUB) — those MUST burn into the transcode. A TEXT /
-        // ASS sub is delivered as a separate `External` rendition the client
-        // renders (SubtitlesOctopus / cue JSON), so burning it is redundant AND
-        // catastrophically slow: a burned-sub VP9 segment uses output seeking
-        // (decode from 0), so a segment deep in the file takes tens of seconds
-        // (Code Geass S01E01 seg ~90 measured at ~100 s for 6 s of content →
-        // constant stutter). Never bake a text-sub index into the transcode URL.
-        if let Some(v) =
-            from_query("SubtitleStreamIndex").or_else(|| body_subtitle_index.map(|n| n.to_string()))
-        {
-            let forward = v.trim() == "-1"
-                || v.trim()
-                    .parse::<u32>()
-                    .ok()
-                    .and_then(|abs| {
-                        probe
-                            .subtitle_tracks
-                            .iter()
-                            .find(|t| t.stream_index == abs)
-                            .map(|t| {
-                                !crate::api::jellyfin::dto::is_text_subtitle_codec(
-                                    t.codec.as_deref(),
-                                )
-                            })
-                    })
-                    // Unknown index → be safe and don't burn.
-                    .unwrap_or(false);
-            if forward {
-                push("SubtitleStreamIndex", v);
+        // Forward a POSITIVE index only when the SELECTED track (explicit
+        // pick, else the container's default-disposition track —
+        // `resolve_selected_subtitle`, the same resolver the DirectPlay burn
+        // -downgrade above consults, so both act on one source of truth)
+        // MUST burn: an IMAGE subtitle (PGS/VOBSUB — no external rendition
+        // exists), or a TEXT/ASS sub this client's SubtitleProfile can't
+        // render externally (`burn_text_indices`, Task 3/B44). A text sub
+        // the client DOES render externally must never ride the URL —
+        // burning it is redundant AND catastrophically slow: a burned-sub
+        // VP9 segment uses output seeking (decode from 0), so a segment deep
+        // in the file takes tens of seconds (Code Geass S01E01 seg ~90
+        // measured at ~100 s for 6 s of content → constant stutter).
+        if explicit_subtitle_index == Some(-1) {
+            push("SubtitleStreamIndex", "-1".to_string());
+        } else if let Some(t) = selected_sub {
+            if is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
+                || burn_text_indices.contains(&t.stream_index)
+            {
+                push("SubtitleStreamIndex", t.stream_index.to_string());
             }
-        } else if let Some(def) = probe.subtitle_tracks.iter().find(|t| {
-            t.is_default && !crate::api::jellyfin::dto::is_text_subtitle_codec(t.codec.as_deref())
-        }) {
-            // B44 — no client pick at all: honour the container's DEFAULT
-            // disposition when it names an IMAGE subtitle. Forced-Na'vi-style
-            // tracks (Avatar: PGS "Forced Stylized (Na'vi)", default+forced)
-            // exist precisely so untranslated-dialogue sections play
-            // subtitled WITHOUT the user doing anything — real Jellyfin
-            // burns them by default. We advertise the track via
-            // DefaultSubtitleStreamIndex, so the client already believes
-            // it's active; not baking it into the transcode URL silently
-            // played those sections unsubtitled. (Text defaults still
-            // deliver External — the client renders them itself.)
-            push("SubtitleStreamIndex", def.stream_index.to_string());
         }
         s
     };
@@ -2371,21 +2411,9 @@ async fn playback_info(
                 .and_then(crate::api::jellyfin::subtitles::sidecar_language_from_name)
         })
         .collect();
-    // Resolve which embedded TEXT subs this client can't render externally
-    // (its SubtitleProfile lacks an External/Embed/Hls entry for that
-    // format) — those must advertise Encode so the client requests the burn
-    // transcode instead of trying to render raw ASS itself (black bars on
-    // Android/TV, which never declares ass External).
-    let mut burn_text_indices = std::collections::BTreeSet::new();
-    for track in &probe.subtitle_tracks {
-        if crate::api::jellyfin::subtitle_delivery::decide_subtitle_delivery(
-            track.codec.as_deref(),
-            &profile.subtitle_profiles,
-        ) == crate::api::jellyfin::subtitle_delivery::SubtitleDelivery::Burn
-        {
-            burn_text_indices.insert(track.stream_index);
-        }
-    }
+    // burn_text_indices is computed earlier (right after the Matroska
+    // downgrade) — it's needed by the DirectPlay burn-downgrade and the
+    // URL-forward predicate above, in addition to this ctx.
     let ctx = SubtitleStreamCtx {
         item_id: item.id,
         sidecar_count: sidecars.len() as u32,
@@ -6417,6 +6445,61 @@ mod browser_matroska_fallback_tests {
         assert!(!browser_matroska_direct_unplayable(
             true, false, true, true, false
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod resolve_selected_subtitle_tests {
+    use super::resolve_selected_subtitle;
+    use pharos_core::{MediaProbe, SubtitleTrack};
+
+    fn probe_with(tracks: Vec<SubtitleTrack>) -> MediaProbe {
+        MediaProbe {
+            subtitle_tracks: tracks,
+            ..Default::default()
+        }
+    }
+
+    fn track(idx: u32, is_default: bool) -> SubtitleTrack {
+        SubtitleTrack {
+            stream_index: idx,
+            codec: Some("subrip".into()),
+            is_default,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_positive_index_resolves_that_track() {
+        let probe = probe_with(vec![track(2, false), track(4, true)]);
+        let sel = resolve_selected_subtitle(Some(2), &probe);
+        assert_eq!(sel.map(|t| t.stream_index), Some(2));
+    }
+
+    #[test]
+    fn explicit_minus_one_is_off() {
+        let probe = probe_with(vec![track(2, false), track(4, true)]);
+        assert!(resolve_selected_subtitle(Some(-1), &probe).is_none());
+    }
+
+    #[test]
+    fn no_explicit_pick_falls_back_to_default_track() {
+        let probe = probe_with(vec![track(2, false), track(4, true)]);
+        let sel = resolve_selected_subtitle(None, &probe);
+        assert_eq!(sel.map(|t| t.stream_index), Some(4));
+    }
+
+    #[test]
+    fn no_explicit_pick_and_no_default_is_none() {
+        let probe = probe_with(vec![track(2, false), track(4, false)]);
+        assert!(resolve_selected_subtitle(None, &probe).is_none());
+    }
+
+    #[test]
+    fn explicit_index_with_no_matching_track_is_none() {
+        let probe = probe_with(vec![track(2, false)]);
+        assert!(resolve_selected_subtitle(Some(99), &probe).is_none());
     }
 }
 
