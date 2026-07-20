@@ -228,11 +228,19 @@ async fn audio_universal(
         .find(|c| matches!(c.to_ascii_lowercase().as_str(), "aac"))
         .cloned()
         .unwrap_or_else(|| "aac".to_string());
+    // A remuxed/downmixed stream is a live ffmpeg pipe (chunked, no
+    // Content-Length) so the browser can't byte-range seek it; jellyfin-web
+    // instead re-requests this URL with a new `StartTimeTicks` on every seek
+    // (the same contract the progressive-WebM transcode honours). Without an
+    // input seek the encode always restarted at 0, so the user could only seek
+    // within what had already streamed (B102). Honour it via `-ss`.
+    let start_ticks = parse_start_time_ticks(qs);
     audio_remux(
         &item,
         &target,
         bitrate,
         max_channels,
+        start_ticks,
         state.playback_activity.clone(),
     )
     .await
@@ -243,6 +251,7 @@ async fn audio_remux(
     target_codec: &str,
     bitrate_bps: Option<u64>,
     max_channels: Option<u32>,
+    start_ticks: u64,
     clock: Arc<AtomicI64>,
 ) -> Result<HttpResponse, actix_web::Error> {
     use std::process::Stdio;
@@ -262,29 +271,17 @@ async fn audio_remux(
     let bitrate = bitrate_bps.unwrap_or(192_000);
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-nostdin")
-        .arg("-i")
-        .arg(&item.path)
-        .arg("-vn")
-        .arg("-c:a")
-        .arg(ffmpeg_codec)
-        .arg("-b:a")
-        .arg(bitrate.to_string());
-    // P19 — downmix to the requested channel count when the client
-    // asked for one. ffmpeg's `-ac N` runs a default mix-down for
-    // surround → stereo / mono.
-    if let Some(n) = max_channels.filter(|n| *n > 0) {
-        cmd.arg("-ac").arg(n.to_string());
-    }
-    cmd.arg("-f")
-        .arg(muxer)
-        .arg("pipe:1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    cmd.args(audio_remux_args(
+        &item.path,
+        ffmpeg_codec,
+        muxer,
+        bitrate,
+        max_channels,
+        start_ticks,
+    ))
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
 
     let mut child = cmd
         .spawn()
@@ -309,6 +306,50 @@ async fn audio_remux(
             .body(actix_web::body::BodyStream::new(stream)),
         clock,
     ))
+}
+
+/// Build the ffmpeg argv for a live audio remux/downmix. Pure so the
+/// seek-offset ordering is unit-testable without spawning ffmpeg: `-ss` MUST
+/// precede `-i` to act as an INPUT seek (fast keyframe seek + decode forward);
+/// placed after `-i` it would decode from 0 and be tens-of-seconds slow deep in
+/// a file. A resume/seek re-request carries a fresh `StartTimeTicks`, so this is
+/// the only thing that makes a remuxed/downmixed stream seekable (B102).
+fn audio_remux_args(
+    input: &std::path::Path,
+    ffmpeg_codec: &str,
+    muxer: &str,
+    bitrate: u64,
+    max_channels: Option<u32>,
+    start_ticks: u64,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+    ];
+    if start_ticks > 0 {
+        let secs = start_ticks as f64 / TICKS_PER_SECOND as f64;
+        args.push("-ss".into());
+        args.push(format!("{secs:.3}"));
+    }
+    args.push("-i".into());
+    args.push(input.to_string_lossy().into_owned());
+    args.push("-vn".into());
+    args.push("-c:a".into());
+    args.push(ffmpeg_codec.into());
+    args.push("-b:a".into());
+    args.push(bitrate.to_string());
+    // P19 — downmix to the requested channel count when the client asked for
+    // one. ffmpeg's `-ac N` runs a default mix-down for surround → stereo/mono.
+    if let Some(n) = max_channels.filter(|n| *n > 0) {
+        args.push("-ac".into());
+        args.push(n.to_string());
+    }
+    args.push("-f".into());
+    args.push(muxer.into());
+    args.push("pipe:1".into());
+    args
 }
 
 fn parse_audio_codec_list(qs: &str) -> Vec<String> {
@@ -829,6 +870,47 @@ mod tests {
             created_at: None,
             metadata: Default::default(),
         }
+    }
+
+    // B102 — a seek/resume re-request carries a fresh StartTimeTicks; the remux
+    // must input-seek to it (`-ss` BEFORE `-i`) or the encode restarts at 0 and
+    // the user can only seek within already-streamed audio.
+    #[::core::prelude::v1::test]
+    fn audio_remux_args_seek_is_input_option() {
+        let args = audio_remux_args(
+            std::path::Path::new("/m.mkv"),
+            "aac",
+            "adts",
+            192_000,
+            Some(2),
+            60 * TICKS_PER_SECOND, // 60s
+        );
+        let joined = args.join(" ");
+        let ss = args.iter().position(|a| a == "-ss").expect("-ss present");
+        let i = args.iter().position(|a| a == "-i").expect("-i present");
+        assert!(ss < i, "-ss must precede -i (input seek): {joined}");
+        assert_eq!(args[ss + 1], "60.000", "seek seconds: {joined}");
+        assert!(joined.contains("-ac 2"), "downmix preserved: {joined}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn audio_remux_args_no_seek_at_zero() {
+        let args = audio_remux_args(
+            std::path::Path::new("/m.mkv"),
+            "aac",
+            "adts",
+            192_000,
+            None,
+            0,
+        );
+        assert!(
+            !args.iter().any(|a| a == "-ss"),
+            "no input seek at ticks 0: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-ac"),
+            "no downmix when channels None: {args:?}"
+        );
     }
 
     #[tokio::test]
