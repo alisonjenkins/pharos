@@ -1408,12 +1408,13 @@ async fn vp9_audio_playlist(
         .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
-    let duration = item
-        .probe
-        .duration_ms
-        .map(|ms| ms as f64 / 1000.0)
-        .unwrap_or(0.0)
-        .max(0.0);
+    // B103 — take duration through `load_hls_item`, which falls back to a live
+    // ffprobe when the persisted probe lacks it. The old `unwrap_or(0.0)` had
+    // NO fallback, so a row missing `duration_ms` collapsed the whole audio
+    // timeline to a single 6 s segment — the client could then only seek within
+    // the first segment (the same `.max(1)` truncation the video variant
+    // already guards against via this path).
+    let duration = load_hls_item(&state, &id).await?.duration_seconds.max(0.0);
     let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
     let mut body = String::with_capacity(128 + segment_count as usize * 48);
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");

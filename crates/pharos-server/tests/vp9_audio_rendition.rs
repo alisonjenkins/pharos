@@ -108,6 +108,14 @@ fn beep_times(file: &Path) -> Vec<f64> {
 }
 
 async fn seed(fixture: std::path::PathBuf, cache_dir: &Path) -> (web::Data<AppState>, String) {
+    seed_with_duration(fixture, cache_dir, Some(SECS as u64 * 1000)).await
+}
+
+async fn seed_with_duration(
+    fixture: std::path::PathBuf,
+    cache_dir: &Path,
+    duration_ms: Option<u64>,
+) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -129,7 +137,7 @@ async fn seed(fixture: std::path::PathBuf, cache_dir: &Path) -> (web::Data<AppSt
             title: "s".into(),
             kind: MediaKind::Movie,
             probe: MediaProbe {
-                duration_ms: Some(SECS as u64 * 1000),
+                duration_ms,
                 width: Some(320),
                 height: Some(240),
                 bitrate_bps: Some(400_000),
@@ -257,5 +265,43 @@ async fn audio_rendition_is_gapless_and_video_is_audio_free() {
     assert!(
         !streams.contains("audio"),
         "video segment still carries audio:\n{streams}"
+    );
+}
+
+// B103 — the audio VOD playlist derived its segment count from
+// `probe.duration_ms.unwrap_or(0.0)` with NO ffprobe fallback, so a row whose
+// persisted probe lacked a duration collapsed the whole audio timeline to a
+// single 6 s segment — the client could then only seek within the first
+// segment. The playlist must recover the duration via a live ffprobe (the video
+// variant already does, through `load_hls_item`) and enumerate every segment.
+#[actix_web::test]
+#[ignore = "requires ffmpeg; real transcode"]
+async fn audio_playlist_recovers_duration_when_probe_lacks_it() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let src = make_clip(td.path());
+    // No persisted duration → the handler must fall back to a live ffprobe.
+    let (state, token) = seed_with_duration(src, &td.path().join("cache"), None).await;
+    let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
+
+    let aplaylist = String::from_utf8_lossy(
+        &test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/videos/42/vp9/audio.m3u8?api_key={token}"))
+                .to_request(),
+        )
+        .await,
+    )
+    .to_string();
+
+    // 42 s / 6 s ⇒ 7 media segments; the bug produced exactly 1.
+    let seg_count = aplaylist.matches(".m4s").count();
+    assert!(
+        seg_count >= 6,
+        "audio timeline collapsed to {seg_count} segment(s) — seek would be capped to the first:\n{aplaylist}"
     );
 }
