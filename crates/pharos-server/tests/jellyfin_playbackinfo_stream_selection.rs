@@ -308,6 +308,57 @@ async fn mac_firefox_is_not_forced_onto_vp9() {
     )
     .await;
     // Realistic dual profile — only the UA differs from the Linux case.
+    // `seed()`'s source also carries a default+forced PGS subtitle (for the
+    // unrelated image-sub-forwarding tests below); explicitly turn subtitles
+    // off here so this test isolates the VP9-vs-h264 codec question from the
+    // separate (and separately tested) subtitle-burn downgrade.
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_FIREFOX_BOTH).unwrap()["DeviceProfile"],
+        "SubtitleStreamIndex": -1,
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX_MAC))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let ms = &v["MediaSources"][0];
+    let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
+    assert!(
+        !url.contains("/vp9/"),
+        "Mac Firefox decodes H.264 natively — must not be forced onto VP9: {url:?}"
+    );
+    // h264-in-mp4 source + h264 direct-play profile + no subtitle selected →
+    // direct play, the fastest possible path (no transcode at all).
+    assert_eq!(
+        ms["SupportsDirectPlay"], true,
+        "h264/mp4 source should direct-play on an h264-capable client: {ms}"
+    );
+}
+
+// Task 5 (no-gap fix): today's bug was silent — an otherwise-DirectPlay
+// client that (explicitly or by container default) selects the forced PGS
+// track got DirectStream'd raw and never saw the subtitle at all (nothing
+// burns a raw `/stream` file). Same h264-capable Mac Firefox client as
+// above, but this time WITHOUT overriding the default subtitle pick — the
+// default+forced PGS track must force a transcode so the burn has a video
+// stream to land in.
+#[actix_web::test]
+async fn h264_capable_client_with_default_image_sub_still_downgrades_to_transcode() {
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
     let raw = test::call_and_read_body(
         &app,
         test::TestRequest::post()
@@ -321,16 +372,19 @@ async fn mac_firefox_is_not_forced_onto_vp9() {
     .await;
     let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     let ms = &v["MediaSources"][0];
+    assert_eq!(
+        ms["SupportsDirectPlay"], false,
+        "a default-forced PGS sub has no video stream to burn into on DirectPlay: {ms}"
+    );
+    assert_eq!(ms["SupportsDirectStream"], false, "{ms}");
     let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
     assert!(
         !url.contains("/vp9/"),
-        "Mac Firefox decodes H.264 natively — must not be forced onto VP9: {url:?}"
+        "still h264-capable — the burn downgrade must not also force VP9: {url:?}"
     );
-    // h264-in-mp4 source + h264 direct-play profile → direct play, the
-    // fastest possible path (no transcode at all).
-    assert_eq!(
-        ms["SupportsDirectPlay"], true,
-        "h264/mp4 source should direct-play on an h264-capable client: {ms}"
+    assert!(
+        url.contains("SubtitleStreamIndex=5"),
+        "the forced default PGS index must ride the transcode URL: {url:?}"
     );
 }
 

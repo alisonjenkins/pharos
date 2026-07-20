@@ -9,7 +9,7 @@ use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
-        device_profile::{negotiate, Decision, DeviceProfile, SourceMedia},
+        device_profile::{negotiate, Decision, DeviceProfile, SourceMedia, SubtitleProfileDto},
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
             BaseItemDto, CollectionFolderDto, ItemsResultDto, MediaSourceInfoDto, NameGuidPairDto,
@@ -1845,6 +1845,24 @@ fn resolve_selected_subtitle(
     }
 }
 
+/// A DirectPlay/DirectStream decision must downgrade to Transcode when the
+/// selected subtitle will be BURNED (no external stream to render it): a
+/// text/ASS sub the client has no external SubtitleProfile for, or any image
+/// sub (PGS/VOBSUB — never externally renderable). Mirrors the B80/V40
+/// Matroska downgrade so a `TranscodingUrl` is emitted and
+/// `SupportsDirectStream` resolves false instead of silently dropping the
+/// subtitle.
+fn subtitle_selection_forces_transcode(
+    decision: &Decision,
+    selected: Option<&pharos_core::SubtitleTrack>,
+    client_profiles: &[SubtitleProfileDto],
+) -> bool {
+    decision.is_direct()
+        && selected.is_some_and(|t| {
+            decide_subtitle_delivery(t.codec.as_deref(), client_profiles) == SubtitleDelivery::Burn
+        })
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -2079,9 +2097,29 @@ async fn playback_info(
     }
 
     // The subtitle track this playback will act on (explicit pick, else the
-    // container's default) — the single source of truth the URL-forward
-    // predicate further down consults (Task 4).
+    // container's default), used by both the downgrade below and the
+    // URL-forward predicate further down — one source of truth (Task 4/5).
     let selected_sub = resolve_selected_subtitle(explicit_subtitle_index, probe);
+
+    // No-gap fix: a client that would DIRECT-PLAY the file but selects (or
+    // defaults to) a subtitle it can't render externally has no video stream
+    // to burn into. Mirror the Matroska downgrade above so a TranscodingUrl
+    // is emitted (carrying the burn index — see the forward predicate below)
+    // and SupportsDirectStream resolves false, instead of silently dropping
+    // the subtitle (today's bug for a DirectPlay client selecting a
+    // PGS/default-image sub).
+    let decision =
+        if subtitle_selection_forces_transcode(&decision, selected_sub, &profile.subtitle_profiles)
+        {
+            Decision::Transcode {
+                target_container: "ts".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: remote_ceiling,
+            }
+        } else {
+            decision
+        };
 
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
     // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
@@ -6500,6 +6538,101 @@ mod resolve_selected_subtitle_tests {
     fn explicit_index_with_no_matching_track_is_none() {
         let probe = probe_with(vec![track(2, false)]);
         assert!(resolve_selected_subtitle(Some(99), &probe).is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod subtitle_selection_forces_transcode_tests {
+    use super::{subtitle_selection_forces_transcode, Decision, SubtitleProfileDto};
+    use pharos_core::SubtitleTrack;
+
+    fn ass_track(idx: u32) -> SubtitleTrack {
+        SubtitleTrack {
+            stream_index: idx,
+            codec: Some("ass".into()),
+            ..Default::default()
+        }
+    }
+
+    fn pgs_track(idx: u32) -> SubtitleTrack {
+        SubtitleTrack {
+            stream_index: idx,
+            codec: Some("hdmv_pgs_subtitle".into()),
+            ..Default::default()
+        }
+    }
+
+    fn subrip_external_only() -> Vec<SubtitleProfileDto> {
+        vec![SubtitleProfileDto {
+            format: "subrip".into(),
+            method: "External".into(),
+            ..Default::default()
+        }]
+    }
+
+    fn ass_external() -> Vec<SubtitleProfileDto> {
+        vec![SubtitleProfileDto {
+            format: "ass".into(),
+            method: "External".into(),
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn directplay_with_burned_ass_forces_transcode() {
+        let sel = ass_track(4);
+        let profiles = subrip_external_only();
+        assert!(subtitle_selection_forces_transcode(
+            &Decision::DirectPlay,
+            Some(&sel),
+            &profiles
+        ));
+    }
+
+    #[test]
+    fn directplay_with_externally_rendered_ass_does_not_transcode() {
+        let sel = ass_track(4);
+        let profiles = ass_external();
+        assert!(!subtitle_selection_forces_transcode(
+            &Decision::DirectPlay,
+            Some(&sel),
+            &profiles
+        ));
+    }
+
+    #[test]
+    fn directplay_with_image_sub_forces_transcode() {
+        let sel = pgs_track(7);
+        assert!(subtitle_selection_forces_transcode(
+            &Decision::DirectPlay,
+            Some(&sel),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn no_subtitle_selected_keeps_directplay() {
+        assert!(!subtitle_selection_forces_transcode(
+            &Decision::DirectPlay,
+            None,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn already_transcoding_is_noop() {
+        let sel = ass_track(4);
+        assert!(!subtitle_selection_forces_transcode(
+            &Decision::Transcode {
+                target_container: "ts".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: None,
+            },
+            Some(&sel),
+            &[]
+        ));
     }
 }
 
