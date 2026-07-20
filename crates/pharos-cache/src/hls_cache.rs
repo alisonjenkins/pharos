@@ -161,7 +161,12 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// keyframe-sloppy durations, 6ch AAC) and re-encoded segments gained
 /// `-muxdelay 0` (old ones carry a +1.4 s skew) — every cached `.ts` from
 /// v2 is poisoned.
-const HLS_GEN_VERSION: u32 = 3;
+///
+/// v4 (B105): the VP9 continuous-audio rendition now frame-snaps its seek
+/// anchor to the video grid instead of the nominal `seg*6.0`. Stale
+/// `_audiohls` dirs carry nominal-anchored segments that desync against the
+/// video — orphan them so a fresh, aligned session regenerates on demand.
+const HLS_GEN_VERSION: u32 = 4;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
@@ -502,9 +507,17 @@ impl HlsSegmentCache {
         media_id: u64,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
+        frame_rate_mille: Option<u32>,
     ) -> Result<PathBuf, HlsCacheError> {
-        self.ensure_audio_hls_covering(source, media_id, audio_index, audio_bitrate_bps, 0)
-            .await
+        self.ensure_audio_hls_covering(
+            source,
+            media_id,
+            audio_index,
+            audio_bitrate_bps,
+            0,
+            frame_rate_mille,
+        )
+        .await
     }
 
     /// How far past the newest written segment a request may point while we
@@ -514,6 +527,21 @@ impl HlsSegmentCache {
     /// (B42 — the single from-0 session made deep seeks 404 "audio segment
     /// not ready" until the encoder crawled the whole file over NFS).
     const AUDIO_SEEK_LOOKAHEAD_SEGS: u32 = 20;
+
+    /// Frame-snapped start time (seconds) of audio segment `seg`, matching the
+    /// video path's `segment_start_secs`: the nominal `seg*6.0` rounded to the
+    /// nearest video-frame boundary so the audio and video renditions share one
+    /// timeline. `None`/unknown fps falls back to the nominal grid.
+    fn audio_seg_start_secs(seg: u32, frame_rate_mille: Option<u32>) -> f64 {
+        let nominal = seg as f64 * 6.0;
+        match frame_rate_mille {
+            Some(m) if m > 0 => {
+                let fps = m as f64 / 1000.0;
+                (nominal * fps).round() / fps
+            }
+            _ => nominal,
+        }
+    }
 
     /// Ensure an audio-rendition session exists whose output will cover
     /// `want_seg` promptly. `want_seg == 0` is the plain from-the-start
@@ -528,6 +556,7 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
         want_seg: u32,
+        frame_rate_mille: Option<u32>,
     ) -> Result<PathBuf, HlsCacheError> {
         let a = audio_index.unwrap_or(0);
         let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
@@ -588,7 +617,14 @@ impl HlsSegmentCache {
         tokio::fs::create_dir_all(&dir).await?;
         tokio::fs::write(&running, b"").await?;
 
-        let args = Self::audio_hls_args(source, &dir, audio_index, audio_bitrate_bps, start_seg)?;
+        let args = Self::audio_hls_args(
+            source,
+            &dir,
+            audio_index,
+            audio_bitrate_bps,
+            start_seg,
+            frame_rate_mille,
+        )?;
         if start_seg > 0 {
             tracing::info!(
                 media.id = media_id,
@@ -662,6 +698,7 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
         start_seg: u32,
+        frame_rate_mille: Option<u32>,
     ) -> Result<Vec<String>, HlsCacheError> {
         let src = source
             .to_str()
@@ -686,7 +723,12 @@ impl HlsSegmentCache {
             .to_string();
         let bitrate = audio_bitrate_bps.unwrap_or(128_000);
         let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
-        let start_secs = start_seg as f64 * 6.0;
+        // Frame-snap to the SAME grid the video segments seek to
+        // (`api::jellyfin::hls::segment_start_secs`). Video input-seeks to the
+        // frame-snapped source timestamp and stamps its tfdt there; anchoring
+        // audio to the nominal `start_seg*6.0` instead leaves a fixed sub-frame
+        // A/V skew at every mid-file audio switch (B105 desync).
+        let start_secs = Self::audio_seg_start_secs(start_seg, frame_rate_mille);
         if start_seg > 0 {
             args.push("-ss".into());
             args.push(format!("{start_secs:.3}"));
@@ -1025,6 +1067,7 @@ mod tests {
             Some(1),
             Some(128_000),
             0,
+            None,
         )
         .unwrap();
         let joined = a.join(" ");
@@ -1048,6 +1091,7 @@ mod tests {
             None,
             Some(128_000),
             30,
+            None,
         )
         .unwrap();
         let joined = a.join(" ");
@@ -1059,5 +1103,37 @@ mod tests {
         let ss = a.iter().position(|x| x == "-ss").unwrap();
         let i = a.iter().position(|x| x == "-i").unwrap();
         assert!(ss < i, "-ss must precede -i: {joined}");
+    }
+
+    /// B105 — the seek anchor MUST be frame-snapped to the SAME grid the
+    /// video segments use (`segment_start_secs`), not the nominal `seg*6.0`.
+    /// Video seeks to the frame-snapped source timestamp and stamps its tfdt
+    /// there; anchoring audio to the nominal grid leaves a fixed sub-frame
+    /// A/V skew at every mid-file audio switch (the reported desync). On a
+    /// 23.976 fps source, segment 1's nominal 6.000 s snaps to 6.006 s.
+    #[test]
+    fn audio_hls_args_seek_anchor_is_frame_snapped_to_video_grid() {
+        let a = HlsSegmentCache::audio_hls_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/d"),
+            None,
+            Some(128_000),
+            1,
+            Some(23_976),
+        )
+        .unwrap();
+        let joined = a.join(" ");
+        assert!(
+            joined.contains("-ss 6.006"),
+            "expected frame-snapped seek, got: {joined}"
+        );
+        assert!(
+            joined.contains("-output_ts_offset 6.006"),
+            "offset must match the frame-snapped seek: {joined}"
+        );
+        assert!(
+            !joined.contains("6.000"),
+            "nominal seg*6.0 anchor leaves the A/V skew: {joined}"
+        );
     }
 }
