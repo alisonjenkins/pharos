@@ -928,6 +928,10 @@ async fn serve_segment(
     // empty. MUST run before the T87 hint, the ETag, the prefetch AND the
     // cache read: all of them key on the (post-gating) burn index.
     gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    // Burn a TEXT/ASS sub from the small cached `.ass` sidecar + fontsdir, not
+    // the whole source per segment. Resolved paths propagate into the prefetch
+    // clones below.
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
 
     // T87 — remember this play session's exact variant for SyncPlay seek
     // prewarming (same as the VP9 path).
@@ -1186,6 +1190,8 @@ fn build_segment_opts(
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
                     burn_subtitle_is_text: subtitle_is_text,
+                    burn_subtitle_ass_path: None,
+                    burn_fonts_dir: None,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1211,6 +1217,8 @@ fn build_segment_opts(
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
                     burn_subtitle_is_text: subtitle_is_text,
+                    burn_subtitle_ass_path: None,
+                    burn_fonts_dir: None,
                 };
             }
             _ => {}
@@ -1236,6 +1244,8 @@ fn build_segment_opts(
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index: subtitle_stream_index,
         burn_subtitle_is_text: subtitle_is_text,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     }
 }
 
@@ -1297,6 +1307,78 @@ async fn gate_image_sub_burn(
             }
         }
         pharos_cache::subtitle_cache::EventWindows::Unknown => {}
+    }
+}
+
+/// Point a live TEXT/ASS burn at the small pre-extracted `.ass` sidecar + a
+/// font directory instead of the whole source container. ffmpeg's `subtitles`
+/// filter opens a SECOND demuxer on its `filename=` at init — ONCE PER SEGMENT
+/// — and reads the WHOLE file to gather subtitle packets + embedded fonts, so
+/// pointing it at the multi-GB NFS source re-demuxes the entire MKV every 6 s
+/// segment (the documented whole-file-demux stutter). The cached sidecar keeps
+/// the source's ABSOLUTE event times, so the transcoder's `setpts` alignment is
+/// unchanged. Leaves the fields `None` (transcoder falls back to the source
+/// `filename=<src>:si=N` form — correct, just slower) whenever the sidecar or
+/// fonts can't be produced.
+///
+/// Must run AFTER `gate_image_sub_burn` (which may clear the burn index) and
+/// BEFORE the cache read. Only touches the TEXT/ASS burn; image-sub burn
+/// overlays the source bitmap stream and needs neither field. The resolved
+/// paths are deterministic per (item, sub) and NOT part of the segment cache
+/// key, so a prefetch/live pair that resolve differently still share a key and
+/// produce identical output — only encode cost differs.
+async fn resolve_text_burn_assets(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    opts: &mut SegmentOpts,
+) {
+    if !opts.burn_subtitle_is_text {
+        return;
+    }
+    let Some(rel_idx) = opts.burn_subtitle_stream_index else {
+        return;
+    };
+    // The burn index is subtitle-relative (`si=N`); the ASS cache + extraction
+    // key on the ABSOLUTE ffprobe stream index. Invert `codec_relative_index`
+    // (position among all subtitle tracks) to recover it.
+    let Some(abs_idx) = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .map(|t| t.stream_index)
+        .nth(rel_idx as usize)
+    else {
+        return;
+    };
+    // Materialize the small `.ass` sidecar (extract-if-cold, bg-gated); leave
+    // the field None on failure so the transcoder uses the source-file form.
+    match super::subtitles::ensure_ass_sidecar_path(state, item, abs_idx).await {
+        Some(p) => opts.burn_subtitle_ass_path = Some(p),
+        None => return,
+    }
+    // libass needs the embedded fonts to render styled ASS. Extract EVERY
+    // attachment in one source open (`ensure_all_attachments`) and hand libass
+    // the directory via `fontsdir`. No attachments → no fontsdir (defaults).
+    if let Some(images) = state.images.as_ref() {
+        let indices: Vec<u32> = item
+            .probe
+            .attachments
+            .iter()
+            .map(|a| a.stream_index)
+            .collect();
+        if !indices.is_empty() {
+            match images
+                .ensure_all_attachments(item.id, &item.path, &indices)
+                .await
+            {
+                Ok(dir) => opts.burn_fonts_dir = Some(dir),
+                Err(e) => tracing::debug!(
+                    media.id = item.id,
+                    error = %e,
+                    "font attachment extract failed; burning ASS without fontsdir"
+                ),
+            }
+        }
     }
 }
 
@@ -1586,6 +1668,7 @@ async fn vp9_init(
         let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
     let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
@@ -1630,6 +1713,9 @@ async fn vp9_segment(
         let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
+    // Burn a TEXT/ASS sub from the cached sidecar + fontsdir (see the mpegts
+    // handler); the prefetch clones inherit the resolved paths.
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
     // T87 — remember this play session's exact variant so a SyncPlay seek
     // can prewarm its segments before the client even applies the command.
     if let Some(psid) = q.play_session_id.as_deref() {
@@ -2100,6 +2186,8 @@ async fn vp9_segment_opts(
         audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
         burn_subtitle_is_text: sub_is_text,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     }
 }
 

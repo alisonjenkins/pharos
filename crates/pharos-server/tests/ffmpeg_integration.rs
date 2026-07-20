@@ -144,6 +144,8 @@ async fn transcoder_streams_bytes_from_real_video() {
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
         burn_subtitle_is_text: false,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     };
     let mut stream = FfmpegTranscoder::new()
         .transcode(&fixture, &opts)
@@ -292,6 +294,8 @@ async fn transcoder_honours_audio_stream_index() {
         audio_source_stream_index: Some(0),
         burn_subtitle_stream_index: None,
         burn_subtitle_is_text: false,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     };
     let track0_stream = FfmpegTranscoder::new()
         .transcode(&fixture, &common)
@@ -338,6 +342,8 @@ async fn transcoder_honours_burn_subtitle_index() {
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
         burn_subtitle_is_text: false,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     };
     let no_burn_stream = FfmpegTranscoder::new()
         .transcode(&fixture, &base)

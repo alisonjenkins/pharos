@@ -415,6 +415,76 @@ fn build_batch_extract_args(input: &str, tracks: &[BatchTrack]) -> Vec<String> {
     args
 }
 
+/// Resolve a local `.ass` file to burn a TEXT/ASS track from, extracting +
+/// disk-caching the embedded stream if cold. `stream_index` is the ABSOLUTE
+/// ffprobe index (same convention as `deliver_ass` / `pre_extract_subtitles`).
+///
+/// The burn path uses this to point ffmpeg's `subtitles=` filter at a small
+/// local file instead of the whole source container: the `subtitles` filter
+/// opens a SECOND demuxer on its `filename=` at init — once PER HLS segment —
+/// and reads the WHOLE container to collect subtitle packets + fonts, so a
+/// multi-GB NFS source is re-demuxed end-to-end every 6 s segment. Returns
+/// `None` (caller then falls back to the source-file form — correct, slower)
+/// when no local file can be produced: an external sidecar that's missing, or a
+/// memory-only subtitle cache (no disk root → no stable path to hand ffmpeg).
+///
+/// - External `.ass`/`.srt` sidecars (index ≥ `sidecar_base`) are already small
+///   local files → returned directly (also fixes the source `si=N` form, which
+///   is wrong for a sidecar not muxed into the source).
+/// - Embedded tracks are extracted verbatim as `.ass` into the disk-backed
+///   subtitle cache (shared with `deliver_ass`, so a warmed sidecar is reused),
+///   and the on-disk path is returned.
+pub(crate) async fn ensure_ass_sidecar_path(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+) -> Option<std::path::PathBuf> {
+    // External sidecar → the file on disk is already the burn source.
+    let sidecar_base = sidecar_base_index(&item.probe);
+    if stream_index >= sidecar_base {
+        let offset = (stream_index - sidecar_base) as usize;
+        let sidecars = discover_sidecars(&item.path).await;
+        return sidecars.into_iter().nth(offset).map(|(p, _)| p);
+    }
+
+    // Embedded → extract-if-cold into the disk-backed cache, hand back its path.
+    let cache = state.subtitles.as_ref()?;
+    let mtime = mtime_secs(&item.path).await;
+    // Memory-only cache → no stable file path to give ffmpeg; caller falls back.
+    let disk = cache.disk_path_of(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)?;
+    if tokio::fs::try_exists(&disk).await.unwrap_or(false) {
+        return Some(disk);
+    }
+    // Cold — dedupe concurrent segment requests on the per-key fetch lock, then
+    // extract (bg-gated, like every other ASS extraction) + store (writes disk).
+    let lock = cache
+        .lock(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+        .await;
+    let _guard = lock.lock().await;
+    if tokio::fs::try_exists(&disk).await.unwrap_or(false) {
+        return Some(disk);
+    }
+    let input = item.path.to_str()?;
+    let out = run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority())
+        .await
+        .ok()?;
+    cache
+        .store(
+            &item.path,
+            mtime,
+            stream_index,
+            SubtitleKind::EmbeddedAss,
+            out,
+        )
+        .await;
+    // `store` writes the disk sidecar only when a disk root is configured;
+    // confirm the file is really there before handing ffmpeg the path.
+    tokio::fs::try_exists(&disk)
+        .await
+        .unwrap_or(false)
+        .then_some(disk)
+}
+
 /// Extract one embedded subtitle stream verbatim as ASS.
 async fn run_ffmpeg_embedded_ass(
     input: &str,

@@ -95,6 +95,8 @@ fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path:
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
         burn_subtitle_is_text: false,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         src.to_str().expect("utf8 tmpdir"),

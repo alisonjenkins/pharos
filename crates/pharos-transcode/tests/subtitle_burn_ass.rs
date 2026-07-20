@@ -106,6 +106,86 @@ fn transcode_segment(
         audio_source_stream_index: None,
         burn_subtitle_stream_index: if burn_text { Some(0) } else { None },
         burn_subtitle_is_text: burn_text,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
+    };
+    let args = pharos_transcode::ffmpeg_transcode_args(
+        input.to_str().unwrap(),
+        &opts,
+        DeviceId::Cpu,
+        out.to_str().unwrap(),
+    );
+    eprintln!("argv: ffmpeg {}", args.join(" "));
+    let status = Command::new("ffmpeg")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("spawn production ffmpeg");
+    status.success()
+}
+
+/// A plain 60 s black clip with NO embedded subtitle stream. The sidecar-burn
+/// test drives the cue from a STANDALONE `.ass` file, so the source must carry
+/// no sub of its own — otherwise a source-file `si=` fallback could mask a
+/// broken sidecar path.
+fn make_black_clip(dir: &Path) -> PathBuf {
+    let clip = dir.join("black.mkv");
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "color=c=black:s=320x240:r=25:d=60"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&clip)
+        .status()
+        .expect("spawn ffmpeg (black clip)");
+    assert!(status.success(), "black clip generation failed");
+    clip
+}
+
+/// Write a standalone `.ass` sidecar whose big white centred "MARK30" is on
+/// screen ONLY 29–31 s (source-absolute times, exactly as the embedded track).
+fn write_ass_sidecar(dir: &Path) -> PathBuf {
+    let ass = dir.join("standalone.ass");
+    std::fs::write(
+        &ass,
+        "[Script Info]\n\
+         ScriptType: v4.00+\n\
+         PlayResX: 320\n\
+         PlayResY: 240\n\n\
+         [V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Default,Arial,72,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,5,10,10,10,1\n\n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,0:00:29.00,0:00:31.00,Default,,0,0,0,,MARK30\n",
+    )
+    .expect("write standalone ass");
+    ass
+}
+
+/// Transcode a single segment via the REAL production argv, burning from a
+/// STANDALONE `.ass` sidecar (`burn_subtitle_ass_path`) rather than the source.
+fn transcode_segment_from_sidecar(
+    input: &Path,
+    ass: &Path,
+    out: &Path,
+    start_secs: u64,
+    dur_secs: u64,
+) -> bool {
+    let opts = TranscodeOptions {
+        container: Container::Mp4,
+        video: Some(VideoCodec::H264),
+        audio: None,
+        video_bitrate_bps: Some(1_000_000),
+        audio_bitrate_bps: None,
+        start_position_ticks: start_secs * TICKS_PER_SEC,
+        duration_ticks: Some(dur_secs * TICKS_PER_SEC),
+        audio_source_stream_index: None,
+        // A real text burn: index + is_text set, plus the sidecar path the
+        // filter should read INSTEAD of re-demuxing `input`.
+        burn_subtitle_stream_index: Some(0),
+        burn_subtitle_is_text: true,
+        burn_subtitle_ass_path: Some(ass.to_path_buf()),
+        burn_fonts_dir: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
@@ -194,5 +274,78 @@ fn ass_cue_burns_into_the_correct_segment() {
         "no-cue segment differs burn-vs-no-burn \
          (burn={empty_burn_l:.2} vs no-burn={empty_noburn_l:.2}) — \
          a wrong/from-zero cue leaked into the segment"
+    );
+}
+
+#[test]
+#[ignore = "requires ffmpeg; real transcode + pixel inspection"]
+fn ass_sidecar_cue_burns_into_the_correct_segment() {
+    // The FIX (this task): burn a TEXT/ASS track from the small pre-extracted,
+    // disk-cached `.ass` SIDECAR (`burn_subtitle_ass_path`) instead of pointing
+    // the `subtitles` filter at the whole source MKV — which re-demuxes the
+    // entire (multi-GB, NFS) container ONCE PER SEGMENT. The sidecar keeps the
+    // source's ABSOLUTE event times, so the `setpts` alignment must land the
+    // cue on the SAME segment as the source-file path, proving byte-for-byte
+    // equivalent placement from a small local file.
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    // Source carries NO subtitle stream; the cue lives only in the sidecar.
+    let src = make_black_clip(td.path());
+    let ass = write_ass_sidecar(td.path());
+
+    // Segment covering absolute 27..33 s — the 29..31 s cue falls inside.
+    let cue_burn = td.path().join("s_cue_burn.mp4");
+    assert!(
+        transcode_segment_from_sidecar(&src, &ass, &cue_burn, 27, 6),
+        "sidecar text-burn transcode of the cue segment failed to produce output"
+    );
+    // Same segment, NO burn (source has no sub, so this stays black).
+    let cue_noburn = td.path().join("s_cue_noburn.mp4");
+    assert!(transcode_segment(&src, &cue_noburn, 27, 6, false));
+
+    // Segment covering absolute 7..13 s — NO cue active; must stay black, which
+    // is what proves the sidecar events are read at ABSOLUTE (not from-zero)
+    // time — a mis-aligned render would light the 0..6 s cue here.
+    let empty_burn = td.path().join("s_empty_burn.mp4");
+    assert!(transcode_segment_from_sidecar(
+        &src,
+        &ass,
+        &empty_burn,
+        7,
+        6
+    ));
+    let empty_noburn = td.path().join("s_empty_noburn.mp4");
+    assert!(transcode_segment(&src, &empty_noburn, 7, 6, false));
+
+    let cue_burn_l = max_luma(&cue_burn);
+    let cue_noburn_l = max_luma(&cue_noburn);
+    let empty_burn_l = max_luma(&empty_burn);
+    let empty_noburn_l = max_luma(&empty_noburn);
+    eprintln!(
+        "sidecar max luma: cue_burn={cue_burn_l:.2} cue_noburn={cue_noburn_l:.2} \
+         empty_burn={empty_burn_l:.2} empty_noburn={empty_noburn_l:.2}"
+    );
+
+    // The sidecar cue must render in the segment whose ABSOLUTE time contains
+    // it — burning from the sidecar brightens the frame the no-burn render did
+    // not. This is the whole fix: a small local file produces the SAME result
+    // as re-demuxing the source.
+    assert!(
+        cue_burn_l > cue_noburn_l + 5.0,
+        "cue segment: sidecar text burn did not brighten the frame \
+         (burn={cue_burn_l:.2} vs no-burn={cue_noburn_l:.2}) — sidecar cue not rendered"
+    );
+
+    // No-cue segment must be identical burn-vs-no-burn: proves the sidecar
+    // events align at absolute time (a from-zero / mis-timed render would light
+    // up here even though nothing is active at 7..13 s).
+    assert!(
+        (empty_burn_l - empty_noburn_l).abs() < 2.0,
+        "no-cue segment differs burn-vs-no-burn \
+         (burn={empty_burn_l:.2} vs no-burn={empty_noburn_l:.2}) — \
+         a wrong/from-zero sidecar cue leaked into the segment"
     );
 }

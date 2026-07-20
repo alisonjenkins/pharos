@@ -164,6 +164,8 @@ fn tool_opts(out: &std::path::Path) -> pharos_transcode::options::TranscodeOptio
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
         burn_subtitle_is_text: false,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
     }
 }
 

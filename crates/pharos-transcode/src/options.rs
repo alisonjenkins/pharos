@@ -181,6 +181,22 @@ pub struct TranscodeOptions {
     /// (picks ffmpeg's `subtitles=` filter instead of the image `overlay`
     /// graph). `false` for image-subtitle burn or when no burn is set.
     pub burn_subtitle_is_text: bool,
+    /// Local `.ass` sidecar to burn from for a TEXT/ASS burn. `Some` points
+    /// the `subtitles=` filter at this small pre-extracted, disk-cached file
+    /// (`filename=<p>`, no `si=` — a sidecar is single-track) instead of the
+    /// whole source container. ffmpeg's `subtitles` filter opens a SECOND
+    /// demuxer on `filename=` at init — ONCE PER SEGMENT — and reads the WHOLE
+    /// container to collect subtitle packets + embedded fonts; pointing it at a
+    /// multi-GB NFS source re-demuxes the entire file every 6 s segment (the
+    /// documented whole-file-demux stutter). The sidecar preserves the source's
+    /// ABSOLUTE event times, so the `setpts` alignment is unchanged. `None`
+    /// falls back to `filename=<source>:si=N` (correct, just slower).
+    pub burn_subtitle_ass_path: Option<std::path::PathBuf>,
+    /// Directory of extracted embedded font attachments handed to libass as
+    /// `:fontsdir=<dir>` alongside `burn_subtitle_ass_path`. libass scans it by
+    /// font CONTENT, so index-named files are fine. `None` renders with
+    /// system/default fonts. Only consulted on the TEXT/ASS-sidecar path.
+    pub burn_fonts_dir: Option<std::path::PathBuf>,
 }
 
 impl TranscodeOptions {
@@ -216,6 +232,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -234,6 +252,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }

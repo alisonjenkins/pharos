@@ -252,6 +252,10 @@ fn ffmpeg_filter_escape(path: &str) -> String {
 ///   explicit audio track.
 ///
 /// The `si=N` and `[0:s:N]` indices share the same subtitle-relative meaning.
+// A private arg-marshalling helper for the burn filter chain; the parameters
+// are all distinct scalars threaded straight from `TranscodeOptions`, so a
+// wrapper struct would only add indirection.
+#[allow(clippy::too_many_arguments)]
 fn push_video_filters(
     a: &mut Vec<String>,
     vf_parts: &[String],
@@ -260,11 +264,36 @@ fn push_video_filters(
     input: &str,
     start_seconds: Option<f64>,
     audio_source_stream_index: Option<u32>,
+    burn_ass_path: Option<&Path>,
+    burn_fonts_dir: Option<&Path>,
 ) {
     match (burn_subtitle_stream_index, burn_is_text) {
         (Some(si), true) => {
-            let esc = ffmpeg_filter_escape(input);
-            let subtitles = format!("subtitles=filename={esc}:si={si}");
+            // Prefer the small pre-extracted `.ass` sidecar: ffmpeg's
+            // `subtitles` filter opens a SECOND demuxer on `filename=` at init —
+            // ONCE PER SEGMENT — and reads the WHOLE container to gather subtitle
+            // packets + embedded fonts, so pointing it at the multi-GB NFS source
+            // re-demuxes the entire file every 6 s segment (the documented
+            // whole-file-demux stutter). The sidecar is a single-track `.ass`
+            // (NO `si=`) whose events keep the source's ABSOLUTE times, so the
+            // `setpts` sandwich below is unchanged. `:fontsdir=` hands libass the
+            // extracted embedded fonts. When no sidecar was produced, fall back
+            // to `filename=<source>:si=N` so a burn degrades (slower) not breaks.
+            let subtitles = match burn_ass_path {
+                Some(ass) => {
+                    let esc = ffmpeg_filter_escape(&ass.to_string_lossy());
+                    let mut s = format!("subtitles=filename={esc}");
+                    if let Some(dir) = burn_fonts_dir {
+                        let fesc = ffmpeg_filter_escape(&dir.to_string_lossy());
+                        s.push_str(&format!(":fontsdir={fesc}"));
+                    }
+                    s
+                }
+                None => {
+                    let esc = ffmpeg_filter_escape(input);
+                    format!("subtitles=filename={esc}:si={si}")
+                }
+            };
             let mut chain: Vec<String> = Vec::new();
             match start_seconds {
                 Some(start) if start > 0.0 => {
@@ -451,6 +480,8 @@ fn build_args_for_device(
                     input,
                     start,
                     opts.audio_source_stream_index,
+                    opts.burn_subtitle_ass_path.as_deref(),
+                    opts.burn_fonts_dir.as_deref(),
                 );
                 a.push("-c:v".into());
                 a.push(
@@ -481,6 +512,8 @@ fn build_args_for_device(
                     input,
                     start,
                     opts.audio_source_stream_index,
+                    opts.burn_subtitle_ass_path.as_deref(),
+                    opts.burn_fonts_dir.as_deref(),
                 );
                 a.push("-c:v".into());
                 a.push(encoder.into());
@@ -731,6 +764,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         }
     }
 
@@ -853,6 +888,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -907,6 +944,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -946,6 +985,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -968,6 +1009,8 @@ mod tests {
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
@@ -1070,6 +1113,65 @@ mod tests {
         assert!(!joined.contains("-map "), "{joined}");
         // Still a real re-encode (filtering requires it).
         assert!(joined.contains("-c:v libx264"), "{joined}");
+    }
+
+    #[test]
+    fn burn_text_subtitle_from_ass_sidecar_reads_sidecar_not_source() {
+        // The fix — a TEXT/ASS burn with a pre-extracted `.ass` sidecar points
+        // the `subtitles` filter at the SMALL local file (`filename=<ass>`, NO
+        // `si=` — single-track sidecar) + the extracted `fontsdir`, NOT the
+        // whole source (which ffmpeg would re-demux end-to-end once per HLS
+        // segment). The `setpts` sandwich stays (sidecar keeps absolute times).
+        let mut o = opts();
+        o.start_position_ticks = 27 * 10_000_000;
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        o.burn_subtitle_ass_path = Some(std::path::PathBuf::from("/cache/subs/x.ass"));
+        o.burn_fonts_dir = Some(std::path::PathBuf::from("/cache/fonts/9"));
+        let joined = build_args("/m/whole-source.mkv", &o).join(" ");
+        assert!(
+            joined.contains(
+                "-vf setpts=PTS+27.000/TB,\
+                 subtitles=filename=/cache/subs/x.ass:fontsdir=/cache/fonts/9,\
+                 setpts=PTS-27.000/TB"
+            ),
+            "{joined}"
+        );
+        // Must NOT re-demux the source: no `filename=<source>` and no `si=`.
+        assert!(!joined.contains("whole-source.mkv:si="), "{joined}");
+        assert!(!joined.contains("si=2"), "{joined}");
+    }
+
+    #[test]
+    fn burn_text_subtitle_sidecar_without_fonts_omits_fontsdir() {
+        // No embedded fonts → no `:fontsdir=`; libass falls back to defaults.
+        let mut o = opts();
+        o.burn_subtitle_stream_index = Some(0);
+        o.burn_subtitle_is_text = true;
+        o.burn_subtitle_ass_path = Some(std::path::PathBuf::from("/cache/subs/y.ass"));
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(
+            joined.contains("-vf subtitles=filename=/cache/subs/y.ass"),
+            "{joined}"
+        );
+        assert!(!joined.contains("fontsdir"), "{joined}");
+        assert!(!joined.contains(":si="), "{joined}");
+    }
+
+    #[test]
+    fn burn_text_subtitle_without_sidecar_falls_back_to_source_si() {
+        // No sidecar produced (e.g. memory-only cache / extraction failed) →
+        // the burn degrades to the source-file form so it still works, just
+        // slower. This is the safety net the resolver relies on.
+        let mut o = opts();
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        o.burn_subtitle_ass_path = None;
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(
+            joined.contains("-vf subtitles=filename=/m/x.mkv:si=2"),
+            "{joined}"
+        );
     }
 
     #[test]

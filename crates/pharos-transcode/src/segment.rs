@@ -116,6 +116,14 @@ pub struct SegmentOpts {
     /// (Task 7 picks the `subtitles=` filter instead of `overlay`). `false`
     /// for image-subtitle burn (PGS/VOBSUB/DVB) or when no burn is set.
     pub burn_subtitle_is_text: bool,
+    /// Local `.ass` sidecar to burn a TEXT/ASS track from (see
+    /// [`TranscodeOptions::burn_subtitle_ass_path`]). `Some` points libass at
+    /// the small cached file instead of re-demuxing the whole source per
+    /// segment; `None` falls back to the source-file form.
+    pub burn_subtitle_ass_path: Option<std::path::PathBuf>,
+    /// Directory of extracted embedded fonts for libass (`:fontsdir=`); see
+    /// [`TranscodeOptions::burn_fonts_dir`].
+    pub burn_fonts_dir: Option<std::path::PathBuf>,
 }
 
 impl SegmentOpts {
@@ -133,6 +141,8 @@ impl SegmentOpts {
             audio_source_stream_index: self.audio_source_stream_index,
             burn_subtitle_stream_index: self.burn_subtitle_stream_index,
             burn_subtitle_is_text: self.burn_subtitle_is_text,
+            burn_subtitle_ass_path: self.burn_subtitle_ass_path.clone(),
+            burn_fonts_dir: self.burn_fonts_dir.clone(),
         }
     }
 }
@@ -154,6 +164,8 @@ mod tests {
             audio_source_stream_index: Some(1),
             burn_subtitle_stream_index: Some(0),
             burn_subtitle_is_text: true,
+            burn_subtitle_ass_path: Some(std::path::PathBuf::from("/cache/sub.ass")),
+            burn_fonts_dir: Some(std::path::PathBuf::from("/cache/fonts")),
         };
         let t = s.to_transcode_options();
         assert_eq!(t.container, Container::Mpegts);
@@ -165,6 +177,14 @@ mod tests {
         assert_eq!(t.audio_source_stream_index, Some(1));
         assert_eq!(t.burn_subtitle_stream_index, Some(0));
         assert!(t.burn_subtitle_is_text);
+        assert_eq!(
+            t.burn_subtitle_ass_path,
+            Some(std::path::PathBuf::from("/cache/sub.ass"))
+        );
+        assert_eq!(
+            t.burn_fonts_dir,
+            Some(std::path::PathBuf::from("/cache/fonts"))
+        );
     }
 
     #[test]
