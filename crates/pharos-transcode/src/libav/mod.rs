@@ -15,6 +15,7 @@ pub mod attachment;
 pub mod fingerprint;
 #[cfg(feature = "backend-lib")]
 pub mod frames;
+#[cfg(feature = "backend-lib")]
 pub mod image;
 #[cfg(feature = "backend-lib")]
 pub mod probe;
