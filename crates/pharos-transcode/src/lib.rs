@@ -190,31 +190,97 @@ where
     }
 }
 
-/// Emit the video filter arguments: a plain `-vf` chain normally, or — when
-/// an IMAGE subtitle is being burned in (B40) — a `-filter_complex` that
-/// overlays the subtitle stream onto the video before the rest of the chain:
+/// Escape a filesystem path for use as an ffmpeg filtergraph option value —
+/// the `subtitles=filename=…` argument of the text-burn chain.
 ///
-/// ```text
-/// [0:v:0][0:s:N]overlay=eof_action=pass[,rest-of-chain][vout]
-/// ```
+/// ffmpeg parses a filter option value through TWO independent levels: the
+/// filtergraph tokenizer (splits filters on `,`/`;`, options on `:`, pads on
+/// `[`/`]`) AND the per-option value parser (which itself treats `'` as a quote
+/// and `\` as an escape). A SINGLE level of escaping is therefore not enough:
+/// an apostrophe in a real path (`Ocean's.mkv`) survives level 1, then the
+/// option parser reads it as an opening quote and swallows the remainder of the
+/// argument — `:si=N` included — while dropping the quote character itself
+/// (verified live: the file `it's a.mkv` opened as `its a.mkv:si=0`). So each
+/// special is escaped twice: once for the option-value layer, then again for
+/// the filtergraph layer. Verified empirically in `tests/subtitle_burn_ass.rs`
+/// / the Task-7 spike against a path holding a space, `[`, `]`, `,`, and `'`
+/// (which produces e.g. `it\\\'s` and `\[x\]\,1`, both of which ffmpeg 8.1
+/// accepts and opens correctly).
+fn ffmpeg_filter_escape(path: &str) -> String {
+    fn escape_layer(s: &str, specials: &[char]) -> String {
+        let mut out = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            if specials.contains(&c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    }
+    // Level 2 — the option-value parser: backslash, quote, and the `:` that
+    // ends the option value.
+    let l2 = escape_layer(path, &['\\', '\'', ':']);
+    // Level 1 — the filtergraph tokenizer: backslash, quote, and the graph
+    // delimiters. This re-escapes the backslashes level 2 introduced so they
+    // survive to reach the option parser.
+    escape_layer(&l2, &['\\', '\'', '[', ']', ',', ';'])
+}
+
+/// Emit the video filter arguments. Three shapes:
 ///
-/// `overlay` is the only ffmpeg path that renders bitmap subtitles
-/// (PGS/VOBSUB/DVB): the `subtitles=` filter is libass and text-only — using
-/// it for a PGS burn aborts with "Only text based subtitles are currently
-/// supported" (observed live: Avatar's PGS track 500'd every segment). The
-/// `si=N` and `[0:s:N]` indices share the same subtitle-relative meaning.
-/// `eof_action=pass` keeps video flowing when the sparse subtitle stream has
-/// no events in the segment window. A `-filter_complex` disables ffmpeg's
-/// default stream selection, so the video map (`[vout]`) and the audio map
-/// are emitted here too.
+/// - No burn — a plain `-vf` chain (or nothing when the chain is empty).
+/// - IMAGE subtitle burn (B40) — a `-filter_complex` overlaying the bitmap
+///   subtitle stream onto the video before the rest of the chain:
+///   `[0:v:0][0:s:N]overlay=eof_action=pass[,rest][vout]`. `overlay` is the
+///   only ffmpeg path that renders bitmap subs (PGS/VOBSUB/DVB); libass'
+///   `subtitles=` is text-only and aborts a PGS burn with "Only text based
+///   subtitles are currently supported" (Avatar's PGS track 500'd every
+///   segment). A `-filter_complex` disables default stream selection, so the
+///   video (`[vout]`) and audio maps are emitted here.
+/// - TEXT/ASS subtitle burn (Task 7) — a plain `-vf subtitles=filename=…:si=N`
+///   chain. libass rasterizes the text/ASS events and auto-loads the source's
+///   embedded attachment fonts. Because the `subtitles` filter opens a SECOND
+///   demuxer at t=0 and renders by frame PTS, a mid-file segment (input-seek
+///   `-ss START` before `-i`) needs its frame PTS lifted to ABSOLUTE time or
+///   the wrong (from-zero) cue renders. `setpts=PTS+START/TB … setpts=PTS-…`
+///   brackets the filter so it sees absolute PTS (correct cue) while the OUTPUT
+///   stays zero-based — leaving `-t DUR` and the muxer's `-output_ts_offset`
+///   timing untouched (`-copyts` instead would make output PTS absolute and
+///   collapse `-t` to ~0 frames — verified in `tests/subtitle_burn_ass.rs`). A
+///   plain `-vf` (single input) keeps ffmpeg default stream selection, so NO
+///   maps are emitted here; the caller's normal audio-map path handles an
+///   explicit audio track.
+///
+/// The `si=N` and `[0:s:N]` indices share the same subtitle-relative meaning.
 fn push_video_filters(
     a: &mut Vec<String>,
     vf_parts: &[String],
     burn_subtitle_stream_index: Option<u32>,
+    burn_is_text: bool,
+    input: &str,
+    start_seconds: Option<f64>,
     audio_source_stream_index: Option<u32>,
 ) {
-    match burn_subtitle_stream_index {
-        Some(si) => {
+    match (burn_subtitle_stream_index, burn_is_text) {
+        (Some(si), true) => {
+            let esc = ffmpeg_filter_escape(input);
+            let subtitles = format!("subtitles=filename={esc}:si={si}");
+            let mut chain: Vec<String> = Vec::new();
+            match start_seconds {
+                Some(start) if start > 0.0 => {
+                    chain.push(format!("setpts=PTS+{start:.3}/TB"));
+                    chain.push(subtitles);
+                    chain.push(format!("setpts=PTS-{start:.3}/TB"));
+                }
+                _ => chain.push(subtitles),
+            }
+            // Any hardware-upload / format filters (VAAPI: format=nv12,hwupload)
+            // chain AFTER the software rasterization.
+            chain.extend(vf_parts.iter().cloned());
+            a.push("-vf".into());
+            a.push(chain.join(","));
+        }
+        (Some(si), false) => {
             let mut graph = format!("[0:v:0][0:s:{si}]overlay=eof_action=pass");
             if !vf_parts.is_empty() {
                 graph.push(',');
@@ -231,7 +297,7 @@ fn push_video_filters(
                 None => "0:a:0?".into(),
             });
         }
-        None => {
+        (None, _) => {
             if !vf_parts.is_empty() {
                 a.push("-vf".into());
                 a.push(vf_parts.join(","));
@@ -296,9 +362,15 @@ fn build_args_for_device(
     // render image subs at all: every PGS burn 500'd with "Only text based
     // subtitles are currently supported" while the guards upstream only ever
     // request burn for image subs.
-    let burning_subs = opts.video.is_some()
+    // Only the IMAGE burn rides an `overlay` filter_complex that owns the
+    // video + audio maps. A TEXT/ASS burn (`burn_subtitle_is_text`) uses a
+    // plain `-vf subtitles=` chain that keeps ffmpeg's default stream
+    // selection, so it must NOT take the map-skip path below — it falls through
+    // to the normal audio-map handling like any other re-encode.
+    let burning_image_subs = opts.video.is_some()
         && !matches!(opts.video, Some(VideoCodec::Copy))
-        && opts.burn_subtitle_stream_index.is_some();
+        && opts.burn_subtitle_stream_index.is_some()
+        && !opts.burn_subtitle_is_text;
     // Bound DECODER threads for a real video transcode (input-side
     // `-threads`, before `-i`). ffmpeg otherwise frame-threads the decoder
     // across every logical core PER JOB, so N concurrent segment encodes
@@ -337,10 +409,11 @@ fn build_args_for_device(
     // also aligns with the probe, which advertises the first video as THE
     // video track. (B6 — surfaced once B4 made the audio index actually reach
     // the segment; before that the index was dropped and this path never ran.)
-    if burning_subs {
+    if burning_image_subs {
         // B40 — the overlay filter_complex below owns the video map
         // (`-map [vout]`); adding `0:v:0?` here would map the source video a
-        // second time.
+        // second time. (Text-sub burn uses `-vf` + default selection, so it is
+        // deliberately excluded from `burning_image_subs` and handled here.)
     } else if let Some(audio_idx) = opts.audio_source_stream_index {
         a.push("-map".into());
         a.push("0:v:0?".into());
@@ -374,6 +447,9 @@ fn build_args_for_device(
                     &mut a,
                     &vf_parts,
                     opts.burn_subtitle_stream_index,
+                    opts.burn_subtitle_is_text,
+                    input,
+                    start,
                     opts.audio_source_stream_index,
                 );
                 a.push("-c:v".into());
@@ -401,6 +477,9 @@ fn build_args_for_device(
                     &mut a,
                     &vf_parts,
                     opts.burn_subtitle_stream_index,
+                    opts.burn_subtitle_is_text,
+                    input,
+                    start,
                     opts.audio_source_stream_index,
                 );
                 a.push("-c:v".into());
@@ -943,6 +1022,86 @@ mod tests {
         assert!(!joined.contains("subtitles="), "{joined}");
         // Video must not ALSO be mapped from the source.
         assert!(!joined.contains("-map 0:v:0?"), "{joined}");
+    }
+
+    #[test]
+    fn ffmpeg_filter_escape_double_escapes_filtergraph_specials() {
+        // ffmpeg parses a filter option value through two levels (filtergraph
+        // tokenizer + option-value parser), so specials need escaping twice.
+        // A plain path is untouched.
+        assert_eq!(ffmpeg_filter_escape("/m/plain.mkv"), "/m/plain.mkv");
+        // An apostrophe (the common breakage — `Ocean's.mkv`) must reach libass
+        // as a literal, so it emerges triple-backslashed + quote.
+        assert_eq!(ffmpeg_filter_escape("a'b"), "a\\\\\\'b");
+        // Filtergraph delimiters `[ ] ,` (release-tag paths like `[x],1`) get a
+        // single backslash — they are inert at the option-value level.
+        assert_eq!(ffmpeg_filter_escape("a[b],c"), "a\\[b\\]\\,c");
+        // A literal `:` (rare on-disk, but legal) is escaped for the option
+        // parser then its backslash survives level 1.
+        assert_eq!(ffmpeg_filter_escape("a:b"), "a\\\\:b");
+    }
+
+    #[test]
+    fn burn_text_subtitle_uses_subtitles_vf_with_setpts_alignment() {
+        // Task 7 — a TEXT/ASS burn rasterizes via libass' `subtitles=` filter
+        // (NOT overlay, which is bitmap-only). It is a plain `-vf` (single
+        // input), so it keeps ffmpeg's default stream selection: no
+        // `-filter_complex`, no `-map [vout]`. Because the filter renders by
+        // frame PTS off a from-zero demuxer, a mid-file segment brackets it with
+        // `setpts` so it sees ABSOLUTE time (right cue) while output stays
+        // zero-based (verified in tests/subtitle_burn_ass.rs).
+        let mut o = opts();
+        o.start_position_ticks = 27 * 10_000_000; // 27 s segment start
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        let a = build_args("/m/x.mkv", &o);
+        let joined = a.join(" ");
+        assert!(
+            joined.contains(
+                "-vf setpts=PTS+27.000/TB,subtitles=filename=/m/x.mkv:si=2,setpts=PTS-27.000/TB"
+            ),
+            "{joined}"
+        );
+        // Never the image overlay path for text.
+        assert!(!joined.contains("-filter_complex"), "{joined}");
+        assert!(!joined.contains("overlay="), "{joined}");
+        assert!(!joined.contains("-map [vout]"), "{joined}");
+        // Default stream selection handles audio here (no explicit index set).
+        assert!(!joined.contains("-map "), "{joined}");
+        // Still a real re-encode (filtering requires it).
+        assert!(joined.contains("-c:v libx264"), "{joined}");
+    }
+
+    #[test]
+    fn burn_text_subtitle_at_zero_skips_setpts() {
+        // A segment starting at 0 (or a progressive stream from the top) has no
+        // absolute-time offset, so the setpts bracket is omitted — plain
+        // `subtitles=`.
+        let mut o = opts();
+        o.burn_subtitle_stream_index = Some(0);
+        o.burn_subtitle_is_text = true;
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(
+            joined.contains("-vf subtitles=filename=/m/x.mkv:si=0"),
+            "{joined}"
+        );
+        assert!(!joined.contains("setpts"), "{joined}");
+    }
+
+    #[test]
+    fn burn_text_subtitle_with_audio_index_maps_that_track() {
+        // Text burn keeps default selection UNLESS an explicit audio track is
+        // requested, in which case the normal map path (not the overlay path)
+        // routes video + the chosen audio.
+        let mut o = opts();
+        o.burn_subtitle_stream_index = Some(0);
+        o.burn_subtitle_is_text = true;
+        o.audio_source_stream_index = Some(3);
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(joined.contains("-map 0:v:0?"), "{joined}");
+        assert!(joined.contains("-map 0:a:3"), "{joined}");
+        assert!(joined.contains("subtitles=filename="), "{joined}");
+        assert!(!joined.contains("-filter_complex"), "{joined}");
     }
 
     #[test]
