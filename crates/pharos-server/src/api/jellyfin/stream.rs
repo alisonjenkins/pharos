@@ -105,7 +105,7 @@ async fn head_video(
     let media_id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     authorize_media(&state, &req, media_id).await?;
-    head_response(&state, path.id_str()).await
+    head_response(&state, &req, path.id_str()).await
 }
 
 async fn head_audio(
@@ -121,38 +121,40 @@ async fn head_audio(
     let media_id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     authorize_media(&state, &req, media_id).await?;
-    head_response(&state, path.id_str()).await
+    head_response(&state, &req, path.id_str()).await
 }
 
-/// P11 — HEAD short-circuit. Returns Content-Length + Content-Type
-/// from the probe / stat without opening the body. Mobile clients
-/// use HEAD to validate a stream URL before issuing the playback
-/// GET; without this they fall back to GET-then-cancel. P25 — also
-/// emits `Last-Modified` so a phone re-opening the player can
-/// conditional-GET the range cache instead of re-downloading.
-async fn head_response(state: &AppState, id_str: &str) -> Result<HttpResponse, actix_web::Error> {
+/// P11 — HEAD short-circuit. Returns Content-Length + Content-Type + range
+/// support without transmitting the body. Mobile clients use HEAD to validate
+/// a stream URL before issuing the playback GET; without this they fall back to
+/// GET-then-cancel. P25 — also emits `Last-Modified` so a phone re-opening the
+/// player can conditional-GET the range cache instead of re-downloading.
+///
+/// B101 — serve the HEAD through `NamedFile` rather than a hand-built
+/// `.finish()` response. actix's h1 encoder derives a HEAD response's
+/// `Content-Length` from the response body's declared `BodySize` (the body
+/// bytes are never sent for HEAD) and drops any manually-inserted
+/// `Content-Length` header. An empty `()` body is `BodySize::Sized(0)`, so the
+/// old code advertised `Content-Length: 0` for every file — Firefox HEAD-probes
+/// a progressive `<video>` source to learn its length so it can range-fetch the
+/// trailing `moov` seek index of a non-faststart mp4; a zero length reads as
+/// "nothing to seek" and collapses `seekable` to `buffered`. `NamedFile`'s body
+/// is a `SizedStream` whose `BodySize::Sized(file_len)` makes the encoder emit
+/// the real length; its reader is never polled on a HEAD, so no bytes are read.
+/// It also sets `Accept-Ranges`, `Content-Type`, `ETag`, and `Last-Modified`,
+/// and honours `If-Modified-Since` / `If-None-Match`.
+async fn head_response(
+    state: &AppState,
+    req: &HttpRequest,
+    id_str: &str,
+) -> Result<HttpResponse, actix_web::Error> {
     let item = load_item(state, id_str).await?;
-    let meta = tokio::fs::metadata(&item.path).await.ok();
-    let size = item
-        .probe
-        .size_bytes
-        .or_else(|| meta.as_ref().map(|m| m.len()))
-        .unwrap_or(0);
-    let mime = mime_guess::from_path(&item.path)
-        .first_or_octet_stream()
-        .to_string();
-    let mut builder = HttpResponse::Ok();
-    builder
-        .insert_header((header::CONTENT_TYPE, mime))
-        .insert_header((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")))
-        .insert_header((
-            header::CONTENT_LENGTH,
-            HeaderValue::from_str(&size.to_string()).map_err(error::ErrorInternalServerError)?,
-        ));
-    if let Some(lm) = last_modified_from_meta(meta.as_ref()) {
-        builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
-    }
-    Ok(builder.finish())
+    let file = NamedFile::open_async(&item.path)
+        .await
+        .map_err(|e| error::ErrorNotFound(e.to_string()))?
+        .use_etag(true)
+        .use_last_modified(true);
+    Ok(file.into_response(req))
 }
 
 /// P25 — `Last-Modified` header formatting from a `Metadata`.

@@ -307,3 +307,38 @@ async fn head_alt_extension_route_advertises_ranges() {
         "HEAD must advertise Accept-Ranges: bytes"
     );
 }
+
+// B101 — the B95 HEAD handler advertised Accept-Ranges but reported
+// `Content-Length: 0`. It built the response with `.finish()`, whose empty
+// `()` body has `BodySize::Sized(0)`. actix's h1 encoder derives a HEAD
+// response's Content-Length from the body's declared `BodySize` (the bytes are
+// never transmitted) and drops any hand-inserted Content-Length header, so the
+// real size the handler computed was replaced with 0. Firefox HEAD-probes a
+// progressive `<video>` source to learn the resource length; for a
+// non-faststart mp4 (moov atom at EOF, as most library files are) it must know
+// the length to range-fetch the trailing `moov` seek index. A zero length reads
+// as "nothing to seek", collapsing `seekable` to `buffered` — the user can only
+// seek within already-downloaded bytes. The HEAD body must therefore declare
+// the real file size.
+#[actix_web::test]
+async fn head_reports_real_content_length() {
+    use actix_web::body::{BodySize, MessageBody};
+    let (state, token, _td) = seed_with_file().await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::default()
+        .method(actix_web::http::Method::HEAD)
+        .uri("/Videos/42/stream.mp4")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    // The wire Content-Length of a HEAD response is exactly the response body's
+    // declared `BodySize` — that is what the encoder writes and what the browser
+    // reads. Assert on it directly (a header-only check passes even on the buggy
+    // `.finish()` path, because the clobber happens downstream in the encoder).
+    assert_eq!(
+        resp.into_body().size(),
+        BodySize::Sized(PAYLOAD.len() as u64),
+        "HEAD must report the real file size or Firefox marks a moov-at-EOF mp4 non-seekable"
+    );
+}
