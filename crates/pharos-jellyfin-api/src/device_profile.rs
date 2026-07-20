@@ -31,6 +31,8 @@ pub struct DeviceProfile {
     /// required conditions fall through to Transcode.
     #[serde(default)]
     pub codec_profiles: Vec<CodecProfileDto>,
+    #[serde(default)]
+    pub subtitle_profiles: Vec<SubtitleProfileDto>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -44,6 +46,20 @@ pub struct CodecProfileDto {
     pub codec: String,
     #[serde(default)]
     pub conditions: Vec<ProfileCondition>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct SubtitleProfileDto {
+    #[serde(default)]
+    pub format: String,
+    /// Jellyfin: "Encode" (burn) | "Embed" | "External" | "Hls".
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub language: String,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -832,6 +848,18 @@ mod tests {
         assert_eq!(p.direct_play_profiles.len(), 1);
         assert_eq!(p.direct_play_profiles[0].video_codec, "vp9");
         assert_eq!(p.max_streaming_bitrate, Some(4_000_000));
+    }
+
+    #[test]
+    fn parses_subtitle_profiles_from_pascalcase() {
+        let json = r#"{"SubtitleProfiles":[
+            {"Format":"ass","Method":"Encode"},
+            {"Format":"subrip","Method":"External"}]}"#;
+        let p: super::DeviceProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.subtitle_profiles.len(), 2);
+        assert_eq!(p.subtitle_profiles[0].format, "ass");
+        assert_eq!(p.subtitle_profiles[0].method, "Encode");
+        assert_eq!(p.subtitle_profiles[1].method, "External");
     }
 
     // ---- bit-depth derivation (B75) ----

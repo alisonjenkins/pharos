@@ -1895,6 +1895,10 @@ async fn playback_info(
         ),
         None => (DeviceProfile::default(), None, None),
     };
+    tracing::info!(
+        subtitle_profiles = ?profile.subtitle_profiles,
+        "playbackinfo: client subtitle profiles"
+    );
     let decision = negotiate(&profile, &source);
     // Connection-aware transcode ceiling (Lace incident, 2026-07-16). A remote
     // client on jellyfin-web's "Auto" quality advertises an effectively-
