@@ -1945,10 +1945,6 @@ async fn playback_info(
         ),
         None => (DeviceProfile::default(), None, None),
     };
-    tracing::info!(
-        subtitle_profiles = ?profile.subtitle_profiles,
-        "playbackinfo: client subtitle profiles"
-    );
     // The client's explicit SubtitleStreamIndex pick — query string wins,
     // falling back to the POST body (jellyfin-web's track-switch reload
     // sends it only in the body). Resolved once, early, so both the
