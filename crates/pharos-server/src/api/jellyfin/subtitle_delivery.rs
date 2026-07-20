@@ -9,6 +9,46 @@ pub enum SubtitleDelivery {
     Burn,
 }
 
+fn format_matches(codec: &str, fmt: &str) -> bool {
+    let c = codec.to_ascii_lowercase();
+    let f = fmt.to_ascii_lowercase();
+    c == f
+        || (matches!(c.as_str(), "ass" | "ssa" | "advanced substation alpha")
+            && matches!(f.as_str(), "ass" | "ssa"))
+        || (c == "subrip" && matches!(f.as_str(), "subrip" | "srt"))
+}
+
+fn method_is_external(method: &str) -> bool {
+    matches!(
+        method.to_ascii_lowercase().as_str(),
+        "external" | "embed" | "hls"
+    )
+}
+
+pub fn decide_subtitle_delivery(
+    codec: Option<&str>,
+    client_profiles: &[SubtitleProfileDto],
+) -> SubtitleDelivery {
+    let codec = codec.unwrap_or("");
+    if is_image_subtitle_codec(&codec.to_ascii_lowercase()) {
+        return SubtitleDelivery::Burn;
+    }
+    if !is_text_subtitle_codec(Some(codec)) {
+        return SubtitleDelivery::Burn; // unknown/other → safest is burn
+    }
+    if client_profiles.is_empty() {
+        return SubtitleDelivery::External; // profile-less caller keeps the default
+    }
+    let has_external = client_profiles
+        .iter()
+        .any(|p| format_matches(codec, &p.format) && method_is_external(&p.method));
+    if has_external {
+        SubtitleDelivery::External
+    } else {
+        SubtitleDelivery::Burn
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -64,45 +104,5 @@ mod tests {
             decide_subtitle_delivery(Some("ass"), &[]),
             SubtitleDelivery::External
         ));
-    }
-}
-
-fn format_matches(codec: &str, fmt: &str) -> bool {
-    let c = codec.to_ascii_lowercase();
-    let f = fmt.to_ascii_lowercase();
-    c == f
-        || (matches!(c.as_str(), "ass" | "ssa" | "advanced substation alpha")
-            && matches!(f.as_str(), "ass" | "ssa"))
-        || (c == "subrip" && matches!(f.as_str(), "subrip" | "srt"))
-}
-
-fn method_is_external(method: &str) -> bool {
-    matches!(
-        method.to_ascii_lowercase().as_str(),
-        "external" | "embed" | "hls"
-    )
-}
-
-pub fn decide_subtitle_delivery(
-    codec: Option<&str>,
-    client_profiles: &[SubtitleProfileDto],
-) -> SubtitleDelivery {
-    let codec = codec.unwrap_or("");
-    if is_image_subtitle_codec(&codec.to_ascii_lowercase()) {
-        return SubtitleDelivery::Burn;
-    }
-    if !is_text_subtitle_codec(Some(codec)) {
-        return SubtitleDelivery::Burn; // unknown/other → safest is burn
-    }
-    if client_profiles.is_empty() {
-        return SubtitleDelivery::External; // profile-less caller keeps the default
-    }
-    let has_external = client_profiles
-        .iter()
-        .any(|p| format_matches(codec, &p.format) && method_is_external(&p.method));
-    if has_external {
-        SubtitleDelivery::External
-    } else {
-        SubtitleDelivery::Burn
     }
 }

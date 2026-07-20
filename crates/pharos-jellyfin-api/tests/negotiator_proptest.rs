@@ -76,6 +76,7 @@ fn profile_strat() -> impl Strategy<Value = DeviceProfile> {
             max_streaming_bitrate: max_br,
             max_static_bitrate: None,
             codec_profiles: vec![],
+            subtitle_profiles: vec![],
         })
 }
 
