@@ -2046,6 +2046,11 @@ pub struct SubtitleStreamCtx {
     /// caller. `None` where the filename carried no language token. Labels each
     /// external track with its language instead of a bare "External N".
     pub sidecar_langs: Vec<Option<String>>,
+    /// Absolute ffprobe stream indices of TEXT subs the client will BURN
+    /// (its SubtitleProfile lacks external support for that format). Such a
+    /// track is advertised Encode/no-DeliveryUrl so the client requests the
+    /// burn transcode instead of trying to render the raw ASS itself.
+    pub burn_text_indices: std::collections::BTreeSet<u32>,
 }
 
 impl SubtitleStreamCtx {
@@ -2054,6 +2059,7 @@ impl SubtitleStreamCtx {
             item_id,
             sidecar_count: 0,
             sidecar_langs: Vec::new(),
+            burn_text_indices: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -2230,6 +2236,15 @@ pub fn build_media_streams_with_subtitles(
                 let is_text = is_text_subtitle_codec(t.codec.as_deref());
                 let is_ass = is_ass_subtitle_codec(t.codec.as_deref());
                 let ext = if is_ass { "ass" } else { "vtt" };
+                // A text sub the resolved client delivery decision (Task 2)
+                // says to Burn (client's SubtitleProfile lacks external
+                // support for this format) must NOT advertise External —
+                // otherwise the client tries to render the raw ASS/text
+                // itself and gets black bars / a failed track. It's still
+                // IsTextSubtitleStream (jellyfin semantics: text vs image),
+                // just not externally deliverable.
+                let burn = ctx.burn_text_indices.contains(&t.stream_index);
+                let external = is_text && !burn;
                 streams.push(MediaStreamDto {
                     kind: "Subtitle",
                     index: t.stream_index,
@@ -2250,16 +2265,24 @@ pub fn build_media_streams_with_subtitles(
                     is_hearing_impaired: t.is_hearing_impaired,
                     is_interlaced: false,
                     is_original: false,
-                    delivery_url: is_text.then(|| {
+                    delivery_url: external.then(|| {
                         format!(
                             "/Videos/{id}/{id}/Subtitles/{idx}/Stream.{ext}",
                             id = wire_item_id(ctx.item_id),
                             idx = t.stream_index,
                         )
                     }),
-                    delivery_method: Some(if is_text { "External" } else { "Encode" }),
+                    delivery_method: Some(if is_text {
+                        if burn {
+                            "Encode"
+                        } else {
+                            "External"
+                        }
+                    } else {
+                        "Encode"
+                    }),
                     is_text_subtitle_stream: is_text,
-                    supports_external_stream: is_text,
+                    supports_external_stream: external,
                     replay_gain: None,
                     display_title: None,
                 });
@@ -2716,6 +2739,52 @@ mod tests {
         assert!(ass.supports_external_stream);
     }
 
+    fn probe_with_one_ass_track() -> MediaProbe {
+        MediaProbe {
+            video_codec: Some("h264".into()),
+            subtitle_tracks: vec![pharos_core::SubtitleTrack {
+                stream_index: 4,
+                codec: Some("ass".into()),
+                language: Some("eng".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ass_track_marked_burn_emits_encode_not_external() {
+        // B?? — Android/TV can't render raw ASS externally; when the
+        // resolved delivery decision (Task 2) says Burn, the ctx carries the
+        // stream's absolute ffprobe index so this branch advertises Encode
+        // instead of External, with no DeliveryUrl (the client must request
+        // the burn transcode, not fetch the raw .ass itself).
+        let probe = probe_with_one_ass_track();
+        let mut ctx = SubtitleStreamCtx::new(1);
+        ctx.burn_text_indices.insert(4);
+        let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
+        let ass = streams.iter().find(|s| s.index == 4).unwrap();
+        assert_eq!(ass.delivery_method, Some("Encode"));
+        assert!(!ass.supports_external_stream);
+        assert!(ass.delivery_url.is_none());
+        // Still a text stream — just burned, not natively-renderable.
+        assert!(ass.is_text_subtitle_stream);
+    }
+
+    #[test]
+    fn ass_track_not_marked_stays_external() {
+        // jellyfin-web (SubtitlesOctopus) handles ass fine — an empty burn
+        // set (the /Items path via build_media_streams, or a client whose
+        // profile declares ass support) must preserve today's External
+        // behavior unchanged.
+        let probe = probe_with_one_ass_track();
+        let ctx = SubtitleStreamCtx::new(1); // empty burn set
+        let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
+        let ass = streams.iter().find(|s| s.index == 4).unwrap();
+        assert_eq!(ass.delivery_method, Some("External"));
+        assert!(ass.delivery_url.is_some());
+    }
+
     #[test]
     fn sidecar_subtitle_indices_are_contiguous_not_a_sentinel() {
         // B71 — sidecar subtitle wire indices must be REAL, small, contiguous
@@ -2737,6 +2806,7 @@ mod tests {
             item_id: 0x2a,
             sidecar_count: 3,
             sidecar_langs: vec![Some("eng".into()), Some("spa".into()), None],
+            burn_text_indices: Default::default(),
         };
         let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
         let subs: Vec<u32> = streams

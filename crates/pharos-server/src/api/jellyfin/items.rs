@@ -2371,10 +2371,26 @@ async fn playback_info(
                 .and_then(crate::api::jellyfin::subtitles::sidecar_language_from_name)
         })
         .collect();
+    // Resolve which embedded TEXT subs this client can't render externally
+    // (its SubtitleProfile lacks an External/Embed/Hls entry for that
+    // format) — those must advertise Encode so the client requests the burn
+    // transcode instead of trying to render raw ASS itself (black bars on
+    // Android/TV, which never declares ass External).
+    let mut burn_text_indices = std::collections::BTreeSet::new();
+    for track in &probe.subtitle_tracks {
+        if crate::api::jellyfin::subtitle_delivery::decide_subtitle_delivery(
+            track.codec.as_deref(),
+            &profile.subtitle_profiles,
+        ) == crate::api::jellyfin::subtitle_delivery::SubtitleDelivery::Burn
+        {
+            burn_text_indices.insert(track.stream_index);
+        }
+    }
     let ctx = SubtitleStreamCtx {
         item_id: item.id,
         sidecar_count: sidecars.len() as u32,
         sidecar_langs,
+        burn_text_indices,
     };
     let streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
     // Embedded fonts → MediaAttachments so jellyfin-web hands them to
