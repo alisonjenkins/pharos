@@ -306,6 +306,32 @@ impl SubtitleCache {
         )))
     }
 
+    /// On-disk path where a cached entry for this key lives (or would live)
+    /// under the configured disk root, or `None` when the cache is memory-only.
+    ///
+    /// The path is deterministic; the file is present iff the entry has been
+    /// `store`d (the disk write is part of `store`). Callers needing a
+    /// guaranteed-present FILE (not bytes) — the subtitle-burn path points
+    /// ffmpeg's `subtitles=` filter at the small cached `.ass` sidecar instead
+    /// of re-demuxing the whole source per HLS segment — should `store` (or
+    /// verify existence with `try_exists`) first. Exposing the path (rather
+    /// than only the bytes via [`get`](Self::get)) is what lets the transcoder
+    /// read the sidecar directly.
+    pub fn disk_path_of(
+        &self,
+        path: &std::path::Path,
+        mtime_secs: i64,
+        stream_index: u32,
+        kind: SubtitleKind,
+    ) -> Option<PathBuf> {
+        self.disk_path(&Key {
+            path: path.to_path_buf(),
+            mtime_secs,
+            stream_index,
+            kind,
+        })
+    }
+
     /// Lookup the cached WebVTT bytes for this key. Returns `None` on
     /// miss; caller is expected to populate via `store`.
     pub async fn get(
@@ -568,6 +594,53 @@ mod tests {
             .get(Path::new("/m/x.mkv"), 8, 3, SubtitleKind::EmbeddedAss)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn disk_path_of_is_deterministic_and_none_without_root() {
+        // The burn path needs the on-disk PATH of a cached `.ass` sidecar so it
+        // can point ffmpeg's `subtitles=` filter at the small local file. No
+        // disk root → None (memory-only can't hand out a file path).
+        let mem = SubtitleCache::new(1_024, 64);
+        assert!(mem
+            .disk_path_of(Path::new("/m/x.mkv"), 7, 3, SubtitleKind::EmbeddedAss)
+            .is_none());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("cache");
+        let disk = SubtitleCache::new(1_024, 64).with_disk(&root);
+        let p1 = disk
+            .disk_path_of(Path::new("/m/x.mkv"), 7, 3, SubtitleKind::EmbeddedAss)
+            .expect("disk root set → Some path");
+        let p2 = disk
+            .disk_path_of(Path::new("/m/x.mkv"), 7, 3, SubtitleKind::EmbeddedAss)
+            .unwrap();
+        assert_eq!(p1, p2, "same key → same path");
+        assert!(p1.starts_with(&root));
+        // And it matches where `store` actually writes the bytes.
+        disk.store(
+            Path::new("/m/x.mkv"),
+            7,
+            3,
+            SubtitleKind::EmbeddedAss,
+            b"[Script Info]\n".to_vec(),
+        )
+        .await;
+        assert!(
+            tokio::fs::try_exists(&p1).await.unwrap(),
+            "store must materialize the file at disk_path_of"
+        );
+        // Distinct kind / index / mtime → distinct paths (no aliasing).
+        assert_ne!(
+            p1,
+            disk.disk_path_of(Path::new("/m/x.mkv"), 7, 3, SubtitleKind::Embedded)
+                .unwrap()
+        );
+        assert_ne!(
+            p1,
+            disk.disk_path_of(Path::new("/m/x.mkv"), 8, 3, SubtitleKind::EmbeddedAss)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
