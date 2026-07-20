@@ -6123,42 +6123,50 @@ async fn reload_libraries_and_backfill(state: &AppState) -> Result<(), actix_web
 /// fans `RefreshProgress` frames keyed by that library's item id so the legacy
 /// library-card indicator fills too.
 ///
-/// If a scan is already running (the task is not `Idle`), this still scans — so
-/// an add-library or per-library refresh is never silently dropped — but does
-/// NOT drive the single shared task bar (two scans must not fight over one
-/// percent). `try_start` hands back the run's cancel flag; a `DELETE
-/// /ScheduledTasks/Running/{id}` sets it and the root loop stops after the
-/// current root (the finest cancellation granularity the scanner exposes).
+/// One library scan runs at a time (B100). If a scan is already running, this
+/// does NOT spawn a second concurrent scan — it coalesces the request into a
+/// single pending re-run (`force` OR'd) that fires once the current scan
+/// finishes. Stacked concurrent scans re-probing the whole catalog over NFS
+/// I/O-starved the single node and stalled the control plane during the B98
+/// recovery. `start_or_mark_pending` hands back the run's cancel flag; a
+/// `DELETE /ScheduledTasks/Running/{id}` sets it and the root loop stops after
+/// the current root (the finest cancellation granularity the scanner exposes).
+/// A cancelled run does not fire its coalesced re-run.
 pub(crate) fn spawn_scan_tracked(
     state: std::sync::Arc<AppState>,
     roots: Vec<std::path::PathBuf>,
     force: bool,
     refresh_item_id: Option<String>,
 ) {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    let cancel = state
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Acquire the single scan slot. `None` → a scan is already running and this
+    // request was folded into one pending re-run; there is nothing to spawn.
+    let Some(initial_cancel) = state
         .scan_tasks
-        .try_start(crate::scan_tasks::TASK_REFRESH_LIBRARY);
-    let tracked = cancel.is_some();
+        .start_or_mark_pending(crate::scan_tasks::TASK_REFRESH_LIBRARY, force)
+    else {
+        tracing::info!("scan: already running — coalesced into one pending re-run (B100)");
+        return;
+    };
     actix_web::rt::spawn(async move {
+        use pharos_core::LibraryStore;
         // Overall percent folds each per-root fraction across all roots, so a
-        // multi-root "Scan All" advances 0→100 once, not once per root.
-        let num_roots = roots.len().max(1) as f64;
+        // multi-root "Scan All" advances 0→100 once, not once per root. Held in
+        // an atomic because a coalesced re-run may cover a different root count
+        // than the first pass.
+        let num_roots = std::sync::Arc::new(AtomicU64::new(roots.len().max(1) as u64));
         let completed_roots = std::sync::Arc::new(AtomicU64::new(0));
-        // The scanner checks this mid-root (per group + per probe) so DELETE
-        // /ScheduledTasks/Running stops a single-library scan promptly, not just
-        // between roots. Untracked runs get a private flag that never flips.
-        let cancel_flag = cancel
-            .clone()
-            .unwrap_or_else(|| std::sync::Arc::new(AtomicBool::new(false)));
+        // The scanner checks the cancel flag mid-root (per group + per probe) so
+        // DELETE /ScheduledTasks/Running stops a scan promptly, not just between
+        // roots.
         let sink: pharos_scanner::ProgressSink = {
             let st = state.clone();
             let item_id = refresh_item_id.clone();
             let done = completed_roots.clone();
+            let total = num_roots.clone();
             std::sync::Arc::new(move |p: pharos_scanner::ScanProgress| {
-                let overall =
-                    ((done.load(Ordering::Relaxed) as f64) * 100.0 + p.percent()) / num_roots;
-                // No-op when untracked: set_progress only moves a Running task.
+                let n = total.load(Ordering::Relaxed).max(1) as f64;
+                let overall = ((done.load(Ordering::Relaxed) as f64) * 100.0 + p.percent()) / n;
                 st.scan_tasks
                     .set_progress(crate::scan_tasks::TASK_REFRESH_LIBRARY, overall);
                 if let Some(id) = &item_id {
@@ -6167,87 +6175,105 @@ pub(crate) fn spawn_scan_tracked(
             })
         };
 
-        // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build probes
-        // in-process via the resident libav worker (the distroless OCI image
-        // ships no `ffprobe` binary, so `FfmpegProber` would fail every probe);
-        // the spawn build keeps `FfmpegProber`. `force` bypasses the
-        // incremental `(mtime,size)` skip to re-probe every file.
-        // Adaptive backpressure — draw every probe read through the shared I/O
-        // gate the server shrinks during live playback, so this background
-        // re-scan paces itself down to a trickle while streaming instead of
-        // saturating shared storage (the failure mode that stalled playback),
-        // yet never fully pauses.
-        #[cfg(all(unix, feature = "ffmpeg-lib"))]
-        let scanner =
-            pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+        // First pass scans the requested roots; a coalesced re-run rescans the
+        // full current media-root set (so a library added while a scan ran is
+        // still picked up). `force`/`cancel` may change on the re-run.
+        let mut pass_roots = roots;
+        let mut cancel_flag = initial_cancel;
+        let mut force = force;
+        loop {
+            num_roots.store(pass_roots.len().max(1) as u64, Ordering::Relaxed);
+            completed_roots.store(0, Ordering::Relaxed);
+            // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build
+            // probes in-process via the resident libav worker (the distroless
+            // OCI image ships no `ffprobe` binary); the spawn build keeps
+            // `FfmpegProber`. `force` bypasses the incremental `(mtime,size)`
+            // skip. Every probe read draws through the shared I/O gate the
+            // server shrinks during live playback, so the re-scan paces down to
+            // a trickle while streaming instead of saturating shared storage.
+            #[cfg(all(unix, feature = "ffmpeg-lib"))]
+            let scanner =
+                pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
+                    .with_rate_limit_ms(state.scan_rate_limit_ms)
+                    .with_probe_concurrency_opt(state.scan_probe_concurrency)
+                    .with_io_gate(state.bg_io.clone())
+                    .with_force(force)
+                    .with_progress(sink.clone())
+                    .with_cancel(cancel_flag.clone());
+            #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+            let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
                 .with_force(force)
-                .with_progress(sink)
+                .with_progress(sink.clone())
                 .with_cancel(cancel_flag.clone());
-        #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
-        let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
-            .with_rate_limit_ms(state.scan_rate_limit_ms)
-            .with_probe_concurrency_opt(state.scan_probe_concurrency)
-            .with_io_gate(state.bg_io.clone())
-            .with_force(force)
-            .with_progress(sink)
-            .with_cancel(cancel_flag.clone());
-        let mut added: Vec<pharos_core::MediaId> = Vec::new();
-        let mut removed: Vec<pharos_core::MediaId> = Vec::new();
-        let mut cancelled = false;
-        for root in &roots {
-            if let Some(flag) = &cancel {
-                if flag.load(Ordering::SeqCst) {
+            let mut added: Vec<pharos_core::MediaId> = Vec::new();
+            let mut removed: Vec<pharos_core::MediaId> = Vec::new();
+            let mut cancelled = false;
+            for root in &pass_roots {
+                if cancel_flag.load(Ordering::SeqCst) {
                     cancelled = true;
                     tracing::info!("scan: cancellation requested; stopping between roots");
                     break;
                 }
-            }
-            match scanner.scan_into(root, &state.stores).await {
-                Ok(outcome) => {
-                    tracing::info!(
-                        root = %root.display(),
-                        added = outcome.added.len(),
-                        updated = outcome.updated.len(),
-                        removed = outcome.removed.len(),
-                        skipped = outcome.skipped,
-                        "scan: root scanned"
-                    );
-                    added.extend(outcome.added.iter().copied());
-                    added.extend(outcome.updated.iter().copied());
-                    removed.extend(outcome.removed.iter().copied());
+                match scanner.scan_into(root, &state.stores).await {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            root = %root.display(),
+                            added = outcome.added.len(),
+                            updated = outcome.updated.len(),
+                            removed = outcome.removed.len(),
+                            skipped = outcome.skipped,
+                            "scan: root scanned"
+                        );
+                        added.extend(outcome.added.iter().copied());
+                        added.extend(outcome.updated.iter().copied());
+                        removed.extend(outcome.removed.iter().copied());
+                    }
+                    Err(e) => {
+                        tracing::warn!(root = %root.display(), error = %e, "scan: root scan failed")
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(root = %root.display(), error = %e, "scan: root scan failed")
-                }
+                completed_roots.fetch_add(1, Ordering::Relaxed);
             }
-            completed_roots.fetch_add(1, Ordering::Relaxed);
-        }
-        use pharos_core::LibraryStore;
-        if let Err(e) = state.stores.backfill_library_ids().await {
-            tracing::warn!(error = %e, "scan: post-scan library-id backfill failed");
-        }
-        // Reload the runtime set so newly-scanned items resolve under the lib.
-        if let Ok(libs) = state.stores.libraries().await {
-            state.set_libraries(libs);
-        }
-        state.notify_library_delta(&added, &removed);
-        if tracked {
+            if let Err(e) = state.stores.backfill_library_ids().await {
+                tracing::warn!(error = %e, "scan: post-scan library-id backfill failed");
+            }
+            // Reload the runtime set so newly-scanned items resolve under the lib.
+            if let Ok(libs) = state.stores.libraries().await {
+                state.set_libraries(libs);
+            }
+            state.notify_library_delta(&added, &removed);
+
             let status = if cancelled {
                 crate::scan_tasks::CompletionStatus::Cancelled
             } else {
                 crate::scan_tasks::CompletionStatus::Completed
             };
-            state
+            match state
                 .scan_tasks
-                .finish(crate::scan_tasks::TASK_REFRESH_LIBRARY, status);
-        }
-        // A terminal RefreshProgress so a per-library card settles at 100%
-        // instead of freezing on the last mid-scan frame.
-        if let Some(id) = &refresh_item_id {
-            state.notify_refresh_progress(id, 100.0);
+                .finish_or_rerun(crate::scan_tasks::TASK_REFRESH_LIBRARY, status)
+            {
+                // A request arrived mid-scan: run exactly one coalesced re-run
+                // over the full current root set, keeping the shared task bar
+                // Running the whole time (no Idle gap a concurrent start could
+                // exploit).
+                Some((next_cancel, next_force)) => {
+                    tracing::info!("scan: running one coalesced re-run (B100)");
+                    cancel_flag = next_cancel;
+                    force = next_force;
+                    pass_roots = state.media_roots.clone();
+                }
+                None => {
+                    // A terminal RefreshProgress so a per-library card settles at
+                    // 100% instead of freezing on the last mid-scan frame.
+                    if let Some(id) = &refresh_item_id {
+                        state.notify_refresh_progress(id, 100.0);
+                    }
+                    break;
+                }
+            }
         }
     });
 }

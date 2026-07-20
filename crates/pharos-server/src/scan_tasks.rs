@@ -103,6 +103,14 @@ struct Runtime {
     /// Cancellation flag handed to the running job. Replaced with a fresh flag
     /// on each `try_start` so a stale cancel never bleeds into the next run.
     cancel: Arc<AtomicBool>,
+    /// B100 — a re-run was requested (a second `/Library/Refresh`) while this
+    /// task was already Running. Rather than start a concurrent scan, the
+    /// running job re-runs exactly once more on completion; further requests
+    /// during the run coalesce into this single pending flag.
+    pending: bool,
+    /// OR of the `force` flags of every request coalesced into `pending`, so a
+    /// forced refresh arriving mid-scan still forces the queued re-run.
+    pending_force: bool,
 }
 
 impl Default for Runtime {
@@ -113,6 +121,8 @@ impl Default for Runtime {
             last: None,
             started_ms: 0,
             cancel: Arc::new(AtomicBool::new(false)),
+            pending: false,
+            pending_force: false,
         }
     }
 }
@@ -159,6 +169,72 @@ impl ScanTasks {
         rt.started_ms = now_ms();
         rt.cancel = cancel.clone();
         Some(cancel)
+    }
+
+    /// B100 — start the task if it is `Idle`, otherwise fold this request into a
+    /// single pending re-run and return `None`. This is the scan entry point:
+    /// many concurrent `/Library/Refresh`s collapse to **one** running scan plus
+    /// **at most one** queued re-run (`force` OR'd across them), instead of
+    /// spawning N concurrent catalog walks — the stacked-scan NFS I/O storm that
+    /// starved the node and stalled the control plane during the B98 recovery.
+    /// A `Some(cancel)` return means the caller owns the run and must eventually
+    /// call [`finish_or_rerun`](Self::finish_or_rerun); `None` means "already
+    /// running, re-run queued — nothing to spawn".
+    pub fn start_or_mark_pending(&self, id: &str, force: bool) -> Option<Arc<AtomicBool>> {
+        let mut map = self.inner.lock().ok()?;
+        let rt = map.get_mut(id)?;
+        if rt.state == RunState::Idle {
+            let cancel = Arc::new(AtomicBool::new(false));
+            rt.state = RunState::Running;
+            rt.progress = Some(0.0);
+            rt.started_ms = now_ms();
+            rt.cancel = cancel.clone();
+            rt.pending = false;
+            rt.pending_force = false;
+            Some(cancel)
+        } else {
+            rt.pending = true;
+            rt.pending_force |= force;
+            None
+        }
+    }
+
+    /// B100 — end one scan pass. If a re-run was coalesced during the pass (and
+    /// it was not cancelled), keep the task `Running` for another pass and return
+    /// the fresh `(cancel, force)` to drive it; otherwise finish to `Idle`,
+    /// recording the result, and return `None`. Holding the slot `Running` across
+    /// the re-run leaves no `Idle` window in which a concurrent request could
+    /// slip in and start a second scan. A cancelled pass never re-runs (an
+    /// operator cancel must actually stop).
+    pub fn finish_or_rerun(
+        &self,
+        id: &str,
+        status: CompletionStatus,
+    ) -> Option<(Arc<AtomicBool>, bool)> {
+        let mut map = self.inner.lock().ok()?;
+        let rt = map.get_mut(id)?;
+        if rt.pending && status != CompletionStatus::Cancelled {
+            let force = rt.pending_force;
+            rt.pending = false;
+            rt.pending_force = false;
+            let cancel = Arc::new(AtomicBool::new(false));
+            rt.state = RunState::Running;
+            rt.progress = Some(0.0);
+            rt.started_ms = now_ms();
+            rt.cancel = cancel.clone();
+            Some((cancel, force))
+        } else {
+            rt.last = Some(LastRun {
+                start_ms: rt.started_ms,
+                end_ms: now_ms(),
+                status,
+            });
+            rt.state = RunState::Idle;
+            rt.progress = None;
+            rt.pending = false;
+            rt.pending_force = false;
+            None
+        }
     }
 
     /// Update a running task's percent (`0..=100`, clamped). No-op if the task
@@ -334,5 +410,56 @@ mod tests {
             !second.load(Ordering::SeqCst),
             "new run starts un-cancelled"
         );
+    }
+
+    // ---- B100: one scan at a time, concurrent requests coalesce ----
+
+    #[test]
+    fn concurrent_starts_coalesce_into_one_pending_rerun() {
+        let t = ScanTasks::new();
+        let id = TASK_REFRESH_LIBRARY;
+        // First request wins the slot and runs.
+        assert!(t.start_or_mark_pending(id, false).is_some());
+        assert_eq!(t.snapshot_one(id).unwrap().state, RunState::Running);
+        // Concurrent requests do NOT start a second scan — they coalesce.
+        assert!(t.start_or_mark_pending(id, false).is_none());
+        assert!(t.start_or_mark_pending(id, true).is_none()); // force OR'd in
+                                                              // Pass ends → exactly one re-run is queued, carrying the OR'd force.
+        let (_c2, force) = t
+            .finish_or_rerun(id, CompletionStatus::Completed)
+            .expect("a coalesced re-run must be pending");
+        assert!(force, "pending_force must OR the coalesced requests' force");
+        assert_eq!(
+            t.snapshot_one(id).unwrap().state,
+            RunState::Running,
+            "task stays Running across the coalesced re-run (no Idle gap)"
+        );
+        // No further requests during the re-run → it finishes to Idle.
+        assert!(t.finish_or_rerun(id, CompletionStatus::Completed).is_none());
+        assert_eq!(t.snapshot_one(id).unwrap().state, RunState::Idle);
+    }
+
+    #[test]
+    fn a_lone_run_with_no_pending_finishes_to_idle() {
+        let t = ScanTasks::new();
+        let id = TASK_REFRESH_LIBRARY;
+        t.start_or_mark_pending(id, false).unwrap();
+        assert!(t.finish_or_rerun(id, CompletionStatus::Completed).is_none());
+        let s = t.snapshot_one(id).unwrap();
+        assert_eq!(s.state, RunState::Idle);
+        assert_eq!(s.last.unwrap().status, CompletionStatus::Completed);
+    }
+
+    #[test]
+    fn a_cancelled_pass_does_not_rerun_even_with_pending() {
+        let t = ScanTasks::new();
+        let id = TASK_REFRESH_LIBRARY;
+        t.start_or_mark_pending(id, false).unwrap();
+        t.start_or_mark_pending(id, false); // queue a re-run
+                                            // An operator cancel must actually stop — no coalesced re-run fires.
+        assert!(t.finish_or_rerun(id, CompletionStatus::Cancelled).is_none());
+        let s = t.snapshot_one(id).unwrap();
+        assert_eq!(s.state, RunState::Idle);
+        assert_eq!(s.last.unwrap().status, CompletionStatus::Cancelled);
     }
 }
