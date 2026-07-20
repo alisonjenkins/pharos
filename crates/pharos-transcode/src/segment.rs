@@ -110,8 +110,12 @@ pub struct SegmentOpts {
     pub duration_ticks: Option<u64>,
     /// Source-relative audio-stream index (`-map 0:a:{N}`).
     pub audio_source_stream_index: Option<u32>,
-    /// Subtitle-relative stream index for IMAGE-subtitle burn-in.
+    /// Subtitle-relative stream index for subtitle burn-in (image OR text).
     pub burn_subtitle_stream_index: Option<u32>,
+    /// `true` when `burn_subtitle_stream_index` refers to a TEXT/ASS track
+    /// (Task 7 picks the `subtitles=` filter instead of `overlay`). `false`
+    /// for image-subtitle burn (PGS/VOBSUB/DVB) or when no burn is set.
+    pub burn_subtitle_is_text: bool,
 }
 
 impl SegmentOpts {
@@ -128,6 +132,7 @@ impl SegmentOpts {
             duration_ticks: self.duration_ticks,
             audio_source_stream_index: self.audio_source_stream_index,
             burn_subtitle_stream_index: self.burn_subtitle_stream_index,
+            burn_subtitle_is_text: self.burn_subtitle_is_text,
         }
     }
 }
@@ -148,6 +153,7 @@ mod tests {
             duration_ticks: Some(60_060_000),
             audio_source_stream_index: Some(1),
             burn_subtitle_stream_index: Some(0),
+            burn_subtitle_is_text: true,
         };
         let t = s.to_transcode_options();
         assert_eq!(t.container, Container::Mpegts);
@@ -158,6 +164,7 @@ mod tests {
         assert_eq!(t.duration_ticks, Some(60_060_000));
         assert_eq!(t.audio_source_stream_index, Some(1));
         assert_eq!(t.burn_subtitle_stream_index, Some(0));
+        assert!(t.burn_subtitle_is_text);
     }
 
     #[test]

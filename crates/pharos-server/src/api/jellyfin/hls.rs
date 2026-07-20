@@ -1088,23 +1088,32 @@ fn build_segment_opts(
     let audio_stream_index = audio_stream_index.and_then(|abs| {
         codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
     });
+    // Task 6 — burn either IMAGE subtitles (PGS/VOBSUB, unchanged) OR a
+    // TEXT/ASS subtitle the client explicitly asked to burn (Tasks 4/5 only
+    // forward a text index here for burn-required clients; the default path
+    // still delivers text subs out-of-band as a separate External
+    // rendition). `burn_subtitle_is_text` tells Task 7's transcoder which
+    // ffmpeg filter graph to build.
+    let mut subtitle_is_text = false;
     let subtitle_stream_index = subtitle_stream_index.and_then(|abs| {
-        // Burn only IMAGE subtitles (PGS/VOBSUB); text/ASS are delivered as a
-        // separate External rendition the client renders — burning them is both
-        // redundant and (via output-seek decode-from-0) tens-of-seconds slow
-        // deep in a file. Same guard as the VP9 path (`vp9_segment_opts`).
-        let is_image = item
+        let codec = item
             .probe
             .subtitle_tracks
             .iter()
             .find(|t| t.stream_index == abs)
-            .map(|t| {
-                super::subtitles::is_image_subtitle_codec(&t.codec.clone().unwrap_or_default())
-            })
+            .map(|t| t.codec.clone().unwrap_or_default());
+        let is_image = codec
+            .as_deref()
+            .map(super::subtitles::is_image_subtitle_codec)
             .unwrap_or(false);
-        if !is_image {
+        let is_text = codec
+            .as_deref()
+            .map(|c| pharos_jellyfin_api::dto::is_text_subtitle_codec(Some(c)))
+            .unwrap_or(false);
+        if !is_image && !is_text {
             return None;
         }
+        subtitle_is_text = is_text;
         codec_relative_index(
             item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
             abs,
@@ -1176,6 +1185,7 @@ fn build_segment_opts(
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
+                    burn_subtitle_is_text: subtitle_is_text,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1200,6 +1210,7 @@ fn build_segment_opts(
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
+                    burn_subtitle_is_text: subtitle_is_text,
                 };
             }
             _ => {}
@@ -1224,6 +1235,7 @@ fn build_segment_opts(
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index: subtitle_stream_index,
+        burn_subtitle_is_text: subtitle_is_text,
     }
 }
 
@@ -1255,6 +1267,14 @@ async fn gate_image_sub_burn(
     let Some(rel_idx) = opts.burn_subtitle_stream_index else {
         return;
     };
+    // Task 6 — the image-event-window scan only covers IMAGE subtitle
+    // tracks. A TEXT/ASS burn fails open (always keeps the index): the
+    // `subtitles=` filter Task 7 wires up no-ops on a segment with no
+    // active cue, so there's no correctness reason to gate it, and no
+    // event-window data exists for text tracks to gate against anyway.
+    if opts.burn_subtitle_is_text {
+        return;
+    }
     let Some(subs) = state.subtitles.as_ref() else {
         return;
     };
@@ -2034,25 +2054,32 @@ async fn vp9_segment_opts(
     // each track's position among its own codec's streams — matching the
     // progressive-webm handler so multi-audio selection + subtitle burn-in
     // pick the right track.
+    // Task 6 — burn either IMAGE subtitles (PGS/VOBSUB, unchanged) OR a
+    // TEXT/ASS subtitle the client explicitly asked to burn (Tasks 4/5 only
+    // forward a text index here for burn-required clients; the default path
+    // still delivers text subs out-of-band as a separate External
+    // rendition). `burn_subtitle_is_text` tells Task 7's transcoder which
+    // ffmpeg filter graph to build.
+    let mut sub_is_text = false;
     let sub_rel = subtitle_stream_index.and_then(|abs| {
-        // Defence-in-depth: only IMAGE subtitles (PGS/VOBSUB) are burned in.
-        // Text/ASS subs are delivered as a separate External rendition — burning
-        // them is redundant and, because a burned-sub segment decodes from 0
-        // (output seeking), tens-of-seconds slow deep in the file. The
-        // PlaybackInfo layer already withholds text-sub indices from the URL;
-        // this guards the segment path even if one leaks through.
-        let is_image = item
+        let codec = item
             .probe
             .subtitle_tracks
             .iter()
             .find(|t| t.stream_index == abs)
-            .map(|t| {
-                super::subtitles::is_image_subtitle_codec(&t.codec.clone().unwrap_or_default())
-            })
+            .map(|t| t.codec.clone().unwrap_or_default());
+        let is_image = codec
+            .as_deref()
+            .map(super::subtitles::is_image_subtitle_codec)
             .unwrap_or(false);
-        if !is_image {
+        let is_text = codec
+            .as_deref()
+            .map(|c| pharos_jellyfin_api::dto::is_text_subtitle_codec(Some(c)))
+            .unwrap_or(false);
+        if !is_image && !is_text {
             return None;
         }
+        sub_is_text = is_text;
         codec_relative_index(
             item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
             abs,
@@ -2072,6 +2099,7 @@ async fn vp9_segment_opts(
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
+        burn_subtitle_is_text: sub_is_text,
     }
 }
 
@@ -2806,6 +2834,65 @@ mod tests {
         let item = item_with_video_codec(Some("vp9"));
         let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
         assert_eq!(opts.burn_subtitle_stream_index, Some(0));
+    }
+
+    /// Task 6 fixture — extends `item_with_video_codec`'s single IMAGE track
+    /// (abs idx 2) with a second, TEXT/ASS track at abs idx 3 (per-codec
+    /// relative index 1, since the subtitle-filter's `si=N` counts across
+    /// ALL subtitle streams in appearance order, not per codec kind).
+    fn item_with_subs() -> pharos_core::MediaItem {
+        let mut item = item_with_video_codec(Some("h264"));
+        item.probe.subtitle_tracks.push(pharos_core::SubtitleTrack {
+            stream_index: 3,
+            codec: Some("ass".into()),
+            ..Default::default()
+        });
+        item
+    }
+
+    #[::core::prelude::v1::test]
+    fn build_segment_opts_burns_text_sub_and_flags_is_text() {
+        // Task 6 — a TEXT/ASS `SubtitleStreamIndex` (Tasks 4/5 forward these
+        // for burn-required clients) must now yield a burn index too, MAPPED
+        // to the per-codec relative index (abs 3 -> si=1), with
+        // `burn_subtitle_is_text` set so Task 7 picks the `subtitles=`
+        // filter instead of `overlay`.
+        let item = item_with_subs();
+        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(3));
+        assert_eq!(opts.burn_subtitle_stream_index, Some(1));
+        assert!(opts.burn_subtitle_is_text);
+
+        // The existing IMAGE track still burns, but is NOT flagged text.
+        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
+        assert_eq!(opts.burn_subtitle_stream_index, Some(0));
+        assert!(!opts.burn_subtitle_is_text);
+
+        // No selection -> no burn, and the flag stays false.
+        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
+        assert_eq!(opts.burn_subtitle_stream_index, None);
+        assert!(!opts.burn_subtitle_is_text);
+    }
+
+    #[actix_web::test]
+    async fn vp9_segment_opts_burns_text_sub_and_flags_is_text() {
+        // Task 6 — same contract as `build_segment_opts` above, exercised on
+        // the VP9/fMP4 segment-opts builder (brief's specified test target).
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = web::Data::new(AppState::new(stores, "t".into()));
+        let req = test::TestRequest::default().to_http_request();
+        let item = item_with_subs();
+
+        let opts = vp9_segment_opts(&state, &req, &item, 0, None, Some(3)).await;
+        assert_eq!(opts.burn_subtitle_stream_index, Some(1));
+        assert!(opts.burn_subtitle_is_text);
+
+        let opts = vp9_segment_opts(&state, &req, &item, 0, None, Some(2)).await;
+        assert_eq!(opts.burn_subtitle_stream_index, Some(0));
+        assert!(!opts.burn_subtitle_is_text);
+
+        let opts = vp9_segment_opts(&state, &req, &item, 0, None, None).await;
+        assert_eq!(opts.burn_subtitle_stream_index, None);
+        assert!(!opts.burn_subtitle_is_text);
     }
 
     #[::core::prelude::v1::test]

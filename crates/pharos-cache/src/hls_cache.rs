@@ -886,6 +886,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -908,6 +909,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts)
@@ -933,6 +935,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -971,6 +974,7 @@ mod tests {
                 duration_ticks: None,
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
+                burn_subtitle_is_text: false,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)
@@ -989,6 +993,7 @@ mod tests {
                 duration_ticks: None,
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
+                burn_subtitle_is_text: false,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)

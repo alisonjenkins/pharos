@@ -177,6 +177,10 @@ pub struct TranscodeOptions {
     /// `subtitles=` filter cannot render image subs). None leaves subtitles
     /// out of the encode entirely.
     pub burn_subtitle_stream_index: Option<u32>,
+    /// `true` when `burn_subtitle_stream_index` refers to a TEXT/ASS track
+    /// (picks ffmpeg's `subtitles=` filter instead of the image `overlay`
+    /// graph). `false` for image-subtitle burn or when no burn is set.
+    pub burn_subtitle_is_text: bool,
 }
 
 impl TranscodeOptions {
@@ -211,6 +215,7 @@ mod tests {
             duration_ticks: Some(50_000_000),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -228,6 +233,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         assert_eq!(o.start_position_seconds(), None);
     }

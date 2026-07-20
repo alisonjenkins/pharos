@@ -651,6 +651,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         }
     }
 
@@ -772,6 +773,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -825,6 +827,7 @@ mod tests {
             duration_ticks: Some(6 * 10_000_000),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -863,6 +866,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -884,6 +888,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
