@@ -434,6 +434,11 @@ fn build_batch_extract_args(input: &str, tracks: &[BatchTrack]) -> Vec<String> {
 /// - Embedded tracks are extracted verbatim as `.ass` into the disk-backed
 ///   subtitle cache (shared with `deliver_ass`, so a warmed sidecar is reused),
 ///   and the on-disk path is returned.
+#[tracing::instrument(
+    name = "ensure_ass_sidecar_path",
+    skip_all,
+    fields(media.id = %item.id, stream_index)
+)]
 pub(crate) async fn ensure_ass_sidecar_path(
     state: &AppState,
     item: &pharos_core::MediaItem,
