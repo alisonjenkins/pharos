@@ -9,7 +9,10 @@ use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
-        device_profile::{negotiate, Decision, DeviceProfile, SourceMedia, SubtitleProfileDto},
+        device_profile::{
+            negotiate, CodecCap, Decision, DeviceProfile, ServerCodecSupport, SourceMedia,
+            SubtitleProfileDto,
+        },
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
             BaseItemDto, CollectionFolderDto, ItemsResultDto, MediaSourceInfoDto, NameGuidPairDto,
@@ -1863,6 +1866,51 @@ fn subtitle_selection_forces_transcode(
         })
 }
 
+/// Convert the boot-resolved server encode capabilities into the negotiator's
+/// codec-support DTO (canonical codec names, hw flag, cost tier). An empty
+/// capability set (tests / not-yet-wired) yields an empty support list, so the
+/// picker falls back to h264 — matching the old hardcoded target.
+fn server_codec_support(caps: &pharos_transcode::ServerEncodeCapabilities) -> ServerCodecSupport {
+    fn codec_name(c: pharos_transcode::VideoCodec) -> Option<&'static str> {
+        use pharos_transcode::VideoCodec::*;
+        match c {
+            H264 => Some("h264"),
+            H265 => Some("h265"),
+            Vp9 => Some("vp9"),
+            Av1 => Some("av1"),
+            Copy => None,
+        }
+    }
+    fn cost(c: pharos_transcode::RelCost) -> u8 {
+        use pharos_transcode::RelCost::*;
+        match c {
+            Cheap => 0,
+            Moderate => 1,
+            Expensive => 2,
+            Glacial => 3,
+        }
+    }
+    let encodable: Vec<CodecCap> = caps
+        .video
+        .iter()
+        .filter_map(|c| {
+            codec_name(c.codec).map(|name| CodecCap {
+                name: name.to_string(),
+                hw: c.accel.is_hardware(),
+                cost: cost(c.cost),
+            })
+        })
+        .collect();
+    // An empty set means capabilities weren't resolved (tests, or an ffmpeg
+    // that failed `-encoders`) — NOT "can encode nothing". Fall back to the
+    // permissive software assumption so a vp9-only client still gets vp9, etc.
+    if encodable.is_empty() {
+        ServerCodecSupport::default()
+    } else {
+        ServerCodecSupport { encodable }
+    }
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1954,7 +2002,14 @@ async fn playback_info(
         query_param(req.query_string(), "SubtitleStreamIndex")
             .and_then(|v| v.trim().parse::<i64>().ok())
             .or(body_subtitle_index);
-    let decision = negotiate(&profile, &source);
+    // Capability-aware negotiation: the transcode target is the best codec in
+    // (client-decodable ∩ server-encodable), hardware-preferred — so Firefox
+    // lands on hardware h264 (or a hardware VP9 where the GPU supports it)
+    // instead of a forced software VP9 encode. Built from the boot-resolved
+    // server encode capabilities (empty in tests → h264 fallback, matching the
+    // old hardcode).
+    let server_codecs = server_codec_support(&state.encode_capabilities);
+    let decision = negotiate(&profile, &source, &server_codecs);
     // Connection-aware transcode ceiling (Lace incident, 2026-07-16). A remote
     // client on jellyfin-web's "Auto" quality advertises an effectively-
     // unlimited MaxStreamingBitrate, so `negotiate` leaves the transcode

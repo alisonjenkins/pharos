@@ -355,7 +355,11 @@ fn compare_string(op: &str, source: Option<&str>, target: Option<&str>) -> bool 
 /// Pick the right action given the source + a client profile. Caller
 /// is expected to use `DeviceProfile::default()` when the client
 /// didn't send a body (matches Jellyfin's permissive default).
-pub fn negotiate(profile: &DeviceProfile, source: &SourceMedia) -> Decision {
+pub fn negotiate(
+    profile: &DeviceProfile,
+    source: &SourceMedia,
+    server: &ServerCodecSupport,
+) -> Decision {
     let want_kind = if source.is_video { "Video" } else { "Audio" };
 
     let bitrate_cap = profile.max_streaming_bitrate.or(profile.max_static_bitrate);
@@ -443,12 +447,11 @@ pub fn negotiate(profile: &DeviceProfile, source: &SourceMedia) -> Decision {
         return Decision::Transcode {
             target_container: pick_first_csv(&tp.container)
                 .unwrap_or_else(|| default_container(source.is_video).into()),
-            // B59 — prefer h264 (shareable + universally decodable) over the
-            // client's first-listed codec for VIDEO, so a SyncPlay group whose
-            // browsers each list a different first codec still converges on one
-            // shared encode. Audio keeps first-listed.
+            // Capability-aware: best codec in (client-decodable ∩
+            // server-encodable), hardware-preferred, h264 tiebreak for B59
+            // SyncPlay convergence. Audio keeps first-listed.
             target_video_codec: if source.is_video {
-                pick_preferred_video_codec(&tp.video_codec)
+                pick_transcode_video_codec(&tp.video_codec, server)
             } else {
                 pick_first_csv(&tp.video_codec)
             },
@@ -462,7 +465,8 @@ pub fn negotiate(profile: &DeviceProfile, source: &SourceMedia) -> Decision {
     // built-in browser profile applies.
     Decision::Transcode {
         target_container: default_container(source.is_video).into(),
-        target_video_codec: source.is_video.then(|| "h264".to_string()),
+        // No client profile → pick the server's safe target (h264 if encodable).
+        target_video_codec: source.is_video.then(|| server.fallback_target()),
         target_audio_codec: Some(if source.is_video {
             "aac".into()
         } else {
@@ -513,29 +517,127 @@ fn pick_first_csv(csv: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Pick the transcode VIDEO codec from a client's CSV list, PREFERRING H.264
-/// when the client offers it (B59). H.264 is the universally-decodable,
-/// hardware-friendly target AND — crucially for SyncPlay — the SHAREABLE one:
-/// every group member transcoding to h264 hits ONE cached encode, keyed by
-/// `(media, seg, audio, sub, bitrate, codec)`. Honouring the client's
-/// first-listed codec instead (e.g. a browser that lists `vp9,h264`) split a
-/// group across two encodes — one member cold-transcoding VP9 (slow, software)
-/// while the rest shared a warm h264 stream, so the VP9 member stalled and
-/// never joined the shared playback. A client that offers NO h264 (a VP9/AV1-
-/// only profile) still gets its first codec. The Linux-Firefox-can't-decode-
-/// h264 case is forced to VP9 downstream (playback_info `force_webm`), which
-/// overrides this — so a browser that genuinely needs VP9 still gets it.
-fn pick_preferred_video_codec(csv: &str) -> Option<String> {
-    let codecs: Vec<&str> = csv
+/// What the SERVER can encode, as the negotiator sees it. A plain DTO in this
+/// leaf crate (no dependency on `pharos-transcode`); the server converts its
+/// `ServerEncodeCapabilities` into this. Codec names are canonical lowercase
+/// (`h264`, `h265`, `vp9`, `av1`).
+#[derive(Debug, Clone)]
+pub struct CodecCap {
+    pub name: String,
+    /// Hardware-accelerated on this server.
+    pub hw: bool,
+    /// Rough encode cost, lower = cheaper (0 hw … 3 glacial software AV1).
+    pub cost: u8,
+}
+
+/// The set of video codecs THIS server can encode. See [`negotiate`].
+#[derive(Debug, Clone)]
+pub struct ServerCodecSupport {
+    pub encodable: Vec<CodecCap>,
+}
+
+impl Default for ServerCodecSupport {
+    /// Permissive: assume software h264/h265/vp9/av1 (what a full ffmpeg build
+    /// provides). Used by tests and as a safe fallback; production builds the
+    /// real value from the server's probed capabilities.
+    fn default() -> Self {
+        Self {
+            encodable: vec![
+                CodecCap {
+                    name: "h264".into(),
+                    hw: false,
+                    cost: 1,
+                },
+                CodecCap {
+                    name: "h265".into(),
+                    hw: false,
+                    cost: 1,
+                },
+                CodecCap {
+                    name: "vp9".into(),
+                    hw: false,
+                    cost: 2,
+                },
+                CodecCap {
+                    name: "av1".into(),
+                    hw: false,
+                    cost: 3,
+                },
+            ],
+        }
+    }
+}
+
+impl ServerCodecSupport {
+    fn find(&self, canon: &str) -> Option<&CodecCap> {
+        self.encodable.iter().find(|c| c.name == canon)
+    }
+
+    /// The safe target when the client offers nothing this server can encode:
+    /// h264 if available, else the cheapest encodable codec, else `h264`.
+    fn fallback_target(&self) -> String {
+        if self.find("h264").is_some() {
+            return "h264".into();
+        }
+        self.encodable
+            .iter()
+            .min_by(|a, b| a.cost.cmp(&b.cost).then(a.name.cmp(&b.name)))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "h264".into())
+    }
+}
+
+/// Canonicalise a client codec token to the negotiator's codec name, or `None`
+/// for a codec pharos never targets.
+fn canon_video_codec(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "avc1" => Some("h264"),
+        "h265" | "hevc" | "hvc1" => Some("h265"),
+        "vp9" | "vp09" => Some("vp9"),
+        "av1" | "av01" => Some("av1"),
+        _ => None,
+    }
+}
+
+/// Pick the transcode VIDEO codec as the best codec in
+/// *(client-decodable ∩ server-encodable)*, preferring HARDWARE, then lower
+/// cost, with an H.264 tiebreak.
+///
+/// The h264 tiebreak keeps B59 SyncPlay convergence: a group whose browsers
+/// list different first codecs (`vp9,h264` vs `h264,vp9`) still lands on ONE
+/// shared cached encode, keyed by `(media, seg, audio, sub, bitrate, codec)`.
+/// Replaces the old h264-hardcode: on a box with a hardware VP9 encoder and a
+/// vp9-only client this now targets VP9 hardware instead of silently forcing a
+/// software encode, and on a plain NVENC box a `vp9,h264` client targets the
+/// hardware h264 rung instead of software VP9. Falls back to the server's safe
+/// target when the client offers nothing this server can encode.
+fn pick_transcode_video_codec(client_csv: &str, server: &ServerCodecSupport) -> Option<String> {
+    let mut cands: Vec<(usize, &CodecCap)> = Vec::new();
+    for (i, tok) in client_csv
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect();
-    codecs
-        .iter()
-        .find(|c| c.eq_ignore_ascii_case("h264"))
-        .or_else(|| codecs.first())
-        .map(|s| (*s).to_string())
+        .enumerate()
+    {
+        if let Some(canon) = canon_video_codec(tok) {
+            if let Some(cap) = server.find(canon) {
+                if !cands.iter().any(|(_, c)| c.name == cap.name) {
+                    cands.push((i, cap));
+                }
+            }
+        }
+    }
+    if cands.is_empty() {
+        return Some(server.fallback_target());
+    }
+    cands.sort_by(|(ai, a), (bi, b)| {
+        // Hardware first, then cheaper, then h264 wins ties, then client order.
+        b.hw.cmp(&a.hw)
+            .then(a.cost.cmp(&b.cost))
+            .then((b.name == "h264").cmp(&(a.name == "h264")))
+            .then(ai.cmp(bi))
+    });
+    Some(cands[0].1.name.clone())
 }
 
 #[cfg(test)]
@@ -645,7 +747,11 @@ mod tests {
 
     #[test]
     fn empty_profile_falls_through_to_default_transcode() {
-        let d = negotiate(&DeviceProfile::default(), &webm_vp9_opus_source());
+        let d = negotiate(
+            &DeviceProfile::default(),
+            &webm_vp9_opus_source(),
+            &ServerCodecSupport::default(),
+        );
         match d {
             Decision::Transcode {
                 target_container,
@@ -662,27 +768,96 @@ mod tests {
     }
 
     #[test]
-    fn prefers_h264_over_first_listed_video_codec() {
-        // B59 — the pure picker: h264 wins whenever offered, whatever its slot.
+    fn transcode_codec_hardware_then_cost_then_h264_tiebreak() {
+        // Software-only box (permissive default): h264/h265 cheap, vp9 costlier,
+        // av1 costliest.
+        let sw = ServerCodecSupport::default();
+        // h264 wins over vp9 (cheaper + B59 tiebreak), whatever the slot.
         assert_eq!(
-            pick_preferred_video_codec("vp9,h264").as_deref(),
+            pick_transcode_video_codec("vp9,h264", &sw).as_deref(),
             Some("h264")
         );
         assert_eq!(
-            pick_preferred_video_codec("h264,vp9").as_deref(),
+            pick_transcode_video_codec("h264,vp9", &sw).as_deref(),
             Some("h264")
         );
-        // Case-insensitive match.
+        // Canonical lowercase output, case-insensitive input.
         assert_eq!(
-            pick_preferred_video_codec("VP9, H264").as_deref(),
-            Some("H264")
+            pick_transcode_video_codec("VP9, H264", &sw).as_deref(),
+            Some("h264")
         );
-        // No h264 offered → first listed stands (a VP9/AV1-only browser).
+        // No h264: the CHEAPER software codec wins (vp9 < av1), not client-order
+        // — software AV1 is glacial and would stall live playback.
         assert_eq!(
-            pick_preferred_video_codec("av1,vp9").as_deref(),
-            Some("av1")
+            pick_transcode_video_codec("av1,vp9", &sw).as_deref(),
+            Some("vp9")
         );
-        assert_eq!(pick_preferred_video_codec("vp9").as_deref(), Some("vp9"));
+        assert_eq!(
+            pick_transcode_video_codec("vp9", &sw).as_deref(),
+            Some("vp9")
+        );
+        // Client offers only a codec this server can't encode → safe h264 fallback.
+        assert_eq!(
+            pick_transcode_video_codec("theora", &sw).as_deref(),
+            Some("h264")
+        );
+    }
+
+    #[test]
+    fn transcode_codec_is_capability_aware() {
+        // A box with hardware VP9 but only software h264 targets VP9 for a
+        // vp9,h264 client (hardware beats the h264 cost/tiebreak).
+        let hw_vp9 = ServerCodecSupport {
+            encodable: vec![
+                CodecCap {
+                    name: "h264".into(),
+                    hw: false,
+                    cost: 1,
+                },
+                CodecCap {
+                    name: "vp9".into(),
+                    hw: true,
+                    cost: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            pick_transcode_video_codec("vp9,h264", &hw_vp9).as_deref(),
+            Some("vp9")
+        );
+        // The NVENC + Firefox case: hardware h264 + software vp9 → h264, so
+        // Firefox gets the fast hardware rung instead of a software VP9 encode.
+        let hw_h264 = ServerCodecSupport {
+            encodable: vec![
+                CodecCap {
+                    name: "h264".into(),
+                    hw: true,
+                    cost: 0,
+                },
+                CodecCap {
+                    name: "vp9".into(),
+                    hw: false,
+                    cost: 2,
+                },
+            ],
+        };
+        assert_eq!(
+            pick_transcode_video_codec("vp9,h264", &hw_h264).as_deref(),
+            Some("h264")
+        );
+        // A vp9-only server can't give an h264-only client h264 → fallback to
+        // the one thing it CAN encode.
+        let vp9_only = ServerCodecSupport {
+            encodable: vec![CodecCap {
+                name: "vp9".into(),
+                hw: true,
+                cost: 0,
+            }],
+        };
+        assert_eq!(
+            pick_transcode_video_codec("h264", &vp9_only).as_deref(),
+            Some("vp9")
+        );
     }
 
     #[test]
@@ -703,7 +878,7 @@ mod tests {
             transcoding_profiles: vec![tp("ts", "vp9,h264", "aac", "Video")],
             ..Default::default()
         };
-        match negotiate(&profile, &source) {
+        match negotiate(&profile, &source, &ServerCodecSupport::default()) {
             Decision::Transcode {
                 target_video_codec, ..
             } => assert_eq!(target_video_codec.as_deref(), Some("h264")),
@@ -718,7 +893,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            negotiate(&profile, &webm_vp9_opus_source()),
+            negotiate(
+                &profile,
+                &webm_vp9_opus_source(),
+                &ServerCodecSupport::default()
+            ),
             Decision::DirectPlay,
         );
     }
@@ -730,7 +909,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            negotiate(&profile, &webm_vp9_opus_source()),
+            negotiate(
+                &profile,
+                &webm_vp9_opus_source(),
+                &ServerCodecSupport::default()
+            ),
             Decision::DirectPlay,
         );
     }
@@ -742,7 +925,11 @@ mod tests {
             transcoding_profiles: vec![tp("ts", "h264", "aac", "Video")],
             ..Default::default()
         };
-        match negotiate(&profile, &webm_vp9_opus_source()) {
+        match negotiate(
+            &profile,
+            &webm_vp9_opus_source(),
+            &ServerCodecSupport::default(),
+        ) {
             Decision::AudioRemux { target_audio_codec } => assert_eq!(target_audio_codec, "aac"),
             other => panic!("expected AudioRemux, got {other:?}"),
         }
@@ -755,7 +942,11 @@ mod tests {
             transcoding_profiles: vec![tp("mp4", "h264", "aac", "Video")],
             ..Default::default()
         };
-        match negotiate(&profile, &webm_vp9_opus_source()) {
+        match negotiate(
+            &profile,
+            &webm_vp9_opus_source(),
+            &ServerCodecSupport::default(),
+        ) {
             Decision::Transcode {
                 target_container,
                 target_video_codec,
@@ -779,7 +970,7 @@ mod tests {
             ..Default::default()
         };
         let source = webm_vp9_opus_source();
-        let d = negotiate(&profile, &source);
+        let d = negotiate(&profile, &source, &ServerCodecSupport::default());
         assert!(!d.is_direct(), "expected non-direct, got {d:?}");
         if let Decision::Transcode {
             max_video_bitrate_bps,
@@ -809,7 +1000,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(negotiate(&profile, &source), Decision::DirectPlay);
+        assert_eq!(
+            negotiate(&profile, &source, &ServerCodecSupport::default()),
+            Decision::DirectPlay
+        );
     }
 
     #[test]
@@ -830,7 +1024,10 @@ mod tests {
             is_video: true,
             ..Default::default()
         };
-        assert_eq!(negotiate(&profile, &source), Decision::DirectPlay);
+        assert_eq!(
+            negotiate(&profile, &source, &ServerCodecSupport::default()),
+            Decision::DirectPlay
+        );
     }
 
     #[test]
@@ -940,7 +1137,11 @@ mod tests {
         // TCL-style TV that CAN decode HEVC → direct play, no transcode.
         let profile = hevc_8bit_only_tv_profile();
         assert_eq!(
-            negotiate(&profile, &hevc_8bit_source()),
+            negotiate(
+                &profile,
+                &hevc_8bit_source(),
+                &ServerCodecSupport::default()
+            ),
             Decision::DirectPlay,
             "8-bit HEVC on an HEVC-capable TV must direct-play"
         );
@@ -952,7 +1153,11 @@ mod tests {
         // must NOT direct-play (it would decode garbage / hard-fail). The
         // VideoBitDepth<=8 CodecProfile condition forces a transcode.
         let profile = hevc_8bit_only_tv_profile();
-        match negotiate(&profile, &hevc_10bit_source()) {
+        match negotiate(
+            &profile,
+            &hevc_10bit_source(),
+            &ServerCodecSupport::default(),
+        ) {
             Decision::Transcode { .. } => {}
             other => panic!("10-bit on 8-bit device must transcode, got {other:?}"),
         }
@@ -973,7 +1178,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        match negotiate(&profile, &hevc_8bit_source()) {
+        match negotiate(
+            &profile,
+            &hevc_8bit_source(),
+            &ServerCodecSupport::default(),
+        ) {
             Decision::Transcode {
                 target_video_codec, ..
             } => assert_eq!(target_video_codec.as_deref(), Some("h264")),
@@ -997,7 +1206,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        match negotiate(&profile, &hevc_8bit_source()) {
+        match negotiate(
+            &profile,
+            &hevc_8bit_source(),
+            &ServerCodecSupport::default(),
+        ) {
             Decision::Transcode {
                 max_video_bitrate_bps,
                 ..

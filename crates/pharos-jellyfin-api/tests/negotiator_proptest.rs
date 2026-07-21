@@ -19,7 +19,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pharos_jellyfin_api::device_profile::{
-    negotiate, Decision, DeviceProfile, DirectPlayProfile, SourceMedia, TranscodingProfile,
+    negotiate, Decision, DeviceProfile, DirectPlayProfile, ServerCodecSupport, SourceMedia,
+    TranscodingProfile,
 };
 use proptest::prelude::*;
 
@@ -117,7 +118,7 @@ proptest! {
     /// All shapes must produce *some* Decision.
     #[test]
     fn negotiate_never_panics(profile in profile_strat(), source in source_strat()) {
-        let _ = negotiate(&profile, &source);
+        let _ = negotiate(&profile, &source, &ServerCodecSupport::default());
     }
 
     /// Invariant 2: when DirectPlay is selected, at least one
@@ -125,7 +126,7 @@ proptest! {
     /// CSV) and codec set.
     #[test]
     fn direct_play_matches_a_profile(profile in profile_strat(), source in source_strat()) {
-        if let Decision::DirectPlay = negotiate(&profile, &source) {
+        if let Decision::DirectPlay = negotiate(&profile, &source, &ServerCodecSupport::default()) {
             let any_match = profile.direct_play_profiles.iter().any(|p| {
                 let containers: Vec<&str> = p.container.split(',').map(str::trim).collect();
                 containers.iter().any(|c| c.eq_ignore_ascii_case(&source.container))
@@ -141,7 +142,7 @@ proptest! {
         let cap = profile.max_streaming_bitrate.or(profile.max_static_bitrate);
         if let (Some(cap), Some(br)) = (cap, source.bitrate_bps) {
             if br > cap {
-                let d = negotiate(&profile, &source);
+                let d = negotiate(&profile, &source, &ServerCodecSupport::default());
                 prop_assert!(!matches!(d, Decision::DirectPlay), "DirectPlay over bitrate: {d:?}");
             }
         }
@@ -173,7 +174,7 @@ proptest! {
             is_video: true,
             ..Default::default()
         };
-        let d = negotiate(&profile, &source);
+        let d = negotiate(&profile, &source, &ServerCodecSupport::default());
         prop_assert!(matches!(d, Decision::DirectPlay), "silent video must direct-play: {d:?}");
     }
 
@@ -202,7 +203,7 @@ proptest! {
             is_video: true,
             ..Default::default()
         };
-        let d = negotiate(&profile, &source);
+        let d = negotiate(&profile, &source, &ServerCodecSupport::default());
         prop_assert!(matches!(d, Decision::DirectPlay), "case mismatch broke direct play: {d:?}");
     }
 }

@@ -12,7 +12,9 @@ use pharos_core::{
 use pharos_server::{
     api::jellyfin::{
         self,
-        device_profile::{negotiate, Decision, DeviceProfile, DirectPlayProfile, SourceMedia},
+        device_profile::{
+            negotiate, Decision, DeviceProfile, DirectPlayProfile, ServerCodecSupport, SourceMedia,
+        },
     },
     auth::BuiltinAuth,
     middleware::LowercasePath,
@@ -45,7 +47,11 @@ fn mkv_h264_aac_against_mp4_profile_remuxes_container_only() {
         is_video: true,
         ..Default::default()
     };
-    let decision = negotiate(&mp4_h264_aac_profile(), &source);
+    let decision = negotiate(
+        &mp4_h264_aac_profile(),
+        &source,
+        &ServerCodecSupport::default(),
+    );
     match decision {
         Decision::VideoRemux {
             target_container,
@@ -69,7 +75,11 @@ fn mkv_h264_ac3_against_mp4_profile_remuxes_with_audio_aac_target() {
         is_video: true,
         ..Default::default()
     };
-    let decision = negotiate(&mp4_h264_aac_profile(), &source);
+    let decision = negotiate(
+        &mp4_h264_aac_profile(),
+        &source,
+        &ServerCodecSupport::default(),
+    );
     match decision {
         Decision::VideoRemux {
             target_container,
@@ -94,7 +104,11 @@ fn mkv_vp9_against_mp4_h264_profile_does_not_remux() {
         is_video: true,
         ..Default::default()
     };
-    let decision = negotiate(&mp4_h264_aac_profile(), &source);
+    let decision = negotiate(
+        &mp4_h264_aac_profile(),
+        &source,
+        &ServerCodecSupport::default(),
+    );
     assert!(
         matches!(decision, Decision::Transcode { .. }),
         "{decision:?}"
@@ -113,7 +127,11 @@ fn matching_container_still_takes_direct_play_or_audio_remux_path() {
         is_video: true,
         ..Default::default()
     };
-    let decision = negotiate(&mp4_h264_aac_profile(), &source);
+    let decision = negotiate(
+        &mp4_h264_aac_profile(),
+        &source,
+        &ServerCodecSupport::default(),
+    );
     assert!(matches!(decision, Decision::DirectPlay), "{decision:?}");
 }
 
