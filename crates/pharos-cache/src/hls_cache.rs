@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use pharos_transcode::{FfmpegTranscoder, SegmentOpts, SegmentVideo, TranscodeOptions};
 use tokio::io::AsyncReadExt;
@@ -272,6 +273,11 @@ impl HlsSegmentCache {
     /// V30 — this is the ONLY segment-mint entry point, and it accepts only
     /// [`SegmentOpts`]: a stream-copied or progressive-container segment is
     /// a compile error, not a code-review catch.
+    #[tracing::instrument(
+        name = "segment_cache",
+        skip_all,
+        fields(media.id = media_id, seg = seg_index)
+    )]
     pub async fn segment_bytes_keyed(
         &self,
         media_id: u64,
@@ -313,7 +319,20 @@ impl HlsSegmentCache {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _guard = lock.lock().await;
+        // Time the single-flight wait separately from the transcode. A high
+        // lock_wait_ms means a concurrent request for the SAME key (variant +
+        // burn + audio tuple) is already transcoding this segment and we are
+        // queued behind it — invisible in transcode_ms, and a real contributor
+        // to the client-visible segment latency ramp under prefetch / ABR.
+        let lock_wait_ms = {
+            let waited = std::time::Instant::now();
+            let g = lock
+                .lock()
+                .instrument(tracing::info_span!("segment_fetch_lock_wait"))
+                .await;
+            (g, waited.elapsed().as_millis() as u64)
+        };
+        let (_guard, lock_wait_ms) = lock_wait_ms;
 
         // Re-check: another task may have populated while we waited.
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -337,6 +356,7 @@ impl HlsSegmentCache {
         let started = std::time::Instant::now();
         let timing = match self
             .write_segment(source, &opts.to_transcode_options(), &tmp)
+            .instrument(tracing::info_span!("write_segment"))
             .await
         {
             Ok(t) => t,
@@ -361,6 +381,7 @@ impl HlsSegmentCache {
             media.id = media_id,
             seg = seg_index,
             transcode_ms = transcode_ms as u64,
+            lock_wait_ms,
             queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
             encode_ms = timing.as_ref().map(|t| t.encode_ms),
             device = timing.as_ref().map(|t| t.device.to_string()),

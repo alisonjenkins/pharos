@@ -1267,6 +1267,11 @@ const BURN_GATE_PAD_MS: u64 = 500;
 /// burn (`EventWindows::Unknown`), so gating can only ever REMOVE
 /// provably-empty burns, never lose a visible subtitle. The first ask
 /// kicks off the once-ever background scan (persisted per file+mtime+track).
+#[tracing::instrument(
+    name = "gate_image_sub_burn",
+    skip_all,
+    fields(media.id = %item.id, burn_idx = opts.burn_subtitle_stream_index)
+)]
 async fn gate_image_sub_burn(
     state: &AppState,
     item: &pharos_core::MediaItem,
@@ -1327,6 +1332,11 @@ async fn gate_image_sub_burn(
 /// paths are deterministic per (item, sub) and NOT part of the segment cache
 /// key, so a prefetch/live pair that resolve differently still share a key and
 /// produce identical output — only encode cost differs.
+#[tracing::instrument(
+    name = "resolve_text_burn_assets",
+    skip_all,
+    fields(media.id = %item.id, burn_idx = opts.burn_subtitle_stream_index)
+)]
 async fn resolve_text_burn_assets(
     state: &AppState,
     item: &pharos_core::MediaItem,
