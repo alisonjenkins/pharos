@@ -763,58 +763,48 @@ async fn serve_from_offset(
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("stat: {e}")))?;
     let total = meta.len();
-    if offset >= total {
+    // A past-EOF offset is unrepresentable as a `ContentRange` → 416. This is
+    // the SAME constructor that fixes the B94 `bytes=0-` → 200 case: `status()`
+    // is hard-wired to 206, so this response can never regress to a 200 the
+    // browser reads as "ranges unsupported".
+    let Some(range) = super::seek::ContentRange::from_offset(offset, total) else {
         return Err(error::ErrorRangeNotSatisfiable("StartTimeTicks past EOF"));
-    }
+    };
     file.seek(SeekFrom::Start(offset))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("seek: {e}")))?;
 
-    let remaining = total - offset;
-    // Pre-buffer in memory for small files; stream chunks otherwise.
-    // 16 MiB threshold keeps RSS bounded while letting tests verify
-    // first-byte content cheaply.
-    let body = if remaining <= 16 * 1024 * 1024 {
+    let remaining = range.content_length();
+    // Same `DeliveryMime` as the plain open + HEAD, so a mkv/VP9 seek is not
+    // served the `video/x-matroska` Firefox rejects.
+    let mime = super::seek::DeliveryMime::for_source(item).header();
+    let mut resp_builder = HttpResponse::build(range.status());
+    resp_builder
+        .insert_header((header::CONTENT_TYPE, mime))
+        .insert_header((header::CONTENT_RANGE, range.header_value()))
+        .insert_header((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")));
+    if let Some(lm) = last_modified_from_meta(meta_for_lm.as_ref()) {
+        resp_builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
+    }
+    // Both branches carry a DECLARED length: a 206 must never fall back to
+    // chunked framing (strict clients refuse to seek a length-less partial
+    // body — the old code stripped Content-Length for every seek >16 MiB, i.e.
+    // almost all of them). Small files buffer to a sized `Vec`; large ones use
+    // a `SizedStream` so actix emits `Content-Length: {remaining}` and streams
+    // without buffering the whole tail into RSS.
+    let resp = if remaining <= 16 * 1024 * 1024 {
         let mut buf = Vec::with_capacity(remaining as usize);
         file.read_to_end(&mut buf)
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
-        actix_web::body::BoxBody::new(buf)
+        resp_builder.body(buf)
     } else {
         let stream = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024);
         let stream = futures_util::TryStreamExt::map_err(stream, |e| {
             actix_web::error::ErrorInternalServerError(format!("read: {e}"))
         });
-        actix_web::body::BoxBody::new(actix_web::body::BodyStream::new(stream))
+        resp_builder.body(actix_web::body::SizedStream::new(remaining, stream))
     };
-
-    let end = total - 1;
-    // Same `DeliveryMime` as the plain open + HEAD, so a mkv/VP9 seek is not
-    // served the `video/x-matroska` Firefox rejects.
-    let mime = super::seek::DeliveryMime::for_source(item).header();
-    let mut resp_builder = HttpResponse::build(StatusCode::PARTIAL_CONTENT);
-    resp_builder
-        .insert_header((header::CONTENT_TYPE, mime))
-        .insert_header((
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes {offset}-{end}/{total}"))
-                .map_err(error::ErrorInternalServerError)?,
-        ))
-        .insert_header((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")))
-        .insert_header((
-            header::CONTENT_LENGTH,
-            HeaderValue::from_str(&remaining.to_string())
-                .map_err(error::ErrorInternalServerError)?,
-        ));
-    if let Some(lm) = last_modified_from_meta(meta_for_lm.as_ref()) {
-        resp_builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
-    }
-    let mut resp = resp_builder.body(body);
-    // Strip Content-Length on streaming bodies — actix sets
-    // transfer-encoding: chunked for those automatically.
-    if remaining > 16 * 1024 * 1024 {
-        resp.headers_mut().remove(header::CONTENT_LENGTH);
-    }
     Ok(meter_body(resp, clock))
 }
 
