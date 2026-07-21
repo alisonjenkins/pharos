@@ -132,7 +132,19 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
+            {{- if .Values.gpu.nvidia.enabled }}
+            # NVENC: request nvidia.com/gpu so the device plugin schedules this
+            # pod onto the GPU node and injects the driver/NVENC libs. Merged
+            # into a deep copy of resources.limits so the configured cpu/memory
+            # caps are preserved.
+            {{- $res := deepCopy .Values.resources }}
+            {{- $limits := default dict $res.limits }}
+            {{- $_ := set $limits "nvidia.com/gpu" .Values.gpu.nvidia.count }}
+            {{- $_ := set $res "limits" $limits }}
+            {{- toYaml $res | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/pharos
