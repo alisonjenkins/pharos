@@ -881,13 +881,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_target_when_no_device() {
-        // A table with only HW devices and an opts that no HW supports
-        // still has CPU (always present) — so to force Unsupported we
-        // build a table whose only slot is in permanent cooldown? Simpler:
-        // CPU always supports, so Unsupported only happens if eligible is
-        // empty. With Vp9 → CPU still supports. There is no real
-        // "unsupported" with CPU present; assert Vp9 lands on CPU instead.
+    async fn vp9_lands_on_vaapi_hardware() {
+        // VAAPI has a VP9 encoder (`vp9_vaapi`); the scheduler routes a VP9 job
+        // to it (hardware) rather than the CPU. NVENC has no VP9 encoder so it is
+        // never eligible for a VP9 target.
         let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
             out_bytes: 1,
         });
@@ -898,7 +895,7 @@ mod tests {
             .submit(PathBuf::from("/m/x"), o, file_sink())
             .await
             .unwrap();
-        assert_eq!(done.device, DeviceId::Cpu);
+        assert_eq!(done.device, DeviceId::hw(HwAccel::Vaapi, 0));
     }
 
     #[tokio::test]
