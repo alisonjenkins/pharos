@@ -612,6 +612,18 @@ fn canon_video_codec(name: &str) -> Option<&'static str> {
 /// hardware h264 rung instead of software VP9. Falls back to the server's safe
 /// target when the client offers nothing this server can encode.
 fn pick_transcode_video_codec(client_csv: &str, server: &ServerCodecSupport) -> Option<String> {
+    rank_transcode_video_codecs(client_csv, server)
+        .into_iter()
+        .next()
+        .or_else(|| Some(server.fallback_target()))
+}
+
+/// The client-decodable ∩ server-encodable video codecs, ranked best-first
+/// (hardware, then cheaper, then h264 tiebreak, then client order), canonical
+/// names. Empty when the client offers nothing this server can encode. This is
+/// the rendition SET for the unified multi-codec HLS master: the client's own
+/// `isTypeSupported` makes the final pick among the advertised rungs.
+pub fn rank_transcode_video_codecs(client_csv: &str, server: &ServerCodecSupport) -> Vec<String> {
     let mut cands: Vec<(usize, &CodecCap)> = Vec::new();
     for (i, tok) in client_csv
         .split(',')
@@ -627,9 +639,6 @@ fn pick_transcode_video_codec(client_csv: &str, server: &ServerCodecSupport) -> 
             }
         }
     }
-    if cands.is_empty() {
-        return Some(server.fallback_target());
-    }
     cands.sort_by(|(ai, a), (bi, b)| {
         // Hardware first, then cheaper, then h264 wins ties, then client order.
         b.hw.cmp(&a.hw)
@@ -637,7 +646,7 @@ fn pick_transcode_video_codec(client_csv: &str, server: &ServerCodecSupport) -> 
             .then((b.name == "h264").cmp(&(a.name == "h264")))
             .then(ai.cmp(bi))
     });
-    Some(cands[0].1.name.clone())
+    cands.into_iter().map(|(_, c)| c.name.clone()).collect()
 }
 
 #[cfg(test)]

@@ -789,7 +789,6 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         web: cfg.server.ui_dir.clone(),
     });
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
-    state = state.with_linux_firefox_h264(cfg.server.linux_firefox_h264);
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);

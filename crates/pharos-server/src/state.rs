@@ -208,9 +208,6 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
-    /// B60 — when true, desktop Linux Firefox is served H.264 (shared encode)
-    /// instead of the forced VP9/WebM path. Config `[server].linux_firefox_h264`.
-    pub linux_firefox_h264: bool,
     /// Connection-aware default transcode ceiling (bps) for REMOTE clients.
     /// jellyfin-web's "Auto" quality advertises an effectively-unlimited
     /// MaxStreamingBitrate, so a remote (WAN) transcode otherwise targets the
@@ -521,7 +518,6 @@ impl AppState {
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
-            linux_firefox_h264: false,
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
@@ -601,7 +597,6 @@ impl AppState {
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             played_threshold_pct: 90,
-            linux_firefox_h264: false,
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
@@ -625,11 +620,6 @@ impl AppState {
     /// clamping to `[50, 100]` so a misconfigured 0 doesn't
     /// flip every play to played=true and a 250 doesn't make
     /// played unreachable.
-    pub fn with_linux_firefox_h264(mut self, on: bool) -> Self {
-        self.linux_firefox_h264 = on;
-        self
-    }
-
     /// Attach the resolved server encode capabilities (built at boot from the
     /// trial-confirmed hardware families + this ffmpeg build's software
     /// encoders). The negotiator reads it to pick a hardware-encodable target.

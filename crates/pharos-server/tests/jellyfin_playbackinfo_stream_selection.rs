@@ -129,8 +129,8 @@ async fn audio_stream_index_in_body_reaches_transcoding_url() {
 
     let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
     assert!(
-        url.contains("/vp9/master.m3u8"),
-        "expected the Firefox VP9 transcode surface, got {url:?}"
+        url.contains("/master.m3u8") && url.contains("renditions="),
+        "expected the unified transcode master, got {url:?}"
     );
     assert!(
         url.contains("AudioStreamIndex=3"),
@@ -178,8 +178,8 @@ async fn text_subtitle_index_is_not_baked_into_transcoding_url() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        url.contains("/vp9/master.m3u8"),
-        "expected the Firefox VP9 transcode surface, got {url:?}"
+        url.contains("/master.m3u8") && url.contains("renditions="),
+        "expected the unified transcode master, got {url:?}"
     );
     assert!(
         !url.contains("SubtitleStreamIndex"),
@@ -385,37 +385,6 @@ async fn h264_capable_client_with_default_image_sub_still_downgrades_to_transcod
     assert!(
         url.contains("SubtitleStreamIndex=5"),
         "the forced default PGS index must ride the transcode URL: {url:?}"
-    );
-}
-
-#[actix_web::test]
-async fn linux_firefox_still_forced_onto_vp9() {
-    let (state, token) = seed().await;
-    let app = test::init_service(
-        App::new()
-            .app_data(state)
-            .wrap(LowercasePath)
-            .configure(jellyfin::configure),
-    )
-    .await;
-    let raw = test::call_and_read_body(
-        &app,
-        test::TestRequest::post()
-            .uri("/Items/1/PlaybackInfo")
-            .insert_header(("X-Emby-Token", token.as_str()))
-            .insert_header(("User-Agent", UA_FIREFOX))
-            .insert_header(("content-type", "application/json"))
-            .set_payload(PROFILE_FIREFOX_BOTH)
-            .to_request(),
-    )
-    .await;
-    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    let url = v["MediaSources"][0]["TranscodingUrl"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        url.contains("/vp9/master.m3u8"),
-        "desktop-Linux Firefox keeps the VP9 force (its canPlayType lies): {url:?}"
     );
 }
 
