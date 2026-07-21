@@ -12,6 +12,7 @@ pub mod items;
 pub mod live_tv;
 pub mod playlists;
 pub mod search;
+pub mod seek;
 pub mod sessions;
 pub mod socket;
 pub mod stream;
