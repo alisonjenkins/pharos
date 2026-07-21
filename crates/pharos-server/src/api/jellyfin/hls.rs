@@ -1857,14 +1857,10 @@ fn segment_prefetch_ahead() -> u32 {
 /// together (measured: a constant −preskip offset, zero accumulation).
 /// Falls back to the nominal grid when fps is unknown.
 fn segment_start_secs(seg: u32, fps_mille: Option<u32>) -> f64 {
-    let nominal = seg as f64 * SEGMENT_SECONDS;
-    match fps_mille {
-        Some(m) if m > 0 => {
-            let fps = m as f64 / 1000.0;
-            (nominal * fps).round() / fps
-        }
-        _ => nominal,
-    }
+    // ONE canonical frame-snap definition, shared with `seek::SegmentGrid` so
+    // the playlist EXTINF, each segment's `-ss`, the audio anchor and the
+    // SyncPlay prewarm provably read the same grid.
+    super::seek::frame_snapped_start(seg, fps_mille)
 }
 
 /// The `(start, duration)` of segment `seg` in seconds, both frame-aligned so

@@ -227,6 +227,23 @@ impl ResyncWitness {
 
 // ──────────────────────────── SegmentGrid ──────────────────────────────────
 
+/// Frame-snapped start time (seconds) of segment `seg`: nominal `seg*6` rounded
+/// to the nearest source-frame boundary. The SINGLE definition of the segment
+/// seek grid on the server — [`SegmentGrid`] and the HLS/VP9 segment handlers
+/// all snap to this, so the video segments, the audio-rendition anchor and the
+/// SyncPlay prewarm cannot compute independent grids that drift apart. Falls
+/// back to the nominal grid when fps is unknown.
+pub fn frame_snapped_start(seg: u32, fps_mille: Option<u32>) -> f64 {
+    let nominal = seg as f64 * SEGMENT_SECONDS;
+    match fps_mille {
+        Some(m) if m > 0 => {
+            let fps = m as f64 / 1000.0;
+            (nominal * fps).round() / fps
+        }
+        _ => nominal,
+    }
+}
+
 /// A segment index PROVEN in `[0, count)` for a title. Constructible only via
 /// [`SegmentGrid::checked`] / [`SegmentGrid::resolve`], so an over-index request
 /// becomes a typed absence the handler turns into `404`/`416` — never the vp9
@@ -290,18 +307,8 @@ impl SegmentGrid {
     /// clamped by the remaining media. This is the single definition of a
     /// segment boundary; the audio rendition seeks to the same grid.
     pub fn frame_snapped_range(&self, idx: SegmentIndex) -> (f64, f64) {
-        let snap = |seg: u32| -> f64 {
-            let nominal = seg as f64 * SEGMENT_SECONDS;
-            match self.frame_rate_mille {
-                Some(m) if m > 0 => {
-                    let fps = m as f64 / 1000.0;
-                    (nominal * fps).round() / fps
-                }
-                _ => nominal,
-            }
-        };
-        let start = snap(idx.0);
-        let next = snap(idx.0 + 1);
+        let start = frame_snapped_start(idx.0, self.frame_rate_mille);
+        let next = frame_snapped_start(idx.0 + 1, self.frame_rate_mille);
         let remaining = (self.duration_secs - start).max(0.01);
         let dur = (next - start).min(remaining);
         (start, dur)
