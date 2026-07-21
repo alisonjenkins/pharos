@@ -446,7 +446,10 @@ async fn build_transcode_scheduler(
     detected: &[pharos_transcode::HwAccel],
     hw_session_cap: usize,
     probe_caps: bool,
-) -> Option<pharos_transcode::scheduler::TranscodeScheduler> {
+) -> Option<(
+    pharos_transcode::scheduler::TranscodeScheduler,
+    Vec<pharos_transcode::HwAccel>,
+)> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
     use pharos_transcode::probe::{probe_device_caps, ProbeConfig};
     use pharos_transcode::protocol::{DeviceId, WorkerId};
@@ -501,16 +504,31 @@ async fn build_transcode_scheduler(
             .map(|d| (d, hw_session_cap.max(1)))
             .collect()
     };
+    // The distinct hardware families that PASSED the trial encode — the
+    // authoritative "what can this box hardware-encode" set (phantom GPUs are
+    // already excluded from `caps`). Feeds ServerEncodeCapabilities so the
+    // negotiator can target a hardware codec.
+    let mut hw_families: Vec<pharos_transcode::HwAccel> = Vec::new();
+    for (d, _) in &caps {
+        if let DeviceId::Hw { accel, .. } = d {
+            if !hw_families.contains(accel) {
+                hw_families.push(*accel);
+            }
+        }
+    }
     let table = DeviceTable::from_probe(&caps, default_cpu_permits());
     tracing::info!(
         devices = caps.len(),
         cpu_permits = default_cpu_permits(),
         "transcode scheduler device table built"
     );
-    Some(TranscodeScheduler::spawn(
-        table,
-        std::sync::Arc::new(ProcSpawner::new()),
-        SchedConfig::default(),
+    Some((
+        TranscodeScheduler::spawn(
+            table,
+            std::sync::Arc::new(ProcSpawner::new()),
+            SchedConfig::default(),
+        ),
+        hw_families,
     ))
 }
 
@@ -589,7 +607,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // all-CPU, crash-isolated workers) once, shared by the HLS cache
     // (segment path) + the live/uncached path on AppState. Falls back to
     // inline ffmpeg when disabled or when the worker can't be brought up.
-    let transcode_scheduler = if cfg.server.transcode_hw_session_cap > 0 {
+    let (transcode_scheduler, confirmed_hw) = if cfg.server.transcode_hw_session_cap > 0 {
         match build_transcode_scheduler(
             &detected,
             cfg.server.transcode_hw_session_cap,
@@ -597,21 +615,34 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         )
         .await
         {
-            Some(sched) => {
+            Some((sched, hw)) => {
                 tracing::info!("transcode scheduler enabled (load-balanced workers)");
-                Some(sched)
+                (Some(sched), hw)
             }
             None => {
                 tracing::warn!("transcode worker unavailable; using the inline ffmpeg path");
-                None
+                (None, Vec::new())
             }
         }
     } else {
-        None
+        (None, Vec::new())
     };
     if let Some(sched) = transcode_scheduler.as_ref() {
         state = state.with_transcode_scheduler(sched.clone());
     }
+    // What THIS server can actually encode = trial-confirmed hardware families
+    // (empty when there's no usable GPU / the scheduler is off) + the software
+    // encoders in this ffmpeg build. The negotiator targets the best codec in
+    // (client-decodable ∩ server-encodable), hardware-preferred.
+    let encode_caps = pharos_transcode::ServerEncodeCapabilities::from_parts(
+        &confirmed_hw,
+        &pharos_transcode::capability::detect_encoders("ffmpeg").await,
+    );
+    tracing::info!(
+        video = ?encode_caps.video,
+        "server encode capabilities resolved"
+    );
+    state = state.with_encode_capabilities(std::sync::Arc::new(encode_caps));
     if let Some(cache_dir) = cfg.server.transcode_cache_dir.clone() {
         let mut hls = HlsSegmentCache::new(cache_dir, cfg.server.transcode_cache_max_bytes)
             .with_hwaccel(accel);

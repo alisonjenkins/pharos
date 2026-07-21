@@ -144,6 +144,11 @@ pub struct AppState {
     /// present, the live/uncached HLS path streams through it; the cached
     /// path uses its own clone held inside `HlsSegmentCache`.
     pub transcode_scheduler: Option<pharos_transcode::scheduler::TranscodeScheduler>,
+    /// What THIS server can encode (trial-confirmed hardware families + software
+    /// encoders in this ffmpeg build). The negotiator targets the best codec in
+    /// (client-decodable ∩ server-encodable), hardware-preferred. Empty default
+    /// = software-only assumption (tests / GPU-less boxes).
+    pub encode_capabilities: std::sync::Arc<pharos_transcode::ServerEncodeCapabilities>,
     pub trickplay: Option<TrickplayCache>,
     pub subtitles: Option<SubtitleCache>,
     /// Trickplay layout knobs surfaced to handlers + DTO emitter so
@@ -498,6 +503,7 @@ impl AppState {
             images: None,
             hls: None,
             transcode_scheduler: None,
+            encode_capabilities: std::sync::Arc::new(Default::default()),
             trickplay: None,
             subtitles: None,
             trickplay_widths: Vec::new(),
@@ -577,6 +583,7 @@ impl AppState {
             images: None,
             hls: None,
             transcode_scheduler: None,
+            encode_capabilities: std::sync::Arc::new(Default::default()),
             trickplay: None,
             subtitles: None,
             trickplay_widths: Vec::new(),
@@ -620,6 +627,17 @@ impl AppState {
     /// played unreachable.
     pub fn with_linux_firefox_h264(mut self, on: bool) -> Self {
         self.linux_firefox_h264 = on;
+        self
+    }
+
+    /// Attach the resolved server encode capabilities (built at boot from the
+    /// trial-confirmed hardware families + this ffmpeg build's software
+    /// encoders). The negotiator reads it to pick a hardware-encodable target.
+    pub fn with_encode_capabilities(
+        mut self,
+        caps: std::sync::Arc<pharos_transcode::ServerEncodeCapabilities>,
+    ) -> Self {
+        self.encode_capabilities = caps;
         self
     }
 
