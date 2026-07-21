@@ -17,8 +17,36 @@
 
 use std::collections::BTreeSet;
 
+use tokio::sync::OnceCell;
+
 use crate::hwaccel::HwAccel;
 use crate::{AudioCodec, VideoCodec};
+
+/// Run `ffmpeg -hide_banner -encoders` once and cache the parsed name set, so
+/// boot-time capability detection doesn't fan out into per-request subprocess
+/// spawns (mirrors [`crate::hwaccel::detect_available`]).
+static ENCODERS: OnceCell<BTreeSet<String>> = OnceCell::const_new();
+
+/// Detect the ffmpeg encoder names available in this build (cached).
+pub async fn detect_encoders(ffmpeg_bin: &str) -> BTreeSet<String> {
+    ENCODERS
+        .get_or_init(|| async move {
+            let output = tokio::process::Command::new(ffmpeg_bin)
+                .arg("-hide_banner")
+                .arg("-encoders")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await;
+            match output {
+                Ok(o) if o.status.success() => parse_encoders_output(&o.stdout),
+                _ => BTreeSet::new(),
+            }
+        })
+        .await
+        .clone()
+}
 
 /// How a codec is encoded on this server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
