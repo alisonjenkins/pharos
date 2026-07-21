@@ -154,7 +154,15 @@ async fn head_response(
         .map_err(|e| error::ErrorNotFound(e.to_string()))?
         .use_etag(true)
         .use_last_modified(true);
-    Ok(file.into_response(req))
+    let mut resp = file.into_response(req);
+    // Same `DeliveryMime` as the GET, so the Firefox seekability HEAD-probe
+    // advertises the exact Content-Type the body will carry — a mkv/VP9 HEAD
+    // must not say `video/x-matroska` while the GET serves `video/webm`.
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        super::seek::DeliveryMime::for_source(&item).header(),
+    );
+    Ok(resp)
 }
 
 /// P25 — `Last-Modified` header formatting from a `Metadata`.
@@ -660,35 +668,17 @@ async fn deliver_stream(
     {
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
     }
-    // A Matroska file carrying only WebM-legal codecs (VP8/VP9/AV1 + Opus/
-    // Vorbis) is playable by browsers as `video/webm`, but `mime_guess` maps
-    // the `.mkv` extension to `video/x-matroska`, which Firefox rejects
-    // outright ("Content-Type video/matroska is not supported"). Re-label such
-    // a direct-play stream as `video/webm` so the browser accepts it.
-    let webm_video = matches!(
-        item.probe
-            .video_codec
-            .as_deref()
-            .map(|c| c.to_ascii_lowercase())
-            .as_deref(),
-        Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
+    // Content-Type is computed ONCE, via `seek::DeliveryMime`, so this open,
+    // the StartTimeTicks seek (`serve_from_offset`) and the HEAD probe
+    // (`head_response`) can never disagree. It relabels a WebM-legal
+    // Matroska/WebM source (VP8/VP9/AV1) to `video/webm`, because `mime_guess`
+    // maps `.mkv` to `video/x-matroska`, which Firefox rejects ("Content-Type
+    // video/matroska is not supported"); for every other source it is the
+    // identical `mime_guess` value NamedFile already set.
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        super::seek::DeliveryMime::for_source(&item).header(),
     );
-    let matroska = matches!(
-        item.probe
-            .container
-            .as_deref()
-            .map(|c| c.to_ascii_lowercase())
-            .as_deref(),
-        Some("webm" | "matroska" | "mkv")
-    ) || item
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("webm"));
-    if webm_video && matroska {
-        resp.headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/webm"));
-    }
     // P24 — echo the auth as a cookie so a follow-up `<video>`-style
     // fetch can drop the `?api_key=` and still authenticate.
     if let Some(token) = api_key_query_value(req.query_string()) {
@@ -799,9 +789,9 @@ async fn serve_from_offset(
     };
 
     let end = total - 1;
-    let mime = mime_guess::from_path(&item.path)
-        .first_or_octet_stream()
-        .to_string();
+    // Same `DeliveryMime` as the plain open + HEAD, so a mkv/VP9 seek is not
+    // served the `video/x-matroska` Firefox rejects.
+    let mime = super::seek::DeliveryMime::for_source(item).header();
     let mut resp_builder = HttpResponse::build(StatusCode::PARTIAL_CONTENT);
     resp_builder
         .insert_header((header::CONTENT_TYPE, mime))

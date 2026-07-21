@@ -2,8 +2,8 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
-    UserStore,
+    MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
+    UserRecord, UserStore,
 };
 use pharos_server::{
     api::jellyfin,
@@ -250,6 +250,111 @@ async fn seek_repro_open_ended_and_if_range() {
         accept_ranges.as_deref(),
         Some("bytes"),
         "Accept-Ranges: bytes is the seekability signal"
+    );
+}
+
+/// Seed a VP9-in-Matroska item (a real Firefox DirectPlay shape) so the
+/// `video/webm` relabel is exercised. The default `seed_with_file` uses an
+/// empty probe, which never triggers the codec-conditional relabel.
+async fn seed_vp9_mkv() -> (web::Data<AppState>, String, TempDir) {
+    let td = TempDir::new().unwrap();
+    let path = td.path().join("movie.mkv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(PAYLOAD).unwrap();
+
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 42,
+            path,
+            title: "movie".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                container: Some("matroska".into()),
+                video_codec: Some("vp9".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    (state, token.0.expose().to_string(), td)
+}
+
+// A WebM-legal Matroska (VP8/VP9/AV1) plays in Firefox as `video/webm`, but
+// `mime_guess` maps `.mkv` to `video/x-matroska`, which Firefox rejects
+// outright. The relabel used to live ONLY in deliver_stream's whole-file branch,
+// so a Range seek and the HEAD seekability probe served the rejected type and
+// regressed a stream that plain-opened fine. `seek::DeliveryMime` now computes
+// the type once, so open / range-seek / HEAD must all agree on `video/webm`.
+#[actix_web::test]
+async fn webm_legal_mkv_serves_video_webm_on_open_seek_and_head() {
+    let (state, token, _td) = seed_vp9_mkv().await;
+    let app = test::init_service(build_app(state)).await;
+
+    let content_type = |resp: &actix_web::dev::ServiceResponse| {
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+
+    // 1) Plain open.
+    let open = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Videos/42/stream")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(content_type(&open).as_deref(), Some("video/webm"), "open");
+
+    // 2) Range seek (goes through the NamedFile + B94 branch).
+    let seek = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Videos/42/stream")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("Range", "bytes=4-9"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(seek.status(), 206);
+    assert_eq!(
+        content_type(&seek).as_deref(),
+        Some("video/webm"),
+        "a range seek must not regress to video/x-matroska"
+    );
+
+    // 3) HEAD seekability probe.
+    let head = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::HEAD)
+            .uri("/Videos/42/stream.mkv")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        content_type(&head).as_deref(),
+        Some("video/webm"),
+        "the HEAD probe must advertise the same type the GET body carries"
     );
 }
 
