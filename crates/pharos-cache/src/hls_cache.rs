@@ -846,13 +846,51 @@ impl HlsSegmentCache {
         Ok(args)
     }
 
+    /// Poll interval + budgets for [`audio_hls_file`](Self::audio_hls_file).
+    /// The old flat "100 × 50 ms = 5 s then 404" gave up while a cold session
+    /// was STILL PRODUCING: a deep seek spawns an ffmpeg that must open the
+    /// whole source over NFS and encode opus to the target segment, which can
+    /// exceed 5 s — the client then got a spurious 404 "audio segment not
+    /// ready" and hls.js stalled the seek (the high-severity VP9 finding).
+    const AUDIO_POLL_INTERVAL_MS: u64 = 50;
+    /// Overall hard cap (× interval) — 30 s, so a very deep cold seek still has
+    /// room even on slow storage.
+    const AUDIO_POLL_MAX: usize = 600;
+    /// Give up this many polls (12 s) after the session has produced NOTHING at
+    /// all — the ffmpeg failed to start or died before its first segment.
+    const AUDIO_POLL_NO_PROGRESS: usize = 240;
+    /// Give up this many polls (3 s) after a session that WAS producing stops
+    /// advancing — it finished (target genuinely absent) or wedged.
+    const AUDIO_POLL_STALL: usize = 60;
+
     /// Read a produced audio-rendition file (`init.mp4`, `aN.m4s`, or
     /// `audio.m3u8`) from an [`ensure_audio_hls`](Self::ensure_audio_hls)
-    /// directory, polling briefly for it to appear — the continuous ffmpeg
-    /// writes segments ahead of the playhead, so a just-requested segment is
-    /// usually already there; a near-live one may need a moment. Returns
-    /// `NotFound` past the wait budget.
+    /// directory, waiting for the continuous ffmpeg to produce it. Waits WHILE
+    /// the session keeps writing new segments (progress advancing), and gives up
+    /// only when the session stalls or never starts — so a slow-but-progressing
+    /// cold seek is served instead of a false 404, while a dead session still
+    /// fails promptly. Returns `NotFound` past the budget.
     pub async fn audio_hls_file(&self, dir: &Path, name: &str) -> Result<Vec<u8>, HlsCacheError> {
+        self.audio_hls_file_budget(
+            dir,
+            name,
+            Self::AUDIO_POLL_MAX,
+            Self::AUDIO_POLL_NO_PROGRESS,
+            Self::AUDIO_POLL_STALL,
+        )
+        .await
+    }
+
+    /// Budget-parameterised core of [`audio_hls_file`](Self::audio_hls_file), so
+    /// the progress-aware wait is unit-testable without real 30 s timeouts.
+    async fn audio_hls_file_budget(
+        &self,
+        dir: &Path,
+        name: &str,
+        max_polls: usize,
+        no_progress_polls: usize,
+        stall_polls: usize,
+    ) -> Result<Vec<u8>, HlsCacheError> {
         // Basic traversal guard: names are simple file basenames.
         if name.contains('/') || name.contains("..") {
             return Err(HlsCacheError::Io(std::io::Error::from(
@@ -860,12 +898,40 @@ impl HlsSegmentCache {
             )));
         }
         let path = dir.join(name);
-        // Up to ~5 s of polling (segments normally land far faster).
-        for _ in 0..100 {
-            match tokio::fs::read(&path).await {
-                Ok(b) if !b.is_empty() => return Ok(b),
-                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        let mut last_progress: Option<u32> = None;
+        let mut stalls = 0usize;
+        for i in 0..max_polls {
+            if let Ok(b) = tokio::fs::read(&path).await {
+                if !b.is_empty() {
+                    return Ok(b);
+                }
             }
+            match Self::audio_session_progress(dir).await {
+                // The session has written at least one segment. Wait while it
+                // keeps advancing toward our target; give up once it stalls.
+                Some(prog) => {
+                    if Some(prog) == last_progress {
+                        stalls += 1;
+                        if stalls >= stall_polls {
+                            break;
+                        }
+                    } else {
+                        stalls = 0;
+                        last_progress = Some(prog);
+                    }
+                }
+                // Nothing produced yet — a cold NFS open before the first
+                // segment. Allow a bounded grace, then declare the session dead.
+                None => {
+                    if i >= no_progress_polls {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                Self::AUDIO_POLL_INTERVAL_MS,
+            ))
+            .await;
         }
         Err(HlsCacheError::Io(std::io::Error::from(
             std::io::ErrorKind::NotFound,
@@ -1248,5 +1314,86 @@ mod tests {
             HlsSegmentCache::choose_audio_start_seg(35, false, Some(30)),
             AudioStart::Reuse
         );
+    }
+
+    // The high-severity VP9 seek fix: audio_hls_file must WAIT while a cold
+    // session is still producing, not 404 on a fixed 5 s cliff. Parameterised
+    // budgets keep these sub-second.
+
+    #[tokio::test]
+    async fn audio_hls_file_waits_for_a_segment_produced_after_a_delay() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let dir = td.path().join("s");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let write_dir = dir.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::fs::write(write_dir.join("a3.m4s"), b"seg3")
+                .await
+                .unwrap();
+        });
+        // no_progress budget (0.5 s) covers the 150 ms cold window.
+        let got = cache
+            .audio_hls_file_budget(&dir, "a3.m4s", 40, 10, 6)
+            .await
+            .unwrap();
+        assert_eq!(got, b"seg3");
+    }
+
+    #[tokio::test]
+    async fn audio_hls_file_keeps_waiting_while_the_session_advances() {
+        // A session producing a3, a4, a5 over time must not be abandoned at the
+        // stall budget: each new segment resets the stall counter, so the target
+        // a5 (300 ms out, well past the 0.3 s stall window) is still served.
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let dir = td.path().join("s");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("a2.m4s"), b"x").await.unwrap();
+        let wd = dir.clone();
+        tokio::spawn(async move {
+            // Write a3, a4, a5 at ~80 ms increments — each gap is under the
+            // 0.3 s stall budget, so progress keeps resetting the stall counter
+            // and the target a5 (~240 ms out) is still served.
+            for seg in [3u32, 4, 5] {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                tokio::fs::write(wd.join(format!("a{seg}.m4s")), b"y")
+                    .await
+                    .unwrap();
+            }
+        });
+        let got = cache
+            .audio_hls_file_budget(&dir, "a5.m4s", 200, 10, 6)
+            .await
+            .unwrap();
+        assert_eq!(got, b"y");
+    }
+
+    #[tokio::test]
+    async fn audio_hls_file_gives_up_when_session_never_starts() {
+        // Empty dir, nothing ever produced → NotFound after the no-progress
+        // grace, not a 30 s hang.
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let dir = td.path().join("s");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let res = cache.audio_hls_file_budget(&dir, "a3.m4s", 200, 6, 6).await;
+        assert!(matches!(res, Err(HlsCacheError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn audio_hls_file_gives_up_after_a_producing_session_stalls() {
+        // The session produced a2 then wedged; the target a9 never appears →
+        // give up after the stall budget (not the full max).
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let dir = td.path().join("s");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("a2.m4s"), b"x").await.unwrap();
+        let res = cache
+            .audio_hls_file_budget(&dir, "a9.m4s", 200, 100, 6)
+            .await;
+        assert!(matches!(res, Err(HlsCacheError::Io(_))));
     }
 }
