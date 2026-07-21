@@ -531,6 +531,98 @@ fn qs_video_bitrate_cap(qs: &str) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// Parse the `renditions` query param — the CSV of OUTPUT video codecs the
+/// unified master should advertise, in preference order, so the client's own
+/// `MediaSource.isTypeSupported` picks the one it can actually decode (no UA
+/// sniffing). Only the codecs pharos has a segment surface for are honoured
+/// (`h264` → mpegts `/hls1`, `vp9` → fMP4 `/vp9`). Empty / absent → the h264
+/// default (backwards compat + a native single-codec client).
+fn parse_renditions(qs: &str) -> Vec<&'static str> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("renditions") {
+                let mut out: Vec<&'static str> = Vec::new();
+                for tok in v.split(',').map(|s| s.trim().to_ascii_lowercase()) {
+                    match tok.as_str() {
+                        "h264" | "avc" | "avc1" if !out.contains(&"h264") => out.push("h264"),
+                        "vp9" | "vp09" if !out.contains(&"vp9") => out.push("vp9"),
+                        _ => {}
+                    }
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+    }
+    vec!["h264"]
+}
+
+/// Append the H.264/mpegts master rungs: the backwards-compat `main` rung + the
+/// resolution ladder, all advertising the avc1+aac CODECS the segments carry.
+fn push_h264_rungs(
+    body: &mut String,
+    id: &str,
+    qs: &str,
+    item: &HlsItem,
+    bitrate_cap: Option<u64>,
+) {
+    let codecs = hls_output_codecs_string(
+        item.video_codec.as_deref(),
+        item.video_profile.as_deref(),
+        item.video_level,
+    );
+    let aspect_w = item
+        .width
+        .zip(item.height)
+        .map(|(w, h)| w as f64 / h as f64);
+    let baseline_bw = effective_video_bitrate(bitrate_cap, item.source_bitrate_bps) + 128_000;
+    let baseline_res = match (item.width, item.height) {
+        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
+        _ => String::new(),
+    };
+    body.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}\n\
+         /Videos/{id}/main.m3u8?{qs}\n"
+    ));
+    for v in Variant::ladder_for(item.height, bitrate_cap) {
+        let target_h = v.height();
+        let resolution = match aspect_w {
+            Some(ratio) => {
+                let target_w = (ratio * target_h as f64).round() as u32 & !1;
+                format!(",RESOLUTION={target_w}x{target_h}")
+            }
+            None => String::new(),
+        };
+        body.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\"{resolution}\n\
+             /Videos/{id}/variants/{name}.m3u8?{qs}\n",
+            bw = v.advertised_bandwidth(),
+            name = v.name(),
+        ));
+    }
+}
+
+/// Append the VP9/fMP4 master rung: a continuous-audio `EXT-X-MEDIA` group + one
+/// `EXT-X-STREAM-INF` advertising the vp09+opus CODECS, pointing at the fMP4
+/// `/vp9` surface. Shared by the standalone `vp9_master` route and the unified
+/// master.
+fn push_vp9_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
+    let bitrate = target_video_bitrate(item.source_bitrate_bps) + 128_000;
+    body.push_str(&format!(
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
+         AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
+    ));
+    let resolution = match (item.width, item.height) {
+        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
+        _ => String::new(),
+    };
+    body.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}\n\
+         /videos/{id}/vp9/main.m3u8?{qs}\n"
+    ));
+}
+
 async fn master_playlist(
     state: web::Data<AppState>,
     _user: AuthUser,
@@ -548,21 +640,27 @@ async fn master_playlist(
         qs_video_bitrate_cap(req.query_string()),
     );
 
-    // Advertise the codecs the transcoded segments actually carry (H.264 +
-    // AAC, or a stream-copied h264/hevc source) — NOT the raw source codec.
-    // A legacy mpeg4/DivX source re-encodes to H.264, so advertising `mpeg4`
-    // made the browser reject the stream before fetching a segment.
-    let codecs = hls_output_codecs_string(
-        item.video_codec.as_deref(),
-        item.video_profile.as_deref(),
-        item.video_level,
-    );
+    // The OUTPUT codecs to advertise, in preference order. A multi-codec master
+    // lists an h264/mpegts rung AND a vp9/fMP4 rung; the client's own
+    // MediaSource.isTypeSupported drops any rung it can't decode and plays the
+    // rest — so a browser that genuinely can't decode H.264 self-selects VP9
+    // with NO server-side UA sniffing. `renditions` is chosen capability-aware
+    // by PlaybackInfo; absent → h264 (backwards compat, audio-only, native).
+    let renditions = parse_renditions(req.query_string());
+    let is_audio = matches!(item.kind, pharos_core::MediaKind::Audio);
+    let has_fmp4 = !is_audio && renditions.contains(&"vp9");
 
     let mut body = String::new();
-    body.push_str("#EXTM3U\n#EXT-X-VERSION:3\n");
+    // fMP4 (VP9) media segments require HLS v7; an mpegts-only master stays v3.
+    if has_fmp4 {
+        body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
+    } else {
+        body.push_str("#EXTM3U\n#EXT-X-VERSION:3\n");
+    }
     // P18 — Safari refuses to seek on a master playlist without this
     // tag. Asserting independent segments is true for h264/hevc HLS
-    // (each segment starts on an IDR / SPS boundary).
+    // (each segment starts on an IDR / SPS boundary) AND for the VP9 fMP4
+    // segments (each an independent frame-boundary transcode).
     body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
     // Text subtitles are delivered as an External rendition via PlaybackInfo
@@ -571,7 +669,7 @@ async fn master_playlist(
     // would render it as a second, WebVTT-flattened copy on top of the External
     // one ("subtitle shown twice"). Image subs still burn into the transcode.
 
-    if matches!(item.kind, pharos_core::MediaKind::Audio) {
+    if is_audio {
         // P3 — audio-only HLS: no RESOLUTION token, audio CODECS only.
         let audio_codec_token = item
             .audio_codec
@@ -598,46 +696,15 @@ async fn master_playlist(
             .body(body));
     }
 
-    let ladder = Variant::ladder_for(item.height, bitrate_cap);
-
-    // Compute the aspect-ratio-preserving render width for each
-    // variant's `RESOLUTION=` hint. Falls back to omitting
-    // RESOLUTION when the source dimensions weren't probed.
-    let aspect_w = item
-        .width
-        .zip(item.height)
-        .map(|(w, h)| w as f64 / h as f64);
-
-    // Backwards-compat single-variant entry. Older players that
-    // ignore EXT-X-STREAM-INF iteration still pick the first one. Advertise the
-    // CAP-bounded bitrate (Lace incident) so hls.js ABR doesn't overshoot a
-    // remote client's ceiling when it picks this `main` rung.
-    let baseline_bw = effective_video_bitrate(bitrate_cap, item.source_bitrate_bps) + 128_000;
-    let baseline_res = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
-    body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}\n\
-         /Videos/{id}/main.m3u8?{qs}\n"
-    ));
-
-    // W3 — quality ladder filtered by session cap (P2).
-    for v in ladder {
-        let target_h = v.height();
-        let resolution = match aspect_w {
-            Some(ratio) => {
-                let target_w = (ratio * target_h as f64).round() as u32 & !1; // even width
-                format!(",RESOLUTION={target_w}x{target_h}")
-            }
-            None => String::new(),
-        };
-        body.push_str(&format!(
-            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\"{resolution}\n\
-             /Videos/{id}/variants/{name}.m3u8?{qs}\n",
-            bw = v.advertised_bandwidth(),
-            name = v.name(),
-        ));
+    // One rung group per advertised codec. hls.js evaluates each STREAM-INF's
+    // CODECS against isTypeSupported and plays the first it can decode; a
+    // browser lacking H.264 in MSE simply drops the h264 rungs and takes VP9.
+    for r in &renditions {
+        match *r {
+            "h264" => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
+            "vp9" => push_vp9_rungs(&mut body, &id, &qs, &item),
+            _ => {}
+        }
     }
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -1473,31 +1540,15 @@ async fn vp9_master(
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
     let qs = playback_qs(&req);
-    let bitrate = target_video_bitrate(item.source_bitrate_bps) + 128_000;
 
+    // NOTE: text subtitles are delivered as an External rendition via
+    // PlaybackInfo; we deliberately do NOT advertise an in-manifest
+    // EXT-X-MEDIA:TYPE=SUBTITLES rendition here (would render twice). Image subs
+    // still burn in. The single VP9 rung + its continuous-audio group are shared
+    // with the unified master via `push_vp9_rungs`.
     let mut body = String::new();
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    // NOTE: text subtitles are delivered as an External rendition via
-    // PlaybackInfo (`DeliveryUrl` → SubtitlesOctopus for ASS / cue JSON), which
-    // jellyfin-web renders itself. We deliberately do NOT also advertise an
-    // in-manifest `EXT-X-MEDIA:TYPE=SUBTITLES` rendition here: hls.js would
-    // render it as a second (WebVTT-flattened, unstyled) copy on top of the
-    // External one — the "subtitle shown twice" bug. Image subs still burn in.
-    // Continuous-audio rendition: a separate audio group so the audio is one
-    // gapless encode (no per-segment preskip drift/clicks). The video variant
-    // references it via AUDIO="aud"; video segments carry no audio.
-    body.push_str(&format!(
-        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
-         AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
-    ));
-    let resolution = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
-    body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}\n\
-         /videos/{id}/vp9/main.m3u8?{qs}\n"
-    ));
+    push_vp9_rungs(&mut body, &id, &qs, &item);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(true))
@@ -2632,6 +2683,75 @@ mod tests {
         assert!(s.contains("RESOLUTION=1280x720"), "{s}");
         // 1.5 Mbps source + 128 kbps audio overhead = 1_628_000.
         assert!(s.contains("BANDWIDTH=1628000"), "{s}");
+        // No `renditions` param → h264-only, v3 (backwards compat + native).
+        assert!(s.contains("#EXT-X-VERSION:3"), "{s}");
+        assert!(
+            !s.contains("vp09"),
+            "default master must not advertise vp9: {s}"
+        );
+    }
+
+    async fn master_body(renditions: Option<&str>) -> String {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(10_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(3_000_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let uri = match renditions {
+            Some(r) => format!("/videos/9/master.m3u8?api_key={token}&renditions={r}"),
+            None => format!("/videos/9/master.m3u8?api_key={token}"),
+        };
+        let body =
+            test::call_and_read_body(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    // The multi-codec master: one h264/mpegts rung AND one vp9/fMP4 rung, so the
+    // client's own MediaSource.isTypeSupported picks the codec it can decode —
+    // no server-side UA sniffing.
+    #[actix_web::test]
+    async fn multi_codec_master_lists_both_h264_and_vp9_rungs() {
+        let s = master_body(Some("h264,vp9")).await;
+        // fMP4 (vp9) rung present → HLS v7.
+        assert!(s.contains("#EXT-X-VERSION:7"), "{s}");
+        // h264 rung: avc1 CODECS pointing at the mpegts /main.m3u8 surface.
+        assert!(
+            s.contains("avc1.") && s.contains("/Videos/9/main.m3u8"),
+            "h264 rung missing: {s}"
+        );
+        // vp9 rung: vp09+opus CODECS + continuous-audio group → fMP4 /vp9 surface.
+        assert!(
+            s.contains("CODECS=\"vp09.00.40.08,opus\"") && s.contains("/videos/9/vp9/main.m3u8"),
+            "vp9 rung missing: {s}"
+        );
+        assert!(
+            s.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "vp9 needs its continuous-audio group: {s}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn h264_only_rendition_is_v3_no_vp9() {
+        let s = master_body(Some("h264")).await;
+        assert!(s.contains("#EXT-X-VERSION:3"), "{s}");
+        assert!(s.contains("avc1."), "{s}");
+        assert!(!s.contains("vp09"), "h264-only must not advertise vp9: {s}");
+    }
+
+    #[actix_web::test]
+    async fn vp9_only_rendition_lists_only_vp9() {
+        let s = master_body(Some("vp9")).await;
+        assert!(s.contains("#EXT-X-VERSION:7"), "{s}");
+        assert!(s.contains("vp09."), "{s}");
+        // No h264 mpegts rung when the client only asked for vp9.
+        assert!(
+            !s.contains("/Videos/9/main.m3u8"),
+            "vp9-only leaked an h264 rung: {s}"
+        );
     }
 
     #[::core::prelude::v1::test]
