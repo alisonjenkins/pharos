@@ -861,6 +861,21 @@ async fn serve_segment(
         None
     };
 
+    // Bounds-check the requested segment against the VOD grid the playlist
+    // enumerated (`ceil(duration/6)`). An over-index — a stale playlist, a
+    // client bug, or a probe duration that overshoots the real media — must be
+    // a clean 404, not a 500 from an empty transcode or an empty-tail segment
+    // cached and served forever as a 200. Only bound when the duration is known
+    // (the common case); a legacy row without a probed duration keeps the old
+    // permissive behaviour rather than risk rejecting a valid segment.
+    if let Some(dur_ms) = item.probe.duration_ms {
+        let grid =
+            super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
+        if grid.checked(seg).is_none() {
+            return Err(error::ErrorNotFound("segment index past end of media"));
+        }
+    }
+
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
@@ -1725,6 +1740,16 @@ async fn vp9_segment(
     state.note_playback_activity();
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
+    // Bounds-check against the VOD grid the playlist enumerated. An over-index
+    // used to reach the encoder, produce no frames past EOF, and surface as a
+    // NoMoof/NoMoov → 500; make it a clean 404 (only when duration is known).
+    if let Some(dur_ms) = item.probe.duration_ms {
+        let grid =
+            super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
+        if grid.checked(seg).is_none() {
+            return Err(error::ErrorNotFound("segment index past end of media"));
+        }
+    }
     let mut opts = vp9_segment_opts(
         &state,
         &req,
