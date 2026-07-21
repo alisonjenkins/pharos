@@ -12,6 +12,7 @@
 //! accelerated impl) happens at the wiring layer.
 
 pub mod backend;
+pub mod capability;
 pub mod device;
 pub mod fingerprint;
 pub mod hwaccel;
@@ -32,6 +33,7 @@ pub use backend::LibBackend;
 #[cfg(feature = "backend-spawn")]
 pub use backend::SpawnBackend;
 pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, WaveformPoint};
+pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
 pub use options::{AudioCodec, Container, TranscodeOptions, VideoCodec};
 pub use segment::{SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo};
