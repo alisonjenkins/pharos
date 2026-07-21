@@ -644,8 +644,23 @@ async fn deliver_stream(
     let start_ticks = parse_start_time_ticks(req.query_string());
 
     if !has_range && start_ticks > 0 {
-        if let Some(offset) = byte_offset_from_ticks(&item, start_ticks).await {
-            return serve_from_offset(&item, offset, req, clock).await;
+        // A StartTimeTicks resume with no Range can only be honoured by cutting
+        // the source at a byte offset and streaming from there. That is
+        // decodable ONLY for a self-framing container (MPEG-TS / ADTS-AAC /
+        // MP3), which resyncs from any packet. For a header-prefixed
+        // mp4/mkv/webm the moov / EBML index / cues live at file start or EOF,
+        // so a raw interior slice is HEADERLESS and undecodable — the old
+        // high-severity bug shipped a 206 the player could not decode.
+        // `ResyncWitness` makes that call unrepresentable: for a header-prefixed
+        // source we skip the byte cut and fall through to the whole-file
+        // NamedFile response, which is fully seekable — the client jumps to the
+        // resume offset itself using its own container index (a browser issues
+        // a Range; a native player self-seeks).
+        let tolerance = super::seek::CutTolerance::for_source(&item);
+        if let Some(witness) = super::seek::ResyncWitness::of(tolerance) {
+            if let Some(offset) = byte_offset_from_ticks(&item, start_ticks).await {
+                return serve_from_offset(&item, offset, req, clock, witness).await;
+            }
         }
     }
 
@@ -736,11 +751,17 @@ async fn byte_offset_from_ticks(item: &MediaItem, start_ticks: u64) -> Option<u6
     Some(bytes.min(u64::MAX as u128) as u64)
 }
 
+/// Serve `file[offset..EOF]` as a 206. Callable ONLY with a
+/// [`ResyncWitness`](super::seek::ResyncWitness) — proof the source is a
+/// self-framing container that decodes from an arbitrary interior byte. A
+/// header-prefixed mp4/mkv cannot produce one, so the headerless-slice bug is a
+/// compile error rather than a runtime 206 the player chokes on.
 async fn serve_from_offset(
     item: &MediaItem,
     offset: u64,
     req: &HttpRequest,
     clock: Arc<AtomicI64>,
+    _witness: super::seek::ResyncWitness,
 ) -> Result<HttpResponse, actix_web::Error> {
     // P25 — conditional GET. When the client's cached snapshot is
     // still current per `If-Modified-Since`, short-circuit with 304.
