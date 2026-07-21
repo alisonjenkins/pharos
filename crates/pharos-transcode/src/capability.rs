@@ -11,9 +11,10 @@
 //! then targets the best codec in *(client-decodable ∩ server-encodable)*,
 //! hardware-preferred — see `pharos_jellyfin_api::device_profile`.
 //!
-//! Hardware VP9/AV1 (VAAPI, newer NVENC/Arc) is added in a follow-up; today the
-//! hardware families expose only h264/hevc encoders, so VP9/AV1 resolve to the
-//! software cost tier here.
+//! Hardware VP9 (VAAPI) and AV1 (VAAPI / newer NVENC / Arc QSV) are supported,
+//! but a codec is only reported as hardware when a boot-time TRIAL ENCODE on the
+//! device actually succeeded — so a family that merely NAMES an encoder it can't
+//! run (e.g. `av1_nvenc` on a Pascal card) correctly falls back to software.
 
 use std::collections::BTreeSet;
 
@@ -118,17 +119,6 @@ fn software_video_encoder(codec: VideoCodec) -> Option<&'static str> {
     }
 }
 
-/// Whether a hardware family exposes a real encoder for `codec`. VP9/AV1 return
-/// `None` for every family today (no `vp9_encoder`/`av1_encoder` yet), so they
-/// fall through to the software tier.
-fn hardware_video_encoder(accel: HwAccel, codec: VideoCodec) -> Option<&'static str> {
-    match codec {
-        VideoCodec::H264 => accel.h264_encoder(),
-        VideoCodec::H265 => accel.hevc_encoder(),
-        _ => None,
-    }
-}
-
 /// Software encode cost per codec.
 fn software_cost(codec: VideoCodec) -> RelCost {
     match codec {
@@ -153,18 +143,23 @@ fn software_audio_encoder(codec: AudioCodec) -> Option<&'static str> {
 }
 
 impl ServerEncodeCapabilities {
-    /// Build from the set of trial-confirmed hardware families (pass an empty
-    /// slice for a software-only / GPU-less box) and the parsed
-    /// `ffmpeg -encoders` name set. Each codec resolves to its best available
-    /// acceleration: a hardware encoder (Cheap) when any confirmed family
-    /// provides it, else the software encoder if present.
-    pub fn from_parts(confirmed_hw: &[HwAccel], encoders: &BTreeSet<String>) -> Self {
+    /// Build from the TRIAL-CONFIRMED hardware `(family, codec)` pairs — a device
+    /// is listed for a codec ONLY after a real boot-time encode succeeded, so a
+    /// family that names an encoder it can't run (e.g. `av1_nvenc` on a Pascal
+    /// card) is correctly absent — and the parsed `ffmpeg -encoders` name set for
+    /// the software fallback. Pass an empty slice for a software-only / GPU-less
+    /// box. Each codec resolves to its best acceleration: hardware (Cheap) when a
+    /// confirmed pair provides it, else the software encoder if present.
+    pub fn from_confirmed(
+        confirmed_hw: &[(HwAccel, VideoCodec)],
+        encoders: &BTreeSet<String>,
+    ) -> Self {
         let mut video = Vec::new();
         for codec in TARGET_VIDEO_CODECS {
             let hw = confirmed_hw
                 .iter()
-                .copied()
-                .find(|&a| hardware_video_encoder(a, codec).is_some());
+                .find(|(_, c)| *c == codec)
+                .map(|(a, _)| *a);
             if let Some(accel) = hw {
                 video.push(VideoEncodeCap {
                     codec,
@@ -287,7 +282,7 @@ mod tests {
             "aac",
             "libopus",
         ]);
-        let caps = ServerEncodeCapabilities::from_parts(&[], &enc);
+        let caps = ServerEncodeCapabilities::from_confirmed(&[], &enc);
         assert!(caps.can_encode(VideoCodec::H264));
         assert!(caps.can_encode(VideoCodec::Vp9));
         assert!(caps.can_encode(VideoCodec::Av1));
@@ -308,28 +303,64 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_box_hardware_encodes_h264_hevc_but_vp9_stays_software() {
-        // NVENC exposes h264/hevc encoders; VP9 has no hw encoder yet → software.
-        let enc = encoders(&["libx264", "libx265", "libvpx-vp9", "aac"]);
-        let caps = ServerEncodeCapabilities::from_parts(&[HwAccel::Nvenc], &enc);
-        let h264 = caps.best_for(VideoCodec::H264).unwrap();
-        assert_eq!(h264.accel, EncodeAccel::Hardware(HwAccel::Nvenc));
-        assert_eq!(h264.cost, RelCost::Cheap);
-        let hevc = caps.best_for(VideoCodec::H265).unwrap();
-        assert_eq!(hevc.accel, EncodeAccel::Hardware(HwAccel::Nvenc));
-        // VP9: still software (no hw vp9 encoder yet).
-        let vp9 = caps.best_for(VideoCodec::Vp9).unwrap();
-        assert_eq!(vp9.accel, EncodeAccel::Software);
-        assert_eq!(vp9.cost, RelCost::Expensive);
+    fn pascal_nvenc_confirms_h264_hevc_but_not_av1_or_vp9() {
+        // A Pascal card: the trial confirmed h264 + hevc but NOT av1 (no AV1
+        // block) — even though the NVENC family names `av1_nvenc`. VP9 has no
+        // NVENC encoder at all. Both must fall back to software.
+        let enc = encoders(&["libx264", "libx265", "libvpx-vp9", "libaom-av1", "aac"]);
+        let caps = ServerEncodeCapabilities::from_confirmed(
+            &[
+                (HwAccel::Nvenc, VideoCodec::H264),
+                (HwAccel::Nvenc, VideoCodec::H265),
+            ],
+            &enc,
+        );
+        assert_eq!(
+            caps.best_for(VideoCodec::H264).unwrap().accel,
+            EncodeAccel::Hardware(HwAccel::Nvenc)
+        );
+        assert_eq!(
+            caps.best_for(VideoCodec::H265).unwrap().accel,
+            EncodeAccel::Hardware(HwAccel::Nvenc)
+        );
+        // VP9 + AV1: software (VP9 has no NVENC encoder; AV1 trial not confirmed).
+        assert_eq!(
+            caps.best_for(VideoCodec::Vp9).unwrap().accel,
+            EncodeAccel::Software
+        );
+        assert_eq!(
+            caps.best_for(VideoCodec::Av1).unwrap().accel,
+            EncodeAccel::Software
+        );
         let hw: Vec<_> = caps.hw_codecs().collect();
-        assert!(hw.contains(&VideoCodec::H264) && hw.contains(&VideoCodec::H265));
-        assert!(!hw.contains(&VideoCodec::Vp9));
+        assert_eq!(hw, vec![VideoCodec::H264, VideoCodec::H265]);
+    }
+
+    #[test]
+    fn vaapi_confirmed_for_vp9_reports_hardware_vp9() {
+        // A VAAPI box whose trial confirmed h264 + vp9 → hardware VP9 (Cheap),
+        // beating the software tier.
+        let enc = encoders(&["libx264", "libvpx-vp9", "aac"]);
+        let caps = ServerEncodeCapabilities::from_confirmed(
+            &[
+                (HwAccel::Vaapi, VideoCodec::H264),
+                (HwAccel::Vaapi, VideoCodec::Vp9),
+            ],
+            &enc,
+        );
+        let vp9 = caps.best_for(VideoCodec::Vp9).unwrap();
+        assert_eq!(vp9.accel, EncodeAccel::Hardware(HwAccel::Vaapi));
+        assert_eq!(vp9.cost, RelCost::Cheap);
+        assert!(caps
+            .hw_codecs()
+            .collect::<Vec<_>>()
+            .contains(&VideoCodec::Vp9));
     }
 
     #[test]
     fn missing_libx265_means_no_h265() {
         let enc = encoders(&["libx264", "aac"]);
-        let caps = ServerEncodeCapabilities::from_parts(&[], &enc);
+        let caps = ServerEncodeCapabilities::from_confirmed(&[], &enc);
         assert!(caps.can_encode(VideoCodec::H264));
         assert!(
             !caps.can_encode(VideoCodec::H265),
@@ -340,7 +371,7 @@ mod tests {
     #[test]
     fn audio_reflects_present_encoders() {
         let enc = encoders(&["libx264", "aac", "libopus"]);
-        let caps = ServerEncodeCapabilities::from_parts(&[], &enc);
+        let caps = ServerEncodeCapabilities::from_confirmed(&[], &enc);
         assert!(caps.audio.contains(&AudioCodec::Aac));
         assert!(caps.audio.contains(&AudioCodec::Opus));
         assert!(

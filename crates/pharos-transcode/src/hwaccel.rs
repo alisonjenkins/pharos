@@ -55,6 +55,45 @@ impl HwAccel {
         }
     }
 
+    /// ffmpeg encoder name for vp9 targets. Only VAAPI has a hardware VP9
+    /// encoder in ffmpeg (`vp9_vaapi`); NVENC/QSV/VideoToolbox have none, so
+    /// VP9 stays software (`libvpx-vp9`) on those. Whether a given VAAPI device
+    /// ACTUALLY has a VP9 encode block is confirmed by a trial encode at boot —
+    /// this method only names the encoder to try.
+    pub fn vp9_encoder(self) -> Option<&'static str> {
+        match self {
+            Self::Vaapi => Some("vp9_vaapi"),
+            _ => None,
+        }
+    }
+
+    /// ffmpeg encoder name for av1 targets. Hardware AV1 encode exists on newer
+    /// VAAPI (Intel Arc / AMD RDNA3+), NVENC (Ada / RTX 40+) and QSV (Arc); a
+    /// trial encode at boot confirms whether THIS device really has it (e.g. a
+    /// Pascal NVENC names `av1_nvenc` but has no AV1 block — the trial fails and
+    /// it is not advertised).
+    pub fn av1_encoder(self) -> Option<&'static str> {
+        match self {
+            Self::Vaapi => Some("av1_vaapi"),
+            Self::Nvenc => Some("av1_nvenc"),
+            Self::Qsv => Some("av1_qsv"),
+            _ => None,
+        }
+    }
+
+    /// The ffmpeg encoder name for `codec` on this family, or `None` when the
+    /// family has no hardware encoder for it.
+    pub fn video_encoder(self, codec: crate::VideoCodec) -> Option<&'static str> {
+        use crate::VideoCodec::*;
+        match codec {
+            H264 => self.h264_encoder(),
+            H265 => self.hevc_encoder(),
+            Vp9 => self.vp9_encoder(),
+            Av1 => self.av1_encoder(),
+            Copy => None,
+        }
+    }
+
     /// Resolve `Auto` against the detected-encoder set. Pure function
     /// on a snapshot — the snapshot itself comes from
     /// [`detect_available`].

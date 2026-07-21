@@ -140,9 +140,14 @@ pub async fn probe_device_caps(devices: &[DeviceId], cfg: &ProbeConfig) -> Probe
 /// (nonzero exit / timeout) means the device couldn't take another
 /// concurrent session.
 async fn ffmpeg_probe_attempt(device: DeviceId, ffmpeg_bin: &str, timeout: Duration) -> bool {
-    let args = probe_args(device);
+    run_ffmpeg_probe(ffmpeg_bin, &probe_args(device), timeout).await
+}
+
+/// Spawn a throwaway ffmpeg with `args` and report whether it exited 0 within
+/// `timeout`. Shared by the session-cap probe and the per-codec encode probe.
+async fn run_ffmpeg_probe(ffmpeg_bin: &str, args: &[String], timeout: Duration) -> bool {
     let mut cmd = tokio::process::Command::new(ffmpeg_bin);
-    cmd.args(&args)
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -155,6 +160,69 @@ async fn ffmpeg_probe_attempt(device: DeviceId, ffmpeg_bin: &str, timeout: Durat
         tokio::time::timeout(timeout, wait_status(child)).await,
         Ok(Some(true))
     )
+}
+
+/// Which of the target video codecs `device` can ACTUALLY hardware-encode,
+/// confirmed by a real trial encode each. This is stricter than "the family
+/// names an encoder": a Pascal NVENC names `av1_nvenc` but has no AV1 block, so
+/// the trial fails and AV1 is excluded. CPU returns empty (software codecs come
+/// from `ffmpeg -encoders`, not a device trial). Drives the negotiator's
+/// `ServerEncodeCapabilities`, so it only ever advertises hardware codecs a real
+/// encode proved.
+pub async fn probe_encodable_codecs(device: DeviceId, timeout: Duration) -> Vec<crate::VideoCodec> {
+    use crate::VideoCodec::{Av1, Vp9, H264, H265};
+    let bin = ffmpeg_bin();
+    let mut out = Vec::new();
+    for codec in [H264, H265, Vp9, Av1] {
+        if let Some(args) = codec_probe_args(device, codec) {
+            if run_ffmpeg_probe(&bin, &args, timeout).await {
+                out.push(codec);
+            }
+        }
+    }
+    out
+}
+
+/// ffmpeg argv for a tiny throwaway encode of `codec` on `device` (lavfi source
+/// → the device's hardware encoder → null muxer). `None` when the device's
+/// family names no hardware encoder for `codec` (so there's nothing to trial).
+fn codec_probe_args(device: DeviceId, codec: crate::VideoCodec) -> Option<Vec<String>> {
+    use crate::hwaccel::HwAccel;
+    let DeviceId::Hw { accel, index } = device else {
+        return None;
+    };
+    let encoder = accel.video_encoder(codec)?;
+    let mut a: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+    ];
+    if let Some(node) = device.vaapi_render_node() {
+        a.push("-vaapi_device".into());
+        a.push(node);
+    }
+    a.push("-f".into());
+    a.push("lavfi".into());
+    a.push("-i".into());
+    a.push("testsrc=size=128x128:rate=5:duration=1".into());
+    if matches!(accel, HwAccel::Vaapi) {
+        // VAAPI encodes from a GPU-resident surface.
+        a.push("-vf".into());
+        a.push("format=nv12,hwupload".into());
+    }
+    a.push("-c:v".into());
+    a.push(encoder.into());
+    if matches!(accel, HwAccel::Nvenc) {
+        a.push("-gpu".into());
+        a.push(index.to_string());
+    }
+    a.push("-frames:v".into());
+    a.push("5".into());
+    a.push("-f".into());
+    a.push("null".into());
+    a.push("-".into());
+    Some(a)
 }
 
 async fn wait_status(mut child: tokio::process::Child) -> Option<bool> {

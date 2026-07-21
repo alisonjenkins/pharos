@@ -16,7 +16,7 @@
 //! `Semaphore`s aren't serialisable so the runtime table stays here.
 
 use crate::hwaccel::HwAccel;
-use crate::options::{TranscodeOptions, VideoCodec};
+use crate::options::TranscodeOptions;
 use crate::protocol::DeviceId;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -148,10 +148,15 @@ pub fn device_supports(device: DeviceId, opts: &TranscodeOptions) -> bool {
     match device {
         DeviceId::Cpu => true,
         DeviceId::Hw { accel, .. } => match opts.video {
-            Some(VideoCodec::H264) => accel.h264_encoder().is_some(),
-            Some(VideoCodec::H265) => accel.hevc_encoder().is_some(),
-            // Vp9/Av1/Copy/None → CPU only.
-            _ => false,
+            // A hardware device is eligible for a codec when its family names an
+            // encoder for it (h264/hevc always; vp9 on VAAPI; av1 on
+            // VAAPI/NVENC/QSV). The negotiator only TARGETS a hardware codec the
+            // boot trial-encode confirmed, so a family that names an encoder it
+            // can't actually run (e.g. av1_nvenc on Pascal) is never picked and
+            // thus never reaches here; a runtime failure still falls back to CPU.
+            Some(codec) => accel.video_encoder(codec).is_some(),
+            // Pure Copy / audio-only → CPU.
+            None => false,
         },
     }
 }
@@ -217,7 +222,7 @@ mod tests {
 
     use super::*;
     use crate::hwaccel::HwAccel;
-    use crate::options::{AudioCodec, Container};
+    use crate::options::{AudioCodec, Container, VideoCodec};
     use std::time::Duration;
 
     #[test]
@@ -285,12 +290,16 @@ mod tests {
     }
 
     #[test]
-    fn vp9_target_routes_cpu_only() {
+    fn vp9_routes_to_vaapi_hardware_not_nvenc() {
         let t = table();
         let mut o = h264_opts();
         o.video = Some(VideoCodec::Vp9);
         let elig = t.eligible_for(&o, Instant::now());
-        assert_eq!(elig.as_slice(), &[DeviceId::Cpu]);
+        // VAAPI has `vp9_vaapi`; NVENC has no VP9 encoder → excluded. CPU last.
+        assert_eq!(
+            elig.as_slice(),
+            &[DeviceId::hw(HwAccel::Vaapi, 0), DeviceId::Cpu]
+        );
     }
 
     #[test]

@@ -448,10 +448,10 @@ async fn build_transcode_scheduler(
     probe_caps: bool,
 ) -> Option<(
     pharos_transcode::scheduler::TranscodeScheduler,
-    Vec<pharos_transcode::HwAccel>,
+    Vec<(pharos_transcode::HwAccel, pharos_transcode::VideoCodec)>,
 )> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
-    use pharos_transcode::probe::{probe_device_caps, ProbeConfig};
+    use pharos_transcode::probe::{probe_device_caps, probe_encodable_codecs, ProbeConfig};
     use pharos_transcode::protocol::{DeviceId, WorkerId};
     use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler, WorkerSpawner};
     use pharos_transcode::worker::ProcSpawner;
@@ -504,15 +504,21 @@ async fn build_transcode_scheduler(
             .map(|d| (d, hw_session_cap.max(1)))
             .collect()
     };
-    // The distinct hardware families that PASSED the trial encode — the
-    // authoritative "what can this box hardware-encode" set (phantom GPUs are
-    // already excluded from `caps`). Feeds ServerEncodeCapabilities so the
-    // negotiator can target a hardware codec.
-    let mut hw_families: Vec<pharos_transcode::HwAccel> = Vec::new();
+    // For each trial-confirmed device (phantom GPUs already excluded from
+    // `caps`), probe WHICH video codecs it can ACTUALLY hardware-encode — a real
+    // trial encode per codec, so the capability report is per-codec accurate (a
+    // Pascal NVENC confirms h264/hevc but not av1, even though the family names
+    // `av1_nvenc`). Feeds ServerEncodeCapabilities so the negotiator only ever
+    // targets a hardware codec a real encode proved.
+    let probe_timeout = ProbeConfig::default().per_attempt_timeout;
+    let mut hw_codecs: Vec<(pharos_transcode::HwAccel, pharos_transcode::VideoCodec)> = Vec::new();
     for (d, _) in &caps {
         if let DeviceId::Hw { accel, .. } = d {
-            if !hw_families.contains(accel) {
-                hw_families.push(*accel);
+            for codec in probe_encodable_codecs(*d, probe_timeout).await {
+                if !hw_codecs.contains(&(*accel, codec)) {
+                    hw_codecs.push((*accel, codec));
+                    tracing::info!(device = %d, ?codec, "hardware codec confirmed by trial encode");
+                }
             }
         }
     }
@@ -528,7 +534,7 @@ async fn build_transcode_scheduler(
             std::sync::Arc::new(ProcSpawner::new()),
             SchedConfig::default(),
         ),
-        hw_families,
+        hw_codecs,
     ))
 }
 
@@ -634,7 +640,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // (empty when there's no usable GPU / the scheduler is off) + the software
     // encoders in this ffmpeg build. The negotiator targets the best codec in
     // (client-decodable ∩ server-encodable), hardware-preferred.
-    let encode_caps = pharos_transcode::ServerEncodeCapabilities::from_parts(
+    let encode_caps = pharos_transcode::ServerEncodeCapabilities::from_confirmed(
         &confirmed_hw,
         &pharos_transcode::capability::detect_encoders("ffmpeg").await,
     );
