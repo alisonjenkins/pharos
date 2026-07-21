@@ -241,13 +241,17 @@ async fn browser_codec_routing_matrix() {
             UA_FIREFOX,
             PROFILE_FIREFOX,
             &[
-                (1, WebmVp9),    // h264 UNRELIABLE on firefox → force webm
-                (2, WebmVp9),    // hevc → webm
+                // h264/mp4: FF lists mp4/h264 DirectPlay → direct (modern FF152
+                // decodes h264; no UA force). Instant byte-range seek.
+                (1, DirectPlay),
+                // hevc → transcode → unified master offering h264 AND vp9 (FF's
+                // profile lists both), so a codec-less FF still has a vp9 fallback.
+                (2, WebmVp9),
                 (3, DirectPlay), // vp9 plays natively → keep direct
-                (4, WebmVp9),    // mpeg4 → webm
+                (4, WebmVp9),    // mpeg4 → transcode → multi-codec master
                 (5, DirectPlay), // av1 plays natively → keep direct
-                (6, WebmVp9),    // webm/h264 (the trap) → force webm, NOT direct-play
-                (7, WebmVp9),    // h264+eac3 mkv → h264 forces webm (audio→opus too)
+                (6, WebmVp9),    // webm/h264 not directplayable → multi-codec master
+                (7, WebmVp9),    // h264+eac3 mkv → transcode → multi-codec master
             ],
         ),
         (
@@ -296,11 +300,17 @@ async fn browser_codec_routing_matrix() {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            let renditions = url
+                .split("renditions=")
+                .nth(1)
+                .map(|r| r.split('&').next().unwrap_or(""))
+                .unwrap_or("");
             let got = if direct {
                 DirectPlay
-            } else if url.contains("/vp9/master.m3u8") {
-                // VP9-in-fMP4 HLS (Firefox path). Checked BEFORE the generic
-                // master.m3u8 arm since both end in master.m3u8.
+            } else if url.contains("master.m3u8") && renditions.contains("vp9") {
+                // The unified multi-codec master advertising a vp9 rung — a
+                // browser that can't decode h264 in MSE self-selects it. Replaces
+                // the old server-side force to /vp9/master.m3u8.
                 WebmVp9
             } else if url.contains("master.m3u8") {
                 HlsH264

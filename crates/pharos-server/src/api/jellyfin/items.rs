@@ -2181,75 +2181,49 @@ async fn playback_info(
     // targeted client quirk: when a Firefox-family UA ALSO advertises a VP9
     // transcode target, serve the progressive VP9/WebM stream (which its MSE
     // decodes reliably) instead. Chromium/Safari keep the efficient H.264 HLS.
-    let is_firefox = req
-        .headers()
-        .get(actix_web::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        // Match "Firefox" only — Chrome's UA contains "like Gecko" so a
-        // bare "Gecko" check would wrongly capture Chromium. B43 — scope the
-        // quirk to DESKTOP LINUX Firefox: only there can the distro build
-        // lack the system H.264 decoder while canPlayType still says
-        // "probably" (the lie this force exists for). Firefox on
-        // macOS (VideoToolbox), Windows (Media Foundation) and Android
-        // (MediaCodec) always decodes H.264 for real — forcing those onto
-        // the VP9 encode path turned an h264 source's near-instant remux
-        // (stream copy) into a ~2.5s-per-segment libvpx encode, the
-        // dominant cost of every seek.
-        .is_some_and(|ua| {
-            ua.contains("Firefox") && ua.contains("Linux") && !ua.contains("Android")
-        })
-        // B60 — opt out of the VP9 force for Linux Firefox when configured:
-        // modern Linux FF decodes H.264 in MSE, so serving h264 puts it on the
-        // shared encode and off the fragile VP9 split-audio path (the Sabrina
-        // hang). Reversible via `[server].linux_firefox_h264`.
-        && !state.linux_firefox_h264;
-    let client_offers_vp9 = profile.transcoding_profiles.iter().any(|t| {
-        (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
-            && t.video_codec.split(',').any(|c| {
-                matches!(
-                    c.trim().to_ascii_lowercase().as_str(),
-                    "vp9" | "vp8" | "vp09" | "vp08"
-                )
-            })
-    });
-    // B60 — evidence for the codec-decision trace: does the client advertise
-    // h264 as a transcode target at all? If a Linux Firefox that hangs on VP9
-    // never even offers h264, the VP9 force is genuinely required for it.
-    let client_offers_h264 = profile.transcoding_profiles.iter().any(|t| {
-        (t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
-            && t.video_codec.split(',').any(|c| {
-                matches!(
-                    c.trim().to_ascii_lowercase().as_str(),
-                    "h264" | "avc" | "avc1"
-                )
-            })
-    });
-    // The video codecs a modern Firefox reliably decodes in ANY context
-    // (MSE or a plain <video>): the VP/AV1 family. THIS user's Firefox can't
-    // do H.264 at all, so treat h264/hevc/mpeg4/… as un-decodable and force a
-    // VP9 transcode. A genuine VP9/VP8/AV1 source is left to direct-play.
-    let source_firefox_native = matches!(
-        source
-            .video_codec
-            .as_deref()
-            .map(|c| c.to_ascii_lowercase())
-            .as_deref(),
-        Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
-    );
-    // Firefox client-quirk: jellyfin-web advertises H.264 (canPlayType says
-    // "probably") and will DirectPlay / remux / HLS-transcode it, but the
-    // browser's decoder rejects it. Force a progressive VP9/WebM transcode
-    // UNLESS the negotiated outcome is already a direct-play of a codec Firefox
-    // natively decodes (VP8/VP9/AV1). This also covers an AV1/VP9 source in a
-    // container the client's profile doesn't direct-play (e.g. av1-in-mp4 when
-    // the profile only lists av1-in-webm) — that would otherwise transcode to
-    // H.264, which Firefox can't play.
-    let force_webm = is_video
-        && is_firefox
-        && client_offers_vp9
-        && !(decision.is_direct() && source_firefox_native);
+    // The rendition SET for the unified multi-codec master. The old code forced
+    // Linux Firefox onto VP9 via a UA sniff, because a codec-less distro Firefox
+    // reports `canPlayType('avc1')="probably"` (lists h264) yet its MSE
+    // `isTypeSupported` is false. pharos can't see that from the profile — so
+    // instead of guessing by UA, advertise EVERY codec the client's profile says
+    // it decodes AND this server can encode (ranked hardware-first), and let the
+    // client's own `isTypeSupported` drop the rungs it can't play. A modern
+    // Firefox decodes h264 and takes the cheap hardware rung; a codec-less one
+    // drops h264 and self-selects VP9. Limited to the codecs pharos has a
+    // segment surface for: h264 (mpegts) and vp9 (fMP4).
+    let client_video_csv = profile
+        .transcoding_profiles
+        .iter()
+        .filter(|t| t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
+        .map(|t| t.video_codec.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut renditions: Vec<String> =
+        pharos_jellyfin_api::device_profile::rank_transcode_video_codecs(
+            &client_video_csv,
+            &server_codecs,
+        )
+        .into_iter()
+        .filter(|c| matches!(c.as_str(), "h264" | "vp9"))
+        .collect();
+    if renditions.is_empty() {
+        renditions.push("h264".to_string()); // the always-available safe surface
+    }
+    // Native clients don't MSE-`isTypeSupported`-filter a master; they take the
+    // first rung. Give them a single codec (the negotiated target).
+    if !is_web_client {
+        let one = match &decision {
+            Decision::Transcode {
+                target_video_codec: Some(c),
+                ..
+            } if c.to_ascii_lowercase().starts_with("vp") => "vp9".to_string(),
+            _ => renditions.first().cloned().unwrap_or_else(|| "h264".into()),
+        };
+        renditions = vec![one];
+    }
+    let renditions_param = renditions.join(",");
 
-    let direct_play = decision.is_direct() && !force_webm;
+    let direct_play = decision.is_direct();
     // B77 — `SupportsDirectStream` promises the raw `/stream` file is playable
     // AS-IS: pharos's `/stream` serves the source verbatim (no container remux,
     // no audio transcode — the only massaging is `deliver_stream`'s webm
@@ -2259,15 +2233,13 @@ async fn playback_info(
     // VP9. A VideoRemux/AudioRemux of anything else — the h264+eac3/ac3/dts
     // Matroska that dominates the library — is NOT playable raw (browser rejects
     // the container/audio), so it must transcode via the TranscodingUrl below.
-    // Advertising DirectStream for it handed the client an unplayable stream
-    // with (for AudioRemux) no URL to fall back to. Native players that CAN play
-    // such files declare it in their profile → DirectPlay, unaffected.
-    let supports_direct_stream = !force_webm
-        && (direct_play
-            || (matches!(
-                decision,
-                Decision::VideoRemux { .. } | Decision::AudioRemux { .. }
-            ) && webm_relabel_playable));
+    // Native players that CAN play such files declare it in their profile →
+    // DirectPlay, unaffected.
+    let supports_direct_stream = direct_play
+        || (matches!(
+            decision,
+            Decision::VideoRemux { .. } | Decision::AudioRemux { .. }
+        ) && webm_relabel_playable);
     // Forward the client's audio/subtitle track selection into the VP9 HLS
     // URL — jellyfin-web re-requests PlaybackInfo with these when the user
     // switches tracks. The VP9 segment handler maps them into ffmpeg (audio
@@ -2346,77 +2318,33 @@ async fn playback_info(
             .map(|b| format!("&VideoBitrate={b}"))
             .unwrap_or_default(),
     };
-    let vp9_hls_url = format!(
-        "/videos/{id_str}/vp9/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
+    // Every VIDEO transcode/remux drives the UNIFIED master playlist. It carries
+    // `renditions=` (the capability-ranked codec set) so the h264/mpegts rung
+    // AND — when the client offers vp9 — the vp9/fMP4 rung are advertised
+    // together; the client's own isTypeSupported picks the codec it can decode.
+    // No UA sniffing, no separate vp9 master URL. PlaySessionId rides the URL so
+    // the segment handlers reuse the cached Decision; B41 stream_selection +
+    // B45/Lace video_bitrate_param ride through master → variant → segment.
+    let master_url = format!(
+        "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}&renditions={renditions_param}{stream_selection}{video_bitrate_param}"
     );
-    let transcoding_url = if force_webm {
-        Some(vp9_hls_url.clone())
-    } else {
-        match &decision {
-            // Any VIDEO transcode drives the HLS master playlist. pharos's HLS
-            // pipeline always emits mpegts H.264/AAC segments regardless of the
-            // container the client's profile nominally requested (hls.js demuxes
-            // mpegts fine), so the URL must be emitted for every video transcode —
-            // not only when the negotiated target_container happened to be "ts".
-            // Gating on `== "ts"` left `SupportsTranscoding: true` with a null
-            // TranscodingUrl whenever a client profile requested e.g. an mp4/hls
-            // transcode, and jellyfin-web then failed with "error processing the
-            // request" before ever fetching a segment.
-            // PlaySessionId rides on the URL so the HLS handlers look up the cached
-            // Decision instead of re-running the negotiator per segment.
-            // A client whose transcoding profile asks for VP9/VP8 (a browser whose
-            // MSE can't decode H.264 — e.g. some Firefox/Zen builds) gets a
-            // VP9-in-fMP4 HLS stream instead of the H.264/mpegts HLS surface,
-            // which it could not play. Everything else takes the H.264 HLS master.
-            Decision::Transcode {
-                target_video_codec, ..
-            } if is_video
-                && target_video_codec.as_deref().is_some_and(|c| {
-                    matches!(
-                        c.to_ascii_lowercase().as_str(),
-                        "vp9" | "vp8" | "vp09" | "vp08"
-                    )
-                }) =>
-            {
-                Some(vp9_hls_url.clone())
-            }
-            // B41 — carry the caller's stream selection (audio track + image-
-            // subtitle burn index) exactly like the VP9 URL: the h264 master
-            // URL dropped it, so a selected PGS subtitle never reached the
-            // segment handler (burn silently off) and an explicit audio track
-            // fell back to the default.
-            Decision::Transcode { .. } if is_video => Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
-            )),
-            // Audio transcode → the universal audio endpoint.
-            Decision::Transcode { .. } => Some(format!(
-                "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}"
-            )),
-            // P9 — VideoRemux drives the same HLS surface as Transcode;
-            // the segment handler reads `Decision::VideoRemux` from the
-            // registered session and emits `-c:v copy`.
-            Decision::VideoRemux { .. } => Some(format!(
-                // Remux copies video (no burn possible) but the AUDIO pick
-                // must still ride along (B41). The segmented-HLS surface still
-                // re-encodes video (B45), so a remote ceiling rides too.
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
-            )),
-            // B77 — a VIDEO AudioRemux (compatible video, undecodable audio)
-            // drives the same HLS master as VideoRemux: the segment surface
-            // re-encodes to h264 + aac (a `-c:v copy` segment stream is
-            // structurally broken, see hls.rs/B45), giving the client audio it
-            // can actually decode. Without this the client got DirectStream'd
-            // raw eac3/ac3/dts and no URL to fall back to.
-            Decision::AudioRemux { .. } if is_video => Some(format!(
-                "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}{stream_selection}{video_bitrate_param}"
-            )),
-            // Audio-only source whose codec the client can't direct-play →
-            // the universal audio endpoint remuxes to the negotiated target.
-            Decision::AudioRemux { .. } => Some(format!(
-                "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}"
-            )),
-            _ => None,
-        }
+    let universal_audio_url =
+        format!("/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}");
+    let transcoding_url = match &decision {
+        // Transcode: video → unified master; audio-only → universal endpoint.
+        Decision::Transcode { .. } if is_video => Some(master_url.clone()),
+        Decision::Transcode { .. } => Some(universal_audio_url.clone()),
+        // P9 — VideoRemux drives the same master; the segment handler reads
+        // Decision::VideoRemux from the session and emits `-c:v copy` for the
+        // h264 rung (the vp9 rung, if advertised, full-transcodes VP9 for a
+        // client that can't decode the copied h264).
+        Decision::VideoRemux { .. } => Some(master_url.clone()),
+        // B77 — a VIDEO AudioRemux (compatible video, undecodable audio) drives
+        // the master too: the segment surface re-encodes to a decodable codec.
+        Decision::AudioRemux { .. } if is_video => Some(master_url.clone()),
+        // Audio-only source whose codec the client can't direct-play → universal.
+        Decision::AudioRemux { .. } => Some(universal_audio_url.clone()),
+        _ => None,
     };
     // B74 — native players (Android TV / ExoPlayer) use the TranscodingUrl
     // verbatim and do NOT client-seek a transcode, so a resume must ride the
@@ -2452,8 +2380,8 @@ async fn playback_info(
         _ => None,
     };
     let route = match transcoding_url.as_deref() {
-        Some(u) if u.contains("/vp9/") => "vp9-fmp4",
-        Some(u) if u.contains("/master.m3u8") => "h264-hls",
+        Some(u) if u.contains("/master.m3u8") => "hls-master",
+        Some(u) if u.contains("/universal") => "audio",
         Some(_) => "other",
         None => "direct",
     };
@@ -2461,10 +2389,8 @@ async fn playback_info(
         media.id = id,
         user.name = %user.0.name,
         is_video,
-        is_firefox,
-        client_offers_vp9,
-        client_offers_h264,
-        force_webm,
+        is_web_client,
+        renditions = %renditions_param,
         source_codec = source.video_codec.as_deref().unwrap_or("?"),
         negotiated_video_codec = negotiated_video_codec.as_deref().unwrap_or("-"),
         route,
