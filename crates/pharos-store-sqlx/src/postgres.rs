@@ -36,7 +36,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
     series_folder, series_year, track_number, disc_number, release_year, \
-    synopsis, content_rating, network, release_date";
+    synopsis, content_rating, network, release_date, has_primary_art";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -1007,6 +1007,20 @@ impl MediaStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // Keep the denormalized `has_primary_art` flag (read back into the
+        // MediaItem, consulted by `image_tags_for`) in lock-step with the
+        // artwork table — its only writer. A Primary write sets the flag to
+        // whether the winning source is one the image route can actually serve
+        // (a local sidecar); a `url` Primary is not item-servable, so it clears
+        // the flag. Non-Primary roles never touch it.
+        if role.eq_ignore_ascii_case("Primary") {
+            sqlx::query("UPDATE media_items SET has_primary_art = $1 WHERE id = $2")
+                .bind(source.eq_ignore_ascii_case("local"))
+                .bind(id_i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -2932,6 +2946,7 @@ struct MediaRow {
     content_rating: Option<String>,
     network: Option<String>,
     release_date: Option<String>,
+    has_primary_art: bool,
 }
 
 impl MediaRow {
@@ -3012,6 +3027,7 @@ impl MediaRow {
             series,
             created_at: self.created_at,
             metadata,
+            has_primary_art: self.has_primary_art,
         })
     }
 }

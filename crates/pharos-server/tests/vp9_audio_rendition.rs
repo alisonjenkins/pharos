@@ -149,6 +149,7 @@ async fn seed_with_duration(
             series: None,
             created_at: None,
             metadata: Default::default(),
+            has_primary_art: false,
         })
         .await
         .unwrap();

@@ -96,6 +96,7 @@ async fn silent_video_emits_no_audio_stream_in_playback_info() {
         series: None,
         created_at: None,
         metadata: Default::default(),
+        has_primary_art: false,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -132,6 +133,7 @@ async fn container_alias_is_a_single_known_token() {
         series: None,
         created_at: None,
         metadata: Default::default(),
+        has_primary_art: false,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -182,6 +184,7 @@ async fn direct_play_omits_transcoding_sub_protocol() {
         series: None,
         created_at: None,
         metadata: Default::default(),
+        has_primary_art: false,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -241,6 +244,7 @@ async fn synth_ids_route_via_items_endpoint() {
         }),
         created_at: None,
         metadata: Default::default(),
+        has_primary_art: false,
     }];
     let (state, token) = seed_with_items(items).await;
     // Add a configured root so library ids exist.
@@ -299,6 +303,7 @@ async fn item_dto_keys_are_pascal_case() {
         series: None,
         created_at: None,
         metadata: Default::default(),
+        has_primary_art: false,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -361,6 +366,7 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
         series: None,
         created_at: None,
         metadata: Default::default(),
+        has_primary_art: false,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -389,7 +395,8 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
 
 /// (7) — Video items advertise Primary + Backdrop + Thumb ImageTags
 /// so jellyfin-web's tile grid renders covers without 404-ing on
-/// /Items/{id}/Images/Primary?tag=…. Audio gets Primary only.
+/// /Items/{id}/Images/Primary?tag=…. Audio gets Primary only when it has
+/// cover art (has_primary_art), never Backdrop/Thumb.
 #[actix_web::test]
 async fn video_item_advertises_primary_backdrop_thumb_image_tags() {
     let (state, token) = seed_with_items(vec![
@@ -436,8 +443,11 @@ async fn video_item_advertises_primary_backdrop_thumb_image_tags() {
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let tags = v["ImageTags"].as_object().expect("ImageTags object");
-    assert!(tags.contains_key("Primary"));
-    // Audio doesn't get Backdrop / Thumb (no frame to grab).
+    // Coverless audio (no local Primary sidecar) advertises NO image tags: the
+    // image route can't serve any of them, so a Primary tag would only 404 on
+    // every grid render. Audio never gets Backdrop / Thumb (no frame to grab);
+    // the covered-audio Primary case is asserted in the dto unit test.
+    assert!(!tags.contains_key("Primary"));
     assert!(!tags.contains_key("Backdrop"));
     assert!(!tags.contains_key("Thumb"));
 }

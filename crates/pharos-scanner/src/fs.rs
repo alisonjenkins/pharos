@@ -1044,6 +1044,10 @@ impl<P: Prober> FsScanner<P> {
                     // a later EPIC D pass; the scanner emits an empty
                     // block today.
                     metadata: Default::default(),
+                    // Set by `set_artwork` when `persist_artwork` records a
+                    // local Primary sidecar (it runs after this row is put);
+                    // false here so a coverless item stays false.
+                    has_primary_art: false,
                 })
             }
             Err(err) => {

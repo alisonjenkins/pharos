@@ -30,6 +30,7 @@ fn media_item(id: MediaId, title: &str, kind: MediaKind) -> MediaItem {
         series: None,
         created_at: Some(1_700_000_000 + id as i64),
         metadata: MediaMetadata::default(),
+        has_primary_art: false,
     }
 }
 
