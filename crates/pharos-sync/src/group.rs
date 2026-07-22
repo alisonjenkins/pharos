@@ -835,13 +835,23 @@ impl GroupState {
     /// strings ('Unpause' / 'Ready' — matched case-sensitively).
     fn start_playing(&mut self, position_ms: u64, reason: &str) {
         let server_ms = self.server_ms_now();
+        let at_server_ms = server_ms + self.lead_time_ms();
+        // C — anchor at the SCHEDULED start instant (`at_server_ms`), NOT `now`.
+        // Clients play `position_ms` AT `at_server_ms` (Jellyfin's `When`), so
+        // anchoring at `now` made the server model run `lead_time` ahead of every
+        // client: each pause then broadcast a position `lead` in the future,
+        // clients jumped forward on pause, and the persisted paused position
+        // re-anchored on resume — the forward creep compounded per pause.
+        // Anchoring at `at_server_ms` makes `current_position_ms` read exactly
+        // what clients play (and `position_ms` during the pre-roll window, where
+        // the saturating_sub clamps the not-yet-started playback to the start).
         self.playback = PlaybackState::Playing {
             position_ms,
-            anchor_server_ms: server_ms,
+            anchor_server_ms: at_server_ms,
         };
         self.clear_buffering_freeze();
         self.broadcast(ServerMsg::Play {
-            at_server_ms: server_ms + self.lead_time_ms(),
+            at_server_ms,
             position_ms,
         });
         self.broadcast(ServerMsg::StateUpdate {
@@ -1730,9 +1740,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // them so a later resolve_waiting / anti-wedge can't contradict it.
             state.waiting = None;
             state.clear_buffering_freeze();
+            // C — anchor at the scheduled start instant, not `now` (see
+            // start_playing): clients play `position_ms` at `at_server_ms`.
             state.playback = PlaybackState::Playing {
                 position_ms,
-                anchor_server_ms: server_ms,
+                anchor_server_ms: at_server_ms,
             };
             state.broadcast(ServerMsg::Play {
                 at_server_ms,
@@ -3802,6 +3814,44 @@ mod tests {
         assert!(
             play.is_some(),
             "the buffering member's Ready alone must resolve the gate"
+        );
+    }
+
+    /// C: playback is anchored at the SCHEDULED start instant, not `now`, so
+    /// the server's position model matches what clients actually play. A pause
+    /// during the pre-roll (sub-`lead`) window must report the START position,
+    /// not one advanced by `lead` (which, pre-fix, made every pause jump clients
+    /// forward and compounded over repeated pauses).
+    #[tokio::test]
+    async fn play_position_does_not_run_ahead_of_clients_by_lead() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (_m2, _rx2) = add_member(&h, &sinks, "second").await;
+        // No clock observations → lead == MIN_LEAD (200ms).
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // Well within the ~200ms pre-roll: playback hasn't started for clients.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut pause_pos = None;
+        while let Ok(msg) = rx1.try_recv() {
+            if let ServerMsg::Pause { position_ms, .. } = msg {
+                pause_pos = Some(position_ms);
+            }
+        }
+        let pos = pause_pos.expect("pause must broadcast a position");
+        assert!(
+            pos <= 10_050,
+            "pre-roll pause must report the start position (~10000), not lead-advanced; got {pos}"
         );
     }
 
