@@ -515,9 +515,16 @@ async fn handle_inbound(
                 })
                 .await;
         }
-        "SyncPlayPause" | "SyncPlayUnpause" => {
+        "SyncPlayPause" => {
             let Some(h) = current_group else { return };
             let _ = h.tx.send(GroupMsg::LeaderPause { sender: member_id }).await;
+        }
+        "SyncPlayUnpause" => {
+            // A RESUME verb — must not fold into Pause (the old mapping inverted
+            // it). Route to the shared Unpause so it resumes the group (gating
+            // only on any members still buffering), the counterpart to Pause.
+            let Some(h) = current_group else { return };
+            let _ = h.tx.send(GroupMsg::Unpause { sender: member_id }).await;
         }
         "SyncPlaySeek" => {
             let Some(h) = current_group else { return };
