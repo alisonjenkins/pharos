@@ -603,7 +603,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let mut state = AppState::load(stores, cfg.server.name.clone())
         .await?
         .with_media_roots(scan_roots.clone())
-        .with_libraries(libraries);
+        .with_libraries(libraries)
+        // T11 — the manual Identify endpoints build a one-off TMDB/TVDB
+        // enricher on demand; mirrors the keys the T9 backfill spawn below
+        // already reads off `cfg`.
+        .with_metadata_provider_keys(cfg.tmdb.api_key.clone(), cfg.tvdb.api_key.clone())
+        .with_metadata_config(cfg.metadata.clone());
     // T68 — resolve the parental-rating score table (config override, else the
     // built-in US default) backing per-user MaxParentalRating enforcement.
     state.parental_ratings =
