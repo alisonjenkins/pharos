@@ -649,6 +649,36 @@ pub fn match_best(
     best.filter(|b| b.confidence >= min_confidence)
 }
 
+/// Parse a bare `YYYY-MM-DD` date (TMDB/TVDB style) to unix seconds at UTC
+/// midnight. `None` on any malformed/empty input. Pure integer arithmetic —
+/// no date-library dependency (uses the days-from-civil algorithm).
+pub fn parse_ymd_to_unix(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let mut it = s.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: u32 = it.next()?.parse().ok()?;
+    let d: u32 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None; // reject extra components
+    }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) * 86_400)
+}
+
+/// Howard Hinnant's days-from-civil: days since 1970-01-01 for a proleptic
+/// Gregorian (y, m in [1,12], d in [1,31]). Exact integer arithmetic.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * i64::from(mp) + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 /// LIB-C2 — a person entity row (one per distinct cast/crew member
 /// name). `wire_id` is the stable [`person_wire_id`] the Jellyfin DTO
 /// emits as the Person's `Id`; the integer `id` is the internal PK used

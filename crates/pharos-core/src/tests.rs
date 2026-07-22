@@ -497,3 +497,20 @@ fn title_similarity_ignores_case_and_punctuation() {
     assert!(title_similarity("WALL·E", "wall e") > 0.85);
     assert!(title_similarity("Se7en", "Seven") < 0.9); // not falsely perfect
 }
+
+#[test]
+fn parse_ymd_epoch_and_known_dates() {
+    assert_eq!(parse_ymd_to_unix("1970-01-01"), Some(0));
+    assert_eq!(parse_ymd_to_unix("2021-10-01"), Some(1_633_046_400)); // 2021-10-01T00:00:00Z
+    assert_eq!(parse_ymd_to_unix("2000-02-29"), Some(951_782_400)); // leap day
+    assert_eq!(parse_ymd_to_unix("  2011-04-17  "), Some(1_302_998_400)); // trimmed
+}
+
+#[test]
+fn parse_ymd_rejects_malformed() {
+    assert_eq!(parse_ymd_to_unix(""), None);
+    assert_eq!(parse_ymd_to_unix("2021"), None);
+    assert_eq!(parse_ymd_to_unix("2021-13-01"), None);
+    assert_eq!(parse_ymd_to_unix("not-a-date"), None);
+    assert_eq!(parse_ymd_to_unix("2021-10-01-05"), None);
+}
