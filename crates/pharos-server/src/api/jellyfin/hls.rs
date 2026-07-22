@@ -531,31 +531,42 @@ fn qs_video_bitrate_cap(qs: &str) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
-/// Parse the `renditions` query param — the CSV of OUTPUT video codecs the
-/// unified master should advertise, in preference order, so the client's own
-/// `MediaSource.isTypeSupported` picks the one it can actually decode (no UA
-/// sniffing). Only the codecs pharos has a segment surface for are honoured
-/// (`h264` → mpegts `/hls1`, `vp9` → fMP4 `/vp9`). Empty / absent → the h264
-/// default (backwards compat + a native single-codec client).
-fn parse_renditions(qs: &str) -> Vec<&'static str> {
+/// The single video codec a master playlist may advertise. A master carries
+/// EXACTLY ONE of these. The h264 rungs mux their audio into the mpegts
+/// segments; the vp9 rung demuxes audio into a `DEFAULT=YES`
+/// `EXT-X-MEDIA:TYPE=AUDIO` group. Mixing the two audio models in one master is
+/// invalid: hls.js attaches the vp9 Opus group to the muxed h264 variant (which
+/// already carries AAC), the two audio sources never align, the video buffer
+/// starves, and the browser buffers forever (`bufferFullError`). Holding ONE
+/// `MasterVideo` — never a `Vec` of codecs — makes that mixed master
+/// structurally unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterVideo {
+    H264,
+    Vp9,
+}
+
+/// Select the master's single video codec from the `renditions` CSV. PlaybackInfo
+/// already learned which codecs this client decodes and negotiation ranked them
+/// best-first, so the FIRST recognised token is always a codec the client can
+/// decode (h264 for every real browser; a genuinely h264-incapable client ranks
+/// vp9 first). Absent / empty → h264: the always-decodable, hardware-encoded
+/// default, and the codec a native single-rung client expects.
+fn select_master_video(qs: &str) -> MasterVideo {
     for kv in qs.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
             if k.eq_ignore_ascii_case("renditions") {
-                let mut out: Vec<&'static str> = Vec::new();
                 for tok in v.split(',').map(|s| s.trim().to_ascii_lowercase()) {
                     match tok.as_str() {
-                        "h264" | "avc" | "avc1" if !out.contains(&"h264") => out.push("h264"),
-                        "vp9" | "vp09" if !out.contains(&"vp9") => out.push("vp9"),
+                        "h264" | "avc" | "avc1" => return MasterVideo::H264,
+                        "vp9" | "vp09" => return MasterVideo::Vp9,
                         _ => {}
                     }
-                }
-                if !out.is_empty() {
-                    return out;
                 }
             }
         }
     }
-    vec!["h264"]
+    MasterVideo::H264
 }
 
 /// Append the H.264/mpegts master rungs: the backwards-compat `main` rung + the
@@ -640,15 +651,16 @@ async fn master_playlist(
         qs_video_bitrate_cap(req.query_string()),
     );
 
-    // The OUTPUT codecs to advertise, in preference order. A multi-codec master
-    // lists an h264/mpegts rung AND a vp9/fMP4 rung; the client's own
-    // MediaSource.isTypeSupported drops any rung it can't decode and plays the
-    // rest — so a browser that genuinely can't decode H.264 self-selects VP9
-    // with NO server-side UA sniffing. `renditions` is chosen capability-aware
-    // by PlaybackInfo; absent → h264 (backwards compat, audio-only, native).
-    let renditions = parse_renditions(req.query_string());
+    // The single OUTPUT video codec to advertise. A master may carry exactly one
+    // (see `MasterVideo`): the h264 rungs mux audio into mpegts while the vp9
+    // rung demuxes it into a DEFAULT audio group, and mixing those two audio
+    // models in one master wedges hls.js (the Opus group binds to the muxed h264
+    // variant → endless buffering). PlaybackInfo already knows which codecs the client
+    // decodes and ranks them best-first, so the first `renditions` token is one
+    // the client can play; absent → h264 (backwards compat, audio-only, native).
+    let video = select_master_video(req.query_string());
     let is_audio = matches!(item.kind, pharos_core::MediaKind::Audio);
-    let has_fmp4 = !is_audio && renditions.contains(&"vp9");
+    let has_fmp4 = !is_audio && video == MasterVideo::Vp9;
 
     let mut body = String::new();
     // fMP4 (VP9) media segments require HLS v7; an mpegts-only master stays v3.
@@ -696,15 +708,11 @@ async fn master_playlist(
             .body(body));
     }
 
-    // One rung group per advertised codec. hls.js evaluates each STREAM-INF's
-    // CODECS against isTypeSupported and plays the first it can decode; a
-    // browser lacking H.264 in MSE simply drops the h264 rungs and takes VP9.
-    for r in &renditions {
-        match *r {
-            "h264" => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
-            "vp9" => push_vp9_rungs(&mut body, &id, &qs, &item),
-            _ => {}
-        }
+    // Exactly one codec's rungs — never both. The h264 family shares one muxed
+    // audio model across its ladder; the vp9 rung owns its demuxed audio group.
+    match video {
+        MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
+        MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item),
     }
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -2764,27 +2772,45 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
-    // The multi-codec master: one h264/mpegts rung AND one vp9/fMP4 rung, so the
-    // client's own MediaSource.isTypeSupported picks the codec it can decode —
-    // no server-side UA sniffing.
+    // A master carries EXACTLY ONE video codec — never a muxed-audio h264 rung
+    // AND a demuxed-audio-group vp9 rung together. Mixing the two audio models
+    // wedges hls.js: the DEFAULT Opus group binds to the muxed h264 variant and
+    // the browser buffers forever. When negotiation ranks h264 first (every real
+    // browser), the client gets a clean h264-only master.
     #[actix_web::test]
-    async fn multi_codec_master_lists_both_h264_and_vp9_rungs() {
+    async fn multi_codec_request_collapses_to_the_first_codec_no_mix() {
         let s = master_body(Some("h264,vp9")).await;
-        // fMP4 (vp9) rung present → HLS v7.
-        assert!(s.contains("#EXT-X-VERSION:7"), "{s}");
-        // h264 rung: avc1 CODECS pointing at the mpegts /main.m3u8 surface.
+        // h264 ranked first → h264/mpegts master, v3, muxed audio.
+        assert!(s.contains("#EXT-X-VERSION:3"), "{s}");
         assert!(
             s.contains("avc1.") && s.contains("/Videos/9/main.m3u8"),
             "h264 rung missing: {s}"
         );
-        // vp9 rung: vp09+opus CODECS + continuous-audio group → fMP4 /vp9 surface.
+        // The invalid mix: no vp9 surface and NO demuxed audio group alongside
+        // the muxed h264 rungs.
+        assert!(
+            !s.contains("vp09") && !s.contains("/videos/9/vp9/main.m3u8"),
+            "h264-first master leaked a vp9 rung (the wedging mix): {s}"
+        );
+        assert!(
+            !s.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "a muxed-audio h264 master must not carry a demuxed audio group: {s}"
+        );
+    }
+
+    // A client that ranks vp9 first (genuinely h264-incapable) gets a clean
+    // vp9-only master — its own audio group, no stray h264 rung.
+    #[actix_web::test]
+    async fn vp9_first_request_collapses_to_a_clean_vp9_master() {
+        let s = master_body(Some("vp9,h264")).await;
+        assert!(s.contains("#EXT-X-VERSION:7"), "{s}");
         assert!(
             s.contains("CODECS=\"vp09.00.40.08,opus\"") && s.contains("/videos/9/vp9/main.m3u8"),
             "vp9 rung missing: {s}"
         );
         assert!(
-            s.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
-            "vp9 needs its continuous-audio group: {s}"
+            !s.contains("/Videos/9/main.m3u8"),
+            "vp9-first master leaked an h264 mpegts rung (the wedging mix): {s}"
         );
     }
 
