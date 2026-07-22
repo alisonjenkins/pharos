@@ -758,6 +758,45 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             tracing::info!("T81 person-image backfill disabled (no [tmdb].api_key)");
         }
     }
+    // T9 — online metadata/artwork enrichment (TMDB movies, TVDB→TMDB
+    // episodes). Gated on a provider key AND the extracted-image cache being
+    // configured (art download has nowhere to land otherwise); mirrors the
+    // T81 spawn above. Provide keys out-of-band via `PHAROS_TMDB_API_KEY` /
+    // `PHAROS_TVDB_API_KEY`, never config.toml.
+    {
+        let tmdb = match cfg.tmdb.api_key.as_deref() {
+            Some(key) if !key.is_empty() => Some(pharos_server::tmdb::TmdbEnricher(
+                pharos_server::tmdb::TmdbClient::new(key.to_string()),
+            )),
+            _ => None,
+        };
+        let tvdb = match cfg.tvdb.api_key.as_deref() {
+            Some(key) if !key.is_empty() => Some(pharos_server::tvdb::TvdbEnricher(
+                pharos_server::tvdb::TvdbClient::new(key.to_string()),
+            )),
+            _ => None,
+        };
+        match (tmdb.is_some() || tvdb.is_some(), state.images.clone()) {
+            (true, Some(images)) => {
+                pharos_server::metadata_backfill::spawn(
+                    state.stores.clone(),
+                    state.bg_io.clone(),
+                    std::sync::Arc::new(images),
+                    tmdb,
+                    tvdb,
+                    cfg.metadata.clone(),
+                );
+            }
+            (true, None) => {
+                tracing::warn!(
+                    "T9 metadata backfill disabled: provider key set but no image cache configured"
+                );
+            }
+            (false, _) => {
+                tracing::info!("T9 metadata backfill disabled (no [tmdb]/[tvdb] api_key)");
+            }
+        }
+    }
     // Cap the extracted-image cache. Unlike the trickplay/HLS caches it has no
     // in-line eviction, so on a large library posters/backdrops/thumbs/scaled
     // artwork can slowly fill the shared cache volume. A periodic janitor
