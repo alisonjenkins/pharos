@@ -2044,6 +2044,96 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
     });
 }
 
+/// How many leading segments the cold-start prewarm warms into the cache at
+/// PlaybackInfo time. hls.js needs a few buffered segments before it starts
+/// playback, and segment 0 is otherwise the FIRST time anything spawns ffmpeg
+/// and opens the (often large, NFS-backed) source — a cold hit that overran
+/// hls.js's fragment-load timeout and stalled the very start of playback. Three
+/// covers hls.js's initial buffer; the on-demand prefetch takes over from
+/// segment 0 onward (it only ever warms the segments after the base, never the
+/// base itself).
+const COLD_START_PREWARM_SEGS: u32 = 3;
+
+/// Cold-start prewarm: transcode the first [`COLD_START_PREWARM_SEGS`] h264/
+/// mpegts `main`-rung segments into the HLS cache the moment PlaybackInfo
+/// negotiates a transcode — seconds before the client (which first runs a
+/// bitrate probe + intro/next-episode fetches) actually asks for segment 0.
+/// By the time it does, the segments are already cached → no cold ffmpeg spawn
+/// on the critical path, no first-fragment `fragLoadTimeOut`.
+///
+/// The opts are built EXACTLY as [`serve_segment`] builds them for the `main`
+/// rung (variant `None`): `build_segment_opts(Some(session), …)` then the same
+/// URL-carried `VideoBitrate` cap + clamp. `&VideoBitrate=` equals the
+/// session's negotiated ceiling, so the two agree and the prewarmed bytes hit
+/// the exact cache key the client's request keys on. No-op without a cache.
+pub(super) fn prewarm_cold_start(
+    state: &web::Data<AppState>,
+    session: crate::transcode_sessions::TranscodeSession,
+    audio_stream_index: Option<u32>,
+    subtitle_stream_index: Option<u32>,
+    video_bitrate_cap: Option<u64>,
+) {
+    if state.hls.is_none() {
+        return;
+    }
+    let media_id = session.media_id;
+    let state = state.clone();
+    actix_web::rt::spawn(async move {
+        let Ok(item) = fetch_item(&state, media_id).await else {
+            return;
+        };
+        let total_segs = item
+            .probe
+            .duration_ms
+            .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32)
+            .unwrap_or(u32::MAX);
+        for seg in 0..COLD_START_PREWARM_SEGS.min(total_segs) {
+            let state = state.clone();
+            let item = item.clone();
+            let session = session.clone();
+            actix_web::rt::spawn(async move {
+                let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+                let start_ticks = Ticks::from_seconds(start_secs).0;
+                let duration_ticks = Ticks::from_seconds(dur_secs).0;
+                let mut opts = build_segment_opts(
+                    Some(session),
+                    &item,
+                    start_ticks,
+                    duration_ticks,
+                    audio_stream_index,
+                    subtitle_stream_index,
+                );
+                // Mirror serve_segment's URL-carried VideoBitrate cap + clamp so
+                // the prewarmed key matches the client's eventual request.
+                if let (Some(cap), Some(cur)) = (video_bitrate_cap, opts.video_bitrate_bps) {
+                    opts.video_bitrate_bps =
+                        Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
+                }
+                // Same per-segment burn gating serve_segment applies before the
+                // cache read (the burn index is part of the key).
+                gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+                resolve_text_burn_assets(&state, &item, &mut opts).await;
+                let Some(cache) = state.hls.as_ref() else {
+                    return;
+                };
+                if let Err(e) = cache
+                    .segment_bytes_keyed(
+                        item.id,
+                        seg,
+                        opts.audio_source_stream_index,
+                        opts.burn_subtitle_stream_index,
+                        &item.path,
+                        &opts,
+                    )
+                    .await
+                {
+                    tracing::debug!(media.id = item.id, seg, error = %e, "cold-start prewarm failed");
+                }
+            });
+        }
+    });
+}
+
 /// How far ahead (in segments) the window-aware burn prefetch looks for the
 /// next subtitle-bearing segments, and how many it front-loads per request.
 /// B51 — burn segments encode ~2× slower than plain ones (overlay decode +

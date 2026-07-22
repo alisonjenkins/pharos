@@ -2417,6 +2417,40 @@ async fn playback_info(
         )
         .await;
 
+    // Cold-start prewarm (a): the moment a video transcode is negotiated onto
+    // the h264/mpegts master, warm its first few `main`-rung segments into the
+    // cache. The client won't request segment 0 until after its bitrate probe +
+    // intro/next-episode fetches, so the encode runs off the critical path and
+    // the opening `fragLoadTimeOut` stall (cold ffmpeg spawn on segment 0) is
+    // gone. Only when h264 is the rung the client actually starts on (every
+    // real browser); a vp9-first client never touches /hls1/main, so skip it.
+    if route == "hls-master" && renditions.first().is_some_and(|c| c == "h264") {
+        let audio_idx =
+            query_param(&stream_selection, "AudioStreamIndex").and_then(|v| v.parse::<u32>().ok());
+        let sub_idx = query_param(&stream_selection, "SubtitleStreamIndex")
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&i| i >= 0)
+            .map(|i| i as u32);
+        let video_bitrate_cap = match &decision {
+            Decision::Transcode {
+                max_video_bitrate_bps,
+                ..
+            } => *max_video_bitrate_bps,
+            _ => remote_ceiling,
+        };
+        crate::api::jellyfin::hls::prewarm_cold_start(
+            &state,
+            crate::transcode_sessions::TranscodeSession {
+                media_id: id,
+                decision: decision.clone(),
+                source_probe: probe.clone(),
+            },
+            audio_idx,
+            sub_idx,
+            video_bitrate_cap,
+        );
+    }
+
     let sidecars = discover_sidecars(&item.path).await;
     let sidecar_langs: Vec<Option<String>> = sidecars
         .iter()
