@@ -86,3 +86,104 @@ pub trait OnlineEnricher: Send + Sync {
     /// bridged art). `None` on any transport/HTTP error.
     fn fetch_image_bytes(&self, url: &str) -> impl Future<Output = Option<Vec<u8>>> + Send;
 }
+
+/// Sets `slot` only when it is currently unset — local data always wins
+/// over online enrichment.
+fn fill<T>(slot: &mut Option<T>, v: Option<T>) {
+    if slot.is_none() {
+        if let Some(v) = v {
+            *slot = Some(v);
+        }
+    }
+}
+
+/// Join-entity rows (genres/people) [`apply_enrichment`] decided should be
+/// linked to the item — only non-empty when the item had none of that kind
+/// already (fill-if-empty; see [`apply_enrichment`]).
+pub struct AppliedEnrichment {
+    pub genres: Vec<String>,
+    pub people: Vec<PersonRef>,
+}
+
+/// Folds one provider's [`EnrichedMetadata`] onto a stored `item` WITHOUT
+/// overriding curated local data: scalars fill only when the item's field
+/// is `None` (local always wins), and join entities (genres/people) are
+/// handed back for linking ONLY when `counts` shows the item currently has
+/// none of that kind (fill-if-empty) — a curated NFO genre list is never
+/// diluted by an online guess.
+///
+/// Deliberately does not touch `title` (local title stays authoritative)
+/// or `metadata.provider_ids` (the orchestrator sets those once it knows
+/// which provider matched — T9).
+pub fn apply_enrichment(
+    item: &mut pharos_core::MediaItem,
+    counts: pharos_core::EntityCounts,
+    e: &EnrichedMetadata,
+) -> AppliedEnrichment {
+    let md = &mut item.metadata;
+    fill(&mut md.overview, e.overview.clone());
+    fill(&mut md.tagline, e.tagline.clone());
+    fill(&mut md.production_year, e.production_year);
+    fill(&mut md.premiere_date, e.premiere_date);
+    fill(&mut md.community_rating, e.community_rating);
+    fill(&mut md.official_rating, e.official_rating.clone());
+    AppliedEnrichment {
+        genres: if counts.genres == 0 {
+            e.genres.clone()
+        } else {
+            vec![]
+        },
+        people: if counts.people == 0 {
+            e.people.clone()
+        } else {
+            vec![]
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `MediaItem` with all metadata fields `None`/empty — the baseline
+    /// for fill-if-absent assertions.
+    fn bare_movie() -> pharos_core::MediaItem {
+        pharos_core::MediaItem {
+            kind: MediaKind::Movie,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_enrichment_fills_only_missing_scalars() {
+        let mut item = bare_movie(); // helper: all metadata None
+        item.metadata.overview = Some("local overview".into());
+        let e = EnrichedMetadata {
+            overview: Some("online overview".into()),
+            production_year: Some(1999),
+            genres: vec!["Sci-Fi".into()],
+            provider_id: Some("603".into()),
+            ..EnrichedMetadata::default()
+        };
+        let applied = apply_enrichment(&mut item, pharos_core::EntityCounts::default(), &e);
+        assert_eq!(item.metadata.overview.as_deref(), Some("local overview")); // local kept
+        assert_eq!(item.metadata.production_year, Some(1999)); // gap filled
+        assert_eq!(applied.genres, vec!["Sci-Fi"]); // item had 0 genres
+    }
+
+    #[test]
+    fn apply_enrichment_skips_joins_when_already_populated() {
+        let mut item = bare_movie();
+        let e = EnrichedMetadata {
+            genres: vec!["Sci-Fi".into()],
+            ..EnrichedMetadata::default()
+        };
+        let counts = pharos_core::EntityCounts {
+            genres: 3,
+            people: 0,
+            studios: 0,
+        };
+        let applied = apply_enrichment(&mut item, counts, &e);
+        assert!(applied.genres.is_empty()); // local NFO genres present -> online genres not linked
+    }
+}
