@@ -567,6 +567,13 @@ struct GroupState {
     /// can never freeze the group past `BUFFERING_MAX_MS`. `None` whenever the
     /// group is not frozen for buffering. (B55.)
     buffering_since: Option<tokio::time::Instant>,
+    /// Intent captured when the V19 buffering freeze engages: was the group
+    /// PLAYING at that moment (→ resume Playing when it lifts) or not. Without
+    /// it, every freeze-recovery path force-resumed Playing — so a user pause
+    /// during/around a member's buffer, or a track-change reload while already
+    /// paused, played the group out from under the pause. Persisted so a
+    /// mid-freeze replica takeover resumes to the right state.
+    buffering_resume_playing: bool,
     playback: PlaybackState,
     queue: PlayQueue,
     /// `Some` while the readiness gate is open (group is `Waiting`).
@@ -597,6 +604,7 @@ impl GroupState {
             leader: None,
             group_paused_due_to_buffering: false,
             buffering_since: None,
+            buffering_resume_playing: false,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
             waiting: None,
@@ -779,6 +787,37 @@ impl GroupState {
             .collect()
     }
 
+    /// Drop every V19 buffering-freeze bookkeeping field. A deliberate pause, a
+    /// seek, or a resume all supersede an in-flight freeze; this is the ONE
+    /// place those flags are cleared so no path forgets one (a stray
+    /// `buffering_since` re-arms the anti-wedge and phantom-resumes the group
+    /// ~30s later). Does not touch `playback`.
+    fn clear_buffering_freeze(&mut self) {
+        self.group_paused_due_to_buffering = false;
+        self.buffering_since = None;
+        self.buffering_resume_playing = false;
+    }
+
+    /// Lift a V19 buffering freeze, resuming per the intent captured when it
+    /// engaged: `Playing` if the group was playing (the normal mid-play stall),
+    /// else settle `Paused` (a freeze that engaged around a paused group / a
+    /// user paused during the freeze). Clears the freeze bookkeeping either way.
+    /// Caller must ensure the freeze should lift (no buffering members, no open
+    /// readiness gate).
+    fn resume_after_buffering(&mut self) {
+        let position_ms = self.current_position_ms();
+        if self.buffering_resume_playing {
+            self.start_playing(position_ms, "Ready");
+        } else {
+            self.playback = PlaybackState::Paused { position_ms };
+            self.clear_buffering_freeze();
+            self.broadcast(ServerMsg::StateUpdate {
+                state: GroupPlayState::Paused,
+                reason: "Ready".into(),
+            });
+        }
+    }
+
     /// Freeze playback into `Paused` at the current live position and return
     /// it (Idle stays Idle at 0). The value every outbound `Pause` must carry —
     /// jellyfin-web's `schedulePause` seeks to the command's PositionTicks, so
@@ -800,8 +839,7 @@ impl GroupState {
             position_ms,
             anchor_server_ms: server_ms,
         };
-        self.group_paused_due_to_buffering = false;
-        self.buffering_since = None;
+        self.clear_buffering_freeze();
         self.broadcast(ServerMsg::Play {
             at_server_ms: server_ms + self.lead_time_ms(),
             position_ms,
@@ -971,6 +1009,7 @@ impl GroupState {
                 .collect(),
             leader: self.leader,
             group_paused_due_to_buffering: self.group_paused_due_to_buffering,
+            buffering_resume_playing: self.buffering_resume_playing,
             playback: match self.playback {
                 PlaybackState::Idle => PersistPlayback::Idle,
                 PlaybackState::Playing {
@@ -1030,6 +1069,10 @@ impl GroupState {
             .collect();
         self.leader = ps.leader;
         self.group_paused_due_to_buffering = ps.group_paused_due_to_buffering;
+        // Back-fill a frozen-but-fieldless (pre-field) snapshot as "was
+        // playing" — a freeze only ever engages from a Playing group.
+        self.buffering_resume_playing =
+            ps.buffering_resume_playing || ps.group_paused_due_to_buffering;
         // B55 — a group hydrated mid-freeze restores members with cleared
         // buffering flags (they re-report on reconnect), so the BufferingEnd
         // auto-resume can never fire on its own. Re-arm the anti-wedge deadline
@@ -1121,6 +1164,12 @@ struct PersistState {
     members: Vec<PersistMember>,
     leader: Option<MemberId>,
     group_paused_due_to_buffering: bool,
+    /// Resume intent captured when the freeze engaged. `default` keeps older
+    /// snapshots (written before this field) deserializable; `apply_persist`
+    /// back-fills a frozen-but-fieldless snapshot as "was playing" (the only
+    /// state a freeze engages from).
+    #[serde(default)]
+    buffering_resume_playing: bool,
     playback: PersistPlayback,
     queue_items: Vec<PersistQueueItem>,
     playing_index: usize,
@@ -1316,13 +1365,13 @@ impl GroupHandle {
                             m.buffering = false;
                         }
                         if state.waiting.is_none() {
-                            let position_ms = state.current_position_ms();
-                            state.start_playing(position_ms, "Ready");
+                            // Resume per the captured intent (Playing normally;
+                            // Paused if the freeze engaged around a user pause).
+                            state.resume_after_buffering();
                         } else {
                             // A gate owns the resume; just disarm the freeze so
                             // this arm doesn't spin.
-                            state.group_paused_due_to_buffering = false;
-                            state.buffering_since = None;
+                            state.clear_buffering_freeze();
                         }
                         state.persist();
                     }
@@ -1433,8 +1482,7 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
         && !state.members.values().any(|m| m.buffering)
     {
         tracing::info!(group = %state.id, "syncplay: buffering member left — lifting freeze");
-        let position_ms = state.current_position_ms();
-        state.start_playing(position_ms, "Ready");
+        state.resume_after_buffering();
     }
 }
 
@@ -1628,6 +1676,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 return;
             }
             let at_server_ms = state.server_ms_now() + state.lead_time_ms();
+            // A deliberate pause supersedes an in-flight V19 buffering freeze.
+            state.clear_buffering_freeze();
             // Freeze position at the moment we paused so late joiners
             // get the correct still-frame.
             let position_ms = state.freeze_paused_position();
@@ -1700,10 +1750,23 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 rec.buffering = true;
             }
             // V19: one corrective Pause, not a storm. If already paused due
-            // to another member's buffering, do nothing.
-            if !state.group_paused_due_to_buffering && state.members.values().any(|m| m.buffering) {
+            // to another member's buffering, do nothing. Only a PLAYING group
+            // freezes: buffer isolation exists to pause a party that is playing
+            // when one member stalls — a group that is already Paused (a user
+            // pause, or a track-change reload while paused) has nothing to
+            // isolate, and freezing it would resume Playing on the reload's
+            // Ready, playing out from under the pause.
+            if !state.group_paused_due_to_buffering
+                && matches!(state.playback, PlaybackState::Playing { .. })
+                && state.members.values().any(|m| m.buffering)
+            {
                 tracing::info!(group = %state.id, member = %member_id, "syncplay: member buffering — freezing group (V19)");
                 state.group_paused_due_to_buffering = true;
+                // Capture resume intent BEFORE freeze_paused_position() below
+                // overwrites Playing → Paused. Guarded on Playing above, so this
+                // is always true here; kept explicit so the recovery paths read
+                // one field rather than re-deriving intent from clobbered state.
+                state.buffering_resume_playing = true;
                 // B55 — arm the anti-wedge deadline the moment the freeze
                 // engages so a member buffering forever (or vanishing mid-buffer
                 // without a BufferingEnd) can't hold the group past
@@ -1747,8 +1810,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 && !state.members.values().any(|m| m.buffering)
                 && state.waiting.is_none()
             {
-                let position_ms = state.current_position_ms();
-                state.start_playing(position_ms, "Ready");
+                state.resume_after_buffering();
             }
         }
         GroupMsg::Unpause { sender: _ } => {
@@ -1784,6 +1846,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             let at_server_ms = state.server_ms_now() + state.lead_time_ms();
             // Cancel any pending readiness gate — we're pausing, not starting.
             state.waiting = None;
+            // A deliberate pause supersedes an in-flight V19 buffering freeze:
+            // clear its bookkeeping so a member's later Ready / the anti-wedge
+            // timer can't force-resume the group out from under this pause.
+            state.clear_buffering_freeze();
             let position_ms = state.freeze_paused_position();
             state.broadcast(ServerMsg::Pause {
                 at_server_ms,
@@ -1890,9 +1956,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // automatically. Real Jellyfin does exactly this
                 // (WaitingGroupState issues an internal Unpause once
                 // IsBuffering() clears); without it every network hiccup
-                // paused the group until a human pressed play.
-                let position_ms = state.current_position_ms();
-                state.start_playing(position_ms, "Ready");
+                // paused the group until a human pressed play. Resume per the
+                // captured intent — a freeze that engaged around a user pause
+                // settles Paused rather than force-playing.
+                state.resume_after_buffering();
             } else if matches!(state.playback, PlaybackState::Playing { .. }) {
                 // No waiting gate: the group already resolved (often because
                 // the ready-timeout fired before THIS member's player finished
@@ -1939,8 +2006,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     && !state.members.values().any(|m| m.buffering)
                     && state.waiting.is_none()
                 {
-                    let position_ms = state.current_position_ms();
-                    state.start_playing(position_ms, "Ready");
+                    state.resume_after_buffering();
                 }
             }
         }
@@ -2614,11 +2680,21 @@ mod tests {
         // V19: a single broadcast of Pause across the group; subsequent
         // BufferingStart from another member does NOT trigger a second
         // broadcast. Each broadcast = one Pause per member sink.
-        let (h, sinks, mut leader_rx, _leader) = fresh().await;
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
         let (m2, mut m2_rx) = add_member(&h, &sinks, "b").await;
         let (m3, mut m3_rx) = add_member(&h, &sinks, "c").await;
 
-        // Drain MemberJoined notifications.
+        // The group must be PLAYING for a member's buffer to freeze it (V19
+        // buffer isolation only pauses a playing party).
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Drain MemberJoined + the Play notifications.
         while leader_rx.try_recv().is_ok() {}
         while m2_rx.try_recv().is_ok() {}
         while m3_rx.try_recv().is_ok() {}
@@ -3046,6 +3122,118 @@ mod tests {
             snapshot_of(&h).await.play_state,
             GroupPlayState::Playing,
             "group must be Playing again after the opt-out"
+        );
+    }
+
+    /// Root Cause A: a deliberate pause DURING a member's buffer freeze must
+    /// win — the later Ready must NOT force-resume the group out from under the
+    /// user's pause. Before the intent capture, every freeze recovery path
+    /// called start_playing unconditionally.
+    #[tokio::test]
+    async fn user_pause_during_buffer_freeze_is_not_overridden_by_ready() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // m2 buffers → group freezes (was playing → resume intent = play).
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        // The user deliberately pauses while m2 is still buffering.
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // m2 recovers → Ready. The group must STAY paused, not resume.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut saw_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                saw_play = true;
+            }
+        }
+        assert!(
+            !saw_play,
+            "a Ready after a deliberate pause must not force-resume the group"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "group must remain paused after the user pause"
+        );
+    }
+
+    /// Root Cause A (already-paused variant): a track-change reload while the
+    /// group is PAUSED must not engage the freeze, so the reload's Ready leaves
+    /// the group paused rather than resuming Playing.
+    #[tokio::test]
+    async fn buffer_while_paused_does_not_resume_the_group() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // m2 reloads for a track change while the group is paused.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_000,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::BufferingEnd { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut saw_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                saw_play = true;
+            }
+        }
+        assert!(
+            !saw_play,
+            "a track-change reload while paused must not resume the group"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "group must stay paused"
         );
     }
 
