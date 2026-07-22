@@ -451,3 +451,49 @@ async fn scanner_callable_via_generic_bound() {
     }
     assert!(drive(&NoopScanner).await.is_empty());
 }
+
+#[test]
+fn match_best_prefers_exact_title_and_year() {
+    let cands = vec![
+        SearchCandidate {
+            id: "1".into(),
+            title: "The Thing".into(),
+            year: Some(2011),
+        },
+        SearchCandidate {
+            id: "2".into(),
+            title: "The Thing".into(),
+            year: Some(1982),
+        },
+    ];
+    let m = match_best("The Thing", Some(1982), &cands, 0.7).unwrap();
+    assert_eq!(m.id, "2");
+    assert!(m.confidence > 0.9);
+}
+
+#[test]
+fn match_best_rejects_below_threshold() {
+    let cands = vec![SearchCandidate {
+        id: "9".into(),
+        title: "Completely Different".into(),
+        year: None,
+    }];
+    assert!(match_best("The Thing", Some(1982), &cands, 0.7).is_none());
+}
+
+#[test]
+fn match_best_year_off_by_one_is_partial_not_zero() {
+    let cands = vec![SearchCandidate {
+        id: "3".into(),
+        title: "Blade Runner".into(),
+        year: Some(1983),
+    }];
+    // title exact, year ±1 -> still above threshold
+    assert!(match_best("Blade Runner", Some(1982), &cands, 0.7).is_some());
+}
+
+#[test]
+fn title_similarity_ignores_case_and_punctuation() {
+    assert!(title_similarity("WALL·E", "wall e") > 0.85);
+    assert!(title_similarity("Se7en", "Seven") < 0.9); // not falsely perfect
+}

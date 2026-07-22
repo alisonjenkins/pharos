@@ -549,6 +549,106 @@ pub fn search_tokens(term: &str) -> Vec<String> {
         .collect()
 }
 
+/// A single search result returned by an online metadata provider, as
+/// input to [`match_best`]. `id` is the provider's own identifier for the
+/// candidate (opaque to this crate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchCandidate {
+    pub id: String,
+    pub title: String,
+    pub year: Option<u32>,
+}
+
+/// The winning [`SearchCandidate`] chosen by [`match_best`], with the
+/// confidence score (`title_similarity × year_factor`) that won it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchOutcome {
+    pub id: String,
+    pub confidence: f32,
+}
+
+/// Lowercase, keep only alphanumerics + single spaces (collapse the rest).
+fn normalize_title(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            for l in c.to_lowercase() {
+                out.push(l);
+            }
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Normalized Levenshtein similarity in 0..1 over normalized titles.
+pub fn title_similarity(a: &str, b: &str) -> f32 {
+    let (a, b) = (normalize_title(a), normalize_title(b));
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let (av, bv): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (n, m) = (av.len(), bv.len());
+    if n == 0 || m == 0 {
+        return 0.0;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if av[i - 1] == bv[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let dist = prev[m] as f32;
+    let maxlen = n.max(m) as f32;
+    1.0 - dist / maxlen
+}
+
+/// Year agreement multiplier: exact = 1.0, ±1 = 0.9, else 0.6; unknown = 0.85.
+fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
+    match (q, c) {
+        (Some(q), Some(c)) => {
+            let d = q.abs_diff(c);
+            if d == 0 {
+                1.0
+            } else if d == 1 {
+                0.9
+            } else {
+                0.6
+            }
+        }
+        _ => 0.85,
+    }
+}
+
+/// Best-scoring candidate over `min_confidence`, else None. Score = title
+/// similarity × year factor. Ties resolve to the earliest candidate.
+pub fn match_best(
+    query_title: &str,
+    query_year: Option<u32>,
+    candidates: &[SearchCandidate],
+    min_confidence: f32,
+) -> Option<MatchOutcome> {
+    let mut best: Option<MatchOutcome> = None;
+    for c in candidates {
+        let score = title_similarity(query_title, &c.title) * year_factor(query_year, c.year);
+        if best.as_ref().map(|b| score > b.confidence).unwrap_or(true) {
+            best = Some(MatchOutcome {
+                id: c.id.clone(),
+                confidence: score,
+            });
+        }
+    }
+    best.filter(|b| b.confidence >= min_confidence)
+}
+
 /// LIB-C2 — a person entity row (one per distinct cast/crew member
 /// name). `wire_id` is the stable [`person_wire_id`] the Jellyfin DTO
 /// emits as the Person's `Id`; the integer `id` is the internal PK used
