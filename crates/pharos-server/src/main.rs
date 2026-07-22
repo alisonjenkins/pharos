@@ -449,6 +449,12 @@ async fn build_transcode_scheduler(
 ) -> Option<(
     pharos_transcode::scheduler::TranscodeScheduler,
     Vec<(pharos_transcode::HwAccel, pharos_transcode::VideoCodec)>,
+    // Total trial-confirmed HARDWARE encode-session budget (sum of every
+    // hw device's probed concurrent-session cap; 0 when CPU-only). The
+    // segment prefetch depth scales on this — a GPU that sustains N
+    // sessions at several× realtime can safely warm a deeper buffer than
+    // the CPU thread budget would ever allow.
+    usize,
 )> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
     use pharos_transcode::probe::{probe_device_caps, probe_encodable_codecs, ProbeConfig};
@@ -523,9 +529,18 @@ async fn build_transcode_scheduler(
         }
     }
     let table = DeviceTable::from_probe(&caps, default_cpu_permits());
+    // Sum the probed session caps of the HARDWARE devices only (phantom GPUs
+    // are already excluded from `caps`). This is the concurrency the encoder
+    // fleet can actually sustain — the prefetch buffer scales on it.
+    let hw_session_budget: usize = caps
+        .iter()
+        .filter(|(d, _)| matches!(d, DeviceId::Hw { .. }))
+        .map(|(_, c)| *c)
+        .sum();
     tracing::info!(
         devices = caps.len(),
         cpu_permits = default_cpu_permits(),
+        hw_session_budget,
         "transcode scheduler device table built"
     );
     Some((
@@ -535,6 +550,7 @@ async fn build_transcode_scheduler(
             SchedConfig::default(),
         ),
         hw_codecs,
+        hw_session_budget,
     ))
 }
 
@@ -613,29 +629,31 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // all-CPU, crash-isolated workers) once, shared by the HLS cache
     // (segment path) + the live/uncached path on AppState. Falls back to
     // inline ffmpeg when disabled or when the worker can't be brought up.
-    let (transcode_scheduler, confirmed_hw) = if cfg.server.transcode_hw_session_cap > 0 {
-        match build_transcode_scheduler(
-            &detected,
-            cfg.server.transcode_hw_session_cap,
-            cfg.server.transcode_probe_caps,
-        )
-        .await
-        {
-            Some((sched, hw)) => {
-                tracing::info!("transcode scheduler enabled (load-balanced workers)");
-                (Some(sched), hw)
+    let (transcode_scheduler, confirmed_hw, hw_session_budget) =
+        if cfg.server.transcode_hw_session_cap > 0 {
+            match build_transcode_scheduler(
+                &detected,
+                cfg.server.transcode_hw_session_cap,
+                cfg.server.transcode_probe_caps,
+            )
+            .await
+            {
+                Some((sched, hw, budget)) => {
+                    tracing::info!("transcode scheduler enabled (load-balanced workers)");
+                    (Some(sched), hw, budget)
+                }
+                None => {
+                    tracing::warn!("transcode worker unavailable; using the inline ffmpeg path");
+                    (None, Vec::new(), 0)
+                }
             }
-            None => {
-                tracing::warn!("transcode worker unavailable; using the inline ffmpeg path");
-                (None, Vec::new())
-            }
-        }
-    } else {
-        (None, Vec::new())
-    };
+        } else {
+            (None, Vec::new(), 0)
+        };
     if let Some(sched) = transcode_scheduler.as_ref() {
         state = state.with_transcode_scheduler(sched.clone());
     }
+    state = state.with_hw_encode_session_budget(hw_session_budget);
     // What THIS server can actually encode = trial-confirmed hardware families
     // (empty when there's no usable GPU / the scheduler is off) + the software
     // encoders in this ffmpeg build. The negotiator targets the best codec in
