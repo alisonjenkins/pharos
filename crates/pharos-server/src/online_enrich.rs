@@ -7,7 +7,11 @@
 
 use std::future::Future;
 
-use pharos_core::{ArtworkRole, MediaKind, PersonRef, SearchCandidate};
+use pharos_cache::image_cache::{ImageCache, ImageRole};
+use pharos_core::{
+    ArtworkRole, DomainError, DomainResult, MediaItem, MediaKind, MediaStore, PersonRef,
+    SearchCandidate,
+};
 
 /// One piece of remote artwork a provider can offer: its role (Primary /
 /// Backdrop / Thumb / ...) and the fully-qualified URL to fetch the bytes
@@ -141,7 +145,58 @@ pub fn apply_enrichment(
     }
 }
 
+/// The [`pharos_cache::image_cache::ImageRole`] that corresponds to an
+/// [`ArtworkRole`] (T8). The two enums share variant names by design but
+/// live in different crates (`pharos-core` has no cache-layer dependency),
+/// so a provider's remote-art role can't be used directly as a cache-write
+/// argument. Match is exhaustive so a new `ArtworkRole` variant fails to
+/// compile here rather than silently losing its cache role.
+fn to_cache_role(role: ArtworkRole) -> ImageRole {
+    match role {
+        ArtworkRole::Primary => ImageRole::Primary,
+        ArtworkRole::Backdrop => ImageRole::Backdrop,
+        ArtworkRole::Thumb => ImageRole::Thumb,
+        ArtworkRole::Logo => ImageRole::Logo,
+        ArtworkRole::Banner => ImageRole::Banner,
+        ArtworkRole::Disc => ImageRole::Disc,
+        ArtworkRole::Art => ImageRole::Art,
+    }
+}
+
+/// T8 — persist already-downloaded provider artwork bytes: write them into
+/// the on-disk image cache (same tree the local-sidecar / upload paths use),
+/// then record the resulting cache-file path in the `artwork` table under
+/// `provider` as `source` (`"tmdb"`/`"tvdb"`). Once recorded, the widened
+/// `has_primary_art` predicate and `local_artwork_path` filter (this task)
+/// serve it identically to a local sidecar — the download step is the only
+/// thing distinguishing it from local art. The orchestrator (T9) calls this
+/// once per fetched [`RemoteArt`] after downloading `bytes` via
+/// [`OnlineEnricher::fetch_image_bytes`](OnlineEnricher::fetch_image_bytes).
+pub async fn download_and_cache_art<S: MediaStore>(
+    cache: &ImageCache,
+    store: &S,
+    item: &MediaItem,
+    provider: &str,
+    art: &RemoteArt,
+    bytes: Vec<u8>,
+) -> DomainResult<()> {
+    let role = to_cache_role(art.role);
+    let path = cache
+        .upload(item.id, role, item.kind, 0, &bytes)
+        .await
+        .map_err(|e| DomainError::Backend(format!("artwork cache upload: {e}")))?;
+    store
+        .set_artwork(
+            item.id,
+            art.role.as_str(),
+            provider,
+            &path.to_string_lossy(),
+        )
+        .await
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -169,6 +224,63 @@ mod tests {
         assert_eq!(item.metadata.overview.as_deref(), Some("local overview")); // local kept
         assert_eq!(item.metadata.production_year, Some(1999)); // gap filled
         assert_eq!(applied.genres, vec!["Sci-Fi"]); // item had 0 genres
+    }
+
+    #[test]
+    fn to_cache_role_maps_every_artwork_role() {
+        // Exhaustive by construction (the match has no wildcard arm), but
+        // pin the actual mapping so a future rename in either enum is
+        // caught here rather than only at the call site.
+        assert_eq!(to_cache_role(ArtworkRole::Primary), ImageRole::Primary);
+        assert_eq!(to_cache_role(ArtworkRole::Backdrop), ImageRole::Backdrop);
+        assert_eq!(to_cache_role(ArtworkRole::Thumb), ImageRole::Thumb);
+        assert_eq!(to_cache_role(ArtworkRole::Logo), ImageRole::Logo);
+        assert_eq!(to_cache_role(ArtworkRole::Banner), ImageRole::Banner);
+        assert_eq!(to_cache_role(ArtworkRole::Disc), ImageRole::Disc);
+        assert_eq!(to_cache_role(ArtworkRole::Art), ImageRole::Art);
+    }
+
+    #[tokio::test]
+    async fn download_and_cache_art_writes_bytes_and_records_artwork_row() {
+        let td = tempfile::TempDir::new().unwrap();
+        let cache = ImageCache::new(td.path());
+        let store = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let item = MediaItem {
+            id: 900021,
+            kind: MediaKind::Movie,
+            title: "Arrival".into(),
+            ..Default::default()
+        };
+        store.put(item.clone()).await.unwrap();
+        let art = RemoteArt {
+            role: ArtworkRole::Primary,
+            url: "https://image.tmdb.org/t/p/w780/x.jpg".into(),
+        };
+        let bytes = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+
+        download_and_cache_art(&cache, &store, &item, "tmdb", &art, bytes.clone())
+            .await
+            .unwrap();
+
+        // Bytes landed on disk under the cache tree.
+        let expect_path =
+            pharos_cache::image_cache::primary_path(td.path(), MediaKind::Movie, 900021);
+        let on_disk = tokio::fs::read(&expect_path).await.unwrap();
+        assert_eq!(on_disk, bytes);
+
+        // The artwork row was recorded with `source = "tmdb"` and the
+        // cache-file locator, which flips `has_primary_art`.
+        let rows = store.artwork_for(900021).await.unwrap();
+        let (role, source, locator) = rows
+            .into_iter()
+            .find(|(r, _, _)| r.eq_ignore_ascii_case("Primary"))
+            .unwrap();
+        assert_eq!(role, "Primary");
+        assert_eq!(source, "tmdb");
+        assert_eq!(locator, expect_path.to_string_lossy());
+        assert!(store.get(900021).await.unwrap().has_primary_art);
     }
 
     #[test]

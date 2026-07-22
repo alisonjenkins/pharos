@@ -1261,6 +1261,60 @@ async fn set_primary_artwork_flips_has_primary_art() {
 }
 
 #[tokio::test]
+async fn tmdb_primary_artwork_flips_has_primary_art() {
+    // Task 8: a downloaded provider artwork (`tmdb`/`tvdb` source, an
+    // absolute on-disk cache path) is just as servable as a local sidecar —
+    // the image route serves it identically — so it must flip the
+    // denormalized flag exactly like a `local` Primary does.
+    let s = fresh().await;
+    let it = item(
+        900020,
+        "/movies/Arrival/Arrival.mkv",
+        "Arrival",
+        MediaKind::Movie,
+    );
+    s.put(it).await.unwrap();
+
+    s.set_artwork(900020, "Primary", "tmdb", "/cache/primary/movie/900020.jpg")
+        .await
+        .unwrap();
+    assert!(
+        s.get(900020).await.unwrap().has_primary_art,
+        "downloaded tmdb Primary → true"
+    );
+
+    // A non-Primary role must not disturb the flag.
+    s.set_artwork(
+        900020,
+        "Backdrop",
+        "tmdb",
+        "/cache/backdrop/movie/900020.jpg",
+    )
+    .await
+    .unwrap();
+    assert!(
+        s.get(900020).await.unwrap().has_primary_art,
+        "Backdrop leaves Primary flag untouched"
+    );
+
+    // A Primary downgraded to a not-yet-downloaded `url` source (the remote
+    // URL before Task 8's download-and-cache step ran) is not servable —
+    // must clear the flag.
+    s.set_artwork(
+        900020,
+        "Primary",
+        "url",
+        "https://image.tmdb.org/t/p/w780/x.jpg",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !s.get(900020).await.unwrap().has_primary_art,
+        "undownloaded url Primary is not item-servable → false"
+    );
+}
+
+#[tokio::test]
 async fn set_item_match_persists_and_excludes_from_needing() {
     let store = fresh().await;
     let mut it = item(900010, "/m/dune.mkv", "Dune", MediaKind::Movie);
