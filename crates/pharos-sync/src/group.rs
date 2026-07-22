@@ -964,6 +964,32 @@ impl GroupState {
         resolved
     }
 
+    /// Perform a gated group SEEK to `position_ms`. Reconciles any in-flight
+    /// V19 buffering freeze (a seek re-buffers everyone, so the old freeze is
+    /// moot — but capture its play intent first, since the freeze forced
+    /// `Paused`), preserves the play/pause intent (an open Seek gate carries the
+    /// true one; B58), broadcasts the Seek NOW so clients can ACK it, and opens
+    /// a readiness gate on the followers with `not_before = at_server_ms` so a
+    /// pre-schedule ack can't resolve it early (B38). Shared by the HTTP
+    /// `SeekTo` and the leader/native `LeaderSeek` so both behave identically.
+    fn seek_to(&mut self, position_ms: u64) {
+        let was_frozen_playing =
+            self.group_paused_due_to_buffering && self.buffering_resume_playing;
+        self.clear_buffering_freeze();
+        let resume = match self.waiting.as_ref() {
+            Some(w) => w.resume_playing,
+            None => was_frozen_playing || matches!(self.playback, PlaybackState::Playing { .. }),
+        };
+        let at_server_ms = self.server_ms_now() + self.lead_time_ms();
+        self.playback = PlaybackState::Paused { position_ms };
+        self.broadcast(ServerMsg::Seek {
+            at_server_ms,
+            position_ms,
+        });
+        let pending = self.follower_ids();
+        self.enter_waiting(pending, resume, position_ms, "Seek", at_server_ms);
+    }
+
     /// Lowest-MemberId-wins election. Deterministic, no voting needed.
     fn elect_leader(&mut self) {
         self.leader = self.members.keys().min().copied();
@@ -1700,6 +1726,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
             let server_ms = state.server_ms_now();
             let at_server_ms = server_ms + state.lead_time_ms();
+            // B — a deliberate play overrides any pending gate + freeze; clear
+            // them so a later resolve_waiting / anti-wedge can't contradict it.
+            state.waiting = None;
+            state.clear_buffering_freeze();
             state.playback = PlaybackState::Playing {
                 position_ms,
                 anchor_server_ms: server_ms,
@@ -1721,6 +1751,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 return;
             }
             let at_server_ms = state.server_ms_now() + state.lead_time_ms();
+            // B — cancel any pending readiness gate. A gate opened by an HTTP
+            // client (NextItem/SeekTo, resume_playing=true) would otherwise
+            // survive this pause and, on a follower's later Ready or the 30s
+            // anti-wedge, `resolve_waiting → start_playing` would override the
+            // pause and force the group back to Playing. Mirrors PauseShared.
+            state.waiting = None;
             // A deliberate pause supersedes an in-flight V19 buffering freeze.
             state.clear_buffering_freeze();
             // Freeze position at the moment we paused so late joiners
@@ -1745,21 +1781,13 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 );
                 return;
             }
-            let server_ms = state.server_ms_now();
-            let at_server_ms = server_ms + state.lead_time_ms();
-            // Seek preserves play/pause; only mutates the position
-            // anchor. Idle treats Seek as "load this position paused".
-            state.playback = match state.playback {
-                PlaybackState::Playing { .. } => PlaybackState::Playing {
-                    position_ms,
-                    anchor_server_ms: server_ms,
-                },
-                _ => PlaybackState::Paused { position_ms },
-            };
-            state.broadcast(ServerMsg::Seek {
-                at_server_ms,
-                position_ms,
-            });
+            // D — route through the SAME gated seek as the HTTP `SeekTo` path.
+            // The old inline body opened no readiness gate (followers re-buffered
+            // while the group clock ran on → each resumed behind by its rebuffer
+            // latency), ignored an in-flight V19 freeze (settled Paused + left
+            // the anti-wedge armed for a ~30s phantom resume), and re-anchored
+            // Playing at `now`. `seek_to` fixes all three.
+            state.seek_to(position_ms);
         }
         GroupMsg::ObserveClock {
             member_id,
@@ -1913,45 +1941,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             sender: _,
             position_ms,
         } => {
-            // Preserve play/pause across a seek: a seek while playing resumes
-            // playing (after re-buffer); while paused/idle it stays paused.
-            //
-            // A seek reconciles any in-flight V19 buffering freeze: it
-            // re-buffers every member (a fresh gate opens below), so the old
-            // freeze is moot. But the freeze already forced playback → Paused,
-            // so the resume computation would read `false` and settle the group
-            // Paused after the seek even though it was playing — the reported
-            // "seek left us paused, had to press play". Worse, a leftover
-            // `buffering_since` would phantom-resume the group ~30s later
-            // (Zombieland-class). Capture the freeze's play intent, then clear
-            // the freeze so neither happens.
-            let was_frozen_playing =
-                state.group_paused_due_to_buffering && state.buffering_resume_playing;
-            state.clear_buffering_freeze();
-            // B58 — a Seek always sets `playback = Paused` below, so a SECOND
-            // seek arriving before the first's gate resolves (scrubbing the
-            // timeline while playing sends a burst) would recompute `resume`
-            // from that Paused state = false, and the group would settle Paused
-            // after the seek even though the user was playing. When a Seek gate
-            // is already open it already holds the true intent — carry it over.
-            let resume = match state.waiting.as_ref() {
-                Some(w) => w.resume_playing,
-                None => {
-                    was_frozen_playing || matches!(state.playback, PlaybackState::Playing { .. })
-                }
-            };
-            // Deliver the Seek NOW: each client applies it (pause + seek +
-            // re-buffer) and ACKs with `Ready` (scheduleSeek's 'ready'
-            // handler). Withholding it until the gate resolved deadlocked —
-            // nobody can ACK a command they never received.
-            let at_server_ms = state.server_ms_now() + state.lead_time_ms();
-            state.playback = PlaybackState::Paused { position_ms };
-            state.broadcast(ServerMsg::Seek {
-                at_server_ms,
-                position_ms,
-            });
-            let pending = state.follower_ids();
-            state.enter_waiting(pending, resume, position_ms, "Seek", at_server_ms);
+            // Shared with LeaderSeek — see `GroupState::seek_to`.
+            state.seek_to(position_ms);
         }
         GroupMsg::MemberReady {
             member_id,
@@ -3811,6 +3802,139 @@ mod tests {
         assert!(
             play.is_some(),
             "the buffering member's Ready alone must resolve the gate"
+        );
+    }
+
+    /// B: a leader Pause must cancel an open readiness gate (e.g. an HTTP
+    /// client's in-flight SeekTo/NextItem gate). Otherwise a follower's later
+    /// Ready — or the 30s anti-wedge — resolves the stale gate and force-resumes
+    /// the group, overriding the leader's pause.
+    #[tokio::test]
+    async fn leader_pause_cancels_an_open_gate() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (_m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        // Open a gate (a seek in flight).
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "seek should open a gate"
+        );
+        // The leader pauses while the gate is open.
+        h.tx.send(GroupMsg::LeaderPause { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // Past the seek's schedule time, the followers ACK the (now-cancelled)
+        // seek. The group must STAY paused — no gate remains to resolve.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for mid in [m1, _m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 60_000,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let _ = snapshot_of(&h).await;
+        let mut saw_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                saw_play = true;
+            }
+        }
+        assert!(
+            !saw_play,
+            "a leader pause must cancel the gate so no later Ready resumes the group"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "group must remain paused after the leader pause"
+        );
+    }
+
+    /// D: a LeaderSeek (native/ws path) must behave like the HTTP SeekTo —
+    /// open a readiness gate and resume playing on the followers' Ready — not
+    /// broadcast a lone Seek that leaves the group ungated and drifting.
+    #[tokio::test]
+    async fn leader_seek_opens_a_gate_and_resumes_on_ready() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::LeaderSeek {
+            sender: m1,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        // Seek broadcast now + a gate opens.
+        let seek = recv_matching(&mut m2_rx, Duration::from_millis(500), |m| {
+            matches!(
+                m,
+                ServerMsg::Seek {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(seek.is_some(), "LeaderSeek must broadcast the Seek");
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "LeaderSeek must open a readiness gate (not leave the group ungated)"
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for mid in [m1, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 60_000,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let play = recv_matching(&mut m2_rx, Duration::from_millis(500), |m| {
+            matches!(
+                m,
+                ServerMsg::Play {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "LeaderSeek gate must resume playing at the target on all-Ready"
         );
     }
 
