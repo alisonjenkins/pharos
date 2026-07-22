@@ -917,7 +917,10 @@ impl GroupState {
         } else {
             // The members already applied the Seek broadcast at gate entry and
             // sit paused at the position — re-sending it would re-trigger their
-            // seek→Ready cycle. Just settle the group state.
+            // seek→Ready cycle. Just settle the group state. Clear any freeze
+            // bookkeeping too (defence: SeekTo clears it up front, but this
+            // keeps the invariant that a settled-Paused group holds no freeze).
+            self.clear_buffering_freeze();
             self.playback = PlaybackState::Paused {
                 position_ms: w.position_ms,
             };
@@ -1867,15 +1870,29 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // Preserve play/pause across a seek: a seek while playing resumes
             // playing (after re-buffer); while paused/idle it stays paused.
             //
-            // B58 — but a Seek always sets `playback = Paused` below, so a
-            // SECOND seek arriving before the first's gate resolves (scrubbing
-            // the timeline while playing sends a burst) would recompute `resume`
+            // A seek reconciles any in-flight V19 buffering freeze: it
+            // re-buffers every member (a fresh gate opens below), so the old
+            // freeze is moot. But the freeze already forced playback → Paused,
+            // so the resume computation would read `false` and settle the group
+            // Paused after the seek even though it was playing — the reported
+            // "seek left us paused, had to press play". Worse, a leftover
+            // `buffering_since` would phantom-resume the group ~30s later
+            // (Zombieland-class). Capture the freeze's play intent, then clear
+            // the freeze so neither happens.
+            let was_frozen_playing =
+                state.group_paused_due_to_buffering && state.buffering_resume_playing;
+            state.clear_buffering_freeze();
+            // B58 — a Seek always sets `playback = Paused` below, so a SECOND
+            // seek arriving before the first's gate resolves (scrubbing the
+            // timeline while playing sends a burst) would recompute `resume`
             // from that Paused state = false, and the group would settle Paused
             // after the seek even though the user was playing. When a Seek gate
             // is already open it already holds the true intent — carry it over.
             let resume = match state.waiting.as_ref() {
                 Some(w) => w.resume_playing,
-                None => matches!(state.playback, PlaybackState::Playing { .. }),
+                None => {
+                    was_frozen_playing || matches!(state.playback, PlaybackState::Playing { .. })
+                }
             };
             // Deliver the Seek NOW: each client applies it (pause + seek +
             // re-buffer) and ACKs with `Ready` (scheduleSeek's 'ready'
@@ -3713,6 +3730,79 @@ mod tests {
         })
         .await;
         assert!(play.is_some(), "all-Ready must resume playback at the seek");
+    }
+
+    /// Root Cause B: a SEEK issued while the group is frozen for a member's
+    /// buffer must resume PLAYING after the re-buffer, not silently settle
+    /// Paused. The freeze forced `playback = Paused`, so the pre-fix resume
+    /// computation read `false` and the group stayed paused after the seek —
+    /// the "seek left us paused, had to press play" recovery step. Clearing the
+    /// freeze up front (which also nulls `buffering_since`, killing the ~30s
+    /// phantom-resume timer) and carrying the captured play intent fixes both.
+    #[tokio::test]
+    async fn seek_during_buffer_freeze_resumes_playing() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // m2 buffers → group freezes (Paused, resume intent = play).
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 5_000,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        // A seek arrives DURING the freeze.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: leader,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        // B38 — Readys must land after the Seek's scheduled at_server_ms.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for mid in [leader, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 60_000,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        // The gate must resolve to PLAY (not settle Paused) — proves the seek
+        // carried the freeze's play intent.
+        let play = recv_matching(&mut m2_rx, Duration::from_millis(500), |m| {
+            matches!(
+                m,
+                ServerMsg::Play {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "a seek during a buffer freeze must resume playing at the target"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "group must be Playing after the seek+ready, not stuck Paused"
+        );
     }
 
     #[tokio::test]
