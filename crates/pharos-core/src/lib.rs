@@ -2352,6 +2352,41 @@ pub trait MediaStore: Send + Sync {
         &self,
         item_id: MediaId,
     ) -> impl std::future::Future<Output = DomainResult<Vec<(String, String, String)>>> + Send;
+
+    /// Write the 5 online-match columns for `id` in one UPDATE. `confidence`
+    /// is `None` for `nfo_id`/`manual`. No-op (zero rows) if the id is absent.
+    fn set_item_match(
+        &self,
+        item_id: MediaId,
+        provider: &str,
+        external_id: &str,
+        source: &str,
+        confidence: Option<f32>,
+        refreshed_at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Items eligible for online enrichment: `match_source` NULL or in
+    /// (`search`,`none`), not refreshed since `ttl_cutoff`, kind movie/episode,
+    /// ascending id, capped at `limit`. Excludes `manual`/`nfo_id`.
+    fn items_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
+
+    /// Count of linked genres/people/studios for `id` (fill-if-empty gate).
+    fn item_entity_counts(
+        &self,
+        item_id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<EntityCounts>> + Send;
+}
+
+/// Linked-entity population counts for one item (online-enrich fill-if-empty gate).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntityCounts {
+    pub genres: u32,
+    pub people: u32,
+    pub studios: u32,
 }
 
 /// Per-(user, item) state Jellyfin tracks: watched/unwatched, play
