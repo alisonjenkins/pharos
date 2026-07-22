@@ -1259,3 +1259,43 @@ async fn set_primary_artwork_flips_has_primary_art() {
         "url Primary is not item-servable → false"
     );
 }
+
+#[tokio::test]
+async fn set_item_match_persists_and_excludes_from_needing() {
+    let store = fresh().await;
+    let mut it = item(900010, "/m/dune.mkv", "Dune", MediaKind::Movie);
+    it.id = 900010;
+    store.put(it.clone()).await.unwrap();
+
+    // Before matching, it is eligible.
+    let need = store.items_needing_match(10, i64::MAX).await.unwrap();
+    assert!(need.iter().any(|i| i.id == 900010));
+
+    store
+        .set_item_match(
+            900010,
+            "tmdb",
+            "438631",
+            "search",
+            Some(0.92),
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+    let got = store.get(900010).await.unwrap();
+    assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
+    assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+    assert_eq!(got.match_source.as_deref(), Some("search"));
+    assert_eq!(got.metadata_refreshed_at, Some(1_700_000_000));
+
+    // A fresh (recent) search-match is excluded by a cutoff below its timestamp.
+    let need2 = store.items_needing_match(10, 1_699_999_999).await.unwrap();
+    assert!(!need2.iter().any(|i| i.id == 900010));
+    // But a manual match is excluded regardless of ttl.
+    store
+        .set_item_match(900010, "tmdb", "1", "manual", None, 1)
+        .await
+        .unwrap();
+    let need3 = store.items_needing_match(10, i64::MAX).await.unwrap();
+    assert!(!need3.iter().any(|i| i.id == 900010));
+}

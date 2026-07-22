@@ -2043,6 +2043,89 @@ mod tests {
             out.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(out)
         }
+
+        async fn set_item_match(
+            &self,
+            item_id: MediaId,
+            provider: &str,
+            external_id: &str,
+            source: &str,
+            confidence: Option<f32>,
+            refreshed_at: i64,
+        ) -> DomainResult<()> {
+            // No-op when the row is absent, mirroring rebind_path/set_artwork.
+            if let Some(item) = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get_mut(&item_id)
+            {
+                item.match_provider = Some(provider.to_string());
+                item.match_external_id = Some(external_id.to_string());
+                item.match_source = Some(source.to_string());
+                item.match_confidence = confidence;
+                item.metadata_refreshed_at = Some(refreshed_at);
+            }
+            Ok(())
+        }
+
+        async fn items_needing_match(
+            &self,
+            limit: i64,
+            ttl_cutoff: i64,
+        ) -> DomainResult<Vec<MediaItem>> {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut matches: Vec<MediaItem> = inner
+                .values()
+                .filter(|item| {
+                    let source_eligible = matches!(
+                        item.match_source.as_deref(),
+                        None | Some("search") | Some("none")
+                    );
+                    let ttl_eligible = item
+                        .metadata_refreshed_at
+                        .is_none_or(|refreshed| refreshed < ttl_cutoff);
+                    let kind_eligible = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+                    source_eligible && ttl_eligible && kind_eligible
+                })
+                .cloned()
+                .collect();
+            matches.sort_by_key(|item| item.id);
+            matches.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok(matches)
+        }
+
+        async fn item_entity_counts(
+            &self,
+            item_id: MediaId,
+        ) -> DomainResult<pharos_core::EntityCounts> {
+            let genres = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&item_id)
+                .map_or(0, |v| v.len());
+            let people = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&item_id)
+                .map_or(0, |v| v.len());
+            let studios = self
+                .item_studios
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&item_id)
+                .map_or(0, |v| v.len());
+            Ok(pharos_core::EntityCounts {
+                genres: genres as u32,
+                people: people as u32,
+                studios: studios as u32,
+            })
+        }
     }
 
     // LIB-C4 — minimal in-memory GenreStore so the scanner's

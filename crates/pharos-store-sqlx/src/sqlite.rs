@@ -1,10 +1,10 @@
 use crate::StoreError;
 use pharos_core::{
-    Collection, CollectionCount, CollectionStore, DomainError, DomainResult, Fingerprint, Genre,
-    GenreCount, GenreStore, ItemPerson, Library, LibraryKind, LibraryStore, MediaId, MediaItem,
-    MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore, Person, PersonCount, PersonKind,
-    PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore, ScanState, SeriesInfo, Studio,
-    StudioCount, StudioStore, Tag, TagCount, TagStore, UserId,
+    Collection, CollectionCount, CollectionStore, DomainError, DomainResult, EntityCounts,
+    Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind, LibraryStore,
+    MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore, Person,
+    PersonCount, PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore,
+    ScanState, SeriesInfo, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, UserId,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -1124,6 +1124,85 @@ impl MediaStore for SqliteStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(rows)
+    }
+
+    #[tracing::instrument(skip(self, provider, external_id, source), fields(media.id = %item_id))]
+    async fn set_item_match(
+        &self,
+        item_id: MediaId,
+        provider: &str,
+        external_id: &str,
+        source: &str,
+        confidence: Option<f32>,
+        refreshed_at: i64,
+    ) -> DomainResult<()> {
+        let id_i64 = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        sqlx::query(
+            "UPDATE media_items SET match_provider = ?, match_external_id = ?, \
+             match_source = ?, match_confidence = ?, metadata_refreshed_at = ? WHERE id = ?",
+        )
+        .bind(provider)
+        .bind(external_id)
+        .bind(source)
+        .bind(confidence)
+        .bind(refreshed_at)
+        .bind(id_i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn items_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<MediaItem>> {
+        let sql = format!(
+            "SELECT {MEDIA_COLUMNS} FROM media_items \
+             WHERE (match_source IS NULL OR match_source IN ('search','none')) \
+               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < ?) \
+               AND kind IN ('movie','episode') \
+             ORDER BY id ASC LIMIT ?"
+        );
+        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+            .bind(ttl_cutoff)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %item_id))]
+    async fn item_entity_counts(&self, item_id: MediaId) -> DomainResult<EntityCounts> {
+        let id_i64 = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let (genres,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM item_genres WHERE item_id = ?")
+                .bind(id_i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (people,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM item_people WHERE item_id = ?")
+                .bind(id_i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (studios,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM item_studios WHERE item_id = ?")
+                .bind(id_i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(EntityCounts {
+            genres: genres.max(0) as u32,
+            people: people.max(0) as u32,
+            studios: studios.max(0) as u32,
+        })
     }
 }
 

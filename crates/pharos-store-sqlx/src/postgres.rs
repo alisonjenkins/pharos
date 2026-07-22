@@ -19,13 +19,13 @@
 use crate::StoreError;
 use pharos_core::{
     AuthError, AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainError,
-    DomainResult, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
-    LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore,
-    PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonKind, PersonRef,
-    PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SecretString,
-    SeriesInfo, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
-    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
-    UserStore,
+    DomainResult, EntityCounts, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library,
+    LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe,
+    MediaQuery, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount,
+    PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
+    ScanState, SecretString, SeriesInfo, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
+    TagCount, TagStore, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData,
+    UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -1036,6 +1036,83 @@ impl MediaStore for PostgresStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(rows)
+    }
+
+    #[tracing::instrument(skip(self, provider, external_id, source), fields(media.id = %item_id))]
+    async fn set_item_match(
+        &self,
+        item_id: MediaId,
+        provider: &str,
+        external_id: &str,
+        source: &str,
+        confidence: Option<f32>,
+        refreshed_at: i64,
+    ) -> DomainResult<()> {
+        let id_i64 = media_id_i64(item_id)?;
+        sqlx::query(
+            "UPDATE media_items SET match_provider = $1, match_external_id = $2, \
+             match_source = $3, match_confidence = $4, metadata_refreshed_at = $5 WHERE id = $6",
+        )
+        .bind(provider)
+        .bind(external_id)
+        .bind(source)
+        .bind(confidence)
+        .bind(refreshed_at)
+        .bind(id_i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn items_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<MediaItem>> {
+        let sql = format!(
+            "SELECT {MEDIA_COLUMNS} FROM media_items \
+             WHERE (match_source IS NULL OR match_source IN ('search','none')) \
+               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1) \
+               AND kind IN ('movie','episode') \
+             ORDER BY id ASC LIMIT $2"
+        );
+        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+            .bind(ttl_cutoff)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %item_id))]
+    async fn item_entity_counts(&self, item_id: MediaId) -> DomainResult<EntityCounts> {
+        let id_i64 = media_id_i64(item_id)?;
+        let (genres,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM item_genres WHERE item_id = $1")
+                .bind(id_i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (people,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM item_people WHERE item_id = $1")
+                .bind(id_i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let (studios,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM item_studios WHERE item_id = $1")
+                .bind(id_i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(EntityCounts {
+            genres: genres.max(0) as u32,
+            people: people.max(0) as u32,
+            studios: studios.max(0) as u32,
+        })
     }
 }
 

@@ -6,13 +6,13 @@ use crate::postgres::PostgresStore;
 use crate::sqlite::SqliteStore;
 use crate::{RuntimeConfig, ServerConfigStore, StoreError};
 use pharos_core::{
-    AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult, Fingerprint,
-    GenreCount, GenreStore, ItemPerson, Library, LibraryKind, LibraryStore, MediaFacets, MediaId,
-    MediaItem, MediaQuery, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, Person,
-    PersonCount, PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ScanState, SearchQuery, SecretString, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
-    TagCount, TagStore, TokenRecord, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
-    UserItemData, UserPolicy, UserRecord, UserStore,
+    AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult,
+    EntityCounts, Fingerprint, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
+    LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore, PersistedSyncGroup,
+    PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore, Playlist,
+    PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString, Studio,
+    StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenRecord, TokenStore,
+    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -259,6 +259,59 @@ impl MediaStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.artwork_for(item_id).await,
             AnyStore::Postgres(p) => p.artwork_for(item_id).await,
+        }
+    }
+
+    async fn set_item_match(
+        &self,
+        item_id: MediaId,
+        provider: &str,
+        external_id: &str,
+        source: &str,
+        confidence: Option<f32>,
+        refreshed_at: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.set_item_match(
+                    item_id,
+                    provider,
+                    external_id,
+                    source,
+                    confidence,
+                    refreshed_at,
+                )
+                .await
+            }
+            AnyStore::Postgres(p) => {
+                p.set_item_match(
+                    item_id,
+                    provider,
+                    external_id,
+                    source,
+                    confidence,
+                    refreshed_at,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn items_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<MediaItem>> {
+        match self {
+            AnyStore::Sqlite(s) => s.items_needing_match(limit, ttl_cutoff).await,
+            AnyStore::Postgres(p) => p.items_needing_match(limit, ttl_cutoff).await,
+        }
+    }
+
+    async fn item_entity_counts(&self, item_id: MediaId) -> DomainResult<EntityCounts> {
+        match self {
+            AnyStore::Sqlite(s) => s.item_entity_counts(item_id).await,
+            AnyStore::Postgres(p) => p.item_entity_counts(item_id).await,
         }
     }
 }
