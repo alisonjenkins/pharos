@@ -1910,14 +1910,37 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.ignore_wait = ignore;
             }
-            // A member opting out must release any gate it currently holds —
-            // it halted its playback and will never post the Ready.
+            // A member opting out has HALTED its own playback: it will never
+            // post the Ready/BufferingEnd the group is waiting on. Release it
+            // from BOTH gates it could be holding.
             if ignore {
+                // 1) The readiness gate (Seek / Unpause in flight).
                 if let Some(w) = state.waiting.as_mut() {
                     w.pending.remove(&member_id);
                     if w.pending.is_empty() {
                         state.resolve_waiting();
                     }
+                }
+                // 2) The V19 buffering freeze. A buffering freeze opens NO
+                // readiness gate (BufferingStart broadcasts a bare Pause), so
+                // the branch above is a no-op for it and `rec.buffering` would
+                // stay set forever — the resume checks in BufferingEnd /
+                // MemberReady only fire on a member EVENT, and no further event
+                // arrives for a halted member. So the group stayed frozen until
+                // the 30s anti-wedge. This is the audio/subtitle track-change
+                // wedge: the reloading member's cold transcode overran its start
+                // budget, it posted SetIgnoreWait, and nothing cleared its
+                // buffering flag. Clear it here and actively re-run the resume
+                // check (mirrors BufferingEnd's B27 auto-resume).
+                if let Some(rec) = state.members.get_mut(&member_id) {
+                    rec.buffering = false;
+                }
+                if state.group_paused_due_to_buffering
+                    && !state.members.values().any(|m| m.buffering)
+                    && state.waiting.is_none()
+                {
+                    let position_ms = state.current_position_ms();
+                    state.start_playing(position_ms, "Ready");
                 }
             }
         }
@@ -2961,6 +2984,69 @@ mod tests {
         );
         let snap = snapshot_of(&h).await;
         assert_eq!(snap.play_state, GroupPlayState::Playing);
+    }
+
+    /// Track-change wedge (Root Cause C): a member whose cold transcode reload
+    /// overran its start budget posts `SetIgnoreWait(true)` to opt out of the
+    /// wait. A V19 buffering freeze opens no readiness gate, so opting out must
+    /// ALSO clear the member's buffering flag and actively re-resume — otherwise
+    /// the group stays frozen until the 30s anti-wedge (the reported "stuck
+    /// syncing, had to seek back to recover" symptom).
+    #[tokio::test]
+    async fn set_ignore_wait_clears_buffering_freeze_and_resumes() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // m2 reloads for a track change → BufferingStart freezes the group.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "buffering must freeze the group"
+        );
+
+        // m2's cold reload overruns the budget → it opts out. This must lift the
+        // freeze immediately, NOT wait out BUFFERING_MAX_MS.
+        h.tx.send(GroupMsg::SetIgnoreWait {
+            member_id: m2,
+            ignore: true,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut m1_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m1_play = true;
+            }
+        }
+        assert!(
+            m1_play,
+            "opting a buffering member out must resume the group without the 30s anti-wedge"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "group must be Playing again after the opt-out"
+        );
     }
 
     /// B55 — the SOLE buffering member disconnecting (socket drop / Leave) must
