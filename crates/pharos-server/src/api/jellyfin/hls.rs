@@ -1863,35 +1863,49 @@ async fn vp9_segment(
         .body(processed.media))
 }
 
+/// Cap on the hardware-encode prefetch depth (~36 s of content at 6 s
+/// segments). Deep enough that a rebuffer / >1× catch-up lands in cache, but
+/// bounded so one viewer's speculative warm never monopolises the GPU: at
+/// `budget − 2` this always leaves ≥2 sessions for the live segment + a second
+/// stream, and the scheduler's per-device semaphore + CPU fallback cap actual
+/// concurrency regardless.
+const HW_PREFETCH_MAX_AHEAD: u32 = 6;
+
 /// Segments to speculatively transcode ahead of the one just requested. A
 /// client draining its buffer fast — or playing at >1x — then finds the next
 /// segments already warm in the cache instead of stalling on an on-demand
 /// transcode. This decouples the client's consumption rate from the encoder's
 /// per-segment latency: at 4x, 6s of content is consumed every 1.5s, but with
-/// a few segments pipelined ahead across the CPU pool the player never waits.
+/// a few segments pipelined ahead the player never waits. Prefetch jobs queue
+/// on the SAME scheduler as live segments, and the per-key single-flight in
+/// `HlsSegmentCache` coalesces a prefetch with the client's own eventual
+/// request — so a segment is never transcoded twice and a live request that
+/// catches up simply awaits the in-flight prefetch.
 ///
-/// Kept small on purpose: prefetch jobs queue on the SAME scheduler as live
-/// segments (which already load-balances across every CPU), and the per-key
-/// single-flight in `HlsSegmentCache` coalesces a prefetch with the client's
-/// own eventual request — so a segment is never transcoded twice and a live
-/// request that catches up simply awaits the in-flight prefetch.
+/// `hw_budget` is `Some(sessions)` when THIS stream hardware-encodes (the
+/// server has a usable GPU AND the target codec is one it hardware-encodes) —
+/// then the depth scales on the GPU's trial-probed concurrent-session budget,
+/// which sustains several× realtime, so a deeper buffer builds fast and stays
+/// ahead. `None` (software encode, or CPU-only box) keeps the conservative
+/// CPU-thread-budget depth: every software video segment (VP9 AND x264/x265)
+/// runs `sw_encode_threads()` (≈4) threads and auto-threads across the box, so
+/// admitting more than `cores/threads` (`default_cpu_permits`) racing encodes
+/// drives every segment BELOW realtime (the measured parallel-small-encodes
+/// trap: 5 concurrent encodes on a 16-core box ran 2-3.6 s/segment vs the
+/// ~0.6 s single-stream benchmark).
 ///
-/// Permit-aware: every software video segment (VP9 AND x264/x265) runs
-/// `sw_encode_threads()` (≈4) threads and the CPU device admits
-/// `cores / 4` concurrent jobs (`default_cpu_permits`), so `1 live +
-/// prefetch` must fit inside that budget with a slot or two spare for
-/// audio / trickplay / a second viewer. A fixed 4 was measured on the
-/// 16-core box to run 5 concurrent encodes with `queue_wait_ms = 0` —
-/// i.e. NOT queued but all racing → each segment took 2-3.6 s instead of
-/// the ~0.6 s single-stream benchmark. Also capped at 4 ahead (~24 s of
-/// content): past that, a big box (say 64 cores → 16 permits) would flood
-/// the queue with speculative work and starve a second stream's LIVE
-/// segment behind a wall of one viewer's prefetch.
-fn segment_prefetch_ahead() -> u32 {
-    let permits = pharos_transcode::device::default_cpu_permits() as u32;
-    // Leave 1 slot for the live segment and ~1 for audio/trickplay; floor
-    // at 1 so tiny boxes still pipeline one ahead, cap at 4 (~24 s buffer).
-    permits.saturating_sub(2).clamp(1, 4)
+/// Both branches reserve ~2 slots (live segment + audio/trickplay/second
+/// viewer) and floor at 1 so a tiny box still pipelines one ahead. The old
+/// depth was pinned to `default_cpu_permits` even when a GPU did the encoding —
+/// so a strong-GPU / few-core box warmed only 1 ahead despite ample capacity.
+fn segment_prefetch_ahead(hw_budget: Option<u32>) -> u32 {
+    match hw_budget {
+        Some(sessions) => sessions.saturating_sub(2).clamp(1, HW_PREFETCH_MAX_AHEAD),
+        None => {
+            let permits = pharos_transcode::device::default_cpu_permits() as u32;
+            permits.saturating_sub(2).clamp(1, 4)
+        }
+    }
 }
 
 /// Frame-aligned start time (seconds) of segment `seg`: the nominal
@@ -2101,9 +2115,24 @@ fn spawn_segment_prefetch(
         .probe
         .duration_ms
         .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32);
+    // This stream hardware-encodes when the server has a probed GPU budget AND
+    // the target codec is one it hardware-encodes (h264/h265 on NVENC; VP9/AV1
+    // stay software). Only then does the prefetch scale on the GPU session
+    // budget — a software-codec stream keeps the conservative CPU-thread depth.
+    let hw_budget = opts.video.and_then(|seg_video| {
+        let codec = VideoCodec::from(seg_video);
+        let budget = state.hw_encode_session_budget;
+        (budget > 0
+            && state
+                .encode_capabilities
+                .best_for(codec)
+                .is_some_and(|c| c.accel.is_hardware()))
+        .then_some(budget as u32)
+    });
+    let ahead = segment_prefetch_ahead(hw_budget);
     // Near shallow prefetch: the next few segments, all of them (fast).
-    let near = prefetch_target_segments(base_seg, total_segs, segment_prefetch_ahead());
-    let near_end = base_seg + segment_prefetch_ahead();
+    let near = prefetch_target_segments(base_seg, total_segs, ahead);
+    let near_end = base_seg + ahead;
     for seg in &near {
         spawn_one_prefetch(state, item, *seg, opts, wanted_burn);
     }
@@ -2522,10 +2551,35 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn prefetch_ahead_is_core_aware_and_bounded() {
-        // Never zero (always pipeline at least one ahead), and stays modest so a
-        // single stream's concurrent encodes don't oversubscribe the cores.
-        let n = segment_prefetch_ahead();
-        assert!((1..=8).contains(&n), "prefetch-ahead {n} out of sane range");
+        // Software path (None): never zero (always pipeline at least one ahead),
+        // and stays modest so a single stream's concurrent encodes don't
+        // oversubscribe the cores.
+        let n = segment_prefetch_ahead(None);
+        assert!(
+            (1..=4).contains(&n),
+            "sw prefetch-ahead {n} out of sane range"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn prefetch_ahead_scales_with_hw_session_budget() {
+        // Hardware path: depth = budget − 2, capped at HW_PREFETCH_MAX_AHEAD (6),
+        // reserving 2 sessions for the live segment + audio/second viewer.
+        // GTX-1070-class 8-session GPU → 6 ahead (~36 s buffer).
+        assert_eq!(segment_prefetch_ahead(Some(8)), 6);
+        // Bigger budgets stay capped at 6 (don't flood the queue / starve a
+        // second stream's live segment).
+        assert_eq!(segment_prefetch_ahead(Some(16)), HW_PREFETCH_MAX_AHEAD);
+        // A modest GPU (4 sessions) → 2 ahead, still deeper-basis than pinning
+        // to a low core count would give.
+        assert_eq!(segment_prefetch_ahead(Some(4)), 2);
+        // Never zero even with a tiny 1-session budget — always one ahead.
+        assert_eq!(segment_prefetch_ahead(Some(1)), 1);
+        assert_eq!(segment_prefetch_ahead(Some(2)), 1);
+        // The hardware branch is strictly deeper-or-equal to the software branch
+        // at the same nominal count — the whole point of scaling off the GPU
+        // budget instead of the CPU thread count.
+        assert!(segment_prefetch_ahead(Some(8)) >= segment_prefetch_ahead(None));
     }
 
     use crate::auth::BuiltinAuth;

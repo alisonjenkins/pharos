@@ -149,6 +149,11 @@ pub struct AppState {
     /// (client-decodable ∩ server-encodable), hardware-preferred. Empty default
     /// = software-only assumption (tests / GPU-less boxes).
     pub encode_capabilities: std::sync::Arc<pharos_transcode::ServerEncodeCapabilities>,
+    /// Total trial-confirmed HARDWARE encode-session budget (sum of every hw
+    /// device's probed concurrent-session cap; 0 when CPU-only). Drives the HLS
+    /// segment prefetch depth: a GPU that sustains N sessions at several×
+    /// realtime warms a deeper buffer than the CPU thread budget would allow.
+    pub hw_encode_session_budget: usize,
     pub trickplay: Option<TrickplayCache>,
     pub subtitles: Option<SubtitleCache>,
     /// Trickplay layout knobs surfaced to handlers + DTO emitter so
@@ -501,6 +506,7 @@ impl AppState {
             hls: None,
             transcode_scheduler: None,
             encode_capabilities: std::sync::Arc::new(Default::default()),
+            hw_encode_session_budget: 0,
             trickplay: None,
             subtitles: None,
             trickplay_widths: Vec::new(),
@@ -580,6 +586,7 @@ impl AppState {
             hls: None,
             transcode_scheduler: None,
             encode_capabilities: std::sync::Arc::new(Default::default()),
+            hw_encode_session_budget: 0,
             trickplay: None,
             subtitles: None,
             trickplay_widths: Vec::new(),
@@ -628,6 +635,14 @@ impl AppState {
         caps: std::sync::Arc<pharos_transcode::ServerEncodeCapabilities>,
     ) -> Self {
         self.encode_capabilities = caps;
+        self
+    }
+
+    /// Set the trial-confirmed hardware encode-session budget (0 = CPU-only).
+    /// The HLS segment prefetch depth scales on this instead of the CPU thread
+    /// count so a capable GPU warms a deeper buffer.
+    pub fn with_hw_encode_session_budget(mut self, budget: usize) -> Self {
+        self.hw_encode_session_budget = budget;
         self
     }
 
