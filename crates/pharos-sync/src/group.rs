@@ -2051,6 +2051,16 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.queue.playing_index =
                 playing_index.min(state.queue.items.len().saturating_sub(1));
             state.broadcast_play_queue("new_playlist", true, start_position_ms);
+            // Settle playback at the NEW item's start before the gate opens.
+            // Without this, `state.playback` still holds the previous item's
+            // `Playing{old_pos, old_anchor}` through the whole gate — so the new
+            // item's BufferingStart reads a stale Playing and broadcasts a Pause
+            // at the old (growing) position, and a join/reconnect mid-gate is
+            // told to play the new item from the old position. (SeekTo settles
+            // Paused first for the same reason.)
+            state.playback = PlaybackState::Paused {
+                position_ms: start_position_ms,
+            };
             let pending = state.follower_ids();
             state.enter_waiting(pending, true, start_position_ms, "Unpause", 0);
         }
@@ -2066,6 +2076,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             {
                 state.queue.playing_index = idx;
                 state.broadcast_play_queue("set_current_item", true, 0);
+                // Settle at the new item's start before the gate (see SetNewQueue).
+                state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, "Unpause", 0);
             }
@@ -2094,6 +2106,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     "syncplay: queue advanced to next item"
                 );
                 state.broadcast_play_queue("next_item", true, 0);
+                // Settle at the new item's start before the gate (see SetNewQueue).
+                // This is the dominant binge/auto-advance path — without it every
+                // next-episode transition of a playing group broadcast a Pause at
+                // the old episode's growing position and stranded mid-gate joiners.
+                state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, "Unpause", 0);
             }
@@ -2116,6 +2133,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     "syncplay: queue moved to previous item"
                 );
                 state.broadcast_play_queue("previous_item", true, 0);
+                // Settle at the new item's start before the gate (see SetNewQueue).
+                state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, "Unpause", 0);
             }
@@ -3416,6 +3435,106 @@ mod tests {
             GroupPlayState::Idle,
             "empty queue must not start playback"
         );
+    }
+
+    /// Root Cause A: a queue change (NextItem here) on a PLAYING group must
+    /// settle `playback` at the new item's start BEFORE opening the readiness
+    /// gate. Otherwise the stale `Playing{old_pos}` persists through the gate,
+    /// so (1) the new item's buffering freezes the group with a Pause at the OLD
+    /// growing position, and (2) a mid-transition joiner is told to play the new
+    /// item from the old position while everyone else waits at 0.
+    #[tokio::test]
+    async fn next_item_settles_new_start_before_gate() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+
+        // A 2-item queue, brought to Playing at a non-zero position.
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["ep1".into(), "ep2".into()],
+            playing_index: 0,
+            start_position_ms: 30_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        for mid in [m1, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 30_000,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let _ = snapshot_of(&h).await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "group should be playing ep1"
+        );
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // Advance to the next episode (None pli => not stale => advances).
+        h.tx.send(GroupMsg::NextItem {
+            sender: m1,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // A follower buffers the NEW item. The group must NOT freeze-Pause: the
+        // playback is settled Paused at the new start, so the V19 freeze guard
+        // (which only fires on a Playing group) is false.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        let mut saw_pause = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Pause { .. }) {
+                saw_pause = true;
+            }
+        }
+        assert!(
+            !saw_pause,
+            "a next-item transition must not broadcast a stale-position Pause"
+        );
+
+        // A member joining mid-transition must catch up to the NEW item's start
+        // (position 0, not playing), not the old episode's growing position.
+        let (_m3, mut rx3) = add_member(&h, &sinks, "joiner").await;
+        let _ = snapshot_of(&h).await;
+        let mut checked = false;
+        while let Ok(msg) = rx3.try_recv() {
+            if let ServerMsg::PlayQueue {
+                start_position_ms,
+                is_playing,
+                playing_index,
+                ..
+            } = msg
+            {
+                assert_eq!(playing_index, 1, "joiner must be on the new item");
+                assert_eq!(
+                    start_position_ms, 0,
+                    "joiner must catch up at the new item's start, not the old position"
+                );
+                assert!(
+                    !is_playing,
+                    "joiner must not be told to play while the transition gate is open"
+                );
+                checked = true;
+            }
+        }
+        assert!(checked, "joiner must receive a PlayQueue catch-up");
     }
 
     /// B57 — a member the group is WAITING on (Unpause opened a gate on the
