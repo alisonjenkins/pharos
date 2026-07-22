@@ -304,6 +304,19 @@ pub struct AppState {
     /// enforcement. Defaults to the built-in US table; boot overrides it from
     /// `[parental]` config when present.
     pub parental_ratings: crate::parental::ParentalRatingMap,
+    /// T11 — TMDB/TVDB API keys (mirrors `cfg.tmdb.api_key` /
+    /// `cfg.tvdb.api_key`), held on state so the manual Identify endpoints
+    /// (`RemoteSearch{,/Apply}`) can build a one-off provider enricher on
+    /// demand. Deliberately NOT the enricher objects themselves (each holds
+    /// a `reqwest::Client`) — a rare manual action building one fresh is
+    /// cheap, and keeps `AppState` free of provider-specific types the way
+    /// the T9 backfill's own spawn already does (see `main.rs`).
+    pub tmdb_api_key: Option<String>,
+    pub tvdb_api_key: Option<String>,
+    /// T11 — online-enrichment tunables (refresh cadence, match-confidence
+    /// floor), mirrored onto state so the manual apply endpoint's immediate
+    /// re-enrich shares the configured knobs instead of silently defaulting.
+    pub metadata_config: crate::config::MetadataConfig,
 }
 
 /// Max recent activity entries retained in memory (T73).
@@ -540,6 +553,9 @@ impl AppState {
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             waveform: Default::default(),
             parental_ratings: crate::parental::ParentalRatingMap::us_default(),
+            tmdb_api_key: None,
+            tvdb_api_key: None,
+            metadata_config: crate::config::MetadataConfig::default(),
         }
     }
 
@@ -620,6 +636,9 @@ impl AppState {
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             waveform: Default::default(),
             parental_ratings: crate::parental::ParentalRatingMap::us_default(),
+            tmdb_api_key: None,
+            tvdb_api_key: None,
+            metadata_config: crate::config::MetadataConfig::default(),
         })
     }
 
@@ -655,6 +674,28 @@ impl AppState {
 
     pub fn with_played_threshold_pct(mut self, pct: u32) -> Self {
         self.played_threshold_pct = pct.clamp(50, 100);
+        self
+    }
+
+    /// T11 builder — attach the TMDB/TVDB API keys the manual Identify
+    /// endpoints build a one-off enricher from. Mirrors `cfg.tmdb.api_key`
+    /// / `cfg.tvdb.api_key`; a blank string counts as unset (same rule as
+    /// `Config::apply_env`'s secret-injection path).
+    pub fn with_metadata_provider_keys(
+        mut self,
+        tmdb_api_key: Option<String>,
+        tvdb_api_key: Option<String>,
+    ) -> Self {
+        self.tmdb_api_key = tmdb_api_key.filter(|k| !k.is_empty());
+        self.tvdb_api_key = tvdb_api_key.filter(|k| !k.is_empty());
+        self
+    }
+
+    /// T11 builder — attach the online-enrichment tunables (`[metadata]`)
+    /// so the manual apply endpoint's immediate re-enrich shares the
+    /// configured refresh knobs instead of silently defaulting.
+    pub fn with_metadata_config(mut self, cfg: crate::config::MetadataConfig) -> Self {
+        self.metadata_config = cfg;
         self
     }
 

@@ -60,8 +60,9 @@ const CACHED_ART_ROLES: [ArtworkRole; 3] = [
 
 /// Unix time in whole seconds (0 if the clock is before the epoch). Mirrors
 /// the server-wide helper; `run`/`enrich_one` take `now` as a parameter so
-/// tests are deterministic, and only [`spawn`] reads the wall clock.
-fn now_secs() -> i64 {
+/// tests are deterministic, and only [`spawn`] (and the T11 manual-apply
+/// handler) reads the wall clock.
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -408,6 +409,92 @@ where
     Ok(true)
 }
 
+/// T11 — apply a user's manual Identify choice: persist the override with
+/// `match_source = "manual"` FIRST (a user assertion of identity that stands
+/// even if the fetch below never runs), then attempt an immediate re-enrich
+/// of just this item by handing [`enrich_one`] the chosen id up front (via
+/// `provider_ids`) so it fetches EXACTLY the record the user picked instead
+/// of re-running its own search.
+///
+/// `enrich_one`'s own persistence may record a different `match_source`
+/// (`"nfo_id"`, since the id is now pre-resolved rather than searched) — the
+/// manual override is re-asserted afterward UNCONDITIONALLY so the row is
+/// guaranteed to end `match_source = "manual"`, matching the caller-visible
+/// contract (and, incidentally, `items_needing_match` excludes both
+/// `"manual"` and `"nfo_id"` either way — see its doc comment).
+///
+/// No provider key / no image cache configured → the override is still
+/// persisted (a user's stated identity is honoured regardless of whether
+/// pharos can currently fetch it), the re-enrich step is skipped, and the
+/// skip is logged. Generic over the same `Tm`/`Tv`/`S` bounds as
+/// [`enrich_one`] so tests can drive it against a real in-memory
+/// `SqliteStore` with a fake enricher, exactly like this module's own tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_manual_match<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: Option<&ImageCache>,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    id: u64,
+    provider: &str,
+    external_id: &str,
+    now: i64,
+) -> DomainResult<()>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore + GenreStore + PersonStore,
+{
+    store
+        .set_item_match(id, provider, external_id, "manual", None, now)
+        .await?;
+
+    let Some(cache) = cache else {
+        tracing::info!(
+            media.id = id,
+            "T11 manual match: immediate re-enrich skipped (no image cache configured)"
+        );
+        return Ok(());
+    };
+    if tmdb.is_none() && tvdb.is_none() {
+        tracing::info!(
+            media.id = id,
+            "T11 manual match: immediate re-enrich skipped (no provider key configured)"
+        );
+        return Ok(());
+    }
+    let Ok(mut item) = store.get(id).await else {
+        // Caller already resolved the item before calling this fn; a row
+        // that vanished between calls is not this fn's problem to raise —
+        // the manual override above is already persisted either way.
+        return Ok(());
+    };
+    match provider {
+        "tmdb" => item.metadata.provider_ids.tmdb = Some(external_id.to_string()),
+        "tvdb" => item.metadata.provider_ids.tvdb = Some(external_id.to_string()),
+        _ => {}
+    }
+    store.put(item.clone()).await?;
+
+    if let Err(e) = enrich_one(store, bg_io, cache, tmdb, tvdb, cfg, item, now).await {
+        tracing::warn!(
+            error = %e,
+            media.id = id,
+            "T11 manual match: immediate re-enrich failed (match itself is already persisted)"
+        );
+    }
+
+    // enrich_one's own persistence may have overwritten match_source (e.g.
+    // "nfo_id", since we just pre-seeded provider_ids above) — re-assert the
+    // manual override so it wins regardless of what the fetch above did.
+    store
+        .set_item_match(id, provider, external_id, "manual", None, now)
+        .await?;
+    Ok(())
+}
+
 /// Resolve one item against a single provider: determine the external id
 /// (NFO id if this provider's slot is set, else search + `match_best`), then
 /// fetch the full record. Generic over the concrete enricher (RPITIT → no
@@ -672,5 +759,75 @@ mod tests {
             s.get(900_102).await.unwrap().match_source.as_deref(),
             Some("none")
         );
+    }
+
+    #[tokio::test]
+    async fn apply_manual_match_persists_manual_and_fetches_the_chosen_id() {
+        // T11 — the apply handler's core logic. Deliberately leave the fake
+        // enricher's `search` empty: if `apply_manual_match` fell back to
+        // searching (instead of handing the chosen id straight to `fetch`
+        // via `provider_ids`), this would resolve NoMatch and the overview
+        // would stay unset — so a set overview proves the direct-fetch path.
+        let s = store().await;
+        put_movie(&s, 900_200, "Dune (2021)").await;
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb().with_detail(enriched_overview("A duke's son..."));
+
+        apply_manual_match(
+            &s,
+            &sem(4),
+            Some(&cache),
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            900_200,
+            "tmdb",
+            "438631",
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(900_200).await.unwrap();
+        // The manual override wins — NOT the "nfo_id" source enrich_one's
+        // own internal resolve() would otherwise have recorded.
+        assert_eq!(got.match_source.as_deref(), Some("manual"));
+        assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.metadata_refreshed_at, Some(NOW));
+        // The immediate re-enrich actually ran and merged the chosen
+        // record's metadata.
+        assert_eq!(got.metadata.overview.as_deref(), Some("A duke's son..."));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+    }
+
+    #[tokio::test]
+    async fn apply_manual_match_persists_even_without_an_enricher() {
+        // No provider key configured (mirrors the apply handler's "still set
+        // the manual match" behaviour when [tmdb]/[tvdb] api_key is absent —
+        // a user's stated identity is honoured even when pharos can't
+        // currently fetch it).
+        let s = store().await;
+        put_movie(&s, 900_201, "Whatever").await;
+        let (_td, cache) = cache();
+
+        apply_manual_match(
+            &s,
+            &sem(4),
+            Some(&cache),
+            None::<&FakeEnricher>,
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            900_201,
+            "tmdb",
+            "999",
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(900_201).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("manual"));
+        assert_eq!(got.match_external_id.as_deref(), Some("999"));
     }
 }

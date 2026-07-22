@@ -9,12 +9,16 @@
 //! InstantMix is a real same-kind mix drawn from the library.
 
 use crate::api::jellyfin::ci_query::CiQuery;
+use crate::online_enrich::OnlineEnricher;
+use crate::tmdb::{TmdbClient, TmdbEnricher};
+use crate::tvdb::{ReqwestTransport, TvdbClient, TvdbEnricher};
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, items},
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::MediaStore;
+use pharos_core::{MediaItem, MediaKind, MediaStore};
+use pharos_scanner::FilenameProvider;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -31,7 +35,19 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         )
         .route("/audio/{id}/lyrics", web::get().to(get_lyrics))
         .route("/items/{id}/instantmix", web::get().to(instant_mix))
-        .route("/items/{id}/metadataeditor", web::get().to(metadata_editor));
+        .route("/items/{id}/metadataeditor", web::get().to(metadata_editor))
+        .route(
+            "/items/{id}/remotesearch/movie",
+            web::get().to(remote_search_movie),
+        )
+        .route(
+            "/items/{id}/remotesearch/series",
+            web::get().to(remote_search_series),
+        )
+        .route(
+            "/items/{id}/remotesearch/apply",
+            web::post().to(remote_search_apply),
+        );
 }
 
 /// `GET /Items/{id}/MetadataEditor` (T67) — the bundle jellyfin-web's
@@ -383,4 +399,358 @@ async fn instant_mix(
     let total = mix.len() as u32;
     let page = items::build_items_page(&state, user.0.id, &mix, total, 0).await?;
     Ok(crate::api::jellyfin::wire::json(&page))
+}
+
+// ---------------------------------------------------------------------
+// T11 — manual Identify: search a provider for candidates, apply a chosen
+// one as an override. Unlike `remote_images`/`remote_subtitle_search`
+// above (pharos has NO providers for those), pharos DOES have TMDB/TVDB
+// wired for the T9 background enrichment sweep — these endpoints expose
+// that same capability to jellyfin-web's Identify dialog for a manual
+// override, on demand (a fresh enricher per call; see `AppState::tmdb_api_key`
+// / `tvdb_api_key`).
+// ---------------------------------------------------------------------
+
+/// One candidate in a `RemoteSearch` result — trimmed to the fields
+/// jellyfin-web's Identify dialog renders + needs to round-trip into
+/// `POST .../RemoteSearch/Apply`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoteSearchResultDto {
+    name: String,
+    production_year: Option<u32>,
+    provider_ids: RemoteSearchProviderIdsDto,
+    /// Always absent today — [`pharos_core::SearchCandidate`] carries no
+    /// thumbnail; omitted (not `null`) so a strict client's optional-field
+    /// handling sees "not offered" rather than a broken image request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoteSearchProviderIdsDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tmdb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tvdb: Option<String>,
+}
+
+/// `POST /Items/{id}/RemoteSearch/Apply` body — Jellyfin's Identify dialog
+/// posts the chosen candidate's provider + id.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoteSearchApplyDto {
+    provider: String,
+    id: String,
+}
+
+/// `key.filter(not empty)` — a blank string counts as unset, mirroring
+/// `Config::apply_env`'s secret-injection rule.
+fn non_empty(key: Option<&str>) -> Option<&str> {
+    key.filter(|k| !k.is_empty())
+}
+
+/// Derive `(title, year)` to search a provider with, from an item's stem
+/// (movie) or series metadata (series/episode) — mirrors
+/// [`crate::metadata_backfill::enrich_one`]'s search-key derivation so a
+/// manual search surfaces the same candidates the background pass would.
+fn search_key(item: &MediaItem, movie: bool) -> (String, Option<u32>) {
+    let stem = item
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(item.title.as_str());
+    if movie {
+        let parsed = FilenameProvider::parse_stem(stem, true);
+        (
+            parsed.title.unwrap_or_else(|| item.title.clone()),
+            parsed.year,
+        )
+    } else {
+        let series = item.series.as_ref();
+        let title = series
+            .map(|s| s.series_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                FilenameProvider::parse_stem(stem, false)
+                    .title
+                    .unwrap_or_else(|| item.title.clone())
+            });
+        (title, series.and_then(|s| s.series_year))
+    }
+}
+
+/// [`pharos_core::SearchCandidate`]s → wire DTOs, tagging the id under the
+/// right `ProviderIds` key.
+fn candidates_to_dto(
+    candidates: Vec<pharos_core::SearchCandidate>,
+    provider: &str,
+) -> Vec<RemoteSearchResultDto> {
+    candidates
+        .into_iter()
+        .map(|c| {
+            let mut provider_ids = RemoteSearchProviderIdsDto::default();
+            match provider {
+                "tmdb" => provider_ids.tmdb = Some(c.id),
+                _ => provider_ids.tvdb = Some(c.id),
+            }
+            RemoteSearchResultDto {
+                name: c.title,
+                production_year: c.year,
+                provider_ids,
+                image_url: None,
+            }
+        })
+        .collect()
+}
+
+/// Core of `GET /Items/{id}/RemoteSearch/Movie` — search TMDB for candidate
+/// matches. No `[tmdb].api_key` configured → an honest empty array, the
+/// same treatment `remote_images`/`remote_subtitle_search` above give their
+/// (also absent) providers, rather than erroring the client's fetch.
+/// Split from the actix handler below so it's directly callable from tests
+/// without going through `web::Path` extraction.
+async fn remote_search_movie_inner(
+    state: &AppState,
+    id: u64,
+) -> Result<Vec<RemoteSearchResultDto>, actix_web::Error> {
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let Some(key) = non_empty(state.tmdb_api_key.as_deref()) else {
+        return Ok(Vec::new());
+    };
+    let enricher = TmdbEnricher(TmdbClient::new(key.to_string()));
+    let (title, year) = search_key(&item, true);
+    let candidates = enricher.search(MediaKind::Movie, &title, year).await;
+    Ok(candidates_to_dto(candidates, "tmdb"))
+}
+
+/// `GET /Items/{id}/RemoteSearch/Movie` — jellyfin-web's Identify dialog
+/// lists these candidates.
+async fn remote_search_movie(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let results = remote_search_movie_inner(&state, id).await?;
+    Ok(crate::api::jellyfin::wire::json(&results))
+}
+
+/// Core of `GET /Items/{id}/RemoteSearch/Series` — search TVDB (falling
+/// back to TMDB when no `[tvdb].api_key` is configured but
+/// `[tmdb].api_key` is), mirroring
+/// [`crate::metadata_backfill::enrich_one`]'s episode provider preference.
+/// Neither key configured → an empty array.
+async fn remote_search_series_inner(
+    state: &AppState,
+    id: u64,
+) -> Result<Vec<RemoteSearchResultDto>, actix_web::Error> {
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let (title, year) = search_key(&item, false);
+    if let Some(key) = non_empty(state.tvdb_api_key.as_deref()) {
+        let enricher = TvdbEnricher(TvdbClient::new(key.to_string()));
+        let candidates = enricher.search(MediaKind::Episode, &title, year).await;
+        return Ok(candidates_to_dto(candidates, "tvdb"));
+    }
+    if let Some(key) = non_empty(state.tmdb_api_key.as_deref()) {
+        let enricher = TmdbEnricher(TmdbClient::new(key.to_string()));
+        let candidates = enricher.search(MediaKind::Episode, &title, year).await;
+        return Ok(candidates_to_dto(candidates, "tmdb"));
+    }
+    Ok(Vec::new())
+}
+
+/// `GET /Items/{id}/RemoteSearch/Series` — jellyfin-web's Identify dialog
+/// lists these candidates.
+async fn remote_search_series(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let results = remote_search_series_inner(&state, id).await?;
+    Ok(crate::api::jellyfin::wire::json(&results))
+}
+
+/// Core of `POST /Items/{id}/RemoteSearch/Apply` — sets `match_source =
+/// "manual"` (a user override the T9 background sweep NEVER reprocesses —
+/// see [`pharos_core::MediaStore::items_needing_match`]), then attempts an
+/// immediate re-enrich of just this item so its metadata/art reflect the
+/// new match right away instead of waiting for the next scheduled pass.
+/// The override is persisted even when no provider key is configured (a
+/// user's stated identity is honoured regardless of whether pharos can
+/// currently fetch it) — only the immediate re-enrich step is then skipped.
+/// Split from the actix handler below so it's directly callable from tests
+/// without going through `web::Path`/`web::Json` extraction.
+async fn remote_search_apply_inner(
+    state: &AppState,
+    id: u64,
+    body: RemoteSearchApplyDto,
+) -> Result<(), actix_web::Error> {
+    // Confirm the item exists first — `set_item_match` is a silent no-op on
+    // an unknown id, which would otherwise mask a bad id as a false 204.
+    state.stores.get(id).await.map_err(|e| match e {
+        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+        other => error::ErrorInternalServerError(other.to_string()),
+    })?;
+    let provider = body.provider.to_ascii_lowercase();
+    if provider != "tmdb" && provider != "tvdb" {
+        return Err(error::ErrorBadRequest(
+            "Provider must be \"tmdb\" or \"tvdb\"",
+        ));
+    }
+    let now = crate::metadata_backfill::now_secs();
+    let tmdb = non_empty(state.tmdb_api_key.as_deref())
+        .map(|key| TmdbEnricher(TmdbClient::new(key.to_string())));
+    let tvdb: Option<TvdbEnricher<ReqwestTransport>> = non_empty(state.tvdb_api_key.as_deref())
+        .map(|key| TvdbEnricher(TvdbClient::new(key.to_string())));
+    crate::metadata_backfill::apply_manual_match(
+        &state.stores,
+        &state.bg_io,
+        state.images.as_ref(),
+        tmdb.as_ref(),
+        tvdb.as_ref(),
+        &state.metadata_config,
+        id,
+        &provider,
+        &body.id,
+        now,
+    )
+    .await
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(())
+}
+
+/// `POST /Items/{id}/RemoteSearch/Apply` — jellyfin-web's Identify dialog
+/// posts the user's chosen candidate here.
+async fn remote_search_apply(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    body: web::Json<RemoteSearchApplyDto>,
+) -> Result<impl Responder, actix_web::Error> {
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    remote_search_apply_inner(&state, id, body.into_inner()).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::state::Stores;
+
+    async fn seed_state() -> AppState {
+        let stores = Stores::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        AppState::new(stores, "t".into())
+    }
+
+    async fn put_movie(state: &AppState, id: u64, title: &str) {
+        let item = pharos_core::MediaItem {
+            id,
+            path: format!("/movies/{title}.mkv").into(),
+            title: title.to_string(),
+            kind: MediaKind::Movie,
+            ..pharos_core::MediaItem::default()
+        };
+        state.stores.put(item).await.expect("seed item");
+    }
+
+    /// Handler-core test: drives `remote_search_apply_inner` directly — the
+    /// thin actix wrapper above only parses `web::Path`/`web::Json` and
+    /// delegates here, so this exercises the real handler logic (provider
+    /// validation, `apply_manual_match` wiring) against a real in-memory
+    /// `SqliteStore`, without needing a live login session to satisfy the
+    /// `AuthUser` extractor.
+    #[actix_web::test]
+    async fn apply_flips_match_source_to_manual_and_persists() {
+        let state = seed_state().await;
+        put_movie(&state, 42, "Dune (2021)").await;
+
+        remote_search_apply_inner(
+            &state,
+            42,
+            RemoteSearchApplyDto {
+                provider: "tmdb".to_string(),
+                id: "438631".to_string(),
+            },
+        )
+        .await
+        .expect("apply handler");
+
+        let got = state.stores.get(42).await.expect("item still present");
+        assert_eq!(got.match_source.as_deref(), Some("manual"));
+        assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+    }
+
+    /// No `[tmdb].api_key` configured (the default in `seed_state`) → the
+    /// search route returns an honest empty array, never an error, matching
+    /// the file's existing no-providers stubs (`remote_images` etc).
+    #[actix_web::test]
+    async fn search_movie_returns_empty_without_a_key() {
+        let state = seed_state().await;
+        put_movie(&state, 43, "Dune (2021)").await;
+
+        let results = remote_search_movie_inner(&state, 43)
+            .await
+            .expect("search handler");
+        assert!(results.is_empty());
+    }
+
+    /// Unknown item id → 404, not a silent 204 — `set_item_match` is a
+    /// no-op on an unknown id, which would otherwise mask a bad id as
+    /// success.
+    #[actix_web::test]
+    async fn apply_unknown_item_returns_404() {
+        let state = seed_state().await;
+        let err = remote_search_apply_inner(
+            &state,
+            999,
+            RemoteSearchApplyDto {
+                provider: "tmdb".to_string(),
+                id: "1".to_string(),
+            },
+        )
+        .await
+        .expect_err("unknown id must 404");
+        assert_eq!(
+            err.error_response().status(),
+            actix_web::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    /// An unrecognised `Provider` value is rejected with 400, not silently
+    /// persisted as a bogus match.
+    #[actix_web::test]
+    async fn apply_rejects_unknown_provider() {
+        let state = seed_state().await;
+        put_movie(&state, 44, "Whatever").await;
+        let err = remote_search_apply_inner(
+            &state,
+            44,
+            RemoteSearchApplyDto {
+                provider: "letterboxd".to_string(),
+                id: "1".to_string(),
+            },
+        )
+        .await
+        .expect_err("unknown provider must 400");
+        assert_eq!(
+            err.error_response().status(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+    }
 }
