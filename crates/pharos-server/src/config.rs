@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Config {
     pub server: ServerConfig,
     pub obs: ObsConfig,
@@ -17,6 +17,15 @@ pub struct Config {
     /// no `api_key` → the person-image backfill never spawns (feature off).
     #[serde(default)]
     pub tmdb: TmdbConfig,
+    /// Optional TVDB integration, mirroring `tmdb` — supplies `api_key` via
+    /// `PHAROS_TVDB_API_KEY` rather than committing it to `config.toml`.
+    #[serde(default)]
+    pub tvdb: TvdbConfig,
+    /// Online metadata/artwork enrichment tunables (refresh cadence, batch
+    /// size, match-confidence floor). All fields default when the
+    /// `[metadata]` section is absent.
+    #[serde(default)]
+    pub metadata: MetadataConfig,
 }
 
 /// `[tmdb]` — TMDB (themoviedb.org) integration. Only `api_key` matters
@@ -28,6 +37,55 @@ pub struct TmdbConfig {
     /// TMDB v3 API key. `None` (the default) disables the feature.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// `[tvdb]` — TVDB (thetvdb.com) integration, mirroring `[tmdb]`. Only
+/// `api_key` matters today. Supply it via `PHAROS_TVDB_API_KEY` (a k8s
+/// Secret env var) rather than committing it to `config.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct TvdbConfig {
+    /// TVDB v4 API key. `None` (the default) disables the feature.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// `[metadata]` — online metadata/artwork enrichment tunables. All fields
+/// have defaults, so the section may be omitted entirely.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct MetadataConfig {
+    /// Days before a previously-enriched item is eligible for re-fetch.
+    /// Default 30.
+    #[serde(default = "default_refresh_ttl_days")]
+    pub refresh_ttl_days: u32,
+    /// Max items considered per enrichment pass. Default 5000.
+    #[serde(default = "default_max_per_pass")]
+    pub max_per_pass: i64,
+    /// Minimum match-confidence score (0.0-1.0) required to accept an
+    /// online match. Default 0.7.
+    #[serde(default = "default_match_min_confidence")]
+    pub match_min_confidence: f32,
+}
+
+fn default_refresh_ttl_days() -> u32 {
+    30
+}
+
+fn default_max_per_pass() -> i64 {
+    5000
+}
+
+fn default_match_min_confidence() -> f32 {
+    0.7
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            refresh_ttl_days: default_refresh_ttl_days(),
+            max_per_pass: default_max_per_pass(),
+            match_min_confidence: default_match_min_confidence(),
+        }
+    }
 }
 
 /// `[parental]` — override the official-rating → score mapping used to enforce
@@ -443,7 +501,7 @@ impl Config {
 
     /// Override fields from environment vars. Prefix `PHAROS_`.
     /// Recognized: `PHAROS_BIND`, `PHAROS_LOG_LEVEL`, `PHAROS_OTLP_ENDPOINT`,
-    /// `PHAROS_DATABASE_URL`, `PHAROS_TMDB_API_KEY`.
+    /// `PHAROS_DATABASE_URL`, `PHAROS_TMDB_API_KEY`, `PHAROS_TVDB_API_KEY`.
     pub fn apply_env(mut self) -> Self {
         if let Ok(v) = std::env::var("PHAROS_BIND") {
             self.server.bind = v;
@@ -468,6 +526,16 @@ impl Config {
             let v = v.trim();
             if !v.is_empty() {
                 self.tmdb.api_key = Some(v.to_string());
+            }
+        }
+        // Mirrors PHAROS_TMDB_API_KEY above — the TVDB key is a secret;
+        // inject it from a k8s Secret env var rather than committing it to
+        // config.toml. A blank value counts as unset. Overrides
+        // `[tvdb].api_key`.
+        if let Ok(v) = std::env::var("PHAROS_TVDB_API_KEY") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.tvdb.api_key = Some(v.to_string());
             }
         }
         self
@@ -602,6 +670,26 @@ mod tests {
                 PathBuf::from("/srv/Shows"),
             ]
         );
+    }
+
+    #[test]
+    fn metadata_defaults_and_tvdb_env_override() {
+        // Minimal TOML omitting [tvdb]/[metadata] so the `#[serde(default)]`
+        // paths are exercised.
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+        "#;
+        let cfg = Config::from_toml_str(s).unwrap();
+        assert_eq!(cfg.metadata.refresh_ttl_days, 30);
+        assert_eq!(cfg.metadata.max_per_pass, 5000);
+        assert!((cfg.metadata.match_min_confidence - 0.7).abs() < f32::EPSILON);
+        std::env::set_var("PHAROS_TVDB_API_KEY", "  abc123  ");
+        let cfg = cfg.apply_env();
+        assert_eq!(cfg.tvdb.api_key.as_deref(), Some("abc123"));
+        std::env::remove_var("PHAROS_TVDB_API_KEY");
     }
 
     #[test]
