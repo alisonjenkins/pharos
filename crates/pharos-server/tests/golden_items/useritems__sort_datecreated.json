@@ -33,9 +33,7 @@
         "Jazz"
       ],
       "Id": "0000000000000000000000000000001f",
-      "ImageTags": {
-        "Primary": "6620922965f75a27"
-      },
+      "ImageTags": {},
       "IsFolder": false,
       "LocationType": "FileSystem",
       "MediaSources": [
@@ -141,9 +139,7 @@
         "Jazz"
       ],
       "Id": "0000000000000000000000000000001e",
-      "ImageTags": {
-        "Primary": "4e869b5f937ba34b"
-      },
+      "ImageTags": {},
       "IsFolder": false,
       "LocationType": "FileSystem",
       "MediaSources": [

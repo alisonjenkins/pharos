@@ -123,6 +123,7 @@ async fn seed(fixture: PathBuf, cache_dir: &Path) -> (web::Data<AppState>, Strin
             series: None,
             created_at: None,
             metadata: Default::default(),
+            has_primary_art: false,
         })
         .await
         .unwrap();

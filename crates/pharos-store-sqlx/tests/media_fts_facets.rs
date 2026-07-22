@@ -36,6 +36,7 @@ fn item(id: u64, title: &str, overview: Option<&str>, kind: MediaKind) -> MediaI
             overview: overview.map(str::to_string),
             ..Default::default()
         },
+        has_primary_art: false,
     }
 }
 

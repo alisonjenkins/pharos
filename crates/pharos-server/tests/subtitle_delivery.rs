@@ -184,6 +184,7 @@ async fn seed(fixture: &Path) -> web::Data<AppState> {
             series: None,
             created_at: None,
             metadata: Default::default(),
+            has_primary_art: false,
         })
         .await
         .unwrap();

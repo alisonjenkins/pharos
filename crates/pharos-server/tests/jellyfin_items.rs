@@ -483,6 +483,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
             series: None,
             created_at: None,
             metadata: Default::default(),
+            has_primary_art: false,
         })
         .await
         .unwrap();

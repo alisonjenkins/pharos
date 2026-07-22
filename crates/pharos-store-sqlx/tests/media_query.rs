@@ -70,6 +70,7 @@ fn synth_item(id: u64) -> MediaItem {
             community_rating: Some((id % 100) as f32 / 10.0),
             ..Default::default()
         },
+        has_primary_art: false,
     }
 }
 

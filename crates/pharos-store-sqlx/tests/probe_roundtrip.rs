@@ -179,6 +179,10 @@ fn arb_item() -> impl Strategy<Value = MediaItem> {
             // fixtures in sqlite_store.rs; the probe proptest keeps it
             // at default.
             metadata: Default::default(),
+            // `put` never persists this (it's maintained by `set_artwork`), so
+            // it round-trips as the column default; keep the pre-put value
+            // false to match the fetched row.
+            has_primary_art: false,
         })
 }
 

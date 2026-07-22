@@ -1199,3 +1199,42 @@ async fn upsert_tag_is_idempotent() {
     assert_eq!(id1, id2);
     assert_eq!(s.tags_with_counts().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn set_primary_artwork_flips_has_primary_art() {
+    // The denormalized `has_primary_art` flag (read back into MediaItem, gating
+    // the Jellyfin audio Primary tag) must track the artwork table exactly.
+    let s = fresh().await;
+    let it = item(7, "/music/Album/01.flac", "Track", MediaKind::Audio);
+    s.put(it).await.unwrap();
+    // No artwork yet → false (a coverless audio track).
+    assert!(!s.get(7).await.unwrap().has_primary_art, "no art → false");
+
+    // A local Primary sidecar (folder/cover.jpg) → true.
+    s.set_artwork(7, "Primary", "local", "/music/Album/cover.jpg")
+        .await
+        .unwrap();
+    assert!(
+        s.get(7).await.unwrap().has_primary_art,
+        "local Primary → true"
+    );
+
+    // A non-Primary role must not disturb the flag.
+    s.set_artwork(7, "Backdrop", "local", "/music/Album/fanart.jpg")
+        .await
+        .unwrap();
+    assert!(
+        s.get(7).await.unwrap().has_primary_art,
+        "Backdrop leaves Primary flag untouched"
+    );
+
+    // A Primary downgraded to a non-servable url source clears it (the image
+    // route only serves local artwork for items).
+    s.set_artwork(7, "Primary", "url", "https://example/cover.jpg")
+        .await
+        .unwrap();
+    assert!(
+        !s.get(7).await.unwrap().has_primary_art,
+        "url Primary is not item-servable → false"
+    );
+}

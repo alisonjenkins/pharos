@@ -58,6 +58,15 @@ pub struct MediaItem {
     /// through the store and project down into the Jellyfin
     /// `BaseItemDto`. `Default` = all `None` / empty.
     pub metadata: MediaMetadata,
+    /// Denormalized "a servable local Primary image exists for this item"
+    /// flag, mirrored from the `artwork` table by the store. The Jellyfin DTO
+    /// advertises `ImageTags.Primary` for every VIDEO item (a frame-extract
+    /// always satisfies it), but an Audio track's only Primary source is a
+    /// local sidecar (`folder`/`cover.jpg`); advertising it for a coverless
+    /// track promises a poster the image route 404s. `image_tags_for` gates
+    /// the audio Primary tag on this so that invalid state is unrepresentable.
+    /// `Default` = `false`.
+    pub has_primary_art: bool,
 }
 
 /// LIB-C7/C8/C9 — item-level descriptive metadata persisted alongside

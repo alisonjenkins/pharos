@@ -50,6 +50,7 @@ async fn seed() -> (web::Data<AppState>, String) {
                     official_rating: Some(rating.into()),
                     ..Default::default()
                 },
+                has_primary_art: false,
             }
         };
     let items = [

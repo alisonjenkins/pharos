@@ -1814,13 +1814,20 @@ fn provider_ids_map(ids: &pharos_core::ProviderIds) -> serde_json::Map<String, s
 /// hash IS the version.
 pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, serde_json::Value> {
     let mut m = serde_json::Map::new();
-    // Every item gets a Primary tag — Audio uses cover-art if embedded,
-    // Video uses a frame extracted at seek_seconds. Backdrop/Thumb only
-    // make sense for video.
-    m.insert(
-        "Primary".into(),
-        serde_json::Value::String(image_tag_for(item.id, "primary")),
-    );
+    // A Video item always gets a Primary tag — a frame extracted at
+    // seek_seconds satisfies it. An AUDIO track has no video frames: its only
+    // Primary source is a local sidecar (`folder`/`cover.jpg`), recorded in the
+    // `artwork` table and surfaced as `has_primary_art`. Advertise the audio
+    // Primary tag ONLY when one actually exists — otherwise the client requests
+    // a poster the image route can never serve and every grid render 404s.
+    // Backdrop/Thumb only make sense for video.
+    let has_primary = !matches!(item.kind, pharos_core::MediaKind::Audio) || item.has_primary_art;
+    if has_primary {
+        m.insert(
+            "Primary".into(),
+            serde_json::Value::String(image_tag_for(item.id, "primary")),
+        );
+    }
     if !matches!(item.kind, pharos_core::MediaKind::Audio) {
         m.insert(
             "Backdrop".into(),
@@ -3253,9 +3260,25 @@ mod trickplay_helper_tests {
             "audio: no Backdrop tag"
         );
         assert!(!dto.image_tags.contains_key("Thumb"), "audio: no Thumb tag");
+        // A coverless audio track (no local Primary sidecar → has_primary_art
+        // false) must NOT advertise a Primary tag: the image route can't serve
+        // it, so advertising one guarantees a 404 on every grid render.
         assert!(
-            dto.image_tags.contains_key("Primary"),
-            "audio keeps Primary (cover art)"
+            !dto.image_tags.contains_key("Primary"),
+            "coverless audio: no Primary tag"
+        );
+
+        // The SAME track once a cover sidecar is recorded (has_primary_art) DOES
+        // advertise Primary — the image route serves the local artwork.
+        let audio_with_cover = MediaItem {
+            has_primary_art: true,
+            ..audio.clone()
+        };
+        assert!(
+            super::BaseItemDto::from_domain(&audio_with_cover, "srv")
+                .image_tags
+                .contains_key("Primary"),
+            "audio with cover sidecar advertises Primary"
         );
 
         // A video item still advertises a backdrop.
