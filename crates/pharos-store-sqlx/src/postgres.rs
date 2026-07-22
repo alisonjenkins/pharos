@@ -1012,11 +1012,17 @@ impl MediaStore for PostgresStore {
         // MediaItem, consulted by `image_tags_for`) in lock-step with the
         // artwork table — its only writer. A Primary write sets the flag to
         // whether the winning source is one the image route can actually serve
-        // (a local sidecar); a `url` Primary is not item-servable, so it clears
-        // the flag. Non-Primary roles never touch it.
+        // as an on-disk file — a local sidecar OR a downloaded `tmdb`/`tvdb`
+        // cache entry (Task 8); a `url` Primary (not yet downloaded) is not
+        // item-servable, so it clears the flag. Non-Primary roles never touch
+        // it.
         if role.eq_ignore_ascii_case("Primary") {
+            let servable = matches!(
+                source.to_ascii_lowercase().as_str(),
+                "local" | "tmdb" | "tvdb"
+            );
             sqlx::query("UPDATE media_items SET has_primary_art = $1 WHERE id = $2")
-                .bind(source.eq_ignore_ascii_case("local"))
+                .bind(servable)
                 .bind(id_i64)
                 .execute(&self.pool)
                 .await

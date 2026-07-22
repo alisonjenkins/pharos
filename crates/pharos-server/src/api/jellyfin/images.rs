@@ -648,11 +648,14 @@ fn artwork_role_token(role: ImageRole) -> &'static str {
     }
 }
 
-/// LIB-D5 — the recorded local sidecar path for `(id, role)`, if D4
-/// scanning found one and the file still exists. Best-effort: a store
-/// error or a stale (deleted) sidecar yields `None` so the caller falls
-/// through to the upload / frame-extract path rather than 404ing or
-/// erroring on a public route (V6 spirit).
+/// LIB-D5 — the recorded on-disk artwork path for `(id, role)`, if a
+/// servable source (`local` sidecar from D4 scanning, or a downloaded
+/// `tmdb`/`tvdb` cache entry from Task 8) recorded one and the file still
+/// exists. A `url` source (not yet downloaded) is deliberately excluded —
+/// it has no bytes on disk to serve. Best-effort: a store error or a stale
+/// (deleted) file yields `None` so the caller falls through to the upload /
+/// frame-extract path rather than 404ing or erroring on a public route (V6
+/// spirit).
 async fn local_artwork_path(
     state: &AppState,
     id: u64,
@@ -668,7 +671,13 @@ async fn local_artwork_path(
     };
     let locator = rows
         .into_iter()
-        .find(|(r, source, _)| r.eq_ignore_ascii_case(token) && source == "local")
+        .find(|(r, source, _)| {
+            r.eq_ignore_ascii_case(token)
+                && matches!(
+                    source.to_ascii_lowercase().as_str(),
+                    "local" | "tmdb" | "tvdb"
+                )
+        })
         .map(|(_, _, locator)| locator)?;
     let path = std::path::PathBuf::from(locator);
     match tokio::fs::try_exists(&path).await {
