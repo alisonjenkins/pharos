@@ -91,6 +91,11 @@ async fn seed(cache_dir: &std::path::Path) -> (web::Data<AppState>, String) {
             created_at: None,
             metadata: Default::default(),
             has_primary_art: false,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
         })
         .await
         .unwrap();

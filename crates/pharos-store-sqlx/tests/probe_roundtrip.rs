@@ -183,6 +183,11 @@ fn arb_item() -> impl Strategy<Value = MediaItem> {
             // it round-trips as the column default; keep the pre-put value
             // false to match the fetched row.
             has_primary_art: false,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
         })
 }
 

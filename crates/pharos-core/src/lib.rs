@@ -67,6 +67,19 @@ pub struct MediaItem {
     /// the audio Primary tag on this so that invalid state is unrepresentable.
     /// `Default` = `false`.
     pub has_primary_art: bool,
+    /// Online-enrichment match state. Which provider (`"tmdb"`/`"tvdb"`) and
+    /// id authoritatively identified this item, and how (`match_source`:
+    /// `"nfo_id"`/`"search"`/`"manual"`/`"none"`). `None` = never matched
+    /// (eligible for the background enricher). `manual`/`nfo_id` are never
+    /// re-matched, so a user override / local id survives rescans.
+    pub match_provider: Option<String>,
+    pub match_external_id: Option<String>,
+    pub match_source: Option<String>,
+    /// 0..1 search-match score; 1.0 for `nfo_id`/`manual`. `None` when unmatched.
+    pub match_confidence: Option<f32>,
+    /// Unix-seconds of the last successful enrichment write; drives the TTL
+    /// that stops already-matched items being re-fetched every pass.
+    pub metadata_refreshed_at: Option<i64>,
 }
 
 /// LIB-C7/C8/C9 — item-level descriptive metadata persisted alongside

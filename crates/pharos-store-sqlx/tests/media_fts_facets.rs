@@ -37,6 +37,11 @@ fn item(id: u64, title: &str, overview: Option<&str>, kind: MediaKind) -> MediaI
             ..Default::default()
         },
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }
 }
 

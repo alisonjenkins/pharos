@@ -97,6 +97,11 @@ async fn silent_video_emits_no_audio_stream_in_playback_info() {
         created_at: None,
         metadata: Default::default(),
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -134,6 +139,11 @@ async fn container_alias_is_a_single_known_token() {
         created_at: None,
         metadata: Default::default(),
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -185,6 +195,11 @@ async fn direct_play_omits_transcoding_sub_protocol() {
         created_at: None,
         metadata: Default::default(),
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -245,6 +260,11 @@ async fn synth_ids_route_via_items_endpoint() {
         created_at: None,
         metadata: Default::default(),
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }];
     let (state, token) = seed_with_items(items).await;
     // Add a configured root so library ids exist.
@@ -304,6 +324,11 @@ async fn item_dto_keys_are_pascal_case() {
         created_at: None,
         metadata: Default::default(),
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -367,6 +392,11 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
         created_at: None,
         metadata: Default::default(),
         has_primary_art: false,
+        match_provider: None,
+        match_external_id: None,
+        match_source: None,
+        match_confidence: None,
+        metadata_refreshed_at: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
