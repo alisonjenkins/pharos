@@ -8,6 +8,7 @@ pub mod health;
 pub mod library_watch;
 pub mod middleware;
 pub mod obs;
+pub mod online_enrich;
 pub mod parental;
 pub mod person_image_backfill;
 pub mod quick_connect;
