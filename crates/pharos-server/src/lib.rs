@@ -6,6 +6,7 @@ pub mod config;
 pub mod dlna;
 pub mod health;
 pub mod library_watch;
+pub mod metadata_backfill;
 pub mod middleware;
 pub mod obs;
 pub mod online_enrich;
