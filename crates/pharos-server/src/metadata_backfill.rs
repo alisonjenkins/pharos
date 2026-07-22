@@ -50,11 +50,15 @@ const REQUEST_SPACING: Duration = Duration::from_millis(120);
 
 /// Artwork roles this pass downloads + caches. Bounds the per-item network
 /// cost to the roles clients actually render prominently (poster / backdrop /
-/// logo); any other role a provider offers (episode stills, banners, discs)
-/// is logged and skipped.
-const CACHED_ART_ROLES: [ArtworkRole; 3] = [
+/// per-episode still / logo); any other role a provider offers (banners,
+/// discs) is logged and skipped. `Thumb` covers the TMDB/TVDB per-episode
+/// still image (`RemoteArt{ role: Thumb }` from `tmdb::parse_episode_detail`
+/// / `tvdb::parse_episode_detail`) — Task 11.5 closes the gap where episode
+/// stills were fetched by the parse layer but silently dropped here.
+const CACHED_ART_ROLES: [ArtworkRole; 4] = [
     ArtworkRole::Primary,
     ArtworkRole::Backdrop,
+    ArtworkRole::Thumb,
     ArtworkRole::Logo,
 ];
 
@@ -574,11 +578,14 @@ mod tests {
     use tempfile::TempDir;
 
     /// A network-free [`OnlineEnricher`]: returns a fixed candidate list for
-    /// any search and a fixed record for any fetch. No image bytes.
+    /// any search and a fixed record for any fetch. `image_bytes` is `None`
+    /// by default (no image bytes); set via [`Self::with_image_bytes`] for
+    /// tests that exercise the art-download/cache path.
     struct FakeEnricher {
         provider: &'static str,
         search: Vec<SearchCandidate>,
         detail: Option<EnrichedMetadata>,
+        image_bytes: Option<Vec<u8>>,
     }
 
     impl FakeEnricher {
@@ -587,6 +594,7 @@ mod tests {
                 provider: "tmdb",
                 search: Vec::new(),
                 detail: None,
+                image_bytes: None,
             }
         }
 
@@ -604,6 +612,11 @@ mod tests {
 
         fn with_detail(mut self, detail: EnrichedMetadata) -> Self {
             self.detail = Some(detail);
+            self
+        }
+
+        fn with_image_bytes(mut self, bytes: Vec<u8>) -> Self {
+            self.image_bytes = Some(bytes);
             self
         }
     }
@@ -633,7 +646,7 @@ mod tests {
             self.detail.clone()
         }
         async fn fetch_image_bytes(&self, _url: &str) -> Option<Vec<u8>> {
-            None
+            self.image_bytes.clone()
         }
     }
 
@@ -703,6 +716,52 @@ mod tests {
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // The matched TMDB id was stamped onto the provider ids.
         assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+    }
+
+    #[tokio::test]
+    async fn backfill_caches_thumb_role_alongside_primary() {
+        // Task 11.5 (Part A): a per-episode still image comes back from the
+        // provider as `RemoteArt{ role: Thumb }` (see tmdb::parse_episode_detail
+        // / tvdb::parse_episode_detail) — CACHED_ART_ROLES must include Thumb
+        // or the download step silently drops it (the `continue` at the
+        // `!CACHED_ART_ROLES.contains` guard in `enrich_one`).
+        let s = store().await;
+        put_movie(&s, 900_103, "Dune (2021)").await;
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_detail(EnrichedMetadata {
+                artwork: vec![
+                    RemoteArt {
+                        role: pharos_core::ArtworkRole::Primary,
+                        url: "https://image.tmdb.org/t/p/original/p.jpg".into(),
+                    },
+                    RemoteArt {
+                        role: pharos_core::ArtworkRole::Thumb,
+                        url: "https://image.tmdb.org/t/p/original/still.jpg".into(),
+                    },
+                ],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]); // minimal JPEG-ish bytes
+
+        let n = run(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+
+        let art = s.artwork_for(900_103).await.unwrap();
+        let roles: Vec<&str> = art.iter().map(|(role, _, _)| role.as_str()).collect();
+        assert!(roles.contains(&"Primary"), "roles: {roles:?}");
+        assert!(roles.contains(&"Thumb"), "roles: {roles:?}");
     }
 
     #[tokio::test]

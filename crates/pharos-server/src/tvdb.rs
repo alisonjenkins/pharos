@@ -278,6 +278,9 @@ fn extract_tmdb_remote_id(data: &serde_json::Value) -> Option<String> {
 /// object — a bare `{"data":{"id":..,"name":..}}` fixture with no
 /// overview/genres/image still yields `Some` with whatever fields are
 /// present, mirroring `tmdb::parse_movie_detail`'s tolerance.
+/// `premiere_date` is parsed from the series' `firstAired` field (bare
+/// `YYYY-MM-DD`, TVDB v4's series-level air-date field) via
+/// [`pharos_core::parse_ymd_to_unix`].
 pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let data = v.get("data")?;
@@ -302,6 +305,10 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
             .get("year")
             .and_then(|x| x.as_str())
             .and_then(|s| s.parse().ok()),
+        premiere_date: data
+            .get("firstAired")
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix),
         genres: data
             .get("genres")
             .and_then(|g| g.as_array())
@@ -325,6 +332,9 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
 /// picking out the entry matching `season`/`episode` and mapping it to
 /// [`EnrichedMetadata`]. `None` if the JSON is malformed, the `data.episodes`
 /// array is missing, or no episode matches the requested season/number.
+/// `premiere_date` is parsed from the episode's `aired` field (bare
+/// `YYYY-MM-DD`, TVDB v4's per-episode air-date field) via
+/// [`pharos_core::parse_ymd_to_unix`].
 pub(crate) fn parse_episode_detail(
     body: &str,
     season: u32,
@@ -355,6 +365,10 @@ pub(crate) fn parse_episode_detail(
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        premiere_date: ep
+            .get("aired")
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix),
         provider_id: ep.get("id").and_then(|x| x.as_i64()).map(|i| i.to_string()),
         also_tmdb_id: extract_tmdb_remote_id(ep),
         artwork: art,
@@ -536,7 +550,7 @@ mod tests {
     #[test]
     fn tvdb_parse_series_detail_extracts_fields_and_remote_tmdb_id() {
         let body = r#"{"data":{"id":121361,"name":"Game of Thrones","overview":"Nine noble families...",
-            "year":"2011","image":"https://artworks.thetvdb.com/banners/posters/121361.jpg",
+            "year":"2011","firstAired":"2011-04-17","image":"https://artworks.thetvdb.com/banners/posters/121361.jpg",
             "genres":[{"name":"Drama"},{"name":"Fantasy"}],
             "remoteIds":[{"sourceName":"IMDB","id":"tt0944947"},{"sourceName":"TheMovieDB","id":"1399"}]}}"#;
         let e = super::parse_series_detail(body).unwrap();
@@ -550,6 +564,8 @@ mod tests {
             .artwork
             .iter()
             .any(|a| a.role == ArtworkRole::Primary && a.url.ends_with("121361.jpg")));
+        // firstAired "2011-04-17" -> unix seconds at UTC midnight.
+        assert_eq!(e.premiere_date, Some(1_302_998_400));
     }
 
     #[test]
@@ -560,6 +576,7 @@ mod tests {
         assert_eq!(e.provider_id.as_deref(), Some("121361"));
         assert_eq!(e.also_tmdb_id, None);
         assert!(e.artwork.is_empty());
+        assert_eq!(e.premiere_date, None); // no firstAired in this sparse fixture
     }
 
     #[test]
@@ -571,8 +588,8 @@ mod tests {
     #[test]
     fn tvdb_parse_episode_detail_extracts_matching_episode() {
         let body = r#"{"data":{"episodes":[
-            {"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming","overview":"Lord Stark...","image":"https://artworks.thetvdb.com/ep1.jpg"},
-            {"id":2,"seasonNumber":1,"number":2,"name":"The Kingsroad","overview":"While Bran..."}
+            {"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming","overview":"Lord Stark...","aired":"2011-04-17","image":"https://artworks.thetvdb.com/ep1.jpg"},
+            {"id":2,"seasonNumber":1,"number":2,"name":"The Kingsroad","overview":"While Bran...","aired":"2011-04-24"}
         ]}}"#;
         let e = super::parse_episode_detail(body, 1, 1).unwrap();
         assert_eq!(e.title.as_deref(), Some("Winter Is Coming"));
@@ -582,6 +599,12 @@ mod tests {
             .artwork
             .iter()
             .any(|a| a.role == ArtworkRole::Thumb && a.url.ends_with("ep1.jpg")));
+        // aired "2011-04-17" -> unix seconds at UTC midnight.
+        assert_eq!(e.premiere_date, Some(1_302_998_400));
+
+        let e2 = super::parse_episode_detail(body, 1, 2).unwrap();
+        // aired "2011-04-24" -> unix seconds at UTC midnight.
+        assert_eq!(e2.premiere_date, Some(1_303_603_200));
     }
 
     #[test]

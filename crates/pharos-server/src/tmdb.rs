@@ -380,6 +380,10 @@ pub(crate) fn parse_movie_detail(body: &str) -> Option<crate::online_enrich::Enr
             .get("release_date")
             .and_then(|x| x.as_str())
             .and_then(year_of),
+        premiere_date: v
+            .get("release_date")
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix),
         community_rating: v
             .get("vote_average")
             .and_then(|x| x.as_f64())
@@ -430,6 +434,10 @@ pub(crate) fn parse_tv_detail(body: &str) -> Option<crate::online_enrich::Enrich
             .get("first_air_date")
             .and_then(|x| x.as_str())
             .and_then(year_of),
+        premiere_date: v
+            .get("first_air_date")
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix),
         community_rating: v
             .get("vote_average")
             .and_then(|x| x.as_f64())
@@ -451,15 +459,10 @@ pub(crate) fn parse_tv_detail(body: &str) -> Option<crate::online_enrich::Enrich
 
 /// Parse a TMDB `/tv/{id}/season/{s}/episode/{e}` detail response body
 /// into [`crate::online_enrich::EnrichedMetadata`]. Episode responses
-/// carry `name` (the episode title), `overview`, `air_date`, and
-/// `still_path` (a single per-episode still, mapped to
-/// [`pharos_core::ArtworkRole::Thumb`]).
-///
-/// `premiere_date` (unix seconds) is deliberately left `None`: TMDB's
-/// `air_date` is a bare `YYYY-MM-DD` with no time/offset, and pulling in a
-/// date-parsing dependency for a single best-effort field wasn't
-/// justified for this pass — a later task can add it if `premiere_date`
-/// turns out to be load-bearing for episodes.
+/// carry `name` (the episode title), `overview`, `air_date` (bare
+/// `YYYY-MM-DD`, parsed to unix seconds via
+/// [`pharos_core::parse_ymd_to_unix`]), and `still_path` (a single
+/// per-episode still, mapped to [`pharos_core::ArtworkRole::Thumb`]).
 pub(crate) fn parse_episode_detail(body: &str) -> Option<crate::online_enrich::EnrichedMetadata> {
     use crate::online_enrich::{EnrichedMetadata, RemoteArt};
     use pharos_core::ArtworkRole;
@@ -482,6 +485,10 @@ pub(crate) fn parse_episode_detail(body: &str) -> Option<crate::online_enrich::E
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        premiere_date: v
+            .get("air_date")
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix),
         community_rating: v
             .get("vote_average")
             .and_then(|x| x.as_f64())
@@ -565,6 +572,8 @@ mod tests {
             .artwork
             .iter()
             .any(|a| a.role == pharos_core::ArtworkRole::Backdrop));
+        // release_date "2021-10-01" -> unix seconds at UTC midnight.
+        assert_eq!(e.premiere_date, Some(1_633_046_400));
     }
 
     #[test]
@@ -606,6 +615,8 @@ mod tests {
             .artwork
             .iter()
             .any(|a| a.role == pharos_core::ArtworkRole::Backdrop && a.url.ends_with("/tv_b.jpg")));
+        // first_air_date "2008-01-20" -> unix seconds at UTC midnight.
+        assert_eq!(e.premiere_date, Some(1_200_787_200));
     }
 
     #[test]
@@ -625,9 +636,8 @@ mod tests {
             .artwork
             .iter()
             .any(|a| a.role == pharos_core::ArtworkRole::Thumb && a.url.ends_with("/still.jpg")));
-        // See module doc: episode air_date -> unix-seconds conversion is
-        // deferred, premiere_date stays unset for now.
-        assert_eq!(e.premiere_date, None);
+        // air_date "2008-01-20" -> unix seconds at UTC midnight (Task 11.5).
+        assert_eq!(e.premiere_date, Some(1_200_787_200));
     }
 
     #[test]
