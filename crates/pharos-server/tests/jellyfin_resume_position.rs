@@ -50,6 +50,11 @@ async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String
             created_at: None,
             metadata: Default::default(),
             has_primary_art: false,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
         })
         .await
         .unwrap();
@@ -220,6 +225,11 @@ async fn playback_info_emits_zero_when_no_user_data_row_exists() {
             created_at: None,
             metadata: Default::default(),
             has_primary_art: false,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
         })
         .await
         .unwrap();
@@ -288,6 +298,11 @@ async fn resume_list_filters_by_media_types() {
                 created_at: None,
                 metadata: Default::default(),
                 has_primary_art: false,
+                match_provider: None,
+                match_external_id: None,
+                match_source: None,
+                match_confidence: None,
+                metadata_refreshed_at: None,
             })
             .await
             .unwrap();

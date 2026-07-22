@@ -38,6 +38,27 @@ async fn put_then_get_roundtrip() {
 }
 
 #[tokio::test]
+async fn match_columns_default_null_and_roundtrip() {
+    // T1 — the 5 online-match columns are additive: `put` never writes
+    // them (only a later `set_item_match`, T2), so a freshly-inserted
+    // item round-trips them all as `None`.
+    let s = fresh().await;
+    let it = item(
+        900001,
+        "/m/blade_runner.mkv",
+        "Blade Runner",
+        MediaKind::Movie,
+    );
+    s.put(it.clone()).await.unwrap();
+    let got = s.get(900001).await.unwrap();
+    assert_eq!(got.match_provider, None);
+    assert_eq!(got.match_external_id, None);
+    assert_eq!(got.match_source, None);
+    assert_eq!(got.match_confidence, None);
+    assert_eq!(got.metadata_refreshed_at, None);
+}
+
+#[tokio::test]
 async fn get_missing_is_not_found() {
     let s = fresh().await;
     match s.get(42).await {

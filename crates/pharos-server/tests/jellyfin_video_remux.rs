@@ -171,6 +171,11 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
             created_at: None,
             metadata: Default::default(),
             has_primary_art: false,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
         })
         .await
         .unwrap();
@@ -263,6 +268,11 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
             created_at: None,
             metadata: Default::default(),
             has_primary_art: false,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
         })
         .await
         .unwrap();

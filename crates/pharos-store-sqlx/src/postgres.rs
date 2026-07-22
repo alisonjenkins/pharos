@@ -36,7 +36,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
     series_folder, series_year, track_number, disc_number, release_year, \
-    synopsis, content_rating, network, release_date, has_primary_art";
+    synopsis, content_rating, network, release_date, has_primary_art, \
+    match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -2947,6 +2948,11 @@ struct MediaRow {
     network: Option<String>,
     release_date: Option<String>,
     has_primary_art: bool,
+    match_provider: Option<String>,
+    match_external_id: Option<String>,
+    match_source: Option<String>,
+    match_confidence: Option<f32>,
+    metadata_refreshed_at: Option<i64>,
 }
 
 impl MediaRow {
@@ -3028,6 +3034,11 @@ impl MediaRow {
             created_at: self.created_at,
             metadata,
             has_primary_art: self.has_primary_art,
+            match_provider: self.match_provider,
+            match_external_id: self.match_external_id,
+            match_source: self.match_source,
+            match_confidence: self.match_confidence,
+            metadata_refreshed_at: self.metadata_refreshed_at,
         })
     }
 }

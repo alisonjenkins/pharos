@@ -1048,6 +1048,11 @@ impl<P: Prober> FsScanner<P> {
                     // local Primary sidecar (it runs after this row is put);
                     // false here so a coverless item stays false.
                     has_primary_art: false,
+                    match_provider: None,
+                    match_external_id: None,
+                    match_source: None,
+                    match_confidence: None,
+                    metadata_refreshed_at: None,
                 })
             }
             Err(err) => {
