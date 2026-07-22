@@ -1002,7 +1002,23 @@ impl GroupState {
 
     /// Lowest-MemberId-wins election. Deterministic, no voting needed.
     fn elect_leader(&mut self) {
-        self.leader = self.members.keys().min().copied();
+        // Prefer the lowest-id member that is still LIVE (seen within
+        // MEMBER_TTL_MS). A dead-socket ghost lingers in the roster for up to
+        // ~150s before the T83 prune removes it; electing it as leader would
+        // make every leader-gated command (Play/Pause/Seek) error with
+        // NotLeader for the real, live members until the prune fires. Fall back
+        // to plain lowest-id when none look live (e.g. right after a deploy,
+        // before anyone has re-pinged) so the group is never leaderless.
+        let now = tokio::time::Instant::now();
+        let live_min = self
+            .members
+            .iter()
+            .filter(|(_, m)| {
+                now.saturating_duration_since(m.last_seen).as_millis() as u64 <= MEMBER_TTL_MS
+            })
+            .map(|(id, _)| *id)
+            .min();
+        self.leader = live_min.or_else(|| self.members.keys().min().copied());
     }
 
     fn lead_time_ms(&self) -> u64 {
@@ -3814,6 +3830,56 @@ mod tests {
         assert!(
             play.is_some(),
             "the buffering member's Ready alone must resolve the gate"
+        );
+    }
+
+    /// H: leader election must skip a dead-socket GHOST (a member silent past
+    /// MEMBER_TTL_MS but not yet T83-pruned) even when it has the lowest id —
+    /// otherwise every leader-gated command errors NotLeader for the live
+    /// members until the ghost is pruned. Unit-tested on `elect_leader` directly
+    /// so the T83 prune (which would empty the group under a time-advance) can't
+    /// interfere.
+    #[tokio::test(start_paused = true)]
+    async fn leader_election_skips_a_lower_id_ghost() {
+        let stale = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(MEMBER_TTL_MS + 1_000)).await;
+        let fresh = tokio::time::Instant::now();
+
+        let mut state = GroupState::new(
+            GroupId::new(),
+            0,
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+            None,
+        );
+        // ghost has the LOWER id but a stale last_seen; live is higher-id, fresh.
+        let ghost =
+            MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let live = MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        let mk = |last_seen| MemberRec {
+            name: "m".into(),
+            offset: ClockOffset::default(),
+            buffering: false,
+            ignore_wait: false,
+            last_seen,
+        };
+        state.members.insert(ghost, mk(stale));
+        state.members.insert(live, mk(fresh));
+
+        state.elect_leader();
+        assert_eq!(
+            state.leader,
+            Some(live),
+            "a live member must win over a lower-id ghost"
+        );
+
+        // With NO live member, fall back to the lowest id so the group is never
+        // leaderless.
+        state.members.get_mut(&live).unwrap().last_seen = stale;
+        state.elect_leader();
+        assert_eq!(
+            state.leader,
+            Some(ghost),
+            "with no live member, fall back to the lowest id"
         );
     }
 
