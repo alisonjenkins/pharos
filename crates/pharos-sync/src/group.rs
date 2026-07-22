@@ -931,6 +931,39 @@ impl GroupState {
         }
     }
 
+    /// Ack the open readiness gate for a member that is PRESENT and signalling
+    /// readiness (`Ready` or `BufferingEnd`, or opting out via `SetIgnoreWait`):
+    /// drop it from the pending set and resolve if it was the last holdout — but
+    /// ONLY once the gated command's scheduled `at_server_ms` has arrived (B38).
+    /// An ack before that instant is a stale player transition (the pause-wiggle
+    /// right after a Seek broadcast, or a pre-seek `BufferingEnd`): counting it
+    /// resolves the gate early and fires `Play` before clients run their
+    /// scheduled seek, snapping everyone back to the pre-seek position. Returns
+    /// whether the gate resolved. No-op when no gate is open or the ack is
+    /// premature (the member stays pending until its real, post-schedule ack).
+    fn ack_gate(&mut self, member_id: MemberId) -> bool {
+        let now = self.server_ms_now();
+        let premature = self
+            .waiting
+            .as_ref()
+            .is_some_and(|w| now < w.not_before_server_ms);
+        if premature {
+            tracing::debug!(
+                group = %self.id, member = %member_id,
+                "syncplay: gate ack before the scheduled command time — ignored (B38)"
+            );
+            return false;
+        }
+        let resolved = self.waiting.as_mut().is_some_and(|w| {
+            w.pending.remove(&member_id);
+            w.pending.is_empty()
+        });
+        if resolved {
+            self.resolve_waiting();
+        }
+        resolved
+    }
+
     /// Lowest-MemberId-wins election. Deterministic, no voting needed.
     fn elect_leader(&mut self) {
         self.leader = self.members.keys().min().copied();
@@ -1465,14 +1498,23 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
         }
     }
     state.broadcast(ServerMsg::MemberLeft { member_id, name });
-    // A departing member must not wedge the readiness gate: drop it
-    // from the pending set and resolve if it was the last holdout (and
-    // members remain — an empty group terminates the actor anyway).
+    // A departing member must not wedge the readiness gate: drop it from the
+    // pending set (it is GONE and will never ack). Resolve only if it was the
+    // last holdout AND the gated command's schedule time has passed (E / B38) —
+    // a disconnect inside a Seek gate's lead window must not resolve early and
+    // snap everyone to the pre-seek position; the anti-wedge deadline still
+    // resumes the group if the leave leaves an empty-but-premature gate. (An
+    // empty group terminates the actor anyway.)
     if let Some(w) = state.waiting.as_mut() {
         w.pending.remove(&member_id);
-        if w.pending.is_empty() && !state.members.is_empty() {
-            state.resolve_waiting();
-        }
+    }
+    let resolve = state.waiting.as_ref().is_some_and(|w| {
+        w.pending.is_empty()
+            && !state.members.is_empty()
+            && state.server_ms_now() >= w.not_before_server_ms
+    });
+    if resolve {
+        state.resolve_waiting();
     }
     // B55 — a departing member must not wedge the V19 buffering freeze either.
     // If the group is frozen for buffering and the member that just left was
@@ -1799,12 +1841,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // never counted BufferingEnd it could only clear via the 30s
             // anti-wedge — a needless hang on every mid-buffer Unpause. Treat it
             // like MemberReady: drop the member from the gate and resolve when
-            // it was the last holdout.
-            if let Some(w) = state.waiting.as_mut() {
-                if w.pending.remove(&member_id) && w.pending.is_empty() {
-                    state.resolve_waiting();
-                }
-            }
+            // it was the last holdout — honouring the B38 not_before guard so a
+            // STALE pre-seek BufferingEnd inside the lead window can't resolve a
+            // Seek gate early (E).
+            state.ack_gate(member_id);
             // B27 — same auto-resume as the HTTP path's MemberReady: the
             // buffering-caused freeze lifts the moment the last buffering
             // member recovers (Jellyfin parity; ws-native clients report
@@ -1840,6 +1880,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if buffering.is_empty() {
                 state.start_playing(position_ms, "Unpause");
             } else {
+                // not_before = 0 is correct here: unlike a Seek, the Unpause gate
+                // broadcasts NO scheduled command that clients execute at a future
+                // instant, so a member's Ready/BufferingEnd means "done buffering"
+                // whenever it arrives and must count immediately. (A member still
+                // buffering does not send Ready, so there is no spurious-ack source
+                // to guard against — flooring this rejects legitimate fast acks.)
                 state.enter_waiting(buffering, true, position_ms, "Unpause", 0);
             }
         }
@@ -1944,26 +1990,9 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // those resolved the gate ~1s after a Seek — long before any
                 // client ran its scheduled seek — so the server's Play then
                 // CANCELLED the clients' pending seek callbacks and everyone
-                // resumed from the pre-seek position.
-                let now = state.server_ms_now();
-                let premature = state
-                    .waiting
-                    .as_ref()
-                    .is_some_and(|w| now < w.not_before_server_ms);
-                if premature {
-                    tracing::debug!(
-                        group = %state.id, member = %member_id,
-                        "syncplay: Ready before the gated command's schedule time — ignored"
-                    );
-                    return;
-                }
-                let resolved = state.waiting.as_mut().is_some_and(|w| {
-                    w.pending.remove(&member_id);
-                    w.pending.is_empty()
-                });
-                if resolved {
-                    state.resolve_waiting();
-                }
+                // resumed from the pre-seek position. `ack_gate` centralises the
+                // guard (E).
+                state.ack_gate(member_id);
             } else if state.group_paused_due_to_buffering
                 && !state.members.values().any(|m| m.buffering)
             {
@@ -1998,13 +2027,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // post the Ready/BufferingEnd the group is waiting on. Release it
             // from BOTH gates it could be holding.
             if ignore {
-                // 1) The readiness gate (Seek / Unpause in flight).
-                if let Some(w) = state.waiting.as_mut() {
-                    w.pending.remove(&member_id);
-                    if w.pending.is_empty() {
-                        state.resolve_waiting();
-                    }
-                }
+                // 1) The readiness gate (Seek / Unpause in flight). Honours the
+                // B38 not_before guard via ack_gate (E) — an opt-out inside a
+                // Seek gate's lead window must not resolve it early.
+                state.ack_gate(member_id);
                 // 2) The V19 buffering freeze. A buffering freeze opens NO
                 // readiness gate (BufferingStart broadcasts a bare Pause), so
                 // the branch above is a no-op for it and `rec.buffering` would
@@ -3785,6 +3811,85 @@ mod tests {
         assert!(
             play.is_some(),
             "the buffering member's Ready alone must resolve the gate"
+        );
+    }
+
+    /// E: a stale ack (a pre-seek BufferingEnd here) arriving during a SEEK
+    /// gate's lead window — before the seek's scheduled at_server_ms — must NOT
+    /// resolve the gate and fire Play early (which cancels clients' pending
+    /// seeks and snaps everyone back to the pre-seek position). ack_gate honours
+    /// the B38 not_before guard on every ack path, not just MemberReady.
+    #[tokio::test]
+    async fn premature_ack_does_not_resolve_seek_gate() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // Seek → opens a gate with not_before = at_server_ms (server_ms + lead).
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // Stale acks from BOTH holdouts arrive IMMEDIATELY (within the lead
+        // window): a pre-seek BufferingEnd and an opt-out. Neither may resolve.
+        h.tx.send(GroupMsg::BufferingEnd { member_id: m1 })
+            .await
+            .unwrap();
+        h.tx.send(GroupMsg::BufferingEnd { member_id: m2 })
+            .await
+            .unwrap();
+        let early = recv_matching(&mut rx2, Duration::from_millis(100), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(
+            early.is_none(),
+            "a premature ack must not resolve the seek gate"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "gate must stay open past a premature ack"
+        );
+
+        // After the schedule time, real Readys resolve it → Play at the target.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for mid in [m1, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 60_000,
+                playlist_item_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        let play = recv_matching(&mut rx2, Duration::from_millis(500), |m| {
+            matches!(
+                m,
+                ServerMsg::Play {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "post-schedule Readys must resolve the gate at the seek target"
         );
     }
 
