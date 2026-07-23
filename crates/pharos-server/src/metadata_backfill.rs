@@ -383,9 +383,26 @@ where
         }
     }
 
+    // FR2 — a curated local sidecar (scanner-resolved, source == "local")
+    // must never be overwritten by online art: `set_artwork` is an upsert
+    // keyed on (item, role), so downloading here would silently replace a
+    // user's hand-placed poster/backdrop/etc. Computed once per item, at the
+    // role level (a local Primary must not block filling an absent Backdrop).
+    let local_roles: std::collections::HashSet<String> = store
+        .artwork_for(item.id)
+        .await?
+        .into_iter()
+        .filter(|(_, source, _)| source.eq_ignore_ascii_case("local"))
+        .map(|(role, _, _)| role.to_ascii_lowercase())
+        .collect();
+
     for (prov, art) in &chosen {
         if !CACHED_ART_ROLES.contains(&art.role) {
             tracing::debug!(role = ?art.role, item = item.id, "T9 metadata backfill: skipping art role (not cached)");
+            continue;
+        }
+        if local_roles.contains(&art.role.as_str().to_ascii_lowercase()) {
+            tracing::debug!(role = ?art.role, item = item.id, "T9 metadata backfill: skipping art role (local sidecar present)");
             continue;
         }
         let bytes = {
@@ -936,6 +953,63 @@ mod tests {
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
         assert_eq!(got.match_external_id.as_deref(), Some("999"));
+    }
+
+    #[tokio::test]
+    async fn enrich_one_preserves_local_artwork_but_adds_new_roles() {
+        // FR2 — a curated local sidecar (e.g. hand-placed poster.jpg → Primary)
+        // must survive an enrichment pass; a role with no local row is still
+        // filled from the provider.
+        let s = store().await;
+        put_movie(&s, 900_301, "Dune (2021)").await;
+        s.set_artwork(900_301, "Primary", "local", "/curated/poster.jpg")
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_detail(EnrichedMetadata {
+                artwork: vec![
+                    RemoteArt {
+                        role: ArtworkRole::Primary,
+                        url: "https://image.tmdb.org/t/p/original/p.jpg".into(),
+                    },
+                    RemoteArt {
+                        role: ArtworkRole::Backdrop,
+                        url: "https://image.tmdb.org/t/p/original/b.jpg".into(),
+                    },
+                ],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+
+        let item = s.get(900_301).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let art = s.artwork_for(900_301).await.unwrap();
+        let primary = art
+            .iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("primary row present");
+        assert_eq!(primary.1, "local");
+        assert_eq!(primary.2, "/curated/poster.jpg");
+        let backdrop = art.iter().find(|(role, _, _)| role == "Backdrop");
+        assert!(
+            backdrop.is_some(),
+            "backdrop should still be added: {art:?}"
+        );
+        assert_eq!(backdrop.unwrap().1, "tmdb");
     }
 
     #[tokio::test]
