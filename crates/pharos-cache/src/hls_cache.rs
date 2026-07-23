@@ -24,7 +24,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use pharos_transcode::{FfmpegTranscoder, SegmentOpts, SegmentVideo, TranscodeOptions};
+use pharos_transcode::{
+    FfmpegTranscoder, SegmentContainer, SegmentOpts, SegmentVideo, TranscodeOptions,
+};
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, thiserror::Error)]
@@ -72,25 +74,33 @@ struct SegmentKey {
 
 const NO_SUBTITLE: i32 = -1;
 
-/// Stable small tag distinguishing the output video codec so different
-/// codec outputs never share a cache entry.
-fn codec_tag(video: Option<SegmentVideo>) -> u32 {
+/// Stable small tag distinguishing the output video codec + CONTAINER so
+/// different segment BYTES never share a cache entry. The container matters:
+/// the same H264 codec is muxed into mpegts on the `hls1/*.ts` surface but
+/// emitted as audio-free fMP4 on the `h264cmaf/*` surface — identical
+/// `(media, seg, audio, bitrate)`, totally different bytes. Keying on the codec
+/// alone made them COLLIDE: an h264-CMAF request read a previously-cached
+/// mpegts segment, fed those bytes to the mp4 parser, and 500'd
+/// ("truncated box at offset 0") — a live prod break.
+fn codec_tag(video: Option<SegmentVideo>, container: SegmentContainer) -> u32 {
     // Bumping a tag orphans every pre-existing cached segment for that codec
     // (LRU reclaims them) — the mechanism used whenever a change alters the
-    // BYTES of a segment for a given (media, index) key. The cache key carries
-    // no start time, so a boundary change is exactly such a case.
+    // BYTES of a segment for a given (media, index) key.
     //
     // Historical tags 1 (Copy), 9 (H265), 10 (Av1) retired with the
-    // `SegmentVideo` type (V30): the segmented surface can only emit H264 or
-    // VP9, and stream copy is unrepresentable. Tag values for the live
-    // codecs are preserved so a warm cache survives the type refactor.
-    match video {
-        None => 0,
-        Some(SegmentVideo::H264) => 8,
-        // 12 (was 7): VP9 fMP4 segments are now AUDIO-FREE (audio moved to a
-        // separate continuous rendition, the A/V-sync fix) — orphan the old
-        // muxed segments.
-        Some(SegmentVideo::Vp9) => 12,
+    // `SegmentVideo` type (V30). Tag values for the live codecs are preserved
+    // so a warm cache survives: muxed-mpegts H264 KEEPS 8, VP9 fMP4 KEEPS 12.
+    match (video, container) {
+        (None, _) => 0,
+        // Muxed mpegts H264 (the `hls1/*.ts` surface) — unchanged tag so the
+        // large warm mpegts cache is preserved across this fix.
+        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 8,
+        // Audio-free fMP4 H264 (the demuxed `h264cmaf/*` surface) — a DISTINCT
+        // namespace so it never reads muxed mpegts bytes (or vice versa).
+        (Some(SegmentVideo::H264), SegmentContainer::Fmp4) => 13,
+        // 12 (was 7): VP9 fMP4 segments are AUDIO-FREE (audio is a separate
+        // continuous rendition, the A/V-sync fix). VP9 only ever emits fMP4.
+        (Some(SegmentVideo::Vp9), _) => 12,
     }
 }
 
@@ -293,7 +303,7 @@ impl HlsSegmentCache {
             audio_index,
             subtitle_index,
             opts.video_bitrate_bps,
-            codec_tag(opts.video),
+            codec_tag(opts.video, opts.container),
         );
         let path = self.segment_path_keyed(key);
 
@@ -384,7 +394,7 @@ impl HlsSegmentCache {
                 media.id = media_id,
                 seg = seg_index,
                 bytes = produced,
-                codec = codec_tag(opts.video),
+                codec = codec_tag(opts.video, opts.container),
                 "hls segment transcode produced empty/truncated output — not caching"
             );
             return Err(HlsCacheError::Transcode(format!(
@@ -412,7 +422,7 @@ impl HlsSegmentCache {
             encode_ms = timing.as_ref().map(|t| t.encode_ms),
             device = timing.as_ref().map(|t| t.device.to_string()),
             bytes = bytes.len(),
-            codec = codec_tag(opts.video),
+            codec = codec_tag(opts.video, opts.container),
             burn = opts.burn_subtitle_stream_index.is_some(),
             burn_idx = opts.burn_subtitle_stream_index,
             audio_idx = opts.audio_source_stream_index,
@@ -434,7 +444,7 @@ impl HlsSegmentCache {
                 queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
                 encode_ms = timing.as_ref().map(|t| t.encode_ms),
                 device = timing.as_ref().map(|t| t.device.to_string()),
-                codec = codec_tag(opts.video),
+                codec = codec_tag(opts.video, opts.container),
                 burn = opts.burn_subtitle_stream_index.is_some(),
                 seek_secs,
                 seg_secs,
@@ -1066,6 +1076,29 @@ mod tests {
             )
             .await;
         cache.maybe_evict().await;
+    }
+
+    #[test]
+    fn h264_mpegts_and_fmp4_get_distinct_cache_keys() {
+        // Regression (live prod break): muxed-mpegts H264 (`hls1/*.ts`) and
+        // audio-free fMP4 H264 (`h264cmaf/*`) share the codec and the
+        // (media, seg, audio, bitrate) tuple but have TOTALLY different bytes.
+        // Keying on the codec alone made an h264cmaf request read a
+        // previously-cached mpegts segment, feed those bytes to the mp4 parser,
+        // and 500 ("truncated box at offset 0") in ~4 ms (a cache hit on the
+        // wrong bytes). The container must be part of the key.
+        let mpegts = codec_tag(Some(SegmentVideo::H264), SegmentContainer::Mpegts);
+        let fmp4 = codec_tag(Some(SegmentVideo::H264), SegmentContainer::Fmp4);
+        let vp9 = codec_tag(Some(SegmentVideo::Vp9), SegmentContainer::Fmp4);
+        assert_ne!(mpegts, fmp4, "muxed h264 and fMP4 h264 must not collide");
+        assert_ne!(fmp4, vp9);
+        assert_eq!(mpegts, 8, "warm muxed-h264 cache tag preserved");
+        assert_eq!(vp9, 12, "warm vp9 cache tag preserved");
+
+        // The on-disk keys differ for the same (media, seg, audio, bitrate).
+        let key_ts = make_key(1, 0, Some(1), None, Some(4_000_000), mpegts);
+        let key_m4 = make_key(1, 0, Some(1), None, Some(4_000_000), fmp4);
+        assert_ne!(key_ts, key_m4, "distinct cache keys per container");
     }
 
     #[tokio::test]
