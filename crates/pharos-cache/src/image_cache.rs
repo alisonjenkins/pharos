@@ -127,6 +127,24 @@ pub fn image_path(root: &Path, role: ImageRole, kind: MediaKind, id: u64, index:
     root.join(role.as_dir()).join(media).join(file)
 }
 
+/// Cache path for a Series *container*'s artwork (T9-series). A show has no
+/// numeric MediaId (Series/Season are synthesised from their episodes), so its
+/// poster/backdrop keys on a stable hash of the show's `series_key` and lives
+/// under a dedicated `series` subdir — it can never collide with a real
+/// movie/episode/audio id under the same role. The caller stores the returned
+/// path in `series_metadata` and the images route serves it back verbatim, so
+/// the hash only has to be self-consistent within one write (it is: a
+/// fixed-seed `DefaultHasher`), not stable across toolchain versions.
+pub fn series_image_path(root: &Path, role: ImageRole, series_key: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    series_key.hash(&mut h);
+    let id = h.finish();
+    root.join(role.as_dir())
+        .join("series")
+        .join(format!("{id}.jpg"))
+}
+
 /// Path of the negative-cache marker for a given image slot: an empty sentinel
 /// written beside the (never-created) image when the source proved to have no
 /// extractable content, so subsequent fetches skip the doomed ffmpeg run.
@@ -598,6 +616,27 @@ impl ImageCache {
         body: &[u8],
     ) -> Result<PathBuf, ImageCacheError> {
         let out_path = image_path(&self.root, role, kind, id, index);
+        if let Some(parent) = out_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = out_path.with_extension("jpg.tmp");
+        tokio::fs::write(&tmp_path, body).await?;
+        tokio::fs::rename(&tmp_path, &out_path).await?;
+        Ok(out_path)
+    }
+
+    /// Atomically persist a Series *container*'s downloaded artwork bytes
+    /// (T9-series), returning the cache path to record in `series_metadata`.
+    /// Keyed by `series_key` under the dedicated `series` subdir (see
+    /// [`series_image_path`]) so it never collides with a real item's image.
+    #[instrument(skip(self, body), fields(series_key = %series_key, role = ?role, bytes = body.len()))]
+    pub async fn upload_series_art(
+        &self,
+        series_key: &str,
+        role: ImageRole,
+        body: &[u8],
+    ) -> Result<PathBuf, ImageCacheError> {
+        let out_path = series_image_path(&self.root, role, series_key);
         if let Some(parent) = out_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

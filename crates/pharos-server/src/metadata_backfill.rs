@@ -37,10 +37,11 @@ use crate::online_enrich::{
 use crate::state::Stores;
 use crate::tmdb::TmdbEnricher;
 use crate::tvdb::{ReqwestTransport, TvdbEnricher};
+use pharos_cache::image_cache::ImageRole;
 use pharos_cache::ImageCache;
 use pharos_core::{
     match_best, ArtworkRole, DomainResult, GenreStore, MediaItem, MediaKind, MediaStore,
-    PersonStore, ProviderIds,
+    PersonStore, ProviderIds, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
 };
 use pharos_scanner::FilenameProvider;
 
@@ -175,7 +176,7 @@ pub(crate) async fn run<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore,
+    S: MediaStore + GenreStore + PersonStore + SeriesMetadataStore,
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
     if tmdb.is_none() && tvdb.is_none() {
@@ -187,21 +188,33 @@ where
     let items = store
         .items_needing_match(cfg.max_per_pass, ttl_cutoff)
         .await?;
-    let total = items.len();
-    if total == 0 {
-        return Ok(0);
-    }
-    tracing::info!(total, "T9 metadata backfill: enriching items");
     let mut enriched = 0usize;
-    for item in items {
-        // V6 — one bad item (a provider blip, a store hiccup) never aborts the
-        // pass; log it and carry on to the next.
-        match enrich_one(store, bg_io, cache, tmdb, tvdb, cfg, item, now).await {
-            Ok(true) => enriched += 1,
-            Ok(false) => {}
-            Err(e) => tracing::warn!(error = %e, "T9 metadata backfill: item failed"),
+    if !items.is_empty() {
+        tracing::info!(total = items.len(), "T9 metadata backfill: enriching items");
+        for item in items {
+            // V6 — one bad item (a provider blip, a store hiccup) never aborts
+            // the pass; log it and carry on to the next.
+            match enrich_one(store, bg_io, cache, tmdb, tvdb, cfg, item, now).await {
+                Ok(true) => enriched += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "T9 metadata backfill: item failed"),
+            }
+            tokio::time::sleep(REQUEST_SPACING).await;
         }
-        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+
+    // Series-container pass (TVDB only — the series-level record). Runs even
+    // when no items needed matching: episodes and shows drain independently.
+    if let Some(tv) = tvdb {
+        match enrich_series_pass(store, bg_io, cache, tv, cfg, now).await {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
+                }
+                enriched += n;
+            }
+            Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
+        }
     }
     Ok(enriched)
 }
@@ -679,6 +692,185 @@ fn upsert_art(
     }
 }
 
+/// One enrichment pass over the Series *containers* (T9-series). A show has no
+/// `media_items` row, so this can't ride the item loop — it enumerates distinct
+/// shows via [`SeriesMetadataStore::series_needing_match`] and enriches each
+/// against TVDB (the only provider that carries a series-level record here).
+/// Returns how many shows were newly enriched (counts toward the pass total, so
+/// the loop keeps draining while shows remain). Series are TV-only, so this is
+/// a no-op when `tvdb` is `None`.
+async fn enrich_series_pass<Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tvdb: &Tv,
+    cfg: &MetadataConfig,
+    now: i64,
+) -> DomainResult<usize>
+where
+    Tv: OnlineEnricher,
+    S: SeriesMetadataStore,
+{
+    let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
+    let candidates = store
+        .series_needing_match(cfg.max_per_pass, ttl_cutoff)
+        .await?;
+    let mut enriched = 0usize;
+    for cand in candidates {
+        // V6 — one bad show never aborts the pass; log it and carry on.
+        match enrich_one_series(store, bg_io, cache, tvdb, cfg, cand, now).await {
+            Ok(true) => enriched += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: show failed"),
+        }
+        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+    Ok(enriched)
+}
+
+/// Enrich one show end-to-end: search TVDB by name (+year), fetch the
+/// series-level record (season/episode = `None`), cache its poster + backdrop,
+/// and upsert the [`SeriesMetadata`] row. Returns `Ok(true)` on a persisted
+/// match, `Ok(false)` when it marked the show `none` (no confident hit) or hit
+/// a transient miss (left for the next pass). Local data can't be clobbered —
+/// a show has no curated local metadata, so this simply writes the record.
+async fn enrich_one_series<Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tvdb: &Tv,
+    cfg: &MetadataConfig,
+    cand: SeriesMatchCandidate,
+    now: i64,
+) -> DomainResult<bool>
+where
+    Tv: OnlineEnricher,
+    S: SeriesMetadataStore,
+{
+    // Reuse the item resolver: kind=Episode + season/episode=None routes to the
+    // provider's SERIES-level search+fetch (TvdbEnricher: search_series →
+    // get_series). No nfo id for a synthesised show, so it always searches.
+    let resolved = resolve(
+        tvdb,
+        MediaKind::Episode,
+        "tvdb",
+        &cand.series_name,
+        cand.series_year,
+        None,
+        None,
+        &ProviderIds::default(),
+        bg_io,
+        cfg,
+    )
+    .await;
+    let (external_id, confidence, enriched) = match resolved {
+        Resolved::NoMatch => {
+            // Searched, nothing over the confidence floor → record `none` so the
+            // show isn't re-searched until the TTL re-admits it.
+            store
+                .upsert_series_metadata(SeriesMetadata {
+                    series_key: cand.series_key.clone(),
+                    series_name: cand.series_name.clone(),
+                    match_provider: Some("tvdb".into()),
+                    match_source: Some("none".into()),
+                    metadata_refreshed_at: Some(now),
+                    ..Default::default()
+                })
+                .await?;
+            return Ok(false);
+        }
+        // Transient fetch miss — leave the row untouched so the next pass retries.
+        Resolved::Transient => return Ok(false),
+        Resolved::Hit {
+            external_id,
+            confidence,
+            enriched,
+            ..
+        } => (external_id, confidence, *enriched),
+    };
+
+    let poster_locator = cache_series_art(
+        cache,
+        tvdb,
+        bg_io,
+        &cand.series_key,
+        ArtworkRole::Primary,
+        ImageRole::Primary,
+        &enriched,
+    )
+    .await;
+    let backdrop_locator = cache_series_art(
+        cache,
+        tvdb,
+        bg_io,
+        &cand.series_key,
+        ArtworkRole::Backdrop,
+        ImageRole::Backdrop,
+        &enriched,
+    )
+    .await;
+
+    store
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: cand.series_key.clone(),
+            series_name: cand.series_name.clone(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some(external_id.clone()),
+            match_source: Some("search".into()),
+            match_confidence: confidence,
+            metadata_refreshed_at: Some(now),
+            overview: enriched.overview.clone(),
+            community_rating: enriched.community_rating,
+            premiere_date: enriched.premiere_date,
+            official_rating: enriched.official_rating.clone(),
+            genres: enriched.genres.clone(),
+            // TVDB's series-detail parse carries no studios/networks today.
+            studios: Vec::new(),
+            provider_ids: ProviderIds {
+                tvdb: Some(external_id),
+                // The series-level record's `also_tmdb_id` IS series-scoped
+                // (unlike an episode's), so it's safe to carry as the show's
+                // TMDB id.
+                tmdb: enriched.also_tmdb_id.clone(),
+                ..Default::default()
+            },
+            poster_locator,
+            backdrop_locator,
+        })
+        .await?;
+    Ok(true)
+}
+
+/// Download the show's artwork of role `want` (if the record offers it) and
+/// cache it under `series_key`, returning the cache locator to store. `None`
+/// when the record has no such art or the download/cache failed (non-fatal —
+/// the images route falls back to a representative episode frame).
+async fn cache_series_art<E: OnlineEnricher>(
+    cache: &ImageCache,
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    series_key: &str,
+    want: ArtworkRole,
+    image_role: ImageRole,
+    enriched: &EnrichedMetadata,
+) -> Option<String> {
+    let art = enriched.artwork.iter().find(|a| a.role == want)?;
+    let bytes = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.fetch_image_bytes(&art.url).await?
+    };
+    match cache
+        .upload_series_art(series_key, image_role, &bytes)
+        .await
+    {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Err(e) => {
+            tracing::warn!(error = %e, series_key, "T9-series: art cache write failed");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -715,6 +907,15 @@ mod tests {
         fn tmdb() -> Self {
             Self {
                 provider: "tmdb",
+                search: Vec::new(),
+                detail: None,
+                image_bytes: None,
+            }
+        }
+
+        fn tvdb() -> Self {
+            Self {
+                provider: "tvdb",
                 search: Vec::new(),
                 detail: None,
                 image_bytes: None,
@@ -1105,5 +1306,145 @@ mod tests {
         let got = s.get(900_201).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_external_id.as_deref(), Some("999"));
+    }
+
+    // --- T9-series: series-container enrichment pass -----------------------
+
+    async fn put_episode(store: &SqliteStore, id: u64, series: &str, folder: &str) {
+        let item = MediaItem {
+            id,
+            path: format!("{folder}/S01E{id:02}.mkv").into(),
+            title: format!("{series} ep {id}"),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: series.into(),
+                season_number: Some(1),
+                episode_number: Some(id as u32),
+                series_folder: Some(folder.into()),
+                series_year: Some(1997),
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn series_pass_enriches_container_from_tvdb_and_caches_poster() {
+        let s = store().await;
+        put_episode(&s, 1, "Buffy", "/tv/Buffy (1997)").await;
+        put_episode(&s, 2, "Buffy", "/tv/Buffy (1997)").await;
+        let (_td, cache) = cache();
+        // Candidate title matches the folder-derived series_name ("Buffy") so
+        // match_best clears the confidence floor.
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("70327", "Buffy", Some(1997))])
+            .with_detail(EnrichedMetadata {
+                overview: Some("One girl in all the world.".into()),
+                community_rating: Some(8.7),
+                premiere_date: Some(867_715_200),
+                official_rating: Some("TV-14".into()),
+                genres: vec!["Drama".into(), "Fantasy".into()],
+                also_tmdb_id: Some("95".into()),
+                artwork: vec![RemoteArt {
+                    role: pharos_core::ArtworkRole::Primary,
+                    url: "https://artworks.thetvdb.com/poster.jpg".into(),
+                }],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(b"\xff\xd8\xff\xe0jpegbytes".to_vec());
+
+        let n = run(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        // 2 episodes (item loop) + 1 show (series pass) all match the same
+        // candidate and enrich in one pass.
+        assert_eq!(n, 3, "two episodes plus the show container enriched");
+
+        let got = s
+            .series_metadata_by_keys(&["/tv/Buffy (1997)".into()])
+            .await
+            .unwrap();
+        let m = got.get("/tv/Buffy (1997)").expect("series row written");
+        assert_eq!(m.match_provider.as_deref(), Some("tvdb"));
+        assert_eq!(m.match_source.as_deref(), Some("search"));
+        assert_eq!(m.match_external_id.as_deref(), Some("70327"));
+        assert_eq!(m.overview.as_deref(), Some("One girl in all the world."));
+        assert_eq!(m.community_rating, Some(8.7));
+        assert_eq!(m.genres, vec!["Drama".to_string(), "Fantasy".to_string()]);
+        assert_eq!(m.provider_ids.tvdb.as_deref(), Some("70327"));
+        assert_eq!(m.provider_ids.tmdb.as_deref(), Some("95"));
+        assert_eq!(m.metadata_refreshed_at, Some(NOW));
+        // The poster was downloaded + cached, and the locator points at a real
+        // file on disk that the images route can serve.
+        let locator = m.poster_locator.as_deref().expect("poster cached");
+        assert!(
+            std::path::Path::new(locator).exists(),
+            "poster locator must point at a written cache file: {locator}"
+        );
+
+        // A second pass with the show already fresh does nothing (TTL not due).
+        let n2 = run(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            n2, 0,
+            "already-enriched show is not re-processed within the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn series_pass_no_confident_hit_marks_none() {
+        let s = store().await;
+        put_episode(&s, 1, "Obscure Show", "/tv/Obscure Show").await;
+        let (_td, cache) = cache();
+        // Search returns a candidate that won't clear the confidence floor
+        // against the query title.
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("1", "Something Totally Different", None)])
+            .with_detail(enriched_overview("should not be used"));
+
+        let n = run(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no confident hit → nothing counted");
+
+        let got = s
+            .series_metadata_by_keys(&["/tv/Obscure Show".into()])
+            .await
+            .unwrap();
+        let m = got.get("/tv/Obscure Show").expect("none-row written");
+        assert_eq!(m.match_source.as_deref(), Some("none"));
+        assert_eq!(m.overview, None, "no metadata applied on a none-match");
+
+        // The `none` write means the show isn't re-searched until the TTL.
+        let need = s.series_needing_match(10, NOW - 1).await.unwrap();
+        assert!(
+            need.is_empty(),
+            "a none-matched show stays out of the eligible set until the TTL cutoff"
+        );
     }
 }
