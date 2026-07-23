@@ -389,6 +389,25 @@ async fn serve_image(
             .await;
         }
     }
+    // T9-series — a synth Series/Season tile prefers the enricher's cached TVDB
+    // poster/backdrop over the representative episode's own frame/still (an
+    // episode still is a poor show tile). Ranked after a season-specific local
+    // sidecar (above) but before the episode-artwork path (below). Bare shows
+    // (never matched) fall straight through, exactly as before.
+    if synth_id && index == 0 {
+        if let Some(series_art) = series_metadata_art_path(state, &item, role).await {
+            return serve_local_artwork(
+                &series_art,
+                role,
+                head_only,
+                format,
+                state,
+                req_width,
+                if_none_match,
+            )
+            .await;
+        }
+    }
     // LIB-D5 — local-sidecar-first resolution. D4 records artwork
     // discovered at scan time (poster.jpg / fanart.jpg / logo.png /…
     // beside the media, or under the series folder for episodes) as
@@ -629,6 +648,44 @@ async fn season_sidecar_path(
         }
     }
     None
+}
+
+/// T9-series — the cached TVDB poster/backdrop for a synth Series/Season id,
+/// if the series enricher matched this show and the file still exists. `item`
+/// is the representative episode the synth id resolved to; its
+/// [`SeriesInfo::series_key`] keys the `series_metadata` row. Only Primary
+/// (poster) and Backdrop have a series-level asset; every other role returns
+/// `None` and keeps the existing resolution. Best-effort — a store error or a
+/// recorded-but-missing file falls through (V6 spirit).
+///
+/// [`SeriesInfo::series_key`]: pharos_core::SeriesInfo::series_key
+async fn series_metadata_art_path(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    role: ImageRole,
+) -> Option<std::path::PathBuf> {
+    use pharos_core::SeriesMetadataStore;
+    if !matches!(role, ImageRole::Primary | ImageRole::Backdrop) {
+        return None;
+    }
+    let series = item.series.as_ref()?;
+    let key = series.series_key().to_string();
+    let map = state
+        .stores
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await
+        .ok()?;
+    let meta = map.get(&key)?;
+    let locator = match role {
+        ImageRole::Primary => meta.poster_locator.clone(),
+        ImageRole::Backdrop => meta.backdrop_locator.clone(),
+        _ => None,
+    }?;
+    let path = std::path::PathBuf::from(locator);
+    match tokio::fs::try_exists(&path).await {
+        Ok(true) => Some(path),
+        _ => None,
+    }
 }
 
 /// The `ArtworkRole::as_str` token (D4 stores these in `artwork.role`)
@@ -1302,6 +1359,68 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 404);
+    }
+
+    #[actix_web::test]
+    async fn synth_series_primary_serves_cached_tvdb_poster() {
+        // T9-series — a synth Series id whose show the enricher matched serves
+        // the cached TVDB poster (via series_metadata.poster_locator), ahead of
+        // the representative episode's own frame.
+        use crate::api::jellyfin::dto::series_id_for_key;
+        use pharos_core::{
+            MediaItem, MediaKind, MediaStore, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let poster = dir.path().join("buffy-poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        // One episode of a folder-keyed show — the synth Series id resolves to it.
+        let ep = MediaItem {
+            id: 501,
+            path: dir.path().join("Buffy/S01E01.mkv"),
+            title: "Buffy S01E01".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Buffy".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/tv/Buffy (1997)".into()),
+                series_year: Some(1997),
+            }),
+            ..Default::default()
+        };
+        state.stores.put(ep).await.unwrap();
+        state
+            .stores
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: "/tv/Buffy (1997)".into(),
+                series_name: "Buffy".into(),
+                match_source: Some("search".into()),
+                poster_locator: Some(poster.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let synth = series_id_for_key(Some("/tv/Buffy (1997)"), "Buffy");
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/items/{synth}/images/primary"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "cached TVDB series poster must serve");
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let body = test::read_body(resp).await;
+        assert_eq!(
+            body.as_ref(),
+            PNG_1X1,
+            "served bytes must be the cached poster"
+        );
     }
 
     #[actix_web::test]
