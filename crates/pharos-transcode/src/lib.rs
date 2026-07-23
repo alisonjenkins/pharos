@@ -659,8 +659,23 @@ fn build_args_for_device(
     // 1/framerate timebase rounds the zero-based first-frame pts to frame
     // index 0 or 1 semi-randomly per segment, gapping/duping the boundary
     // frame by ±1 frame). Encoder option → only when actually encoding video.
+    //
+    // SOFTWARE ENCODERS ONLY. The hardware encoders (h264_nvenc et al.) reject
+    // an externally-forced encoder time_base and emit a broken/empty bitstream
+    // (`Invalid NAL unit size` → a truncated fMP4 → an empty init segment →
+    // 500), observed live when the demuxed-h264 fMP4 rung first routed browsers
+    // onto NVENC. The mux-side `-output_ts_offset` (below) already anchors each
+    // segment's tfdt to its true source position, so a hw encode's default
+    // frame-rate timebase still tiles correctly; only the ±1-frame boundary
+    // nicety is lost on the hw path, which is acceptable. VP9 always runs on the
+    // software libvpx encoder (no hardware VP9 here), so it keeps the flag.
     let fmp4_segment = matches!(opts.container, Container::Fmp4);
-    if fmp4_segment && opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy)) {
+    let software_video = matches!(hwaccel, HwAccel::Off);
+    if fmp4_segment
+        && software_video
+        && opts.video.is_some()
+        && !matches!(opts.video, Some(VideoCodec::Copy))
+    {
         a.push("-enc_time_base".into());
         a.push("1:90000".into());
     }
@@ -957,6 +972,53 @@ mod tests {
         );
         assert!(joined.contains("-avoid_negative_ts disabled"), "{joined}");
         assert!(joined.contains("-output_ts_offset 30.000"), "{joined}");
+    }
+
+    #[test]
+    fn fmp4_h264_on_nvenc_omits_enc_time_base_but_keeps_fragmentation() {
+        use crate::protocol::DeviceId;
+        // Regression (live prod break): h264_nvenc rejects an externally-forced
+        // `-enc_time_base` and emits a broken/empty bitstream → truncated fMP4 →
+        // empty init → 500. The flag must be SOFTWARE-ONLY. The mux-side
+        // source-anchoring (movflags fragmentation + `-output_ts_offset`) is
+        // codec/encoder-agnostic and MUST still be present so hw fMP4 segments
+        // tile on one timeline.
+        let o = TranscodeOptions {
+            container: Container::Fmp4,
+            video: Some(VideoCodec::H264),
+            audio: None,
+            video_bitrate_bps: Some(4_000_000),
+            audio_bitrate_bps: None,
+            start_position_ticks: 30 * 10_000_000,
+            duration_ticks: Some(6 * 10_000_000),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+        };
+        let nvenc =
+            build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.m4s")
+                .join(" ");
+        assert!(
+            !nvenc.contains("-enc_time_base"),
+            "nvenc fMP4 must NOT force enc_time_base: {nvenc}"
+        );
+        assert!(
+            nvenc.contains("-movflags +empty_moov+frag_keyframe+default_base_moof+frag_discont"),
+            "hw fMP4 keeps fragmentation: {nvenc}"
+        );
+        assert!(
+            nvenc.contains("-output_ts_offset 30.000"),
+            "hw fMP4 keeps source anchoring: {nvenc}"
+        );
+
+        // The SAME opts on the software (CPU) encoder DO keep the flag.
+        let cpu = build_args_for_device("/m/x.mkv", &o, DeviceId::Cpu, "out.m4s").join(" ");
+        assert!(
+            cpu.contains("-enc_time_base 1:90000"),
+            "software fMP4 keeps enc_time_base: {cpu}"
+        );
     }
 
     #[test]
