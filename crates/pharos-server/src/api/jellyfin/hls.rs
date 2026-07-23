@@ -2339,11 +2339,19 @@ async fn check_session(state: &AppState, psid: Option<&str>) -> Result<(), actix
 /// Build the per-segment VP9/fMP4 [`SegmentOpts`]. Always VP9 in a
 /// fragmented-mp4 container; the bitrate cap follows the negotiated session
 /// (if any) then the source-derived clamp.
-async fn vp9_segment_opts(
+/// Build the opts for one video-only fMP4 segment, parameterized by the OUTPUT
+/// video codec. Shared by the VP9 rung (`SegmentVideo::Vp9`) and the browser
+/// h264-CMAF rung (`SegmentVideo::H264`). The segment is AUDIO-FREE either way
+/// (`audio: None`, `audio_source_stream_index: None`) — audio is a separate
+/// continuous rendition — so the segment cache key never varies by
+/// `AudioStreamIndex`, which is what lets an audio-track switch reuse the
+/// cached video instead of cold-re-transcoding it.
+async fn fmp4_segment_opts(
     state: &AppState,
     req: &HttpRequest,
     item: &pharos_core::MediaItem,
     seg: u32,
+    video: SegmentVideo,
     // Audio track selection no longer applies to the (audio-free) video
     // segment; it drives the separate audio rendition instead. Kept in the
     // signature for the call sites.
@@ -2402,7 +2410,7 @@ async fn vp9_segment_opts(
     });
     SegmentOpts {
         container: SegmentContainer::Fmp4,
-        video: Some(SegmentVideo::Vp9),
+        video: Some(video),
         // Video segments are AUDIO-FREE (A/V-sync fix): audio is served as a
         // separate continuous-encode rendition (see vp9_audio_playlist), so it
         // carries no per-segment Opus preskip. `audio: None` → `-an`. This also
@@ -2418,6 +2426,28 @@ async fn vp9_segment_opts(
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
     }
+}
+
+/// VP9 video-only fMP4 segment opts — thin wrapper over [`fmp4_segment_opts`]
+/// (unchanged behaviour; the VP9 rung's output codec is VP9).
+async fn vp9_segment_opts(
+    state: &AppState,
+    req: &HttpRequest,
+    item: &pharos_core::MediaItem,
+    seg: u32,
+    audio_stream_index: Option<u32>,
+    subtitle_stream_index: Option<u32>,
+) -> SegmentOpts {
+    fmp4_segment_opts(
+        state,
+        req,
+        item,
+        seg,
+        SegmentVideo::Vp9,
+        audio_stream_index,
+        subtitle_stream_index,
+    )
+    .await
 }
 
 /// Convert a client `AudioStreamIndex` (absolute ffprobe index) to the
@@ -3334,6 +3364,33 @@ mod tests {
         let opts = vp9_segment_opts(&state, &req, &item, 0, None, None).await;
         assert_eq!(opts.burn_subtitle_stream_index, None);
         assert!(!opts.burn_subtitle_is_text);
+    }
+
+    #[actix_web::test]
+    async fn h264_cmaf_segment_opts_is_audio_free_h264_fmp4() {
+        // The whole point of the demuxed h264 rung: the video segment carries NO
+        // audio, so its cache key never varies by AudioStreamIndex — an
+        // audio-track switch then reuses the cached video instead of
+        // cold-re-transcoding it.
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = web::Data::new(AppState::new(stores, "t".into()));
+        let req = test::TestRequest::default().to_http_request();
+        let item = item_with_subs();
+
+        let opts =
+            fmp4_segment_opts(&state, &req, &item, 0, SegmentVideo::H264, Some(1), None).await;
+        assert_eq!(opts.container, SegmentContainer::Fmp4);
+        assert_eq!(opts.video, Some(SegmentVideo::H264));
+        assert_eq!(opts.audio, None, "video segment must be audio-free");
+        assert_eq!(opts.audio_source_stream_index, None);
+
+        // A DIFFERENT audio index yields identical audio-affecting fields, so the
+        // segment cache key is audio-independent.
+        let opts2 =
+            fmp4_segment_opts(&state, &req, &item, 0, SegmentVideo::H264, Some(2), None).await;
+        assert_eq!(opts2.audio, None);
+        assert_eq!(opts2.audio_source_stream_index, None);
+        assert_eq!(opts.video_bitrate_bps, opts2.video_bitrate_bps);
     }
 
     #[::core::prelude::v1::test]
