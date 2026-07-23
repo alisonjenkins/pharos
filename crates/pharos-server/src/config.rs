@@ -64,6 +64,14 @@ pub struct MetadataConfig {
     /// online match. Default 0.7.
     #[serde(default = "default_match_min_confidence")]
     pub match_min_confidence: f32,
+    /// Seconds the enrichment loop idles after a pass that enriched nothing
+    /// (the pool is drained) before re-checking for newly-scanned or
+    /// TTL-re-admitted items. While a pass is still enriching, the loop
+    /// re-runs after a short fixed drain gap instead (see
+    /// `metadata_backfill::DRAIN_GAP`), so a large first-boot backlog clears
+    /// without waiting a full interval between passes. Default 21600 (6h).
+    #[serde(default = "default_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
 }
 
 fn default_refresh_ttl_days() -> u32 {
@@ -78,12 +86,17 @@ fn default_match_min_confidence() -> f32 {
     0.7
 }
 
+fn default_refresh_interval_secs() -> u64 {
+    21_600
+}
+
 impl Default for MetadataConfig {
     fn default() -> Self {
         Self {
             refresh_ttl_days: default_refresh_ttl_days(),
             max_per_pass: default_max_per_pass(),
             match_min_confidence: default_match_min_confidence(),
+            refresh_interval_secs: default_refresh_interval_secs(),
         }
     }
 }
@@ -685,6 +698,7 @@ mod tests {
         let cfg = Config::from_toml_str(s).unwrap();
         assert_eq!(cfg.metadata.refresh_ttl_days, 30);
         assert_eq!(cfg.metadata.max_per_pass, 5000);
+        assert_eq!(cfg.metadata.refresh_interval_secs, 21_600);
         assert!((cfg.metadata.match_min_confidence - 0.7).abs() < f32::EPSILON);
         std::env::set_var("PHAROS_TVDB_API_KEY", "  abc123  ");
         let cfg = cfg.apply_env();
