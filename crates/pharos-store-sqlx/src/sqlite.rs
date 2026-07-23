@@ -4,7 +4,8 @@ use pharos_core::{
     Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind, LibraryStore,
     MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore, Person,
     PersonCount, PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore,
-    ScanState, SeriesInfo, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, UserId,
+    ScanState, SeriesInfo, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio,
+    StudioCount, StudioStore, Tag, TagCount, TagStore, UserId,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -2870,6 +2871,126 @@ struct MediaRow {
     match_source: Option<String>,
     match_confidence: Option<f32>,
     metadata_refreshed_at: Option<i64>,
+}
+
+impl SeriesMetadataStore for SqliteStore {
+    async fn series_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<SeriesMatchCandidate>> {
+        // Distinct shows derived from their episodes' SeriesInfo, LEFT-JOINed
+        // against the metadata table so never-matched (NULL) and TTL-expired
+        // rows qualify while `manual` overrides are excluded. series_key mirrors
+        // SeriesInfo::series_key (series_folder, else series_name).
+        let sql = "SELECT s.series_key AS series_key, s.series_name AS series_name, \
+                          s.series_year AS series_year \
+             FROM ( \
+               SELECT COALESCE(series_folder, series_name) AS series_key, \
+                      MIN(series_name) AS series_name, MAX(series_year) AS series_year \
+               FROM media_items \
+               WHERE kind = 'episode' AND series_name IS NOT NULL AND series_name <> '' \
+               GROUP BY COALESCE(series_folder, series_name) \
+             ) s \
+             LEFT JOIN series_metadata sm ON sm.series_key = s.series_key \
+             WHERE (sm.match_source IS NULL OR sm.match_source IN ('search','none')) \
+               AND (sm.metadata_refreshed_at IS NULL OR sm.metadata_refreshed_at < ?) \
+             ORDER BY s.series_key ASC LIMIT ?";
+        let rows = sqlx::query_as::<_, (String, String, Option<i64>)>(sql)
+            .bind(ttl_cutoff)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(series_key, series_name, series_year)| SeriesMatchCandidate {
+                    series_key,
+                    series_name,
+                    series_year: series_year.and_then(|y| u32::try_from(y).ok()),
+                },
+            )
+            .collect())
+    }
+
+    async fn upsert_series_metadata(&self, meta: SeriesMetadata) -> DomainResult<()> {
+        let genres = crate::string_list_json::encode(&meta.genres).unwrap_or_else(|| "[]".into());
+        let studios = crate::string_list_json::encode(&meta.studios).unwrap_or_else(|| "[]".into());
+        let provider_ids =
+            crate::provider_ids_json::encode(&meta.provider_ids).unwrap_or_else(|| "{}".into());
+        sqlx::query(
+            "INSERT INTO series_metadata (series_key, series_name, match_provider, \
+                 match_external_id, match_source, match_confidence, metadata_refreshed_at, \
+                 overview, community_rating, premiere_date, official_rating, genres, studios, \
+                 provider_ids, poster_locator, backdrop_locator) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(series_key) DO UPDATE SET \
+                 series_name = excluded.series_name, \
+                 match_provider = excluded.match_provider, \
+                 match_external_id = excluded.match_external_id, \
+                 match_source = excluded.match_source, \
+                 match_confidence = excluded.match_confidence, \
+                 metadata_refreshed_at = excluded.metadata_refreshed_at, \
+                 overview = excluded.overview, \
+                 community_rating = excluded.community_rating, \
+                 premiere_date = excluded.premiere_date, \
+                 official_rating = excluded.official_rating, \
+                 genres = excluded.genres, \
+                 studios = excluded.studios, \
+                 provider_ids = excluded.provider_ids, \
+                 poster_locator = excluded.poster_locator, \
+                 backdrop_locator = excluded.backdrop_locator",
+        )
+        .bind(&meta.series_key)
+        .bind(&meta.series_name)
+        .bind(&meta.match_provider)
+        .bind(&meta.match_external_id)
+        .bind(&meta.match_source)
+        .bind(meta.match_confidence)
+        .bind(meta.metadata_refreshed_at)
+        .bind(&meta.overview)
+        .bind(meta.community_rating)
+        .bind(meta.premiere_date)
+        .bind(&meta.official_rating)
+        .bind(genres)
+        .bind(studios)
+        .bind(provider_ids)
+        .bind(&meta.poster_locator)
+        .bind(&meta.backdrop_locator)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn series_metadata_by_keys(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashMap<String, SeriesMetadata>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let cols = crate::series_meta_row::SERIES_META_COLUMNS;
+        let sql =
+            format!("SELECT {cols} FROM series_metadata WHERE series_key IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, crate::series_meta_row::SeriesMetaRow>(&sql);
+        for k in keys {
+            q = q.bind(k);
+        }
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let m: SeriesMetadata = r.into();
+                (m.series_key.clone(), m)
+            })
+            .collect())
+    }
 }
 
 impl MediaRow {

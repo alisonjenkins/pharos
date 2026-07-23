@@ -1,7 +1,10 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_core::{DomainError, MediaItem, MediaKind, MediaStore};
+use pharos_core::{
+    DomainError, MediaItem, MediaKind, MediaStore, ProviderIds, SeriesInfo, SeriesMatchCandidate,
+    SeriesMetadata, SeriesMetadataStore,
+};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use std::sync::Arc;
 
@@ -1352,4 +1355,146 @@ async fn set_item_match_persists_and_excludes_from_needing() {
         .unwrap();
     let need3 = store.items_needing_match(10, i64::MAX).await.unwrap();
     assert!(!need3.iter().any(|i| i.id == 900010));
+}
+
+// --- T9-series: series_metadata store -------------------------------------
+
+fn episode_of(id: u64, series_name: &str, folder: Option<&str>, year: Option<u32>) -> MediaItem {
+    MediaItem {
+        id,
+        path: format!("/tv/{series_name}/S01E{id:02}.mkv").into(),
+        title: format!("{series_name} ep {id}"),
+        kind: MediaKind::Episode,
+        series: Some(SeriesInfo {
+            series_name: series_name.into(),
+            season_number: Some(1),
+            episode_number: Some(id as u32),
+            series_folder: folder.map(str::to_string),
+            series_year: year,
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
+    let s = fresh().await;
+    // Two episodes of one folder-keyed show + one legacy name-keyed show.
+    s.put(episode_of(1, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
+        .await
+        .unwrap();
+    s.put(episode_of(2, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
+        .await
+        .unwrap();
+    s.put(episode_of(3, "Firefly", None, None)).await.unwrap();
+
+    let mut got = s.series_needing_match(10, i64::MAX).await.unwrap();
+    got.sort_by(|a, b| a.series_key.cmp(&b.series_key));
+    assert_eq!(
+        got,
+        vec![
+            SeriesMatchCandidate {
+                series_key: "/tv/Buffy (1997)".into(),
+                series_name: "Buffy".into(),
+                series_year: Some(1997),
+            },
+            SeriesMatchCandidate {
+                series_key: "Firefly".into(),
+                series_name: "Firefly".into(),
+                series_year: None,
+            },
+        ],
+        "one candidate per distinct series_key, folder-keyed dedups its episodes"
+    );
+}
+
+#[tokio::test]
+async fn series_metadata_upsert_then_by_keys_roundtrips() {
+    let s = fresh().await;
+    let meta = SeriesMetadata {
+        series_key: "/tv/Buffy (1997)".into(),
+        series_name: "Buffy the Vampire Slayer".into(),
+        match_provider: Some("tvdb".into()),
+        match_external_id: Some("70327".into()),
+        match_source: Some("search".into()),
+        match_confidence: Some(0.95),
+        metadata_refreshed_at: Some(1000),
+        overview: Some("A slayer.".into()),
+        community_rating: Some(8.7),
+        premiere_date: Some(867715200),
+        official_rating: Some("TV-14".into()),
+        genres: vec!["Drama".into(), "Fantasy".into()],
+        studios: vec!["The WB".into()],
+        provider_ids: ProviderIds {
+            tvdb: Some("70327".into()),
+            tmdb: Some("95".into()),
+            ..Default::default()
+        },
+        poster_locator: Some("cache/poster.jpg".into()),
+        backdrop_locator: Some("cache/back.jpg".into()),
+    };
+    s.upsert_series_metadata(meta.clone()).await.unwrap();
+
+    let got = s
+        .series_metadata_by_keys(&["/tv/Buffy (1997)".into(), "missing".into()])
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "missing key is simply absent");
+    assert_eq!(got.get("/tv/Buffy (1997)"), Some(&meta));
+
+    // Re-upsert overwrites in place (idempotent), not a second row.
+    let mut meta2 = meta.clone();
+    meta2.overview = Some("Updated.".into());
+    s.upsert_series_metadata(meta2.clone()).await.unwrap();
+    let got2 = s
+        .series_metadata_by_keys(&["/tv/Buffy (1997)".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        got2.get("/tv/Buffy (1997)").unwrap().overview.as_deref(),
+        Some("Updated.")
+    );
+}
+
+#[tokio::test]
+async fn series_needing_match_respects_ttl_and_manual_override() {
+    let s = fresh().await;
+    s.put(episode_of(1, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
+        .await
+        .unwrap();
+    s.put(episode_of(2, "Firefly", None, None)).await.unwrap();
+
+    // Enrich Buffy at t=500; mark Firefly as a manual override.
+    s.upsert_series_metadata(SeriesMetadata {
+        series_key: "/tv/Buffy (1997)".into(),
+        series_name: "Buffy".into(),
+        match_source: Some("search".into()),
+        metadata_refreshed_at: Some(500),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    s.upsert_series_metadata(SeriesMetadata {
+        series_key: "Firefly".into(),
+        series_name: "Firefly".into(),
+        match_source: Some("manual".into()),
+        metadata_refreshed_at: Some(500),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Fresh (cutoff=400): Buffy enriched after cutoff → not due; Firefly manual
+    // → never due. Nothing eligible.
+    let need = s.series_needing_match(10, 400).await.unwrap();
+    assert!(
+        need.is_empty(),
+        "recently-enriched + manual are both skipped"
+    );
+
+    // TTL expired (cutoff=600 > Buffy's 500): Buffy re-admits, Firefly (manual)
+    // stays excluded.
+    let need2 = s.series_needing_match(10, 600).await.unwrap();
+    let keys: Vec<&str> = need2.iter().map(|c| c.series_key.as_str()).collect();
+    assert_eq!(keys, vec!["/tv/Buffy (1997)"]);
 }
