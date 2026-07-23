@@ -212,6 +212,16 @@ impl<T: TvdbTransport> TvdbClient<T> {
     pub async fn fetch_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
         self.transport.fetch_bytes(url).await
     }
+
+    /// List a series' artworks from its extended record (the same endpoint
+    /// [`get_series`](Self::get_series) reads). Empty on any
+    /// auth/transport/decode failure.
+    pub async fn list_series_artworks(&self, id: &str) -> Vec<crate::online_enrich::RemoteImage> {
+        let Some(body) = self.authed_get(&format!("/series/{id}/extended")).await else {
+            return vec![];
+        };
+        parse_tvdb_artworks(&body)
+    }
 }
 
 /// Percent-encode a query-string value byte-by-byte (UTF-8 safe: each byte
@@ -281,6 +291,60 @@ fn extract_tmdb_remote_id(data: &serde_json::Value) -> Option<String> {
 /// `premiere_date` is parsed from the series' `firstAired` field (bare
 /// `YYYY-MM-DD`, TVDB v4's series-level air-date field) via
 /// [`pharos_core::parse_ymd_to_unix`].
+/// TVDB v4 series artwork `type` ids the picker surfaces. Others (icon=5,
+/// banner=1, season art, …) are dropped — only poster/backdrop/logo.
+fn tvdb_artwork_role(type_id: i64) -> Option<ArtworkRole> {
+    match type_id {
+        2 => Some(ArtworkRole::Primary),  // poster
+        3 => Some(ArtworkRole::Backdrop), // background
+        23 => Some(ArtworkRole::Logo),    // clearlogo
+        _ => None,
+    }
+}
+
+/// Parse a TVDB `/series/{id}/extended` body's `data.artworks[]` into
+/// role-tagged candidates. Empty on any decode error / missing array.
+pub(crate) fn parse_tvdb_artworks(body: &str) -> Vec<crate::online_enrich::RemoteImage> {
+    use crate::online_enrich::RemoteImage;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    let Some(arr) = v
+        .get("data")
+        .and_then(|d| d.get("artworks"))
+        .and_then(|a| a.as_array())
+    else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for a in arr {
+        let Some(role) = a
+            .get("type")
+            .and_then(|x| x.as_i64())
+            .and_then(tvdb_artwork_role)
+        else {
+            continue;
+        };
+        let Some(url) = a.get("image").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        out.push(RemoteImage {
+            role,
+            url: url.to_string(),
+            width: a.get("width").and_then(|x| x.as_u64()).map(|n| n as u32),
+            height: a.get("height").and_then(|x| x.as_u64()).map(|n| n as u32),
+            language: a
+                .get("language")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            community_rating: a.get("score").and_then(|x| x.as_f64()).map(|f| f as f32),
+            vote_count: None,
+        });
+    }
+    out
+}
+
 pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let data = v.get("data")?;
@@ -422,6 +486,16 @@ impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> 
     async fn fetch_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
         self.0.fetch_image_bytes(url).await
     }
+
+    async fn list_images(
+        &self,
+        _kind: MediaKind,
+        id: &str,
+    ) -> Vec<crate::online_enrich::RemoteImage> {
+        // TVDB only exposes series-level artwork; any `kind` maps to the
+        // series id the caller resolved.
+        self.0.list_series_artworks(id).await
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +505,33 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn tvdb_parse_artworks_maps_known_types() {
+        let body = r#"{"data":{"artworks":[
+          {"image":"https://a/p.jpg","type":2,"language":"eng","score":100,"width":680,"height":1000},
+          {"image":"https://a/bg.jpg","type":3,"language":null,"score":50},
+          {"image":"https://a/logo.png","type":23,"language":"eng","score":10},
+          {"image":"https://a/icon.jpg","type":5,"language":"eng","score":1}
+        ]}}"#;
+        let imgs = parse_tvdb_artworks(body);
+        // types 2/3/23 kept (Primary/Backdrop/Logo); type 5 (icon) dropped.
+        assert_eq!(imgs.len(), 3);
+        let p = imgs
+            .iter()
+            .find(|i| i.role == ArtworkRole::Primary)
+            .unwrap();
+        assert_eq!(p.url, "https://a/p.jpg");
+        assert_eq!(p.width, Some(680));
+        assert_eq!(p.language.as_deref(), Some("eng"));
+        assert!(imgs.iter().any(|i| i.role == ArtworkRole::Backdrop));
+        assert!(imgs.iter().any(|i| i.role == ArtworkRole::Logo));
+    }
+
+    #[test]
+    fn tvdb_parse_artworks_empty_on_garbage() {
+        assert!(parse_tvdb_artworks("nope").is_empty());
+    }
 
     /// A network-free [`TvdbTransport`] fake: queues canned `login`/`get`
     /// responses and counts `login` calls, so the auth state-machine

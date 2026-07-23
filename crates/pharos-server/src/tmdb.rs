@@ -217,6 +217,36 @@ impl TmdbClient {
         }
         resp.bytes().await.ok().map(|b| b.to_vec())
     }
+
+    /// List all images TMDB has for a resolved movie/series id. `kind`
+    /// selects the endpoint (`/movie/{id}/images` vs `/tv/{id}/images`).
+    /// Empty `Vec` on any transport/HTTP error.
+    pub(crate) async fn list_images(
+        &self,
+        kind: pharos_core::MediaKind,
+        id: &str,
+    ) -> Vec<crate::online_enrich::RemoteImage> {
+        let path = match kind {
+            pharos_core::MediaKind::Movie => format!("{API_BASE}/movie/{id}/images"),
+            _ => format!("{API_BASE}/tv/{id}/images"),
+        };
+        let Ok(resp) = self
+            .http
+            .get(path)
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+        else {
+            return vec![];
+        };
+        if !resp.status().is_success() {
+            return vec![];
+        }
+        let Ok(body) = resp.text().await else {
+            return vec![];
+        };
+        parse_tmdb_images(&body)
+    }
 }
 
 /// [`crate::online_enrich::OnlineEnricher`] impl backed by [`TmdbClient`].
@@ -266,6 +296,14 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
 
     async fn fetch_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
         self.0.fetch_image_bytes(url).await
+    }
+
+    async fn list_images(
+        &self,
+        kind: pharos_core::MediaKind,
+        id: &str,
+    ) -> Vec<crate::online_enrich::RemoteImage> {
+        self.0.list_images(kind, id).await
     }
 }
 
@@ -457,6 +495,52 @@ pub(crate) fn parse_tv_detail(body: &str) -> Option<crate::online_enrich::Enrich
     })
 }
 
+/// Parse a TMDB `/movie|tv/{id}/images` body into role-tagged candidates.
+/// `posters`→Primary, `backdrops`→Backdrop, `logos`→Logo. Empty on any
+/// decode error (best-effort).
+pub(crate) fn parse_tmdb_images(body: &str) -> Vec<crate::online_enrich::RemoteImage> {
+    use crate::online_enrich::RemoteImage;
+    use pharos_core::ArtworkRole;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for (key, role) in [
+        ("posters", ArtworkRole::Primary),
+        ("backdrops", ArtworkRole::Backdrop),
+        ("logos", ArtworkRole::Logo),
+    ] {
+        let Some(arr) = v.get(key).and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for img in arr {
+            let Some(path) = img.get("file_path").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            out.push(RemoteImage {
+                role,
+                url: format!("{IMAGE_BASE_ORIGINAL}{path}"),
+                width: img.get("width").and_then(|x| x.as_u64()).map(|n| n as u32),
+                height: img.get("height").and_then(|x| x.as_u64()).map(|n| n as u32),
+                language: img
+                    .get("iso_639_1")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                community_rating: img
+                    .get("vote_average")
+                    .and_then(|x| x.as_f64())
+                    .map(|f| f as f32),
+                vote_count: img
+                    .get("vote_count")
+                    .and_then(|x| x.as_u64())
+                    .map(|n| n as u32),
+            });
+        }
+    }
+    out
+}
+
 /// Parse a TMDB `/tv/{id}/season/{s}/episode/{e}` detail response body
 /// into [`crate::online_enrich::EnrichedMetadata`]. Episode responses
 /// carry `name` (the episode title), `overview`, `air_date` (bare
@@ -511,6 +595,39 @@ mod tests {
             {"id":2,"name":"Jane Doe","profile_path":"/def456.jpg"}
         ]}"#;
         assert_eq!(parse_profile_path(body).as_deref(), Some("/abc123.jpg"));
+    }
+
+    #[test]
+    fn tmdb_parse_images_maps_roles_dims_and_rating() {
+        use pharos_core::ArtworkRole;
+        let body = r#"{
+          "posters":[{"file_path":"/p.jpg","width":2000,"height":3000,"iso_639_1":"en","vote_average":5.4,"vote_count":12}],
+          "backdrops":[{"file_path":"/b.jpg","width":1920,"height":1080,"iso_639_1":null,"vote_average":4.1,"vote_count":3}],
+          "logos":[{"file_path":"/l.png","width":800,"height":310,"iso_639_1":"en","vote_average":0.0,"vote_count":0}]
+        }"#;
+        let imgs = parse_tmdb_images(body);
+        assert_eq!(imgs.len(), 3);
+        let primary = imgs
+            .iter()
+            .find(|i| i.role == ArtworkRole::Primary)
+            .unwrap();
+        assert_eq!(primary.url, "https://image.tmdb.org/t/p/original/p.jpg");
+        assert_eq!(primary.width, Some(2000));
+        assert_eq!(primary.height, Some(3000));
+        assert_eq!(primary.language.as_deref(), Some("en"));
+        assert!((primary.community_rating.unwrap() - 5.4).abs() < 1e-4);
+        assert_eq!(primary.vote_count, Some(12));
+        let backdrop = imgs
+            .iter()
+            .find(|i| i.role == ArtworkRole::Backdrop)
+            .unwrap();
+        assert_eq!(backdrop.language, None);
+        assert!(imgs.iter().any(|i| i.role == ArtworkRole::Logo));
+    }
+
+    #[test]
+    fn tmdb_parse_images_empty_on_garbage() {
+        assert!(parse_tmdb_images("not json").is_empty());
     }
 
     #[test]

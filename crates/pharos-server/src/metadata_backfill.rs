@@ -972,6 +972,13 @@ mod tests {
         async fn fetch_image_bytes(&self, _url: &str) -> Option<Vec<u8>> {
             self.image_bytes.clone()
         }
+        async fn list_images(
+            &self,
+            _kind: MediaKind,
+            _id: &str,
+        ) -> Vec<crate::online_enrich::RemoteImage> {
+            vec![]
+        }
     }
 
     fn enriched_overview(overview: &str) -> EnrichedMetadata {

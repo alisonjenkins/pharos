@@ -23,6 +23,21 @@ pub struct RemoteArt {
     pub url: String,
 }
 
+/// One candidate image a provider offers for an already-resolved id, richer
+/// than [`RemoteArt`] (carries dimensions / language / rating so the
+/// Edit-Images picker can show and sort them). Downloading is still deferred
+/// to [`OnlineEnricher::fetch_image_bytes`] on the chosen [`RemoteImage::url`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteImage {
+    pub role: ArtworkRole,
+    pub url: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub language: Option<String>,
+    pub community_rating: Option<f32>,
+    pub vote_count: Option<u32>,
+}
+
 /// Provider-neutral metadata pulled from a single online provider for a
 /// single item. Every field is optional/empty by default so a provider
 /// that only has partial data (e.g. TVDB with no rating) can still return
@@ -89,6 +104,15 @@ pub trait OnlineEnricher: Send + Sync {
     /// [`RemoteArt::url`](RemoteArt) (or [`EnrichedMetadata::also_tmdb_id`]
     /// bridged art). `None` on any transport/HTTP error.
     fn fetch_image_bytes(&self, url: &str) -> impl Future<Output = Option<Vec<u8>>> + Send;
+
+    /// All candidate images the provider offers for an already-resolved `id`
+    /// (every role in one call). Empty `Vec` on any transport/HTTP/decode
+    /// error — best-effort, never panics, never fails the caller.
+    fn list_images(
+        &self,
+        kind: MediaKind,
+        id: &str,
+    ) -> impl Future<Output = Vec<RemoteImage>> + Send;
 }
 
 /// Sets `slot` only when it is currently unset — local data always wins
