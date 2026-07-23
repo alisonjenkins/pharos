@@ -30,6 +30,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             web::get().to(remote_image_providers),
         )
         .route(
+            "/items/{id}/remoteimages/download",
+            web::post().to(remote_images_download),
+        )
+        .route(
             "/items/{id}/remotesearch/subtitles/{lang}",
             web::get().to(remote_subtitle_search),
         )
@@ -236,30 +240,381 @@ async fn set_content_type(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// `GET /Items/{id}/RemoteImages` — remote artwork search. pharos has no
-/// image providers, so the result is an empty, well-shaped
-/// `RemoteImageResult` (200, not 404) — the same as stock Jellyfin with no
-/// providers.
+/// One image in a `GET /Items/{id}/RemoteImages` result — Jellyfin's
+/// `RemoteImageInfo`. `RatingType` is always `"Score"` (both providers give a
+/// numeric score, not a like/dislike).
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct RemoteImageResultDto {
-    images: &'static [()],
-    total_record_count: u32,
-    providers: &'static [()],
+struct RemoteImageInfoDto {
+    provider_name: String,
+    url: String,
+    #[serde(rename = "Type")]
+    image_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community_rating: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vote_count: Option<u32>,
+    rating_type: &'static str,
 }
 
-async fn remote_images(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
-    crate::api::jellyfin::wire::json(&RemoteImageResultDto {
-        images: &[],
-        total_record_count: 0,
-        providers: &[],
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoteImagesResultDto {
+    images: Vec<RemoteImageInfoDto>,
+    total_record_count: u32,
+    providers: Vec<String>,
+}
+
+/// Query for `GET /Items/{id}/RemoteImages` (bound case-insensitively via
+/// [`CiQuery`], so `Type`/`type` and `ProviderName`/`providerName` all work).
+#[derive(Debug, Default, Deserialize)]
+struct RemoteImagesQuery {
+    #[serde(rename = "type", default)]
+    image_type: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
+}
+
+/// Query for `POST /Items/{id}/RemoteImages/Download`.
+#[derive(Debug, Deserialize)]
+struct RemoteImageDownloadQuery {
+    #[serde(rename = "type")]
+    image_type: String,
+    image_url: String,
+    #[serde(default)]
+    provider_name: Option<String>,
+}
+
+/// Jellyfin display name for an internal provider token.
+fn provider_display(token: &str) -> &'static str {
+    match token {
+        "tmdb" => "TheMovieDb",
+        _ => "TheTVDB",
+    }
+}
+
+/// Jellyfin display name (or internal token) → internal provider token.
+fn provider_token(display: &str) -> Option<&'static str> {
+    match display.to_ascii_lowercase().as_str() {
+        "themoviedb" | "tmdb" => Some("tmdb"),
+        "thetvdb" | "tvdb" => Some("tvdb"),
+        _ => None,
+    }
+}
+
+/// A requested Jellyfin `Type` token → [`pharos_core::ArtworkRole`], restricted
+/// to the three roles the picker supports. `None` for any other type (→ 400 on
+/// download). `ArtworkRole` has no `from_str_ci`; `ImageRole` does, so parse via
+/// it.
+fn artwork_role_from_type(t: &str) -> Option<pharos_core::ArtworkRole> {
+    use pharos_cache::image_cache::ImageRole;
+    match ImageRole::from_str_ci(t)? {
+        ImageRole::Primary => Some(pharos_core::ArtworkRole::Primary),
+        ImageRole::Backdrop => Some(pharos_core::ArtworkRole::Backdrop),
+        ImageRole::Logo => Some(pharos_core::ArtworkRole::Logo),
+        _ => None,
+    }
+}
+
+/// The provider + id to enumerate images from, for a real item or a synth
+/// Series container. `None` when nothing is matched (→ empty list).
+struct ImageMatch {
+    provider: &'static str, // "tmdb" | "tvdb"
+    external_id: String,
+    kind: MediaKind,
+}
+
+/// Resolve the (provider, id, kind) to list images for.
+/// - Real item: whichever `metadata.provider_ids` is set (tmdb preferred).
+/// - Synth Series: the `series_metadata` row via `series_key`.
+async fn resolve_image_match(state: &AppState, id_str: &str) -> Option<ImageMatch> {
+    use pharos_core::SeriesMetadataStore;
+    // Real numeric id?
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+        if let Ok(item) = state.stores.get(id).await {
+            let ids = &item.metadata.provider_ids;
+            if let Some(tmdb) = ids.tmdb.as_deref().filter(|s| !s.is_empty()) {
+                return Some(ImageMatch {
+                    provider: "tmdb",
+                    external_id: tmdb.to_string(),
+                    kind: item.kind,
+                });
+            }
+            if let Some(tvdb) = ids.tvdb.as_deref().filter(|s| !s.is_empty()) {
+                return Some(ImageMatch {
+                    provider: "tvdb",
+                    external_id: tvdb.to_string(),
+                    kind: item.kind,
+                });
+            }
+            return None;
+        }
+    }
+    // Synth Series/Season → representative episode → series_key → metadata row.
+    let item = crate::api::jellyfin::images::resolve_synth_image_item(state, id_str).await?;
+    let key = item.series.as_ref()?.series_key().to_string();
+    let map = state
+        .stores
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await
+        .ok()?;
+    let meta = map.get(&key)?;
+    let provider = match meta.match_provider.as_deref()? {
+        "tmdb" => "tmdb",
+        "tvdb" => "tvdb",
+        _ => return None,
+    };
+    Some(ImageMatch {
+        provider,
+        external_id: meta.match_external_id.clone()?,
+        // Series-level, exactly as the enrichment path resolves a show.
+        kind: MediaKind::Episode,
     })
 }
 
-/// `GET /Items/{id}/RemoteImages/Providers` — the configured image
-/// providers (none).
-async fn remote_image_providers(_user: AuthUser, _path: web::Path<String>) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::Value::Array(vec![]))
+/// Core of `GET /Items/{id}/RemoteImages`. Empty (200) on no key / no match /
+/// provider blip. Filters to the requested `Type` when given.
+async fn remote_images_inner(
+    state: &AppState,
+    id_str: &str,
+    q: &RemoteImagesQuery,
+) -> RemoteImagesResultDto {
+    let Some(m) = resolve_image_match(state, id_str).await else {
+        return RemoteImagesResultDto {
+            images: vec![],
+            total_record_count: 0,
+            providers: vec![],
+        };
+    };
+    // Honour an explicit provider filter: if the client asked for a provider we
+    // didn't match this item to, there's nothing to offer.
+    if let Some(req) = q.provider_name.as_deref().and_then(provider_token) {
+        if req != m.provider {
+            return RemoteImagesResultDto {
+                images: vec![],
+                total_record_count: 0,
+                providers: vec![],
+            };
+        }
+    }
+    // Build the matched provider's enricher iff its key is configured.
+    let images: Vec<crate::online_enrich::RemoteImage> = match m.provider {
+        "tmdb" => match non_empty(state.tmdb_api_key.as_deref()) {
+            Some(key) => {
+                TmdbEnricher(TmdbClient::new(key.to_string()))
+                    .list_images(m.kind, &m.external_id)
+                    .await
+            }
+            None => vec![],
+        },
+        _ => match non_empty(state.tvdb_api_key.as_deref()) {
+            Some(key) => {
+                TvdbEnricher(TvdbClient::new(key.to_string()))
+                    .list_images(m.kind, &m.external_id)
+                    .await
+            }
+            None => vec![],
+        },
+    };
+    let want = q.image_type.as_deref();
+    let dtos: Vec<RemoteImageInfoDto> = images
+        .into_iter()
+        .filter(|img| match want {
+            Some(t) => img.role.as_str().eq_ignore_ascii_case(t),
+            None => true,
+        })
+        .map(|img| RemoteImageInfoDto {
+            provider_name: provider_display(m.provider).to_string(),
+            url: img.url,
+            image_type: img.role.as_str().to_string(),
+            height: img.height,
+            width: img.width,
+            language: img.language,
+            community_rating: img.community_rating,
+            vote_count: img.vote_count,
+            rating_type: "Score",
+        })
+        .collect();
+    let providers = if dtos.is_empty() {
+        vec![]
+    } else {
+        vec![provider_display(m.provider).to_string()]
+    };
+    RemoteImagesResultDto {
+        total_record_count: dtos.len() as u32,
+        images: dtos,
+        providers,
+    }
+}
+
+/// `GET /Items/{id}/RemoteImages` — the Edit-Images dialog's candidate list.
+async fn remote_images(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    q: CiQuery<RemoteImagesQuery>,
+) -> impl Responder {
+    let result = remote_images_inner(&state, &path.into_inner(), &q).await;
+    crate::api::jellyfin::wire::json(&result)
+}
+
+/// `GET /Items/{id}/RemoteImages/Providers` — the matched provider name(s).
+async fn remote_image_providers(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> impl Responder {
+    let providers = match resolve_image_match(&state, &path.into_inner()).await {
+        Some(m) => vec![provider_display(m.provider).to_string()],
+        None => Vec::<String>::new(),
+    };
+    crate::api::jellyfin::wire::json(&providers)
+}
+
+/// Plain public-CDN GET for the chosen image bytes (both TMDB and TVDB serve
+/// art from public CDNs — no auth needed for the download itself). `Err` with
+/// the reason on any transport/HTTP error.
+async fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("image host returned {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| e.to_string())
+}
+
+/// Core of `POST /Items/{id}/RemoteImages/Download`. Fetches the chosen URL,
+/// caches it as the item's art, and freezes the row to `manual` so the
+/// background enrichment pass never clobbers the curated pick.
+async fn remote_images_download_inner(
+    state: &AppState,
+    id_str: &str,
+    q: RemoteImageDownloadQuery,
+) -> Result<(), actix_web::Error> {
+    let role = artwork_role_from_type(&q.image_type)
+        .ok_or_else(|| error::ErrorBadRequest("unsupported image Type"))?;
+    let bytes = fetch_url_bytes(&q.image_url)
+        .await
+        .map_err(|e| error::ErrorBadRequest(format!("could not fetch image: {e}")))?;
+    let now = crate::metadata_backfill::now_secs();
+    let provider = q
+        .provider_name
+        .as_deref()
+        .and_then(provider_token)
+        .unwrap_or("tmdb");
+
+    // Real numeric id → item art row + freeze identity.
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+        if let Ok(item) = state.stores.get(id).await {
+            let cache = state
+                .images
+                .as_ref()
+                .ok_or_else(|| error::ErrorInternalServerError("no image cache configured"))?;
+            let art = crate::online_enrich::RemoteArt {
+                role,
+                url: q.image_url.clone(),
+            };
+            crate::online_enrich::download_and_cache_art(
+                cache,
+                &state.stores,
+                &item,
+                provider,
+                &art,
+                bytes,
+            )
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            // Freeze: keep the existing provider id if any, else the download's.
+            let ext = item
+                .metadata
+                .provider_ids
+                .tmdb
+                .clone()
+                .or_else(|| item.metadata.provider_ids.tvdb.clone())
+                .unwrap_or_default();
+            state
+                .stores
+                .set_item_match(id, provider, &ext, "manual", None, now)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            return Ok(());
+        }
+    }
+
+    // Synth Series → series_metadata locator + freeze.
+    let item = crate::api::jellyfin::images::resolve_synth_image_item(state, id_str)
+        .await
+        .ok_or_else(|| error::ErrorNotFound("not found"))?;
+    let key = item
+        .series
+        .as_ref()
+        .ok_or_else(|| error::ErrorNotFound("not found"))?
+        .series_key()
+        .to_string();
+    let cache = state
+        .images
+        .as_ref()
+        .ok_or_else(|| error::ErrorInternalServerError("no image cache configured"))?;
+    let image_role = pharos_cache::image_cache::ImageRole::from_str_ci(&q.image_type)
+        .ok_or_else(|| error::ErrorBadRequest("unsupported image Type"))?;
+    let path = cache
+        .upload_series_art(&key, image_role, &bytes)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("series art cache: {e}")))?;
+
+    use pharos_core::SeriesMetadataStore;
+    let mut meta = state
+        .stores
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        .remove(&key)
+        .unwrap_or_else(|| pharos_core::SeriesMetadata {
+            series_key: key.clone(),
+            series_name: key.clone(),
+            ..Default::default()
+        });
+    match role {
+        pharos_core::ArtworkRole::Primary => {
+            meta.poster_locator = Some(path.to_string_lossy().into_owned())
+        }
+        pharos_core::ArtworkRole::Backdrop => {
+            meta.backdrop_locator = Some(path.to_string_lossy().into_owned())
+        }
+        // Logo lives at the deterministic `series_image_path`; no locator column.
+        _ => {}
+    }
+    meta.match_source = Some("manual".to_string());
+    meta.metadata_refreshed_at = Some(now);
+    state
+        .stores
+        .upsert_series_metadata(meta)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(())
+}
+
+/// `POST /Items/{id}/RemoteImages/Download` — download the user's chosen image.
+async fn remote_images_download(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+    q: CiQuery<RemoteImageDownloadQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    remote_images_download_inner(&state, &path.into_inner(), q.into_inner()).await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 /// `GET /Items/{id}/RemoteSearch/Subtitles/{lang}` — remote subtitle
@@ -694,6 +1049,132 @@ mod tests {
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
         assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+    }
+
+    async fn seed_state_with_cache(root: &std::path::Path) -> AppState {
+        let stores = Stores::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        AppState::new(stores, "t".into()).with_image_cache(pharos_cache::ImageCache::new(root))
+    }
+
+    // ---- RemoteImages picker (T-remote-images) ----
+
+    #[actix_web::test]
+    async fn remote_images_empty_without_key_or_match() {
+        let state = seed_state().await;
+        put_movie(&state, 42, "Dune (2021)").await; // no provider id, no key
+        let r = remote_images_inner(&state, "42", &RemoteImagesQuery::default()).await;
+        assert_eq!(r.total_record_count, 0);
+        assert!(r.images.is_empty());
+        assert!(r.providers.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn resolve_match_reads_item_provider_id() {
+        let state = seed_state().await;
+        let item = pharos_core::MediaItem {
+            id: 50,
+            path: "/movies/x.mkv".into(),
+            title: "X".into(),
+            kind: MediaKind::Movie,
+            metadata: pharos_core::MediaMetadata {
+                provider_ids: pharos_core::ProviderIds {
+                    tmdb: Some("603".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.stores.put(item).await.unwrap();
+        let m = resolve_image_match(&state, "50").await.unwrap();
+        assert_eq!(m.provider, "tmdb");
+        assert_eq!(m.external_id, "603");
+    }
+
+    #[actix_web::test]
+    async fn download_bad_type_is_400() {
+        let state = seed_state().await;
+        put_movie(&state, 44, "X").await;
+        let err = remote_images_download_inner(
+            &state,
+            "44",
+            RemoteImageDownloadQuery {
+                image_type: "Nonsense".into(),
+                image_url: "https://example/x.jpg".into(),
+                provider_name: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.as_response_error().status_code(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[actix_web::test]
+    async fn download_unreachable_url_is_400() {
+        let state = seed_state().await;
+        put_movie(&state, 45, "X").await;
+        let err = remote_images_download_inner(
+            &state,
+            "45",
+            RemoteImageDownloadQuery {
+                image_type: "Primary".into(),
+                image_url: "http://127.0.0.1:1/nope.jpg".into(),
+                provider_name: Some("TheMovieDb".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.as_response_error().status_code(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[actix_web::test]
+    async fn download_writes_item_art_and_freezes_to_manual() {
+        use actix_web::App;
+        // A tiny local server standing in for the provider image CDN.
+        let img_srv = actix_test::start(|| {
+            App::new().route(
+                "/poster.jpg",
+                web::get().to(|| async { HttpResponse::Ok().body(&b"POSTERBYTES"[..]) }),
+            )
+        });
+        let url = img_srv.url("/poster.jpg");
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 60, "X").await;
+
+        remote_images_download_inner(
+            &state,
+            "60",
+            RemoteImageDownloadQuery {
+                image_type: "Primary".into(),
+                image_url: url,
+                provider_name: Some("TheMovieDb".into()),
+            },
+        )
+        .await
+        .expect("download should succeed");
+
+        // Freeze: identity pinned to manual so the background pass skips it.
+        let got = state.stores.get(60).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("manual"));
+        // A Primary artwork row now exists, sourced from tmdb, pointing at a
+        // real cached file holding the fetched bytes.
+        let rows = state.stores.artwork_for(60).await.unwrap();
+        let (_, source, locator) = rows
+            .iter()
+            .find(|(role, _, _)| role.eq_ignore_ascii_case("Primary"))
+            .expect("a Primary artwork row");
+        assert_eq!(source, "tmdb");
+        assert_eq!(std::fs::read(locator).unwrap(), b"POSTERBYTES");
     }
 
     /// No `[tmdb].api_key` configured (the default in `seed_state`) → the

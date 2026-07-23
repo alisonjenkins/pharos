@@ -511,7 +511,7 @@ async fn serve_image(
 /// in as the group's poster. Series/Season pick the lowest `(season, episode)`
 /// so the poster is stable (usually S01E01); Artist/Album pick the first track.
 /// Returns `None` for an id matching no group (→ 404).
-async fn resolve_synth_image_item(
+pub(crate) async fn resolve_synth_image_item(
     state: &AppState,
     id_str: &str,
 ) -> Option<pharos_core::MediaItem> {
