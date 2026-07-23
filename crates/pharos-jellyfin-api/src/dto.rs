@@ -622,6 +622,19 @@ pub struct SeriesFolderDto {
     pub provider_ids: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub production_year: Option<i32>,
+    /// T9-series — provider-sourced show synopsis. Omitted until the series
+    /// enricher matches the show (bare tile before then).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    /// T9-series — community rating (0–10) from the matched provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_rating: Option<f32>,
+    /// T9-series — parental rating string, e.g. "TV-14".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_rating: Option<String>,
+    /// T9-series — first-aired date as ISO-8601 (from unix-secs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premiere_date: Option<String>,
     /// B93 — child / recursive counts + parent link. Real Jellyfin advertises
     /// these on Series and Season folders. The Android TV (Google TV) app treats
     /// a Season carrying no `ChildCount` as childless and NEVER fetches its
