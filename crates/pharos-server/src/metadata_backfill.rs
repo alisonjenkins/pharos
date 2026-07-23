@@ -303,10 +303,20 @@ where
     let (external_id, source, confidence, enriched) = match resolved {
         Resolved::NoMatch => {
             // No confident hit — record `none` (leaves filename metadata) so
-            // the row isn't re-searched until the TTL re-admits it.
-            store
-                .set_item_match(item.id, matched_provider, "", "none", None, now)
-                .await?;
+            // the row isn't re-searched until the TTL re-admits it. Guard
+            // against a concurrent manual apply that landed while this
+            // item's search was in flight (FR1 TOCTOU) — a user override
+            // must never be reverted by the sweep's trailing write.
+            if is_manual(store, item.id).await {
+                tracing::debug!(
+                    media.id = item.id,
+                    "T9 metadata backfill: skipping none-write, item matched manually mid-flight"
+                );
+            } else {
+                store
+                    .set_item_match(item.id, matched_provider, "", "none", None, now)
+                    .await?;
+            }
             return Ok(false);
         }
         Resolved::Transient => return Ok(false),
@@ -400,17 +410,48 @@ where
 
     // Record the match state last — the row now carries the enrichment, so a
     // crash before this point simply re-enriches next pass (idempotent).
-    store
-        .set_item_match(
-            item.id,
-            matched_provider,
-            &external_id,
-            source,
-            confidence,
-            now,
-        )
-        .await?;
+    // Re-check for a concurrent manual apply (FR1 TOCTOU): the fetch above
+    // took real network time, and a `POST /Items/{id}/RemoteSearch/Apply`
+    // may have landed a user override during that window — never clobber it
+    // with this sweep's "search"/"nfo_id" write. (`apply_manual_match`
+    // itself sets the row to "manual" BEFORE calling `enrich_one`, so this
+    // guard also correctly no-ops the write on the manual-apply path; that
+    // caller re-asserts "manual" afterward regardless.)
+    if is_manual(store, item.id).await {
+        tracing::debug!(
+            media.id = item.id,
+            "T9 metadata backfill: skipping match-write, item matched manually mid-flight"
+        );
+    } else {
+        store
+            .set_item_match(
+                item.id,
+                matched_provider,
+                &external_id,
+                source,
+                confidence,
+                now,
+            )
+            .await?;
+    }
     Ok(true)
+}
+
+/// FR1 — true when `id`'s row is currently `match_source = "manual"`
+/// (case-insensitive). Used immediately before every terminal
+/// `set_item_match` write in [`enrich_one`] to detect a concurrent manual
+/// override (a `POST /Items/{id}/RemoteSearch/Apply` landing mid-flight)
+/// that must never be reverted by this sweep's own write. A store error
+/// reading the row is treated as "not manual" — the sweep's write proceeds
+/// rather than silently stalling on a transient read hiccup; the write
+/// itself will surface any real problem.
+async fn is_manual<S: MediaStore>(store: &S, id: pharos_core::MediaId) -> bool {
+    store
+        .get(id)
+        .await
+        .ok()
+        .and_then(|i| i.match_source)
+        .is_some_and(|s| s.eq_ignore_ascii_case("manual"))
 }
 
 /// T11 — apply a user's manual Identify choice: persist the override with
@@ -858,6 +899,43 @@ mod tests {
         // record's metadata.
         assert_eq!(got.metadata.overview.as_deref(), Some("A duke's son..."));
         assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+    }
+
+    #[tokio::test]
+    async fn enrich_one_skips_match_write_when_manual_lands_mid_flight() {
+        // FR1 — TOCTOU: `run` snapshots eligible items, then `enrich_one` does
+        // seconds of network I/O before writing match-state keyed only by id.
+        // Simulate a concurrent POST /RemoteSearch/Apply landing during that
+        // window (the row is now "manual" with its own id) and assert the
+        // sweep's trailing write does NOT revert the user's override.
+        let s = store().await;
+        put_movie(&s, 900_300, "Dune (2021)").await;
+        s.set_item_match(900_300, "tmdb", "999", "manual", None, 1)
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_detail(enriched_overview("A duke's son..."));
+
+        let item = s.get(900_300).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(900_300).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("manual"));
+        assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(got.match_external_id.as_deref(), Some("999"));
     }
 
     #[tokio::test]
