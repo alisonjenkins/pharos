@@ -281,14 +281,15 @@ struct RemoteImagesQuery {
     provider_name: Option<String>,
 }
 
-/// Query for `POST /Items/{id}/RemoteImages/Download`.
+/// Query for `POST /Items/{id}/RemoteImages/Download`. `ProviderName` is
+/// accepted on the wire (jellyfin-web sends it) but deliberately not bound —
+/// the freeze identity comes from the item's resolved match, never the
+/// client's echoed name, so a mismatched name can't write a bad provider id.
 #[derive(Debug, Deserialize)]
 struct RemoteImageDownloadQuery {
     #[serde(rename = "type")]
     image_type: String,
     image_url: String,
-    #[serde(default)]
-    provider_name: Option<String>,
 }
 
 /// Jellyfin display name for an internal provider token.
@@ -477,17 +478,50 @@ async fn remote_image_providers(
     crate::api::jellyfin::wire::json(&providers)
 }
 
-/// Plain public-CDN GET for the chosen image bytes (both TMDB and TVDB serve
-/// art from public CDNs — no auth needed for the download itself). `Err` with
-/// the reason on any transport/HTTP error.
+/// Cap on a downloaded image's size — a sanity bound, not a security control
+/// (the host allowlist below is that). TMDB/TVDB posters/fanart are a few MB.
+const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Whether `url` is an `https` URL on a TMDB/TVDB image CDN. The Download
+/// endpoint fetches a client-supplied `ImageUrl` server-side and caches the
+/// bytes where they're re-servable, so an unrestricted GET would be an SSRF
+/// primitive (fetch internal/metadata endpoints, read them back out). Restrict
+/// to the two providers' public art hosts — the only hosts `list_images` ever
+/// hands the client.
+fn is_allowed_image_host(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) => {
+            u.scheme() == "https"
+                && matches!(
+                    u.host_str(),
+                    Some(h) if h == "image.tmdb.org"
+                        || h == "thetvdb.com"
+                        || h.ends_with(".thetvdb.com")
+                )
+        }
+        Err(_) => false,
+    }
+}
+
+/// Fetch the chosen image bytes from an allowlisted provider CDN. Rejects any
+/// non-CDN / non-`https` host (SSRF guard), disables redirects (so an allowed
+/// host can't bounce to an internal one), and refuses an over-large body.
 async fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
+    if !is_allowed_image_host(url) {
+        return Err("image URL must be an https TMDB/TVDB CDN URL".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
         .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("image host returned {}", resp.status()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_IMAGE_BYTES {
+            return Err(format!("image too large ({len} bytes)"));
+        }
     }
     resp.bytes()
         .await
@@ -495,9 +529,14 @@ async fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Core of `POST /Items/{id}/RemoteImages/Download`. Fetches the chosen URL,
-/// caches it as the item's art, and freezes the row to `manual` so the
-/// background enrichment pass never clobbers the curated pick.
+/// Core of `POST /Items/{id}/RemoteImages/Download`. Resolves the item's real
+/// provider match, fetches the chosen URL, caches it as the item's art, and
+/// freezes the row to `manual` so the background enrichment pass never clobbers
+/// the curated pick. A download is only meaningful for an item pharos matched
+/// (an unmatched item lists no candidates), so an unmatched id is a 400 — this
+/// also refuses a crafted POST against a synth id with no `series_metadata`
+/// row, which would otherwise fabricate a half-populated `manual` row that
+/// permanently freezes that show's enrichment.
 async fn remote_images_download_inner(
     state: &AppState,
     id_str: &str,
@@ -505,17 +544,30 @@ async fn remote_images_download_inner(
 ) -> Result<(), actix_web::Error> {
     let role = artwork_role_from_type(&q.image_type)
         .ok_or_else(|| error::ErrorBadRequest("unsupported image Type"))?;
+    let m = resolve_image_match(state, id_str)
+        .await
+        .ok_or_else(|| error::ErrorBadRequest("item is not matched to an image provider"))?;
     let bytes = fetch_url_bytes(&q.image_url)
         .await
         .map_err(|e| error::ErrorBadRequest(format!("could not fetch image: {e}")))?;
-    let now = crate::metadata_backfill::now_secs();
-    let provider = q
-        .provider_name
-        .as_deref()
-        .and_then(provider_token)
-        .unwrap_or("tmdb");
+    apply_downloaded_art(state, id_str, role, &q.image_type, &m, bytes).await
+}
 
-    // Real numeric id → item art row + freeze identity.
+/// Persist already-fetched art bytes for `id_str` and freeze the row to
+/// `manual`, using the authoritative provider/id from `m` (never the request's
+/// echoed `ProviderName`, which a misbehaving client can mismatch). Split from
+/// the fetch so the cache-write + freeze is unit-testable without a network.
+async fn apply_downloaded_art(
+    state: &AppState,
+    id_str: &str,
+    role: pharos_core::ArtworkRole,
+    image_type: &str,
+    m: &ImageMatch,
+    bytes: Vec<u8>,
+) -> Result<(), actix_web::Error> {
+    let now = crate::metadata_backfill::now_secs();
+
+    // Real numeric id → item art row + freeze identity to the matched provider.
     if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
         if let Ok(item) = state.stores.get(id).await {
             let cache = state
@@ -524,36 +576,31 @@ async fn remote_images_download_inner(
                 .ok_or_else(|| error::ErrorInternalServerError("no image cache configured"))?;
             let art = crate::online_enrich::RemoteArt {
                 role,
-                url: q.image_url.clone(),
+                url: String::new(), // download_and_cache_art keys on role, not url
             };
             crate::online_enrich::download_and_cache_art(
                 cache,
                 &state.stores,
                 &item,
-                provider,
+                m.provider,
                 &art,
                 bytes,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-            // Freeze: keep the existing provider id if any, else the download's.
-            let ext = item
-                .metadata
-                .provider_ids
-                .tmdb
-                .clone()
-                .or_else(|| item.metadata.provider_ids.tvdb.clone())
-                .unwrap_or_default();
             state
                 .stores
-                .set_item_match(id, provider, &ext, "manual", None, now)
+                .set_item_match(id, m.provider, &m.external_id, "manual", None, now)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
             return Ok(());
         }
     }
 
-    // Synth Series → series_metadata locator + freeze.
+    // Synth Series → series_metadata locator + freeze. `m` resolved from an
+    // existing row (else `resolve_image_match` returned None → 400 above), so
+    // the row is present; the fabrication fallback only guards a resolve/remove
+    // race and carries `m`'s identity so it is never half-populated.
     let item = crate::api::jellyfin::images::resolve_synth_image_item(state, id_str)
         .await
         .ok_or_else(|| error::ErrorNotFound("not found"))?;
@@ -567,7 +614,7 @@ async fn remote_images_download_inner(
         .images
         .as_ref()
         .ok_or_else(|| error::ErrorInternalServerError("no image cache configured"))?;
-    let image_role = pharos_cache::image_cache::ImageRole::from_str_ci(&q.image_type)
+    let image_role = pharos_cache::image_cache::ImageRole::from_str_ci(image_type)
         .ok_or_else(|| error::ErrorBadRequest("unsupported image Type"))?;
     let path = cache
         .upload_series_art(&key, image_role, &bytes)
@@ -583,7 +630,13 @@ async fn remote_images_download_inner(
         .remove(&key)
         .unwrap_or_else(|| pharos_core::SeriesMetadata {
             series_key: key.clone(),
-            series_name: key.clone(),
+            series_name: item
+                .series
+                .as_ref()
+                .map(|s| s.series_name.clone())
+                .unwrap_or_else(|| key.clone()),
+            match_provider: Some(m.provider.to_string()),
+            match_external_id: Some(m.external_id.clone()),
             ..Default::default()
         });
     match role {
@@ -1103,7 +1156,6 @@ mod tests {
             RemoteImageDownloadQuery {
                 image_type: "Nonsense".into(),
                 image_url: "https://example/x.jpg".into(),
-                provider_name: None,
             },
         )
         .await
@@ -1114,8 +1166,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_host_allowlist_rejects_non_cdn_and_non_https() {
+        assert!(is_allowed_image_host(
+            "https://image.tmdb.org/t/p/original/p.jpg"
+        ));
+        assert!(is_allowed_image_host(
+            "https://artworks.thetvdb.com/banners/posters/1.jpg"
+        ));
+        assert!(is_allowed_image_host("https://thetvdb.com/x.jpg"));
+        // SSRF vectors + non-https must all be refused.
+        assert!(!is_allowed_image_host("http://image.tmdb.org/p.jpg")); // not https
+        assert!(!is_allowed_image_host(
+            "https://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!is_allowed_image_host("http://127.0.0.1:1/nope.jpg"));
+        assert!(!is_allowed_image_host(
+            "https://evil.example/image.tmdb.org"
+        ));
+        assert!(!is_allowed_image_host("not a url"));
+    }
+
     #[actix_web::test]
-    async fn download_unreachable_url_is_400() {
+    async fn download_unmatched_item_is_400() {
+        // A plain movie with no provider id → not matched → nothing to pick →
+        // download refused before any fetch.
         let state = seed_state().await;
         put_movie(&state, 45, "X").await;
         let err = remote_images_download_inner(
@@ -1123,8 +1198,7 @@ mod tests {
             "45",
             RemoteImageDownloadQuery {
                 image_type: "Primary".into(),
-                image_url: "http://127.0.0.1:1/nope.jpg".into(),
-                provider_name: Some("TheMovieDb".into()),
+                image_url: "https://image.tmdb.org/t/p/original/p.jpg".into(),
             },
         )
         .await
@@ -1137,37 +1211,45 @@ mod tests {
 
     #[actix_web::test]
     async fn download_writes_item_art_and_freezes_to_manual() {
-        use actix_web::App;
-        // A tiny local server standing in for the provider image CDN.
-        let img_srv = actix_test::start(|| {
-            App::new().route(
-                "/poster.jpg",
-                web::get().to(|| async { HttpResponse::Ok().body(&b"POSTERBYTES"[..]) }),
-            )
-        });
-        let url = img_srv.url("/poster.jpg");
-
+        // Drives the cache-write + freeze directly with literal bytes (the
+        // network fetch is covered separately by the host-allowlist test).
         let cache_dir = tempfile::tempdir().unwrap();
         let state = seed_state_with_cache(cache_dir.path()).await;
-        put_movie(&state, 60, "X").await;
+        let item = pharos_core::MediaItem {
+            id: 60,
+            path: "/movies/x.mkv".into(),
+            title: "X".into(),
+            kind: MediaKind::Movie,
+            metadata: pharos_core::MediaMetadata {
+                provider_ids: pharos_core::ProviderIds {
+                    tmdb: Some("603".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.stores.put(item).await.unwrap();
+        let m = resolve_image_match(&state, "60").await.unwrap();
 
-        remote_images_download_inner(
+        apply_downloaded_art(
             &state,
             "60",
-            RemoteImageDownloadQuery {
-                image_type: "Primary".into(),
-                image_url: url,
-                provider_name: Some("TheMovieDb".into()),
-            },
+            pharos_core::ArtworkRole::Primary,
+            "Primary",
+            &m,
+            b"POSTERBYTES".to_vec(),
         )
         .await
-        .expect("download should succeed");
+        .expect("apply should succeed");
 
-        // Freeze: identity pinned to manual so the background pass skips it.
+        // Freeze: identity pinned to manual (with the matched id, not empty).
         let got = state.stores.get(60).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("manual"));
+        assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(got.match_external_id.as_deref(), Some("603"));
         // A Primary artwork row now exists, sourced from tmdb, pointing at a
-        // real cached file holding the fetched bytes.
+        // real cached file holding the bytes.
         let rows = state.stores.artwork_for(60).await.unwrap();
         let (_, source, locator) = rows
             .iter()
