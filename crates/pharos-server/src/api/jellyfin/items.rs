@@ -2658,7 +2658,7 @@ async fn latest_items(
             .cmp(&a.created_at.unwrap_or(i64::MIN))
             .then(b.id.cmp(&a.id))
     });
-    let limit = q.limit.min(100) as usize;
+    let limit = q.limit.unwrap_or(100).min(100) as usize;
     let page: Vec<MediaItem> = typed.into_iter().take(limit).collect();
     let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
     let user_data = state
@@ -2843,8 +2843,14 @@ async fn media_folders(
 struct ListQuery {
     #[serde(default)]
     start_index: u32,
-    #[serde(default = "default_limit")]
-    limit: u32,
+    /// `?Limit=` page size. `None` = the client omitted it — which for a list
+    /// request means "no limit, return every matching row" (Jellyfin parity).
+    /// jellyfin-web sends NO Limit when its "max items per page" is set to 0
+    /// (show-all mode); defaulting an absent Limit to a fixed page silently
+    /// truncated the grid (the movies list stopped at "B"). A client that
+    /// paginates always sends an explicit Limit, which is honoured verbatim.
+    #[serde(default)]
+    limit: Option<u32>,
     /// Substring of the item title; case-insensitive.
     #[serde(default)]
     search_term: Option<String>,
@@ -2989,6 +2995,15 @@ struct ListQuery {
     exclude_item_ids: Option<String>,
 }
 
+impl ListQuery {
+    /// The page size as a `usize` for in-memory windowing (`.take(..)`), with
+    /// an absent `Limit` meaning "take everything" (`usize::MAX`) — the
+    /// show-all semantics jellyfin-web relies on when its page size is 0.
+    fn take_limit(&self) -> usize {
+        self.limit.map_or(usize::MAX, |l| l as usize)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct UserDataFilter {
     is_favorite: Option<bool>,
@@ -3080,7 +3095,7 @@ async fn list_boxsets_page(
         .collect();
     let total = all.len() as u32;
     let start = q.start_index as usize;
-    let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.limit as usize).collect();
+    let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.take_limit()).collect();
     Ok(
         serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
             items: page,
@@ -3139,7 +3154,7 @@ async fn list_playlists_page(
     }
     let total = all.len() as u32;
     let start = q.start_index as usize;
-    let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.limit as usize).collect();
+    let page: Vec<serde_json::Value> = all.into_iter().skip(start).take(q.take_limit()).collect();
     Ok(
         serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
             items: page,
@@ -3383,11 +3398,8 @@ async fn maybe_list_music(
         }
         let total = items.len() as u32;
         let start = q.start_index as usize;
-        let page: Vec<serde_json::Value> = items
-            .into_iter()
-            .skip(start)
-            .take(q.limit as usize)
-            .collect();
+        let page: Vec<serde_json::Value> =
+            items.into_iter().skip(start).take(q.take_limit()).collect();
         return Ok(Some(crate::api::jellyfin::wire::query_result(
             page,
             total,
@@ -3454,7 +3466,7 @@ async fn maybe_list_music(
     let page: Vec<serde_json::Value> = aggs
         .iter()
         .skip(start)
-        .take(q.limit as usize)
+        .take(q.take_limit())
         .map(|a| synth_album_dto(state, a))
         .collect();
     Ok(Some(crate::api::jellyfin::wire::query_result(
@@ -3584,7 +3596,7 @@ async fn run_items_list(
         let after_ud = apply_userdata_filter(state, user_id, tagged, q).await?;
         let total = after_ud.len() as u32;
         let start = q.start_index as usize;
-        let end = (start + q.limit as usize).min(after_ud.len());
+        let end = start.saturating_add(q.take_limit()).min(after_ud.len());
         let page: Vec<MediaItem> = if start >= after_ud.len() {
             Vec::new()
         } else {
@@ -4227,7 +4239,8 @@ fn build_media_query(
         mq.limit = None;
     } else {
         mq.start_index = u64::from(q.start_index);
-        mq.limit = Some(q.limit);
+        // Absent Limit → None → no SQL LIMIT (return every matching row).
+        mq.limit = q.limit;
     }
     mq
 }
@@ -5170,7 +5183,7 @@ async fn maybe_list_virtual_shows(
     }
     let total = items.len() as u32;
     let start = q.start_index as usize;
-    let end = start.saturating_add(q.limit as usize).min(items.len());
+    let end = start.saturating_add(q.take_limit()).min(items.len());
     let page: Vec<serde_json::Value> = if start >= items.len() {
         Vec::new()
     } else {
@@ -6810,6 +6823,30 @@ mod episode_sort_tests {
     fn sort_keys(q: &ListQuery, parent: &ParentResolution) -> Vec<SortKey> {
         let mq = build_media_query(UserId::new(), q, parent, false);
         mq.sort.into_iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn absent_limit_lists_every_item_not_a_default_page() {
+        // jellyfin-web with "max items per page = 0" omits `Limit` entirely
+        // (asking for the whole library). An absent Limit must map to NO SQL
+        // LIMIT — real Jellyfin returns everything — not a silent 100-row cap
+        // that stranded the Movies grid at "B". Regression for the 2026-07-23
+        // pagination report.
+        let q = list_query(serde_json::json!({ "include_item_types": "Movie" }));
+        let mq = build_media_query(UserId::new(), &q, &ParentResolution::All, false);
+        assert_eq!(
+            mq.limit, None,
+            "an omitted Limit must be unlimited, not a default page cap"
+        );
+    }
+
+    #[test]
+    fn explicit_limit_is_honoured() {
+        // A client that DOES page (page size 100) sends Limit — that must still
+        // bound the SQL query, unchanged.
+        let q = list_query(serde_json::json!({ "include_item_types": "Movie", "limit": 100 }));
+        let mq = build_media_query(UserId::new(), &q, &ParentResolution::All, false);
+        assert_eq!(mq.limit, Some(100), "an explicit Limit must be honoured");
     }
 
     // The exact token the Android TV SDK sends for a season episode list.
