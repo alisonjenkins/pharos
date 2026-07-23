@@ -14,8 +14,9 @@ use pharos_core::{
     CollectionStore, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind,
     MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup,
     PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
-    SecretString, StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore,
-    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore, StudioStore, SyncGroupStore,
+    TagStore, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy,
+    UserRecord, UserStore,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -65,6 +66,7 @@ where
         + pharos_core::LibraryStore
         + pharos_core::TranscodeSessionStore
         + pharos_core::SyncGroupStore
+        + pharos_core::SeriesMetadataStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
         + Send
@@ -602,6 +604,66 @@ where
         .await
         .unwrap()
         .is_none());
+
+    // -----------------------------------------------------------------
+    // SeriesMetadataStore (T9-series). series_needing_match aggregates
+    // media_items.series_year (INT4 on postgres) — this section exercises the
+    // exact query that a strict-typed backend rejects if the decode type is
+    // wrong, so the two engines are proven at parity, not just "it compiles".
+    // -----------------------------------------------------------------
+    let mut ep = media_item(MediaId::from(9_100_001u64), "Series Ep");
+    ep.kind = MediaKind::Episode;
+    ep.series = Some(SeriesInfo {
+        series_name: "Conformance Show".into(),
+        season_number: Some(1),
+        episode_number: Some(1),
+        series_folder: Some("/media/conformance/Conformance Show (2001)".into()),
+        series_year: Some(2001),
+    });
+    MediaStore::put(&store, ep).await.unwrap();
+
+    let need = SeriesMetadataStore::series_needing_match(&store, 10, i64::MAX)
+        .await
+        .unwrap();
+    let cand = need
+        .iter()
+        .find(|c| c.series_key == "/media/conformance/Conformance Show (2001)")
+        .expect("the episode's show is eligible for enrichment");
+    assert_eq!(cand.series_name, "Conformance Show");
+    assert_eq!(cand.series_year, Some(2001));
+
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        SeriesMetadata {
+            series_key: "/media/conformance/Conformance Show (2001)".into(),
+            series_name: "Conformance Show".into(),
+            match_source: Some("search".into()),
+            overview: Some("A show.".into()),
+            genres: vec!["Drama".into()],
+            metadata_refreshed_at: Some(1_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got = SeriesMetadataStore::series_metadata_by_keys(
+        &store,
+        &["/media/conformance/Conformance Show (2001)".to_string()],
+    )
+    .await
+    .unwrap();
+    let m = got
+        .get("/media/conformance/Conformance Show (2001)")
+        .expect("upserted show reads back");
+    assert_eq!(m.overview.as_deref(), Some("A show."));
+    assert_eq!(m.genres, vec!["Drama".to_string()]);
+    // Now enriched within the TTL → no longer eligible.
+    let need2 = SeriesMetadataStore::series_needing_match(&store, 10, 500)
+        .await
+        .unwrap();
+    assert!(!need2
+        .iter()
+        .any(|c| c.series_key == "/media/conformance/Conformance Show (2001)"));
 }
 
 #[cfg(feature = "sqlite")]

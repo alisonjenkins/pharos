@@ -3047,11 +3047,15 @@ impl SeriesMetadataStore for PostgresStore {
         // Distinct shows from their episodes' SeriesInfo, LEFT-JOINed against
         // series_metadata so never-matched / TTL-expired rows qualify and
         // `manual` overrides are excluded. Mirrors the sqlite query.
+        //
+        // media_items.series_year is INT4; cast the aggregate to bigint so the
+        // Option<i64> decode holds (sqlx-postgres is strict — INT4≠INT8 — and
+        // sqlite, being loose, accepts either).
         let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
             "SELECT s.series_key, s.series_name, s.series_year \
              FROM ( \
                SELECT COALESCE(series_folder, series_name) AS series_key, \
-                      MIN(series_name) AS series_name, MAX(series_year) AS series_year \
+                      MIN(series_name) AS series_name, MAX(series_year)::bigint AS series_year \
                FROM media_items \
                WHERE kind = 'episode' AND series_name IS NOT NULL AND series_name <> '' \
                GROUP BY COALESCE(series_folder, series_name) \
