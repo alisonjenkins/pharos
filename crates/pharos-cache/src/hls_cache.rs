@@ -365,6 +365,32 @@ impl HlsSegmentCache {
                 return Err(e);
             }
         };
+        // Never CACHE an empty/truncated transcode. A worker can exit "success"
+        // yet emit near-zero bytes (e.g. a hw encoder fed an option it rejects
+        // produces a broken bitstream). Renaming that into the keyed cache path
+        // poisons it: every later request serves the empty file in ~4 ms
+        // forever (the truncated-fMP4 → empty-init → 500 loop seen live), and it
+        // survives the underlying fix until manual eviction. Treat a sub-minimal
+        // output as a transient transcode failure — leave the cache empty so the
+        // next request re-attempts and a fixed encoder self-heals immediately.
+        const MIN_SEGMENT_BYTES: u64 = 64;
+        let produced = tokio::fs::metadata(&tmp)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if produced < MIN_SEGMENT_BYTES {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            tracing::warn!(
+                media.id = media_id,
+                seg = seg_index,
+                bytes = produced,
+                codec = codec_tag(opts.video),
+                "hls segment transcode produced empty/truncated output — not caching"
+            );
+            return Err(HlsCacheError::Transcode(format!(
+                "transcode produced empty/truncated segment ({produced} bytes)"
+            )));
+        }
         tokio::fs::rename(&tmp, &path).await?;
 
         let bytes = tokio::fs::read(&path).await?;
