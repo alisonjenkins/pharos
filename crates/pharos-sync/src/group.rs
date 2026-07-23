@@ -1912,13 +1912,27 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.resume_after_buffering();
             }
         }
-        GroupMsg::Unpause { sender: _ } => {
+        GroupMsg::Unpause { sender } => {
             // A gate is already open (queue load / seek in flight): it
             // resolves on its members' Readys — do NOT replace it. (Replacing
             // reset the anti-wedge deadline, so a user spamming Unpause used
             // to extend the group's hang indefinitely.)
             if state.waiting.is_some() {
                 return;
+            }
+            // The member that issued the Unpause is asserting "play now"; its
+            // player is idle-paused waiting for the group `Play`, NOT buffering.
+            // A stale `buffering` flag on it (e.g. a scrub-storm BufferingStart
+            // whose BufferingEnd was lost) must not gate the very command it
+            // issued: jellyfin-web emits `Ready` only on a player TRANSITION,
+            // and the sender undergoes none (it is waiting on the withheld
+            // Play), so a gate opened on it self-deadlocks until the 30s
+            // anti-wedge (the Buffy join-wedge, 2026-07-22). Clear the sender's
+            // flag so it is never in its own gate — the ACK-semantics invariant:
+            // never gate the command's own author. A sender genuinely still
+            // buffering re-reports BufferingStart and re-freezes the group (V19).
+            if let Some(rec) = state.members.get_mut(&sender) {
+                rec.buffering = false;
             }
             let position_ms = state.current_position_ms();
             // jellyfin-web only posts `Ready` on a player transition, so an
@@ -3625,6 +3639,59 @@ mod tests {
         }
         assert!(m1_play, "BufferingEnd must resolve the gate and resume");
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// Buffy join-wedge (2026-07-22): a seek-storm left the LEADER carrying a
+    /// stale `buffering` flag (a `BufferingStart` whose `BufferingEnd` was lost
+    /// while paused). When the leader then pressed play, the `Unpause` gate
+    /// computed its pending set from that stale flag and opened a gate on the
+    /// leader ITSELF. jellyfin-web emits `Ready` only on a player transition,
+    /// and the member that issued the Unpause undergoes none (it is idle-paused
+    /// waiting for the very `Play` the gate is withholding), so the gate
+    /// self-deadlocked until the 30s anti-wedge — the user had to seek to
+    /// escape. The Unpause author asserts readiness by issuing the command; it
+    /// must never be in its own gate.
+    #[tokio::test]
+    async fn unpause_does_not_gate_on_its_own_sender_with_a_stale_buffering_flag() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        // Group playing, then paused (the leader paused to wait for the joiner).
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 2_694,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        // The leader's player buffers while paused (post-seek re-buffer) but its
+        // BufferingEnd is lost — a stale `buffering=true` on the leader. Paused,
+        // so this opens no freeze; it only sets the flag.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m1,
+            position_ms: 2_694,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // The leader presses play. The gate must not wait on the leader itself.
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "Unpause must not open a gate on its own sender's stale buffering flag"
+        );
+        let mut m1_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                m1_play = true;
+            }
+        }
+        assert!(m1_play, "the leader that pressed play must receive Play");
     }
 
     /// B58 — scrubbing the timeline while playing sends a burst of Seeks. Each
