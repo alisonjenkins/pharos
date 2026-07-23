@@ -790,6 +790,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     tmdb,
                     tvdb,
                     cfg.metadata.clone(),
+                    state.is_bg_leader.clone(),
                 );
             }
             (true, None) => {

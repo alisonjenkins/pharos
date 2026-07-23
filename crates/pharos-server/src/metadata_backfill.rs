@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::bg_io::BgPermit;
 use crate::config::MetadataConfig;
 use crate::online_enrich::{
@@ -47,6 +49,26 @@ use pharos_scanner::FilenameProvider;
 /// `bg_io` gate (which throttles against playback, not the remote API). Mirrors
 /// T81's 120ms.
 const REQUEST_SPACING: Duration = Duration::from_millis(120);
+
+/// Delay between passes while enrichment is still making progress. A pass caps
+/// at `max_per_pass` items, so a large first-boot backlog needs many passes;
+/// this short gap clears it in minutes instead of one batch per pod restart,
+/// while still yielding the runtime between passes. Once a pass enriches
+/// nothing the loop switches to the long `refresh_interval_secs` idle instead.
+const DRAIN_GAP: Duration = Duration::from_secs(30);
+
+/// How long the enrichment loop waits before its next pass, given how many
+/// items the pass just enriched. Non-zero → the pool likely still holds work
+/// (or the batch was capped), so re-run after the short `drain` gap. Zero →
+/// drained; idle the long `idle` interval, which also re-admits newly-scanned
+/// media and TTL-expired rows on the next wake.
+fn next_delay(enriched: usize, drain: Duration, idle: Duration) -> Duration {
+    if enriched > 0 {
+        drain
+    } else {
+        idle
+    }
+}
 
 /// Artwork roles this pass downloads + caches. Bounds the per-item network
 /// cost to the roles clients actually render prominently (poster / backdrop /
@@ -73,10 +95,22 @@ pub(crate) fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Spawn the one-pass enrichment sweep on the tokio runtime. Fire-and-forget:
-/// a failure aborts only this sweep (logged), never the server. Mirrors
-/// [`crate::person_image_backfill::spawn`]. `now` is computed once here and
-/// threaded through so every item in the pass shares one timestamp.
+/// Spawn the recurring enrichment loop on the tokio runtime. Fire-and-forget:
+/// a failure aborts only the current pass (logged), never the loop or the
+/// server. Mirrors [`crate::person_image_backfill::spawn`]. `now` is recomputed
+/// once per pass so every item in a pass shares one timestamp.
+///
+/// The loop drives the whole library to convergence without a pod restart:
+/// each pass caps at `max_per_pass` items, so after a pass that enriched
+/// anything it re-runs after the short [`DRAIN_GAP`] (clearing a first-boot
+/// backlog in minutes); after a pass that enriched nothing it idles
+/// `cfg.refresh_interval_secs` before re-checking, which also re-admits
+/// newly-scanned media and TTL-expired rows.
+///
+/// Only the elected background-work leader (`is_bg_leader`, B2) enriches, so a
+/// rolling-deploy surge never doubles provider API spend; a non-leader replica
+/// polls leadership on the same short cadence and takes over promptly if the
+/// leader goes away.
 pub fn spawn(
     stores: Stores,
     bg_io: Arc<Semaphore>,
@@ -84,22 +118,40 @@ pub fn spawn(
     tmdb: Option<TmdbEnricher>,
     tvdb: Option<TvdbEnricher<ReqwestTransport>>,
     cfg: MetadataConfig,
+    is_bg_leader: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
-        let now = now_secs();
-        match run(
-            &stores,
-            &bg_io,
-            cache.as_ref(),
-            tmdb.as_ref(),
-            tvdb.as_ref(),
-            &cfg,
-            now,
-        )
-        .await
-        {
-            Ok(n) => tracing::info!(enriched = n, "T9 metadata backfill: complete"),
-            Err(e) => tracing::warn!(error = %e, "T9 metadata backfill: aborted"),
+        let idle = Duration::from_secs(cfg.refresh_interval_secs.max(1));
+        loop {
+            // B2 — defer to the background-work singleton. A follower re-checks
+            // on the short cadence so leadership handoff (leader eviction during
+            // a rollout) is picked up within `DRAIN_GAP`, not a full interval.
+            if !is_bg_leader.load(Ordering::Relaxed) {
+                tokio::time::sleep(DRAIN_GAP).await;
+                continue;
+            }
+            let now = now_secs();
+            let enriched = match run(
+                &stores,
+                &bg_io,
+                cache.as_ref(),
+                tmdb.as_ref(),
+                tvdb.as_ref(),
+                &cfg,
+                now,
+            )
+            .await
+            {
+                Ok(n) => {
+                    tracing::info!(enriched = n, "T9 metadata backfill: pass complete");
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "T9 metadata backfill: pass aborted");
+                    0
+                }
+            };
+            tokio::time::sleep(next_delay(enriched, DRAIN_GAP, idle)).await;
         }
     });
 }
@@ -634,6 +686,19 @@ mod tests {
     use pharos_core::{MediaItem, SearchCandidate};
     use pharos_store_sqlx::sqlite::SqliteStore;
     use tempfile::TempDir;
+
+    #[test]
+    fn next_delay_drains_fast_then_idles_when_pass_is_empty() {
+        let drain = Duration::from_secs(30);
+        let idle = Duration::from_secs(21_600);
+        // A pass that enriched anything → come back after the short drain gap;
+        // more items (or a maxed-out batch) likely remain in the pool.
+        assert_eq!(next_delay(1, drain, idle), drain);
+        assert_eq!(next_delay(4999, drain, idle), drain);
+        // A pass that enriched nothing → the pool is drained; idle the long
+        // interval before re-checking for new scans / TTL re-admissions.
+        assert_eq!(next_delay(0, drain, idle), idle);
+    }
 
     /// A network-free [`OnlineEnricher`]: returns a fixed candidate list for
     /// any search and a fixed record for any fetch. `image_bytes` is `None`
