@@ -10,9 +10,10 @@ use pharos_core::{
     EntityCounts, Fingerprint, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
     LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore, PersistedSyncGroup,
     PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore, Playlist,
-    PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString, Studio,
-    StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenRecord, TokenStore,
-    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString,
+    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio, StudioCount, StudioStore,
+    SyncGroupStore, Tag, TagCount, TagStore, TokenRecord, TokenStore, TranscodeSessionStore,
+    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -419,6 +420,39 @@ impl GenreStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.backfill_genres().await,
             AnyStore::Postgres(p) => p.backfill_genres().await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// SeriesMetadataStore
+// ---------------------------------------------------------------------
+impl SeriesMetadataStore for AnyStore {
+    async fn series_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<SeriesMatchCandidate>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_needing_match(limit, ttl_cutoff).await,
+            AnyStore::Postgres(p) => p.series_needing_match(limit, ttl_cutoff).await,
+        }
+    }
+
+    async fn upsert_series_metadata(&self, meta: SeriesMetadata) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.upsert_series_metadata(meta).await,
+            AnyStore::Postgres(p) => p.upsert_series_metadata(meta).await,
+        }
+    }
+
+    async fn series_metadata_by_keys(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashMap<String, SeriesMetadata>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_metadata_by_keys(keys).await,
+            AnyStore::Postgres(p) => p.series_metadata_by_keys(keys).await,
         }
     }
 }

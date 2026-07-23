@@ -61,6 +61,9 @@ pub mod audio_track_json;
 // JSON adapter for MediaMetadata.provider_ids (LIB-C9). Same pattern.
 pub mod provider_ids_json;
 
+/// Shared `series_metadata` row shape (T9-series), used by both store backends.
+pub(crate) mod series_meta_row;
+
 // JSON adapter for the Vec<String> metadata columns —
 // production_locations + trailers (T67). Same pattern.
 pub mod string_list_json;

@@ -1037,6 +1037,94 @@ pub struct PlaylistEntry {
     pub item_id: MediaId,
 }
 
+/// T9-series — enriched, provider-sourced metadata for a Series *container*.
+///
+/// pharos has no `media_items` row for a show (Series/Season are synthesised
+/// from their episodes' [`SeriesInfo`]), so series-level metadata can't hang
+/// off the episode match columns the way movie/episode enrichment does. This
+/// is its own table keyed by [`SeriesInfo::series_key`] — the same identity
+/// the synthesised Series wire id hashes on — so the API can look a show's
+/// overview / genres / rating / poster back up when it builds the folder tile.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeriesMetadata {
+    /// [`SeriesInfo::series_key`] — `series_folder` when present, else
+    /// `series_name`. Primary key.
+    pub series_key: String,
+    /// The show's display name at enrichment time (for logs / fallback).
+    pub series_name: String,
+    /// Which provider matched (`"tvdb"`). `None` until first matched.
+    pub match_provider: Option<String>,
+    /// The matched id on `match_provider`.
+    pub match_external_id: Option<String>,
+    /// Match state, mirroring the `media_items` discipline: `"search"` (an
+    /// online match), `"none"` (searched, nothing over the confidence floor —
+    /// don't re-search until the TTL), or `"manual"` (an operator override the
+    /// enricher must never clobber). `None` = never matched = eligible now.
+    pub match_source: Option<String>,
+    /// Confidence of the accepted match (0.0-1.0).
+    pub match_confidence: Option<f32>,
+    /// Unix seconds of the last enrichment attempt; drives the TTL re-admit.
+    pub metadata_refreshed_at: Option<i64>,
+    pub overview: Option<String>,
+    pub community_rating: Option<f32>,
+    /// First-aired date, Unix seconds.
+    pub premiere_date: Option<i64>,
+    pub official_rating: Option<String>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    pub provider_ids: ProviderIds,
+    /// [`pharos_cache`] locator for the cached poster (Primary). `None` when no
+    /// poster was fetched; the API then falls back to a representative episode
+    /// frame (see the images route).
+    pub poster_locator: Option<String>,
+    /// Locator for the cached backdrop (Backdrop), same fallback semantics.
+    pub backdrop_locator: Option<String>,
+}
+
+/// T9-series — one distinct show that needs (or is due for re-)enrichment,
+/// derived from its episodes' [`SeriesInfo`]. `series_year` is the max year
+/// seen across the show's episodes (disambiguates same-name reboots).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesMatchCandidate {
+    pub series_key: String,
+    pub series_name: String,
+    pub series_year: Option<u32>,
+}
+
+/// T9-series — series-container metadata as a first-class table, split from
+/// [`MediaStore`] like [`CollectionStore`]/[`GenreStore`] so in-memory test
+/// stores that only round-trip items don't have to implement it. The
+/// background enricher (T9) populates it from TVDB; the Jellyfin items API
+/// reads it when it synthesises a Series folder tile.
+pub trait SeriesMetadataStore: Send + Sync {
+    /// Distinct shows eligible for enrichment: those with no metadata row yet,
+    /// or whose last attempt predates `ttl_cutoff` — excluding `manual`
+    /// overrides. Mirrors [`MediaStore::items_needing_match`]'s filter, over
+    /// the synthesised-from-episodes series identity. At most `limit` rows.
+    fn series_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesMatchCandidate>>> + Send;
+
+    /// Upsert a show's metadata by `series_key` (insert or replace). Idempotent
+    /// — re-running an enrichment pass overwrites the prior provider record.
+    fn upsert_series_metadata(
+        &self,
+        meta: SeriesMetadata,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Batch-fetch metadata for the given `series_key`s, keyed by `series_key`
+    /// (missing keys are simply absent). Batched so building a Series *list*
+    /// (hundreds of tiles) is one query, not N.
+    fn series_metadata_by_keys(
+        &self,
+        keys: &[String],
+    ) -> impl std::future::Future<
+        Output = DomainResult<std::collections::HashMap<String, SeriesMetadata>>,
+    > + Send;
+}
+
 /// T70 — playlists as first-class, user-owned, ordered item containers.
 /// Split from [`MediaStore`] like [`CollectionStore`] so in-memory test
 /// stores that only round-trip items don't have to implement the join.
