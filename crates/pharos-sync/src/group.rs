@@ -215,6 +215,21 @@ pub enum GroupMsg {
     MemberPing {
         member_id: MemberId,
     },
+    /// Seed the group's queue from the CREATOR's already-active playback at
+    /// group creation, WITHOUT disturbing the creator (no broadcast, no
+    /// readiness gate). Real Jellyfin seeds a new group's play queue from the
+    /// creating session's now-playing item; jellyfin-web does NOT re-send its
+    /// queue when SyncPlay is enabled on an already-playing leader (its
+    /// `playbackstart` already fired), so the group would otherwise stay
+    /// queue-less until the leader manually re-triggers playback — and any
+    /// member who joins in that window gets `GroupJoined` but no media and is
+    /// stranded (`send_catch_up` no-ops on an empty queue). Applied only when
+    /// the queue is still empty (a real `SetNewQueue` that already landed wins).
+    SeedQueue {
+        item_id: String,
+        position_ms: u64,
+        is_paused: bool,
+    },
     Snapshot {
         reply: oneshot::Sender<GroupSnapshot>,
     },
@@ -1611,7 +1626,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         GroupMsg::AddMember { .. } | GroupMsg::RemoveMember { .. } | GroupMsg::Snapshot { .. } => {
             None
         }
-        GroupMsg::SetGroupName { .. } => None,
+        GroupMsg::SetGroupName { .. } | GroupMsg::SeedQueue { .. } => None,
     }
 }
 
@@ -2122,6 +2137,44 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             };
             let pending = state.follower_ids();
             state.enter_waiting(pending, true, start_position_ms, "Unpause", 0);
+        }
+        GroupMsg::SeedQueue {
+            item_id,
+            position_ms,
+            is_paused,
+        } => {
+            // Seed the group's queue from the creator's already-active playback
+            // WITHOUT disturbing the creator: no broadcast (the creator drives
+            // playback from its own player and must not be reloaded) and no
+            // readiness gate. This only fills server state so a LATER joiner's
+            // `send_catch_up` has a queue to hydrate them from. A real
+            // `SetNewQueue` that already landed always wins — never clobber it.
+            if !state.queue.items.is_empty() {
+                return;
+            }
+            if item_id.is_empty() {
+                return;
+            }
+            state.queue.items = vec![QueueEntry {
+                item_id,
+                playlist_item_id: Uuid::new_v4().simple().to_string(),
+            }];
+            state.queue.playing_index = 0;
+            // Bump the change-timestamp so a fresh joiner's catch-up PlayQueue
+            // looks newer than its (empty) client state and is applied.
+            state.queue.updated_unix_ms = unix_now_ms().max(state.queue.updated_unix_ms + 1);
+            state.playback = if is_paused {
+                PlaybackState::Paused { position_ms }
+            } else {
+                PlaybackState::Playing {
+                    position_ms,
+                    anchor_server_ms: state.server_ms_now(),
+                }
+            };
+            tracing::info!(
+                group = %state.id, position_ms, is_paused,
+                "syncplay: seeded group queue from creator's active playback"
+            );
         }
         GroupMsg::SetPlaylistItem {
             sender: _,
@@ -3841,6 +3894,94 @@ mod tests {
             }
             assert!(saw_play, "unpause must broadcast Play immediately");
         }
+    }
+
+    #[tokio::test]
+    async fn seed_queue_hydrates_a_late_joiner() {
+        // Regression (live incident): a leader who was ALREADY playing when the
+        // group formed never re-sends its queue (jellyfin-web's `playbackstart`
+        // fired before SyncPlay was enabled), so the group stays queue-less and
+        // a member joining mid-playback gets `GroupJoined` but no media —
+        // `send_catch_up` no-ops on an empty queue, stranding the joiner with a
+        // blank player. Seeding the queue from the creator's now-playing
+        // (`SeedQueue`) must make a subsequent join hydrate properly.
+        let (h, sinks, mut leader_rx, _leader) = fresh().await;
+        // What `/SyncPlay/New` sends right after AddMember (leader playing @ 90s).
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "ep1".into(),
+            position_ms: 90_000,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        // The seed must NOT disturb the already-playing creator: sending it a
+        // PlayQueue would reload its player mid-episode.
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::PlayQueue { .. }),
+                "seeding must not reload the already-playing creator's player"
+            );
+        }
+        // A late joiner now gets a real catch-up instead of nothing.
+        let (_m2, mut m2_rx) = add_member(&h, &sinks, "lace").await;
+        let pq = recv_matching(&mut m2_rx, Duration::from_secs(1), |m| {
+            matches!(m, ServerMsg::PlayQueue { .. })
+        })
+        .await
+        .expect("late joiner must receive a PlayQueue catch-up");
+        match pq {
+            ServerMsg::PlayQueue {
+                items,
+                is_playing,
+                start_position_ms,
+                ..
+            } => {
+                assert_eq!(items.len(), 1, "seeded single-item queue");
+                assert_eq!(items[0].item_id, "ep1");
+                assert!(is_playing, "seeded-playing group catches up as playing");
+                assert!(
+                    start_position_ms >= 90_000,
+                    "catch-up resumes at (or past) the seeded position"
+                );
+            }
+            other => panic!("expected PlayQueue, got {other:?}"),
+        }
+        // …and a Play command so the joiner actually starts.
+        let play = recv_matching(&mut m2_rx, Duration::from_secs(1), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(play.is_some(), "joiner must also get a Play to start");
+    }
+
+    #[tokio::test]
+    async fn seed_queue_ignored_when_queue_already_set() {
+        // A real SetNewQueue that already landed always wins — a seed racing the
+        // leader's own queue push must never clobber it.
+        let (h, _sinks, _leader_rx, leader) = fresh().await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["real1".into(), "real2".into()],
+            playing_index: 1,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "seed".into(),
+            position_ms: 5_000,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(
+            snap.current_item_id.as_deref(),
+            Some("real2"),
+            "seed must not clobber an already-set queue"
+        );
     }
 
     #[tokio::test]
