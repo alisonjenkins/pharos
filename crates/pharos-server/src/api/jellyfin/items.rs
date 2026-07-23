@@ -5127,6 +5127,22 @@ async fn maybe_list_virtual_shows(
     let mut reps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     match mode {
         ShowFolderKind::Series => {
+            use pharos_core::SeriesMetadataStore;
+            // T9-series — batch-fetch provider-sourced show metadata for every
+            // distinct series in ONE query (keyed by SeriesInfo::series_key —
+            // folder-or-name — NOT the wire id), so each tile carries its
+            // overview / genres / rating / provider ids without an N+1.
+            let keys: Vec<String> = episodes
+                .iter()
+                .filter_map(|e| e.series.as_ref().map(|s| s.series_key().to_string()))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let meta_map = state
+                .stores
+                .series_metadata_by_keys(&keys)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
             for ep in &episodes {
                 let Some(series) = ep.series.as_ref() else {
                     continue;
@@ -5148,8 +5164,9 @@ async fn maybe_list_virtual_shows(
                     .map(|s| s.len() as u32)
                     .unwrap_or(0);
                 let episode_count = series_eps.get(&skey).copied().unwrap_or(0);
+                let meta = meta_map.get(series.series_key());
                 reps.entry(sort_key).or_insert_with(|| {
-                    series_dto(&state.server_id, series, season_count, episode_count)
+                    series_dto(&state.server_id, series, season_count, episode_count, meta)
                 });
             }
         }
@@ -5230,11 +5247,19 @@ async fn synth_series_or_season(
                     }
                 }
             }
+            // T9-series — fold in the show's provider-sourced metadata.
+            use pharos_core::SeriesMetadataStore;
+            let meta_map = state
+                .stores
+                .series_metadata_by_keys(&[series.series_key().to_string()])
+                .await
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
             return Ok(Some(series_dto(
                 &state.server_id,
                 series,
                 seasons.len() as u32,
                 episode_count,
+                meta_map.get(series.series_key()),
             )));
         }
     }
@@ -5285,9 +5310,29 @@ fn series_dto(
     series: &pharos_core::SeriesInfo,
     season_count: u32,
     episode_count: u32,
+    meta: Option<&pharos_core::SeriesMetadata>,
 ) -> serde_json::Value {
-    use crate::api::jellyfin::dto::series_id_for_key;
+    use crate::api::jellyfin::dto::{format_iso8601, series_id_for_key};
     let id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+    // T9-series — fold in provider-sourced metadata when the enricher has
+    // matched this show; a never-matched show renders the bare tile as before.
+    let genres = meta.map(|m| m.genres.clone()).unwrap_or_default();
+    let mut provider_ids = std::collections::BTreeMap::new();
+    if let Some(m) = meta {
+        if let Some(tmdb) = &m.provider_ids.tmdb {
+            provider_ids.insert("Tmdb".to_string(), tmdb.clone());
+        }
+        if let Some(tvdb) = &m.provider_ids.tvdb {
+            provider_ids.insert("Tvdb".to_string(), tvdb.clone());
+        }
+        if let Some(imdb) = &m.provider_ids.imdb {
+            provider_ids.insert("Imdb".to_string(), imdb.clone());
+        }
+    }
+    let overview = meta.and_then(|m| m.overview.clone());
+    let community_rating = meta.and_then(|m| m.community_rating);
+    let official_rating = meta.and_then(|m| m.official_rating.clone());
+    let premiere_date = meta.and_then(|m| m.premiere_date).map(format_iso8601);
     // Advertise a Primary + Thumb tag so jellyfin-web requests the poster.
     // pharos has no stored Series row, so `/Items/{id}/Images/Primary` resolves
     // the synth id to a representative episode's frame (see images.rs). The tag
@@ -5310,7 +5355,7 @@ fn series_dto(
         series_id: None,
         index_number: None,
         user_data: UserItemDataDto::folder(&id, false, 0, false),
-        genres: Vec::new(),
+        genres,
         genre_items: Vec::new(),
         tags: Vec::new(),
         studios: Vec::new(),
@@ -5319,8 +5364,12 @@ fn series_dto(
         chapters: Some(Vec::new()),
         image_tags,
         backdrop_image_tags: vec![id.clone()],
-        provider_ids: std::collections::BTreeMap::new(),
+        provider_ids,
         production_year: series.series_year.map(|y| y as i32),
+        overview,
+        community_rating,
+        official_rating,
+        premiere_date,
         // B93 — a series' direct children are its seasons; recursive = episodes.
         // Without ChildCount the Android TV app treats the show as empty.
         child_count: Some(season_count),
@@ -5372,6 +5421,11 @@ fn season_dto(
         backdrop_image_tags: Vec::new(),
         provider_ids: std::collections::BTreeMap::new(),
         production_year: None,
+        // Series-level metadata lives on the Series tile, not per-season.
+        overview: None,
+        community_rating: None,
+        official_rating: None,
+        premiere_date: None,
         // B93 — a season's children are its episodes (ChildCount ==
         // RecursiveItemCount); ParentId links back to the series. The Android TV
         // app skips the episode fetch when a season advertises no ChildCount.
@@ -6955,5 +7009,74 @@ mod episode_sort_tests {
             &[SortKey::DiscNumber, SortKey::TrackNumber],
             "audio tracks must keep (disc, track) ordering: {keys:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod series_dto_tests {
+    use super::series_dto;
+    use pharos_core::{ProviderIds, SeriesInfo, SeriesMetadata};
+
+    fn series() -> SeriesInfo {
+        SeriesInfo {
+            series_name: "Buffy".into(),
+            season_number: Some(1),
+            episode_number: Some(1),
+            series_folder: Some("/tv/Buffy (1997)".into()),
+            series_year: Some(1997),
+        }
+    }
+
+    #[test]
+    fn series_dto_folds_in_enriched_metadata() {
+        let meta = SeriesMetadata {
+            series_key: "/tv/Buffy (1997)".into(),
+            series_name: "Buffy".into(),
+            overview: Some("One girl in all the world.".into()),
+            community_rating: Some(8.7),
+            official_rating: Some("TV-14".into()),
+            premiere_date: Some(867_715_200),
+            genres: vec!["Drama".into(), "Fantasy".into()],
+            provider_ids: ProviderIds {
+                tvdb: Some("70327".into()),
+                tmdb: Some("95".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let v = series_dto("srv", &series(), 7, 144, Some(&meta));
+        assert_eq!(v["Overview"], "One girl in all the world.");
+        assert!((v["CommunityRating"].as_f64().unwrap() - 8.7).abs() < 1e-4);
+        assert_eq!(v["OfficialRating"], "TV-14");
+        assert_eq!(v["Genres"], serde_json::json!(["Drama", "Fantasy"]));
+        assert_eq!(v["ProviderIds"]["Tvdb"], "70327");
+        assert_eq!(v["ProviderIds"]["Tmdb"], "95");
+        // premiere_date is emitted as an ISO-8601 string (1997-07-01…).
+        assert!(
+            v["PremiereDate"]
+                .as_str()
+                .unwrap()
+                .starts_with("1997-07-01"),
+            "PremiereDate = {:?}",
+            v["PremiereDate"]
+        );
+        // Still a Series folder tile with its counts intact.
+        assert_eq!(v["Type"], "Series");
+        assert_eq!(v["ChildCount"], 7);
+        assert_eq!(v["RecursiveItemCount"], 144);
+    }
+
+    #[test]
+    fn series_dto_without_metadata_is_the_bare_tile() {
+        let v = series_dto("srv", &series(), 7, 144, None);
+        // Enriched fields are omitted entirely (skip_serializing_if) so a
+        // never-matched show renders exactly as before.
+        assert!(v.get("Overview").is_none());
+        assert!(v.get("CommunityRating").is_none());
+        assert!(v.get("PremiereDate").is_none());
+        assert_eq!(v["Genres"], serde_json::json!([]));
+        assert_eq!(v["ProviderIds"], serde_json::json!({}));
+        assert_eq!(v["Type"], "Series");
     }
 }
