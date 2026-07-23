@@ -83,6 +83,21 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             web::get().to(vp9_audio_file),
         )
         .route("/videos/{id}/vp9/{seg}.m4s", web::get().to(vp9_segment))
+        // Browser h264 CMAF: a VIDEO-ONLY h264 fMP4 surface sharing the demuxed
+        // audio group above, so an audio-track switch reuses the cached video
+        // instead of cold-re-transcoding it (the SyncPlay audio-swap wedge).
+        .route(
+            "/videos/{id}/h264cmaf/main.m3u8",
+            web::get().to(h264cmaf_variant),
+        )
+        .route(
+            "/videos/{id}/h264cmaf/init.mp4",
+            web::get().to(h264cmaf_init),
+        )
+        .route(
+            "/videos/{id}/h264cmaf/{seg}.m4s",
+            web::get().to(h264cmaf_segment),
+        )
         // `DELETE /Videos/ActiveEncodings` — jellyfin-web calls
         // `apiClient.stopActiveEncodings(playSessionId)` as the FIRST step of a
         // mid-playback audio/subtitle/quality switch (its `changeStream` tears
@@ -634,6 +649,41 @@ fn push_vp9_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
     ));
 }
 
+/// A browser (hls.js) client — the only surface that gets the demuxed all-fMP4
+/// h264 master. Mirrors the `is_web_client` UA test PlaybackInfo uses when it
+/// builds `renditions` (a `Mozilla` token). Native players (Android TV, etc.)
+/// fail this and keep the muxed mpegts path, containing the compat blast radius.
+fn is_web_client(req: &HttpRequest) -> bool {
+    req.headers()
+        .get(actix_web::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ua| ua.contains("Mozilla"))
+}
+
+/// Append the browser-h264 demuxed rung: a video-only h264 fMP4 STREAM-INF bound
+/// to the shared demuxed audio group (the SAME `/vp9/audio.m3u8` continuous-Opus
+/// rendition the VP9 rung uses — it is codec-neutral). All-fMP4, so it never
+/// mixes muxed + demuxed audio in one master. Because the video is audio-free,
+/// its segment cache is shared across every audio track, so switching the audio
+/// track re-spins only the cheap audio rendition, not the video.
+fn push_h264_cmaf_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
+    let bitrate = effective_video_bitrate(None, item.source_bitrate_bps) + 128_000;
+    // Video codec (re-encoded h264) + the audio GROUP's Opus codec.
+    let codecs = codecs_string(Some("h264"), None, None, Some("opus"));
+    body.push_str(&format!(
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
+         AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
+    ));
+    let resolution = match (item.width, item.height) {
+        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
+        _ => String::new(),
+    };
+    body.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
+         /videos/{id}/h264cmaf/main.m3u8?{qs}\n"
+    ));
+}
+
 async fn master_playlist(
     state: web::Data<AppState>,
     _user: AuthUser,
@@ -660,7 +710,12 @@ async fn master_playlist(
     // the client can play; absent → h264 (backwards compat, audio-only, native).
     let video = select_master_video(req.query_string());
     let is_audio = matches!(item.kind, pharos_core::MediaKind::Audio);
-    let has_fmp4 = !is_audio && video == MasterVideo::Vp9;
+    // A BROWSER h264 client gets a demuxed all-fMP4 master (video-only h264 fMP4
+    // + the shared audio group) so an audio-track switch reuses cached video.
+    // Native / non-browser h264 keeps the muxed mpegts path unchanged.
+    let demuxed_h264 = !is_audio && video == MasterVideo::H264 && is_web_client(&req);
+    // fMP4 media segments (VP9 rung OR the demuxed-h264 rung) require HLS v7.
+    let has_fmp4 = !is_audio && (video == MasterVideo::Vp9 || demuxed_h264);
 
     let mut body = String::new();
     // fMP4 (VP9) media segments require HLS v7; an mpegts-only master stays v3.
@@ -708,9 +763,13 @@ async fn master_playlist(
             .body(body));
     }
 
-    // Exactly one codec's rungs — never both. The h264 family shares one muxed
-    // audio model across its ladder; the vp9 rung owns its demuxed audio group.
+    // Exactly one codec's rungs — never both, and never a mix of muxed + demuxed
+    // audio models in one master (hls.js binds a demuxed audio group to a muxed
+    // variant → endless buffering). The muxed h264 ladder and the vp9 rung each
+    // own one coherent audio model; the browser-h264 rung is an all-fMP4 demuxed
+    // master (video-only h264 + the shared audio group).
     match video {
+        MasterVideo::H264 if demuxed_h264 => push_h264_cmaf_rungs(&mut body, &id, &qs, &item),
         MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
         MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item),
     }
@@ -1871,6 +1930,148 @@ async fn vp9_segment(
         .body(processed.media))
 }
 
+/// `GET /videos/{id}/h264cmaf/main.m3u8` — the browser h264 CMAF rung's
+/// VIDEO-ONLY fMP4 media playlist. Mirrors [`vp9_variant`] but points at the
+/// h264 `/h264cmaf` segment surface; audio is the shared demuxed rendition
+/// (added to the master, not here). Because the video is audio-free, its
+/// segment cache is shared across every audio track — an audio switch reuses it.
+async fn h264cmaf_variant(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = path.into_inner();
+    let item = load_hls_item(&state, &id).await?;
+    let duration = item.duration_seconds;
+    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
+    let qs = playback_qs(&req);
+
+    let mut body = String::with_capacity(256 + segment_count as usize * 48);
+    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    body.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        SEGMENT_SECONDS as u32
+    ));
+    body.push_str(&format!(
+        "#EXT-X-MAP:URI=\"/videos/{id}/h264cmaf/init.mp4?{qs}\"\n"
+    ));
+    let start_ticks = parse_start_time_ticks_qs(req.query_string());
+    if start_ticks > 0 {
+        let secs = Ticks(start_ticks).seconds();
+        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    }
+    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    for seg in 0..segment_count {
+        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
+        let len = dur_secs.min((duration - start_secs).max(0.01));
+        body.push_str(&format!(
+            "#EXTINF:{len:.3},\n/videos/{id}/h264cmaf/{seg}.m4s?{qs}\n"
+        ));
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
+        .body(body))
+}
+
+/// `GET /videos/{id}/h264cmaf/init.mp4` — shared h264 fMP4 init (`ftyp`+`moov`).
+/// Mirrors [`vp9_init`] with the h264 output codec.
+async fn h264cmaf_init(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let item = fetch_item(&state, id_num).await?;
+    check_session(&state, q.play_session_id.as_deref()).await?;
+    let mut opts = fmp4_segment_opts(
+        &state,
+        &req,
+        &item,
+        0,
+        SegmentVideo::H264,
+        q.audio_stream_index,
+        q.subtitle_stream_index,
+    )
+    .await;
+    {
+        let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
+        gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    }
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
+    let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    let processed = fmp4::process_segment(&raw)
+        .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type("video/mp4")
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(processed.init))
+}
+
+/// `GET /videos/{id}/h264cmaf/{seg}.m4s` — one video-only h264 fMP4 media
+/// segment. Mirrors [`vp9_segment`] (bounds-check, backfill yield, prefetch,
+/// 3-tier cache, `tfdt`-corrected fMP4) with the h264 output codec.
+async fn h264cmaf_segment(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, seg) = path.into_inner();
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    state.note_playback_activity();
+    let item = fetch_item(&state, id_num).await?;
+    check_session(&state, q.play_session_id.as_deref()).await?;
+    if let Some(dur_ms) = item.probe.duration_ms {
+        let grid =
+            super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
+        if grid.checked(seg).is_none() {
+            return Err(error::ErrorNotFound("segment index past end of media"));
+        }
+    }
+    let mut opts = fmp4_segment_opts(
+        &state,
+        &req,
+        &item,
+        seg,
+        SegmentVideo::H264,
+        q.audio_stream_index,
+        q.subtitle_stream_index,
+    )
+    .await;
+    let wanted_burn = opts.burn_subtitle_stream_index;
+    {
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+        gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    }
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
+    if let Some(psid) = q.play_session_id.as_deref() {
+        state.note_segment_opts(psid, item.id, &opts);
+    }
+    spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
+    let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    let processed = fmp4::process_segment(&raw)
+        .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type(Container::Fmp4.content_type())
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(processed.media))
+}
+
 /// Cap on the hardware-encode prefetch depth (~36 s of content at 6 s
 /// segments). Deep enough that a rebuffer / >1× catch-up lands in cache, but
 /// bounded so one viewer's speculative warm never monopolises the GPU: at
@@ -2876,6 +3077,118 @@ mod tests {
         assert!(
             !s.contains("vp09"),
             "default master must not advertise vp9: {s}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn h264cmaf_main_playlist_is_fmp4_video_only() {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(18_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(3_000_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri(&format!("/videos/9/h264cmaf/main.m3u8?api_key={token}"))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("#EXT-X-VERSION:7"), "{s}");
+        assert!(
+            s.contains("#EXT-X-MAP:URI=\"/videos/9/h264cmaf/init.mp4"),
+            "declares its own fMP4 init: {s}"
+        );
+        assert!(s.contains("/videos/9/h264cmaf/0.m4s"), "fMP4 segments: {s}");
+        assert!(!s.contains(".ts"), "video-only fMP4, no mpegts: {s}");
+    }
+
+    #[actix_web::test]
+    async fn browser_h264_master_is_demuxed_cmaf() {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(10_000),
+            width: Some(1280),
+            height: Some(720),
+            bitrate_bps: Some(1_500_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri(&format!(
+                "/videos/9/master.m3u8?api_key={token}&renditions=h264"
+            ))
+            .insert_header((
+                actix_web::http::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) Firefox/152.0",
+            ))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.contains("#EXT-X-VERSION:7"),
+            "demuxed h264 is fMP4 → v7: {s}"
+        );
+        assert!(
+            s.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "demuxed audio group: {s}"
+        );
+        assert!(
+            s.contains("AUDIO=\"aud\""),
+            "video rung binds the group: {s}"
+        );
+        assert!(
+            s.contains("/videos/9/h264cmaf/main.m3u8"),
+            "video-only h264-cmaf rung: {s}"
+        );
+        assert!(
+            s.contains("avc1") && s.contains("opus"),
+            "CODECS lists video + group audio: {s}"
+        );
+        assert!(
+            !s.contains("/videos/9/hls1/") && !s.contains("/Videos/9/main.m3u8"),
+            "a demuxed master carries NO muxed mpegts rung: {s}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn native_h264_master_stays_muxed_mpegts() {
+        // No Mozilla UA → native path → the muxed mpegts master, byte-for-byte
+        // as before (the compat blast radius stays off native players).
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(10_000),
+            width: Some(1280),
+            height: Some(720),
+            bitrate_bps: Some(1_500_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri(&format!(
+                "/videos/9/master.m3u8?api_key={token}&renditions=h264"
+            ))
+            .insert_header((
+                actix_web::http::header::USER_AGENT,
+                "AndroidTV/1.0 ExoPlayer",
+            ))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("#EXT-X-VERSION:3"), "muxed master stays v3: {s}");
+        assert!(
+            s.contains("/Videos/9/main.m3u8"),
+            "muxed mpegts main rung: {s}"
+        );
+        assert!(
+            !s.contains("h264cmaf"),
+            "native must not get the CMAF rung: {s}"
+        );
+        assert!(
+            !s.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "native muxed master has no demuxed audio group: {s}"
         );
     }
 
