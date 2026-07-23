@@ -665,11 +665,25 @@ async fn series_metadata_art_path(
     role: ImageRole,
 ) -> Option<std::path::PathBuf> {
     use pharos_core::SeriesMetadataStore;
-    if !matches!(role, ImageRole::Primary | ImageRole::Backdrop) {
+    if !matches!(
+        role,
+        ImageRole::Primary | ImageRole::Backdrop | ImageRole::Logo
+    ) {
         return None;
     }
     let series = item.series.as_ref()?;
     let key = series.series_key().to_string();
+    // Logo has no DB locator column — it lives at the deterministic
+    // series-cache path `upload_series_art` writes. Serve it iff present.
+    if role == ImageRole::Logo {
+        let cache = state.images.as_ref()?;
+        let path =
+            pharos_cache::image_cache::series_image_path(cache.root(), ImageRole::Logo, &key);
+        return match tokio::fs::try_exists(&path).await {
+            Ok(true) => Some(path),
+            _ => None,
+        };
+    }
     let map = state
         .stores
         .series_metadata_by_keys(std::slice::from_ref(&key))
@@ -1420,6 +1434,59 @@ mod tests {
             body.as_ref(),
             PNG_1X1,
             "served bytes must be the cached poster"
+        );
+    }
+
+    #[actix_web::test]
+    async fn synth_series_logo_serves_cached_file_without_db_locator() {
+        // Series Logo has no DB locator column — it serves straight from the
+        // deterministic `series_image_path` slot `upload_series_art` writes,
+        // even with no series_metadata poster/backdrop row.
+        use crate::api::jellyfin::dto::series_id_for_key;
+        use pharos_cache::image_cache::{series_image_path, ImageRole};
+        use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+
+        let series_key = "/tv/Dragon Ball";
+        // Write a logo into the deterministic series-cache slot.
+        let logo_path = series_image_path(cache_dir.path(), ImageRole::Logo, series_key);
+        std::fs::create_dir_all(logo_path.parent().unwrap()).unwrap();
+        std::fs::write(&logo_path, PNG_1X1).unwrap();
+
+        let ep = MediaItem {
+            id: 601,
+            path: dir.path().join("Dragon Ball/S01E01.mkv"),
+            title: "Dragon Ball S01E01".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Dragon Ball".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some(series_key.into()),
+                series_year: Some(1986),
+            }),
+            ..Default::default()
+        };
+        state.stores.put(ep).await.unwrap();
+
+        let synth = series_id_for_key(Some(series_key), "Dragon Ball");
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/items/{synth}/images/logo"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "cached series logo must serve");
+        let body = test::read_body(resp).await;
+        assert_eq!(
+            body.as_ref(),
+            PNG_1X1,
+            "served bytes must be the cached logo"
         );
     }
 
