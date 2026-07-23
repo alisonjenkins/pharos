@@ -289,6 +289,25 @@ async fn remote_image_search() {
 }
 
 #[actix_web::test]
+async fn remote_image_download_route_exists() {
+    let f = seed_rich().await;
+    // Unreachable ImageUrl → the handler runs and 400s on the failed fetch,
+    // proving the route is wired (a missing route would 404 instead).
+    let status = post_status(
+        &f,
+        &format!(
+            "/Items/{}/RemoteImages/Download?Type=Primary&ImageUrl=http://127.0.0.1:1/x.jpg&ProviderName=TheMovieDb",
+            f.rich_item_id
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "download route should be wired (400 on bad fetch), not 404"
+    );
+}
+
+#[actix_web::test]
 async fn remote_subtitle_search() {
     let f = seed_rich().await;
     assert_eq!(
