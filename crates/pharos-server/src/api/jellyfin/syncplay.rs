@@ -266,11 +266,34 @@ struct IgnoreWaitBody {
     ignore_wait: bool,
 }
 
+/// Find the creator's currently-playing item so a freshly-created group can
+/// inherit it (real-Jellyfin parity: a new group is seeded from the creating
+/// session's now-playing). Matches the creator's OWN session by (user, device):
+/// jellyfin-web derives an identical `deviceId` across same-UA installs (B53),
+/// so the user id disambiguates two people (e.g. Alison + Lace) on one browser.
+/// Returns `(item_id, position_ms, is_paused)`.
+async fn creator_now_playing(
+    state: &crate::state::AppState,
+    user_id: &pharos_core::UserId,
+    device_id: &str,
+) -> Option<(String, u64, bool)> {
+    let uid = user_id.0.simple().to_string();
+    let sessions = state.sessions.snapshot().await.ok()?;
+    sessions.into_iter().find_map(|s| {
+        if s.user_id != uid || s.device_id != device_id {
+            return None;
+        }
+        let item = s.now_playing_item_id?;
+        Some((item, s.position_ticks / POSITION_TICKS_PER_MS, s.is_paused))
+    })
+}
+
 async fn new_group(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
     sinks: web::Data<MemberSinks>,
     registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Bytes,
 ) -> HttpResponse {
     let Some(dev) = auth.sync_key() else {
@@ -296,6 +319,35 @@ async fn new_group(
     // (e.g. SetGroupName) — otherwise it dies before the creator ever joins.
     add_caller_to_group(&hub, &sinks, &dev, handle.clone()).await;
     let _ = handle.tx.send(GroupMsg::SetGroupName { name }).await;
+    // Seed the group's queue from the creator's already-active playback. Stock
+    // jellyfin-web does NOT re-send its play queue when SyncPlay is enabled on
+    // an ALREADY-playing leader (its `playbackstart` already fired), so the
+    // group would otherwise stay queue-less until the leader manually
+    // re-triggers playback — and a member who joins in that window gets
+    // `GroupJoined` but no media, stranded (live-observed: a remote joiner sat
+    // ~1 min with a blank player until the leader re-set the queue). The seed
+    // is silent (no broadcast, no gate) and only applies while the queue is
+    // still empty, so a real `SetNewQueue` that lands first always wins.
+    if let Some((item_id, position_ms, is_paused)) = creator_now_playing(
+        &state,
+        &auth.user.id,
+        auth.device_id.as_deref().unwrap_or(""),
+    )
+    .await
+    {
+        tracing::info!(
+            device_id = %dev, group = %handle.group_id, %item_id, position_ms, is_paused,
+            "syncplay: seeding new group from creator's now-playing item"
+        );
+        let _ = handle
+            .tx
+            .send(GroupMsg::SeedQueue {
+                item_id,
+                position_ms,
+                is_paused,
+            })
+            .await;
+    }
     no_content()
 }
 
@@ -642,6 +694,7 @@ fn now_iso8601() -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::sessions::SessionEvent;
     use actix_web::{test, App};
     use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 
@@ -664,6 +717,61 @@ mod tests {
         let token = stores.issue(uid, "t").await.unwrap();
         let state = web::Data::new(crate::state::AppState::new(stores, "t".into()));
         (state, token.0.expose().to_string())
+    }
+
+    #[actix_web::test]
+    async fn creator_now_playing_matches_own_session_and_disambiguates_shared_device() {
+        // The seed source for `/SyncPlay/New`. jellyfin-web derives an identical
+        // deviceId across same-UA installs (B53), so two people on one browser
+        // share a device — the seed must key on (user, device), never device
+        // alone, or Alison's group would inherit Lace's now-playing.
+        let (state, _token) = seed_auth().await;
+        let alison = UserId::new();
+        let lace = UserId::new();
+        let dev = "shared-firefox-device";
+        state
+            .sessions
+            .apply(SessionEvent::Started {
+                session_id: "alison-sess".into(),
+                user_id: alison,
+                user_name: "alison".into(),
+                device_id: dev.into(),
+                device_name: "ff".into(),
+                client: "web".into(),
+                version: "1".into(),
+                item_id: "scooby".into(),
+                position_ticks: 900_000_000, // 90s (10_000 ticks/ms)
+            })
+            .await
+            .unwrap();
+        state
+            .sessions
+            .apply(SessionEvent::Started {
+                session_id: "lace-sess".into(),
+                user_id: lace,
+                user_name: "lace".into(),
+                device_id: dev.into(),
+                device_name: "ff".into(),
+                client: "web".into(),
+                version: "1".into(),
+                item_id: "other".into(),
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+
+        // Alison creating a group seeds from ALISON's item, not Lace's.
+        assert_eq!(
+            creator_now_playing(&state, &alison, dev).await,
+            Some(("scooby".to_string(), 90_000, false))
+        );
+        // A user with no active session yields nothing → no seed sent.
+        assert_eq!(creator_now_playing(&state, &UserId::new(), dev).await, None);
+        // Right user, wrong device → no match.
+        assert_eq!(
+            creator_now_playing(&state, &alison, "other-device").await,
+            None
+        );
     }
 
     #[actix_web::test]
