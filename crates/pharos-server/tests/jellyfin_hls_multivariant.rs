@@ -162,6 +162,48 @@ async fn named_variants_produce_distinct_segment_bytes() {
 
 #[actix_web::test]
 #[ignore = "requires ffmpeg + PHAROS_TEST_FIXTURES"]
+async fn h264cmaf_video_segment_is_identical_across_audio_indices() {
+    // The demuxed-h264 invariant: the CMAF video segment is audio-free, so its
+    // cache key does NOT vary by AudioStreamIndex. Two fetches differing only in
+    // the audio track must return BYTE-IDENTICAL video — that is what lets an
+    // audio-track switch reuse the cached video instead of cold-re-transcoding
+    // it. (Software encode here; the NVENC path is validated by an on-GPU smoke
+    // test, since CI has no GPU.)
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg/fixture missing");
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fx = fixture("dualaudio.mkv").unwrap();
+    let (state, token) = seed_with_fixture(fx, td.path()).await;
+    let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
+
+    let a1 = test::TestRequest::get()
+        .uri(&format!(
+            "/videos/42/h264cmaf/0.m4s?api_key={token}&AudioStreamIndex=1"
+        ))
+        .to_request();
+    let seg_a1 = test::call_and_read_body(&app, a1).await.to_vec();
+
+    let a2 = test::TestRequest::get()
+        .uri(&format!(
+            "/videos/42/h264cmaf/0.m4s?api_key={token}&AudioStreamIndex=2"
+        ))
+        .to_request();
+    let seg_a2 = test::call_and_read_body(&app, a2).await.to_vec();
+
+    assert!(
+        !seg_a1.is_empty(),
+        "h264cmaf video segment produced no bytes"
+    );
+    assert_eq!(
+        seg_a1, seg_a2,
+        "audio-free CMAF video must be identical across audio tracks"
+    );
+}
+
+#[actix_web::test]
+#[ignore = "requires ffmpeg + PHAROS_TEST_FIXTURES"]
 async fn unknown_variant_returns_404() {
     if !ffmpeg_available() {
         return;

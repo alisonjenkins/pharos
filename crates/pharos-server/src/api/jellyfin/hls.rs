@@ -83,6 +83,23 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             web::get().to(vp9_audio_file),
         )
         .route("/videos/{id}/vp9/{seg}.m4s", web::get().to(vp9_segment))
+        // Demuxed-audio h264 CMAF: VIDEO-ONLY h264 fMP4 sharing the demuxed
+        // audio group. Endpoints exist so the NVENC fMP4 encode can be
+        // smoke-tested directly; NOTHING routes browsers here yet (the master
+        // stays muxed) — the gate is enabled in a follow-up once the encode is
+        // proven on the GPU.
+        .route(
+            "/videos/{id}/h264cmaf/main.m3u8",
+            web::get().to(h264cmaf_variant),
+        )
+        .route(
+            "/videos/{id}/h264cmaf/init.mp4",
+            web::get().to(h264cmaf_init),
+        )
+        .route(
+            "/videos/{id}/h264cmaf/{seg}.m4s",
+            web::get().to(h264cmaf_segment),
+        )
         // `DELETE /Videos/ActiveEncodings` — jellyfin-web calls
         // `apiClient.stopActiveEncodings(playSessionId)` as the FIRST step of a
         // mid-playback audio/subtitle/quality switch (its `changeStream` tears
@@ -1871,6 +1888,147 @@ async fn vp9_segment(
         .body(processed.media))
 }
 
+/// `GET /videos/{id}/h264cmaf/main.m3u8` — the demuxed-audio h264 CMAF rung's
+/// VIDEO-ONLY fMP4 media playlist. Endpoints are ALWAYS available so the encode
+/// path can be smoke-tested directly against the GPU; nothing routes browsers
+/// here until the master gate is enabled in a follow-up. Audio is the shared
+/// demuxed rendition. Video is audio-free, so its cache is shared across audio
+/// tracks — an audio switch reuses it instead of cold-re-transcoding.
+async fn h264cmaf_variant(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = path.into_inner();
+    let item = load_hls_item(&state, &id).await?;
+    let duration = item.duration_seconds;
+    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
+    let qs = playback_qs(&req);
+
+    let mut body = String::with_capacity(256 + segment_count as usize * 48);
+    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    body.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        SEGMENT_SECONDS as u32
+    ));
+    body.push_str(&format!(
+        "#EXT-X-MAP:URI=\"/videos/{id}/h264cmaf/init.mp4?{qs}\"\n"
+    ));
+    let start_ticks = parse_start_time_ticks_qs(req.query_string());
+    if start_ticks > 0 {
+        let secs = Ticks(start_ticks).seconds();
+        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    }
+    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    for seg in 0..segment_count {
+        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
+        let len = dur_secs.min((duration - start_secs).max(0.01));
+        body.push_str(&format!(
+            "#EXTINF:{len:.3},\n/videos/{id}/h264cmaf/{seg}.m4s?{qs}\n"
+        ));
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
+        .body(body))
+}
+
+/// `GET /videos/{id}/h264cmaf/init.mp4` — shared h264 fMP4 init (`ftyp`+`moov`).
+async fn h264cmaf_init(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let item = fetch_item(&state, id_num).await?;
+    check_session(&state, q.play_session_id.as_deref()).await?;
+    let mut opts = fmp4_segment_opts(
+        &state,
+        &req,
+        &item,
+        0,
+        SegmentVideo::H264,
+        q.audio_stream_index,
+        q.subtitle_stream_index,
+    )
+    .await;
+    {
+        let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
+        gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    }
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
+    let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    let processed = fmp4::process_segment(&raw)
+        .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type("video/mp4")
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(processed.init))
+}
+
+/// `GET /videos/{id}/h264cmaf/{seg}.m4s` — one video-only h264 fMP4 media
+/// segment. Mirrors [`vp9_segment`] with the h264 output codec.
+async fn h264cmaf_segment(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, seg) = path.into_inner();
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    state.note_playback_activity();
+    let item = fetch_item(&state, id_num).await?;
+    check_session(&state, q.play_session_id.as_deref()).await?;
+    if let Some(dur_ms) = item.probe.duration_ms {
+        let grid =
+            super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
+        if grid.checked(seg).is_none() {
+            return Err(error::ErrorNotFound("segment index past end of media"));
+        }
+    }
+    let mut opts = fmp4_segment_opts(
+        &state,
+        &req,
+        &item,
+        seg,
+        SegmentVideo::H264,
+        q.audio_stream_index,
+        q.subtitle_stream_index,
+    )
+    .await;
+    let wanted_burn = opts.burn_subtitle_stream_index;
+    {
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+        gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+    }
+    resolve_text_burn_assets(&state, &item, &mut opts).await;
+    if let Some(psid) = q.play_session_id.as_deref() {
+        state.note_segment_opts(psid, item.id, &opts);
+    }
+    spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
+    let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    let processed = fmp4::process_segment(&raw)
+        .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type(Container::Fmp4.content_type())
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable",
+        ))
+        .body(processed.media))
+}
+
 /// Cap on the hardware-encode prefetch depth (~36 s of content at 6 s
 /// segments). Deep enough that a rebuffer / >1× catch-up lands in cache, but
 /// bounded so one viewer's speculative warm never monopolises the GPU: at
@@ -2877,6 +3035,31 @@ mod tests {
             !s.contains("vp09"),
             "default master must not advertise vp9: {s}"
         );
+    }
+
+    #[actix_web::test]
+    async fn h264cmaf_main_playlist_is_fmp4_video_only() {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(18_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(3_000_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri(&format!("/videos/9/h264cmaf/main.m3u8?api_key={token}"))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("#EXT-X-VERSION:7"), "{s}");
+        assert!(
+            s.contains("#EXT-X-MAP:URI=\"/videos/9/h264cmaf/init.mp4"),
+            "declares its own fMP4 init: {s}"
+        );
+        assert!(s.contains("/videos/9/h264cmaf/0.m4s"), "fMP4 segments: {s}");
+        assert!(!s.contains(".ts"), "video-only fMP4, no mpegts: {s}");
     }
 
     async fn master_body(renditions: Option<&str>) -> String {
