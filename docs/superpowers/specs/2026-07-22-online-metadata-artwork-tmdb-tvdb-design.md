@@ -75,19 +75,28 @@ URLs come back as absolute CDN URLs (downloaded, not 302'd).
 
 ### Responsibility split (the hybrid)
 
-- **Inline, during scan** — `TmdbProvider` + `TvdbProvider` sit in the
-  `MetadataResolver` chain **below** NFO/sidecar and **above** filename, ordered
-  TVDB-then-TMDB. Each acts **only** when the item already carries that
-  provider's exact id (`ProviderIds.tvdb`/`tmdb`/`imdb`, typically from an NFO):
-  one cheap authenticated GET → fills `None` gaps. **No search, no image
-  download inline.** Zero added scan latency when no id is present.
-- **Background, after scan** — `metadata_backfill` walks unmatched/stale items
-  and does the expensive work: title+year **search** (TVDB for TV, TMDB for
+> **As-built note (2026-07-23):** the original design placed exact-id lookups
+> *inline in the scan resolver*. Implementation showed this cannot work — a
+> `MetadataProvider` in the resolver chain receives only a path and cannot see
+> the NFO-resolved tmdb/tvdb id (providers don't observe each other's merge
+> output; the id exists only *after* the item is stored). So **both** the cheap
+> id-lookup and the expensive search run in the **same background pass**
+> (`metadata_backfill`), which keeps scans 100% network-free — strictly better
+> than the "latency when id present" the inline design implied. The hybrid split
+> below is unchanged in spirit (cheap id-path vs expensive search); only its
+> execution site moved from scan-inline to the background pass.
+
+- **Cheap id-path (background, prioritised)** — for an item that already carries
+  a provider id (`ProviderIds.tvdb`/`tmdb`/`imdb`, typically from an NFO), the
+  backfill does one authenticated GET → fills `None` gaps, no search. Recorded
+  as `match_source = "nfo_id"` so it is never re-matched.
+- **Expensive path (background)** — `metadata_backfill` walks unmatched/stale
+  items and does the heavy work: title+year **search** (TVDB for TV, TMDB for
   movies), `SxxExx` episode resolution, and **artwork download** into the image
   cache. Each remote call draws a `BG_IO` permit (same gate as scans /
   subtitle-warm / person-image backfill) so it paces against live playback,
   plus a `REQUEST_SPACING` courtesy delay under each provider's rate ceiling
-  (mirrors T81).
+  (mirrors T81). Scans themselves make **no** network calls.
 
 ### Gating
 
