@@ -96,7 +96,12 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths. The `image_type` path param is
     // therefore also lowercased by `LowercasePath` — `ImageRole::from_str_ci`
     // accepts both forms anyway.
-    cfg.route("/items/{id}/images/{image_type}", web::get().to(get_image))
+    // The bare LIST route jellyfin-web's "Edit Images" dialog calls first
+    // (`getItemImageInfos`). Must precede `/{image_type}` conceptually — actix
+    // matches the fixed segment count, so ordering is not load-bearing here, but
+    // its absence 404'd → the dialog spun forever (unguarded ajax, no .catch).
+    cfg.route("/items/{id}/images", web::get().to(get_item_images))
+        .route("/items/{id}/images/{image_type}", web::get().to(get_image))
         .route(
             "/items/{id}/images/{image_type}",
             web::head().to(head_image),
@@ -132,6 +137,52 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/items/{id}/images/chapter/{image_index}",
             web::get().to(get_chapter_image),
         );
+}
+
+/// `GET /Items/{id}/Images` — the ImageInfo LIST jellyfin-web's "Edit Images"
+/// dialog fetches first. Returns the roles the item advertises (matching its
+/// `BaseItemDto` tags) so every editor thumbnail resolves. Unauthenticated like
+/// the other GET image routes. A non-item id (person / synthesised container)
+/// or an unknown item yields `[]` — an empty grid, never a hang.
+async fn get_item_images(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id_str = path.into_inner();
+    let canonical = crate::api::jellyfin::items::canonical_wire_id(&id_str);
+    let Some(id) = pharos_jellyfin_api::dto::parse_item_id(canonical.as_ref()) else {
+        // Person portraits / synthesised Series-Season containers don't resolve
+        // as a stored item id; the editor isn't reachable for them via a video
+        // context. Empty list keeps any caller from spinning.
+        return Ok(crate::api::jellyfin::wire::json(&Vec::<
+            pharos_jellyfin_api::dto::ImageInfoDto,
+        >::new()));
+    };
+    let item = match state.stores.get(id).await {
+        Ok(item) => item,
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            return Ok(crate::api::jellyfin::wire::json(&Vec::<
+                pharos_jellyfin_api::dto::ImageInfoDto,
+            >::new()));
+        }
+        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+    };
+    // LIB-D5 local sidecar roles (Logo/Banner/Art/Disc, or a role overriding a
+    // frame-extract default). Best-effort — a store error just means the base
+    // frame-extract roles, never a 500 that would re-hang the dialog.
+    let local_roles: Vec<String> = match state.stores.artwork_for(id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|(_, source, _)| source == "local")
+            .map(|(role, _, _)| role)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = id, "artwork lookup for image list failed");
+            Vec::new()
+        }
+    };
+    let infos = pharos_jellyfin_api::dto::image_infos_for(&item, &local_roles);
+    Ok(crate::api::jellyfin::wire::json(&infos))
 }
 
 async fn get_chapter_image(

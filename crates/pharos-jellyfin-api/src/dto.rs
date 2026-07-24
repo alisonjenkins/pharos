@@ -1854,6 +1854,71 @@ pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, 
     m
 }
 
+/// One entry of `GET /Items/{id}/Images` — the ImageInfo shape jellyfin-web's
+/// "Edit Images" dialog fetches first (`getItemImageInfos`) to render the
+/// existing-images grid. The dialog's ajax has no `.catch`, so a missing route
+/// (404) leaves it spinning forever ([[reference_jellyfin_web_unguarded_endpoints]]).
+/// Only the fields jellyfin-web reads are emitted; `Width`/`Height`/`Size` are
+/// omitted (the editor renders them only when present).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageInfoDto {
+    pub image_type: String,
+    pub image_tag: String,
+    /// `Backdrop` is a list role (index into `BackdropImageTags`); single-image
+    /// roles omit the index so jellyfin-web deletes via the un-indexed route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_index: Option<u32>,
+}
+
+/// Build the ImageInfo list an item advertises, matching EXACTLY the tags the
+/// item's `BaseItemDto` carries (`image_tags_for` + LIB-D5 `local_roles`), so
+/// every editor thumbnail URL (`?tag=`) resolves to real bytes and none 404.
+/// `local_roles` are the `ArtworkRole::as_str` tokens with a recorded local
+/// sidecar (from `MediaStore::artwork_for`, filtered to `source == "local"`).
+pub fn image_infos_for(item: &pharos_core::MediaItem, local_roles: &[String]) -> Vec<ImageInfoDto> {
+    // Frame-extract / has_primary_art roles, in a stable canonical order.
+    let base = image_tags_for(item);
+    let mut roles: Vec<String> = ["Primary", "Backdrop", "Thumb"]
+        .into_iter()
+        .filter(|r| base.contains_key(*r))
+        .map(str::to_string)
+        .collect();
+    // LIB-D5 upload-only roles (Logo/Banner/Art/Disc) + any sidecar override of
+    // a base role (deduped case-insensitively so a "primary" sidecar doesn't
+    // double the Primary entry).
+    for r in local_roles {
+        if !roles.iter().any(|x| x.eq_ignore_ascii_case(r)) {
+            roles.push(canonical_image_role(r));
+        }
+    }
+    roles
+        .into_iter()
+        .map(|role| ImageInfoDto {
+            image_index: if role.eq_ignore_ascii_case("backdrop") {
+                Some(0)
+            } else {
+                None
+            },
+            image_tag: image_tag_for(item.id, &role.to_ascii_lowercase()),
+            image_type: role,
+        })
+        .collect()
+}
+
+/// Normalise an artwork-role token to the PascalCase `ImageType` jellyfin-web
+/// expects (`"logo"` → `"Logo"`). Tokens are ASCII; the first byte is upper-
+/// cased and the rest lowercased.
+fn canonical_image_role(role: &str) -> String {
+    let mut chars = role.chars();
+    match chars.next() {
+        Some(first) => {
+            first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+        }
+        None => String::new(),
+    }
+}
+
 /// Per-(item, role) stable hex tag (16 chars — Jellyfin's `?tag=` is
 /// usually a hex string and the length doesn't matter to the client).
 pub fn image_tag_for(item_id: u64, role: &str) -> String {
@@ -3246,6 +3311,69 @@ mod trickplay_helper_tests {
             dto.backdrop_image_tags[0],
             super::image_tag_for(5, "backdrop")
         );
+    }
+
+    #[test]
+    fn image_infos_lists_advertised_roles_with_matching_tags() {
+        use pharos_core::{MediaItem, MediaKind};
+        let item = MediaItem {
+            id: 5,
+            path: "/m/a.mkv".into(),
+            title: "A".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        // A video advertises Primary/Backdrop/Thumb; a local Logo sidecar adds
+        // one more. This is what jellyfin-web's Edit Images dialog renders.
+        let infos = super::image_infos_for(&item, &["Logo".into()]);
+        let by_type: std::collections::BTreeMap<_, _> =
+            infos.iter().map(|i| (i.image_type.as_str(), i)).collect();
+        assert_eq!(by_type.len(), 4, "Primary + Backdrop + Thumb + Logo");
+        // Every tag matches what the BaseItemDto advertises → no editor 404.
+        assert_eq!(
+            by_type["Primary"].image_tag,
+            super::image_tag_for(5, "primary")
+        );
+        assert_eq!(by_type["Logo"].image_tag, super::image_tag_for(5, "logo"));
+        // Backdrop is the only indexed (list) role.
+        assert_eq!(by_type["Backdrop"].image_index, Some(0));
+        assert_eq!(by_type["Primary"].image_index, None);
+        assert_eq!(by_type["Logo"].image_index, None);
+    }
+
+    #[test]
+    fn image_infos_dedupes_sidecar_override_of_a_base_role() {
+        use pharos_core::{MediaItem, MediaKind};
+        let item = MediaItem {
+            id: 9,
+            path: "/m/a.mkv".into(),
+            title: "A".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        // A "primary" local sidecar overrides the frame-extract Primary — it
+        // must NOT produce a second Primary ImageInfo.
+        let infos = super::image_infos_for(&item, &["primary".into()]);
+        let primaries = infos
+            .iter()
+            .filter(|i| i.image_type.eq_ignore_ascii_case("primary"))
+            .count();
+        assert_eq!(primaries, 1, "sidecar override is deduped, not doubled");
+    }
+
+    #[test]
+    fn image_infos_coverless_audio_is_empty() {
+        use pharos_core::{MediaItem, MediaKind};
+        // Coverless audio advertises no servable image → the editor shows an
+        // empty grid (add-from-provider), never a spinner.
+        let audio = MediaItem {
+            id: 4,
+            path: "/m/a.webm".into(),
+            title: "A".into(),
+            kind: MediaKind::Audio,
+            ..Default::default()
+        };
+        assert!(super::image_infos_for(&audio, &[]).is_empty());
     }
 
     #[test]
