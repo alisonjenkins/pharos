@@ -442,11 +442,29 @@ async fn handle_connection<S>(
     }
     // HTTP path: membership lives in the hub and must SURVIVE this disconnect so
     // a reconnect (jellyfin-web reconnects its socket constantly) re-attaches
-    // instead of orphaning the member. Schedule a generation-guarded teardown:
-    // if a newer socket connects within the grace window it bumps the
-    // generation and this no-ops; otherwise the member is removed. The sink is
-    // only dropped when the teardown actually fires — a reconnect re-inserted a
-    // fresh sink under the same member id, which must not be wiped.
+    // instead of orphaning the member. But the member's socket is GONE now, so
+    // it can no longer ack a readiness gate — tell the group immediately so the
+    // gate resolves for the still-connected members instead of freezing for the
+    // 20s grace (and then the 30s anti-wedge). The member stays in the roster; a
+    // reconnect within the grace re-marks it connected, otherwise the grace
+    // teardown below removes it. Gen-fenced: a newer socket that already
+    // reconnected (bumped conn_gen) supersedes this drop, so skip it then. This
+    // is the fix for the live "one friend's flaky connection freezes the whole
+    // group" wedge (Loki: `readiness gate timed out` while a member's socket
+    // flapped and its HTTP Ready/Pause/Seek were dropped for minutes).
+    if hub.conn_gen(&device_key) == Some(conn_gen) {
+        if let Some(group) = hub.resolve(&device_key).and_then(|s| s.group) {
+            let _ = group
+                .tx
+                .send(GroupMsg::MemberSocketLost { member_id })
+                .await;
+        }
+    }
+    // Schedule a generation-guarded teardown: if a newer socket connects within
+    // the grace window it bumps the generation and this no-ops; otherwise the
+    // member is removed. The sink is only dropped when the teardown actually
+    // fires — a reconnect re-inserted a fresh sink under the same member id,
+    // which must not be wiped.
     const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
     let hub2 = hub.clone();
     let dev2 = device_key.clone();
