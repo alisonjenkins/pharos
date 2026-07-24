@@ -115,6 +115,39 @@ test.describe("syncplay group-watch matrix (chromium/VP9)", () => {
     await c.close();
   });
 
+  test("a member losing its connection does not freeze the rest of the group", async ({
+    browser,
+  }) => {
+    // Regression guard for the socket-drop wedge (fix: gates only wait on
+    // members with a live socket). Before it, a member whose /socket dropped
+    // stayed in the readiness gate's pending set for the 20s reconnect grace,
+    // so a command that opened a gate froze everyone until the 30s anti-wedge.
+    test.setTimeout(150_000);
+    const [a, b, c] = await Promise.all(
+      [0, 1, 2].map((i) => VirtualPerson.spawn(browser, i)),
+    );
+    const g = await a.createGroup("m-socketdrop");
+    await b.joinGroup(g);
+    await c.joinGroup(g);
+    await a.setNewQueue(["1"]);
+    await a.unpause();
+    await waitUntilInSync([a, b, c]);
+
+    // b's connection dies — the server sees its /socket drop (→ MemberSocketLost).
+    await b.goOffline();
+    // a opens a gate (seek). The still-connected a + c must converge AND keep
+    // playing, NOT freeze for 30s waiting on the disconnected b — this is the
+    // regression guard for the socket-drop wedge. (A member reconnecting and
+    // resyncing is covered by the reconnect_restores_a_member_to_the_gate unit
+    // test; asserting it here is fragile against the 5s fixture ending.)
+    await a.seek(1000);
+    await assertSeekConverged([a, c], 1000);
+    await waitUntilInSync([a, c]);
+    await a.close();
+    await b.close();
+    await c.close();
+  });
+
   test("audio + subtitle swap on one member does not desync the group", async ({
     browser,
   }) => {
