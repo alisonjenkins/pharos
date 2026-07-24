@@ -46,6 +46,10 @@ export class VirtualPerson implements Probeable {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).WebSocket = function (this: any, url: string, protocols?: any) {
         const ws = new Native(url, protocols);
+        // Track the live SyncPlay `/socket` so a test can force-drop it.
+        if (/\/socket(\?|$)/i.test(String(url))) {
+          (window as any).__pharos_ws = ws;
+        }
         ws.addEventListener("message", (ev: MessageEvent) => {
           try {
             (window as any).__pharos_msgs.push(JSON.parse(ev.data));
@@ -277,6 +281,28 @@ export class VirtualPerson implements Probeable {
       `\n--- ${this.label}: console (last 40) ---\n` +
       this.consoleLines.slice(-40).join("\n")
     );
+  }
+
+  /** Drop this member's `/socket` the way a real connection loss does: block
+   *  the WS from reconnecting, then close the live one so the server runs its
+   *  disconnect handler (→ MemberSocketLost). HTTP is left working — jellyfin-web
+   *  keeps POSTing commands over HTTP with no socket, exactly the observed
+   *  prod failure. `setOffline` alone does NOT do this: it blocks HTTP but
+   *  leaves the WebSocket up, so the server never sees the disconnect. */
+  async goOffline(): Promise<void> {
+    await this.page.route("**/socket**", (route) => route.abort());
+    await this.page.evaluate(() => {
+      const ws = (window as any).__pharos_ws as WebSocket | undefined;
+      if (ws && ws.readyState <= 1) ws.close();
+    });
+  }
+
+  /** Allow the socket to reconnect so jellyfin-web re-opens it and the server
+   *  resyncs this member. Nudge an `online` event so its connection manager
+   *  reconnects promptly instead of waiting out its retry backoff. */
+  async goOnline(): Promise<void> {
+    await this.page.unroute("**/socket**");
+    await this.page.evaluate(() => window.dispatchEvent(new Event("online")));
   }
 
   async close(): Promise<void> {
