@@ -1,0 +1,39 @@
+name: syncplay-e2e
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/pharos-sync/**"
+      - "crates/pharos-server/src/api/jellyfin/syncplay.rs"
+      - "crates/pharos-server/src/api/jellyfin/hls.rs"
+      - "crates/pharos-server/src/sessions.rs"
+      - "crates/pharos-transcode/**"
+      - "crates/pharos-cache/src/hls_cache.rs"
+      - "crates/pharos-server/src/main.rs"
+      - "compat-playwright/tests/syncplay-*.spec.ts"
+      - "compat-playwright/tests/lib/**"
+      - "compat-playwright/playwright.syncplay.config.ts"
+      - ".github/workflows/syncplay-e2e.yml"
+      - "justfile"
+
+concurrency:
+  group: syncplay-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syncplay:
+    name: syncplay group-watch E2E
+    runs-on: pharos-nix-builder-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: alisonjenkins/setup-host-nix@v1
+      - name: npm install
+        run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
+      - name: Run SyncPlay group-watch harness
+        run: nix develop --command just compat-syncplay
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncplay-report-${{ github.sha }}
+          path: compat-playwright/playwright-report
