@@ -134,6 +134,11 @@ async fn stop_active_encodings(
             .then(|| v.to_string())
     });
     if let Some(psid) = psid {
+        // Cancel this session's outstanding segment prefetch — jellyfin-web
+        // sends this DELETE as the first step of a track/quality switch AND when
+        // stopping the current item to play the next (episode swap), so the
+        // abandoned segments stop transcoding instead of stealing encoder slots.
+        state.prefetch_tasks.cancel(&psid);
         if let Err(e) = state.transcode_sessions.remove(&psid).await {
             tracing::warn!(error = %e, psid, "stop_active_encodings: session remove failed");
         }
@@ -1124,7 +1129,14 @@ async fn serve_segment(
         // Warm the next few segments so a fast / >1x client doesn't stall on
         // on-demand transcode (spawned before this segment's own read so they
         // pipeline across the CPU pool).
-        spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
+        spawn_segment_prefetch(
+            &state,
+            &item,
+            seg,
+            &opts,
+            wanted_burn,
+            q.play_session_id.as_deref(),
+        );
         let bytes = cache
             .segment_bytes_keyed(
                 id_num,
@@ -1897,7 +1909,14 @@ async fn vp9_segment(
     // Warm the next few segments in the background so a fast / >1x client finds
     // them cached instead of stalling. Spawned BEFORE this segment's own
     // transcode so N and N+1.. queue together across the CPU pool.
-    spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
+    spawn_segment_prefetch(
+        &state,
+        &item,
+        seg,
+        &opts,
+        wanted_burn,
+        q.play_session_id.as_deref(),
+    );
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
     // A/V-sync diagnostic (T-avsync): log each track's tfdt + content duration
     // so real playback reveals a per-segment gap/overlap or an audio-vs-video
@@ -2059,7 +2078,14 @@ async fn h264cmaf_segment(
     if let Some(psid) = q.play_session_id.as_deref() {
         state.note_segment_opts(psid, item.id, &opts);
     }
-    spawn_segment_prefetch(&state, &item, seg, &opts, wanted_burn);
+    spawn_segment_prefetch(
+        &state,
+        &item,
+        seg,
+        &opts,
+        wanted_burn,
+        q.play_session_id.as_deref(),
+    );
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
@@ -2357,7 +2383,7 @@ fn spawn_one_prefetch(
     seg: u32,
     opts: &SegmentOpts,
     wanted_burn: Option<u32>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     let item = item.clone();
     let mut o = opts.clone();
@@ -2376,7 +2402,9 @@ fn spawn_one_prefetch(
     o.burn_subtitle_stream_index = wanted_burn;
     // actix arbiter spawn: the future awaits I/O + the scheduler channel
     // (the encode runs in the transcode worker pool, not here), so it
-    // yields the worker immediately and never blocks request handling.
+    // yields the worker immediately and never blocks request handling. The
+    // handle is returned so the caller can register it for session-scoped
+    // cancellation (episode swap / stop) — see PrefetchRegistry.
     actix_web::rt::spawn(async move {
         // Gate for THIS segment's window (sparse tracks flip burn on/off
         // between segments; the cache key follows the burn index).
@@ -2397,7 +2425,7 @@ fn spawn_one_prefetch(
         {
             tracing::debug!(media.id = item.id, seg, error = %e, "segment prefetch failed");
         }
-    });
+    })
 }
 
 fn spawn_segment_prefetch(
@@ -2406,6 +2434,7 @@ fn spawn_segment_prefetch(
     base_seg: u32,
     opts: &SegmentOpts,
     wanted_burn: Option<u32>,
+    psid: Option<&str>,
 ) {
     if state.hls.is_none() {
         return;
@@ -2432,55 +2461,68 @@ fn spawn_segment_prefetch(
     // Near shallow prefetch: the next few segments, all of them (fast).
     let near = prefetch_target_segments(base_seg, total_segs, ahead);
     let near_end = base_seg + ahead;
-    for seg in &near {
-        spawn_one_prefetch(state, item, *seg, opts, wanted_burn);
-    }
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = near
+        .iter()
+        .map(|seg| spawn_one_prefetch(state, item, *seg, opts, wanted_burn))
+        .collect();
 
     // B51 — window-aware deep prefetch: when a subtitle is selected, look
     // past the near window for the upcoming SLOW burn segments and front-
     // load them, so a dialogue burst is already cached when the playhead
     // reaches it. Only the burn segments (sparse) are deep-prefetched; the
     // fast non-burn ones encode on demand.
-    let Some(burn_idx) = wanted_burn else {
-        return;
-    };
-    let Some(subs) = state.subtitles.clone() else {
-        return;
-    };
-    let state = state.clone();
-    let item = item.clone();
-    let opts = opts.clone();
-    actix_web::rt::spawn(async move {
-        let mtime = pharos_cache::subtitle_cache::mtime_secs(&item.path).await;
-        let windows = match subs
-            .image_sub_event_windows(&item.path, mtime, burn_idx)
-            .await
-        {
-            pharos_cache::subtitle_cache::EventWindows::Known(w) => w,
-            // Not scanned yet → nothing to front-load; the near prefetch
-            // still covers the immediate segments.
-            pharos_cache::subtitle_cache::EventWindows::Unknown => return,
-        };
-        let targets = burn_prefetch_targets(
-            near_end + 1,
-            base_seg + PREFETCH_BURN_HORIZON_SEGS,
-            total_segs,
-            &windows,
-            item.probe.frame_rate_mille,
-            PREFETCH_BURN_MAX,
-        );
-        for seg in &targets {
-            spawn_one_prefetch(&state, &item, *seg, &opts, wanted_burn);
-        }
-        if !targets.is_empty() {
-            tracing::debug!(
-                media.id = item.id,
-                base_seg,
-                burn_segments_prefetched = targets.len(),
-                "front-loaded upcoming subtitle-burn segments"
+    if let (Some(burn_idx), Some(subs)) = (wanted_burn, state.subtitles.clone()) {
+        let state_c = state.clone();
+        let item_c = item.clone();
+        let opts_c = opts.clone();
+        let psid_owned = psid.map(str::to_string);
+        let media_id = item.id;
+        let deep = actix_web::rt::spawn(async move {
+            let mtime = pharos_cache::subtitle_cache::mtime_secs(&item_c.path).await;
+            let windows = match subs
+                .image_sub_event_windows(&item_c.path, mtime, burn_idx)
+                .await
+            {
+                pharos_cache::subtitle_cache::EventWindows::Known(w) => w,
+                // Not scanned yet → nothing to front-load; the near prefetch
+                // still covers the immediate segments.
+                pharos_cache::subtitle_cache::EventWindows::Unknown => return,
+            };
+            let targets = burn_prefetch_targets(
+                near_end + 1,
+                base_seg + PREFETCH_BURN_HORIZON_SEGS,
+                total_segs,
+                &windows,
+                item_c.probe.frame_rate_mille,
+                PREFETCH_BURN_MAX,
             );
-        }
-    });
+            let inner: Vec<tokio::task::JoinHandle<()>> = targets
+                .iter()
+                .map(|seg| spawn_one_prefetch(&state_c, &item_c, *seg, &opts_c, wanted_burn))
+                .collect();
+            // Append only if the session is STILL on this media — the scan above
+            // is async, so it may have swapped episodes meanwhile; then these
+            // late tasks are aborted instead of resurrecting abandoned work.
+            state_c
+                .prefetch_tasks
+                .append_if_current(psid_owned.as_deref(), media_id, inner);
+            if !targets.is_empty() {
+                tracing::debug!(
+                    media.id = item_c.id,
+                    base_seg,
+                    burn_segments_prefetched = targets.len(),
+                    "front-loaded upcoming subtitle-burn segments"
+                );
+            }
+        });
+        handles.push(deep);
+    }
+
+    // Track every prefetch task under the play session, so an episode swap
+    // (register with a new media aborts the prior one) or a session stop
+    // (`stop_active_encodings` → cancel) tears this episode's prefetch down
+    // instead of letting it transcode to completion and steal encoder slots.
+    state.prefetch_tasks.register(psid, item.id, handles);
 }
 
 /// B51 — the segments in `[from_seg, to_seg]` that OVERLAP a subtitle event

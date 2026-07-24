@@ -208,6 +208,11 @@ pub struct AppState {
     /// session); cleared wholesale past a sanity cap.
     pub segment_opts_hints:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, SegmentOpts)>>>,
+    /// Cancellable registry of in-flight HLS segment-prefetch tasks, keyed by
+    /// `PlaySessionId`, so an episode swap / track switch / session stop cancels
+    /// the abandoned episode's prefetch instead of letting it transcode to
+    /// completion and steal encoder slots from the new one.
+    pub prefetch_tasks: crate::prefetch_registry::PrefetchRegistry,
     /// P36 — clamped played-flag threshold (50–100) used by
     /// `Sessions/Playing/Stopped` to decide when an item flips to
     /// `played=true`. Surfaced here so handlers stay zero-allocation
@@ -536,6 +541,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION"),
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             played_threshold_pct: 90,
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
@@ -619,6 +625,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION"),
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             played_threshold_pct: 90,
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,

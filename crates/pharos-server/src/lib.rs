@@ -12,6 +12,7 @@ pub mod obs;
 pub mod online_enrich;
 pub mod parental;
 pub mod person_image_backfill;
+pub mod prefetch_registry;
 pub mod quick_connect;
 pub mod router;
 #[cfg(unix)]
