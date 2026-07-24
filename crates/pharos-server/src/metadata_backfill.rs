@@ -233,9 +233,18 @@ enum Resolved {
     /// Search returned no candidate over the confidence floor — mark `none`
     /// so the row isn't re-searched every pass (TTL still re-admits it later).
     NoMatch,
-    /// A transient miss (fetch returned nothing for a resolved id). Leave the
-    /// row untouched so the next pass retries.
-    Transient,
+    /// The id resolved (via search or a pre-set provider id) but the detail
+    /// fetch came back empty — a transient provider miss. Carries the resolved
+    /// id so [`enrich_one`] can stamp the row (`match_source` + `external_id` +
+    /// `metadata_refreshed_at = now`) and drop it out of the eligible front,
+    /// rather than leaving it untouched to be re-pulled every pass (which would
+    /// block lower-id items queued behind it). A `search`-class row is
+    /// re-admitted for a retry once the TTL cutoff passes.
+    Transient {
+        external_id: String,
+        source: &'static str,
+        confidence: Option<f32>,
+    },
 }
 
 /// Enrich a single item end-to-end. Returns `Ok(true)` when a record was
@@ -384,7 +393,36 @@ where
             }
             return Ok(false);
         }
-        Resolved::Transient => return Ok(false),
+        Resolved::Transient {
+            external_id,
+            source,
+            confidence,
+        } => {
+            // The id resolved but the detail fetch returned nothing. Stamp the
+            // resolved id + refresh time so this row leaves the eligible front
+            // instead of being re-pulled (and re-blocking items behind it)
+            // every pass; the TTL re-admits it for a retry later. Guard the
+            // same manual-override TOCTOU as the other terminal writes — never
+            // revert a user's Identify that landed mid-flight.
+            if is_manual(store, item.id).await {
+                tracing::debug!(
+                    media.id = item.id,
+                    "T9 metadata backfill: skipping transient stamp, item matched manually mid-flight"
+                );
+            } else {
+                store
+                    .set_item_match(
+                        item.id,
+                        matched_provider,
+                        &external_id,
+                        source,
+                        confidence,
+                        now,
+                    )
+                    .await?;
+            }
+            return Ok(false);
+        }
         Resolved::Hit {
             external_id,
             source,
@@ -670,7 +708,11 @@ async fn resolve<E: OnlineEnricher>(
             confidence,
             enriched: Box::new(e),
         },
-        None => Resolved::Transient,
+        None => Resolved::Transient {
+            external_id,
+            source,
+            confidence,
+        },
     }
 }
 
@@ -779,8 +821,10 @@ where
                 .await?;
             return Ok(false);
         }
-        // Transient fetch miss — leave the row untouched so the next pass retries.
-        Resolved::Transient => return Ok(false),
+        // Transient fetch miss — leave the show's row untouched so the next
+        // pass retries. (A synth series has no persisted id to stamp the way an
+        // item does; the whole-series retry is cheap and infrequent.)
+        Resolved::Transient { .. } => return Ok(false),
         Resolved::Hit {
             external_id,
             confidence,
@@ -1148,6 +1192,45 @@ mod tests {
         assert_eq!(
             s.get(900_102).await.unwrap().match_source.as_deref(),
             Some("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_transient_fetch_miss_is_stamped_out_of_the_front() {
+        // A confident search match whose detail fetch returns nothing must not
+        // be re-pulled every pass (it would block lower-id items queued behind
+        // it). It's stamped with the resolved id + refresh time so it drops out
+        // of the eligible set until the TTL re-admits it for a retry.
+        let s = store().await;
+        put_movie(&s, 900_104, "Dune (2021)").await;
+        let (_td, cache) = cache();
+        // Search returns a clean match, but the fake has no detail → fetch
+        // returns None → Resolved::Transient.
+        let tmdb = FakeEnricher::tmdb().with_search(vec![("438631", "Dune", Some(2021))]);
+
+        let n = run(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "a transient miss is not a hit");
+
+        let got = s.get(900_104).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("search"));
+        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.metadata_refreshed_at, Some(NOW));
+        // With metadata_refreshed_at = now, a cutoff in the past excludes it —
+        // it is no longer re-pulled at the front of the next pass.
+        let eligible = s.items_needing_match(10, NOW - 1).await.unwrap();
+        assert!(
+            !eligible.iter().any(|i| i.id == 900_104),
+            "a stamped transient row must drop out of the eligible set"
         );
     }
 
