@@ -90,6 +90,16 @@ pub enum GroupMsg {
     RemoveMember {
         member_id: MemberId,
     },
+    /// The member's `/socket` dropped but it is KEPT in the roster for the
+    /// reconnect grace (jellyfin-web reconnects its socket constantly). Mark it
+    /// disconnected so no readiness gate / buffering freeze waits on it — a
+    /// socket with no live delivery can never ack, so leaving it in a gate
+    /// freezes the whole group until the 30s anti-wedge. Local to this replica
+    /// (never forwarded): socket liveness is per-replica. Reconnect (AddMember /
+    /// ResyncMember) marks it connected again.
+    MemberSocketLost {
+        member_id: MemberId,
+    },
     LeaderPlay {
         sender: MemberId,
         position_ms: u64,
@@ -488,6 +498,15 @@ struct MemberRec {
     /// waits. Excluded from every readiness-gate pending set until it posts
     /// `IgnoreWait: false` (or a `Ready`, which implies it re-followed).
     ignore_wait: bool,
+    /// Whether this member currently has a live `/socket` on this replica. A
+    /// readiness gate / buffering freeze only ever waits on CONNECTED members
+    /// (see `follower_ids`): a member whose socket dropped can never ack, so
+    /// counting it freezes the whole group until the 30s anti-wedge. Flipped
+    /// `false` by `MemberSocketLost` (kept in the roster for the reconnect
+    /// grace), back `true` on reconnect (AddMember / ResyncMember). Not
+    /// persisted — socket liveness is per-replica; a hydrated member is assumed
+    /// connected until a socket-loss event or the ghost prune says otherwise.
+    connected: bool,
     /// The member's last sign of life (any attributed message — KeepAlive-
     /// driven `MemberPing`, clock reports, Ready, commands). `tokio::time::
     /// Instant` (monotonic, test-clock-aware), NOT wall clock. NOT persisted:
@@ -797,7 +816,11 @@ impl GroupState {
     fn follower_ids(&self) -> HashSet<MemberId> {
         self.members
             .iter()
-            .filter(|(_, m)| !m.ignore_wait)
+            // A gate only waits on members that opted in AND have a live socket:
+            // a disconnected member can never ack, so including it freezes the
+            // group until the 30s anti-wedge (it stays in the roster for the
+            // reconnect grace and rejoins gates once its socket is back).
+            .filter(|(_, m)| !m.ignore_wait && m.connected)
             .map(|(id, _)| *id)
             .collect()
     }
@@ -1165,6 +1188,7 @@ impl GroupState {
                         offset: ClockOffset::default(),
                         buffering: false,
                         ignore_wait: m.ignore_wait,
+                        connected: true,
                         last_seen: now,
                     },
                 )
@@ -1565,13 +1589,19 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
         }
     }
     state.broadcast(ServerMsg::MemberLeft { member_id, name });
-    // A departing member must not wedge the readiness gate: drop it from the
-    // pending set (it is GONE and will never ack). Resolve only if it was the
-    // last holdout AND the gated command's schedule time has passed (E / B38) —
-    // a disconnect inside a Seek gate's lead window must not resolve early and
-    // snap everyone to the pre-seek position; the anti-wedge deadline still
-    // resumes the group if the leave leaves an empty-but-premature gate. (An
-    // empty group terminates the actor anyway.)
+    release_gate_holds_for(state, member_id);
+}
+
+/// Free any readiness gate / buffering freeze that is only still waiting on
+/// `member_id` because it can no longer ack — because it LEFT (roster already
+/// dropped it) or its SOCKET dropped (still in the roster for the reconnect
+/// grace, marked disconnected). Never touches the roster; the caller owns that.
+fn release_gate_holds_for(state: &mut GroupState, member_id: MemberId) {
+    // Drop it from the pending set (it will never ack). Resolve only if it was
+    // the last holdout AND the gated command's schedule time has passed
+    // (E / B38) — a disconnect inside a Seek gate's lead window must not resolve
+    // early and snap everyone to the pre-seek position; the anti-wedge deadline
+    // still resumes the group if this leaves an empty-but-premature gate.
     if let Some(w) = state.waiting.as_mut() {
         w.pending.remove(&member_id);
     }
@@ -1583,17 +1613,17 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
     if resolve {
         state.resolve_waiting();
     }
-    // B55 — a departing member must not wedge the V19 buffering freeze either.
-    // If the group is frozen for buffering and the member that just left was
-    // the last one still buffering, lift the freeze now (same auto-resume as
-    // BufferingEnd) instead of waiting out the anti-wedge deadline. Skipped
-    // when a readiness gate is open — that path owns the resume.
+    // B55 — the same member must not wedge the V19 buffering freeze either. If
+    // the group is frozen for buffering and this was the last member still
+    // buffering, lift the freeze now (same auto-resume as BufferingEnd) instead
+    // of waiting out the anti-wedge deadline. Skipped when a readiness gate is
+    // open — that path owns the resume.
     if state.group_paused_due_to_buffering
         && !state.members.is_empty()
         && state.waiting.is_none()
         && !state.members.values().any(|m| m.buffering)
     {
-        tracing::info!(group = %state.id, "syncplay: buffering member left — lifting freeze");
+        tracing::info!(group = %state.id, "syncplay: buffering holder gone — lifting freeze");
         state.resume_after_buffering();
     }
 }
@@ -1626,7 +1656,11 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         GroupMsg::AddMember { .. } | GroupMsg::RemoveMember { .. } | GroupMsg::Snapshot { .. } => {
             None
         }
-        GroupMsg::SetGroupName { .. } | GroupMsg::SeedQueue { .. } => None,
+        // A socket loss is the OPPOSITE of a sign of life — never refresh
+        // last_seen for it (that would keep a ghost alive past its TTL).
+        GroupMsg::SetGroupName { .. }
+        | GroupMsg::SeedQueue { .. }
+        | GroupMsg::MemberSocketLost { .. } => None,
     }
 }
 
@@ -1653,6 +1687,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.name = name.clone();
                 rec.last_seen = tokio::time::Instant::now();
+                // The socket is back — the member is a gate follower again.
+                rec.connected = true;
                 let summaries = state.member_summaries();
                 let leader = state.leader.unwrap_or(member_id);
                 let _ = reply.send(Joined {
@@ -1679,6 +1715,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     offset: ClockOffset::default(),
                     buffering: false,
                     ignore_wait: false,
+                    connected: true,
                     last_seen: tokio::time::Instant::now(),
                 },
             );
@@ -1722,6 +1759,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // immediately re-syncs. The member (and its place in any readiness
             // gate) is untouched. Ignored if the member isn't in the roster.
             if state.members.contains_key(&member_id) {
+                // The socket is back — the member is a gate follower again.
+                if let Some(rec) = state.members.get_mut(&member_id) {
+                    rec.connected = true;
+                }
                 // A reconnect (page reload / deploy rollover) hands a FRESH
                 // jellyfin-web Manager whose `groupInfo` is null and whose
                 // SyncPlay is not enabled. Lead the catch-up with `Joined`
@@ -1745,6 +1786,25 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         }
         GroupMsg::RemoveMember { member_id } => {
             remove_member(state, member_id);
+        }
+        GroupMsg::MemberSocketLost { member_id } => {
+            // The /socket dropped but the member is KEPT in the roster for the
+            // reconnect grace. Mark it disconnected + clear its buffering flag
+            // so no readiness gate / buffering freeze waits on it (it can't ack
+            // with no socket → the whole group would freeze to the 30s
+            // anti-wedge), then release any hold it currently has. A no-op if it
+            // is already gone from the roster.
+            if let Some(rec) = state.members.get_mut(&member_id) {
+                rec.connected = false;
+                rec.buffering = false;
+            } else {
+                return;
+            }
+            tracing::info!(
+                group = %state.id, member = %member_id,
+                "syncplay: member socket lost — excluded from gates until reconnect"
+            );
+            release_gate_holds_for(state, member_id);
         }
         GroupMsg::MemberPing { member_id } => {
             // Liveness only — the shared touch at the top of `handle` already
@@ -3273,6 +3333,161 @@ mod tests {
         );
     }
 
+    /// A member whose /socket dropped must NOT hold an open readiness gate:
+    /// the group resolves for the still-connected members instead of freezing
+    /// until the 30s anti-wedge. The dropped member is KEPT in the roster for
+    /// the reconnect grace and resyncs when its socket returns. This is the
+    /// "one friend's flaky connection freezes the whole group" bug (Loki:
+    /// repeated `readiness gate timed out` while a member's socket flapped and
+    /// its HTTP `Ready`/`Pause`/`Seek` were dropped for minutes).
+    #[tokio::test]
+    async fn socket_loss_frees_the_gate_without_dropping_the_member() {
+        let (h, sinks) = spawn_group();
+        let m1 = MemberId::new();
+        let m2 = MemberId::new();
+        let mut rx1 = join(&h, &sinks, m1, "one").await;
+        let _rx2 = join(&h, &sinks, m2, "two").await;
+
+        // Open a readiness gate on both members (SetNewQueue → Unpause gate).
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["1".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "SetNewQueue opens a readiness gate"
+        );
+        while rx1.try_recv().is_ok() {}
+
+        // m1 is ready; only the (about-to-disconnect) m2 remains pending.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m1,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "gate still waits on m2 before its socket drops"
+        );
+
+        // m2's socket drops. The gate must resolve for m1 NOW, not in 30s.
+        h.tx.send(GroupMsg::MemberSocketLost { member_id: m2 })
+            .await
+            .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(
+            snap.play_state,
+            GroupPlayState::Playing,
+            "a dropped socket must not hold the gate — the group resumes for the rest"
+        );
+        assert_eq!(
+            snap.participants.len(),
+            2,
+            "the dropped member is kept in the roster for the reconnect grace"
+        );
+        let mut got_play = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                got_play = true;
+            }
+        }
+        assert!(
+            got_play,
+            "the still-connected member gets the resolved Play"
+        );
+    }
+
+    /// After a socket loss, a NEW gate must not wait on the disconnected member
+    /// either — it's excluded from the followers until it reconnects, so a
+    /// gate opened during the reconnect grace resolves on the live members.
+    #[tokio::test]
+    async fn a_new_gate_does_not_wait_on_a_disconnected_member() {
+        let (h, sinks) = spawn_group();
+        let m1 = MemberId::new();
+        let m2 = MemberId::new();
+        let mut rx1 = join(&h, &sinks, m1, "one").await;
+        let _rx2 = join(&h, &sinks, m2, "two").await;
+
+        h.tx.send(GroupMsg::MemberSocketLost { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // Open a gate AFTER m2 is gone; only m1 is a follower now.
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["1".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        // m1 readies — the gate must resolve without waiting on the absent m2.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m1,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "a gate opened during the grace must not wait on a disconnected member"
+        );
+    }
+
+    /// A reconnect restores the member to the followers, so it participates in
+    /// gates again (the group waits on it once its socket is back).
+    #[tokio::test]
+    async fn reconnect_restores_a_member_to_the_gate() {
+        let (h, sinks) = spawn_group();
+        let m1 = MemberId::new();
+        let m2 = MemberId::new();
+        let mut rx1 = join(&h, &sinks, m1, "one").await;
+        let _rx2 = join(&h, &sinks, m2, "two").await;
+
+        h.tx.send(GroupMsg::MemberSocketLost { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // m2's socket comes back (idempotent re-join refreshes the member).
+        let _rx2b = join(&h, &sinks, m2, "two").await;
+        while rx1.try_recv().is_ok() {}
+
+        // A fresh gate must now WAIT on m2 again — m1 readying alone is not enough.
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["1".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m1,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "a reconnected member is a follower again — the gate waits on it"
+        );
+    }
+
     /// Root Cause A: a deliberate pause DURING a member's buffer freeze must
     /// win — the later Ready must NOT force-resume the group out from under the
     /// user's pause. Before the intent capture, every freeze recovery path
@@ -4068,6 +4283,7 @@ mod tests {
             offset: ClockOffset::default(),
             buffering: false,
             ignore_wait: false,
+            connected: true,
             last_seen,
         };
         state.members.insert(ghost, mk(stale));

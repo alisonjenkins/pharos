@@ -160,10 +160,13 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         // Answered locally on the remote replica, never forwarded. `SeedQueue`
         // is issued only from `/SyncPlay/New`, whose caller's replica created
         // and therefore OWNS the group — so it is always applied locally and
-        // never needs to cross the bus.
-        GroupMsg::AddMember { .. } | GroupMsg::Snapshot { .. } | GroupMsg::SeedQueue { .. } => {
-            return None
-        }
+        // never needs to cross the bus. `MemberSocketLost` is per-replica socket
+        // liveness (a member's socket lives on exactly one replica), so it is
+        // meaningful only where the socket dropped and is never forwarded.
+        GroupMsg::AddMember { .. }
+        | GroupMsg::Snapshot { .. }
+        | GroupMsg::SeedQueue { .. }
+        | GroupMsg::MemberSocketLost { .. } => return None,
     })
 }
 
