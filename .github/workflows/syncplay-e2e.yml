@@ -31,9 +31,12 @@ jobs:
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       - name: Run SyncPlay group-watch harness
         run: nix develop --command just compat-syncplay
-      - name: Upload Playwright report on failure
+      - name: Upload Playwright report + traces on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: syncplay-report-${{ github.sha }}
-          path: compat-playwright/playwright-report
+          if-no-files-found: warn
+          path: |
+            compat-playwright/playwright-report
+            compat-playwright/test-results
