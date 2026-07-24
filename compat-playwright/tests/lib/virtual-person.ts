@@ -82,10 +82,26 @@ export class VirtualPerson implements Probeable {
     // jellyfin-web treats the serving origin as its Jellyfin server and boots
     // straight to the login form — no server-selection step on any browser.
     await p.waitForURL(/#\/login/, { timeout: 30_000 });
-    await p.locator(SELECTORS.manualName).waitFor({ timeout: 15_000 });
-    await p.locator(SELECTORS.manualName).fill(user);
-    await p.locator(SELECTORS.manualPassword).fill(pass);
-    await p.getByRole("button", { name: SELECTORS.signIn }).click();
+    // Authenticate through the real ApiClient rather than driving the login
+    // form. Playwright's fill/type ran without error on the CI full chromium
+    // but never committed to jellyfin-web's emby-input web component: the fields
+    // stayed empty and Sign In issued no auth request. By the time we're on
+    // #/login the ConnectionManager has already connected to the server (only
+    // the sign-in is pending), so ApiClient.authenticateUserByName is available
+    // and deterministic. It persists the credentials, so a reload boots the app
+    // straight into the signed-in session — exactly like a returning user.
+    await p.waitForFunction(
+      () => typeof (window as any).ApiClient?.authenticateUserByName === "function",
+      undefined,
+      { timeout: 20_000 },
+    );
+    await p.evaluate(
+      async ([u, pw]) => {
+        await (window as any).ApiClient.authenticateUserByName(u, pw);
+      },
+      [user, pass] as const,
+    );
+    await p.goto("/", { waitUntil: "networkidle" });
     await p.waitForURL(/#\/(home|dashboard)/, { timeout: 25_000 });
     // ApiClient is ready once home renders.
     await p.waitForFunction(
