@@ -152,6 +152,25 @@ fn noart_sentinel(out_path: &Path) -> PathBuf {
     out_path.with_extension("noart")
 }
 
+/// One-shot marker written beside an extractable image once it has been
+/// checked for the black-frame bug (or uploaded). Its presence means "don't
+/// re-evaluate this slot", so a healthy poster is stat-checked at most once.
+fn healed_marker(out_path: &Path) -> PathBuf {
+    out_path.with_extension("healed")
+}
+
+/// Size floor (bytes) below which a cached extractable frame is treated as the
+/// old fixed-seek black-frame bug and re-extracted. A pure-black / title-card
+/// MJPEG compresses to a few KB; a real frame is comfortably larger, so this
+/// only catches genuinely blank posters and never a real image or upload.
+/// Backdrops are 1280px wide (vs 480/640) so their blank floor is higher.
+fn blank_ceiling(role: ImageRole) -> u64 {
+    match role {
+        ImageRole::Backdrop => 12 * 1024,
+        _ => 8 * 1024,
+    }
+}
+
 /// A per-caller-unique scratch basename (V36). A fixed name lets two concurrent
 /// batches collide on one temp dir; pid + a monotonic counter guarantee no two
 /// calls in this process (or across replicas sharing the cache PVC) collide.
@@ -235,6 +254,12 @@ impl ImageCache {
     ) -> Result<PathBuf, ImageCacheError> {
         let out_path = image_path(&self.root, role, kind, id, index);
         if tokio::fs::try_exists(&out_path).await.unwrap_or(false) {
+            // Self-heal a poster/thumb/backdrop that a previous build extracted
+            // as an all-black frame (fixed-seek landed on a title card / fade).
+            if role.is_extractable() {
+                self.heal_if_blank(id, role, kind, source, index, &out_path)
+                    .await;
+            }
             return Ok(out_path);
         }
         if !role.is_extractable() {
@@ -279,6 +304,69 @@ impl ImageCache {
         }
         tokio::fs::rename(&tmp_path, &out_path).await?;
         Ok(out_path)
+    }
+
+    /// One-shot self-heal for an already-cached extractable image that is
+    /// suspiciously small — a pure-black frame (the old fixed-seek bug)
+    /// compresses to a few KB, versus 15 KB+ for a real frame. Re-extract once
+    /// with the black-avoiding extractor, then drop a [`healed_marker`] so the
+    /// slot is never re-evaluated. Real images and uploads sit above
+    /// [`blank_ceiling`] (and uploads carry the marker from the start), so they
+    /// are never disturbed. Best-effort: any failure leaves the existing file
+    /// in place and still marks the slot so a persistently-blank source isn't
+    /// re-attempted on every library-grid render.
+    async fn heal_if_blank(
+        &self,
+        id: u64,
+        role: ImageRole,
+        kind: MediaKind,
+        source: &Path,
+        index: u32,
+        out_path: &Path,
+    ) {
+        let marker = healed_marker(out_path);
+        if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+            return;
+        }
+        let Ok(meta) = tokio::fs::metadata(out_path).await else {
+            return;
+        };
+        if meta.len() >= blank_ceiling(role) {
+            // A real image — leave it untouched. The stat is cheap, so no
+            // marker: a slot only earns one if it was actually blank or
+            // uploaded, keeping healthy posters indistinguishable from fresh.
+            return;
+        }
+        // Serialize with the miss-fill path so a grid storm heals exactly once.
+        let lock = self
+            .locks
+            .lock(format!("fetch:{id}:{role:?}:{index}"))
+            .await;
+        let _guard = lock.lock().await;
+        // Re-check under the lock: another waiter may have healed + marked.
+        if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+            return;
+        }
+        if tokio::fs::metadata(out_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+            >= blank_ceiling(role)
+        {
+            return;
+        }
+        let tmp_path = out_path.with_extension("heal.tmp");
+        match self.extract(source, kind, role, &tmp_path).await {
+            Ok(()) => {
+                let _ = tokio::fs::rename(&tmp_path, out_path).await;
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+            }
+        }
+        // Mark handled regardless — a re-extract failure or a genuinely dark
+        // source must not re-trigger on every render.
+        let _ = tokio::fs::write(&marker, []).await;
     }
 
     /// Scale a local artwork file (a downloaded `poster.jpg` / `fanart.jpg`
@@ -622,6 +710,12 @@ impl ImageCache {
         let tmp_path = out_path.with_extension("jpg.tmp");
         tokio::fs::write(&tmp_path, body).await?;
         tokio::fs::rename(&tmp_path, &out_path).await?;
+        // A deliberately-uploaded image must never be treated as a blank
+        // extraction and re-generated over — mark extractable slots handled so
+        // `heal_if_blank` skips them even if the upload is small.
+        if role.is_extractable() {
+            let _ = tokio::fs::write(healed_marker(&out_path), []).await;
+        }
         Ok(out_path)
     }
 
@@ -873,10 +967,15 @@ impl ImageCache {
             _ => self.seek_seconds,
         };
         let seek = seek.to_string();
+        // `thumbnail` picks the most representative frame from a 100-frame
+        // batch before scaling, so a black opening title / fade at the seek
+        // point doesn't become an all-black poster (the libav path scans for
+        // the first non-black frame explicitly; this is the spawn-path
+        // equivalent). `-frames:v 1` then keeps that single representative.
         let scale = match role {
-            ImageRole::Backdrop => "scale=1280:-1",
-            ImageRole::Thumb => "scale=640:-1",
-            _ => "scale=480:-1",
+            ImageRole::Backdrop => "thumbnail=100,scale=1280:-1",
+            ImageRole::Thumb => "thumbnail=100,scale=640:-1",
+            _ => "thumbnail=100,scale=480:-1",
         };
         let args: Vec<&str> = match kind {
             MediaKind::Movie | MediaKind::Episode => vec![
@@ -1059,6 +1158,77 @@ mod tests {
             matches!(res, Err(ImageCacheError::NoContent)),
             "sentinel must short-circuit to NoContent, got {res:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn blank_cached_frame_is_marked_and_left_when_reextract_fails() {
+        let td = tempfile::TempDir::new().unwrap();
+        // No pool + bad ffmpeg: a heal re-extract can only fail, proving the
+        // original file survives and the slot is marked so it's not retried.
+        let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
+        let p = primary_path(td.path(), MediaKind::Movie, 42);
+        tokio::fs::create_dir_all(p.parent().unwrap())
+            .await
+            .unwrap();
+        // A tiny (blank-looking) poster — below the size floor.
+        tokio::fs::write(&p, vec![0u8; 512]).await.unwrap();
+        let got = cache
+            .primary(42, MediaKind::Movie, Path::new("/no/source"))
+            .await
+            .unwrap();
+        assert_eq!(got, p);
+        // File untouched (re-extract failed), and the slot is now marked.
+        assert_eq!(tokio::fs::read(&p).await.unwrap(), vec![0u8; 512]);
+        assert!(
+            tokio::fs::try_exists(healed_marker(&p)).await.unwrap(),
+            "a checked slot must be marked so it isn't re-evaluated every render"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_sized_cached_frame_is_not_touched_or_marked() {
+        let td = tempfile::TempDir::new().unwrap();
+        let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
+        let p = primary_path(td.path(), MediaKind::Movie, 7);
+        tokio::fs::create_dir_all(p.parent().unwrap())
+            .await
+            .unwrap();
+        // A real-sized poster (above the blank floor) must be served verbatim.
+        let real = vec![0xABu8; 20 * 1024];
+        tokio::fs::write(&p, &real).await.unwrap();
+        let got = cache
+            .primary(7, MediaKind::Movie, Path::new("/no/source"))
+            .await
+            .unwrap();
+        assert_eq!(got, p);
+        assert_eq!(tokio::fs::read(&p).await.unwrap(), real, "not re-extracted");
+        assert!(
+            !tokio::fs::try_exists(healed_marker(&p)).await.unwrap(),
+            "healthy posters earn no marker (cheap stat, stay indistinguishable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_marks_extractable_slot_healed() {
+        let td = tempfile::TempDir::new().unwrap();
+        let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
+        // A small uploaded poster would otherwise look blank — the upload marker
+        // protects it from ever being re-extracted over.
+        let body = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+        let p = cache
+            .upload(55, ImageRole::Primary, MediaKind::Movie, 0, &body)
+            .await
+            .unwrap();
+        assert!(
+            tokio::fs::try_exists(healed_marker(&p)).await.unwrap(),
+            "an uploaded extractable image must be marked so heal skips it"
+        );
+        // A subsequent fetch serves it untouched despite its small size.
+        let got = cache
+            .primary(55, MediaKind::Movie, Path::new("/no/source"))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&got).await.unwrap(), body);
     }
 
     #[tokio::test]
