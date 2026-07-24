@@ -186,21 +186,46 @@ export class VirtualPerson implements Probeable {
   // ---- audio / subtitle swap via the real OSD ----
 
   private async openOsd(): Promise<void> {
-    // The player OSD auto-hides; a pointer move over the video re-shows it.
-    await this.page.mouse.move(400, 300);
-    await this.page.locator(SELECTORS.videoOsd).first().waitFor({ timeout: 10_000 });
+    // The OSD auto-hides; jellyfin-web binds pointermove on `document` and
+    // reveals the controls only on REAL movement — a single static move has
+    // zero delta and is ignored. Wiggle across the video (steps => genuine
+    // intermediate pointermove events) until the bottom bar is visible.
+    const osd = this.page.locator(SELECTORS.videoOsd).first();
+    for (let i = 0; i < 6; i++) {
+      if (await osd.isVisible().catch(() => false)) break;
+      await this.page.mouse.move(300 + i * 30, 260);
+      await this.page.mouse.move(660, 430, { steps: 12 });
+    }
+    await osd.waitFor({ state: "visible", timeout: 10_000 });
   }
 
-  async swapAudio(index: number): Promise<void> {
+  // Open a track actionsheet (audio/subtitle) from the OSD.
+  private async openTrackMenu(button: string): Promise<void> {
     await this.openOsd();
-    await this.page.locator(SELECTORS.osdAudioButton).first().click();
-    await this.page.locator(SELECTORS.trackMenuItem(index)).click({ timeout: 10_000 });
+    await this.page.locator(button).first().click();
+    await this.page
+      .locator(SELECTORS.actionSheet)
+      .waitFor({ state: "visible", timeout: 10_000 });
   }
 
-  async swapSubtitle(index: number): Promise<void> {
-    await this.openOsd();
-    await this.page.locator(SELECTORS.osdSubtitleButton).first().click();
-    await this.page.locator(SELECTORS.trackMenuItem(index)).click({ timeout: 10_000 });
+  // Switch to the LAST menu entry: for the 2-audio fixture that is the
+  // alternate track; for subtitles it enables a real track (default is Off).
+  // A concrete track index is unstable (subtitle stream indices are 3/4, not
+  // 1/2), so we select the alternate by menu position — deterministic switch.
+  async swapAudio(): Promise<void> {
+    await this.openTrackMenu(SELECTORS.osdAudioButton);
+    await this.page
+      .locator(`${SELECTORS.actionSheet} .actionSheetMenuItem`)
+      .last()
+      .click({ timeout: 10_000 });
+  }
+
+  async swapSubtitle(): Promise<void> {
+    await this.openTrackMenu(SELECTORS.osdSubtitleButton);
+    await this.page
+      .locator(`${SELECTORS.actionSheet} .actionSheetMenuItem`)
+      .last()
+      .click({ timeout: 10_000 });
   }
 
   // ---- observation ----
