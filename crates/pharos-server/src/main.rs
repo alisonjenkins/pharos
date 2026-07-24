@@ -318,11 +318,11 @@ async fn generate_seed_fixtures(
         "-f",
         "lavfi",
         "-i",
-        "testsrc=duration=5:size=320x240:rate=15",
+        "testsrc=duration=120:size=320x240:rate=15",
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:duration=5",
+        "sine=frequency=440:duration=120",
         "-c:v",
         "libvpx-vp9",
         "-deadline",
@@ -361,10 +361,10 @@ async fn generate_seed_fixtures(
     // Multi-track clip: VP9 + two Opus tracks + two WebVTT subtitle tracks.
     let sub_a = fixture_dir.join("a.vtt");
     let sub_b = fixture_dir.join("b.vtt");
-    tokio::fs::write(&sub_a, "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nTrack A\n")
+    tokio::fs::write(&sub_a, "WEBVTT\n\n00:00:00.000 --> 00:02:00.000\nTrack A\n")
         .await
         .map_err(AppError::Io)?;
-    tokio::fs::write(&sub_b, "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nTrack B\n")
+    tokio::fs::write(&sub_b, "WEBVTT\n\n00:00:00.000 --> 00:02:00.000\nTrack B\n")
         .await
         .map_err(AppError::Io)?;
     let multitrack = target_dir.join("multitrack.mkv");
@@ -376,15 +376,15 @@ async fn generate_seed_fixtures(
         "-f",
         "lavfi",
         "-i",
-        "testsrc=duration=5:size=320x240:rate=15",
+        "testsrc=duration=120:size=320x240:rate=15",
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:duration=5",
+        "sine=frequency=440:duration=120",
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=880:duration=5",
+        "sine=frequency=880:duration=120",
         "-i",
         sub_a.to_string_lossy().as_ref(),
         "-i",

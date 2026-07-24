@@ -139,7 +139,7 @@ test.describe("syncplay group-watch matrix (chromium/VP9)", () => {
     // playing, NOT freeze for 30s waiting on the disconnected b — this is the
     // regression guard for the socket-drop wedge. (A member reconnecting and
     // resyncing is covered by the reconnect_restores_a_member_to_the_gate unit
-    // test; asserting it here is fragile against the 5s fixture ending.)
+    // test; this scenario stays scoped to freeze-prevention.)
     await a.seek(1000);
     await assertSeekConverged([a, c], 1000);
     await waitUntilInSync([a, c]);
