@@ -844,6 +844,12 @@
             # the one present in the store path.
             pkgs.nodejs_22
             pkgs.jellyfin-web
+            # h264-capable Chromium for the SyncPlay h264 codec smoke
+            # (compat-playwright/syncplay-h264-codec.spec.ts). The nix-pinned
+            # playwright-driver chromium is a FOSS build with NO h264 decode,
+            # so it can only exercise the VP9 path; pkgs.chromium decodes h264
+            # and stands in for the Firefox/Zen demuxed-CMAF path in prod.
+            pkgs.chromium
             # schemathesis (Layer A of T29) — install separately via:
             #   pipx install schemathesis
             # Not pinned in the flake because nixpkgs lacks a stable
@@ -876,6 +882,11 @@
             # distros) and any implicit download attempt.
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
             export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+            # Absolute path of the h264-capable chromium (see packages list).
+            # syncplay-h264-codec.spec.ts launches it via Playwright
+            # executablePath; the spec asserts h264 decode and fails loudly
+            # with a swap-to-google-chrome hint if this build lacks it.
+            export PHAROS_H264_BROWSER=${pkgs.chromium}/bin/chromium
             # Test fixtures for `cargo nextest run -- --ignored
             # ffmpeg_integration`. Built once in /nix/store, cached
             # across CI + dev. Tests skip when env unset.

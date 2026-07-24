@@ -178,6 +178,43 @@ compat-playwright-full:
     sleep 2
     nix develop --command bash -c 'cd compat-playwright && npx playwright test'
 
+# Manual SyncPlay group-watch E2E: up to 3 real jellyfin-web members through
+# the full scenario matrix (VP9) + an h264 demuxed-CMAF smoke. Heavy (3
+# browsers + live transcode) — run before group-watch nights / pre-release, or
+# let the path-filtered syncplay-e2e workflow run it when group-play code
+# changes.
+compat-syncplay:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    cat > "$TMP/pharos.toml" <<EOF
+    [server]
+    bind = "127.0.0.1:8096"
+    name = "pharos-syncplay"
+    image_cache_dir = "$TMP/images"
+    trickplay_cache_dir = "$TMP/trickplay"
+    transcode_cache_dir = "$TMP/transcode"
+    image_seek_seconds = 1
+    [obs]
+    log_level = "warn"
+    [media]
+    roots = ["$TMP/media"]
+    [database]
+    url = "sqlite://$TMP/pharos.db?mode=rwc"
+    EOF
+    PHAROS_CONFIG="$TMP/pharos.toml"
+    nix develop --command cargo build -q --bin transcode-worker
+    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin create-user --name playwright2 --password playwright2-test-pw --admin
+    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin create-user --name playwright3 --password playwright3-test-pw --admin
+    nix develop --command bash -c "cargo run -q --bin pharos -- --config '$PHAROS_CONFIG' serve" &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
+    # Wait for readiness (condition-based, not a flat sleep).
+    for i in $(seq 1 60); do curl -sf http://127.0.0.1:8096/System/Info/Public >/dev/null && break || sleep 0.5; done
+    nix develop --command bash -c 'cd compat-playwright && npx playwright test --config playwright.syncplay.config.ts'
+
 # Render every docs/*.d2 + docs/diagrams/*.d2 source to a sibling SVG.
 # `d2` is not in the devShell; `nix run nixpkgs#d2` pulls it on demand and
 # caches in the nix store after first run. The .d2 source is canonical;

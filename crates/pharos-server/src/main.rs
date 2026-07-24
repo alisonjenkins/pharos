@@ -164,9 +164,7 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
 
 #[cfg(debug_assertions)]
 async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
-    use pharos_core::{
-        MediaItem, MediaKind, MediaStore, SecretString, UserId, UserPolicy, UserRecord, UserStore,
-    };
+    use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
     let stores = Stores::connect(&cfg.database.url).await?;
@@ -190,49 +188,258 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         }
     }
 
-    // Generate a 5-second WebM fixture via ffmpeg so the playback
-    // Playwright test has real bytes to stream. Path is
-    // /tmp/pharos-playwright-media/fixture.webm — overwritten each
-    // run so a stale file from a code change doesn't shadow new
-    // ffmpeg args.
-    //
-    // WebM + VP9 + Opus so the FOSS Chromium shipped with Playwright
-    // (no proprietary codec support) can actually decode it. H.264 fails
-    // with DEMUXER_ERROR_NO_SUPPORTED_STREAMS under headless chromium.
+    // Fixtures live under /tmp/pharos-playwright-media (base clip + subtitle
+    // sidecars); the servable copies land in the first configured media root
+    // (writable in prod / containers), falling back to the fixture dir for the
+    // devShell case.
     let fixture_dir = std::path::PathBuf::from("/tmp/pharos-playwright-media");
-    tokio::fs::create_dir_all(&fixture_dir)
+    let target_dir = cfg
+        .media
+        .roots
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fixture_dir.clone());
+    let paths = generate_seed_fixtures(&fixture_dir, &target_dir).await?;
+    register_seed_items(&stores, &paths).await?;
+    // Probe the multitrack clip so PlaybackInfo advertises its 2 audio + 2
+    // subtitle streams. jellyfin-web hides the audio/subtitle track buttons
+    // for a single-track source, so the swap scenario needs the real stream
+    // list; register_seed_items writes an empty probe (pure DB, no ffmpeg).
+    seed_probe_multitrack(&stores, &paths.multitrack).await?;
+
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    writeln!(
+        lock,
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 8 items \
+         (incl. 3-episode series + multitrack), fixture={}",
+        paths.movie.display()
+    )?;
+    Ok(())
+}
+
+/// On-disk paths of the seed fixtures, produced by [`generate_seed_fixtures`]
+/// and consumed by [`register_seed_items`]. Single-track VP9/Opus clips for
+/// ids 1–7; a dual-audio + 2-subtitle Matroska clip for id 8.
+#[cfg(debug_assertions)]
+struct SeedPaths {
+    movie: std::path::PathBuf,
+    movie2: std::path::PathBuf,
+    episode_legacy: std::path::PathBuf,
+    audio: std::path::PathBuf,
+    series_eps: [std::path::PathBuf; 3],
+    multitrack: std::path::PathBuf,
+}
+
+/// Register the seed media rows (pure DB — no ffmpeg). Ids 1–4 keep their
+/// legacy shapes so the existing crawl / console specs stay green; ids 5–7
+/// form one 3-episode series (for next/prev-episode SyncPlay tests); id 8 is
+/// the dual-audio / 2-subtitle clip (for the audio/subtitle-swap test).
+#[cfg(debug_assertions)]
+async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), AppError> {
+    use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+
+    let legacy: [(u64, MediaKind, &std::path::PathBuf); 4] = [
+        (1, MediaKind::Movie, &paths.movie),
+        (2, MediaKind::Movie, &paths.movie2),
+        (3, MediaKind::Episode, &paths.episode_legacy),
+        (4, MediaKind::Audio, &paths.audio),
+    ];
+    for (id, kind, path) in legacy {
+        let item = MediaItem {
+            id,
+            path: path.clone(),
+            title: format!("Playwright Title {id}"),
+            kind,
+            ..Default::default()
+        };
+        let _ = stores.put(item).await;
+    }
+
+    // 3-episode series (ids 5-7). `series_folder` gives a stable series_key so
+    // pharos synthesises one Series + Season with three ordered episodes.
+    let series_folder = paths.series_eps[0]
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned());
+    for (idx, path) in paths.series_eps.iter().enumerate() {
+        let ep = (idx + 1) as u32;
+        let item = MediaItem {
+            id: 5 + idx as u64,
+            path: path.clone(),
+            title: format!("Playwright Show S01E0{ep}"),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Playwright Show".into(),
+                season_number: Some(1),
+                episode_number: Some(ep),
+                series_folder: series_folder.clone(),
+                series_year: Some(2026),
+            }),
+            ..Default::default()
+        };
+        let _ = stores.put(item).await;
+    }
+
+    // Dual-audio + 2-subtitle clip (id 8) for the swap scenario.
+    let multitrack = MediaItem {
+        id: 8,
+        path: paths.multitrack.clone(),
+        title: "Playwright Multitrack".into(),
+        kind: MediaKind::Movie,
+        ..Default::default()
+    };
+    let _ = stores.put(multitrack).await;
+    Ok(())
+}
+
+/// Materialise the seed fixtures with ffmpeg. Ids 1–7 are copies of one 5 s
+/// VP9/Opus single-track clip (the FOSS Playwright chromium decodes VP9, not
+/// h264). Id 8 is a fresh encode with two Opus tracks (440 Hz / 880 Hz) and
+/// two WebVTT subtitle tracks, muxed into Matroska so pharos probes 2 audio +
+/// 2 subs.
+#[cfg(debug_assertions)]
+async fn generate_seed_fixtures(
+    fixture_dir: &std::path::Path,
+    target_dir: &std::path::Path,
+) -> Result<SeedPaths, AppError> {
+    tokio::fs::create_dir_all(fixture_dir)
         .await
         .map_err(AppError::Io)?;
-    let fixture_path = fixture_dir.join("fixture.webm");
+    tokio::fs::create_dir_all(target_dir)
+        .await
+        .map_err(AppError::Io)?;
+
+    let base = fixture_dir.join("fixture.webm");
+    run_ffmpeg(&[
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=5:size=320x240:rate=15",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=5",
+        "-c:v",
+        "libvpx-vp9",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-row-mt",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libopus",
+        "-shortest",
+        base.to_string_lossy().as_ref(),
+    ])
+    .await?;
+
+    // Copy the base into every single-track path (UNIQUE(path) needs distinct
+    // files). Order: movie, movie2, episode_legacy, audio, s01e01..03.
+    let single_names = [
+        "fixture-1.webm",
+        "fixture-2.webm",
+        "fixture-3.webm",
+        "fixture-4.webm",
+        "show-s01e01.webm",
+        "show-s01e02.webm",
+        "show-s01e03.webm",
+    ];
+    let mut singles: Vec<std::path::PathBuf> = Vec::with_capacity(single_names.len());
+    for name in single_names {
+        let dst = target_dir.join(name);
+        tokio::fs::copy(&base, &dst).await.map_err(AppError::Io)?;
+        singles.push(dst);
+    }
+
+    // Multi-track clip: VP9 + two Opus tracks + two WebVTT subtitle tracks.
+    let sub_a = fixture_dir.join("a.vtt");
+    let sub_b = fixture_dir.join("b.vtt");
+    tokio::fs::write(&sub_a, "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nTrack A\n")
+        .await
+        .map_err(AppError::Io)?;
+    tokio::fs::write(&sub_b, "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nTrack B\n")
+        .await
+        .map_err(AppError::Io)?;
+    let multitrack = target_dir.join("multitrack.mkv");
+    run_ffmpeg(&[
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=5:size=320x240:rate=15",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=5",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:duration=5",
+        "-i",
+        sub_a.to_string_lossy().as_ref(),
+        "-i",
+        sub_b.to_string_lossy().as_ref(),
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:a",
+        "-map",
+        "3:s",
+        "-map",
+        "4:s",
+        "-c:v",
+        "libvpx-vp9",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-row-mt",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libopus",
+        "-c:s",
+        "webvtt",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-metadata:s:a:1",
+        "language=jpn",
+        "-metadata:s:s:0",
+        "language=eng",
+        "-metadata:s:s:1",
+        "language=jpn",
+        multitrack.to_string_lossy().as_ref(),
+    ])
+    .await?;
+
+    Ok(SeedPaths {
+        movie: singles[0].clone(),
+        movie2: singles[1].clone(),
+        episode_legacy: singles[2].clone(),
+        audio: singles[3].clone(),
+        series_eps: [singles[4].clone(), singles[5].clone(), singles[6].clone()],
+        multitrack,
+    })
+}
+
+/// Run ffmpeg with the given args, mapping a non-zero exit to an error.
+#[cfg(debug_assertions)]
+async fn run_ffmpeg(args: &[&str]) -> Result<(), AppError> {
     let status = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=duration=5:size=320x240:rate=15",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=5",
-            "-c:v",
-            "libvpx-vp9",
-            "-deadline",
-            "realtime",
-            "-cpu-used",
-            "8",
-            "-row-mt",
-            "1",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "libopus",
-            "-shortest",
-        ])
-        .arg(&fixture_path)
+        .args(args)
         .status()
         .await
         .map_err(AppError::Io)?;
@@ -241,51 +448,35 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
             "ffmpeg fixture generation failed",
         )));
     }
+    Ok(())
+}
 
-    // Materialise four distinct paths so the store's UNIQUE(path)
-    // constraint doesn't silently drop items 2/3/4. Each is a copy of
-    // the same fixture bytes. Target dir = first configured media
-    // root (writable in production / containers), falling back to
-    // `fixture_dir` for the devShell case.
-    let target_dir = cfg
-        .media
-        .roots
-        .first()
-        .cloned()
-        .unwrap_or_else(|| fixture_dir.clone());
-    tokio::fs::create_dir_all(&target_dir)
-        .await
-        .map_err(AppError::Io)?;
-    let mut per_id_paths: Vec<(u64, MediaKind, std::path::PathBuf)> = Vec::new();
-    for (i, kind) in [
-        (1u64, MediaKind::Movie),
-        (2, MediaKind::Movie),
-        (3, MediaKind::Episode),
-        (4, MediaKind::Audio),
-    ] {
-        let per_path = target_dir.join(format!("fixture-{i}.webm"));
-        tokio::fs::copy(&fixture_path, &per_path)
-            .await
-            .map_err(AppError::Io)?;
-        per_id_paths.push((i, kind, per_path));
-    }
-    for (i, kind, path) in per_id_paths {
-        let item = MediaItem {
-            id: i,
-            path,
-            title: format!("Playwright Title {i}"),
-            kind,
+/// Probe the multitrack seed clip (id 8) with the same Prober the scanner
+/// uses, and rewrite its row with the real stream list so PlaybackInfo
+/// advertises the 2 audio + 2 subtitle tracks. Uses the libav prober on the
+/// `ffmpeg-lib` build (the transcode-worker sibling the recipe builds), else
+/// the ffprobe spawn prober — self-consistent stream indices, so an audio
+/// swap maps to the right source stream.
+#[cfg(debug_assertions)]
+async fn seed_probe_multitrack(stores: &Stores, path: &std::path::Path) -> Result<(), AppError> {
+    use pharos_core::{MediaItem, MediaKind, MediaStore, Prober};
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    let prober = pharos_scanner::LibavProber::with_discovered_bin();
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+    let prober = pharos_scanner::FfmpegProber::new();
+
+    let info = prober.probe(path).await?;
+    stores
+        .put(MediaItem {
+            id: 8,
+            path: path.to_path_buf(),
+            title: "Playwright Multitrack".into(),
+            kind: MediaKind::Movie,
+            probe: info.probe,
             ..Default::default()
-        };
-        let _ = stores.put(item).await;
-    }
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    writeln!(
-        lock,
-        "seeded: user='playwright' password='playwright-test-pw' (admin), 4 items, fixture={}",
-        fixture_path.display()
-    )?;
+        })
+        .await?;
     Ok(())
 }
 
@@ -1125,4 +1316,51 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         g.send_byebye().await;
     }
     Ok(())
+}
+
+// Both `test` AND `debug_assertions`: the seed helpers it exercises are
+// `#[cfg(debug_assertions)]`, so a release test build (e.g. `nix flake check`'s
+// clippy) that has `cfg(test)` but not `debug_assertions` would reference items
+// compiled out.
+#[cfg(all(test, debug_assertions))]
+mod seed_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use pharos_core::{MediaKind, MediaStore};
+
+    // register_seed_items must persist the 3-episode series (ids 5-7) with
+    // SeriesInfo adjacency and the multitrack item (id 8), on top of the
+    // legacy 1-4. Pure DB path — no ffmpeg, paths are synthetic.
+    #[tokio::test]
+    async fn register_seed_items_persists_series_and_multitrack() {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let p = |s: &str| std::path::PathBuf::from(format!("/seed/{s}"));
+        let paths = SeedPaths {
+            movie: p("fixture-1.webm"),
+            movie2: p("fixture-2.webm"),
+            episode_legacy: p("fixture-3.webm"),
+            audio: p("fixture-4.webm"),
+            series_eps: [
+                p("show/show-s01e01.webm"),
+                p("show/show-s01e02.webm"),
+                p("show/show-s01e03.webm"),
+            ],
+            multitrack: p("multitrack.mkv"),
+        };
+        register_seed_items(&stores, &paths).await.unwrap();
+
+        // Legacy item still present.
+        assert_eq!(stores.get(1).await.unwrap().kind, MediaKind::Movie);
+        // The three series episodes carry ordered SeriesInfo.
+        for (id, ep) in [(5u64, 1u32), (6, 2), (7, 3)] {
+            let item = stores.get(id).await.unwrap();
+            assert_eq!(item.kind, MediaKind::Episode);
+            let s = item.series.expect("SeriesInfo set");
+            assert_eq!(s.series_name, "Playwright Show");
+            assert_eq!(s.season_number, Some(1));
+            assert_eq!(s.episode_number, Some(ep));
+        }
+        // The multitrack clip is registered as a Movie.
+        assert_eq!(stores.get(8).await.unwrap().kind, MediaKind::Movie);
+    }
 }
