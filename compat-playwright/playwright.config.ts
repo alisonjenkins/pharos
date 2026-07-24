@@ -21,6 +21,12 @@ if (!JELLYFIN_WEB_DIR) {
 
 export default defineConfig({
   testDir: "./tests",
+  // The SyncPlay group-watch specs are a SEPARATE suite with their own runner
+  // and webServer (`just compat-syncplay` → playwright.syncplay.config.ts, which
+  // serves a same-origin proxy the specs' login flow requires). This default
+  // crawl config uses a different webServer, so it must not glob them in — under
+  // it their connectAndLogin never reaches #/login and they time out.
+  testIgnore: ["**/syncplay-group-matrix.spec.ts", "**/syncplay-h264-codec.spec.ts"],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
