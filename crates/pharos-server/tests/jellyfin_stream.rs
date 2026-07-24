@@ -253,6 +253,106 @@ async fn seek_repro_open_ended_and_if_range() {
     );
 }
 
+/// Seed a movie item backed by a file of exactly `size` bytes (a repeating
+/// byte pattern) so an over-cap DirectPlay range can be exercised end-to-end.
+async fn seed_with_sized_file(size: usize) -> (web::Data<AppState>, String, TempDir) {
+    let td = TempDir::new().unwrap();
+    let path = td.path().join("movie.mp4");
+    let mut f = std::fs::File::create(&path).unwrap();
+    // Deterministic, position-dependent bytes so we can assert byte-exactness.
+    let chunk: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+    let mut written = 0;
+    while written < size {
+        let n = (size - written).min(chunk.len());
+        f.write_all(&chunk[..n]).unwrap();
+        written += n;
+    }
+    f.flush().unwrap();
+
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 42,
+            path,
+            title: "movie".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+    (state, token.0.expose().to_string(), td)
+}
+
+// Deadpool — a `<video>` opens a progressive mp4 with an open-ended `bytes=X-`.
+// Answering the whole `X..EOF` (up to ~1.8 GB) in one body makes a reverse proxy
+// temp-file the remainder before relaying (unbuffered seeks take minutes) and a
+// stalled/reset progressive connection restarts the player at 0. deliver_stream
+// caps an over-cap range to an 8 MiB window; the client re-requests the next one.
+#[actix_web::test]
+async fn oversized_open_ended_range_is_capped_to_a_window() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let total = CAP + 100; // just over the cap
+    let (state, token, _td) = seed_with_sized_file(total).await;
+    let app = test::init_service(build_app(state)).await;
+
+    // Opening `bytes=0-` on an over-cap file → 206 of exactly CAP bytes.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Videos/42/stream")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("Range", "bytes=0-"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("bytes 0-{}/{}", CAP - 1, total).as_str()),
+        "an over-cap open-ended range must be capped to the first window"
+    );
+    let body = test::read_body(resp).await;
+    assert_eq!(
+        body.len(),
+        CAP,
+        "capped body is exactly the window, not EOF"
+    );
+    // Byte-exactness: the window is the file prefix.
+    assert_eq!(body[0], 0);
+    assert_eq!(body[255], 255);
+
+    // The client's next window: `bytes=CAP-` — the remaining tail is smaller than
+    // the cap, so it is served whole (defers to NamedFile), completing the file.
+    let tail = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Videos/42/stream")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("Range", format!("bytes={CAP}-").as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(tail.status(), 206);
+    let tail_body = test::read_body(tail).await;
+    assert_eq!(tail_body.len(), 100, "the sub-cap tail is served whole");
+}
+
 /// Seed a VP9-in-Matroska item (a real Firefox DirectPlay shape) so the
 /// `video/webm` relabel is exercised. The default `seed_with_file` uses an
 /// empty probe, which never triggers the codec-conditional relabel.
