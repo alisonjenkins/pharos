@@ -201,6 +201,11 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
         .unwrap_or_else(|| fixture_dir.clone());
     let paths = generate_seed_fixtures(&fixture_dir, &target_dir).await?;
     register_seed_items(&stores, &paths).await?;
+    // Probe the multitrack clip so PlaybackInfo advertises its 2 audio + 2
+    // subtitle streams. jellyfin-web hides the audio/subtitle track buttons
+    // for a single-track source, so the swap scenario needs the real stream
+    // list; register_seed_items writes an empty probe (pure DB, no ffmpeg).
+    seed_probe_multitrack(&stores, &paths.multitrack).await?;
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -443,6 +448,35 @@ async fn run_ffmpeg(args: &[&str]) -> Result<(), AppError> {
             "ffmpeg fixture generation failed",
         )));
     }
+    Ok(())
+}
+
+/// Probe the multitrack seed clip (id 8) with the same Prober the scanner
+/// uses, and rewrite its row with the real stream list so PlaybackInfo
+/// advertises the 2 audio + 2 subtitle tracks. Uses the libav prober on the
+/// `ffmpeg-lib` build (the transcode-worker sibling the recipe builds), else
+/// the ffprobe spawn prober — self-consistent stream indices, so an audio
+/// swap maps to the right source stream.
+#[cfg(debug_assertions)]
+async fn seed_probe_multitrack(stores: &Stores, path: &std::path::Path) -> Result<(), AppError> {
+    use pharos_core::{MediaItem, MediaKind, MediaStore, Prober};
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    let prober = pharos_scanner::LibavProber::with_discovered_bin();
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+    let prober = pharos_scanner::FfmpegProber::new();
+
+    let info = prober.probe(path).await?;
+    stores
+        .put(MediaItem {
+            id: 8,
+            path: path.to_path_buf(),
+            title: "Playwright Multitrack".into(),
+            kind: MediaKind::Movie,
+            probe: info.probe,
+            ..Default::default()
+        })
+        .await?;
     Ok(())
 }
 
