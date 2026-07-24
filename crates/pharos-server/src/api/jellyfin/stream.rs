@@ -623,6 +623,32 @@ async fn stream_audio(
     deliver_stream(&state, &req, path.id_str()).await
 }
 
+/// Cap for a single DirectPlay range response body.
+///
+/// A `<video>` opens a progressive (non-faststart) mp4 with an open-ended
+/// `Range: bytes=X-`; answering the whole `X..EOF` — up to ~1.8 GB for a
+/// feature film — in one body makes a reverse proxy temp-file the entire
+/// remainder before relaying (an unbuffered seek then takes minutes), and a
+/// stalled/reset progressive connection restarts the `<video>` at 0 (the
+/// Deadpool report). Capping to a bounded window the client simply re-requests
+/// keeps every response small and fast. 8 MiB ≈ 10 s at 6 Mbps.
+const DIRECTPLAY_RANGE_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Decide whether a DirectPlay `Range` should be answered as a *capped* window
+/// rather than deferred whole to `NamedFile`. `Some` only for a single
+/// `bytes=START-…` range whose served length exceeds `cap`; `None` for small,
+/// suffix (`bytes=-N`), multi-range, or unparseable headers — those stay on
+/// `NamedFile`, which handles the full range grammar (and its ETag / conditional
+/// / multipart behaviour) unchanged.
+fn capped_window(range_header: &str, total: u64, cap: u64) -> Option<super::seek::ContentRange> {
+    let range = super::seek::ByteRange::parse(range_header)?;
+    let served = range.served_len(total)?;
+    if served <= cap {
+        return None;
+    }
+    super::seek::ContentRange::window(range.start, total, cap)
+}
+
 /// P7 — when `StartTimeTicks` query is present AND no Range header
 /// supplied, translate ticks → byte offset and respond 206 starting
 /// at that byte. Range header wins when both are sent (matches
@@ -660,6 +686,36 @@ async fn deliver_stream(
         if let Some(witness) = super::seek::ResyncWitness::of(tolerance) {
             if let Some(offset) = byte_offset_from_ticks(&item, start_ticks).await {
                 return serve_from_offset(&item, offset, req, clock, witness).await;
+            }
+        }
+    }
+
+    // Cap an over-large / open-ended DirectPlay range to a bounded window so the
+    // client re-requests the next chunk. A single multi-GB `bytes=X-` answer
+    // stalls proxy buffering (minutes-long unbuffered seeks) and a reset
+    // progressive connection restarts the `<video>` at 0 (Deadpool). Capping a
+    // byte-range the client explicitly asked for is valid for ANY container (we
+    // return a prefix of the requested bytes), so — unlike the StartTimeTicks
+    // time→byte cut above — it needs no `ResyncWitness`. Small / suffix / multi
+    // ranges fall through to `NamedFile`.
+    if has_range {
+        if let Some(range_header) = req
+            .headers()
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+        {
+            let total = tokio::fs::metadata(&item.path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Some(window) = capped_window(range_header, total, DIRECTPLAY_RANGE_CAP_BYTES) {
+                tracing::debug!(
+                    media.id = item.id,
+                    range = range_header,
+                    content_range = %String::from_utf8_lossy(window.header_value().as_bytes()),
+                    "DirectPlay range capped to window"
+                );
+                return serve_content_range(&item, window, req, clock).await;
             }
         }
     }
@@ -763,6 +819,31 @@ async fn serve_from_offset(
     clock: Arc<AtomicI64>,
     _witness: super::seek::ResyncWitness,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let total = tokio::fs::metadata(&item.path)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("stat: {e}")))?
+        .len();
+    // A past-EOF offset is unrepresentable as a `ContentRange` → 416. `status()`
+    // is hard-wired to 206, so this response can never regress to a 200 the
+    // browser reads as "ranges unsupported" (the B94 case).
+    let Some(range) = super::seek::ContentRange::from_offset(offset, total) else {
+        return Err(error::ErrorRangeNotSatisfiable("StartTimeTicks past EOF"));
+    };
+    serve_content_range(item, range, req, clock).await
+}
+
+/// Stream a bounded `206` body for `range` from `item`'s file: seek to
+/// `range.offset()` and emit EXACTLY `range.content_length()` bytes with a
+/// `Content-Range` / `Content-Length` that match. Shared by the StartTimeTicks
+/// resume (`serve_from_offset`, whole tail) and the capped DirectPlay range
+/// (`deliver_stream`, a bounded window), so both answer a seek with a
+/// decodable, self-consistent partial body that never runs past its window.
+async fn serve_content_range(
+    item: &MediaItem,
+    range: super::seek::ContentRange,
+    req: &HttpRequest,
+    clock: Arc<AtomicI64>,
+) -> Result<HttpResponse, actix_web::Error> {
     // P25 — conditional GET. When the client's cached snapshot is
     // still current per `If-Modified-Since`, short-circuit with 304.
     let meta_for_lm = tokio::fs::metadata(&item.path).await.ok();
@@ -779,19 +860,7 @@ async fn serve_from_offset(
     let mut file = tokio::fs::File::open(&item.path)
         .await
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
-    let meta = file
-        .metadata()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(format!("stat: {e}")))?;
-    let total = meta.len();
-    // A past-EOF offset is unrepresentable as a `ContentRange` → 416. This is
-    // the SAME constructor that fixes the B94 `bytes=0-` → 200 case: `status()`
-    // is hard-wired to 206, so this response can never regress to a 200 the
-    // browser reads as "ranges unsupported".
-    let Some(range) = super::seek::ContentRange::from_offset(offset, total) else {
-        return Err(error::ErrorRangeNotSatisfiable("StartTimeTicks past EOF"));
-    };
-    file.seek(SeekFrom::Start(offset))
+    file.seek(SeekFrom::Start(range.offset()))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("seek: {e}")))?;
 
@@ -807,20 +876,27 @@ async fn serve_from_offset(
     if let Some(lm) = last_modified_from_meta(meta_for_lm.as_ref()) {
         resp_builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
     }
-    // Both branches carry a DECLARED length: a 206 must never fall back to
-    // chunked framing (strict clients refuse to seek a length-less partial
-    // body — the old code stripped Content-Length for every seek >16 MiB, i.e.
-    // almost all of them). Small files buffer to a sized `Vec`; large ones use
-    // a `SizedStream` so actix emits `Content-Length: {remaining}` and streams
-    // without buffering the whole tail into RSS.
+    // P24 — echo the auth as a cookie so a follow-up `<video>`-style fetch can
+    // drop the `?api_key=` and still authenticate (parity with the NamedFile
+    // branch of `deliver_stream`).
+    if let Some(token) = api_key_query_value(req.query_string()) {
+        if let Ok(hv) = HeaderValue::from_str(&auth_cookie_header(&token)) {
+            resp_builder.insert_header((header::SET_COOKIE, hv));
+        }
+    }
+    // Read EXACTLY `remaining` bytes — a capped window must NOT run to EOF, and a
+    // 206 must carry a declared length (never chunked framing). Small windows
+    // buffer to a sized `Vec`; large ones (a whole-tail resume) stream via a
+    // length-bounded `SizedStream`.
     let resp = if remaining <= 16 * 1024 * 1024 {
-        let mut buf = Vec::with_capacity(remaining as usize);
-        file.read_to_end(&mut buf)
+        let mut buf = vec![0u8; remaining as usize];
+        file.read_exact(&mut buf)
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
         resp_builder.body(buf)
     } else {
-        let stream = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024);
+        let limited = file.take(remaining);
+        let stream = tokio_util::io::ReaderStream::with_capacity(limited, 64 * 1024);
         let stream = futures_util::TryStreamExt::map_err(stream, |e| {
             actix_web::error::ErrorInternalServerError(format!("read: {e}"))
         });
@@ -982,6 +1058,41 @@ mod tests {
         assert_eq!(parse_start_time_ticks(""), 0);
         assert_eq!(parse_start_time_ticks("foo=bar"), 0);
         assert_eq!(parse_start_time_ticks("StartTimeTicks=notanumber"), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn capped_window_caps_open_ended_and_oversized_ranges() {
+        let total = 2_000_000_000; // ~2 GB feature film
+        let cap = 8 * 1024 * 1024;
+        // Open-ended near start → capped to an 8 MiB window at that offset.
+        let w = capped_window("bytes=379000000-", total, cap).unwrap();
+        assert_eq!(w.offset(), 379_000_000);
+        assert_eq!(w.content_length(), cap);
+        assert_eq!(w.end(), 379_000_000 + cap - 1);
+        // Open-ended from 0 (Firefox's opening probe) is also capped.
+        let w0 = capped_window("bytes=0-", total, cap).unwrap();
+        assert_eq!(w0.offset(), 0);
+        assert_eq!(w0.content_length(), cap);
+        // A closed range larger than the cap is capped too.
+        let wc = capped_window("bytes=100-900000000", total, cap).unwrap();
+        assert_eq!(wc.offset(), 100);
+        assert_eq!(wc.content_length(), cap);
+    }
+
+    #[::core::prelude::v1::test]
+    fn capped_window_defers_small_suffix_and_multi_to_namedfile() {
+        let total = 2_000_000_000;
+        let cap = 8 * 1024 * 1024;
+        // A range already within the cap is served whole by NamedFile.
+        assert!(capped_window("bytes=100-199", total, cap).is_none());
+        // Open-ended range whose tail is smaller than the cap (near EOF).
+        assert!(capped_window("bytes=1999000000-", total, cap).is_none());
+        // Suffix and multi-range are NamedFile's job.
+        assert!(capped_window("bytes=-500", total, cap).is_none());
+        assert!(capped_window("bytes=0-99,200-299", total, cap).is_none());
+        // Garbage / start past EOF.
+        assert!(capped_window("bytes=abc", total, cap).is_none());
+        assert!(capped_window("bytes=2000000000-", total, cap).is_none());
     }
 
     #[::core::prelude::v1::test]

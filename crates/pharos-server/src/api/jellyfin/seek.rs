@@ -82,9 +82,39 @@ impl ContentRange {
         .unwrap_or_else(|_| HeaderValue::from_static("bytes 0-0/0"))
     }
 
+    /// A capped window `[offset, min(offset + max_len, total))` served as `206`.
+    ///
+    /// Caps an over-large or open-ended client byte-range so a DirectPlay
+    /// response is a bounded chunk the client re-requests, rather than one
+    /// multi-GB body streamed to EOF. A single uncapped `bytes=X-` answer (up to
+    /// ~1.8 GB for a feature film) makes a reverse proxy temp-file the whole
+    /// remainder before relaying — so an unbuffered seek takes minutes and a
+    /// stalled/reset progressive connection restarts the `<video>` at 0
+    /// (Deadpool). Capping a range the client explicitly asked for is always
+    /// valid regardless of container (unlike a StartTimeTicks time→byte cut,
+    /// which needs a [`ResyncWitness`]): we return a prefix of the requested
+    /// bytes and the client asks for the next window.
+    ///
+    /// `None` when `offset >= total` (→ `416`) or `max_len == 0`.
+    pub fn window(offset: u64, total: u64, max_len: u64) -> Option<Self> {
+        if offset >= total || max_len == 0 {
+            return None;
+        }
+        let end = (offset + max_len - 1).min(total - 1);
+        Some(Self { offset, end, total })
+    }
+
     /// The mandatory `Content-Length` — the number of bytes in the window.
+    /// End-based so a capped [`window`](Self::window) reports its true (shorter)
+    /// length, not the whole tail; equals `total - offset` for a
+    /// [`from_offset`](Self::from_offset) window whose end is EOF.
     pub const fn content_length(&self) -> u64 {
-        self.total - self.offset
+        self.end - self.offset + 1
+    }
+
+    /// The inclusive end byte of the window.
+    pub const fn end(&self) -> u64 {
+        self.end
     }
 
     /// Byte offset the body starts at.
@@ -95,6 +125,62 @@ impl ContentRange {
     /// Total file length.
     pub const fn total(&self) -> u64 {
         self.total
+    }
+}
+
+// ──────────────────────────────── ByteRange ────────────────────────────────
+
+/// A single HTTP byte-range request — `bytes=START-` or `bytes=START-END`.
+///
+/// Suffix ranges (`bytes=-N`) and multi-range requests (`bytes=a-b,c-d`) parse
+/// to `None`; the caller defers those to `NamedFile`, which handles the full
+/// range grammar. This exists only to recognise the one shape a `<video>` (or
+/// native player) actually sends for progressive playback/seek so an
+/// over-large window can be capped ([`ContentRange::window`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    /// First byte requested.
+    pub start: u64,
+    /// Inclusive last byte, or `None` for an open-ended `bytes=START-`.
+    pub end: Option<u64>,
+}
+
+impl ByteRange {
+    /// Parse a `Range` header value. `None` for anything but a single
+    /// `bytes=START-` / `bytes=START-END` (suffix and multi-range included).
+    pub fn parse(header: &str) -> Option<Self> {
+        let spec = header.trim().strip_prefix("bytes=")?;
+        if spec.contains(',') {
+            return None; // multi-range → NamedFile
+        }
+        let (a, b) = spec.split_once('-')?;
+        // A suffix range ("bytes=-N") has an empty start → parse fails → None.
+        let start: u64 = a.trim().parse().ok()?;
+        let end = {
+            let b = b.trim();
+            if b.is_empty() {
+                None
+            } else {
+                Some(b.parse::<u64>().ok()?)
+            }
+        };
+        if let Some(e) = end {
+            if e < start {
+                return None; // inverted → NamedFile answers 416
+            }
+        }
+        Some(Self { start, end })
+    }
+
+    /// Bytes this range would serve from a `total`-byte file, or `None` when the
+    /// start is at/after EOF (the caller answers `416`). An open end resolves to
+    /// EOF.
+    pub fn served_len(&self, total: u64) -> Option<u64> {
+        if self.start >= total {
+            return None;
+        }
+        let end = self.end.unwrap_or(total - 1).min(total - 1);
+        Some(end - self.start + 1)
     }
 }
 
@@ -423,6 +509,98 @@ mod tests {
         let cr = ContentRange::from_offset(0, 100).unwrap();
         assert_eq!(cr.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(cr.header_value().to_str().unwrap(), "bytes 0-99/100");
+    }
+
+    #[test]
+    fn content_range_window_caps_to_max_len() {
+        // A window well inside the file is exactly max_len bytes.
+        let cr = ContentRange::window(10, 1000, 100).unwrap();
+        assert_eq!(cr.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(cr.offset(), 10);
+        assert_eq!(cr.end(), 109);
+        assert_eq!(cr.content_length(), 100);
+        assert_eq!(cr.header_value().to_str().unwrap(), "bytes 10-109/1000");
+    }
+
+    #[test]
+    fn content_range_window_clamps_to_eof() {
+        // Near EOF the window is shorter than max_len (never past the last byte).
+        let cr = ContentRange::window(950, 1000, 100).unwrap();
+        assert_eq!(cr.end(), 999);
+        assert_eq!(cr.content_length(), 50);
+        assert_eq!(cr.header_value().to_str().unwrap(), "bytes 950-999/1000");
+    }
+
+    #[test]
+    fn content_range_window_rejects_past_eof_and_zero_len() {
+        assert!(ContentRange::window(1000, 1000, 100).is_none()); // at EOF
+        assert!(ContentRange::window(1001, 1000, 100).is_none()); // past EOF
+        assert!(ContentRange::window(10, 1000, 0).is_none()); // zero cap
+    }
+
+    #[test]
+    fn byte_range_parses_open_and_closed() {
+        assert_eq!(
+            ByteRange::parse("bytes=100-"),
+            Some(ByteRange {
+                start: 100,
+                end: None
+            })
+        );
+        assert_eq!(
+            ByteRange::parse("bytes=100-199"),
+            Some(ByteRange {
+                start: 100,
+                end: Some(199)
+            })
+        );
+        assert_eq!(
+            ByteRange::parse("bytes=0-"),
+            Some(ByteRange {
+                start: 0,
+                end: None
+            })
+        );
+    }
+
+    #[test]
+    fn byte_range_rejects_suffix_multi_and_garbage() {
+        assert_eq!(ByteRange::parse("bytes=-500"), None); // suffix → NamedFile
+        assert_eq!(ByteRange::parse("bytes=0-99,200-299"), None); // multi-range
+        assert_eq!(ByteRange::parse("bytes=200-100"), None); // inverted
+        assert_eq!(ByteRange::parse("bytes=abc"), None);
+        assert_eq!(ByteRange::parse("items=0-5"), None); // wrong unit
+    }
+
+    #[test]
+    fn byte_range_served_len() {
+        // Open-ended resolves to EOF.
+        assert_eq!(
+            ByteRange {
+                start: 100,
+                end: None
+            }
+            .served_len(1000),
+            Some(900)
+        );
+        // Closed range is end-inclusive.
+        assert_eq!(
+            ByteRange {
+                start: 100,
+                end: Some(199)
+            }
+            .served_len(1000),
+            Some(100)
+        );
+        // Start at/after EOF → None (→ 416).
+        assert_eq!(
+            ByteRange {
+                start: 1000,
+                end: None
+            }
+            .served_len(1000),
+            None
+        );
     }
 
     #[test]
