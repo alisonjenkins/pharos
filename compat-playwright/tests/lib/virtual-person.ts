@@ -1,5 +1,5 @@
 import { Browser, BrowserContext, Page } from "@playwright/test";
-import { PHAROS_URL, SELECTORS, USERS } from "./handles";
+import { SELECTORS, USERS } from "./handles";
 import type { Probeable, VideoProbeLike } from "./sync-oracle";
 
 // A single "virtual person": an isolated jellyfin-web browser context running
@@ -78,20 +78,11 @@ export class VirtualPerson implements Probeable {
   private async connectAndLogin(user: string, pass: string): Promise<void> {
     const p = this.page;
     await p.goto("/", { waitUntil: "networkidle" });
-    // Some builds land straight on login if a server is already known.
-    const onSelect = await p
-      .getByText(SELECTORS.addServer)
-      .isVisible()
-      .catch(() => false);
-    if (onSelect) {
-      await p.getByText(SELECTORS.addServer).click();
-      const host = p.locator(SELECTORS.serverHost);
-      await host.waitFor({ timeout: 10_000 });
-      await host.fill(PHAROS_URL);
-      await p.getByRole("button", { name: SELECTORS.connect }).click();
-    }
-    await p.waitForURL(/#\/login/, { timeout: 20_000 });
-    await p.locator(SELECTORS.manualName).waitFor({ timeout: 10_000 });
+    // The webServer is a same-origin proxy to pharos (tools/jf-proxy.cjs), so
+    // jellyfin-web treats the serving origin as its Jellyfin server and boots
+    // straight to the login form — no server-selection step on any browser.
+    await p.waitForURL(/#\/login/, { timeout: 30_000 });
+    await p.locator(SELECTORS.manualName).waitFor({ timeout: 15_000 });
     await p.locator(SELECTORS.manualName).fill(user);
     await p.locator(SELECTORS.manualPassword).fill(pass);
     await p.getByRole("button", { name: SELECTORS.signIn }).click();

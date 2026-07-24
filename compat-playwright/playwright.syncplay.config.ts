@@ -5,10 +5,10 @@ import { defineConfig, devices } from "@playwright/test";
 //             (VP9 — the codec that browser advertises).
 //   - h264:   the demuxed-CMAF decode + audio-swap smoke on an h264-capable
 //             chromium (PHAROS_H264_BROWSER, exported by the devShell).
-// pharos + jellyfin-web are started by `just compat-syncplay`; the webServer
-// below serves the jellyfin-web bundle with a REST proxy to pharos.
+// pharos is started by `just compat-syncplay`; the webServer below runs a
+// same-origin proxy (tools/jf-proxy.cjs) that serves the jellyfin-web bundle and
+// forwards the REST API + /socket WebSocket to pharos.
 
-const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const JELLYFIN_WEB_PORT = parseInt(process.env.JELLYFIN_WEB_PORT ?? "8910", 10);
 const JELLYFIN_WEB_DIR = process.env.JELLYFIN_WEB_DIR;
 if (!JELLYFIN_WEB_DIR) {
@@ -65,7 +65,13 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: `npx http-server ${JELLYFIN_WEB_DIR} -p ${JELLYFIN_WEB_PORT} -s --cors --proxy ${PHAROS_URL}?`,
+    // Same-origin front-end: serves the jellyfin-web bundle AND reverse-proxies
+    // the REST API + the /socket WebSocket to pharos (see tools/jf-proxy.cjs).
+    // The browser sees ONE origin, so jellyfin-web boots straight to login on
+    // every browser — no cross-origin connect to pharos:8096 (which a full
+    // chromium can't reach in the CI container). JELLYFIN_WEB_DIR /
+    // JELLYFIN_WEB_PORT / PHAROS_URL are read from the environment by the proxy.
+    command: `node tools/jf-proxy.cjs`,
     port: JELLYFIN_WEB_PORT,
     reuseExistingServer: true,
     timeout: 30_000,
