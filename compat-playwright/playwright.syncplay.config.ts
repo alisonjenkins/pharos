@@ -21,7 +21,12 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: process.env.CI ? 2 : 0,
-  reporter: process.env.CI ? "github" : "list",
+  // On CI emit GitHub annotations AND an HTML report so a failure uploads
+  // usable evidence (traces/screenshots live under test-results/, which the
+  // HTML report bundles).
+  reporter: process.env.CI
+    ? [["github"], ["html", { open: "never" }]]
+    : "list",
   // The GPU-less CI runner transcodes in software, so each scenario's waits
   // are slower; give a generous per-test budget there (a passing test finishes
   // well under it — this only bounds the worst case).
@@ -51,6 +56,8 @@ export default defineConfig({
           // The nix chromium runs as root in the CI container and can't use the
           // sandbox there; /dev/shm is also tiny. The bundled Playwright
           // chromium handles this itself, but a raw executablePath does not.
+          // (The login-load stall was NOT a browser-boot problem — it was
+          // harness-side server-discovery; see virtual-person.ts connectAndLogin.)
           args: ["--no-sandbox", "--disable-dev-shm-usage"],
         },
       },
