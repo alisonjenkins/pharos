@@ -4,8 +4,14 @@
 
 export const SYNC_TOL_MS = 1500; // playing convergence: pairwise spread ceiling
 export const SEEK_TOL_MS = 1000; // seek accuracy vs the target position
-export const SETTLE_MS = 8000; // how long to poll for a predicate to hold
-export const POLL_MS = 200; // poll interval
+// How long to poll for a predicate to hold. This bounds how long we WAIT for a
+// video to start / re-converge — not the strictness of the sync (that's
+// SYNC_TOL_MS). CI runs on a GPU-less 16-vCPU runner where a first-segment
+// software transcode of 3 concurrent streams can take far longer than a warm
+// dev box, so allow a much larger window there; a passing test still exits the
+// poll early, so this only extends the FAILURE timeout.
+export const SETTLE_MS = process.env.CI ? 30_000 : 8000;
+export const POLL_MS = 250; // poll interval
 
 export interface VideoProbeLike {
   itemId: string | null;

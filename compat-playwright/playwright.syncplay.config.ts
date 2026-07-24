@@ -22,7 +22,10 @@ export default defineConfig({
   workers: 1,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? "github" : "list",
-  timeout: 150_000,
+  // The GPU-less CI runner transcodes in software, so each scenario's waits
+  // are slower; give a generous per-test budget there (a passing test finishes
+  // well under it — this only bounds the worst case).
+  timeout: process.env.CI ? 300_000 : 150_000,
 
   use: {
     baseURL: `http://127.0.0.1:${JELLYFIN_WEB_PORT}`,
@@ -43,7 +46,13 @@ export default defineConfig({
       testMatch: /syncplay-h264-codec\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
-        launchOptions: H264_BROWSER ? { executablePath: H264_BROWSER } : {},
+        launchOptions: {
+          ...(H264_BROWSER ? { executablePath: H264_BROWSER } : {}),
+          // The nix chromium runs as root in the CI container and can't use the
+          // sandbox there; /dev/shm is also tiny. The bundled Playwright
+          // chromium handles this itself, but a raw executablePath does not.
+          args: ["--no-sandbox", "--disable-dev-shm-usage"],
+        },
       },
     },
   ],
