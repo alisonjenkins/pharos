@@ -128,9 +128,9 @@ test.describe("syncplay group-watch matrix (chromium/VP9)", () => {
     await a.setNewQueue(["8"]); // multitrack item (2 audio + 2 subs)
     await a.unpause();
     await waitUntilInSync([a, b, c]);
-    await b.swapAudio(1); // B switches to the 2nd audio track
+    await b.swapAudio(); // B switches to the 2nd audio track
     await waitUntilInSync([a, b, c]); // B re-converges, group intact
-    await b.swapSubtitle(1); // B switches subtitle track
+    await b.swapSubtitle(); // B switches subtitle track
     await waitUntilInSync([a, b, c]);
     await a.close();
     await b.close();

@@ -48,7 +48,7 @@ test.describe("syncplay h264 codec smoke (real-codec browser)", () => {
       expect(pr.errorCode, `${p.label} video.error`).toBeNull();
     }
 
-    await b.swapAudio(1); // the PR#70 class: swap must reuse cached video
+    await b.swapAudio(); // the PR#70 class: swap must reuse cached video
     await waitUntilInSync([a, b]);
     await a.close();
     await b.close();
