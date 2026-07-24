@@ -1318,7 +1318,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     Ok(())
 }
 
-#[cfg(test)]
+// Both `test` AND `debug_assertions`: the seed helpers it exercises are
+// `#[cfg(debug_assertions)]`, so a release test build (e.g. `nix flake check`'s
+// clippy) that has `cfg(test)` but not `debug_assertions` would reference items
+// compiled out.
+#[cfg(all(test, debug_assertions))]
 mod seed_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
