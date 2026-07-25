@@ -151,7 +151,7 @@ async fn head_response(
     let item = load_item(state, id_str).await?;
     let file = NamedFile::open_async(&item.path)
         .await
-        .map_err(|e| error::ErrorNotFound(e.to_string()))?
+        .map_err(|e| source_unreadable(&item, &e))?
         .use_etag(true)
         .use_last_modified(true);
     let mut resp = file.into_response(req);
@@ -724,7 +724,7 @@ async fn deliver_stream(
 
     let file = NamedFile::open_async(&item.path)
         .await
-        .map_err(|e| error::ErrorNotFound(e.to_string()))?
+        .map_err(|e| source_unreadable(&item, &e))?
         .use_etag(true)
         .use_last_modified(true);
     let mut resp = file.into_response(req);
@@ -861,7 +861,7 @@ async fn serve_content_range(
 
     let mut file = tokio::fs::File::open(&item.path)
         .await
-        .map_err(|e| error::ErrorNotFound(e.to_string()))?;
+        .map_err(|e| source_unreadable(item, &e))?;
     file.seek(SeekFrom::Start(range.offset()))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("seek: {e}")))?;
@@ -907,6 +907,35 @@ async fn serve_content_range(
     Ok(meter_body(resp, clock))
 }
 
+/// Turn a failure to OPEN a known item's file into the 404 the client sees,
+/// after recording WHAT could not be opened and why.
+///
+/// The two 404s a video route can produce are indistinguishable to a client and
+/// used to be indistinguishable in the log as well: an unknown item id, and a
+/// known item whose bytes are not readable on disk. The second is a storage
+/// incident, not a catalogue one — when the mergerfs pool stopped, every path
+/// resolved to nothing, the whole library "just stopped playing", and all the
+/// evidence there was to work from was undifferentiated 404s.
+///
+/// The path stays in the log; the client is told only that the source is
+/// unreadable, since a filesystem layout is not a client's business.
+fn source_unreadable(item: &MediaItem, e: &std::io::Error) -> actix_web::Error {
+    let reason = match e.kind() {
+        std::io::ErrorKind::NotFound => "missing",
+        std::io::ErrorKind::PermissionDenied => "permission",
+        _ => "io",
+    };
+    tracing::warn!(
+        media.id = item.id,
+        path = %item.path.display(),
+        reason,
+        error = %e,
+        "media source is catalogued but unreadable on disk"
+    );
+    metrics::counter!("pharos_source_unreadable_total", "reason" => reason).increment(1);
+    error::ErrorNotFound("media source unreadable")
+}
+
 async fn load_item(state: &AppState, id_str: &str) -> Result<MediaItem, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
@@ -935,6 +964,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pharos_core::{MediaItem, MediaKind, MediaProbe};
+
+    /// A catalogued item whose bytes are gone still answers 404 — the client
+    /// contract is unchanged — but it must no longer be MUTE about it, and it
+    /// must not hand the client the server's filesystem layout.
+    #[test]
+    fn an_unreadable_source_is_a_404_that_names_itself_in_the_metric() {
+        let _ = crate::obs::init("info", None);
+        let item = MediaItem {
+            id: 4242,
+            path: "/mnt/media/gone.mkv".into(),
+            ..Default::default()
+        };
+        let err = source_unreadable(
+            &item,
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        );
+        assert_eq!(err.as_response_error().status_code(), StatusCode::NOT_FOUND);
+        assert!(
+            !err.to_string().contains("/mnt/media"),
+            "the on-disk path must not reach the client: {err}"
+        );
+
+        let rendered = crate::obs::render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("pharos_source_unreadable_total")
+                    && l.contains("reason=\"missing\"")),
+            "a vanished source must be countable apart from an unknown id; \
+             rendered:\n{rendered}"
+        );
+    }
 
     fn item_with_bitrate(bitrate_bps: Option<u64>, size_bytes: Option<u64>) -> MediaItem {
         MediaItem {
