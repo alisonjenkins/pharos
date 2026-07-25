@@ -368,7 +368,15 @@ impl SegmentIdentity {
         Self {
             media_id,
             seg_index,
-            audio_index: audio_index.unwrap_or(0),
+            // Only a segment that CARRIES audio is keyed by the audio track.
+            // The fMP4 surfaces deliver audio as a separate rendition and end
+            // their argv in `-an`, so their bytes are identical across tracks;
+            // keying them apart minted a second, byte-identical video ladder
+            // the moment a viewer switched audio track.
+            audio_index: match opts.audio_codec() {
+                Some(_) => audio_index.unwrap_or(0),
+                None => 0,
+            },
             subtitle_index: subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
             video_bitrate_kbps: kbps(opts.video_bitrate_bps),
             audio_bitrate_kbps: kbps(opts.audio_bitrate_bps()),
@@ -2855,6 +2863,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn an_audio_free_segment_is_not_keyed_by_the_audio_track() {
+        // A VP9 / h264-CMAF segment carries NO audio (`AudioDelivery::Separate`
+        // → the argv ends in `-an`), so two requests differing only in the
+        // client's AudioStreamIndex are the SAME bytes. Keying them apart minted
+        // a second, byte-identical video ladder the moment a viewer switched
+        // audio track, doubling GPU + NFS load mid-playback and dragging the
+        // encoder below realtime (Ghost in the Shell, 2026-07-25: 6 of 47
+        // segments encoded twice, each pair byte-for-byte equal).
+        let opts = ident_opts(
+            Some(SegmentVideo::Vp9),
+            None,
+            SegmentContainer::Fmp4,
+            Some(4_000_000),
+            None,
+        );
+        let track0 = SegmentIdentity::new(1, 7, Some(0), None, &opts);
+        let track1 = SegmentIdentity::new(1, 7, Some(1), None, &opts);
+        assert_eq!(track0, track1);
+        assert_eq!(track0.filename(), track1.filename());
+        assert_eq!(track0.etag(), track1.etag());
+    }
+
+    #[test]
+    fn a_muxed_segment_is_still_keyed_by_the_audio_track() {
+        // The converse must hold: an mpegts segment DOES carry the chosen
+        // track's audio, so collapsing its key would serve one track's bytes
+        // under another's request.
+        let opts = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        assert_ne!(
+            SegmentIdentity::new(1, 7, Some(0), None, &opts),
+            SegmentIdentity::new(1, 7, Some(1), None, &opts)
+        );
     }
 
     #[test]
