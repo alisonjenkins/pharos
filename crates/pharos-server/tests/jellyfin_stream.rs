@@ -395,14 +395,17 @@ async fn seed_vp9_mkv() -> (web::Data<AppState>, String, TempDir) {
     (state, token.0.expose().to_string(), td)
 }
 
-// A WebM-legal Matroska (VP8/VP9/AV1) plays in Firefox as `video/webm`, but
-// `mime_guess` maps `.mkv` to `video/x-matroska`, which Firefox rejects
-// outright. The relabel used to live ONLY in deliver_stream's whole-file branch,
-// so a Range seek and the HEAD seekability probe served the rejected type and
-// regressed a stream that plain-opened fine. `seek::DeliveryMime` now computes
-// the type once, so open / range-seek / HEAD must all agree on `video/webm`.
+// Open / range-seek / HEAD must all report the SAME Content-Type: the relabel
+// once lived only in deliver_stream's whole-file branch, so a Range seek and
+// the HEAD seekability probe disagreed with the plain open and regressed a
+// stream that opened fine. `seek::DeliveryMime` computes the type once.
+//
+// The agreed type for a .mkv is `video/x-matroska` (B107). Serving it as
+// `video/webm` never made it playable — a browser demuxes the container before
+// the codecs, and Firefox refuses EBML DocType `matroska` outright — it only
+// misdescribed the bytes. Such a source is downgraded to a transcode upstream.
 #[actix_web::test]
-async fn webm_legal_mkv_serves_video_webm_on_open_seek_and_head() {
+async fn mkv_reports_one_consistent_content_type_on_open_seek_and_head() {
     let (state, token, _td) = seed_vp9_mkv().await;
     let app = test::init_service(build_app(state)).await;
 
@@ -422,7 +425,11 @@ async fn webm_legal_mkv_serves_video_webm_on_open_seek_and_head() {
             .to_request(),
     )
     .await;
-    assert_eq!(content_type(&open).as_deref(), Some("video/webm"), "open");
+    assert_eq!(
+        content_type(&open).as_deref(),
+        Some("video/x-matroska"),
+        "open"
+    );
 
     // 2) Range seek (goes through the NamedFile + B94 branch).
     let seek = test::call_service(
@@ -437,8 +444,8 @@ async fn webm_legal_mkv_serves_video_webm_on_open_seek_and_head() {
     assert_eq!(seek.status(), 206);
     assert_eq!(
         content_type(&seek).as_deref(),
-        Some("video/webm"),
-        "a range seek must not regress to video/x-matroska"
+        Some("video/x-matroska"),
+        "a range seek must agree with the plain open"
     );
 
     // 3) HEAD seekability probe.
@@ -453,7 +460,7 @@ async fn webm_legal_mkv_serves_video_webm_on_open_seek_and_head() {
     .await;
     assert_eq!(
         content_type(&head).as_deref(),
-        Some("video/webm"),
+        Some("video/x-matroska"),
         "the HEAD probe must advertise the same type the GET body carries"
     );
 }

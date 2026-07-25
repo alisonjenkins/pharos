@@ -216,32 +216,34 @@ impl DeliveryMime {
     }
 }
 
-/// True when the source is a Matroska/WebM container whose video codec is
-/// browser-legal in a `video/webm` MSE stream (VP8/VP9/AV1). Mirrors the
-/// original `deliver_stream` predicate exactly so the relabel is behaviour-
-/// identical, just centralised.
+/// True when the source really IS a WebM container, and so may be served as
+/// `video/webm`.
+///
+/// This used to relabel any Matroska carrying WebM-legal video (VP8/VP9/AV1),
+/// on the premise that a browser would then accept it. It does not (B107):
+/// a browser demuxes the container before it reaches a codec, and Firefox has
+/// no Matroska demuxer — it reads the EBML DocType, finds `matroska` where
+/// WebM requires `webm`, and refuses the file however WebM-legal its streams
+/// are. The relabel therefore never made a .mkv playable; it only made pharos
+/// describe it as something it is not, and Firefox reported the container it
+/// had sniffed rather than the Content-Type we sent, which is why the error
+/// named a type pharos never emitted.
+///
+/// The extension is the discriminator, because ffprobe reports `matroska,webm`
+/// for every member of the family (see `container_for`).
 fn source_is_webm_legal(item: &MediaItem) -> bool {
-    let webm_video = matches!(
-        item.probe
-            .video_codec
-            .as_deref()
-            .map(|c| c.to_ascii_lowercase())
-            .as_deref(),
-        Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
-    );
-    let matroska = matches!(
-        item.probe
-            .container
-            .as_deref()
-            .map(|c| c.to_ascii_lowercase())
-            .as_deref(),
-        Some("webm" | "matroska" | "mkv")
-    ) || item
+    let ext_is_webm = item
         .path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("webm"));
-    webm_video && matroska
+        .is_some_and(|e| e.eq_ignore_ascii_case("webm"));
+    // A probe reporting bare `webm` (no `matroska` alias) is unambiguous too.
+    let probe_is_webm = item
+        .probe
+        .container
+        .as_deref()
+        .is_some_and(|c| c.eq_ignore_ascii_case("webm"));
+    ext_is_webm || probe_is_webm
 }
 
 // ──────────────────────────── Cut tolerance ────────────────────────────────
@@ -522,16 +524,24 @@ mod tests {
     }
 
     #[test]
-    fn delivery_mime_relabels_webm_legal_matroska() {
-        let mkv_vp9 = item(Some("matroska"), Some("vp9"), "/m/x.mkv");
+    fn delivery_mime_never_calls_a_matroska_webm() {
+        // B107 — a vp9/av1 .mkv is NOT a WebM file. Serving it as `video/webm`
+        // did not make Firefox play it (no Matroska demuxer, DocType checked),
+        // it only misdescribed the bytes.
+        let mkv_vp9 = item(Some("matroska,webm"), Some("vp9"), "/m/x.mkv");
         assert_eq!(
             DeliveryMime::for_source(&mkv_vp9)
                 .header()
                 .to_str()
                 .unwrap(),
-            "video/webm"
+            "video/x-matroska"
         );
-        let webm_av1 = item(Some("webm"), Some("av1"), "/m/x.webm");
+    }
+
+    #[test]
+    fn delivery_mime_serves_a_genuine_webm_as_webm() {
+        // Same ffprobe alias list, real WebM file — the extension decides.
+        let webm_av1 = item(Some("matroska,webm"), Some("av1"), "/m/x.webm");
         assert_eq!(
             DeliveryMime::for_source(&webm_av1)
                 .header()
@@ -548,8 +558,6 @@ mod tests {
             DeliveryMime::for_source(&mp4).header().to_str().unwrap(),
             "video/mp4"
         );
-        // h264-in-mkv is NOT webm-legal; the router downgrades it to transcode,
-        // so DirectPlay never relabels it (mirrors the original predicate).
         let mkv_h264 = item(Some("matroska"), Some("h264"), "/m/x.mkv");
         assert_eq!(
             DeliveryMime::for_source(&mkv_h264)
