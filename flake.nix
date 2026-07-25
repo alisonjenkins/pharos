@@ -482,6 +482,40 @@
         # at publish time. Avoids materialising + gzipping the ~150 MB tarball
         # into the nix store (and the artifact round-trip). Same args as
         # buildLayeredImage.
+        # Fonts for subtitle burn-in. libass resolves every font name through
+        # fontconfig, and the distroless image shipped neither fonts nor a
+        # fontconfig cache: each burn logged "No writable cache directories
+        # /var/cache/fontconfig /var/lib/pharos/.cache/fontconfig", rescanned
+        # from nothing, and flooded stderr — which then filled the tail the
+        # worker reports, hiding the actual ffmpeg error behind the noise.
+        #
+        # DejaVu is libass's own default family; Liberation supplies the
+        # metric-compatible Arial/Times/Courier that subtitle scripts name far
+        # more often than they ship.
+        subtitleFonts = pkgs.symlinkJoin {
+          name = "pharos-subtitle-fonts";
+          paths = [ pkgs.dejavu_fonts pkgs.liberation_ttf ];
+        };
+        # A fonts.conf whose <cachedir> is a cache built HERE, so the running
+        # container never needs to write one.
+        fontsConf = pkgs.runCommand "pharos-fonts-conf"
+          { nativeBuildInputs = [ pkgs.fontconfig ]; } ''
+            mkdir -p $out/etc/fonts $out/var/cache/fontconfig
+            cat > $out/etc/fonts/fonts.conf <<EOF
+            <?xml version="1.0"?>
+            <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+            <fontconfig>
+              <dir>${subtitleFonts}/share/fonts</dir>
+              <cachedir>$out/var/cache/fontconfig</cachedir>
+              <!-- Generic-family and metric-alias rules. Without them a
+                   script asking for Arial resolves to whatever sorts first
+                   rather than to metric-compatible Liberation Sans. -->
+              <include ignore_missing="yes">${pkgs.fontconfig.out}/etc/fonts/conf.d</include>
+            </fontconfig>
+            EOF
+            FONTCONFIG_FILE=$out/etc/fonts/fonts.conf fc-cache --force --system-only
+          '';
+
         ociImage = pkgs.dockerTools.streamLayeredImage {
           name = "pharos";
           tag = "latest";
@@ -492,6 +526,8 @@
             pkgs.ffmpeg-headless
             pkgs.cacert
             pkgs.tzdata
+            subtitleFonts
+            fontsConf
           ];
           # Real /etc + state dirs in the rootfs (see note above). chmod 1777
           # /tmp for ffmpeg + tokio getrandom; a passwd/group entry for the
@@ -518,6 +554,9 @@
               # Explicit worker path so the transcode scheduler uses the
               # crash-isolated worker pool, not the inline-ffmpeg fallback.
               "PHAROS_TRANSCODE_WORKER=${transcodeWorker}/bin/transcode-worker"
+              # Subtitle burn-in: point libass at the prebuilt font cache
+              # (see `fontsConf`) so no burn ever tries to write one.
+              "FONTCONFIG_FILE=${fontsConf}/etc/fonts/fonts.conf"
             ];
             WorkingDir = "/var/lib/pharos";
           };
