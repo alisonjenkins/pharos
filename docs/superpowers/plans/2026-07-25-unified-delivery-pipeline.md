@@ -110,6 +110,40 @@ change, or it proves nothing.
 
 **This is the fix.**
 
+### Mechanism — VALIDATED against real ffmpeg before plumbing (2026-07-25)
+
+One continuous encode of the whole title as **MPEG-TS** (self-framing AND
+carries absolute PTS, so `-ss` lands on the global grid; ADTS cannot be seeked
+accurately and a growing MP4 is not streamable):
+
+```
+ffmpeg -i SRC -vn -map 0:a:0 -c:a aac -b:a 128k -ac 2 -f mpegts audio.ts
+```
+
+Each segment then takes it as a second input and copies the slice:
+
+```
+ffmpeg -ss S -i SRC -ss S -i audio.ts -t D \
+       -map 0:v:0 -map 1:a:0 -c:v <enc> -c:a copy -sn \
+       -f mpegts -muxdelay 0 -muxpreload 0 -output_ts_offset S
+```
+
+Measured on a 23.976/48 kHz fixture, segments 3 and 4:
+
+| | today (per-segment encode) | with continuous copy |
+|---|---|---|
+| phase between first samples | 281.53 frames (**non-integer**) | **288.0000 frames** |
+| boundary overlap | 31 ms, differently encoded, phase-shifted | 42.7 ms, byte-identical, same grid |
+
+The overlap gets *larger* and that is fine — it is now the same frames at the
+same PTS, which a player resolves by overwrite. Drift is impossible because
+there is only one grid. `-accurate_seek` makes no difference under `-c copy`
+(verified both ways), so no extra flag is needed.
+
+**Test assertion correction:** "no overlap" is the wrong invariant for a
+stream-copy boundary. Assert instead: (a) phase is a whole number of frames —
+the fix; (b) no GAP — audio is never missing; (c) overlap is bounded (< 100 ms).
+
 **Files:**
 - Modify: `crates/pharos-transcode/src/lib.rs` (argv builder: second input + `-c:a copy`)
 - Modify: `crates/pharos-transcode/src/segment.rs` (`SegmentOpts` carries the continuous-audio path, not an audio codec)
