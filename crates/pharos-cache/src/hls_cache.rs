@@ -1114,6 +1114,276 @@ impl HlsSegmentCache {
         Ok(args)
     }
 
+    // ---- Continuous AAC encode, for segments that MUX their audio ----------
+    //
+    // The mpegts surface (native / Google TV) muxes audio into each media
+    // segment. Encoding that audio per segment re-primes the AAC encoder at
+    // every boundary: each segment emits its own priming frame and starts a
+    // fresh frame grid at its own seek point, so consecutive segments carry
+    // overlapping, phase-misaligned audio — the same instants encoded twice,
+    // at different timestamps, from different encoder state. Measured live on
+    // Fringe S01E02: 6.037 s of audio against 6.006 s of video in every
+    // segment, and the copies 0.53 of a frame out of phase with each other.
+    //
+    // The fix is one encode per title, sliced by copy. This produces that
+    // encode; the segment ffmpeg takes it as a second input and `-c:a copy`s
+    // the slice, so every audio frame belongs to exactly one segment at a
+    // deterministic PTS and there is only one grid to drift from.
+    //
+    // MPEG-TS rather than ADTS or a growing MP4: it is self-framing AND
+    // carries absolute PTS, so the segment's `-ss` lands on the global grid.
+
+    /// Where the continuous encode for one `(media, track, bitrate)` lives.
+    fn continuous_audio_root(
+        &self,
+        media_id: u64,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+    ) -> PathBuf {
+        let a = audio_index.unwrap_or(0);
+        let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
+        self.root
+            .join("_contaudio")
+            .join(format!("{media_id}-a{a}-b{br}"))
+    }
+
+    /// Start position of the session that can serve a segment starting at
+    /// `want_start_secs`.
+    ///
+    /// The segment's ffmpeg seeks BOTH inputs to the same point — one decode
+    /// preroll before the segment start — because two inputs seeked to
+    /// different positions are re-based by different amounts and the audio
+    /// would land offset from the video by the difference. So the continuous
+    /// encode has to reach back at least that far, not merely to the segment
+    /// start.
+    ///
+    /// Snapped down to the audio grid so that repeated requests around one
+    /// playhead resolve to the SAME session instead of spawning a new encode
+    /// per segment.
+    fn continuous_audio_session_start_secs(want_start_secs: f64) -> f64 {
+        let earliest = want_start_secs - pharos_transcode::DECODE_PREROLL_SECONDS;
+        if earliest <= 0.0 {
+            return 0.0;
+        }
+        (earliest / Self::AUDIO_SEGMENT_SECONDS).floor() * Self::AUDIO_SEGMENT_SECONDS
+    }
+
+    /// Session directory for a continuous encode starting at `start_secs`.
+    /// Whole-file sessions own the root; every seek session gets its own,
+    /// for the same reason the rendition sessions do.
+    fn continuous_audio_session_dir(root: &Path, start_secs: f64) -> PathBuf {
+        if start_secs <= 0.0 {
+            root.to_path_buf()
+        } else {
+            root.join(format!("s{}", start_secs as u64))
+        }
+    }
+
+    /// ffmpeg argv for one continuous encode. Source-anchored exactly as the
+    /// rendition sessions are: `-ss X` with a matching `-output_ts_offset X`,
+    /// which cancel, so every sample keeps its true source timestamp and a
+    /// seek session's output is interchangeable with the whole-file one.
+    fn continuous_audio_args(
+        source: &Path,
+        dir: &Path,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+        start_secs: f64,
+    ) -> Result<Vec<String>, HlsCacheError> {
+        let src = source.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
+        let out = dir.join("audio.ts");
+        let out_s = out.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
+        if start_secs > 0.0 {
+            args.push("-ss".into());
+            args.push(format!("{start_secs:.6}"));
+        }
+        args.push("-i".into());
+        args.push(src.into());
+        args.push("-vn".into());
+        args.push("-map".into());
+        args.push(match audio_index {
+            Some(i) => format!("0:a:{i}"),
+            None => "0:a:0?".into(),
+        });
+        args.extend(
+            [
+                "-c:a",
+                "aac",
+                "-b:a",
+                &audio_bitrate_bps.unwrap_or(128_000).to_string(),
+                "-ac",
+                "2",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        if start_secs > 0.0 {
+            args.push("-output_ts_offset".into());
+            args.push(format!("{start_secs:.6}"));
+        }
+        // The mpegts muxer's default 1.4 s initial cue delay would shift every
+        // sample away from its source timestamp, which is the one thing this
+        // encode exists to preserve.
+        args.extend(
+            ["-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0"]
+                .into_iter()
+                .map(String::from),
+        );
+        // How far the encode has got, so a reader can wait for coverage
+        // instead of probing a file that is still being written.
+        args.push("-progress".into());
+        args.push(
+            pharos_transcode::progress_sidecar_path(&out)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        args.push("-y".into());
+        args.push(out_s.into());
+        Ok(args)
+    }
+
+    /// Source position the session starting at `start_secs` has encoded up to,
+    /// read from its progress report. `None` while it has produced nothing.
+    ///
+    /// `out_time` counts from the session's own first sample and does NOT
+    /// include `-output_ts_offset` (verified against ffmpeg 8.1), so the
+    /// covered position is the session start plus it.
+    async fn continuous_audio_covered_secs(dir: &Path, start_secs: f64) -> Option<f64> {
+        let report = tokio::fs::read_to_string(pharos_transcode::progress_sidecar_path(
+            &dir.join("audio.ts"),
+        ))
+        .await
+        .ok()?;
+        let out_time = report
+            .lines()
+            .filter_map(|l| l.strip_prefix("out_time_us="))
+            .filter_map(|v| v.trim().parse::<f64>().ok())
+            .next_back()?;
+        Some(start_secs + out_time / 1e6)
+    }
+
+    /// Ensure a continuous AAC encode exists covering `[want_start_secs,
+    /// want_end_secs)` and return the file a segment should `-c:a copy` from.
+    ///
+    /// Blocks until the encode has reached `want_end_secs`, or until the
+    /// session that was producing it exits — an encode that ran to completion
+    /// without reaching the request has hit the end of the source, and its
+    /// output is as complete as it will ever be.
+    pub async fn ensure_continuous_audio_covering(
+        &self,
+        source: &Path,
+        media_id: u64,
+        audio_index: Option<u32>,
+        audio_bitrate_bps: Option<u64>,
+        want_start_secs: f64,
+        want_end_secs: f64,
+    ) -> Result<PathBuf, HlsCacheError> {
+        let root = self.continuous_audio_root(media_id, audio_index, audio_bitrate_bps);
+        let start_secs = Self::continuous_audio_session_start_secs(want_start_secs);
+        // A whole-file session that has already got this far serves the
+        // request without spawning anything; prefer it so ordinary sequential
+        // play does not accumulate one encode per seek.
+        for candidate in [0.0, start_secs] {
+            if candidate > want_start_secs {
+                continue;
+            }
+            let dir = Self::continuous_audio_session_dir(&root, candidate);
+            if Self::continuous_audio_covered_secs(&dir, candidate)
+                .await
+                .is_some_and(|c| c >= want_end_secs)
+            {
+                return Ok(dir.join("audio.ts"));
+            }
+        }
+
+        let dir = Self::continuous_audio_session_dir(&root, start_secs);
+        let file = dir.join("audio.ts");
+        let running = root.join(format!(".running-cont-{}", start_secs as u64));
+        let lock = {
+            let mut state = self.state.lock().await;
+            state
+                .audio_locks
+                .entry(running.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let spawned = {
+            let _guard = lock.lock().await;
+            if tokio::fs::try_exists(&running).await.unwrap_or(false) {
+                false
+            } else {
+                tokio::fs::create_dir_all(&dir).await?;
+                tokio::fs::write(&running, b"").await?;
+                let args = Self::continuous_audio_args(
+                    source,
+                    &dir,
+                    audio_index,
+                    audio_bitrate_bps,
+                    start_secs,
+                )?;
+                let bin = self.transcoder.binary().to_path_buf();
+                let marker = running.clone();
+                tracing::info!(
+                    media.id = media_id,
+                    start_secs,
+                    "continuous audio: spawning AAC encode for muxed segments"
+                );
+                tokio::spawn(async move {
+                    let mut cmd = tokio::process::Command::new(&bin);
+                    cmd.args(&args)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                    match cmd.spawn() {
+                        Ok(mut child) => {
+                            if let Ok(s) = child.wait().await {
+                                if !s.success() {
+                                    tracing::warn!(
+                                        media.id = media_id,
+                                        ?s,
+                                        "continuous audio encode exited non-zero"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            media.id = media_id,
+                            error = %e,
+                            "failed to spawn continuous audio encode"
+                        ),
+                    }
+                    let _ = tokio::fs::remove_file(&marker).await;
+                });
+                true
+            }
+        };
+        let _ = spawned;
+
+        for _ in 0..Self::AUDIO_POLL_MAX {
+            if Self::continuous_audio_covered_secs(&dir, start_secs)
+                .await
+                .is_some_and(|c| c >= want_end_secs)
+            {
+                return Ok(file);
+            }
+            // The encode finished without reaching the request: it ran out of
+            // source. Whatever it wrote is final, so stop waiting for more.
+            if !tokio::fs::try_exists(&running).await.unwrap_or(false)
+                && tokio::fs::try_exists(&file).await.unwrap_or(false)
+            {
+                return Ok(file);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                Self::AUDIO_POLL_INTERVAL_MS,
+            ))
+            .await;
+        }
+        Err(HlsCacheError::Transcode(format!(
+            "continuous audio encode did not reach {want_end_secs:.3}s for media {media_id}"
+        )))
+    }
+
     /// Poll interval + budgets for [`audio_hls_file`](Self::audio_hls_file).
     /// The old flat "100 × 50 ms = 5 s then 404" gave up while a cold session
     /// was STILL PRODUCING: a deep seek spawns an ffmpeg that must open the
@@ -1391,6 +1661,111 @@ mod tests {
                 .await
                 .unwrap(),
             "sidecar left behind"
+        );
+    }
+
+    #[test]
+    fn a_continuous_audio_session_reaches_back_past_the_decode_preroll() {
+        // The segment's ffmpeg seeks BOTH inputs to one preroll before the
+        // segment start, because two inputs seeked to different positions are
+        // re-based by different amounts and the audio would land offset from
+        // the video by the difference. A session that only reached the segment
+        // start would be seeked before its own content.
+        let want = 162.5;
+        let start = HlsSegmentCache::continuous_audio_session_start_secs(want);
+        assert!(
+            start <= want - pharos_transcode::DECODE_PREROLL_SECONDS,
+            "session starts at {start}, not far enough back for a preroll \
+             before {want}"
+        );
+        // Snapped to the audio grid, so repeated requests around one playhead
+        // resolve to the same session instead of one encode per segment.
+        assert_eq!(start % HlsSegmentCache::AUDIO_SEGMENT_SECONDS, 0.0);
+    }
+
+    #[test]
+    fn an_early_continuous_audio_request_starts_at_the_file_head() {
+        for want in [0.0, 6.006, 15.0] {
+            assert_eq!(
+                HlsSegmentCache::continuous_audio_session_start_secs(want),
+                0.0,
+                "want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_continuous_audio_session_is_source_anchored() {
+        // `-ss X` and `-output_ts_offset X` cancel exactly, so every sample
+        // keeps its true source timestamp and a seek session's output is
+        // interchangeable with the whole-file one. They must agree to the
+        // digit or they no longer cancel.
+        let args = HlsSegmentCache::continuous_audio_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/_contaudio/1-a0-b128/s150"),
+            Some(1),
+            Some(128_000),
+            150.0,
+        )
+        .unwrap();
+        let at = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|i| args[i + 1].clone())
+        };
+        assert_eq!(at("-ss"), Some("150.000000".into()));
+        assert_eq!(at("-output_ts_offset"), Some("150.000000".into()));
+        assert_eq!(at("-c:a"), Some("aac".into()));
+        assert_eq!(at("-map"), Some("0:a:1".into()));
+        assert_eq!(at("-f"), Some("mpegts".into()));
+        // Without these the muxer's 1.4 s initial cue delay shifts every
+        // sample away from the source timestamp this encode exists to keep.
+        assert_eq!(at("-muxdelay"), Some("0".into()));
+        assert_eq!(at("-muxpreload"), Some("0".into()));
+        assert!(args.iter().any(|a| a == "-vn"), "{args:?}");
+        assert_eq!(
+            at("-progress"),
+            Some("/c/_contaudio/1-a0-b128/s150/audio.ts.progress".into())
+        );
+    }
+
+    #[test]
+    fn a_whole_file_continuous_audio_session_has_no_anchor_to_cancel() {
+        let args = HlsSegmentCache::continuous_audio_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/_contaudio/1-a0-b128"),
+            None,
+            None,
+            0.0,
+        )
+        .unwrap();
+        assert!(!args.iter().any(|a| a == "-ss"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "-output_ts_offset"), "{args:?}");
+        assert!(args.iter().any(|a| a == "0:a:0?"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn continuous_audio_coverage_is_the_session_start_plus_its_progress() {
+        // `out_time` counts from the session's own first sample and does not
+        // include `-output_ts_offset`, so a seek session that reports 28 s has
+        // covered its start plus 28 — reading it as an absolute position would
+        // make every seek session look 150 s behind and wait forever.
+        let td = TempDir::new().unwrap();
+        tokio::fs::write(
+            td.path().join("audio.ts.progress"),
+            "out_time_us=1000000\nprogress=continue\nout_time_us=28000000\nprogress=end\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            HlsSegmentCache::continuous_audio_covered_secs(td.path(), 150.0).await,
+            Some(178.0)
+        );
+        // Nothing produced yet is not "covered from 0".
+        let empty = TempDir::new().unwrap();
+        assert_eq!(
+            HlsSegmentCache::continuous_audio_covered_secs(empty.path(), 150.0).await,
+            None
         );
     }
 
