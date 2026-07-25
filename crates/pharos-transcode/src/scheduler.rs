@@ -138,6 +138,27 @@ pub enum SinkRequest {
     LiveStream,
 }
 
+impl SinkRequest {
+    /// Bounded label for the `sink` span field. Stable strings: a dashboard
+    /// keyed on these breaks silently if renamed.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FileDirect { .. } => "file",
+            Self::LiveStream => "live_stream",
+        }
+    }
+
+    /// Whether this sink's byte count is something the worker can actually
+    /// measure. A live stream's bytes go straight down the pipe to the main
+    /// process, so the worker reports `0` — which is indistinguishable from
+    /// "produced nothing" in a log, and read as exactly that during the Ghost
+    /// in the Shell investigation (two jobs looked like silent empty encodes;
+    /// they were healthy live streams).
+    pub fn measures_out_bytes(&self) -> bool {
+        matches!(self, Self::FileDirect { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobDone {
     pub device: DeviceId,
@@ -591,13 +612,20 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     // by job id.
                     ctx.span.record("queue_wait_ms", queue_ms);
                     ctx.span.record("encode_ms", encode_ms);
-                    ctx.span.record("out_bytes", out_bytes);
+                    // Only record a byte count the worker could actually
+                    // measure: a live-stream job's bytes go down the pipe, so
+                    // its `0` means "not measured", not "produced nothing".
+                    // Leaving the field ABSENT says that; writing 0 lies.
+                    if ctx.sink.measures_out_bytes() {
+                        ctx.span.record("out_bytes", out_bytes);
+                    }
                     ctx.span.record("outcome", "done");
                     ctx.span.in_scope(|| {
                         tracing::info!(
                             %job_id,
                             %device,
                             out_bytes,
+                            sink = ctx.sink.label(),
                             class = %ctx.class,
                             queue_wait_ms = queue_ms,
                             encode_ms,
@@ -820,6 +848,7 @@ fn record_placement(
         job_id = %job_id,
         device = %dev,
         class = %ctx.class,
+        sink = ctx.sink.label(),
         decode_accel = %decode,
         decode_on_gpu = decode.is_gpu(),
         video = ?ctx.opts.video,
@@ -1157,6 +1186,21 @@ mod tests {
     use crate::options::{AudioCodec, Container, VideoCodec};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn only_a_file_sink_claims_to_have_measured_its_output() {
+        // `out_bytes: 0` from a live-stream job means "the worker never saw the
+        // bytes", not "the encode produced nothing". Conflating them cost a
+        // wrong lead during the Ghost in the Shell investigation.
+        let file = SinkRequest::FileDirect {
+            out_path: PathBuf::from("/tmp/x.ts"),
+        };
+        assert!(file.measures_out_bytes());
+        assert!(!SinkRequest::LiveStream.measures_out_bytes());
+        assert_eq!(file.label(), "file");
+        assert_eq!(SinkRequest::LiveStream.label(), "live_stream");
+        assert_ne!(file.label(), SinkRequest::LiveStream.label());
+    }
 
     fn h264() -> TranscodeOptions {
         TranscodeOptions {
