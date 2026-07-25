@@ -2933,6 +2933,7 @@ name = "pharos-cache"
 version = "0.0.0"
 dependencies = [
  "dashmap",
+ "metrics",
  "pharos-core",
  "pharos-transcode",
  "serde_json",

@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 dashmap.workspace = true
+metrics.workspace = true
 pharos-core = { path = "../pharos-core" }
 pharos-transcode = { path = "../pharos-transcode", default-features = false }
 serde_json.workspace = true

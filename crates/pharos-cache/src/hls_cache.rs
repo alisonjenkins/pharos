@@ -84,6 +84,46 @@ pub struct SegmentIdentity {
 
 const NO_SUBTITLE: i32 = -1;
 
+/// How producing one segment ended.
+///
+/// Every value here is a failure mode that reached production SILENTLY. A
+/// decoder that cannot rebuild its reference list drops frames and ffmpeg
+/// still exits 0; a hardware encoder fed an option it rejects emits a broken
+/// bitstream and exits 0. Nothing counted either, so the only evidence was a
+/// user reporting a frozen picture. These are the counters that make the same
+/// class visible without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentOutcome {
+    /// Produced and cached.
+    Ok,
+    /// Carried less video than its duration implies — see `short_of_frames`.
+    Short,
+    /// Below the minimum plausible size for a segment.
+    Empty,
+    /// The transcode itself failed.
+    Failed,
+}
+
+impl SegmentOutcome {
+    /// The `outcome` label. Stable strings: a dashboard or alert keyed on
+    /// these breaks silently if they are renamed, so the mapping is spelled
+    /// out here and asserted in a test rather than written inline at each
+    /// emission site.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Short => "short",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Count one segment production attempt.
+fn record_segment_outcome(outcome: SegmentOutcome) {
+    metrics::counter!("pharos_segment_produced_total", "outcome" => outcome.label()).increment(1);
+}
+
 /// What ffmpeg reported it actually produced, read from the `-progress`
 /// sidecar next to `out` — which is removed on the way out, success or not.
 /// `(frames, out_time_seconds)`.
@@ -496,7 +536,10 @@ impl HlsSegmentCache {
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             self.touch(key).await;
             match tokio::fs::read(&path).await {
-                Ok(b) => return Ok(b),
+                Ok(b) => {
+                    metrics::counter!("pharos_segment_cache_total", "result" => "hit").increment(1);
+                    return Ok(b);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
                 }
                 Err(e) => return Err(e.into()),
@@ -589,6 +632,7 @@ impl HlsSegmentCache {
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                    record_segment_outcome(SegmentOutcome::Failed);
                     return Err(e);
                 }
             };
@@ -609,6 +653,7 @@ impl HlsSegmentCache {
             }
         }
         if let Some(why) = shortfall {
+            record_segment_outcome(SegmentOutcome::Short);
             return Err(HlsCacheError::Transcode(format!(
                 "transcode produced an incomplete segment even with a \
                  {}s decode preroll: {why}",
@@ -637,6 +682,7 @@ impl HlsSegmentCache {
                 codec = codec_tag(opts.video, opts.audio, opts.container),
                 "hls segment transcode produced empty/truncated output — not caching"
             );
+            record_segment_outcome(SegmentOutcome::Empty);
             return Err(HlsCacheError::Transcode(format!(
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
@@ -645,6 +691,14 @@ impl HlsSegmentCache {
 
         let bytes = tokio::fs::read(&path).await?;
         let transcode_ms = started.elapsed().as_millis();
+        record_segment_outcome(SegmentOutcome::Ok);
+        metrics::counter!("pharos_segment_cache_total", "result" => "miss").increment(1);
+        // The same figure the log line carries, as a histogram: a segment
+        // covers SEGMENT_SECONDS of playback, so a p95 above that means the
+        // encoder is below realtime and clients are stalling. Answering that
+        // from logs means trawling; this makes it a query.
+        metrics::histogram!("pharos_segment_transcode_seconds")
+            .record(started.elapsed().as_secs_f64());
         // Split total transcode_ms into scheduler queue-wait vs actual encode
         // (from the scheduler's JobDone), plus the winning device + retry count,
         // so a slow segment is diagnosable: high queue_wait_ms = saturated
@@ -1408,6 +1462,16 @@ impl HlsSegmentCache {
                     start_secs,
                     "continuous audio: spawning AAC encode for muxed segments"
                 );
+                // Whole-title vs seek session. Worth separating: the two
+                // differ in whether the encode's own start time is zero, and
+                // a bug that only appears on seek sessions is invisible in
+                // aggregate — one shipped, putting unrelated audio under
+                // correct video for anyone past the first few minutes.
+                metrics::counter!(
+                    "pharos_continuous_audio_sessions_total",
+                    "start" => if start_secs > 0.0 { "seek" } else { "from_zero" },
+                )
+                .increment(1);
                 tokio::spawn(async move {
                     let mut cmd = tokio::process::Command::new(&bin);
                     cmd.args(&args)
@@ -1766,6 +1830,48 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             muxed_audio_source: None,
+        }
+    }
+
+    #[test]
+    fn segment_outcome_labels_are_stable_and_distinct() {
+        // Dashboards and alerts key on these strings, so a rename breaks them
+        // silently. Exhaustive match: a new outcome fails to compile here
+        // until it is given a label and added below.
+        let all = [
+            SegmentOutcome::Ok,
+            SegmentOutcome::Short,
+            SegmentOutcome::Empty,
+            SegmentOutcome::Failed,
+        ];
+        for o in all {
+            match o {
+                SegmentOutcome::Ok
+                | SegmentOutcome::Short
+                | SegmentOutcome::Empty
+                | SegmentOutcome::Failed => {}
+            }
+        }
+        let labels: Vec<&str> = all.iter().map(|o| o.label()).collect();
+        assert_eq!(labels, vec!["ok", "short", "empty", "failed"]);
+        let mut uniq = labels.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), labels.len(), "labels must be distinct");
+    }
+
+    #[test]
+    fn recording_an_outcome_works_without_a_recorder_installed() {
+        // The metrics facade is a no-op until the server installs the
+        // Prometheus recorder, and pharos-cache is used in tests and by the
+        // CLI where it never is. Emitting must not panic there.
+        for o in [
+            SegmentOutcome::Ok,
+            SegmentOutcome::Short,
+            SegmentOutcome::Empty,
+            SegmentOutcome::Failed,
+        ] {
+            record_segment_outcome(o);
         }
     }
 
