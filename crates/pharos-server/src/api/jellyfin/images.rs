@@ -97,9 +97,13 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // therefore also lowercased by `LowercasePath` — `ImageRole::from_str_ci`
     // accepts both forms anyway.
     // The bare LIST route jellyfin-web's "Edit Images" dialog calls first
-    // (`getItemImageInfos`). Must precede `/{image_type}` conceptually — actix
-    // matches the fixed segment count, so ordering is not load-bearing here, but
-    // its absence 404'd → the dialog spun forever (unguarded ajax, no .catch).
+    // (`getItemImageInfos`). Its absence 404'd → the dialog spun forever
+    // (unguarded ajax, no .catch).
+    //
+    // Registration order IS load-bearing between routes of the same segment
+    // count: actix takes the first pattern that matches, so a literal segment
+    // only wins over a parameter if it is registered first. See the chapter
+    // route below.
     cfg.route("/items/{id}/images", web::get().to(get_item_images))
         .route("/items/{id}/images/{image_type}", web::get().to(get_image))
         .route(
@@ -113,6 +117,17 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/items/{id}/images/{image_type}",
             web::delete().to(delete_image),
+        )
+        // P32 — chapter image thumbnails. MUST precede the generic
+        // `/{image_type}/{image_index}` route below: actix matches in
+        // REGISTRATION order, not by literal-beats-parameter specificity, so a
+        // generic route registered first swallows every `chapter` request and
+        // answers `400 unknown image type` (`chapter` is not an `ImageRole`).
+        // Dispatches to `ImageCache::chapter`, which seeks ffmpeg to the
+        // chapter's start_ms.
+        .route(
+            "/items/{id}/images/chapter/{image_index}",
+            web::get().to(get_chapter_image),
         )
         .route(
             "/items/{id}/images/{image_type}/{image_index}",
@@ -129,13 +144,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/items/{id}/images/{image_type}/{image_index}",
             web::delete().to(delete_image_indexed),
-        )
-        // P32 — chapter image thumbnails. Same shape as the indexed
-        // image-type route but dispatches to `ImageCache::chapter`
-        // which seeks ffmpeg to the chapter's start_ms.
-        .route(
-            "/items/{id}/images/chapter/{image_index}",
-            web::get().to(get_chapter_image),
         );
 }
 
