@@ -378,6 +378,25 @@ fn hwaccel_to_device(h: HwAccel) -> crate::protocol::DeviceId {
     }
 }
 
+/// How far BEFORE a mid-file start position the decoder is seeded, in
+/// seconds, before the surplus is trimmed back off on the output side.
+///
+/// A segment is an independent `ffmpeg -ss START -t DUR` run whose decoder
+/// starts cold at `START`. ffmpeg seeks to the nearest point the container
+/// index advertises as a random-access point; when that index is wrong, the
+/// HEVC decoder cannot reconstruct the reference picture set there
+/// ("Could not find ref with POC -41" / "Error constructing the frame RPS")
+/// and silently discards frames until it reaches a genuine recovery point —
+/// while still exiting 0.
+///
+/// 10 s restored every short segment measured on the source that surfaced
+/// this (9 of 43 sampled segments short, two with no video at all). This is
+/// deliberately larger than that: the same file's widest gap between real
+/// recovery points is 26.4 s, so a value tuned to the examples in hand would
+/// be tuned to a sample, not to the source. Segments that still come up
+/// short are caught downstream rather than served.
+pub const DECODE_PREROLL_SECONDS: f64 = 15.0;
+
 /// Build the ffmpeg argv for a transcode whose output goes to `output`
 /// (`"pipe:1"` for streaming, or a file path for the worker's
 /// `FileDirect` sink) on a concrete `device`. Exposed so the
@@ -392,11 +411,33 @@ pub fn ffmpeg_transcode_args(
     build_args_for_device(input, opts, device, output)
 }
 
+/// `ffmpeg_transcode_args` with an explicit decode preroll, for a retry
+/// after a produced segment was found to be short of frames.
+pub fn ffmpeg_transcode_args_with_preroll(
+    input: &str,
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    output: &str,
+    preroll_seconds: f64,
+) -> Vec<String> {
+    build_args_inner(input, opts, device, output, preroll_seconds)
+}
+
 fn build_args_for_device(
     input: &str,
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
     output: &str,
+) -> Vec<String> {
+    build_args_inner(input, opts, device, output, DECODE_PREROLL_SECONDS)
+}
+
+fn build_args_inner(
+    input: &str,
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    output: &str,
+    preroll_seconds: f64,
 ) -> Vec<String> {
     use crate::protocol::DeviceId;
     let hwaccel = device.hwaccel();
@@ -451,12 +492,42 @@ fn build_args_for_device(
     // real frame duration, so the margin is now spent only on the thing it
     // exists for.
     let start = opts.start_position_seconds();
-    if let Some(pos) = start {
+    // Split the seek in two: land the DECODER early enough to have rebuilt a
+    // valid reference list by `start`, then discard the surplus on the output
+    // side so the encoder still sees exactly `[start, start+dur)`.
+    //
+    // Without this, ffmpeg seeks straight to `start` — to whatever the
+    // container index claims is the nearest random-access point — and a
+    // decoder that cannot reconstruct its reference picture set there drops
+    // frames until it finds a real recovery point, exiting 0 either way. See
+    // `DECODE_PREROLL_SECONDS`.
+    //
+    // Only for a real decode: `-c:v copy` has no reference list to prime, and
+    // trimming its output would cost work for nothing.
+    let decoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
+    let (input_seek, decode_trim) = match start {
+        Some(s) if decoding_video && preroll_seconds > 0.0 => {
+            // Nothing precedes t=0, so an early segment simply decodes from
+            // the file's head — a genuine random-access point by construction.
+            let seek = (s - preroll_seconds).max(0.0);
+            (seek, s - seek)
+        }
+        Some(s) => (s, 0.0),
+        None => (0.0, 0.0),
+    };
+    if input_seek > 0.0 {
         a.push("-ss".into());
-        a.push(format!("{pos:.6}"));
+        a.push(format!("{input_seek:.6}"));
     }
     a.push("-i".into());
     a.push(input.to_string());
+    if decode_trim > 0.0 {
+        // OUTPUT-side `-ss`: decode and throw away, then re-base the kept
+        // frames to zero. `-t` below measures from that re-based origin, and
+        // the muxer's `-output_ts_offset` still anchors to `start`.
+        a.push("-ss".into());
+        a.push(format!("{decode_trim:.6}"));
+    }
     if let Some(dur) = opts.duration_seconds() {
         a.push("-t".into());
         a.push(format!("{dur:.6}"));
@@ -515,7 +586,9 @@ fn build_args_for_device(
                     opts.burn_subtitle_stream_index,
                     opts.burn_subtitle_is_text,
                     input,
-                    start,
+                    // The point ffmpeg actually seeked to — the filter sees
+                    // PTS re-based to THERE, not to the segment start.
+                    Some(input_seek),
                     opts.audio_source_stream_index,
                     opts.burn_subtitle_ass_path.as_deref(),
                     opts.burn_fonts_dir.as_deref(),
@@ -547,7 +620,9 @@ fn build_args_for_device(
                     opts.burn_subtitle_stream_index,
                     opts.burn_subtitle_is_text,
                     input,
-                    start,
+                    // The point ffmpeg actually seeked to — the filter sees
+                    // PTS re-based to THERE, not to the segment start.
+                    Some(input_seek),
                     opts.audio_source_stream_index,
                     opts.burn_subtitle_ass_path.as_deref(),
                     opts.burn_fonts_dir.as_deref(),
@@ -1229,6 +1304,10 @@ mod tests {
         // frame PTS off a from-zero demuxer, a mid-file segment brackets it with
         // `setpts` so it sees ABSOLUTE time (right cue) while output stays
         // zero-based (verified in tests/subtitle_burn_ass.rs).
+        //
+        // The lift is the point ffmpeg SEEKED to, which the decode preroll puts
+        // `DECODE_PREROLL_SECONDS` before the segment start (27 − 15 = 12): the
+        // input seek is what re-bases the frame PTS the filter reads.
         let mut o = opts();
         o.start_position_ticks = 27 * 10_000_000; // 27 s segment start
         o.burn_subtitle_stream_index = Some(2);
@@ -1237,7 +1316,7 @@ mod tests {
         let joined = a.join(" ");
         assert!(
             joined.contains(
-                "-vf setpts=PTS+27.000000/TB,subtitles=filename=/m/x.mkv:si=2,setpts=PTS-27.000000/TB"
+                "-vf setpts=PTS+12.000000/TB,subtitles=filename=/m/x.mkv:si=2,setpts=PTS-12.000000/TB"
             ),
             "{joined}"
         );
@@ -1267,9 +1346,9 @@ mod tests {
         let joined = build_args("/m/whole-source.mkv", &o).join(" ");
         assert!(
             joined.contains(
-                "-vf setpts=PTS+27.000000/TB,\
+                "-vf setpts=PTS+12.000000/TB,\
                  subtitles=filename=/cache/subs/x.ass:fontsdir=/cache/fonts/9,\
-                 setpts=PTS-27.000000/TB"
+                 setpts=PTS-12.000000/TB"
             ),
             "{joined}"
         );
@@ -1354,6 +1433,26 @@ mod tests {
         assert!(!joined.contains("-map 0:v:0?"), "{joined}");
     }
 
+    /// A deep start must reach its position by SEEKING, never by demuxing the
+    /// file from 0 — that cost tens of seconds per segment deep into a movie.
+    /// The decode preroll trims a bounded amount on the output side, so what
+    /// these guard is that the bounded part stays bounded: the input seek must
+    /// land within one preroll of the requested start.
+    fn assert_seeks_rather_than_demuxing_from_zero(a: &[String], start_secs: f64) {
+        let (before, after) = seek_before_and_after_input(a);
+        let input_seek = before.expect("a deep start must use an input seek");
+        assert!(
+            input_seek >= start_secs - DECODE_PREROLL_SECONDS - 1e-6,
+            "input seek {input_seek} is further back than one preroll before \
+             {start_secs} — that is a decode-from-0 in disguise: {a:?}"
+        );
+        let trim = after.unwrap_or(0.0);
+        assert!(
+            trim <= DECODE_PREROLL_SECONDS + 1e-6,
+            "output-side trim {trim} exceeds the preroll: {a:?}"
+        );
+    }
+
     #[test]
     fn burn_subtitle_with_seek_uses_input_seek() {
         // B40 — overlay reads the subtitle stream from the SAME input, so an
@@ -1361,22 +1460,18 @@ mod tests {
         // text-filter burn forced output seeking = decode-from-0, tens of
         // seconds per segment deep into a movie).
         let mut o = opts();
-        o.start_position_ticks = 50_000_000; // 5s
+        o.start_position_ticks = 6_000_000_000; // 600 s — deep into the file
         o.burn_subtitle_stream_index = Some(0);
         let a = build_args("/m/x.mkv", &o);
-        let i_pos = a.iter().position(|x| x == "-i").unwrap();
-        let ss_pos = a.iter().position(|x| x == "-ss").unwrap();
-        assert!(ss_pos < i_pos, "expected input seek (-ss before -i): {a:?}");
+        assert_seeks_rather_than_demuxing_from_zero(&a, 600.0);
     }
 
     #[test]
     fn seek_without_subs_uses_input_seek() {
         let mut o = opts();
-        o.start_position_ticks = 50_000_000;
+        o.start_position_ticks = 6_000_000_000; // 600 s
         let a = build_args("/m/x.mkv", &o);
-        let i_pos = a.iter().position(|x| x == "-i").unwrap();
-        let ss_pos = a.iter().position(|x| x == "-ss").unwrap();
-        assert!(ss_pos < i_pos, "expected input seek (-ss before -i): {a:?}");
+        assert_seeks_rather_than_demuxing_from_zero(&a, 600.0);
     }
 
     #[test]
@@ -1472,5 +1567,152 @@ mod tests {
         let joined = a.join(" ");
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-ac 2"), "{joined}");
+    }
+
+    /// Position of `-i` in the argv — everything before it is an INPUT
+    /// option, everything after an OUTPUT option. The preroll's whole
+    /// mechanism is that the two seeks sit on opposite sides of it.
+    fn input_pos(a: &[String]) -> usize {
+        a.iter().position(|x| x == "-i").expect("argv has an input")
+    }
+
+    fn seek_before_and_after_input(a: &[String]) -> (Option<f64>, Option<f64>) {
+        let i = input_pos(a);
+        let at = |range: &[String]| -> Option<f64> {
+            range
+                .iter()
+                .position(|x| x == "-ss")
+                .map(|p| range[p + 1].parse().expect("-ss takes a number"))
+        };
+        (at(&a[..i]), at(&a[i..]))
+    }
+
+    #[test]
+    fn a_mid_file_segment_decodes_a_preroll_before_its_start() {
+        // A segment is an independent `ffmpeg -ss START -t DUR` run, so its
+        // decoder starts cold at START. ffmpeg seeks to the nearest point the
+        // CONTAINER INDEX advertises as a random-access point — and when that
+        // index is wrong, the HEVC decoder cannot rebuild the reference
+        // picture set from there:
+        //
+        //   [hevc] Could not find ref with POC -41
+        //   [hevc] Error constructing the frame RPS.
+        //   [hevc] Skipping invalid undecodable NALU: 1
+        //
+        // It then discards every frame until it reaches a genuine recovery
+        // point, and — this is why the defect survived to production —
+        // **exits 0**. Measured on the live source (Fringe S01E02) at the
+        // timestamps the user reported as freezes: 9 of 43 sampled segments
+        // came up short and TWO contained no video frames at all, while the
+        // exit status, the byte-size floor and the cache all read success.
+        //
+        // The fix is to give the decoder the pictures it needs: seek in EARLY
+        // and discard the surplus on the output side, so the frames that reach
+        // the encoder start exactly at START with a fully-primed reference
+        // list. Verified against the real source — segment 396 went from 0
+        // frames to a full 144, segment 240 from 11 to 144.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.start_position_ticks = 1_625_000_000; // 162.5 s — mid file
+        o.duration_ticks = Some(60_060_000); // 6.006 s
+        let a = build_args("/m/x.mkv", &o);
+        let (before, after) = seek_before_and_after_input(&a);
+
+        let input_seek = before.expect("input-side seek");
+        let trim = after.expect("output-side trim discarding the preroll");
+        assert!(
+            input_seek < 162.5,
+            "input seek must land BEFORE the segment start to prime the \
+             decoder, got {input_seek}"
+        );
+        assert!(
+            (input_seek + trim - 162.5).abs() < 1e-6,
+            "input seek + output trim must reconstruct the segment start \
+             exactly: {input_seek} + {trim} != 162.5"
+        );
+        assert!(
+            (trim - DECODE_PREROLL_SECONDS).abs() < 1e-6,
+            "the whole preroll must be trimmed back off, got {trim}"
+        );
+    }
+
+    #[test]
+    fn the_preroll_does_not_move_the_segment_on_the_shared_timeline() {
+        // `-output_ts_offset` anchors the segment to its true position on the
+        // one timeline every segment tiles onto. It must keep naming the
+        // SEGMENT start, not the (earlier) point the decoder was seeded from —
+        // otherwise every segment lands `DECODE_PREROLL_SECONDS` early and the
+        // player's buffer disintegrates.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.start_position_ticks = 300_000_000; // 30 s
+        let joined = build_args("/m/x.mkv", &o).join(" ");
+        assert!(joined.contains("-output_ts_offset 30.000000"), "{joined}");
+    }
+
+    #[test]
+    fn a_burned_subtitle_follows_the_decoder_seek_not_the_segment_start() {
+        // The `subtitles` filter renders by frame PTS, and an input seek
+        // re-bases those PTS to zero at the SEEK point — so the `setpts`
+        // bracket that lifts them back to absolute time must use the point
+        // ffmpeg actually seeked to. Priming the decoder earlier moves that
+        // point; a bracket still naming the segment start would render every
+        // cue `DECODE_PREROLL_SECONDS` late.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.start_position_ticks = 300_000_000; // 30 s
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        let a = build_args("/m/x.mkv", &o);
+        let (input_seek, _) = seek_before_and_after_input(&a);
+        let seek = input_seek.expect("input-side seek");
+        let joined = a.join(" ");
+        assert!(
+            joined.contains(&format!("setpts=PTS+{seek:.6}/TB")),
+            "subtitle time base must be lifted by the input seek ({seek}): \
+             {joined}"
+        );
+    }
+
+    #[test]
+    fn an_early_segment_prerolls_only_as_far_back_as_the_file_starts() {
+        // Nothing precedes t=0, so the preroll clamps and the input seek is
+        // dropped entirely — the decode simply starts at the file's own head,
+        // which is a genuine random-access point by construction.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.start_position_ticks = 60_060_000; // 6.006 s — segment 1
+        let a = build_args("/m/x.mkv", &o);
+        let (before, after) = seek_before_and_after_input(&a);
+        assert_eq!(before, None, "no input seek: {a:?}");
+        assert!(
+            (after.expect("output trim") - 6.006).abs() < 1e-6,
+            "the whole start must be trimmed on the output side: {after:?}"
+        );
+    }
+
+    #[test]
+    fn segment_zero_seeks_nowhere_at_all() {
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.start_position_ticks = 0;
+        let a = build_args("/m/x.mkv", &o);
+        assert_eq!(seek_before_and_after_input(&a), (None, None), "{a:?}");
+    }
+
+    #[test]
+    fn a_stream_copy_gets_no_preroll() {
+        // `-c:v copy` never decodes, so there is no reference list to prime
+        // and a preroll would only cost a pointless output-side trim.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.video = Some(VideoCodec::Copy);
+        o.start_position_ticks = 300_000_000;
+        let a = build_args("/m/x.mkv", &o);
+        assert_eq!(
+            seek_before_and_after_input(&a),
+            (Some(30.0), None),
+            "copy takes a plain input seek: {a:?}"
+        );
     }
 }
