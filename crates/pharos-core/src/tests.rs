@@ -514,3 +514,80 @@ fn parse_ymd_rejects_malformed() {
     assert_eq!(parse_ymd_to_unix("not-a-date"), None);
     assert_eq!(parse_ymd_to_unix("2021-10-01-05"), None);
 }
+
+// ───────────────────────────── FrameRate ─────────────────────────────
+
+#[test]
+fn frame_rate_rejects_the_container_clock_and_other_implausible_rates() {
+    // The exact defect this type exists to prevent: MPEG-TS `r_frame_rate`
+    // is the 90 kHz container clock, which a bare scalar happily carried as
+    // a "frame rate" and which silently degraded the segment grid.
+    assert_eq!(FrameRate::from_mille(90_000_000), None);
+    assert_eq!(FrameRate::from_mille(500_000), None);
+    assert_eq!(FrameRate::from_mille(0), None);
+    assert_eq!(FrameRate::new(90_000, 1), None);
+    assert_eq!(FrameRate::new(24_000, 0), None);
+    assert_eq!(FrameRate::new(0, 1001), None);
+}
+
+#[test]
+fn frame_rate_recovers_exact_ntsc_rationals_from_the_lossy_scalar() {
+    // 23.976 is a rounded decimal; the true rate is 24000/1001. Recovering
+    // the rational is what keeps frame times from drifting over a long title.
+    assert_eq!(
+        FrameRate::from_mille(23_976).map(FrameRate::as_ratio),
+        Some((24_000, 1001))
+    );
+    // Probes report the NTSC family with slightly different rounding.
+    assert_eq!(
+        FrameRate::from_mille(23_970).map(FrameRate::as_ratio),
+        Some((24_000, 1001))
+    );
+    assert_eq!(
+        FrameRate::from_mille(23_977).map(FrameRate::as_ratio),
+        Some((24_000, 1001))
+    );
+    assert_eq!(
+        FrameRate::from_mille(29_970).map(FrameRate::as_ratio),
+        Some((30_000, 1001))
+    );
+    assert_eq!(
+        FrameRate::from_mille(59_940).map(FrameRate::as_ratio),
+        Some((60_000, 1001))
+    );
+    // Integer rates stay exact and reduced.
+    assert_eq!(
+        FrameRate::from_mille(25_000).map(FrameRate::as_ratio),
+        Some((25, 1))
+    );
+    assert_eq!(
+        FrameRate::from_mille(24_000).map(FrameRate::as_ratio),
+        Some((24, 1))
+    );
+}
+
+#[test]
+fn frame_times_are_exact_and_consecutive_frames_are_one_frame_apart() {
+    let r = FrameRate::from_mille(23_976).expect("valid ntsc rate");
+    // Frame 144 of 24000/1001 is exactly 6.006 s — the value the decimal
+    // 23.976 only approximates.
+    assert!((r.secs_of_frame(144) - 6.006).abs() < 1e-9);
+    // The load-bearing property: neighbouring frames differ by exactly one
+    // frame duration, with no accumulation deep into a title.
+    let fd = 1001.0 / 24000.0;
+    for idx in [1_u64, 144, 14_386, 172_800] {
+        let d = r.secs_of_frame(idx + 1) - r.secs_of_frame(idx);
+        assert!((d - fd).abs() < 1e-9, "idx {idx}: {d} vs {fd}");
+    }
+}
+
+#[test]
+fn frame_index_at_round_trips_through_the_frame_grid() {
+    let r = FrameRate::from_mille(23_976).expect("valid ntsc rate");
+    for idx in [0_u64, 1, 143, 144, 100_000] {
+        assert_eq!(r.frame_index_at(r.secs_of_frame(idx)), idx);
+    }
+    // Degenerate inputs clamp rather than panicking or wrapping.
+    assert_eq!(r.frame_index_at(-5.0), 0);
+    assert_eq!(r.frame_index_at(f64::NAN), 0);
+}
