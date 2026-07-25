@@ -28,6 +28,49 @@ Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) re
 - Tasks numbered T1…T27 in §T. Pick next via `/ck:build --next` or `/ck:build T<n>`.
 - Bugs append to §B with cause + invariant link (`/ck:spec bug: …`).
 
+## Observability-driven development (ODD)
+
+Runs **alongside TDD, not instead of it**. A change is not designed until you
+can name the observable behaviour that proves it — in production, by query.
+
+The bugs that have cost this project the most were not hard, they were
+*invisible*. The browser-playback outage (2026-07-25) was diagnosed from a
+reverse proxy's 499s because the segment failure path logged nothing, while the
+success path beside it recorded twelve fields. Diagnosis time went entirely on
+reconstructing state the server could have stated.
+
+On every change, in this order:
+
+1. **Name the signal first.** Before writing a fix, state the exact LogQL /
+   PromQL query that shows the bug happening now. If no such query exists, the
+   FIRST commit adds the instrumentation — separately, so it can ship and be
+   read before the fix lands.
+2. **Instrument decisions, not just errors.** Any branch choosing between
+   behaviours (codec, device, delivery method, burn/no-burn, cache hit/miss)
+   records its inputs, its verdict, AND the reason — carrying the offending
+   value, never a bare class (see §"Expose the cause" discipline in the error
+   types). A reason that doesn't name the value is another round of guessing.
+3. **Test the signal.** The metric/log is part of the contract: assert it in a
+   unit test, and confirm the test FAILS without the instrumentation (disarm
+   it once and watch it go red — `red_metrics.rs`'s abort counter was verified
+   this way).
+4. **Symmetry.** Whatever the success path records, the failure path records
+   too. Rich-on-success/silent-on-failure is the shape that hides outages.
+5. **Verify by query, not by assertion.** After deploying, run the named query
+   and report its actual output. "Should be fixed" is not a result.
+
+Metric labels are a dashboard contract: bounded cardinality, stable strings
+from a `label()` method, asserted distinct in a test. A renamed label breaks
+alerts silently.
+
+Signals already available (use them before adding more):
+`pharos_playback_decision_total{decision,direct_play_block,downgrade}`,
+`pharos_segment_produced_total{outcome,reason}`, `pharos_segment_cache_total`,
+`pharos_segment_transcode_seconds`, `http_client_aborted_total{method,path}`,
+`pharos_source_unreadable_total{reason}`, `pharos_transcode_device_{capacity,in_use,cooldown}`,
+`pharos_transcode_pending_jobs`. Loki: `{namespace="pharos"}`, LB at
+`192.168.1.244:3100`. Traces export to Tempo via OTLP when configured.
+
 ## Subagent worktree isolation
 
 `.claude/settings.json` configures `WorktreeCreate` / `WorktreeRemove` hooks so the `Agent` tool with `isolation: "worktree"` works. Each isolated agent gets its own `agent/<basename>` ephemeral branch off `main`; the hook cleans up the branch on remove.
