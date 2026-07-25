@@ -230,22 +230,42 @@ impl TmdbClient {
             pharos_core::MediaKind::Movie => format!("{API_BASE}/movie/{id}/images"),
             _ => format!("{API_BASE}/tv/{id}/images"),
         };
-        let Ok(resp) = self
+        let resp = match self
             .http
             .get(path)
             .query(&[("api_key", self.api_key.as_str())])
             .send()
             .await
-        else {
-            return vec![];
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(kind = ?kind, id, error = %e, "tmdb list_images: request failed");
+                return vec![];
+            }
         };
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
+            // Body often carries TMDB's status_message — include it so a bad id
+            // / revoked key / rate-limit isn't reduced to a bare status code.
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                kind = ?kind, id, status = status.as_u16(), body = %body.chars().take(200).collect::<String>(),
+                "tmdb list_images: non-success status"
+            );
             return vec![];
         }
-        let Ok(body) = resp.text().await else {
-            return vec![];
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(kind = ?kind, id, error = %e, "tmdb list_images: reading body failed");
+                return vec![];
+            }
         };
-        parse_tmdb_images(&body)
+        let images = parse_tmdb_images(&body);
+        if images.is_empty() {
+            tracing::debug!(kind = ?kind, id, "tmdb list_images: provider returned no usable images");
+        }
+        images
     }
 }
 
