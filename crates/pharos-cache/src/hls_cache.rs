@@ -1330,6 +1330,68 @@ impl HlsSegmentCache {
         best
     }
 
+    /// Highest `aN.m4s` index written by one session directory.
+    async fn session_dir_progress(dir: &Path) -> Option<u32> {
+        let mut best: Option<u32> = None;
+        let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+        while let Ok(Some(e)) = rd.next_entry().await {
+            if let Some(n) = e
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix('a'))
+                .and_then(|r| r.strip_suffix(".m4s"))
+                .and_then(|r| r.parse::<u32>().ok())
+            {
+                best = Some(best.map_or(n, |b| b.max(n)));
+            }
+        }
+        best
+    }
+
+    /// Write progress AS THE READ WAIT SHOULD SEE IT for `name`: the progress
+    /// of the sessions that could actually serve this request.
+    ///
+    /// [`audio_session_progress`](Self::audio_session_progress) is a global
+    /// high-water mark across every session under the rendition root, which
+    /// makes the wait answer the wrong question twice over. A session seeked
+    /// PAST the target can never write it, yet its advance kept the wait alive
+    /// to the full 30 s cap; and — the failure that matters — once ANY session
+    /// had produced anything, a freshly-spawned seek session was denied the
+    /// cold-start grace and judged on the much shorter stall budget while it
+    /// was still opening the source over NFS.
+    ///
+    /// So: consider only sessions whose start is `<= want` (mirroring
+    /// [`resolve_audio_file`](Self::resolve_audio_file)'s selection), and report
+    /// `None` — "not started" — while the deepest of them, the one spawned to
+    /// serve this very request, has written nothing.
+    async fn audio_wait_progress(root: &Path, name: &str) -> Option<u32> {
+        let Some(want) = name
+            .strip_prefix('a')
+            .and_then(|r| r.strip_suffix(".m4s"))
+            .and_then(|r| r.parse::<u32>().ok())
+        else {
+            // `init.mp4` / `audio.m3u8` are not on the segment timeline; any
+            // session's output answers them.
+            return Self::audio_session_progress(root).await;
+        };
+        let candidates: Vec<u32> = Self::audio_session_starts(root)
+            .await
+            .into_iter()
+            .filter(|s| *s <= want)
+            .collect();
+        // `audio_session_starts` returns deepest first.
+        let deepest = *candidates.first()?;
+        Self::session_dir_progress(&Self::audio_session_dir(root, deepest)).await?;
+        let mut best: Option<u32> = None;
+        for start in candidates {
+            if let Some(n) = Self::session_dir_progress(&Self::audio_session_dir(root, start)).await
+            {
+                best = Some(best.map_or(n, |b: u32| b.max(n)));
+            }
+        }
+        best
+    }
+
     /// Build the ffmpeg argv for an audio-rendition session starting at
     /// `start_seg` (0 = whole file). Seek sessions are source-anchored:
     /// `-ss` input seek to the segment boundary, `-start_number` so the
@@ -1798,7 +1860,7 @@ impl HlsSegmentCache {
                     }
                 }
             }
-            match Self::audio_session_progress(dir).await {
+            match Self::audio_wait_progress(dir, name).await {
                 // The session has written at least one segment. Wait while it
                 // keeps advancing toward our target; give up once it stalls.
                 Some(prog) => {
@@ -2914,6 +2976,42 @@ mod tests {
         assert_ne!(
             SegmentIdentity::new(1, 7, Some(0), None, &opts),
             SegmentIdentity::new(1, 7, Some(1), None, &opts)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_seek_session_still_gets_the_cold_start_grace() {
+        // A deep seek spawns `s40` while the finished from-0 session sits at
+        // a12. Under the old GLOBAL high-water mark the wait saw Some(12),
+        // never advancing, and burned the short stall budget while s40 was
+        // still opening the source over NFS — so the segment 404'd even though
+        // its session was healthy and about to write it. Progress must read as
+        // "not started" until the session that will serve this request has
+        // produced something.
+        let td = TempDir::new().unwrap();
+        let root = td.path().join("r");
+        tokio::fs::create_dir_all(root.join("s40")).await.unwrap();
+        tokio::fs::write(root.join("a12.m4s"), b"x").await.unwrap();
+
+        assert_eq!(
+            HlsSegmentCache::audio_wait_progress(&root, "a41.m4s").await,
+            None,
+            "s40 has written nothing — this request's session is still cold"
+        );
+        // Once s40 produces, the wait sees it and stall-detection applies.
+        tokio::fs::write(root.join("s40").join("a40.m4s"), b"y")
+            .await
+            .unwrap();
+        assert_eq!(
+            HlsSegmentCache::audio_wait_progress(&root, "a41.m4s").await,
+            Some(40)
+        );
+        // A session seeked PAST the target can never serve it, so it must not
+        // keep that request's wait alive.
+        assert_eq!(
+            HlsSegmentCache::audio_wait_progress(&root, "a5.m4s").await,
+            Some(12),
+            "only the from-0 session can serve a5"
         );
     }
 
