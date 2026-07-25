@@ -24,10 +24,11 @@ use pharos_transcode::{
     SegmentVideo, VideoCodec,
 };
 
-/// Segment length in seconds. 6 s matches Apple's HLS authoring spec
-/// recommendation and what most clients ask for; Jellyfin's own
-/// default is the same.
-const SEGMENT_SECONDS: f64 = 6.0;
+/// Segment length in seconds — re-exported from [`super::seek`], which owns the
+/// whole segment grid. It was previously declared a second time here; two
+/// definitions of the same boundary constant is precisely how the playlist and
+/// the encoder came to describe different windows.
+use super::seek::SEGMENT_SECONDS;
 
 use pharos_core::time::Ticks;
 
@@ -865,10 +866,11 @@ async fn render_variant_playlist(
 ) -> Result<impl Responder, actix_web::Error> {
     let item = load_hls_item(&state, &id).await?;
     let duration = item.duration_seconds;
-    let segment_count = (duration / SEGMENT_SECONDS).ceil() as u32;
-    let segment_count = segment_count.max(1);
+    let segments: Vec<(u32, f64, f64)> =
+        playlist_segments(duration, item.frame_rate_mille).collect();
+    let segment_count = segments.len();
     let qs = playback_qs(&req);
-    let mut body = String::with_capacity(256 + segment_count as usize * 80);
+    let mut body = String::with_capacity(256 + segment_count * 80);
     body.push_str("#EXTM3U\n");
     body.push_str("#EXT-X-VERSION:3\n");
     body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
@@ -886,12 +888,9 @@ async fn render_variant_playlist(
         body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    for seg in 0..segment_count {
+    for (seg, _start, len) in segments {
         // Frame-aligned duration matching the transcoder's actual cut points,
         // clamped by the remaining media at the tail.
-        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
-        let remaining = (duration - start_secs).max(0.01);
-        let len = dur_secs.min(remaining);
         body.push_str(&format!("#EXTINF:{len:.3},\n"));
         // Lowercase: T31 routes are registered lowercase; emit the
         // canonical form so HLS players don't pay a middleware rewrite
@@ -1680,13 +1679,7 @@ async fn vp9_audio_playlist(
         return Err(error::ErrorNotFound("no cache"));
     };
     cache
-        .ensure_audio_hls(
-            &item.path,
-            media_id,
-            audio_rel,
-            Some(128_000),
-            item.probe.frame_rate_mille,
-        )
+        .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     // B103 — take duration through `load_hls_item`, which falls back to a live
@@ -1696,8 +1689,9 @@ async fn vp9_audio_playlist(
     // the first segment (the same `.max(1)` truncation the video variant
     // already guards against via this path).
     let duration = load_hls_item(&state, &id).await?.duration_seconds.max(0.0);
-    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
-    let mut body = String::with_capacity(128 + segment_count as usize * 48);
+    let segments: Vec<(u32, f64, f64)> =
+        playlist_segments(duration, item.probe.frame_rate_mille).collect();
+    let mut body = String::with_capacity(128 + segments.len() * 48);
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
     body.push_str(&format!(
         "#EXT-X-TARGETDURATION:{}\n",
@@ -1707,14 +1701,9 @@ async fn vp9_audio_playlist(
     body.push_str(&format!(
         "#EXT-X-MAP:URI=\"/videos/{id}/vp9/audio/init.mp4?{qs}\"\n"
     ));
-    for seg in 0..segment_count {
-        // B105 — frame-align the EXTINF grid to the video variant
-        // (`segment_time_range`) so the audio playlist advertises the same
-        // segment boundaries the video does; a uniform 6.0 grid drifts against
-        // the frame-snapped video timeline on a non-integer-fps source.
-        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-        let remaining = (duration - start_secs).max(0.01);
-        let len = dur_secs.min(remaining);
+    for (seg, _start, len) in segments {
+        // B105 — the audio playlist enumerates the same grid the video variant
+        // does, so a client maps a time to the same index on both renditions.
         body.push_str(&format!("#EXTINF:{len:.3},\n"));
         body.push_str(&format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}\n"));
     }
@@ -1754,14 +1743,7 @@ async fn vp9_audio_file(
         .and_then(|r| r.parse::<u32>().ok())
         .unwrap_or(0);
     let dir = cache
-        .ensure_audio_hls_covering(
-            &item.path,
-            media_id,
-            audio_rel,
-            Some(128_000),
-            want_seg,
-            item.probe.frame_rate_mille,
-        )
+        .ensure_audio_hls_covering(&item.path, media_id, audio_rel, Some(128_000), want_seg)
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     let bytes = cache
@@ -1794,10 +1776,11 @@ async fn vp9_variant(
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
     let duration = item.duration_seconds;
-    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
+    let segments: Vec<(u32, f64, f64)> =
+        playlist_segments(duration, item.frame_rate_mille).collect();
     let qs = playback_qs(&req);
 
-    let mut body = String::with_capacity(256 + segment_count as usize * 48);
+    let mut body = String::with_capacity(256 + segments.len() * 48);
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     body.push_str(&format!(
@@ -1814,13 +1797,10 @@ async fn vp9_variant(
         body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    for seg in 0..segment_count {
+    for (seg, _start, len) in segments {
         // Frame-aligned EXTINF matching the transcoder's actual cut points —
         // a fixed 6.0 drifts against the real video timeline on a non-integer-
         // fps source and desyncs A/V over a long title.
-        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
-        let remaining = (duration - start_secs).max(0.01);
-        let len = dur_secs.min(remaining);
         body.push_str(&format!("#EXTINF:{len:.3},\n"));
         body.push_str(&format!("/videos/{id}/vp9/{seg}.m4s?{qs}\n"));
     }
@@ -1982,10 +1962,11 @@ async fn h264cmaf_variant(
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
     let duration = item.duration_seconds;
-    let segment_count = ((duration / SEGMENT_SECONDS).ceil() as u32).max(1);
+    let segments: Vec<(u32, f64, f64)> =
+        playlist_segments(duration, item.frame_rate_mille).collect();
     let qs = playback_qs(&req);
 
-    let mut body = String::with_capacity(256 + segment_count as usize * 48);
+    let mut body = String::with_capacity(256 + segments.len() * 48);
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
     body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     body.push_str(&format!(
@@ -2001,9 +1982,7 @@ async fn h264cmaf_variant(
         body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
     }
     body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    for seg in 0..segment_count {
-        let (start_secs, dur_secs) = segment_time_range(seg, item.frame_rate_mille);
-        let len = dur_secs.min((duration - start_secs).max(0.01));
+    for (seg, _start, len) in segments {
         body.push_str(&format!(
             "#EXTINF:{len:.3},\n/videos/{id}/h264cmaf/{seg}.m4s?{qs}\n"
         ));
@@ -2183,6 +2162,28 @@ fn segment_time_range(seg: u32, fps_mille: Option<u32>) -> (f64, f64) {
     super::seek::segment_range(seg, source_frame_rate(fps_mille))
 }
 
+/// One VOD playlist's worth of `(index, start, duration)`, straight off the
+/// canonical [`SegmentGrid`](super::seek::SegmentGrid).
+///
+/// The four playlist builders each used to re-derive `ceil(duration / 6)` and
+/// re-apply the tail clamp inline. That is four copies of the grid a fifth
+/// place (the segment handler) also computes — the same duplication that let
+/// the encoder and the playlist drift apart in the first place. Going through
+/// `SegmentGrid` means every playlist enumerates exactly the segments the
+/// bounds check will accept and advertises exactly the window the encoder is
+/// handed.
+fn playlist_segments(
+    duration_secs: f64,
+    fps_mille: Option<u32>,
+) -> impl Iterator<Item = (u32, f64, f64)> {
+    let grid = super::seek::SegmentGrid::new(duration_secs, fps_mille);
+    (0..grid.count()).filter_map(move |i| {
+        let idx = grid.checked(i)?;
+        let (start, dur) = grid.frame_snapped_range(idx);
+        Some((i, start, dur))
+    })
+}
+
 /// The segment indices to prefetch after serving `base_seg`: the next
 /// [`segment_prefetch_ahead`], stopping at `total_segs` (exclusive) when the
 /// item's length is known so we never queue a past-EOF transcode. `None`
@@ -2274,7 +2275,6 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             opts.audio_source_stream_index,
                             Some(128_000),
                             target,
-                            item.probe.frame_rate_mille,
                         )
                         .await;
                 }
