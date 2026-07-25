@@ -419,6 +419,89 @@ pub fn progress_sidecar_path(output: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Whether a job's SOURCE DECODE runs on the GPU — and when it does not, why.
+///
+/// pharos chose hardware ENCODERS long before it emitted `-hwaccel`, so a
+/// "GPU transcode" still carried every frame of source decode on the CPU. The
+/// flag now exists, but a deployment serving everything from software decode
+/// looks exactly like one doing GPU decode: the only thing recorded was the
+/// DEVICE a job ran on, and a job on `Nvenc:0` may still decode in software.
+/// Measured on the deployment, NVENC's median encode was 2932 ms against the
+/// CPU's 3555 ms — a gap far too small for an offloaded decode, and no signal
+/// existed that could say whether the flag had engaged.
+///
+/// This is the ONE place that decides it. [`ffmpeg_transcode_args`] emits
+/// `-hwaccel` from this verdict and the scheduler reports the same value, so
+/// "what ffmpeg was told" and "what the dashboard says" cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeAccel {
+    /// Decoding on the GPU, via this ffmpeg `-hwaccel` name.
+    Gpu { name: &'static str },
+    /// Nothing to accelerate: `-c:v copy` decodes no frames, and an audio-only
+    /// job has no video decoder at all.
+    NoVideoDecode,
+    /// The scheduler placed this job on the CPU, so there is no device to
+    /// decode on. The interesting case — it means capacity, cooldown or a
+    /// transient failure pushed a decode that COULD have been offloaded onto
+    /// software.
+    SoftwareDevice,
+    /// A hardware device whose accel carries no decode side (`HwAccel::Off` /
+    /// `Auto` have no `-hwaccel` name).
+    NoDecoderForAccel,
+}
+
+impl DecodeAccel {
+    /// The verdict for `opts` placed on `device`.
+    pub fn of(opts: &TranscodeOptions, device: crate::protocol::DeviceId) -> Self {
+        use crate::protocol::DeviceId;
+        if opts.video.is_none() || matches!(opts.video, Some(VideoCodec::Copy)) {
+            return Self::NoVideoDecode;
+        }
+        if !matches!(device, DeviceId::Hw { .. }) {
+            return Self::SoftwareDevice;
+        }
+        // The hardware gate is load-bearing, not decoration. Measured against
+        // ffmpeg 8.1: with the device missing, ffmpeg reports `Device creation
+        // failed` and exits 255 rather than falling back, so emitting
+        // `-hwaccel` speculatively would break every transcode on a box
+        // without the device. With the device present but the codec
+        // unsupported by its decoder it falls back to software and exits 0 —
+        // which is why an odd codec on a real GPU is safe.
+        match device.hwaccel().decoder_hwaccel() {
+            Some(name) => Self::Gpu { name },
+            None => Self::NoDecoderForAccel,
+        }
+    }
+
+    /// Whether source decode is offloaded.
+    pub fn is_gpu(self) -> bool {
+        matches!(self, Self::Gpu { .. })
+    }
+
+    /// Stable, bounded label for a metric/log field. A dashboard and its
+    /// alerts key on these strings — renaming one breaks them silently, so
+    /// they are asserted distinct in a test.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gpu { .. } => "gpu",
+            Self::NoVideoDecode => "no_video_decode",
+            Self::SoftwareDevice => "software_device",
+            Self::NoDecoderForAccel => "no_decoder_for_accel",
+        }
+    }
+}
+
+impl std::fmt::Display for DecodeAccel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Carry the offending value, not just the class: "gpu" alone does
+            // not say WHICH accel decoded, and that is the first thing asked.
+            Self::Gpu { name } => write!(f, "gpu:{name}"),
+            other => f.write_str(other.label()),
+        }
+    }
+}
+
 /// Build the ffmpeg argv for a transcode whose output goes to `output`
 /// (`"pipe:1"` for streaming, or a file path for the worker's
 /// `FileDirect` sink) on a concrete `device`. Exposed so the
@@ -456,33 +539,22 @@ fn build_args_for_device(
         a.push("-vaapi_device".into());
         a.push(node);
     }
-    // Only for a real decode: `-c:v copy` decodes nothing, and an audio-only
-    // job has no video decoder to accelerate.
-    let decoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
-    // Decode on the GPU as well as encode there. pharos chose hardware
-    // ENCODERS but never emitted `-hwaccel`, so a GPU transcode still carried
-    // every frame of source decode on the CPU — the largest remaining cost in
-    // the segment pipeline on the deployment.
-    //
-    // Gated on the scheduler having actually placed this job on a hardware
-    // device. Measured against ffmpeg 8.1, that gate is load-bearing: with the
-    // device missing, ffmpeg reports `Device creation failed` and exits 255
-    // rather than falling back, so emitting this speculatively would break
-    // every transcode on a box without the device. With the device present but
-    // the codec unsupported by its decoder, it falls back to software and
-    // exits 0 — which is why an odd codec on a real GPU is safe.
-    if decoding_video && matches!(device, DeviceId::Hw { .. }) {
-        if let Some(name) = hwaccel.decoder_hwaccel() {
-            a.push("-hwaccel".into());
-            a.push(name.into());
-            // Decode on the SAME GPU that will encode. Without this a
-            // multi-GPU box decodes on device 0 and encodes on device N,
-            // adding a cross-device copy of every frame.
-            if name == "cuda" {
-                if let Some(idx) = device.index() {
-                    a.push("-hwaccel_device".into());
-                    a.push(idx.to_string());
-                }
+    // A real decode: `-c:v copy` decodes nothing and an audio-only job has no
+    // video decoder. Shares its definition with `DecodeAccel::of`, which is
+    // the ONE place the GPU-decode question is answered.
+    let decoding_video = !matches!(DecodeAccel::of(opts, device), DecodeAccel::NoVideoDecode);
+    // Decode on the GPU as well as encode there — see [`DecodeAccel`], so what
+    // the scheduler reports and what ffmpeg is actually told cannot drift.
+    if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device) {
+        a.push("-hwaccel".into());
+        a.push(name.into());
+        // Decode on the SAME GPU that will encode. Without this a multi-GPU
+        // box decodes on device 0 and encodes on device N, adding a
+        // cross-device copy of every frame.
+        if name == "cuda" {
+            if let Some(idx) = device.index() {
+                a.push("-hwaccel_device".into());
+                a.push(idx.to_string());
             }
         }
     }
@@ -1749,6 +1821,83 @@ mod tests {
         o.video = Some(VideoCodec::Copy);
         let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.ts");
         assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
+    }
+
+    #[test]
+    fn decode_accel_labels_are_distinct_and_stable() {
+        // A dashboard and its alerts key on these strings. Renaming one breaks
+        // them silently, so the set is pinned here.
+        let all = [
+            DecodeAccel::Gpu { name: "cuda" },
+            DecodeAccel::NoVideoDecode,
+            DecodeAccel::SoftwareDevice,
+            DecodeAccel::NoDecoderForAccel,
+        ];
+        let labels: Vec<&str> = all.iter().map(|v| v.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "gpu",
+                "no_video_decode",
+                "software_device",
+                "no_decoder_for_accel"
+            ]
+        );
+        let distinct: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
+        assert_eq!(distinct.len(), labels.len(), "labels must be distinct");
+        // The reason must carry the offending value, never a bare class.
+        assert_eq!(DecodeAccel::Gpu { name: "cuda" }.to_string(), "gpu:cuda");
+    }
+
+    /// The reported verdict and the argv ffmpeg actually receives are ONE
+    /// decision. If they can disagree the signal is worse than none: it would
+    /// report GPU decode on a deployment doing every frame in software, which
+    /// is the exact state it was built to detect.
+    #[test]
+    fn the_reported_decode_accel_matches_the_argv() {
+        use crate::protocol::DeviceId;
+        let mut base = opts();
+        base.container = Container::Mpegts;
+        let mut copy = base.clone();
+        copy.video = Some(VideoCodec::Copy);
+
+        let cases = [
+            (
+                &base,
+                DeviceId::hw(HwAccel::Nvenc, 0),
+                DecodeAccel::Gpu { name: "cuda" },
+            ),
+            (
+                &base,
+                DeviceId::hw(HwAccel::Vaapi, 0),
+                DecodeAccel::Gpu { name: "vaapi" },
+            ),
+            (&base, DeviceId::Cpu, DecodeAccel::SoftwareDevice),
+            (
+                &copy,
+                DeviceId::hw(HwAccel::Nvenc, 0),
+                DecodeAccel::NoVideoDecode,
+            ),
+            (&copy, DeviceId::Cpu, DecodeAccel::NoVideoDecode),
+        ];
+        for (o, device, want) in cases {
+            let got = DecodeAccel::of(o, device);
+            assert_eq!(got, want, "verdict for {device}");
+            let a = build_args_for_device("/m/x.mkv", o, device, "out.ts");
+            match got {
+                DecodeAccel::Gpu { name } => {
+                    let i = a
+                        .iter()
+                        .position(|x| x == "-hwaccel")
+                        .unwrap_or_else(|| panic!("verdict {got} but no -hwaccel in {a:?}"));
+                    assert_eq!(a[i + 1], name, "{a:?}");
+                }
+                _ => assert!(
+                    !a.iter().any(|x| x == "-hwaccel"),
+                    "verdict {got} but argv asks for a hardware decoder: {a:?}"
+                ),
+            }
+        }
     }
 
     #[test]
