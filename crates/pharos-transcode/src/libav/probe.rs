@@ -246,12 +246,24 @@ fn profile_name(id: ffi::AVCodecID, profile: i32) -> Option<String> {
     unsafe { cstr_owned(ffi::avcodec_profile_name(id, profile)) }
 }
 
+/// A stream rational as `fps × 1000`, or `None` when it is not a plausible
+/// video frame rate.
+///
+/// The plausibility gate matters: `avg_frame_rate` is 0/0 on plenty of sources,
+/// so [`extract_video`] falls back to `r_frame_rate` — which for MPEG-TS is the
+/// 90 kHz container clock (90000/1), not a frame rate. Storing that as one made
+/// the HLS segment grid snap to a "90 kHz frame grid", i.e. no snapping at all,
+/// giving every segment boundary a sub-frame cut the encoder resolved by
+/// duplicating or dropping the boundary frame. Reject it here so the probe
+/// records "unknown" honestly rather than a value that reads as valid
+/// downstream. Bounds mirror `pharos_core::FrameRate`, the type that enforces
+/// the same rule on the consuming side.
 fn rational_mille(r: ffi::AVRational) -> Option<u32> {
     if r.den == 0 || r.num <= 0 {
         return None;
     }
     let fps = r.num as f64 / r.den as f64;
-    if !fps.is_finite() || fps <= 0.0 {
+    if !fps.is_finite() || !(pharos_core::MIN_FPS..=pharos_core::MAX_FPS).contains(&fps) {
         return None;
     }
     Some((fps * 1000.0).round() as u32)

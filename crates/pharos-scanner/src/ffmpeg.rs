@@ -563,7 +563,15 @@ fn parse_rational_mille(s: &str) -> Option<u32> {
         return None;
     }
     let fps = num / den;
-    if !fps.is_finite() || fps <= 0.0 {
+    // Reject anything outside a plausible video frame rate. `avg_frame_rate` is
+    // often absent, so the caller falls back to `r_frame_rate` — which for
+    // MPEG-TS is the 90 kHz container clock (90000/1), not a frame rate.
+    // Recording that as one made the HLS segment grid "snap" to a 90 kHz grid,
+    // i.e. not snap at all, so every boundary landed mid-frame and the encoder
+    // duplicated or dropped the boundary frame. Bounds mirror
+    // `pharos_core::FrameRate`, which enforces the same rule on the consuming
+    // side.
+    if !fps.is_finite() || !(pharos_core::MIN_FPS..=pharos_core::MAX_FPS).contains(&fps) {
         return None;
     }
     Some((fps * 1000.0).round() as u32)

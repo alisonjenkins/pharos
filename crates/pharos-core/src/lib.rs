@@ -1980,7 +1980,13 @@ pub struct ScanState {
 // `release_date` — feeding the new `embedded` metadata provider (Overview /
 // OfficialRating / Studios / PremiereDate for sidecar-less files). Re-probe so
 // existing movie/episode rows pick up their embedded descriptions.
-pub const PROBE_SCHEMA_VERSION: i64 = 4;
+// v5: `frame_rate_mille` is now rejected unless it is a plausible video frame
+// rate. Sources with no `avg_frame_rate` fell back to `r_frame_rate`, which for
+// MPEG-TS is the 90 kHz container clock — stored as frame_rate_mille =
+// 90_000_000, which silently flattened the HLS segment grid (see
+// `pharos_core::FrameRate`) and stuttered playback. Re-probe so the rows
+// currently holding a container clock record an honest "unknown" instead.
+pub const PROBE_SCHEMA_VERSION: i64 = 5;
 
 /// T86/ADR-0018 — bump when the intro/outro detection ALGORITHM changes in a
 /// way that invalidates stored segments or fingerprints. A season whose stored
