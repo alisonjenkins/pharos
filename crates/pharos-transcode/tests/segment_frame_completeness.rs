@@ -198,6 +198,41 @@ fn a_mid_file_segment_carries_every_frame_its_duration_implies() {
 }
 
 #[test]
+fn ffmpeg_reports_the_frames_it_wrote_next_to_the_segment() {
+    // The runtime guard in pharos-cache decides whether a segment is complete
+    // from ffmpeg's `-progress` sidecar, because the exit status cannot tell
+    // it. That only works if ffmpeg genuinely writes the report and its count
+    // agrees with the file it produced — assert both against a real encode
+    // rather than trusting the flag.
+    let td = tempfile::TempDir::new().unwrap();
+    let src = make_source(td.path());
+    let (path, _, _) = encode_segment(&src, td.path(), 4);
+    let probed = video_pts(&path).len();
+
+    let sidecar = pharos_transcode::progress_sidecar_path(&path);
+    let report = std::fs::read_to_string(&sidecar)
+        .unwrap_or_else(|e| panic!("no progress report at {}: {e}", sidecar.display()));
+    let reported: usize = report
+        .lines()
+        .filter_map(|l| l.strip_prefix("frame="))
+        .next_back()
+        .expect("progress report carries a frame count")
+        .trim()
+        .parse()
+        .expect("frame count is a number");
+
+    assert_eq!(
+        reported, probed,
+        "ffmpeg reported {reported} frames but the segment holds {probed}"
+    );
+    assert!(
+        report.contains("out_time_us="),
+        "progress report must carry out_time_us, the truncation signal: \
+         {report}"
+    );
+}
+
+#[test]
 fn consecutive_segments_join_without_a_gap_or_a_repeat() {
     // The count check alone cannot see a segment that carries the right
     // number of frames from the wrong place. Two adjacent segments must meet

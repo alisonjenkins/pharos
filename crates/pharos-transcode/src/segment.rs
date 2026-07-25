@@ -143,6 +143,7 @@ impl SegmentOpts {
             burn_subtitle_is_text: self.burn_subtitle_is_text,
             burn_subtitle_ass_path: self.burn_subtitle_ass_path.clone(),
             burn_fonts_dir: self.burn_fonts_dir.clone(),
+            decode_preroll_seconds: None,
         }
     }
 }
