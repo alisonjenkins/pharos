@@ -194,6 +194,13 @@ struct FfprobeDisposition {
     /// filter on `/Items` returns the right rows.
     #[serde(default)]
     hearing_impaired: i32,
+    /// Embedded cover art (an MP3/FLAC/M4A's folder JPEG) is reported as a
+    /// `video` stream carrying one still frame. Without this flag there is no
+    /// way to tell it apart from a real video track, so every music file
+    /// probed as `MediaKind::Movie` with `video_codec: mjpeg` and the
+    /// artwork's dimensions. See `is_real_video_stream`.
+    #[serde(default)]
+    attached_pic: i32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -357,7 +364,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         .as_deref()
         .and_then(|s| s.parse::<u64>().ok());
 
-    let video_stream = parsed.streams.iter().find(|s| s.codec_type == "video");
+    let video_stream = parsed.streams.iter().find(|s| is_real_video_stream(s));
     let audio_stream = parsed.streams.iter().find(|s| s.codec_type == "audio");
 
     // P16 — every audio stream surfaces as an AudioTrack. The scalar
@@ -577,8 +584,22 @@ fn parse_rational_mille(s: &str) -> Option<u32> {
     Some((fps * 1000.0).round() as u32)
 }
 
+/// A `video` stream that is an actual video TRACK, not embedded cover art.
+///
+/// ffprobe labels an album/folder JPEG carried inside an MP3/FLAC/M4A as a
+/// `video` stream with `disposition.attached_pic = 1`; it holds a single still,
+/// reports the artwork's pixel size, and has no usable frame rate. Matching on
+/// `codec_type == "video"` alone made every such music file scan as
+/// `MediaKind::Movie` with `video_codec: mjpeg`, and — on a video file whose
+/// cover art sorts before the real track — picked the artwork as THE video
+/// stream. ffmpeg's own default stream selection excludes attached pictures for
+/// the same reason.
+fn is_real_video_stream(s: &FfprobeStream) -> bool {
+    s.codec_type == "video" && s.disposition.attached_pic == 0
+}
+
 fn infer_kind(out: &FfprobeOutput) -> MediaKind {
-    let has_video = out.streams.iter().any(|s| s.codec_type == "video");
+    let has_video = out.streams.iter().any(is_real_video_stream);
     if has_video {
         MediaKind::Movie
     } else {

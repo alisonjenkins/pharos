@@ -72,7 +72,19 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
         let disp = st.disposition;
         let index = stream.index() as u32;
         match par.codec_type {
-            ffi::AVMediaType::VIDEO if video.is_none() => {
+            // An ATTACHED_PIC stream is embedded cover art (the folder/album
+            // JPEG an MP3/FLAC/M4A carries), not a video track: it holds ONE
+            // still frame and reports the artwork's pixel size, no usable frame
+            // rate, and no duration. Treating it as the video stream made every
+            // music file probe as `MediaKind::Movie` with `video_codec: mjpeg`
+            // and the artwork's dimensions — and, on a video file whose cover
+            // art happens to precede the real track, hid the actual video
+            // entirely. ffmpeg's own default stream selection excludes attached
+            // pictures for exactly this reason, and the transcoder already maps
+            // `0:v:0` to dodge them; the probe has to agree.
+            ffi::AVMediaType::VIDEO
+                if video.is_none() && disp & ffi::AV_DISPOSITION_ATTACHED_PIC == 0 =>
+            {
                 video = Some(extract_video(par, st));
             }
             ffi::AVMediaType::AUDIO => {
