@@ -3030,7 +3030,9 @@ mod tests {
         );
         // And it must still leave the overall cap room for several windows, so
         // a genuinely dead session fails inside 30 s rather than at it.
-        assert!(HlsSegmentCache::AUDIO_POLL_STALL * 2 < HlsSegmentCache::AUDIO_POLL_MAX);
+        const {
+            assert!(HlsSegmentCache::AUDIO_POLL_STALL * 2 < HlsSegmentCache::AUDIO_POLL_MAX);
+        }
     }
 
     #[test]
