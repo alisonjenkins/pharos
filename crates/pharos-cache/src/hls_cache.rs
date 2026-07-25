@@ -1574,6 +1574,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            muxed_audio_source: None,
         }
         .to_transcode_options()
     }
@@ -1882,6 +1883,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            muxed_audio_source: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -1907,6 +1909,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            muxed_audio_source: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts)
@@ -1935,6 +1938,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            muxed_audio_source: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts)
@@ -1976,6 +1980,7 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
+                muxed_audio_source: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)
@@ -1997,6 +2002,7 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
+                muxed_audio_source: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts)

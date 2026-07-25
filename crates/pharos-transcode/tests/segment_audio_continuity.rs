@@ -36,6 +36,19 @@
 //! per-segment audio encode, no matter how the boundaries are rounded: it
 //! demands that both segments' audio sit on ONE global frame grid.
 //!
+//! The fix is to encode the title's audio ONCE and have each segment copy its
+//! slice, so there is only one grid to be on. Measured here after the fix, on
+//! the same fixture:
+//!
+//! ```text
+//! seg3 audio ends   24.042667      seg4 audio starts 24.064000
+//! join 0.021333 s = exactly one AAC frame (1024 / 48000)
+//! phase 281.0000 frames — an integer
+//! ```
+//!
+//! Note the overlap is gone entirely rather than merely made harmless: the
+//! output-side trim cuts both segments on the same global frame boundary.
+//!
 //! Requires `ffmpeg`/`ffprobe` on PATH — guaranteed inside the devShell and CI;
 //! the test fails loudly rather than skipping, so a broken environment cannot
 //! silently drop the guard.
@@ -91,10 +104,49 @@ fn make_source(dir: &Path) -> PathBuf {
     src
 }
 
+/// The title's ONE continuous audio encode — the thing segments slice by
+/// copy instead of each encoding their own. Mirrors what
+/// `HlsSegmentCache::continuous_audio_args` produces.
+fn make_continuous_audio(src: &Path, dir: &Path) -> PathBuf {
+    let out = dir.join("cont.ts");
+    let res = Command::new("ffmpeg")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(src)
+        .args([
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128000",
+            "-ac",
+            "2",
+            "-f",
+            "mpegts",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            "-y",
+        ])
+        .arg(&out)
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        res.status.success(),
+        "continuous audio encode failed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    out
+}
+
 /// Encode one segment through the REAL argv builder, on the same grid the
 /// server uses. Nothing here re-derives a boundary: `segment_range` is the
 /// production function.
-fn encode_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
+fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBuf {
     let rate = pharos_core::FrameRate::from_mille(FPS_MILLE);
     let (start, dur) = pharos_core::segment_range(seg, rate);
     let opts = SegmentOpts {
@@ -110,6 +162,7 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
+        muxed_audio_source: Some(cont_audio.to_path_buf()),
     };
     let out = dir.join(format!("seg{seg}.ts"));
     let args = ffmpeg_transcode_args(
@@ -155,13 +208,13 @@ fn audio_pts(path: &Path) -> Vec<f64> {
 }
 
 #[test]
-#[ignore = "fails until muxed audio is copied from one continuous encode (plan Task 5)"]
 fn audio_frames_tile_exactly_across_a_segment_boundary() {
     let td = tempfile::TempDir::new().unwrap();
     let src = make_source(td.path());
+    let cont = make_continuous_audio(&src, td.path());
 
-    let a = encode_segment(&src, td.path(), 3);
-    let b = encode_segment(&src, td.path(), 4);
+    let a = encode_segment(&src, &cont, td.path(), 3);
+    let b = encode_segment(&src, &cont, td.path(), 4);
     let pa = audio_pts(&a);
     let pb = audio_pts(&b);
     assert!(pa.len() > 10 && pb.len() > 10, "segments carry audio");

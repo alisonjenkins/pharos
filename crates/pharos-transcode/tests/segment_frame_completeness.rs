@@ -106,6 +106,7 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> (PathBuf, f64, f64) {
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
+        muxed_audio_source: None,
     };
     let out = dir.join(format!("seg{seg}.ts"));
     let args = ffmpeg_transcode_args(

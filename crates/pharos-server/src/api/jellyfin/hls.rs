@@ -1370,6 +1370,7 @@ fn build_segment_opts(
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
+                    muxed_audio_source: None,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1397,6 +1398,7 @@ fn build_segment_opts(
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
+                    muxed_audio_source: None,
                 };
             }
             _ => {}
@@ -1424,6 +1426,7 @@ fn build_segment_opts(
         burn_subtitle_is_text: subtitle_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
+        muxed_audio_source: None,
     }
 }
 
@@ -2680,6 +2683,7 @@ async fn fmp4_segment_opts(
         burn_subtitle_is_text: sub_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
+        muxed_audio_source: None,
     }
 }
 

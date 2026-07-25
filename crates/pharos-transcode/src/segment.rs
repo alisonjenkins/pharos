@@ -124,6 +124,14 @@ pub struct SegmentOpts {
     /// Directory of extracted embedded fonts for libass (`:fontsdir=`); see
     /// [`TranscodeOptions::burn_fonts_dir`].
     pub burn_fonts_dir: Option<std::path::PathBuf>,
+    /// The title's one continuous audio encode, which this segment copies its
+    /// audio slice from instead of encoding its own. See
+    /// [`TranscodeOptions::muxed_audio_source`] for why a segment must never
+    /// encode its own audio.
+    ///
+    /// `None` alongside `audio: None` is the separate-rendition surface
+    /// (fMP4), which carries no audio in the segment at all.
+    pub muxed_audio_source: Option<std::path::PathBuf>,
 }
 
 impl SegmentOpts {
@@ -144,6 +152,7 @@ impl SegmentOpts {
             burn_subtitle_ass_path: self.burn_subtitle_ass_path.clone(),
             burn_fonts_dir: self.burn_fonts_dir.clone(),
             decode_preroll_seconds: None,
+            muxed_audio_source: self.muxed_audio_source.clone(),
         }
     }
 }
@@ -167,6 +176,7 @@ mod tests {
             burn_subtitle_is_text: true,
             burn_subtitle_ass_path: Some(std::path::PathBuf::from("/cache/sub.ass")),
             burn_fonts_dir: Some(std::path::PathBuf::from("/cache/fonts")),
+            muxed_audio_source: None,
         };
         let t = s.to_transcode_options();
         assert_eq!(t.container, Container::Mpegts);

@@ -109,6 +109,7 @@ fn transcode_segment(
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
         decode_preroll_seconds: None,
+        muxed_audio_source: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
@@ -188,6 +189,7 @@ fn transcode_segment_from_sidecar(
         burn_subtitle_ass_path: Some(ass.to_path_buf()),
         burn_fonts_dir: None,
         decode_preroll_seconds: None,
+        muxed_audio_source: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
