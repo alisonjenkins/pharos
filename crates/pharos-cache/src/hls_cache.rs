@@ -310,8 +310,8 @@ impl SegmentIdentity {
             audio_index: audio_index.unwrap_or(0),
             subtitle_index: subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
             video_bitrate_kbps: kbps(opts.video_bitrate_bps),
-            audio_bitrate_kbps: kbps(opts.audio_bitrate_bps),
-            codec_tag: codec_tag(opts.video, opts.audio, opts.container),
+            audio_bitrate_kbps: kbps(opts.audio_bitrate_bps()),
+            codec_tag: codec_tag(opts.video, opts.audio_codec(), opts.container),
         }
     }
 
@@ -665,7 +665,7 @@ impl HlsSegmentCache {
                     source,
                     media_id,
                     opts.audio_source_stream_index,
-                    opts.audio_bitrate_bps,
+                    opts.audio_bitrate_bps(),
                     start_secs,
                     start_secs + dur_secs,
                 )
@@ -722,7 +722,7 @@ impl HlsSegmentCache {
                         attempt,
                         reason = failure_reason(&e),
                         error = %e,
-                        codec = codec_tag(opts.video, opts.audio, opts.container),
+                        codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
                         burn = opts.burn_subtitle_stream_index.is_some(),
                         burn_idx = opts.burn_subtitle_stream_index,
                         audio_idx = opts.audio_source_stream_index,
@@ -778,7 +778,7 @@ impl HlsSegmentCache {
                 media.id = media_id,
                 seg = seg_index,
                 bytes = produced,
-                codec = codec_tag(opts.video, opts.audio, opts.container),
+                codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
                 "hls segment transcode produced empty/truncated output — not caching"
             );
             record_segment_outcome(SegmentOutcome::Empty, class);
@@ -834,7 +834,7 @@ impl HlsSegmentCache {
             encode_ms = timing.as_ref().map(|t| t.encode_ms),
             device = timing.as_ref().map(|t| t.device.to_string()),
             bytes = bytes.len(),
-            codec = codec_tag(opts.video, opts.audio, opts.container),
+            codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
             burn = opts.burn_subtitle_stream_index.is_some(),
             burn_idx = opts.burn_subtitle_stream_index,
             audio_idx = opts.audio_source_stream_index,
@@ -856,7 +856,7 @@ impl HlsSegmentCache {
                 queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
                 encode_ms = timing.as_ref().map(|t| t.encode_ms),
                 device = timing.as_ref().map(|t| t.device.to_string()),
-                codec = codec_tag(opts.video, opts.audio, opts.container),
+                codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
                 burn = opts.burn_subtitle_stream_index.is_some(),
                 seek_secs,
                 seg_secs,
@@ -1822,6 +1822,7 @@ impl HlsSegmentCache {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use pharos_transcode::{AudioDelivery, ContinuousAudio};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
 
@@ -1850,9 +1851,13 @@ mod tests {
         SegmentOpts {
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
-            audio: Some(SegmentAudio::Aac),
+            audio: AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Aac,
+
+                bitrate_bps: Some(128_000),
+            }),
+
             video_bitrate_bps: Some(2_000_000),
-            audio_bitrate_bps: Some(128_000),
             start_position_ticks: 1_625_000_000,
             duration_ticks: Some(60_060_000),
             audio_source_stream_index: None,
@@ -1962,9 +1967,14 @@ mod tests {
         SegmentOpts {
             container,
             video,
-            audio,
+            audio: match audio {
+                Some(codec) => AudioDelivery::Muxed(ContinuousAudio {
+                    codec,
+                    bitrate_bps: audio_bitrate_bps,
+                }),
+                None => AudioDelivery::Separate,
+            },
             video_bitrate_bps,
-            audio_bitrate_bps,
             start_position_ticks: 0,
             duration_ticks: Some(60_060_000),
             audio_source_stream_index: None,
@@ -2038,7 +2048,10 @@ mod tests {
         let mut vbr = base_opts.clone();
         vbr.video_bitrate_bps = Some(2_000_000);
         let mut abr = base_opts.clone();
-        abr.audio_bitrate_bps = Some(256_000);
+        abr.audio = AudioDelivery::Muxed(ContinuousAudio {
+            codec: SegmentAudio::Aac,
+            bitrate_bps: Some(256_000),
+        });
         let mut codec = base_opts.clone();
         codec.container = SegmentContainer::Fmp4;
 
@@ -2334,9 +2347,8 @@ mod tests {
         let opts = SegmentOpts {
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
-            audio: None,
+            audio: AudioDelivery::Separate,
             video_bitrate_bps: None,
-            audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
             audio_source_stream_index: None,
@@ -2360,9 +2372,8 @@ mod tests {
         let opts = SegmentOpts {
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
-            audio: None,
+            audio: AudioDelivery::Separate,
             video_bitrate_bps: None,
-            audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
             audio_source_stream_index: None,
@@ -2389,9 +2400,8 @@ mod tests {
         let opts = SegmentOpts {
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
-            audio: None,
+            audio: AudioDelivery::Separate,
             video_bitrate_bps: None,
-            audio_bitrate_bps: None,
             start_position_ticks: 0,
             duration_ticks: None,
             audio_source_stream_index: None,
@@ -2431,9 +2441,8 @@ mod tests {
             let opts = SegmentOpts {
                 container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
-                audio: None,
+                audio: AudioDelivery::Separate,
                 video_bitrate_bps: None,
-                audio_bitrate_bps: None,
                 start_position_ticks: 0,
                 duration_ticks: None,
                 audio_source_stream_index: None,
@@ -2453,9 +2462,8 @@ mod tests {
             let opts = SegmentOpts {
                 container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
-                audio: None,
+                audio: AudioDelivery::Separate,
                 video_bitrate_bps: None,
-                audio_bitrate_bps: None,
                 start_position_ticks: 0,
                 duration_ticks: None,
                 audio_source_stream_index: None,

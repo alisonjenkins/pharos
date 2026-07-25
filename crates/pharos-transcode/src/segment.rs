@@ -92,6 +92,54 @@ impl From<SegmentAudio> for AudioCodec {
     }
 }
 
+/// The audio encode a segment's audio is COPIED from — one per
+/// `(media, track, bitrate, codec)`, produced once for the whole title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuousAudio {
+    pub codec: SegmentAudio,
+    pub bitrate_bps: Option<u64>,
+}
+
+/// How a segment gets its audio.
+///
+/// There is deliberately **no variant meaning "encode audio for this
+/// segment"**. Encoding audio per segment re-primes the codec at every
+/// boundary — each segment emits its own priming frame and starts a fresh
+/// frame grid at its own seek point — so consecutive segments carry
+/// overlapping, phase-misaligned audio. That shipped on the muxed mpegts
+/// surface while the browser surface had a continuous encode, because the
+/// choice lived in a field any delivery path could set either way.
+///
+/// Now it cannot be set that way: the only shapes are "no audio here" and
+/// "copied from the one encode".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioDelivery {
+    /// This segment carries no audio; it is served as its own rendition
+    /// (`EXT-X-MEDIA` group). The fMP4 surfaces.
+    Separate,
+    /// Muxed into this segment, copied from the title's continuous encode.
+    Muxed(ContinuousAudio),
+}
+
+impl AudioDelivery {
+    /// The codec of the audio this segment carries, if any. Used to key the
+    /// cache: segments differing only in audio codec are different bytes.
+    pub fn codec(self) -> Option<SegmentAudio> {
+        match self {
+            Self::Separate => None,
+            Self::Muxed(c) => Some(c.codec),
+        }
+    }
+
+    /// The bitrate of the continuous encode this segment copies from.
+    pub fn bitrate_bps(self) -> Option<u64> {
+        match self {
+            Self::Separate => None,
+            Self::Muxed(c) => c.bitrate_bps,
+        }
+    }
+}
+
 /// Options for ONE independent per-segment HLS transcode. Same field names
 /// as [`TranscodeOptions`] (call sites read identically), but the codec /
 /// container types exclude every segment-illegal state.
@@ -100,11 +148,10 @@ pub struct SegmentOpts {
     pub container: SegmentContainer,
     /// `None` = audio-only rendition segment (`-vn`).
     pub video: Option<SegmentVideo>,
-    /// `None` = audio-free video segment (`-an`; the VP9 surface serves
-    /// audio as a separate continuous rendition).
-    pub audio: Option<SegmentAudio>,
+    /// How this segment gets its audio. See [`AudioDelivery`] — there is no
+    /// value here meaning "encode audio for this segment".
+    pub audio: AudioDelivery,
     pub video_bitrate_bps: Option<u64>,
-    pub audio_bitrate_bps: Option<u64>,
     /// Jellyfin-style ticks (10,000,000 per second). 0 = start of stream.
     pub start_position_ticks: u64,
     pub duration_ticks: Option<u64>,
@@ -124,26 +171,36 @@ pub struct SegmentOpts {
     /// Directory of extracted embedded fonts for libass (`:fontsdir=`); see
     /// [`TranscodeOptions::burn_fonts_dir`].
     pub burn_fonts_dir: Option<std::path::PathBuf>,
-    /// The title's one continuous audio encode, which this segment copies its
-    /// audio slice from instead of encoding its own. See
-    /// [`TranscodeOptions::muxed_audio_source`] for why a segment must never
-    /// encode its own audio.
-    ///
-    /// `None` alongside `audio: None` is the separate-rendition surface
-    /// (fMP4), which carries no audio in the segment at all.
+    /// The RESOLVED continuous encode this segment copies its audio slice
+    /// from. `None` until the cache has produced (or found) the encode that
+    /// [`AudioDelivery::Muxed`] asks for — a handler declares the intent, the
+    /// cache supplies the file.
     pub muxed_audio_source: Option<crate::options::MuxedAudio>,
 }
 
 impl SegmentOpts {
+    /// The audio codec this segment carries, if any.
+    pub fn audio_codec(&self) -> Option<SegmentAudio> {
+        self.audio.codec()
+    }
+
+    /// The bitrate of the continuous encode this segment copies audio from.
+    pub fn audio_bitrate_bps(&self) -> Option<u64> {
+        self.audio.bitrate_bps()
+    }
+
     /// Lower to the transcoder's wire options — the ONLY bridge from the
     /// segment-legal subset into the general option space.
     pub fn to_transcode_options(&self) -> TranscodeOptions {
         TranscodeOptions {
             container: self.container.into(),
             video: self.video.map(VideoCodec::from),
-            audio: self.audio.map(AudioCodec::from),
+            // ALWAYS `None`: a segment never runs an audio encoder. When it
+            // carries audio at all, the bytes are copied from the continuous
+            // encode named by `muxed_audio_source`.
+            audio: None,
             video_bitrate_bps: self.video_bitrate_bps,
-            audio_bitrate_bps: self.audio_bitrate_bps,
+            audio_bitrate_bps: self.audio_bitrate_bps(),
             start_position_ticks: self.start_position_ticks,
             duration_ticks: self.duration_ticks,
             audio_source_stream_index: self.audio_source_stream_index,
@@ -166,9 +223,13 @@ mod tests {
         let s = SegmentOpts {
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
-            audio: Some(SegmentAudio::Aac),
+            audio: AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Aac,
+
+                bitrate_bps: Some(128_000),
+            }),
+
             video_bitrate_bps: Some(3_000_000),
-            audio_bitrate_bps: Some(128_000),
             start_position_ticks: 60_060_000,
             duration_ticks: Some(60_060_000),
             audio_source_stream_index: Some(1),
@@ -181,7 +242,14 @@ mod tests {
         let t = s.to_transcode_options();
         assert_eq!(t.container, Container::Mpegts);
         assert_eq!(t.video, Some(VideoCodec::H264));
-        assert_eq!(t.audio, Some(AudioCodec::Aac));
+        // The old assertion here was `t.audio == Some(AudioCodec::Aac)` —
+        // lowering used to hand the segment an audio ENCODER. That is exactly
+        // the state `AudioDelivery` now makes unrepresentable, so the
+        // assertion inverts: a lowered segment never names an audio encoder,
+        // and the codec survives only as cache-keying information.
+        assert_eq!(t.audio, None, "a segment never encodes its own audio");
+        assert_eq!(s.audio_codec(), Some(SegmentAudio::Aac));
+        assert_eq!(t.audio_bitrate_bps, Some(128_000));
         assert_eq!(t.video_bitrate_bps, Some(3_000_000));
         assert_eq!(t.start_position_ticks, 60_060_000);
         assert_eq!(t.duration_ticks, Some(60_060_000));
@@ -196,6 +264,67 @@ mod tests {
             t.burn_fonts_dir,
             Some(std::path::PathBuf::from("/cache/fonts"))
         );
+    }
+
+    #[test]
+    fn no_audio_delivery_means_encode_this_segments_audio() {
+        // THE property this type exists for. Encoding audio per segment
+        // re-primes the codec at every boundary, so consecutive segments
+        // carry overlapping, phase-misaligned audio — measured live as 6.037s
+        // of audio against 6.006s of video, grids 0.53 of a frame apart. It
+        // shipped because the choice was a field any delivery path could set
+        // either way.
+        //
+        // The match below is EXHAUSTIVE: adding a variant that means "encode
+        // audio here" fails to compile until someone deletes this test, which
+        // is the point.
+        for d in [
+            AudioDelivery::Separate,
+            AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Aac,
+                bitrate_bps: Some(128_000),
+            }),
+        ] {
+            match d {
+                // Carries no audio at all.
+                AudioDelivery::Separate => assert_eq!(d.codec(), None),
+                // Carries audio COPIED from one encode — never its own.
+                AudioDelivery::Muxed(c) => assert_eq!(d.codec(), Some(c.codec)),
+            }
+        }
+    }
+
+    #[test]
+    fn lowering_can_never_name_an_audio_encoder() {
+        // Whatever a caller declares, the wire options reaching ffmpeg carry
+        // no audio codec: the bytes come from the continuous encode.
+        for audio in [
+            AudioDelivery::Separate,
+            AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Aac,
+                bitrate_bps: Some(128_000),
+            }),
+            AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Opus,
+                bitrate_bps: None,
+            }),
+        ] {
+            let s = SegmentOpts {
+                container: SegmentContainer::Mpegts,
+                video: Some(SegmentVideo::H264),
+                audio,
+                video_bitrate_bps: Some(2_000_000),
+                start_position_ticks: 0,
+                duration_ticks: Some(60_060_000),
+                audio_source_stream_index: None,
+                burn_subtitle_stream_index: None,
+                burn_subtitle_is_text: false,
+                burn_subtitle_ass_path: None,
+                burn_fonts_dir: None,
+                muxed_audio_source: None,
+            };
+            assert_eq!(s.to_transcode_options().audio, None, "{audio:?}");
+        }
     }
 
     #[test]
