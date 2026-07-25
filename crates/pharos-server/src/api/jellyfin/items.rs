@@ -1965,7 +1965,7 @@ async fn playback_info(
     // (T29 follow-up). Container falls back to a kind-derived default
     // only when ffprobe never ran (mirrors `container_for` in dto.rs so
     // negotiator + DTO see the same value).
-    let container = container_for(probe, is_video);
+    let container = container_for(probe, &item.path, is_video);
     let source = SourceMedia {
         container: container.clone(),
         video_codec: probe.video_codec.clone(),

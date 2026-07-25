@@ -1552,7 +1552,7 @@ impl BaseItemDto {
         };
         let is_video = !matches!(item.kind, pharos_core::MediaKind::Audio);
         let probe = &item.probe;
-        let container = container_for(probe, is_video);
+        let container = container_for(probe, &item.path, is_video);
         let run_time_ticks = probe.run_time_ticks().unwrap_or(0);
 
         let media_streams = build_media_streams(probe, is_video);
@@ -2096,7 +2096,11 @@ pub struct SessionInfoDto {
 /// Falls back to a kind-default when no probe ran, because an empty
 /// Container makes jellyfin-web pick Transcode with no TranscodingUrl
 /// → "Playback Error" dialog (caught in dev).
-pub fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> String {
+pub fn container_for(
+    probe: &pharos_core::MediaProbe,
+    path: &std::path::Path,
+    is_video: bool,
+) -> String {
     const PREFERRED: &[&str] = &["webm", "m4v", "mp4", "mp3", "flac", "ogg", "opus", "aac"];
     if let Some(c) = probe.container.as_deref() {
         let aliases: Vec<&str> = c
@@ -2104,6 +2108,41 @@ pub fn container_for(probe: &pharos_core::MediaProbe, is_video: bool) -> String 
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
+        // ffprobe names one demuxer per container FAMILY, so an alias list can
+        // be ambiguous about which member is actually on disk: every .mkv and
+        // every .webm alike probe as "matroska,webm". The file's own extension
+        // is the only evidence of the difference, but it is consulted for the
+        // MATROSKA family alone, deliberately.
+        //
+        // The distinction is not "which extensions the library happens to hold"
+        // — it is whether a family's members are mutually decodable. Matroska
+        // and WebM are not: a browser that demuxes WebM refuses Matroska
+        // outright, because it reads the EBML DocType and requires `webm`
+        // there. Guessing wrong is then an outage, not a mislabel (B107): a
+        // Matroska announced as `webm` matches a browser's webm
+        // DirectPlayProfile, so the negotiator returns DirectPlay, pharos
+        // serves the .mkv verbatim, Firefox refuses the file whatever codecs
+        // are inside, and jellyfin-web retries PlaybackInfo forever.
+        //
+        // The ISOBMFF family (mov/mp4/m4a/m4v/3gp) shares one box structure, so
+        // its members ARE interchangeable to a decoder and the canonical alias
+        // chosen below stays correct for any such file — today's or a future
+        // one. Widening the extension override to those would trade a real bug
+        // for needless transcodes with no decoding problem to solve.
+        const MATROSKA_FAMILY_EXT: &[&str] = &["mkv", "mka", "webm"];
+        let probed_matroska = aliases
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("matroska") || a.eq_ignore_ascii_case("webm"));
+        if probed_matroska {
+            if let Some(ext) = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .filter(|e| MATROSKA_FAMILY_EXT.contains(&e.as_str()))
+            {
+                return ext;
+            }
+        }
         for pref in PREFERRED {
             if aliases.iter().any(|a| a.eq_ignore_ascii_case(pref)) {
                 return (*pref).to_string();
@@ -3059,16 +3098,87 @@ mod tests {
     }
 
     #[test]
-    fn container_for_prefers_webm_alias_over_matroska() {
-        // ffprobe reports `format_name = "matroska,webm"` for both .mkv
-        // and .webm files; jellyfin-web's DirectPlayProfile expects
-        // `webm` for vp9 video. Picking "matroska" forces transcode →
-        // "Playback Error" because no TranscodingUrl is wired.
+    fn container_for_calls_a_matroska_file_mkv_not_webm() {
+        // B107 — ffprobe reports `format_name = "matroska,webm"` for BOTH .mkv
+        // and .webm, so the alias list cannot say which is on disk. Announcing
+        // a Matroska as `webm` matched a browser's webm DirectPlayProfile, so
+        // the negotiator direct-played it and Firefox — which has no Matroska
+        // demuxer — rejected the EBML DocType and retried forever.
         let probe = MediaProbe {
             container: Some("matroska,webm".into()),
             ..Default::default()
         };
-        assert_eq!(container_for(&probe, true), "webm");
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/Show S01E01.mkv"), true),
+            "mkv"
+        );
+    }
+
+    #[test]
+    fn container_for_keeps_a_genuine_webm_file_webm() {
+        // Same probe string, different file: this one really IS WebM, and a
+        // browser plays it directly. The extension is the only discriminator.
+        let probe = MediaProbe {
+            container: Some("matroska,webm".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/clip.webm"), true),
+            "webm"
+        );
+    }
+
+    #[test]
+    fn container_for_ignores_an_extension_the_probe_contradicts() {
+        // A mislabelled file (mp4 bytes named .mkv) must follow the PROBE, not
+        // the name — the extension is consulted only when ffprobe itself
+        // reported the Matroska family, so a contradiction falls back to the
+        // alias list.
+        let probe = MediaProbe {
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/wrong.mkv"), true),
+            "mp4"
+        );
+    }
+
+    #[test]
+    fn container_for_leaves_the_isobmff_family_canonical() {
+        // The extension override is deliberately scoped to Matroska, whose
+        // members are mutually UNDECODABLE (a WebM demuxer refuses Matroska).
+        // ISOBMFF members share one box structure and are interchangeable to a
+        // decoder, so they keep the canonical `mp4` alias whatever the file is
+        // named. Pinned so a future .mov/.m4a import cannot silently start
+        // reporting a container clients don't profile on — the failure there
+        // would be needless transcodes, with no decoding problem to solve.
+        let probe = MediaProbe {
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
+            ..Default::default()
+        };
+        for name in ["/m/x.mov", "/m/x.m4a", "/m/x.m4v", "/m/x.mp4"] {
+            assert_eq!(
+                container_for(&probe, std::path::Path::new(name), true),
+                "mp4",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_for_names_a_matroska_audio_file_mka() {
+        // Not in the library today, but the Matroska family is exactly where
+        // the alias list is ambiguous: without the extension this falls through
+        // to the PREFERRED list and reports a .mka as `webm`.
+        let probe = MediaProbe {
+            container: Some("matroska,webm".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/track.mka"), false),
+            "mka"
+        );
     }
 
     #[test]
@@ -3077,14 +3187,23 @@ mod tests {
             container: Some("avi".into()),
             ..Default::default()
         };
-        assert_eq!(container_for(&probe, true), "avi");
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/x.avi"), true),
+            "avi"
+        );
     }
 
     #[test]
     fn container_for_kind_default_when_probe_empty() {
         let probe = MediaProbe::default();
-        assert_eq!(container_for(&probe, true), "mp4");
-        assert_eq!(container_for(&probe, false), "mp3");
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/x.mkv"), true),
+            "mp4"
+        );
+        assert_eq!(
+            container_for(&probe, std::path::Path::new("/m/x.mka"), false),
+            "mp3"
+        );
     }
 
     #[test]
