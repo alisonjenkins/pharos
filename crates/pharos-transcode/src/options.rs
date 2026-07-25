@@ -26,6 +26,24 @@ pub enum Container {
 }
 
 impl Container {
+    /// Whether this container is used to carry ONE HLS segment of a timeline
+    /// tiled by independent per-segment transcodes.
+    ///
+    /// This is the property that decides whether a transcode needs
+    /// frame-exact boundary timestamps: a segment's first frame has to land
+    /// exactly where the previous segment's last frame ended, or the encoder
+    /// resolves the sub-frame residue by duplicating or dropping the boundary
+    /// frame — a hitch at every boundary, on every client. A progressive
+    /// output has no boundaries and needs none of it.
+    ///
+    /// Derived from the container rather than re-tested per call site so a new
+    /// segment container cannot be added without inheriting the treatment (the
+    /// mpegts path was previously missed, so h264/TS segments never received
+    /// `-enc_time_base` at all).
+    pub fn is_hls_segment(self) -> bool {
+        matches!(self, Container::Mpegts | Container::Fmp4)
+    }
+
     /// ffmpeg `-f` muxer name.
     pub fn ffmpeg_muxer(self) -> &'static str {
         match self {

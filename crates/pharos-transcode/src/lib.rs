@@ -671,7 +671,14 @@ fn build_args_for_device(
     // software libvpx encoder (no hardware VP9 here), so it keeps the flag.
     let fmp4_segment = matches!(opts.container, Container::Fmp4);
     let software_video = matches!(hwaccel, HwAccel::Off);
-    if fmp4_segment
+    // EVERY segment container needs this, not just fMP4: an mpegts segment is
+    // tiled onto the same shared timeline and suffers the same ±1-frame
+    // boundary dup/drop when the encoder quantizes the zero-based first-frame
+    // pts to its default 1/framerate timebase. The grid now snaps boundaries to
+    // real frames, which fixes the boundary on every encoder including the
+    // hardware ones; this keeps the software path frame-exact even for a source
+    // whose frame rate could not be determined (no grid to snap to).
+    if opts.container.is_hls_segment()
         && software_video
         && opts.video.is_some()
         && !matches!(opts.video, Some(VideoCodec::Copy))
@@ -1034,6 +1041,36 @@ mod tests {
         assert!(!joined.contains("-avoid_negative_ts"), "{joined}");
         assert!(!joined.contains("frag_discont"), "{joined}");
         assert!(!joined.contains("-enc_time_base"), "{joined}");
+    }
+
+    #[test]
+    fn every_segment_container_gets_frame_exact_timestamps_on_software() {
+        // An mpegts segment tiles the same shared timeline as an fMP4 one, so
+        // it needs the same frame-exact boundary treatment. It previously got
+        // none: `-enc_time_base` was gated on Fmp4 alone, so every software
+        // h264/TS segment quantized its first frame to the encoder's default
+        // 1/framerate timebase and duplicated or dropped the boundary frame.
+        // Driving this off `Container::is_hls_segment` keeps the two in step.
+        for container in [Container::Mpegts, Container::Fmp4] {
+            let mut o = opts();
+            o.container = container;
+            o.start_position_ticks = 30 * 10_000_000;
+            let joined = build_args("/m/x.mkv", &o).join(" ");
+            assert!(
+                joined.contains("-enc_time_base 1:90000"),
+                "{container:?} segment must be frame-exact: {joined}"
+            );
+        }
+        // Progressive containers have no boundaries and must not get it.
+        for container in [Container::Mp4, Container::WebM, Container::Mkv] {
+            let mut o = opts();
+            o.container = container;
+            let joined = build_args("/m/x.mkv", &o).join(" ");
+            assert!(
+                !joined.contains("-enc_time_base"),
+                "{container:?} is progressive: {joined}"
+            );
+        }
     }
 
     #[test]
