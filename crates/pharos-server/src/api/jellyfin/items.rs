@@ -1817,6 +1817,57 @@ fn browser_matroska_direct_unplayable(
     is_web_client && is_video && decision_is_direct && source_is_matroska && !webm_relabel_playable
 }
 
+/// Whether a browser can play pharos's `/stream` response for this source
+/// AS-IS — the file served verbatim, no remux.
+///
+/// A browser demuxes the CONTAINER before it ever reaches a codec, so this is
+/// a container test first. Only WebM qualifies: Firefox ships no Matroska
+/// demuxer, and reads the EBML DocType to decide — `matroska` is refused
+/// outright however WebM-legal the streams inside are.
+///
+/// This was previously computed as "Matroska whose codecs are WebM-legal,
+/// relabelled `video/webm`" (B107). That premise inverted the check it fed:
+/// an av1+opus .mkv satisfied it, so [`browser_matroska_direct_unplayable`]
+/// concluded the file was fine and skipped the downgrade — leaving the browser
+/// with a Matroska it could not open and no `TranscodingUrl` to fall back to.
+///
+/// The codec tests remain: a genuine WebM can still carry streams a given
+/// client does not decode.
+fn source_plays_raw_in_browser(
+    container: &str,
+    video_codec: Option<&str>,
+    audio_codec: Option<&str>,
+    direct_play_profiles: &[pharos_jellyfin_api::device_profile::DirectPlayProfile],
+) -> bool {
+    if !container.eq_ignore_ascii_case("webm") {
+        return false;
+    }
+    // The client must list a webm DirectPlayProfile covering the source's video
+    // codec — a WebM container it cannot decode is no more playable than a
+    // Matroska.
+    let client_plays_webm_video = video_codec.is_some_and(|sv| {
+        direct_play_profiles.iter().any(|p| {
+            (p.kind.is_empty() || p.kind.eq_ignore_ascii_case("Video"))
+                && p.container
+                    .split(',')
+                    .any(|c| c.trim().eq_ignore_ascii_case("webm"))
+                && p.video_codec
+                    .split(',')
+                    .any(|c| c.trim().eq_ignore_ascii_case(sv))
+        })
+    });
+    let v = video_codec.map(|c| c.to_ascii_lowercase());
+    let a = audio_codec.map(|c| c.to_ascii_lowercase());
+    client_plays_webm_video
+        && matches!(
+            v.as_deref(),
+            Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
+        )
+        // Audio must be webm-legal too, else the browser plays video but
+        // cannot decode the audio track.
+        && matches!(a.as_deref(), Some("opus" | "vorbis") | None)
+}
+
 /// Extract `key`'s value from a raw query string, case-insensitively,
 /// treating an empty value as absent (same rule the audio/subtitle
 /// track-selection forwarding in `playback_info` uses).
@@ -2056,44 +2107,15 @@ async fn playback_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.contains("Mozilla"));
 
-    // Whether the raw `/stream` file (re-labelled `video/webm` by
-    // `deliver_stream`) genuinely plays in a browser: a webm-legal Matroska
-    // (VP8/9/AV1 + Opus/Vorbis) whose codecs the client lists under a webm
-    // DirectPlayProfile. Computed HERE — ahead of the DirectPlay/force-webm gate
-    // — so the B80 hang fix below can consult it; it also drives
-    // `SupportsDirectStream` further down.
-    let webm_relabel_playable = {
-        let lc = |c: &Option<String>| c.as_deref().map(|s| s.to_ascii_lowercase());
-        let v = lc(&source.video_codec);
-        let a = lc(&source.audio_codec);
-        let cont = source.container.to_ascii_lowercase();
-        let matroska = cont.contains("matroska") || cont.contains("webm") || cont.contains("mkv");
-        // The client can actually consume the re-labelled `video/webm` when it
-        // lists a webm DirectPlayProfile covering the source's video codec — the
-        // precise "would this play if the container were webm" test, so a
-        // vp9-in-matroska on a webm-capable client still direct-streams rather
-        // than needlessly transcoding.
-        let client_plays_webm_video = source.video_codec.as_deref().is_some_and(|sv| {
-            profile.direct_play_profiles.iter().any(|p| {
-                (p.kind.is_empty() || p.kind.eq_ignore_ascii_case("Video"))
-                    && p.container
-                        .split(',')
-                        .any(|c| c.trim().eq_ignore_ascii_case("webm"))
-                    && p.video_codec
-                        .split(',')
-                        .any(|c| c.trim().eq_ignore_ascii_case(sv))
-            })
-        });
-        matroska
-            && client_plays_webm_video
-            && matches!(
-                v.as_deref(),
-                Some("vp9" | "vp09" | "vp8" | "vp08" | "av1" | "av01")
-            )
-            // Audio must be webm-legal too, else the re-labelled video/webm
-            // plays video but the browser can't decode the audio track.
-            && matches!(a.as_deref(), Some("opus" | "vorbis") | None)
-    };
+    // Whether the raw `/stream` file genuinely plays in a browser. Computed
+    // HERE — ahead of the DirectPlay/force-webm gate — so the B80 hang fix
+    // below can consult it; it also drives `SupportsDirectStream` further down.
+    let webm_relabel_playable = source_plays_raw_in_browser(
+        &source.container,
+        source.video_codec.as_deref(),
+        source.audio_codec.as_deref(),
+        &profile.direct_play_profiles,
+    );
     // B80 (Lace incident, 2026-07-16) — a browser's <video>/MSE cannot demux a
     // raw Matroska container. When the negotiator returned DirectPlay for a
     // Matroska source to a browser that CANNOT play the `video/webm` relabel
@@ -6654,7 +6676,7 @@ mod browser_matroska_fallback_tests {
         assert!(browser_matroska_direct_unplayable(
             true, true, true, true, false
         ));
-        // Webm-legal Matroska (vp9/av1 + opus, client lists webm) → keep direct.
+        // Raw-playable source (a genuine WebM the client decodes) → keep direct.
         assert!(!browser_matroska_direct_unplayable(
             true, true, true, true, true
         ));
@@ -6674,6 +6696,79 @@ mod browser_matroska_fallback_tests {
         // Audio-only source → unaffected.
         assert!(!browser_matroska_direct_unplayable(
             true, false, true, true, false
+        ));
+    }
+}
+
+#[cfg(test)]
+mod source_plays_raw_in_browser_tests {
+    use super::source_plays_raw_in_browser;
+    use pharos_jellyfin_api::device_profile::DirectPlayProfile;
+
+    /// jellyfin-web's browser profile: WebM carrying VP9/AV1 + Opus. Firefox
+    /// declares no `mkv` entry — it has no Matroska demuxer to declare.
+    fn browser_profiles() -> Vec<DirectPlayProfile> {
+        vec![DirectPlayProfile {
+            container: "webm".into(),
+            video_codec: "vp8,vp9,av1".into(),
+            audio_codec: "vorbis,opus".into(),
+            kind: "Video".into(),
+        }]
+    }
+
+    #[test]
+    fn a_matroska_never_plays_raw_however_webm_legal_its_codecs() {
+        // B107, the exact live case: Cobra Kai S01E01, av1 + opus in a .mkv,
+        // to Firefox. Every codec here is WebM-legal and the client lists them
+        // — which is precisely why the old codec-based check said "playable"
+        // and disarmed the downgrade. The container is what decides, and
+        // Firefox refuses EBML DocType `matroska` outright.
+        assert!(!source_plays_raw_in_browser(
+            "mkv",
+            Some("av1"),
+            Some("opus"),
+            &browser_profiles()
+        ));
+    }
+
+    #[test]
+    fn a_genuine_webm_plays_raw() {
+        // Same codecs, same client, real WebM container → still direct.
+        // Fixing B107 must not force needless transcodes on true WebM files.
+        assert!(source_plays_raw_in_browser(
+            "webm",
+            Some("av1"),
+            Some("opus"),
+            &browser_profiles()
+        ));
+    }
+
+    #[test]
+    fn a_webm_the_client_does_not_decode_does_not_play_raw() {
+        // Container alone is not sufficient: a client with no matching video
+        // codec in its webm profile cannot play it.
+        let profiles = vec![DirectPlayProfile {
+            container: "webm".into(),
+            video_codec: "vp8".into(),
+            audio_codec: "opus".into(),
+            kind: "Video".into(),
+        }];
+        assert!(!source_plays_raw_in_browser(
+            "webm",
+            Some("av1"),
+            Some("opus"),
+            &profiles
+        ));
+    }
+
+    #[test]
+    fn a_webm_with_non_webm_audio_does_not_play_raw() {
+        // Video would decode, audio would not — the file is not playable AS-IS.
+        assert!(!source_plays_raw_in_browser(
+            "webm",
+            Some("vp9"),
+            Some("ac3"),
+            &browser_profiles()
         ));
     }
 }
