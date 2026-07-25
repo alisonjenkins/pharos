@@ -612,17 +612,9 @@ impl HlsSegmentCache {
         media_id: u64,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
-        frame_rate_mille: Option<u32>,
     ) -> Result<PathBuf, HlsCacheError> {
-        self.ensure_audio_hls_covering(
-            source,
-            media_id,
-            audio_index,
-            audio_bitrate_bps,
-            0,
-            frame_rate_mille,
-        )
-        .await
+        self.ensure_audio_hls_covering(source, media_id, audio_index, audio_bitrate_bps, 0)
+            .await
     }
 
     /// How far past the newest written segment a request may point while we
@@ -633,19 +625,96 @@ impl HlsSegmentCache {
     /// not ready" until the encoder crawled the whole file over NFS).
     const AUDIO_SEEK_LOOKAHEAD_SEGS: u32 = 20;
 
-    /// Frame-snapped start time (seconds) of audio segment `seg`, matching the
-    /// video path's `segment_start_secs`: the nominal `seg*6.0` rounded to the
-    /// nearest video-frame boundary so the audio and video renditions share one
-    /// timeline. `None`/unknown fps falls back to the nominal grid.
-    fn audio_seg_start_secs(seg: u32, frame_rate_mille: Option<u32>) -> f64 {
-        let nominal = seg as f64 * 6.0;
-        match frame_rate_mille {
-            Some(m) if m > 0 => {
-                let fps = m as f64 / 1000.0;
-                (nominal * fps).round() / fps
-            }
-            _ => nominal,
+    /// Audio-rendition segment length. This is the ONE value `-hls_time` and
+    /// the seek-session start position both read, because ffmpeg's HLS muxer
+    /// cuts every `hls_time` seconds measured from the session's OWN first
+    /// packet — so a session that starts anywhere other than a multiple of this
+    /// produces boundaries no other session can reproduce.
+    const AUDIO_SEGMENT_SECONDS: f64 = 6.0;
+
+    /// Start time (seconds) of audio segment `seg`: the plain uniform grid.
+    ///
+    /// This deliberately does NOT frame-snap to the video's grid. The audio
+    /// rendition is source-anchored (`-ss X` with a matching
+    /// `-output_ts_offset X`, which cancel exactly), so every sample lands at
+    /// its true source timestamp no matter where the session starts — the
+    /// `-ss` value cannot create or fix A/V skew, it only decides which samples
+    /// land in which FILE. Snapping it to the video frame grid therefore bought
+    /// nothing and cost correctness: `-hls_time` cuts on this uniform grid, so a
+    /// frame-snapped session cut its segments up to half a video frame away from
+    /// where the from-0 session cut the same indices. Measured on a real 23.976
+    /// source: `a5` began at 30.0065 s from the whole-file session and 29.9875 s
+    /// from a seek session — the same filename, 19 ms apart.
+    fn audio_seg_start_secs(seg: u32) -> f64 {
+        seg as f64 * Self::AUDIO_SEGMENT_SECONDS
+    }
+
+    /// Directory the session starting at `start_seg` writes into: the rendition
+    /// root for the whole-file (from-0) session, a private `s{start}` subdir for
+    /// every SEEK session.
+    ///
+    /// Sessions cannot agree on segment boundaries — ffmpeg cuts relative to
+    /// each session's own first packet, which after a seek lands at packet
+    /// granularity rather than exactly on the grid — so two sessions writing
+    /// `a{N}.m4s` into one directory produced two different files under one
+    /// name, last writer winning. That made a segment's bytes change underneath
+    /// a playing client at an arbitrary point mid-playback. Giving each session
+    /// its own directory and resolving reads deterministically confines the
+    /// residual (~20 ms, one audio packet) mismatch to the seek point itself,
+    /// where the audio is discontinuous anyway.
+    fn audio_session_dir(root: &Path, start_seg: u32) -> PathBuf {
+        if start_seg == 0 {
+            root.to_path_buf()
+        } else {
+            root.join(format!("s{start_seg}"))
         }
+    }
+
+    /// Every session start present under a rendition root, deepest first. The
+    /// from-0 session (0) is always a candidate; seek sessions announce
+    /// themselves by their `s{start}` directory.
+    async fn audio_session_starts(root: &Path) -> Vec<u32> {
+        let mut starts = vec![0u32];
+        if let Ok(mut rd) = tokio::fs::read_dir(root).await {
+            while let Ok(Some(e)) = rd.next_entry().await {
+                if let Some(n) = e
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_prefix('s'))
+                    .and_then(|r| r.parse::<u32>().ok())
+                {
+                    starts.push(n);
+                }
+            }
+        }
+        starts.sort_unstable_by(|a, b| b.cmp(a));
+        starts.dedup();
+        starts
+    }
+
+    /// Locate one produced file across a rendition's sessions.
+    ///
+    /// For a media segment `a{N}.m4s` the answer is the DEEPEST session whose
+    /// start is `<= N` and which has actually written it — so a client playing
+    /// on from a seek keeps drawing from that one session for every subsequent
+    /// segment instead of alternating with the whole-file session as it catches
+    /// up. Non-segment names (`init.mp4`) take the first session that has one;
+    /// the init is codec configuration and is identical across sessions.
+    async fn resolve_audio_file(root: &Path, name: &str) -> Option<PathBuf> {
+        let want = name
+            .strip_prefix('a')
+            .and_then(|r| r.strip_suffix(".m4s"))
+            .and_then(|r| r.parse::<u32>().ok());
+        for start in Self::audio_session_starts(root).await {
+            if want.is_some_and(|w| start > w) {
+                continue;
+            }
+            let p = Self::audio_session_dir(root, start).join(name);
+            if tokio::fs::try_exists(&p).await.unwrap_or(false) {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// Decide which audio-rendition session serves `want_seg`. Pure so the
@@ -688,8 +757,10 @@ impl HlsSegmentCache {
     /// `want_seg` promptly. `want_seg == 0` is the plain from-the-start
     /// session; a deep target spawns an additional session seeked to that
     /// segment boundary (`-ss`, `-start_number`, `-output_ts_offset` so the
-    /// fmp4 timestamps stay source-anchored). Sessions share the directory —
-    /// overlapping segments are byte-wise re-written with identical content.
+    /// fmp4 timestamps stay source-anchored). Each session writes into its own
+    /// directory (see [`audio_session_dir`](Self::audio_session_dir)) because
+    /// they cannot agree on where a boundary falls; reads resolve across them
+    /// via [`resolve_audio_file`](Self::resolve_audio_file).
     pub async fn ensure_audio_hls_covering(
         &self,
         source: &Path,
@@ -697,7 +768,6 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
         want_seg: u32,
-        frame_rate_mille: Option<u32>,
     ) -> Result<PathBuf, HlsCacheError> {
         let a = audio_index.unwrap_or(0);
         let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
@@ -706,10 +776,11 @@ impl HlsSegmentCache {
             .join("_audiohls")
             .join(format!("{media_id}-a{a}-b{br}"));
         let playlist = dir.join("audio.m3u8");
-        // The requested segment already exists → nothing to spawn.
-        if tokio::fs::try_exists(&dir.join(format!("a{want_seg}.m4s")))
+        // The requested segment already exists in SOME session → nothing to
+        // spawn.
+        if Self::resolve_audio_file(&dir, &format!("a{want_seg}.m4s"))
             .await
-            .unwrap_or(false)
+            .is_some()
         {
             return Ok(dir);
         }
@@ -753,17 +824,10 @@ impl HlsSegmentCache {
         {
             return Ok(dir);
         }
-        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::create_dir_all(Self::audio_session_dir(&dir, start_seg)).await?;
         tokio::fs::write(&running, b"").await?;
 
-        let args = Self::audio_hls_args(
-            source,
-            &dir,
-            audio_index,
-            audio_bitrate_bps,
-            start_seg,
-            frame_rate_mille,
-        )?;
+        let args = Self::audio_hls_args(source, &dir, audio_index, audio_bitrate_bps, start_seg)?;
         if start_seg > 0 {
             tracing::info!(
                 media.id = media_id,
@@ -805,15 +869,22 @@ impl HlsSegmentCache {
         Ok(dir)
     }
 
-    /// Highest `aN.m4s` index present in an audio-rendition dir — the
-    /// running session's write progress. `None` when no segment exists yet.
-    async fn audio_session_progress(dir: &Path) -> Option<u32> {
+    /// Highest `aN.m4s` index written by ANY session of this rendition — the
+    /// overall write progress. `None` when no segment exists yet. Must span the
+    /// per-session subdirectories, or a seek session's output is invisible to
+    /// the progress-aware read wait and to `choose_audio_start_seg`.
+    async fn audio_session_progress(root: &Path) -> Option<u32> {
         let mut best: Option<u32> = None;
-        let mut rd = tokio::fs::read_dir(dir).await.ok()?;
-        while let Ok(Some(e)) = rd.next_entry().await {
-            if let Some(name) = e.file_name().to_str() {
-                if let Some(n) = name
-                    .strip_prefix('a')
+        for start in Self::audio_session_starts(root).await {
+            let dir = Self::audio_session_dir(root, start);
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(e)) = rd.next_entry().await {
+                if let Some(n) = e
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('a'))
                     .and_then(|r| r.strip_suffix(".m4s"))
                     .and_then(|r| r.parse::<u32>().ok())
                 {
@@ -833,44 +904,41 @@ impl HlsSegmentCache {
     /// failure class as B41's mpegts segments).
     fn audio_hls_args(
         source: &Path,
-        dir: &Path,
+        root: &Path,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
         start_seg: u32,
-        frame_rate_mille: Option<u32>,
     ) -> Result<Vec<String>, HlsCacheError> {
         let src = source
             .to_str()
             .ok_or(HlsCacheError::NonUtf8Path)?
             .to_string();
+        // Each session owns its output directory (see `audio_session_dir`), so
+        // two sessions can never write two different files under one name.
+        let dir = Self::audio_session_dir(root, start_seg);
         let seg_pat = dir
             .join("a%d.m4s")
             .to_str()
             .ok_or(HlsCacheError::NonUtf8Path)?
             .to_string();
-        // Seek sessions write a throwaway playlist so they can never clobber
-        // the from-0 session's `audio.m3u8` done-marker.
-        let m3u8_name = if start_seg == 0 {
-            "audio.m3u8".to_string()
-        } else {
-            format!("audio-from-{start_seg}.m3u8")
-        };
+        // `audio.m3u8` at the rendition ROOT doubles as the from-0 session's
+        // done-marker. A seek session writes its own inside its own directory,
+        // so it cannot clobber that marker.
         let m3u8 = dir
-            .join(m3u8_name)
+            .join("audio.m3u8")
             .to_str()
             .ok_or(HlsCacheError::NonUtf8Path)?
             .to_string();
         let bitrate = audio_bitrate_bps.unwrap_or(128_000);
         let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
-        // Frame-snap to the SAME grid the video segments seek to
-        // (`api::jellyfin::hls::segment_start_secs`). Video input-seeks to the
-        // frame-snapped source timestamp and stamps its tfdt there; anchoring
-        // audio to the nominal `start_seg*6.0` instead leaves a fixed sub-frame
-        // A/V skew at every mid-file audio switch (B105 desync).
-        let start_secs = Self::audio_seg_start_secs(start_seg, frame_rate_mille);
+        // Seek to the same uniform grid `-hls_time` below cuts on, so a seek
+        // session's boundaries land where the whole-file session's would (see
+        // `audio_seg_start_secs`). Six decimals, not three: the millisecond
+        // rounding this used to apply is coarser than an audio packet.
+        let start_secs = Self::audio_seg_start_secs(start_seg);
         if start_seg > 0 {
             args.push("-ss".into());
-            args.push(format!("{start_secs:.3}"));
+            args.push(format!("{start_secs:.6}"));
         }
         args.push("-i".into());
         args.push(src);
@@ -888,16 +956,20 @@ impl HlsSegmentCache {
                 .into_iter()
                 .map(String::from),
         );
+        // Exactly cancels the `-ss` above, so every sample keeps its true source
+        // timestamp and the rendition stays anchored regardless of where the
+        // session started. Must use the same precision as the `-ss` or the two
+        // no longer cancel.
         if start_seg > 0 {
             args.push("-output_ts_offset".into());
-            args.push(format!("{start_secs:.3}"));
+            args.push(format!("{start_secs:.6}"));
         }
         args.extend(
             [
                 "-f",
                 "hls",
                 "-hls_time",
-                "6",
+                &format!("{}", Self::AUDIO_SEGMENT_SECONDS),
                 "-hls_segment_type",
                 "fmp4",
                 "-hls_playlist_type",
@@ -973,13 +1045,17 @@ impl HlsSegmentCache {
                 std::io::ErrorKind::InvalidInput,
             )));
         }
-        let path = dir.join(name);
         let mut last_progress: Option<u32> = None;
         let mut stalls = 0usize;
         for i in 0..max_polls {
-            if let Ok(b) = tokio::fs::read(&path).await {
-                if !b.is_empty() {
-                    return Ok(b);
+            // Resolve across the rendition's sessions each poll: the file may
+            // not exist yet, and which session ends up owning it is only known
+            // once one has written it.
+            if let Some(path) = Self::resolve_audio_file(dir, name).await {
+                if let Ok(b) = tokio::fs::read(&path).await {
+                    if !b.is_empty() {
+                        return Ok(b);
+                    }
                 }
             }
             match Self::audio_session_progress(dir).await {
@@ -1342,14 +1418,16 @@ mod tests {
             Some(1),
             Some(128_000),
             0,
-            None,
         )
         .unwrap();
         let joined = a.join(" ");
         assert!(!joined.contains("-ss"), "{joined}");
         assert!(!joined.contains("-start_number"), "{joined}");
         assert!(!joined.contains("-output_ts_offset"), "{joined}");
-        assert!(joined.ends_with("audio.m3u8"), "{joined}");
+        // The whole-file session owns the rendition root, so its playlist is
+        // the root `audio.m3u8` that doubles as the done-marker.
+        assert!(joined.ends_with("/c/d/audio.m3u8"), "{joined}");
+        assert!(joined.contains("/c/d/a%d.m4s"), "{joined}");
         assert!(joined.contains("-map 0:a:1"), "{joined}");
     }
 
@@ -1366,50 +1444,116 @@ mod tests {
             None,
             Some(128_000),
             30,
-            None,
         )
         .unwrap();
         let joined = a.join(" ");
-        assert!(joined.contains("-ss 180.000"), "{joined}");
-        assert!(joined.contains("-output_ts_offset 180.000"), "{joined}");
+        assert!(joined.contains("-ss 180.000000"), "{joined}");
+        assert!(joined.contains("-output_ts_offset 180.000000"), "{joined}");
         assert!(joined.contains("-start_number 30"), "{joined}");
-        assert!(joined.ends_with("audio-from-30.m3u8"), "{joined}");
+        // A seek session writes into its OWN directory, so neither its
+        // playlist nor its segments can clobber the whole-file session's.
+        assert!(joined.ends_with("/c/d/s30/audio.m3u8"), "{joined}");
+        assert!(joined.contains("/c/d/s30/a%d.m4s"), "{joined}");
         // -ss must be an INPUT option (before -i).
         let ss = a.iter().position(|x| x == "-ss").unwrap();
         let i = a.iter().position(|x| x == "-i").unwrap();
         assert!(ss < i, "-ss must precede -i: {joined}");
     }
 
-    /// B105 — the seek anchor MUST be frame-snapped to the SAME grid the
-    /// video segments use (`segment_start_secs`), not the nominal `seg*6.0`.
-    /// Video seeks to the frame-snapped source timestamp and stamps its tfdt
-    /// there; anchoring audio to the nominal grid leaves a fixed sub-frame
-    /// A/V skew at every mid-file audio switch (the reported desync). On a
-    /// 23.976 fps source, segment 1's nominal 6.000 s snaps to 6.006 s.
+    /// The seek anchor sits on the SAME uniform grid `-hls_time` cuts on, and
+    /// the `-output_ts_offset` cancels the `-ss` exactly.
+    ///
+    /// This replaces an assertion that the anchor be frame-snapped to the video
+    /// grid. That was wrong on its own terms: `-ss X` with a matching
+    /// `-output_ts_offset X` cancel, so every sample keeps its true source
+    /// timestamp and the anchor cannot produce A/V skew either way — it only
+    /// decides which samples land in which FILE. Snapping it away from the
+    /// uniform grid meant a seek session cut its segments up to half a video
+    /// frame from where the whole-file session cut the same indices; measured on
+    /// a real 23.976 source, `a5` began at 30.0065 s from one session and
+    /// 29.9875 s from the other.
     #[test]
-    fn audio_hls_args_seek_anchor_is_frame_snapped_to_video_grid() {
-        let a = HlsSegmentCache::audio_hls_args(
-            Path::new("/m/x.mkv"),
-            Path::new("/c/d"),
-            None,
-            Some(128_000),
-            1,
-            Some(23_976),
-        )
-        .unwrap();
-        let joined = a.join(" ");
-        assert!(
-            joined.contains("-ss 6.006"),
-            "expected frame-snapped seek, got: {joined}"
+    fn audio_seek_anchor_matches_the_segmenter_grid_and_cancels_exactly() {
+        for seg in [1u32, 5, 30, 1000] {
+            let a = HlsSegmentCache::audio_hls_args(
+                Path::new("/m/x.mkv"),
+                Path::new("/c/d"),
+                None,
+                Some(128_000),
+                seg,
+            )
+            .unwrap();
+            let at = |flag: &str| {
+                a.iter()
+                    .position(|x| x == flag)
+                    .map(|i| a[i + 1].clone())
+                    .unwrap()
+            };
+            let want = format!("{:.6}", seg as f64 * 6.0);
+            assert_eq!(at("-ss"), want, "seg {seg}");
+            assert_eq!(at("-output_ts_offset"), want, "seg {seg}");
+            // Same string on both, so they cancel to the exact source timestamp.
+            assert_eq!(at("-ss"), at("-output_ts_offset"), "seg {seg}");
+            assert_eq!(at("-hls_time"), "6", "seg {seg}");
+        }
+    }
+
+    #[test]
+    fn audio_sessions_never_share_a_segment_filename() {
+        let root = Path::new("/c/d");
+        assert_eq!(HlsSegmentCache::audio_session_dir(root, 0), root);
+        assert_eq!(
+            HlsSegmentCache::audio_session_dir(root, 30),
+            root.join("s30")
         );
-        assert!(
-            joined.contains("-output_ts_offset 6.006"),
-            "offset must match the frame-snapped seek: {joined}"
+        assert_ne!(
+            HlsSegmentCache::audio_session_dir(root, 0).join("a30.m4s"),
+            HlsSegmentCache::audio_session_dir(root, 30).join("a30.m4s"),
         );
-        assert!(
-            !joined.contains("6.000"),
-            "nominal seg*6.0 anchor leaves the A/V skew: {joined}"
+    }
+
+    #[tokio::test]
+    async fn audio_reads_resolve_to_the_deepest_session_that_has_the_segment() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        // Whole-file session has caught up to a40; a seek session started at
+        // a30 also wrote a30..a40 with its own (different) cut points.
+        tokio::fs::create_dir_all(root.join("s30")).await.unwrap();
+        for n in [5u32, 30, 40] {
+            tokio::fs::write(root.join(format!("a{n}.m4s")), b"from0")
+                .await
+                .unwrap();
+        }
+        for n in [30u32, 40] {
+            tokio::fs::write(root.join("s30").join(format!("a{n}.m4s")), b"seek")
+                .await
+                .unwrap();
+        }
+        let read = |name: &'static str| {
+            let root = root.to_path_buf();
+            async move {
+                let p = HlsSegmentCache::resolve_audio_file(&root, name)
+                    .await
+                    .unwrap();
+                tokio::fs::read(p).await.unwrap()
+            }
+        };
+        // Below the seek session's start it cannot apply.
+        assert_eq!(read("a5.m4s").await, b"from0");
+        // At and above it, the deeper session wins — and keeps winning, so a
+        // client playing on from a seek never alternates between two sessions'
+        // incompatible cut points mid-playback.
+        assert_eq!(read("a30.m4s").await, b"seek");
+        assert_eq!(read("a40.m4s").await, b"seek");
+        // Progress spans every session, so a seek session's output is visible
+        // to the read wait.
+        assert_eq!(
+            HlsSegmentCache::audio_session_progress(td.path()).await,
+            Some(40)
         );
+        assert!(HlsSegmentCache::resolve_audio_file(td.path(), "a999.m4s")
+            .await
+            .is_none());
     }
 
     /// B106 — a fresh mid-file audio-track switch (new `-a{idx}` dir, no
