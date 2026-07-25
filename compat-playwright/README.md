@@ -54,3 +54,41 @@ just compat-playwright
 ## Updating jellyfin-web
 
 Bump `flake.lock`'s nixpkgs input. New `pkgs.jellyfin-web` flows in automatically; re-baseline brittle selectors as needed.
+
+## Diagnostic probes (`tools/`)
+
+Not part of the suite — reach for these when a *player* symptom needs
+attributing to *server* bytes. They exist because a byte-level diagnosis is not
+a diagnosis until a real player has agreed with it: in one session a confident
+root cause ("a stray MP4 chapter track makes hls.js throw") survived inspection
+and died the moment hls.js was handed the ladder carrying it.
+
+They drive the same hls.js jellyfin-web ships, and report whether playback
+advanced *and* whether the player refetched a fragment — the signature of a
+segment it cannot use. Production once served one segment 17 times inside a
+single second, all `200`.
+
+| recipe | question |
+| --- | --- |
+| `just probe-flags --variant a: --variant b:-flag,value` | can a player tell two ffmpeg output-flag variants apart? |
+| `just probe-capture <base> <item> <key> <session>` | grab the exact bytes a running pharos serves |
+| `just probe-bytes <dir> [rung] [browser]` | replay those bytes through a real player |
+
+Both exit non-zero when a probe stalls or storms, so they gate like a test.
+
+**Browser choice matters.** Playwright's Firefox ships **no H.264 decoder**, so
+it cannot judge the `h264cmaf` rung at all — the exact cell a desktop-Firefox
+user occupies. Use `--browser system-firefox` (the `firefox` on `PATH`, driven
+headless with the page posting its verdict back) for that rung; Playwright's
+browsers are fine for VP9 and for Chromium.
+
+**Capturing from the deployment.** Segment routes `410` without a registered
+`PlaySessionId`, so reuse a live one — it and the `api_key` appear in the
+server's `http.target` span field, which means a wedged session can be captured
+while it is still wedged:
+
+```bash
+kubectl port-forward -n pharos <pod> 18080:8096 &
+just probe-capture http://127.0.0.1:18080 <item-id> <api-key> <play-session-id> ./capture 18-21
+just probe-bytes ./capture h264cmaf system-firefox
+```
