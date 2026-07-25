@@ -462,7 +462,13 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// bitrate whenever there was one. v8 names cannot be parsed under the new
 /// scheme and, worse, v8 entries conflated two clients whose audio bitrates
 /// differed.
-const HLS_GEN_VERSION: u32 = 9;
+/// v10: v9 segments produced from a chaptered source carry a stray chapter
+/// track in their `moov` — a DATA track hls.js's transmux worker cannot
+/// classify, which made it throw and refetch the same fragment forever. The
+/// track is baked into the cached bytes and nothing on disk distinguishes a
+/// chaptered source's segments from any other's, so the generation is
+/// orphaned rather than selectively invalidated.
+const HLS_GEN_VERSION: u32 = 10;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
