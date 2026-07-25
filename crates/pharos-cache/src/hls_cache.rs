@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
+use pharos_transcode::scheduler::JobClass;
 use pharos_transcode::{
     progress_sidecar_path, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
     SegmentVideo, TranscodeOptions, VideoCodec,
@@ -137,21 +138,23 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
 }
 
 /// Count one segment production attempt.
-fn record_segment_outcome(outcome: SegmentOutcome) {
+fn record_segment_outcome(outcome: SegmentOutcome, class: JobClass) {
     metrics::counter!(
         "pharos_segment_produced_total",
         "outcome" => outcome.label(),
         "reason" => "none",
+        "class" => class.label(),
     )
     .increment(1);
 }
 
 /// Count one FAILED segment, keeping the reason alongside the outcome.
-fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str) {
+fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str, class: JobClass) {
     metrics::counter!(
         "pharos_segment_produced_total",
         "outcome" => outcome.label(),
         "reason" => reason,
+        "class" => class.label(),
     )
     .increment(1);
 }
@@ -531,8 +534,9 @@ impl HlsSegmentCache {
         seg_index: u32,
         source: &Path,
         opts: &SegmentOpts,
+        class: JobClass,
     ) -> Result<Vec<u8>, HlsCacheError> {
-        self.segment_bytes_keyed(media_id, seg_index, None, None, source, opts)
+        self.segment_bytes_keyed(media_id, seg_index, None, None, source, opts, class)
             .await
     }
 
@@ -544,10 +548,21 @@ impl HlsSegmentCache {
     /// V30 — this is the ONLY segment-mint entry point, and it accepts only
     /// [`SegmentOpts`]: a stream-copied or progressive-container segment is
     /// a compile error, not a code-review catch.
+    ///
+    /// `class` says who is waiting on the mint: [`JobClass::Interactive`] when
+    /// a client HTTP response is blocked on these bytes, [`JobClass::Background`]
+    /// when this is speculative warm-up. Both classes previously reached the
+    /// transcode scheduler as identical jobs, which is why a segment a browser
+    /// was waiting for could sit behind a pile of segments nobody had asked for
+    /// with nothing in any log or metric to say so.
+    // The parameter list is the cache key plus the caller's intent, and V30
+    // makes this the single mint entry point on purpose — collapsing the
+    // dimensions into a struct would hide which of them key the cache.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "segment_cache",
         skip_all,
-        fields(media.id = media_id, seg = seg_index)
+        fields(media.id = media_id, seg = seg_index, class = class.label())
     )]
     pub async fn segment_bytes_keyed(
         &self,
@@ -557,6 +572,7 @@ impl HlsSegmentCache {
         subtitle_index: Option<u32>,
         source: &Path,
         opts: &SegmentOpts,
+        class: JobClass,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let key = SegmentIdentity::new(media_id, seg_index, audio_index, subtitle_index, opts);
         let path = self.segment_path_keyed(key);
@@ -656,7 +672,7 @@ impl HlsSegmentCache {
                     Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
             }
             timing = match self
-                .write_segment(source, &attempt_opts, &tmp)
+                .write_segment(source, &attempt_opts, &tmp, class)
                 .instrument(tracing::info_span!("write_segment"))
                 .await
             {
@@ -687,7 +703,7 @@ impl HlsSegmentCache {
                         source = %source.display(),
                         "hls segment transcode failed"
                     );
-                    record_segment_failure(SegmentOutcome::Failed, failure_reason(&e));
+                    record_segment_failure(SegmentOutcome::Failed, failure_reason(&e), class);
                     return Err(e);
                 }
             };
@@ -708,7 +724,7 @@ impl HlsSegmentCache {
             }
         }
         if let Some(why) = shortfall {
-            record_segment_outcome(SegmentOutcome::Short);
+            record_segment_outcome(SegmentOutcome::Short, class);
             return Err(HlsCacheError::Transcode(format!(
                 "transcode produced an incomplete segment even with a \
                  {}s decode preroll: {why}",
@@ -737,7 +753,7 @@ impl HlsSegmentCache {
                 codec = codec_tag(opts.video, opts.audio, opts.container),
                 "hls segment transcode produced empty/truncated output — not caching"
             );
-            record_segment_outcome(SegmentOutcome::Empty);
+            record_segment_outcome(SegmentOutcome::Empty, class);
             return Err(HlsCacheError::Transcode(format!(
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
@@ -746,7 +762,7 @@ impl HlsSegmentCache {
 
         let bytes = tokio::fs::read(&path).await?;
         let transcode_ms = started.elapsed().as_millis();
-        record_segment_outcome(SegmentOutcome::Ok);
+        record_segment_outcome(SegmentOutcome::Ok, class);
         metrics::counter!("pharos_segment_cache_total", "result" => "miss").increment(1);
         // The same figure the log line carries, as a histogram: a segment
         // covers SEGMENT_SECONDS of playback, so a p95 above that means the
@@ -754,6 +770,25 @@ impl HlsSegmentCache {
         // from logs means trawling; this makes it a query.
         metrics::histogram!("pharos_segment_transcode_seconds")
             .record(started.elapsed().as_secs_f64());
+        // The queue/encode split as queryable series, labelled by who was
+        // waiting. `pharos_segment_transcode_seconds` says a segment was slow;
+        // these say which half was slow and for whom. An interactive p95
+        // queue-wait far above the encode p95 is the scheduler starving client
+        // requests, not a slow encoder — the two need opposite fixes and were
+        // indistinguishable from any metric before this.
+        if let Some(t) = timing.as_ref() {
+            metrics::histogram!(
+                "pharos_transcode_queue_wait_seconds",
+                "class" => class.label(),
+            )
+            .record(t.queue_wait_ms as f64 / 1000.0);
+            metrics::histogram!(
+                "pharos_transcode_encode_seconds",
+                "class" => class.label(),
+                "device" => t.device.to_string(),
+            )
+            .record(t.encode_ms as f64 / 1000.0);
+        }
         // Split total transcode_ms into scheduler queue-wait vs actual encode
         // (from the scheduler's JobDone), plus the winning device + retry count,
         // so a slow segment is diagnosable: high queue_wait_ms = saturated
@@ -840,6 +875,7 @@ impl HlsSegmentCache {
         source: &Path,
         opts: &TranscodeOptions,
         out: &Path,
+        class: JobClass,
     ) -> Result<Option<pharos_transcode::scheduler::JobDone>, HlsCacheError> {
         let _ = source.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
         // Scheduler path: the worker writes the segment file itself,
@@ -853,6 +889,7 @@ impl HlsSegmentCache {
                     SinkRequest::FileDirect {
                         out_path: out.to_path_buf(),
                     },
+                    class,
                 )
                 .await
                 .map_err(|e| HlsCacheError::Transcode(e.to_string()))?;
@@ -1946,7 +1983,7 @@ mod tests {
             SegmentOutcome::Empty,
             SegmentOutcome::Failed,
         ] {
-            record_segment_outcome(o);
+            record_segment_outcome(o, JobClass::Interactive);
         }
     }
 
@@ -2277,7 +2314,7 @@ mod tests {
             muxed_audio_source: None,
         };
         let got = cache
-            .segment_bytes(7, 0, Path::new("/no/source"), &opts)
+            .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
             .await
             .unwrap();
         assert_eq!(got, b"segment-bytes");
@@ -2303,7 +2340,7 @@ mod tests {
             muxed_audio_source: None,
         };
         let res = cache
-            .segment_bytes(8, 0, Path::new("/no/source"), &opts)
+            .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
             .await;
         assert!(matches!(res, Err(HlsCacheError::Transcode(_))));
     }
@@ -2332,7 +2369,7 @@ mod tests {
             muxed_audio_source: None,
         };
         let _ = cache
-            .segment_bytes(7, 0, Path::new("/no/source"), &opts)
+            .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
             .await
             .unwrap();
         // Adding seg 2 should evict seg 1 (the LRU).
@@ -2374,7 +2411,7 @@ mod tests {
                 muxed_audio_source: None,
             };
             cache
-                .segment_bytes(9, 0, Path::new("/n"), &opts)
+                .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
                 .await
                 .unwrap()
         };
@@ -2396,7 +2433,7 @@ mod tests {
                 muxed_audio_source: None,
             };
             cache
-                .segment_bytes(9, 0, Path::new("/n"), &opts)
+                .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
                 .await
                 .unwrap()
         });

@@ -31,10 +31,45 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
+
+/// Who is waiting on a job.
+///
+/// The scheduler's pending queue is shared by client requests and speculative
+/// warm-up, and until this existed the two were indistinguishable in every
+/// signal the server emitted: a segment a browser was blocked on and a segment
+/// nobody had asked for queued identically. "Why did this segment wait 90 s?"
+/// was therefore unanswerable — the wait was visible, what it waited behind
+/// was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobClass {
+    /// A client response is blocked on this job completing.
+    Interactive,
+    /// Speculative warm-up (prefetch, seek prewarm). Nobody is waiting;
+    /// arriving late is worthless and arriving never is cheap.
+    Background,
+}
+
+impl JobClass {
+    /// Stable metric-label string. Bounded cardinality, and a rename here
+    /// breaks dashboards silently — pinned by a test.
+    pub fn label(self) -> &'static str {
+        match self {
+            JobClass::Interactive => "interactive",
+            JobClass::Background => "background",
+        }
+    }
+}
+
+impl std::fmt::Display for JobClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 /// A live transcode output as a stream of muxed byte chunks. Boxed so the
 /// type stays platform-agnostic (the concrete unix worker stream lives in
@@ -146,6 +181,23 @@ pub struct SchedSnapshot {
     pub devices: Vec<DeviceStat>,
     pub pending: usize,
     pub idle_workers: usize,
+    /// Queue depth split by who is waiting. A backlog that is almost all
+    /// `background` is a queue of work nobody asked for, sitting in front of
+    /// the segments a client is blocked on — the shape that turns a 3 s encode
+    /// into a 90 s wait.
+    pub pending_interactive: usize,
+    pub pending_background: usize,
+    /// How long the oldest queued job has been waiting. `pending` says the
+    /// queue is deep; this says whether anything is actually stuck in it.
+    pub oldest_pending_ms: Option<u64>,
+    /// Jobs holding a device permit via the segment path (they report a
+    /// `JobFinished`).
+    pub inflight: usize,
+    /// Streams holding a device permit via [`TranscodeScheduler::submit_live`].
+    /// These never enter `inflight` and never report a `JobFinished`, so a
+    /// permit held for the lifetime of a progressive transcode was previously
+    /// invisible: `in_use` was occupied with nothing to attribute it to.
+    pub live_streams: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +206,10 @@ pub struct DeviceStat {
     pub capacity: usize,
     pub in_use: usize,
     pub in_cooldown: bool,
+    /// Occupancy attributed to segment jobs, split by class. `in_use` minus
+    /// these (minus any live stream on this device) is unattributed occupancy.
+    pub inflight_interactive: usize,
+    pub inflight_background: usize,
 }
 
 /// Tunables.
@@ -187,6 +243,7 @@ enum SchedMsg {
         input: PathBuf,
         opts: TranscodeOptions,
         sink: SinkRequest,
+        class: JobClass,
         reply: oneshot::Sender<Result<JobDone, SchedError>>,
     },
     SubmitLive {
@@ -226,6 +283,13 @@ struct JobCtx {
     /// `None` while queued. Re-stamped on each (re)dispatch so a retry's wait
     /// is counted in the queue, not the encode.
     dispatched: Option<Instant>,
+    /// Who is waiting. Carried through retries + requeues so a job's class is
+    /// the same wherever it is observed (queued, inflight, finished).
+    class: JobClass,
+    /// Device this job is currently running on. `None` while queued. Lets a
+    /// snapshot attribute each device's occupancy to the jobs holding it,
+    /// instead of reporting a bare count with nothing behind it.
+    device: Option<DeviceId>,
 }
 
 struct SchedState {
@@ -235,6 +299,10 @@ struct SchedState {
     inflight: HashMap<JobId, JobCtx>,
     pending: VecDeque<(JobId, JobCtx)>,
     cfg: SchedConfig,
+    /// Live streams currently holding a permit. Shared with each
+    /// [`PermitStream`], which decrements on drop — the only bookkeeping the
+    /// live path has, since it reports no `JobFinished`.
+    live: Arc<AtomicUsize>,
     next_job: u64,
     next_worker: u64,
 }
@@ -255,6 +323,7 @@ impl TranscodeScheduler {
             pending: VecDeque::new(),
             cfg,
             next_job: 0,
+            live: Arc::new(AtomicUsize::new(0)),
             next_worker: 0,
         };
         tokio::spawn(async move {
@@ -272,6 +341,7 @@ impl TranscodeScheduler {
         input: PathBuf,
         opts: TranscodeOptions,
         sink: SinkRequest,
+        class: JobClass,
     ) -> Result<JobDone, SchedError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -279,6 +349,7 @@ impl TranscodeScheduler {
                 input,
                 opts,
                 sink,
+                class,
                 reply,
             })
             .await
@@ -319,6 +390,10 @@ impl TranscodeScheduler {
 struct PermitStream {
     inner: LiveByteStream,
     _permit: OwnedSemaphorePermit,
+    job_id: JobId,
+    device: DeviceId,
+    started: Instant,
+    live: Arc<AtomicUsize>,
 }
 
 impl futures_core::Stream for PermitStream {
@@ -328,12 +403,29 @@ impl futures_core::Stream for PermitStream {
     }
 }
 
+impl Drop for PermitStream {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        // Closes the pair with the acquisition log. A device sitting at
+        // capacity with no segment jobs to account for it is a live stream
+        // holding a permit; without a release line there is no way to tell a
+        // stream that ended from one still running.
+        tracing::info!(
+            job_id = %self.job_id,
+            device = %self.device,
+            held_ms = self.started.elapsed().as_millis() as u64,
+            "live transcode released its device permit"
+        );
+    }
+}
+
 fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg>) {
     match msg {
         SchedMsg::Submit {
             input,
             opts,
             sink,
+            class,
             reply,
         } => {
             if matches!(sink, SinkRequest::LiveStream) {
@@ -353,6 +445,8 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 last_error: None,
                 enqueued: Instant::now(),
                 dispatched: None,
+                class,
+                device: None,
             };
             place(state, job_id, ctx, self_tx);
         }
@@ -373,15 +467,46 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 }
             }
             let Some((device, permit)) = acquired else {
-                let _ = reply.send(Err(if eligible.is_empty() {
-                    SchedError::Unsupported
-                } else {
+                // The live path has no queue: a rejected stream falls back to
+                // an *unscheduled* inline ffmpeg at the caller, which holds no
+                // permit and is therefore invisible to every saturation gauge.
+                // A silent rejection here is the start of load the scheduler
+                // cannot see, so it is never silent.
+                let busy = !eligible.is_empty();
+                tracing::warn!(
+                    input = %input.display(),
+                    eligible = ?eligible,
+                    occupancy = ?state
+                        .devices
+                        .slots()
+                        .iter()
+                        .map(|s| (s.id, s.in_use(), s.capacity))
+                        .collect::<Vec<_>>(),
+                    reason = if busy { "all permits busy" } else { "no eligible device" },
+                    "live transcode rejected; caller falls back off-scheduler"
+                );
+                let _ = reply.send(Err(if busy {
                     SchedError::Busy
+                } else {
+                    SchedError::Unsupported
                 }));
                 return;
             };
             let job_id = JobId(state.next_job);
             state.next_job += 1;
+            // A live stream holds its permit for as long as the client keeps
+            // reading — minutes, not the seconds a segment takes. Name the
+            // device it took at acquisition; `PermitStream::drop` closes the
+            // pair with how long it held it.
+            tracing::info!(
+                %job_id,
+                device = %device,
+                eligible = ?eligible,
+                input = %input.display(),
+                "live transcode took a device permit"
+            );
+            let live = state.live.clone();
+            live.fetch_add(1, Ordering::Relaxed);
             let spec = JobSpec {
                 job_id,
                 input,
@@ -396,11 +521,17 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         let stream: LiveByteStream = Box::pin(PermitStream {
                             inner,
                             _permit: permit,
+                            job_id,
+                            device,
+                            started: Instant::now(),
+                            live,
                         });
                         let _ = reply.send(Ok(stream));
                     }
                     Err(e) => {
                         drop(permit);
+                        live.fetch_sub(1, Ordering::Relaxed);
+                        tracing::warn!(%job_id, device = %device, error = %e, "live transcode spawn failed; permit released");
                         let _ = reply.send(Err(SchedError::Io(e.to_string())));
                     }
                 }
@@ -443,6 +574,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         %job_id,
                         %device,
                         out_bytes,
+                        class = %ctx.class,
                         queue_wait_ms = queue_ms,
                         encode_ms,
                         retries = ctx.retries,
@@ -499,12 +631,40 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     capacity: s.capacity,
                     in_use: s.in_use(),
                     in_cooldown: matches!(s.cooldown_until, Some(t) if t > Instant::now()),
+                    inflight_interactive: state
+                        .inflight
+                        .values()
+                        .filter(|c| c.class == JobClass::Interactive && c.device == Some(s.id))
+                        .count(),
+                    inflight_background: state
+                        .inflight
+                        .values()
+                        .filter(|c| c.class == JobClass::Background && c.device == Some(s.id))
+                        .count(),
                 })
                 .collect();
+            let now = Instant::now();
             let _ = reply.send(SchedSnapshot {
                 devices,
                 pending: state.pending.len(),
                 idle_workers: state.idle.len(),
+                pending_interactive: state
+                    .pending
+                    .iter()
+                    .filter(|(_, c)| c.class == JobClass::Interactive)
+                    .count(),
+                pending_background: state
+                    .pending
+                    .iter()
+                    .filter(|(_, c)| c.class == JobClass::Background)
+                    .count(),
+                oldest_pending_ms: state
+                    .pending
+                    .iter()
+                    .map(|(_, c)| now.saturating_duration_since(c.enqueued).as_millis() as u64)
+                    .max(),
+                inflight: state.inflight.len(),
+                live_streams: state.live.load(Ordering::Relaxed),
             });
         }
     }
@@ -527,6 +687,59 @@ fn retry_or_fail(
         return;
     }
     place(state, job_id, ctx, self_tx);
+}
+
+/// A job that waited longer than this before starting is reported with the
+/// state of the queue it just escaped. One segment covers 6 s of playback, so
+/// a wait past this is already eating a client's buffer.
+const LONG_WAIT_MS: u64 = 3_000;
+
+/// Report a job that queued for a long time *together with what it queued
+/// behind*. `queue_wait_ms` on the finished job says a segment waited; only
+/// the composition of the queue at the moment it was finally dispatched says
+/// whether it waited behind other client requests (genuine overload) or behind
+/// speculative warm-up nobody was waiting for (a scheduling defect).
+fn warn_if_long_wait(
+    state: &SchedState,
+    job_id: JobId,
+    device: DeviceId,
+    ctx: &JobCtx,
+    dispatched_at: Instant,
+) {
+    let waited_ms = dispatched_at
+        .saturating_duration_since(ctx.enqueued)
+        .as_millis() as u64;
+    if waited_ms < LONG_WAIT_MS {
+        return;
+    }
+    let (mut pend_i, mut pend_b) = (0usize, 0usize);
+    for (_, c) in state.pending.iter() {
+        match c.class {
+            JobClass::Interactive => pend_i += 1,
+            JobClass::Background => pend_b += 1,
+        }
+    }
+    let (mut run_i, mut run_b) = (0usize, 0usize);
+    for c in state.inflight.values() {
+        match c.class {
+            JobClass::Interactive => run_i += 1,
+            JobClass::Background => run_b += 1,
+        }
+    }
+    tracing::warn!(
+        %job_id,
+        %device,
+        class = %ctx.class,
+        waited_ms,
+        retries = ctx.retries,
+        pending_interactive = pend_i,
+        pending_background = pend_b,
+        inflight_interactive = run_i,
+        inflight_background = run_b,
+        live_streams = state.live.load(Ordering::Relaxed),
+        input = %ctx.input.display(),
+        "transcode job waited a long time for a device permit"
+    );
 }
 
 /// Try to dispatch `ctx` to its best eligible device; queue if all
@@ -582,6 +795,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             tracing::debug!(
                 %job_id,
                 device = %dev,
+                class = %ctx.class,
                 candidates = ?candidates,
                 excluded = ?ctx.excluded,
                 "transcode job placed"
@@ -596,7 +810,10 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 device: dev,
                 sink: to_output_sink(&ctx.sink),
             };
-            ctx.dispatched = Some(Instant::now());
+            let dispatched_at = Instant::now();
+            warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at);
+            ctx.dispatched = Some(dispatched_at);
+            ctx.device = Some(dev);
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
                 state.spawner.clone(),
@@ -678,7 +895,10 @@ fn try_place_no_queue(
                 device: dev,
                 sink: to_output_sink(&ctx.sink),
             };
-            ctx.dispatched = Some(Instant::now());
+            let dispatched_at = Instant::now();
+            warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at);
+            ctx.dispatched = Some(dispatched_at);
+            ctx.device = Some(dev);
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
                 state.spawner.clone(),
@@ -893,7 +1113,12 @@ mod tests {
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let done = s
-            .submit(PathBuf::from("/m/x"), h264(), file_sink())
+            .submit(
+                PathBuf::from("/m/x"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
             .await
             .unwrap();
         assert_eq!(done.device, DeviceId::hw(HwAccel::Nvenc, 0)); // best-first
@@ -912,7 +1137,7 @@ mod tests {
         let mut o = h264();
         o.video = Some(VideoCodec::Vp9);
         let done = s
-            .submit(PathBuf::from("/m/x"), o, file_sink())
+            .submit(PathBuf::from("/m/x"), o, file_sink(), JobClass::Interactive)
             .await
             .unwrap();
         assert_eq!(done.device, DeviceId::hw(HwAccel::Vaapi, 0));
@@ -925,7 +1150,12 @@ mod tests {
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let r = s
-            .submit(PathBuf::from("/m/x"), h264(), SinkRequest::LiveStream)
+            .submit(
+                PathBuf::from("/m/x"),
+                h264(),
+                SinkRequest::LiveStream,
+                JobClass::Interactive,
+            )
             .await;
         assert_eq!(r, Err(SchedError::Unsupported));
     }
@@ -947,7 +1177,13 @@ mod tests {
         for _ in 0..6 {
             let s2 = s.clone();
             handles.push(tokio::spawn(async move {
-                s2.submit(PathBuf::from("/m/x"), h264(), file_sink()).await
+                s2.submit(
+                    PathBuf::from("/m/x"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
             }));
         }
         let mut busy = 0;
@@ -978,7 +1214,13 @@ mod tests {
         for _ in 0..20 {
             let s2 = s.clone();
             handles.push(tokio::spawn(async move {
-                s2.submit(PathBuf::from("/m/x"), h264(), file_sink()).await
+                s2.submit(
+                    PathBuf::from("/m/x"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
             }));
         }
         let mut ok = 0;
@@ -1003,7 +1245,12 @@ mod tests {
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let done = s
-            .submit(PathBuf::from("/m/x"), h264(), file_sink())
+            .submit(
+                PathBuf::from("/m/x"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
             .await
             .unwrap();
         assert_ne!(done.device, DeviceId::hw(HwAccel::Nvenc, 0));
@@ -1016,7 +1263,14 @@ mod tests {
             WorkerRunResult::Failed(WorkerError::BadInput("scripted bad input".into()))
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
-        let r = s.submit(PathBuf::from("/m/x"), h264(), file_sink()).await;
+        let r = s
+            .submit(
+                PathBuf::from("/m/x"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await;
         assert_eq!(
             r,
             Err(SchedError::Failed(WorkerError::BadInput(
@@ -1042,13 +1296,23 @@ mod tests {
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let done = s
-            .submit(PathBuf::from("/m/x"), h264(), file_sink())
+            .submit(
+                PathBuf::from("/m/x"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
             .await
             .unwrap();
         assert_eq!(done.out_bytes, 9);
         // A second job still works → scheduler alive after a worker death.
         let done2 = s
-            .submit(PathBuf::from("/m/y"), h264(), file_sink())
+            .submit(
+                PathBuf::from("/m/y"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
             .await
             .unwrap();
         assert_eq!(done2.out_bytes, 9);
@@ -1067,7 +1331,12 @@ mod tests {
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let r = tokio::time::timeout(
             Duration::from_secs(5),
-            s.submit(PathBuf::from("/m/x"), h264(), file_sink()),
+            s.submit(
+                PathBuf::from("/m/x"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            ),
         )
         .await
         .expect("submit hung after worker panic");
@@ -1093,7 +1362,13 @@ mod tests {
             for _ in 0..200 {
                 let s2 = s.clone();
                 handles.push(tokio::spawn(async move {
-                    s2.submit(PathBuf::from("/m/x"), h264(), file_sink()).await
+                    s2.submit(
+                        PathBuf::from("/m/x"),
+                        h264(),
+                        file_sink(),
+                        JobClass::Interactive,
+                    )
+                    .await
                 }));
             }
             let mut ok = 0;
@@ -1133,8 +1408,13 @@ mod tests {
         for _ in 0..5 {
             let s2 = s.clone();
             blockers.push(tokio::spawn(async move {
-                s2.submit(PathBuf::from("/m/block"), h264(), file_sink())
-                    .await
+                s2.submit(
+                    PathBuf::from("/m/block"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
             }));
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1146,8 +1426,13 @@ mod tests {
         for _ in 0..10 {
             let s2 = s.clone();
             abandoned.push(tokio::spawn(async move {
-                s2.submit(PathBuf::from("/m/old"), h264(), file_sink())
-                    .await
+                s2.submit(
+                    PathBuf::from("/m/old"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
             }));
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1158,8 +1443,13 @@ mod tests {
         // blockers — it MUST still complete (we skip only abandoned work).
         let s3 = s.clone();
         let seek_target = tokio::spawn(async move {
-            s3.submit(PathBuf::from("/m/seek"), h264(), file_sink())
-                .await
+            s3.submit(
+                PathBuf::from("/m/seek"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -1192,5 +1482,80 @@ mod tests {
         assert_eq!(snap.devices.len(), 3);
         let total_cap: usize = snap.devices.iter().map(|d| d.capacity).sum();
         assert_eq!(total_cap, 2 + 1 + 2);
+    }
+
+    #[test]
+    fn job_class_labels_are_distinct_and_stable() {
+        // These strings are a dashboard contract: they appear as the `class`
+        // label on pharos_transcode_pending_by_class,
+        // pharos_transcode_queue_wait_seconds and
+        // pharos_segment_produced_total. A rename breaks every query silently.
+        assert_eq!(JobClass::Interactive.label(), "interactive");
+        assert_eq!(JobClass::Background.label(), "background");
+        assert_ne!(JobClass::Interactive.label(), JobClass::Background.label());
+    }
+
+    #[tokio::test]
+    async fn snapshot_attributes_the_queue_and_the_devices_to_who_is_waiting() {
+        // The signal under test: a snapshot must say how much work is running
+        // and queued for each class. Without the split, "5 running, 3 queued"
+        // looks the same whether those five are stalled viewers or speculative
+        // warm-up sitting in front of them.
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(600), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        // 5 permits total (2 nvenc + 1 vaapi + 2 cpu). Start with the pool
+        // idle so speculative work is admitted, then fill the rest.
+        let mut handles = Vec::new();
+        for (class, n) in [(JobClass::Background, 2), (JobClass::Interactive, 3)] {
+            for _ in 0..n {
+                let s2 = s.clone();
+                handles.push(tokio::spawn(async move {
+                    s2.submit(PathBuf::from("/m/run"), h264(), file_sink(), class)
+                        .await
+                }));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        // Every permit is now held; further client requests queue.
+        for _ in 0..3 {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/queued"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let snap = s.snapshot().await.expect("snapshot");
+        assert_eq!(snap.inflight, 5, "every permit held by a segment job");
+        assert_eq!(snap.pending, 3);
+        assert_eq!(snap.pending_interactive, 3, "the queue is client requests");
+        assert_eq!(snap.pending_background, 0);
+        assert!(
+            snap.oldest_pending_ms.is_some_and(|ms| ms > 0),
+            "the head of the queue has measurably been waiting"
+        );
+        assert_eq!(snap.live_streams, 0, "no live stream took a permit");
+        // Device occupancy is attributable to the jobs holding it: 3
+        // interactive + 2 speculative, with nothing left unexplained.
+        let by_class = |f: fn(&DeviceStat) -> usize| snap.devices.iter().map(f).sum::<usize>();
+        assert_eq!(by_class(|d| d.inflight_interactive), 3);
+        assert_eq!(by_class(|d| d.inflight_background), 2);
+        assert_eq!(
+            by_class(|d| d.inflight_interactive) + by_class(|d| d.inflight_background),
+            by_class(|d| d.in_use),
+            "no unexplained device occupancy"
+        );
+
+        for h in handles {
+            assert!(h.await.unwrap().is_ok());
+        }
     }
 }
