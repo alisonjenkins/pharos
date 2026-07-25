@@ -19,6 +19,32 @@ test-thorough:
     -xattr -dr com.apple.quarantine target/debug/ 2>/dev/null || true
     PROPTEST_CASES=512 nix develop --command cargo nextest run --workspace
 
+# Run the store suite against a REAL postgres, the way `nix flake check`
+# does — but locally, in seconds, without a full flake evaluation.
+#
+# The postgres arms of `backend_conformance` and `migrate_roundtrip` skip
+# themselves when PHAROS_TEST_POSTGRES_URL is unset, which is every plain
+# `just test`. That silence is a trap: SQL is only checked at execution, so
+# a malformed query (wrong placeholder arity, missing column) compiles, runs
+# green locally, and fails in CI. This recipe closes that gap — run it after
+# ANY change to a `sqlx::query*` string in pharos-store-sqlx.
+#
+# Mirrors flake.nix's `pharosPgTests`: initdb into a temp dir, listen on
+# loopback:5433, drop it all on exit.
+test-postgres:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nix develop --command nix shell nixpkgs#postgresql --command bash -c '
+      set -euo pipefail
+      export PGDATA="$(mktemp -d)/pgdata"
+      trap "pg_ctl -D \"$PGDATA\" stop >/dev/null 2>&1 || true; rm -rf \"$PGDATA\"" EXIT
+      initdb -U postgres --auth=trust --locale=C --encoding=UTF8 -D "$PGDATA" >/dev/null
+      pg_ctl -D "$PGDATA" -o "-h 127.0.0.1 -p 5433 -k $PGDATA" -w start >/dev/null
+      createdb -h 127.0.0.1 -p 5433 -U postgres pharos_test
+      export PHAROS_TEST_POSTGRES_URL="postgres://postgres@127.0.0.1:5433/pharos_test"
+      cargo nextest run -p pharos-store-sqlx --features postgres
+    '
+
 # P52 — fast feedback loop. Runs every crate's library tests but
 # skips the heavy integration binaries in `tests/*.rs`. Use this
 # while iterating on a single change; switch to `test` before a
