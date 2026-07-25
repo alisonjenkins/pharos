@@ -60,17 +60,24 @@ struct EntryMeta {
 /// and any silent arg-order slip mis-keys the cache. Named fields make
 /// that class unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SegmentKey {
+pub struct SegmentIdentity {
     media_id: u64,
     seg_index: u32,
     /// 0 = default track (no client override).
     audio_index: u32,
     /// `NO_SUBTITLE` (-1) = no burn-in.
     subtitle_index: i32,
-    /// kbps of whichever stream governs these bytes — the video bitrate for a
-    /// video segment, the AUDIO bitrate for an audio-only rendition segment
-    /// (which carries no video bitrate at all). 0 = negotiator default.
-    bitrate_kbps: u32,
+    /// Video bitrate in kbps; 0 = negotiator default, and also the audio-only
+    /// rendition segments, which carry no video at all.
+    video_bitrate_kbps: u32,
+    /// Audio bitrate in kbps; 0 = negotiator default.
+    ///
+    /// Kept SEPARATE from the video bitrate rather than collapsed into one
+    /// "governing" number. Two clients negotiating the same video bitrate and
+    /// different audio bitrates produce different bytes, and a single
+    /// governing figure took the video bitrate whenever there was one — so
+    /// they shared a cache entry and served each other's audio.
+    audio_bitrate_kbps: u32,
     /// See `codec_tag` — distinguishes output codec generations.
     codec_tag: u32,
 }
@@ -192,29 +199,85 @@ fn codec_tag(
 /// `EXT-X-STREAM-INF`s for music items) the identical key — whichever rung
 /// transcoded first was then served for all of them, silently defeating audio
 /// ABR and handing a 64 kbps client the 256 kbps bytes (or the reverse).
-fn governing_bitrate_bps(video_bitrate_bps: Option<u64>, audio_bitrate_bps: Option<u64>) -> u32 {
-    video_bitrate_bps
-        .or(audio_bitrate_bps)
-        .map(|b| (b / 1000).min(u32::MAX as u64) as u32)
-        .unwrap_or(0)
-}
+impl SegmentIdentity {
+    /// The one derivation of a segment's identity. The on-disk cache path and
+    /// the HTTP ETag both come from this value, so they cannot describe
+    /// different things — a hand-rolled ETag that restated a hand-picked
+    /// subset of these inputs had already drifted from the cache key once,
+    /// and served one variant's bytes under another's 304.
+    pub fn new(
+        media_id: u64,
+        seg_index: u32,
+        audio_index: Option<u32>,
+        subtitle_index: Option<u32>,
+        opts: &SegmentOpts,
+    ) -> Self {
+        let kbps = |b: Option<u64>| {
+            b.map(|b| (b / 1000).min(u32::MAX as u64) as u32)
+                .unwrap_or(0)
+        };
+        Self {
+            media_id,
+            seg_index,
+            audio_index: audio_index.unwrap_or(0),
+            subtitle_index: subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
+            video_bitrate_kbps: kbps(opts.video_bitrate_bps),
+            audio_bitrate_kbps: kbps(opts.audio_bitrate_bps),
+            codec_tag: codec_tag(opts.video, opts.audio, opts.container),
+        }
+    }
 
-fn make_key(
-    media_id: u64,
-    seg_index: u32,
-    audio_index: Option<u32>,
-    subtitle_index: Option<u32>,
-    video_bitrate_bps: Option<u64>,
-    audio_bitrate_bps: Option<u64>,
-    codec_tag: u32,
-) -> SegmentKey {
-    SegmentKey {
-        media_id,
-        seg_index,
-        audio_index: audio_index.unwrap_or(0),
-        subtitle_index: subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
-        bitrate_kbps: governing_bitrate_bps(video_bitrate_bps, audio_bitrate_bps),
-        codec_tag,
+    /// Cache filename. `{seg}-a{A}-s{S}-v{V}-a{Abr}-c{tag}.ts`.
+    fn filename(&self) -> String {
+        // Destructured WITHOUT `..` deliberately: a new identity field then
+        // fails to compile here until someone decides whether it belongs in
+        // the name. A field that silently stays out of the filename is a
+        // cache collision, which is how the audio ladder came to serve one
+        // rung's bytes for all five.
+        let Self {
+            // The media id is the containing directory, not part of the name.
+            media_id: _,
+            seg_index,
+            audio_index,
+            subtitle_index,
+            video_bitrate_kbps,
+            audio_bitrate_kbps,
+            codec_tag,
+        } = self;
+        let sub = if *subtitle_index == NO_SUBTITLE {
+            "off".to_string()
+        } else {
+            subtitle_index.to_string()
+        };
+        let br = |k: u32| {
+            if k == 0 {
+                "auto".to_string()
+            } else {
+                k.to_string()
+            }
+        };
+        format!(
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}.ts",
+            br(*video_bitrate_kbps),
+            br(*audio_bitrate_kbps),
+        )
+    }
+
+    /// The segment's location under the cache root: `{media}/{filename}`.
+    /// This is the identity in full — the media id lives in the directory
+    /// rather than the file name.
+    fn cache_relative_path(&self) -> String {
+        format!("{}/{}", self.media_id, self.filename())
+    }
+
+    /// HTTP ETag for these bytes. Hashes the SAME string that locates the
+    /// cache entry, so a segment whose bytes would change necessarily gets a
+    /// new ETag, and two requests that resolve to one cache entry always
+    /// present the same one.
+    pub fn etag(&self) -> String {
+        use xxhash_rust::xxh3::xxh3_64;
+        let h = xxh3_64(self.cache_relative_path().as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF;
+        format!("W/\"seg-{h:016x}\"")
     }
 }
 
@@ -222,12 +285,12 @@ fn make_key(
 struct CacheState {
     /// Per-key locks. Held while a fetch is in flight so concurrent
     /// requests for the same segment don't race.
-    fetch_locks: HashMap<SegmentKey, Arc<Mutex<()>>>,
+    fetch_locks: HashMap<SegmentIdentity, Arc<Mutex<()>>>,
     /// Per-directory locks deduplicating continuous-audio HLS sessions (the
     /// A/V-sync fix): the first request spawns the one ffmpeg producing the
     /// audio rendition; concurrent requests see it already running.
     audio_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
-    entries: HashMap<SegmentKey, EntryMeta>,
+    entries: HashMap<SegmentIdentity, EntryMeta>,
     total_bytes: u64,
     access_counter: u64,
 }
@@ -305,7 +368,13 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// `session_start + position` — past the end for any seek session, so the
 /// audio was silence or an unrelated stretch of the title under correct
 /// video. Every v7 segment served from a seek session is poisoned.
-const HLS_GEN_VERSION: u32 = 8;
+///
+/// v9: the cache filename carries the video AND audio bitrates separately
+/// (`-v{V}-b{A}`) instead of one "governing" figure that took the video
+/// bitrate whenever there was one. v8 names cannot be parsed under the new
+/// scheme and, worse, v8 entries conflated two clients whose audio bitrates
+/// differed.
+const HLS_GEN_VERSION: u32 = 9;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
@@ -417,15 +486,7 @@ impl HlsSegmentCache {
         source: &Path,
         opts: &SegmentOpts,
     ) -> Result<Vec<u8>, HlsCacheError> {
-        let key = make_key(
-            media_id,
-            seg_index,
-            audio_index,
-            subtitle_index,
-            opts.video_bitrate_bps,
-            opts.audio_bitrate_bps,
-            codec_tag(opts.video, opts.audio, opts.container),
-        );
+        let key = SegmentIdentity::new(media_id, seg_index, audio_index, subtitle_index, opts);
         let path = self.segment_path_keyed(key);
 
         // Fast hit path: file present, just bump LRU. A concurrent
@@ -642,12 +703,13 @@ impl HlsSegmentCache {
 
     #[cfg(test)]
     fn segment_path(&self, media_id: u64, seg_index: u32) -> PathBuf {
-        self.segment_path_keyed(SegmentKey {
+        self.segment_path_keyed(SegmentIdentity {
             media_id,
             seg_index,
             audio_index: 0,
             subtitle_index: NO_SUBTITLE,
-            bitrate_kbps: 0,
+            video_bitrate_kbps: 0,
+            audio_bitrate_kbps: 0,
             codec_tag: 0,
         })
     }
@@ -657,34 +719,8 @@ impl HlsSegmentCache {
     /// `{root}/{media_id}/{seg}-a{A}-s{S}-b{Bkbps}.ts` when any
     /// dimension diverges. Keeps the existing on-disk layout intact
     /// for warm caches that pre-date per-track + per-variant keys.
-    fn segment_path_keyed(&self, key: SegmentKey) -> PathBuf {
-        let SegmentKey {
-            media_id,
-            seg_index,
-            audio_index,
-            subtitle_index,
-            bitrate_kbps: bitrate_k,
-            codec_tag: codec_k,
-        } = key;
-        // The codec tag is ALWAYS in the filename now. This deliberately
-        // orphans any pre-existing codec-blind `{seg}.ts` files: some were
-        // written by the old fallback that stream-copied HEVC into an avc1
-        // manifest, and there's no way to tell a poisoned HEVC `{seg}.ts` from
-        // a correct h264 one on disk — so bypass them all and let LRU reclaim
-        // the space. New files carry `-c{tag}` and never collide across codecs.
-        let sub_part = if subtitle_index == NO_SUBTITLE {
-            "off".to_string()
-        } else {
-            subtitle_index.to_string()
-        };
-        let bitrate_part = if bitrate_k == 0 {
-            "auto".to_string()
-        } else {
-            format!("{bitrate_k}")
-        };
-        let filename =
-            format!("{seg_index}-a{audio_index}-s{sub_part}-b{bitrate_part}-c{codec_k}.ts");
-        self.root.join(media_id.to_string()).join(filename)
+    fn segment_path_keyed(&self, key: SegmentIdentity) -> PathBuf {
+        self.root.join(key.cache_relative_path())
     }
 
     /// Transcode one segment to `out`. Returns the scheduler's timing split
@@ -1523,7 +1559,7 @@ impl HlsSegmentCache {
         )))
     }
 
-    async fn touch(&self, key: SegmentKey) {
+    async fn touch(&self, key: SegmentIdentity) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -1532,7 +1568,7 @@ impl HlsSegmentCache {
         }
     }
 
-    async fn record(&self, key: SegmentKey, bytes: u64) {
+    async fn record(&self, key: SegmentIdentity, bytes: u64) {
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -1553,7 +1589,7 @@ impl HlsSegmentCache {
     async fn maybe_evict(&self) {
         // Snapshot the (key, last_used) candidates outside the lock so
         // the disk delete doesn't hold the cache state.
-        let mut to_remove: Vec<(SegmentKey, PathBuf)> = Vec::new();
+        let mut to_remove: Vec<(SegmentIdentity, PathBuf)> = Vec::new();
         {
             let mut state = self.state.lock().await;
             while state.total_bytes > self.max_bytes {
@@ -1708,6 +1744,97 @@ mod tests {
         );
     }
 
+    /// Build a `SegmentOpts` carrying just the identity-relevant fields.
+    fn ident_opts(
+        video: Option<SegmentVideo>,
+        audio: Option<SegmentAudio>,
+        container: SegmentContainer,
+        video_bitrate_bps: Option<u64>,
+        audio_bitrate_bps: Option<u64>,
+    ) -> SegmentOpts {
+        SegmentOpts {
+            container,
+            video,
+            audio,
+            video_bitrate_bps,
+            audio_bitrate_bps,
+            start_position_ticks: 0,
+            duration_ticks: Some(60_060_000),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            muxed_audio_source: None,
+        }
+    }
+
+    #[test]
+    fn every_identity_input_changes_both_the_cache_path_and_the_etag() {
+        // The ETag and the cache path must move together. They used to be
+        // derived separately — the ETag restated a hand-picked subset of the
+        // key's inputs — and drifted, so a 304 could hand a client the other
+        // variant's bytes.
+        let base_opts = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        let base = SegmentIdentity::new(1, 5, Some(1), Some(2), &base_opts);
+
+        let mut vbr = base_opts.clone();
+        vbr.video_bitrate_bps = Some(2_000_000);
+        let mut abr = base_opts.clone();
+        abr.audio_bitrate_bps = Some(256_000);
+        let mut codec = base_opts.clone();
+        codec.container = SegmentContainer::Fmp4;
+
+        let cases: Vec<(&str, SegmentIdentity)> = vec![
+            (
+                "media",
+                SegmentIdentity::new(2, 5, Some(1), Some(2), &base_opts),
+            ),
+            (
+                "segment index",
+                SegmentIdentity::new(1, 6, Some(1), Some(2), &base_opts),
+            ),
+            (
+                "audio track",
+                SegmentIdentity::new(1, 5, Some(0), Some(2), &base_opts),
+            ),
+            (
+                "subtitle burn",
+                SegmentIdentity::new(1, 5, Some(1), None, &base_opts),
+            ),
+            (
+                "video bitrate",
+                SegmentIdentity::new(1, 5, Some(1), Some(2), &vbr),
+            ),
+            // Previously invisible: one "governing" bitrate took the video
+            // figure whenever there was one, so two clients on the same video
+            // rung with different audio bitrates shared a cache entry.
+            (
+                "audio bitrate",
+                SegmentIdentity::new(1, 5, Some(1), Some(2), &abr),
+            ),
+            (
+                "container",
+                SegmentIdentity::new(1, 5, Some(1), Some(2), &codec),
+            ),
+        ];
+        for (what, other) in cases {
+            assert_ne!(other, base, "{what} must change the identity");
+            assert_ne!(
+                other.cache_relative_path(),
+                base.cache_relative_path(),
+                "{what} must change the cache path"
+            );
+            assert_ne!(other.etag(), base.etag(), "{what} must change the ETag");
+        }
+    }
+
     #[test]
     fn a_continuous_audio_session_reaches_back_past_the_decode_preroll() {
         // The segment's ffmpeg seeks BOTH inputs to one preroll before the
@@ -1824,12 +1951,13 @@ mod tests {
         tokio::fs::write(&path, body).await.unwrap();
         cache
             .record(
-                SegmentKey {
+                SegmentIdentity {
                     media_id,
                     seg_index: seg,
                     audio_index: 0,
                     subtitle_index: NO_SUBTITLE,
-                    bitrate_kbps: 0,
+                    video_bitrate_kbps: 0,
+                    audio_bitrate_kbps: 0,
                     codec_tag: 0,
                 },
                 body.len() as u64,
@@ -1860,8 +1988,32 @@ mod tests {
         assert_eq!(vp9, 12, "warm vp9 cache tag preserved");
 
         // The on-disk keys differ for the same (media, seg, audio, bitrate).
-        let key_ts = make_key(1, 0, Some(1), None, Some(4_000_000), None, mpegts);
-        let key_m4 = make_key(1, 0, Some(1), None, Some(4_000_000), None, fmp4);
+        let key_ts = SegmentIdentity::new(
+            1,
+            0,
+            Some(1),
+            None,
+            &ident_opts(
+                Some(SegmentVideo::H264),
+                Some(SegmentAudio::Aac),
+                SegmentContainer::Mpegts,
+                Some(4_000_000),
+                None,
+            ),
+        );
+        let key_m4 = SegmentIdentity::new(
+            1,
+            0,
+            Some(1),
+            None,
+            &ident_opts(
+                Some(SegmentVideo::H264),
+                None,
+                SegmentContainer::Fmp4,
+                Some(4_000_000),
+                None,
+            ),
+        );
         assert_ne!(key_ts, key_m4, "distinct cache keys per container");
     }
 
@@ -1874,12 +2026,26 @@ mod tests {
         // same key (bitrate 0, codec tag 0): the first rung to transcode was
         // served for all of them, so ABR silently did nothing and a 64 kbps
         // client got 256 kbps bytes.
-        let tag = codec_tag(None, Some(SegmentAudio::Aac), SegmentContainer::Mpegts);
-        let a64 = make_key(1, 0, None, None, None, Some(64_000), tag);
-        let a256 = make_key(1, 0, None, None, None, Some(256_000), tag);
+        let rung = |bps: u64| {
+            SegmentIdentity::new(
+                1,
+                0,
+                None,
+                None,
+                &ident_opts(
+                    None,
+                    Some(SegmentAudio::Aac),
+                    SegmentContainer::Mpegts,
+                    None,
+                    Some(bps),
+                ),
+            )
+        };
+        let a64 = rung(64_000);
+        let a256 = rung(256_000);
         assert_ne!(a64, a256, "audio rungs must key on their own bitrate");
-        assert_eq!(a64.bitrate_kbps, 64);
-        assert_eq!(a256.bitrate_kbps, 256);
+        assert_eq!(a64.audio_bitrate_kbps, 64);
+        assert_eq!(a256.audio_bitrate_kbps, 256);
 
         // The audio CODEC + container must separate audio-only segments too —
         // they all collapsed onto tag 0 while the video tag carried everything.
@@ -1892,20 +2058,21 @@ mod tests {
 
         // A video segment is unaffected: its video bitrate still governs, so
         // every warm on-disk entry keeps its filename.
-        let v = make_key(
+        let v = SegmentIdentity::new(
             1,
             0,
             Some(1),
             None,
-            Some(4_000_000),
-            Some(128_000),
-            codec_tag(
+            &ident_opts(
                 Some(SegmentVideo::H264),
                 Some(SegmentAudio::Aac),
                 SegmentContainer::Mpegts,
+                Some(4_000_000),
+                Some(128_000),
             ),
         );
-        assert_eq!(v.bitrate_kbps, 4_000);
+        assert_eq!(v.video_bitrate_kbps, 4_000);
+        assert_eq!(v.audio_bitrate_kbps, 128);
     }
 
     #[tokio::test]
