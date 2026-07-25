@@ -590,6 +590,20 @@ impl HlsSegmentCache {
             tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        // EOF on the pipe is not proof of success — a child killed mid-encode
+        // closes stdout exactly like one that finished. Without this check a
+        // truncated segment was renamed into the keyed cache path and served
+        // from there forever. The scheduler path already gates on
+        // `status.success()`; this is the same gate for the inline fallback.
+        let status = stream
+            .wait()
+            .await
+            .map_err(|e| HlsCacheError::Transcode(format!("reap ffmpeg: {e}")))?;
+        if !status.success() {
+            return Err(HlsCacheError::Transcode(format!(
+                "ffmpeg exited unsuccessfully: {status}"
+            )));
+        }
         Ok(None)
     }
 
