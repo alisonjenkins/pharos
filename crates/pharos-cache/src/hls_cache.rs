@@ -25,7 +25,8 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use pharos_transcode::{
-    FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo, TranscodeOptions,
+    progress_sidecar_path, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
+    SegmentVideo, TranscodeOptions, VideoCodec,
 };
 use tokio::io::AsyncReadExt;
 
@@ -75,6 +76,67 @@ struct SegmentKey {
 }
 
 const NO_SUBTITLE: i32 = -1;
+
+/// What ffmpeg reported it actually produced, read from the `-progress`
+/// sidecar next to `out` — which is removed on the way out, success or not.
+/// `(frames, out_time_seconds)`.
+///
+/// `None` when the sidecar is missing or carries no usable numbers. The
+/// completeness check then simply does not fire: a missing report is not
+/// evidence of a bad segment, and rejecting on it would fail every segment
+/// produced by a path that does not write one.
+async fn read_progress(out: &Path) -> Option<(u64, f64)> {
+    let sidecar = progress_sidecar_path(out);
+    let text = tokio::fs::read_to_string(&sidecar).await.ok();
+    let _ = tokio::fs::remove_file(&sidecar).await;
+    // ffmpeg appends a whole block of `key=value` lines every reporting
+    // interval, so the LAST occurrence of each key is the final state.
+    let mut frames: Option<u64> = None;
+    let mut out_time_secs: Option<f64> = None;
+    for line in text?.lines() {
+        match line.split_once('=') {
+            Some(("frame", v)) => frames = v.trim().parse().ok().or(frames),
+            Some(("out_time_us", v)) => {
+                out_time_secs = v
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .map(|us| us / 1e6)
+                    .or(out_time_secs);
+            }
+            _ => {}
+        }
+    }
+    Some((frames?, out_time_secs?))
+}
+
+/// `Some(reason)` when the produced segment carries less than it advertises.
+///
+/// ffmpeg exits 0 after silently dropping frames it could not decode, so the
+/// exit status, the byte floor and the cache all read such a segment as a
+/// success. This is the check that does not.
+///
+/// It deliberately tests only what the produced file can answer on its own:
+/// that a segment asked for video contains some, and that the encoder reached
+/// the duration it was asked for. Catching a segment that is short by a
+/// handful of frames would need the source frame rate here, which this layer
+/// has no honest way to know; the decode preroll is what prevents those, and
+/// `tests/segment_frame_completeness.rs` is what keeps it working.
+async fn short_of_frames(out: &Path, opts: &TranscodeOptions) -> Option<String> {
+    let (frames, out_time_secs) = read_progress(out).await?;
+    let encoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
+    if encoding_video && frames == 0 {
+        return Some("no video frames at all".to_string());
+    }
+    if let Some(want) = opts.duration_seconds() {
+        if out_time_secs < want * 0.9 {
+            return Some(format!(
+                "reached only {out_time_secs:.3}s of the requested {want:.3}s"
+            ));
+        }
+    }
+    None
+}
 
 /// Stable small tag distinguishing the output video codec + CONTAINER so
 /// different segment BYTES never share a cache entry. The container matters:
@@ -404,17 +466,54 @@ impl HlsSegmentCache {
         // client will stall. Logged per miss so Loki/Tempo show exactly which
         // segments are slow and why (codec + subtitle burn are the usual cost).
         let started = std::time::Instant::now();
-        let timing = match self
-            .write_segment(source, &opts.to_transcode_options(), &tmp)
-            .instrument(tracing::info_span!("write_segment"))
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(e);
+        let mut attempt_opts = opts.to_transcode_options();
+        let mut timing = None;
+        // A produced segment can be short of video frames while ffmpeg exits 0
+        // (see `short_of_frames`). That is not transient — re-running the same
+        // command reproduces it exactly — so the retry has to change something:
+        // it seeds the decoder much further back, past the point the container
+        // index lied about.
+        let mut shortfall = None;
+        for attempt in 0..2 {
+            if attempt == 1 {
+                attempt_opts.decode_preroll_seconds =
+                    Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
             }
-        };
+            timing = match self
+                .write_segment(source, &attempt_opts, &tmp)
+                .instrument(tracing::info_span!("write_segment"))
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                    return Err(e);
+                }
+            };
+            shortfall = short_of_frames(&tmp, &attempt_opts).await;
+            match &shortfall {
+                None => break,
+                Some(why) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    tracing::warn!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        attempt,
+                        preroll_secs = attempt_opts.decode_preroll_seconds,
+                        reason = %why,
+                        "hls segment came back short of video frames"
+                    );
+                }
+            }
+        }
+        if let Some(why) = shortfall {
+            return Err(HlsCacheError::Transcode(format!(
+                "transcode produced an incomplete segment even with a \
+                 {}s decode preroll: {why}",
+                pharos_transcode::DECODE_PREROLL_RETRY_SECONDS
+            )));
+        }
         // Never CACHE an empty/truncated transcode. A worker can exit "success"
         // yet emit near-zero bytes (e.g. a hw encoder fed an option it rejects
         // produces a broken bitstream). Renaming that into the keyed cache path
@@ -1182,6 +1281,111 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
+
+    /// A 6.006 s video segment's options, matching the production grid.
+    fn segment_transcode_opts() -> TranscodeOptions {
+        SegmentOpts {
+            container: SegmentContainer::Mpegts,
+            video: Some(SegmentVideo::H264),
+            audio: Some(SegmentAudio::Aac),
+            video_bitrate_bps: Some(2_000_000),
+            audio_bitrate_bps: Some(128_000),
+            start_position_ticks: 1_625_000_000,
+            duration_ticks: Some(60_060_000),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+        }
+        .to_transcode_options()
+    }
+
+    /// Write an ffmpeg `-progress` sidecar for `out`. Shaped like the real
+    /// thing: repeated blocks, only the last of which is final.
+    async fn write_progress(out: &Path, frames: u64, out_time_secs: f64) {
+        let us = (out_time_secs * 1e6) as u64;
+        let body = format!(
+            "frame=1\nfps=0.00\nout_time_us=41708\nprogress=continue\n\
+             frame={frames}\nfps=120.0\nout_time_us={us}\nprogress=end\n"
+        );
+        tokio::fs::write(progress_sidecar_path(out), body)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_complete_segment_is_accepted() {
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 144, 6.006).await;
+        assert_eq!(short_of_frames(&out, &segment_transcode_opts()).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_segment_with_no_video_frames_is_rejected() {
+        // The observed catastrophic case: the decoder could not rebuild its
+        // reference list after the seek and skipped every NALU, so the
+        // segment carries audio and no picture — and ffmpeg exited 0. Two
+        // live segments of Fringe S01E02 looked exactly like this.
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 0, 6.006).await;
+        let why = short_of_frames(&out, &segment_transcode_opts())
+            .await
+            .expect("a video segment with zero frames must be rejected");
+        assert!(why.contains("no video frames"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn an_audio_only_segment_is_not_judged_on_video_frames() {
+        // The `/hls1/{A64..A256}` ladder legitimately produces no video.
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 0, 6.006).await;
+        let mut opts = segment_transcode_opts();
+        opts.video = None;
+        opts.video_bitrate_bps = None;
+        assert_eq!(short_of_frames(&out, &opts).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_segment_is_rejected() {
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 90, 3.5).await;
+        let why = short_of_frames(&out, &segment_transcode_opts())
+            .await
+            .expect("a segment that stopped early must be rejected");
+        assert!(why.contains("3.500") && why.contains("6.006"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_progress_report_accepts_rather_than_rejects() {
+        // A missing report is not evidence of a bad segment. Failing closed
+        // here would reject every segment from any path that does not write
+        // one — an outage, in exchange for no information.
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        assert_eq!(short_of_frames(&out, &segment_transcode_opts()).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_progress_sidecar_does_not_outlive_the_check() {
+        // It sits in the cache directory next to the segment; left behind it
+        // would accumulate one file per segment ever produced, invisible to
+        // the LRU accounting.
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 144, 6.006).await;
+        let _ = short_of_frames(&out, &segment_transcode_opts()).await;
+        assert!(
+            !tokio::fs::try_exists(progress_sidecar_path(&out))
+                .await
+                .unwrap(),
+            "sidecar left behind"
+        );
+    }
 
     /// Seed a cache file directly (no ffmpeg) and update LRU state to
     /// match. Used by unit tests so they don't need a real ffmpeg
