@@ -3363,7 +3363,7 @@ impl TranscodeSessionStore for PostgresStore {
         &self,
         play_session_id: &str,
     ) -> DomainResult<Option<PersistedTranscodeSession>> {
-        let row: Option<(i64, String, String)> = sqlx::query_as(
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
             "SELECT media_id, decision_json, source_probe_json, \
                     burn_subtitle_indices_json \
              FROM transcode_sessions WHERE play_session_id = $1",
