@@ -3338,7 +3338,7 @@ impl TranscodeSessionStore for PostgresStore {
             "INSERT INTO transcode_sessions \
              (play_session_id, media_id, decision_json, source_probe_json, \
               burn_subtitle_indices_json, updated_at) \
-             VALUES ($1, $2, $3, $4, $5) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (play_session_id) DO UPDATE SET \
                media_id = EXCLUDED.media_id, \
                decision_json = EXCLUDED.decision_json, \
