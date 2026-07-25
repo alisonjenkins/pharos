@@ -17,6 +17,7 @@ pub mod sessions;
 pub mod socket;
 pub mod stream;
 pub mod stubs;
+pub mod subtitle_burn;
 pub mod subtitle_delivery;
 pub mod subtitles;
 pub mod syncplay;
