@@ -8,7 +8,7 @@ pub mod time;
 
 pub use segment_grid::{
     frame_snapped_start, segment_range, segment_seek_bias, SegmentGrid, SegmentIndex,
-    SEGMENT_SECONDS,
+    SegmentWindow, SEGMENT_SECONDS,
 };
 
 pub use auth::{

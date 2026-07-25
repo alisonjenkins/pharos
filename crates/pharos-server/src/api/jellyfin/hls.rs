@@ -1022,8 +1022,6 @@ async fn serve_segment(
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-    let start_ticks = Ticks::from_seconds(start_secs).0;
-    let duration_ticks = Ticks::from_seconds(dur_secs).0;
 
     // P2 — pull negotiated bitrate cap from the live session (if any)
     // so we can clamp the variant override below.
@@ -1038,8 +1036,7 @@ async fn serve_segment(
     let mut opts = build_segment_opts(
         session,
         &item,
-        start_ticks,
-        duration_ticks,
+        seg,
         q.audio_stream_index,
         q.subtitle_stream_index,
     );
@@ -1243,11 +1240,18 @@ fn segment_etag(
 fn build_segment_opts(
     session: Option<crate::transcode_sessions::TranscodeSession>,
     item: &pharos_core::MediaItem,
-    start_ticks: u64,
-    duration_ticks: u64,
+    seg: u32,
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
 ) -> SegmentOpts {
+    // The window comes from the grid and the source frame rate, never from a
+    // caller-supplied position: that is what `SegmentWindow`'s private fields
+    // enforce, and what keeps a segment's `-ss` on the same boundaries the
+    // playlist advertises.
+    let window = pharos_core::SegmentWindow::for_segment(
+        seg,
+        source_frame_rate(item.probe.frame_rate_mille),
+    );
     use crate::api::jellyfin::device_profile::Decision;
 
     // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
@@ -1376,8 +1380,7 @@ fn build_segment_opts(
                         max_video_bitrate_bps,
                         item.probe.bitrate_bps,
                     )),
-                    start_position_ticks: start_ticks,
-                    duration_ticks: Some(duration_ticks),
+                    window,
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
                     burn_subtitle_is_text: subtitle_is_text,
@@ -1408,8 +1411,7 @@ fn build_segment_opts(
                     }),
 
                     video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
-                    start_position_ticks: start_ticks,
-                    duration_ticks: Some(duration_ticks),
+                    window,
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
                     burn_subtitle_is_text: subtitle_is_text,
@@ -1440,8 +1442,7 @@ fn build_segment_opts(
         }),
 
         video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
-        start_position_ticks: start_ticks,
-        duration_ticks: Some(duration_ticks),
+        window,
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index: subtitle_stream_index,
         burn_subtitle_is_text: subtitle_is_text,
@@ -2289,8 +2290,10 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                 let item = item.clone();
                 let mut o = opts.clone();
                 let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-                o.start_position_ticks = Ticks::from_seconds(start_secs).0;
-                o.duration_ticks = Some(Ticks::from_seconds(dur_secs).0);
+                o.window = pharos_core::SegmentWindow::for_segment(
+                    seg,
+                    source_frame_rate(item.probe.frame_rate_mille),
+                );
                 actix_web::rt::spawn(async move {
                     // B46 — gate per TARGET segment (the hinted opts carry the
                     // hinting segment's burn decision, not this one's).
@@ -2379,13 +2382,10 @@ pub(super) fn prewarm_cold_start(
             let session = session.clone();
             actix_web::rt::spawn(async move {
                 let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-                let start_ticks = Ticks::from_seconds(start_secs).0;
-                let duration_ticks = Ticks::from_seconds(dur_secs).0;
                 let mut opts = build_segment_opts(
                     Some(session),
                     &item,
-                    start_ticks,
-                    duration_ticks,
+                    seg,
                     audio_stream_index,
                     subtitle_stream_index,
                 );
@@ -2451,8 +2451,10 @@ fn spawn_one_prefetch(
     // bytes are byte-identical to (and cache-key-match) the client's own
     // eventual request for this segment.
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-    o.start_position_ticks = Ticks::from_seconds(start_secs).0;
-    o.duration_ticks = Some(Ticks::from_seconds(dur_secs).0);
+    o.window = pharos_core::SegmentWindow::for_segment(
+        seg,
+        source_frame_rate(item.probe.frame_rate_mille),
+    );
     // B51 — carry the client's ACTUAL subtitle pick, NOT the requesting
     // segment's gated value. The old code cloned the served segment's opts,
     // so while in a quiet (burn-gated-off) stretch every upcoming
@@ -2664,9 +2666,10 @@ async fn fmp4_segment_opts(
 ) -> SegmentOpts {
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
-    let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-    let start_ticks = Ticks::from_seconds(start_secs).0;
-    let duration_ticks = Ticks::from_seconds(dur_secs).0;
+    let window = pharos_core::SegmentWindow::for_segment(
+        seg,
+        source_frame_rate(item.probe.frame_rate_mille),
+    );
     // Fold the live-session cap with any URL-carried `VideoBitrate` ceiling
     // (Lace incident) so a remote Firefox on VP9 is capped too.
     let cap = min_opt(
@@ -2747,8 +2750,7 @@ async fn fmp4_segment_opts(
         // makes the video segments faster (no per-segment audio mux/encode).
         audio: AudioDelivery::Separate,
         video_bitrate_bps: Some(bitrate),
-        start_position_ticks: start_ticks,
-        duration_ticks: Some(duration_ticks),
+        window,
         audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
         burn_subtitle_is_text: sub_is_text,
@@ -2937,7 +2939,7 @@ mod stream_index_tests {
         // allowed → the subtitle index is threaded too).
         let item = item_with_tracks("hevc");
         // abs audio 2 → relative 1; abs subtitle 5 → relative 1.
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, Some(2), Some(5));
+        let opts = build_segment_opts(None, &item, 0, Some(2), Some(5));
         assert_eq!(
             opts.audio_source_stream_index,
             Some(1),
@@ -2955,7 +2957,7 @@ mod stream_index_tests {
         // An absolute index not among the audio streams → None → ffmpeg default
         // selection, never a mis-map.
         let item = item_with_tracks("hevc");
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, Some(9), None);
+        let opts = build_segment_opts(None, &item, 0, Some(9), None);
         assert_eq!(opts.audio_source_stream_index, None);
     }
 }
@@ -3731,7 +3733,7 @@ mod tests {
     fn fallback_keeps_h264_transcode_for_unknown_codec() {
         // VP9 / AV1 / mpeg2 etc. → safe H.264 re-encode.
         let item = item_with_video_codec(Some("vp9"));
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
+        let opts = build_segment_opts(None, &item, 0, None, None);
         assert!(matches!(
             opts.video,
             Some(pharos_transcode::SegmentVideo::H264)
@@ -3746,7 +3748,7 @@ mod tests {
         // keyframe-sloppy durations off the EXTINF grid, multichannel AAC
         // passthrough Firefox can't decode). Even an h264 source re-encodes.
         let item = item_with_video_codec(Some("h264"));
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
+        let opts = build_segment_opts(None, &item, 0, None, None);
         assert!(matches!(
             opts.video,
             Some(pharos_transcode::SegmentVideo::H264)
@@ -3765,7 +3767,7 @@ mod tests {
         // and poisons the segment cache with an undecodable segment.
         for codec in ["hevc", "h265", "HEVC", "Hevc"] {
             let item = item_with_video_codec(Some(codec));
-            let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
+            let opts = build_segment_opts(None, &item, 0, None, None);
             assert!(
                 matches!(opts.video, Some(pharos_transcode::SegmentVideo::H264)),
                 "codec {codec} must re-encode to H264, got {:?}",
@@ -3783,7 +3785,7 @@ mod tests {
         // B45 — h264 sources re-encode now, so image-sub burn-in works on
         // them too (it silently no-op'd under the old `-c:v copy` fallback).
         let item = item_with_video_codec(Some("h264"));
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
+        let opts = build_segment_opts(None, &item, 0, None, Some(2));
         assert_eq!(opts.burn_subtitle_stream_index, Some(0));
     }
 
@@ -3802,7 +3804,7 @@ mod tests {
             source_probe: item.probe.clone(),
             burn_subtitle_indices: Default::default(),
         };
-        let opts = build_segment_opts(Some(session), &item, 0, 60_000_000, None, None);
+        let opts = build_segment_opts(Some(session), &item, 0, None, None);
         assert!(matches!(
             opts.video,
             Some(pharos_transcode::SegmentVideo::H264)
@@ -3852,7 +3854,6 @@ mod tests {
             Some(session_burning_nothing(&item)),
             &item,
             0,
-            60_000_000,
             None,
             Some(3),
         );
@@ -3872,7 +3873,6 @@ mod tests {
             Some(session_burning_nothing(&item)),
             &item,
             0,
-            60_000_000,
             None,
             Some(2),
         );
@@ -3886,7 +3886,7 @@ mod tests {
         let item = item_with_subs();
         let mut session = session_burning_nothing(&item);
         session.burn_subtitle_indices.insert(3);
-        let opts = build_segment_opts(Some(session), &item, 0, 60_000_000, None, Some(3));
+        let opts = build_segment_opts(Some(session), &item, 0, None, Some(3));
         assert_eq!(opts.burn_subtitle_stream_index, Some(1));
         assert!(opts.burn_subtitle_is_text);
     }
@@ -3896,7 +3896,7 @@ mod tests {
         // Re-encode path retains the requested burn-in, MAPPED from the
         // absolute ffprobe index (2) to the per-codec subtitle index (si=0).
         let item = item_with_video_codec(Some("vp9"));
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
+        let opts = build_segment_opts(None, &item, 0, None, Some(2));
         assert_eq!(opts.burn_subtitle_stream_index, Some(0));
     }
 
@@ -3922,17 +3922,17 @@ mod tests {
         // `burn_subtitle_is_text` set so Task 7 picks the `subtitles=`
         // filter instead of `overlay`.
         let item = item_with_subs();
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(3));
+        let opts = build_segment_opts(None, &item, 0, None, Some(3));
         assert_eq!(opts.burn_subtitle_stream_index, Some(1));
         assert!(opts.burn_subtitle_is_text);
 
         // The existing IMAGE track still burns, but is NOT flagged text.
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, Some(2));
+        let opts = build_segment_opts(None, &item, 0, None, Some(2));
         assert_eq!(opts.burn_subtitle_stream_index, Some(0));
         assert!(!opts.burn_subtitle_is_text);
 
         // No selection -> no burn, and the flag stays false.
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
+        let opts = build_segment_opts(None, &item, 0, None, None);
         assert_eq!(opts.burn_subtitle_stream_index, None);
         assert!(!opts.burn_subtitle_is_text);
     }
@@ -3991,7 +3991,7 @@ mod tests {
         // Defensive: a probe row predating the codec migration shows
         // no video codec; we must still pick a working target.
         let item = item_with_video_codec(None);
-        let opts = build_segment_opts(None, &item, 0, 60_000_000, None, None);
+        let opts = build_segment_opts(None, &item, 0, None, None);
         assert!(matches!(
             opts.video,
             Some(pharos_transcode::SegmentVideo::H264)

@@ -220,3 +220,45 @@ mod tests {
         );
     }
 }
+
+/// The slice of the shared timeline one segment occupies.
+///
+/// Fields are private and the only constructor takes a segment INDEX, so a
+/// caller cannot state a start position of its own. That is the point: the
+/// segment grid was re-derived in five places and a frame fell between
+/// segments at nearly every boundary, and separately a playlist's advertised
+/// durations drifted from the transcoder's actual cut points. Both were one
+/// path computing a timeline the others disagreed with. A path can no longer
+/// hold a start position it did not get from the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SegmentWindow {
+    start_ticks: u64,
+    duration_ticks: u64,
+}
+
+impl SegmentWindow {
+    /// The window segment `index` occupies, frame-snapped to `rate`.
+    pub fn for_segment(index: u32, rate: Option<FrameRate>) -> Self {
+        let (start, dur) = segment_range(index, rate);
+        Self {
+            start_ticks: crate::time::Ticks::from_seconds(start).0,
+            duration_ticks: crate::time::Ticks::from_seconds(dur).0,
+        }
+    }
+
+    pub fn start_ticks(self) -> u64 {
+        self.start_ticks
+    }
+
+    pub fn duration_ticks(self) -> u64 {
+        self.duration_ticks
+    }
+
+    pub fn start_seconds(self) -> f64 {
+        crate::time::Ticks(self.start_ticks).seconds()
+    }
+
+    pub fn duration_seconds(self) -> f64 {
+        crate::time::Ticks(self.duration_ticks).seconds()
+    }
+}
