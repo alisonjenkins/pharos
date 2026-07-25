@@ -286,7 +286,14 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// grid start a sub-frame away from where the new playlist says they do — the
 /// encoder duplicated or dropped the boundary frame when producing them, which
 /// is the stutter this fixes — so they must not be reused.
-const HLS_GEN_VERSION: u32 = 5;
+///
+/// v6: segments are produced with a decode preroll. Every segment cached
+/// under v5 whose decoder could not rebuild its reference picture set at the
+/// seek point is missing frames — up to all of them — and ffmpeg exited 0 for
+/// each, so nothing marked them bad. They cannot be told apart from good ones
+/// on disk, and a re-request would serve the frozen picture forever. Orphan
+/// the generation.
+const HLS_GEN_VERSION: u32 = 6;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
