@@ -219,6 +219,11 @@ pub struct SchedConfig {
     pub pending_cap: usize,
     pub cooldown: Duration,
     pub max_retries: u8,
+    /// Permits kept out of reach of [`JobClass::Background`] work. A
+    /// speculative job is admitted only while more than this many permits are
+    /// free across the devices that could take it, so a burst of prefetch can
+    /// never occupy the last slot a client request would have used.
+    pub background_headroom: usize,
 }
 
 impl Default for SchedConfig {
@@ -228,6 +233,7 @@ impl Default for SchedConfig {
             pending_cap: 256,
             cooldown: Duration::from_secs(2),
             max_retries: 3,
+            background_headroom: 1,
         }
     }
 }
@@ -689,6 +695,17 @@ fn retry_or_fail(
     place(state, job_id, ctx, self_tx);
 }
 
+/// Permits currently free across the devices that could take a given job.
+/// Counted over the job's own candidate set, not the whole table: capacity on
+/// a device that cannot encode this target is not headroom for it.
+fn free_permits(state: &SchedState, candidates: &[DeviceId]) -> usize {
+    candidates
+        .iter()
+        .filter_map(|d| state.devices.slot(*d))
+        .map(|s| s.capacity.saturating_sub(s.in_use()))
+        .sum()
+}
+
 /// A job that waited longer than this before starting is reported with the
 /// state of the queue it just escaped. One segment covers 6 s of playback, so
 /// a wait past this is already eating a client's buffer.
@@ -782,6 +799,27 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         return;
     }
 
+    // Speculative work waits for nobody, so it must not make anybody wait.
+    // Prefetch is dispatched *before* the segment the client is blocked on
+    // (it pipelines, by design), and shared one FIFO with that request: a
+    // handful of requests could therefore bury a client's own segment under
+    // tens of speculative encodes, turning a 3 s encode into a 90 s wait.
+    // Background work now runs only out of genuine spare capacity — it is
+    // shed the moment taking a permit would eat into the reserve, and it
+    // never enters the queue at all.
+    if ctx.class == JobClass::Background
+        && free_permits(state, &candidates) <= state.cfg.background_headroom
+    {
+        tracing::debug!(
+            %job_id,
+            candidates = ?candidates,
+            headroom = state.cfg.background_headroom,
+            "speculative transcode shed: no spare capacity"
+        );
+        let _ = ctx.reply.send(Err(SchedError::Busy));
+        return;
+    }
+
     for dev in candidates.iter().copied() {
         let Some(slot) = state.devices.slot(dev) else {
             continue;
@@ -828,7 +866,15 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         }
     }
 
-    // All candidate permits busy → queue (or backpressure).
+    // All candidate permits busy → queue (or backpressure). Background work
+    // never queues: by the time a permit frees, the client has usually asked
+    // for the segment itself, and a queued speculative job holds the cache's
+    // per-key fetch lock — so that client request would inherit the whole wait
+    // it was meant to be spared.
+    if ctx.class == JobClass::Background {
+        let _ = ctx.reply.send(Err(SchedError::Busy));
+        return;
+    }
     if state.pending.len() >= state.cfg.pending_cap {
         let _ = ctx.reply.send(Err(SchedError::Busy));
     } else {
@@ -912,6 +958,8 @@ fn try_place_no_queue(
             return;
         }
     }
+    // Background work never enters `pending` (see `place`), so this can only
+    // be reached by a job that was queued as interactive. Re-queue it.
     requeue.push_back((job_id, ctx));
 }
 
@@ -1555,6 +1603,143 @@ mod tests {
         );
 
         for h in handles {
+            assert!(h.await.unwrap().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_work_is_shed_and_never_queues_in_front_of_a_client() {
+        // The defect this pins: prefetch is dispatched BEFORE the segment the
+        // client is blocked on, and shared one FIFO with it, so speculative
+        // encodes could bury a client's own segment. Background work must now
+        // run only out of spare capacity, and must never join the queue.
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        // 5 permits total (2 nvenc + 1 vaapi + 2 cpu). Occupy every one.
+        let mut running = Vec::new();
+        for _ in 0..5 {
+            let s2 = s.clone();
+            running.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/run"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Speculative work is refused immediately rather than queued.
+        let shed = s
+            .submit(
+                PathBuf::from("/m/prefetch"),
+                h264(),
+                file_sink(),
+                JobClass::Background,
+            )
+            .await;
+        assert_eq!(
+            shed,
+            Err(SchedError::Busy),
+            "prefetch must be shed, not queued"
+        );
+
+        // A client request in the same state still queues and still completes.
+        let s2 = s.clone();
+        let client = tokio::spawn(async move {
+            s2.submit(
+                PathBuf::from("/m/client"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snap = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.pending_background, 0,
+            "nothing speculative in the queue"
+        );
+        assert_eq!(snap.pending_interactive, 1, "the client request is queued");
+
+        assert!(client.await.unwrap().is_ok());
+        for h in running {
+            assert!(h.await.unwrap().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_work_runs_when_there_is_spare_capacity() {
+        // Shedding must not become "never prefetch": with the pool idle, a
+        // background job is admitted like any other.
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 3,
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        let done = s
+            .submit(
+                PathBuf::from("/m/prefetch"),
+                h264(),
+                file_sink(),
+                JobClass::Background,
+            )
+            .await
+            .expect("idle pool must accept speculative work");
+        assert_eq!(done.out_bytes, 3);
+    }
+
+    #[tokio::test]
+    async fn speculative_work_leaves_headroom_for_a_client() {
+        // The last free permit is reserved: background is shed while only
+        // `background_headroom` permits remain, so a client request arriving a
+        // moment later still finds a slot instead of queueing behind a guess.
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        // Occupy 4 of the 5 permits, leaving exactly one free.
+        let mut running = Vec::new();
+        for _ in 0..4 {
+            let s2 = s.clone();
+            running.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/run"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            s.submit(
+                PathBuf::from("/m/prefetch"),
+                h264(),
+                file_sink(),
+                JobClass::Background,
+            )
+            .await,
+            Err(SchedError::Busy),
+            "the reserved permit is not for speculative work"
+        );
+        // ...and that reserved permit is there for the client.
+        let done = s
+            .submit(
+                PathBuf::from("/m/client"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
+            .expect("client must get the reserved permit");
+        assert_eq!(done.queue_wait_ms, 0, "client did not wait");
+        for h in running {
             assert!(h.await.unwrap().is_ok());
         }
     }
