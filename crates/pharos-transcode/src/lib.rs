@@ -838,6 +838,17 @@ fn build_args_for_device(
     // is unaffected: it reads the file directly via the `subtitles` filter, not
     // a mapped output stream.
     a.push("-sn".into());
+    // ...and never carry the source's CHAPTERS either. `-sn` does not cover
+    // them: chapters are not a stream on the input side, so ffmpeg copies them
+    // by default and the mp4 muxer materialises them as a QuickTime chapter
+    // track — `codec_tag=text`, `handler_name=SubtitleHandler`, which ffprobe
+    // reports as a `bin_data` DATA stream. That is a second track in the init
+    // segment's `moov` of every fMP4 rung, video-only rungs included, and
+    // hls.js's transmux worker throws an internal exception on a track it
+    // cannot classify, then refetches the same fragment forever (17 requests
+    // for one segment, all served 200, measured live).
+    a.push("-map_chapters".into());
+    a.push("-1".into());
     // fMP4 HLS segments are independent per-segment encodes that must tile on
     // ONE shared timeline (hls.js concatenates them under a single init
     // segment). Anchor each segment's timestamps to the SOURCE clock instead
@@ -1355,7 +1366,9 @@ mod tests {
         let o = opts();
         let a = build_args("/m/x.mkv", &o);
         let joined = a.join(" ");
-        assert!(!joined.contains("-map"), "{joined}");
+        // Exact token, not a substring of the joined argv: `-map_chapters` is
+        // not a stream map, and a `contains("-map")` check reads it as one.
+        assert!(!a.iter().any(|x| x == "-map"), "{joined}");
     }
 
     #[test]
