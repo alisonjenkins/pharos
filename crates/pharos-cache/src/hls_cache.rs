@@ -39,6 +39,12 @@ pub enum HlsCacheError {
     Transcode(String),
     #[error("non-utf8 path")]
     NonUtf8Path,
+    /// The transcode scheduler declined the job because there was no spare
+    /// capacity for it. Distinct from `Transcode` on purpose: for speculative
+    /// warm-up this is the scheduler working as intended, and collapsing it
+    /// into a generic failure makes deliberate load-shedding read as breakage.
+    #[error("transcode scheduler had no spare capacity")]
+    SchedulerBusy,
 }
 
 #[derive(Debug)]
@@ -103,6 +109,11 @@ enum SegmentOutcome {
     Empty,
     /// The transcode itself failed.
     Failed,
+    /// Deliberately not produced: speculative warm-up declined by the
+    /// scheduler because there was no spare capacity. Not a failure — the
+    /// system choosing a client request over a guess — but it must still be
+    /// countable, or shedding looks like silence.
+    Shed,
 }
 
 impl SegmentOutcome {
@@ -116,6 +127,7 @@ impl SegmentOutcome {
             Self::Short => "short",
             Self::Empty => "empty",
             Self::Failed => "failed",
+            Self::Shed => "shed",
         }
     }
 }
@@ -134,6 +146,7 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
         HlsCacheError::Io(_) => "io",
         HlsCacheError::Transcode(_) => "transcode",
         HlsCacheError::NonUtf8Path => "bad_path",
+        HlsCacheError::SchedulerBusy => "scheduler_busy",
     }
 }
 
@@ -677,6 +690,21 @@ impl HlsSegmentCache {
                 .await
             {
                 Ok(t) => t,
+                Err(HlsCacheError::SchedulerBusy) => {
+                    // Load-shedding, not breakage: the scheduler kept its
+                    // remaining permits for work a client is blocked on. At
+                    // ERROR this would drown the real failures it sits beside.
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                    tracing::debug!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        class = class.label(),
+                        "hls segment shed: no spare transcode capacity"
+                    );
+                    record_segment_failure(SegmentOutcome::Shed, "scheduler_busy", class);
+                    return Err(HlsCacheError::SchedulerBusy);
+                }
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
@@ -892,7 +920,10 @@ impl HlsSegmentCache {
                     class,
                 )
                 .await
-                .map_err(|e| HlsCacheError::Transcode(e.to_string()))?;
+                .map_err(|e| match e {
+                    pharos_transcode::scheduler::SchedError::Busy => HlsCacheError::SchedulerBusy,
+                    other => HlsCacheError::Transcode(other.to_string()),
+                })?;
             return Ok(Some(done));
         }
         // Legacy inline path: one ffmpeg, stream to file.
@@ -1955,17 +1986,19 @@ mod tests {
             SegmentOutcome::Short,
             SegmentOutcome::Empty,
             SegmentOutcome::Failed,
+            SegmentOutcome::Shed,
         ];
         for o in all {
             match o {
                 SegmentOutcome::Ok
                 | SegmentOutcome::Short
                 | SegmentOutcome::Empty
-                | SegmentOutcome::Failed => {}
+                | SegmentOutcome::Failed
+                | SegmentOutcome::Shed => {}
             }
         }
         let labels: Vec<&str> = all.iter().map(|o| o.label()).collect();
-        assert_eq!(labels, vec!["ok", "short", "empty", "failed"]);
+        assert_eq!(labels, vec!["ok", "short", "empty", "failed", "shed"]);
         let mut uniq = labels.clone();
         uniq.sort_unstable();
         uniq.dedup();
