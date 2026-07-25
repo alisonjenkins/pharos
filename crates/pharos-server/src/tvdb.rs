@@ -218,9 +218,20 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// auth/transport/decode failure.
     pub async fn list_series_artworks(&self, id: &str) -> Vec<crate::online_enrich::RemoteImage> {
         let Some(body) = self.authed_get(&format!("/series/{id}/extended")).await else {
+            tracing::warn!(
+                series_id = id,
+                "tvdb list_series_artworks: no response body (auth/transport failure)"
+            );
             return vec![];
         };
-        parse_tvdb_artworks(&body)
+        let images = parse_tvdb_artworks(&body);
+        if images.is_empty() {
+            tracing::debug!(
+                series_id = id,
+                "tvdb list_series_artworks: provider returned no usable images"
+            );
+        }
+        images
     }
 }
 

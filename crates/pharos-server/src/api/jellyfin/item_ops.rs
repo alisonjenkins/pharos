@@ -387,6 +387,16 @@ async fn remote_images_inner(
     q: &RemoteImagesQuery,
 ) -> RemoteImagesResultDto {
     let Some(m) = resolve_image_match(state, id_str).await else {
+        // The single most common "the picker shows nothing" cause: this item
+        // isn't matched to a TMDB/TVDB provider id yet (never enriched, or the
+        // backfill hasn't reached it / marked it `none`). Surface it rather
+        // than swallowing the reason — the online picker has nothing to
+        // enumerate until the item carries a provider id (Identify forces one).
+        tracing::info!(
+            item = id_str,
+            "RemoteImages: empty — item has no resolved TMDB/TVDB provider match \
+             (not enriched yet, or unmatched); online image picker will be blank"
+        );
         return RemoteImagesResultDto {
             images: vec![],
             total_record_count: 0,
@@ -397,6 +407,12 @@ async fn remote_images_inner(
     // didn't match this item to, there's nothing to offer.
     if let Some(req) = q.provider_name.as_deref().and_then(provider_token) {
         if req != m.provider {
+            tracing::debug!(
+                item = id_str,
+                requested = req,
+                matched = m.provider,
+                "RemoteImages: empty — client filtered to a provider this item isn't matched to"
+            );
             return RemoteImagesResultDto {
                 images: vec![],
                 total_record_count: 0,
@@ -412,7 +428,14 @@ async fn remote_images_inner(
                     .list_images(m.kind, &m.external_id)
                     .await
             }
-            None => vec![],
+            None => {
+                tracing::warn!(
+                    item = id_str,
+                    "RemoteImages: empty — item matched tmdb:{} but no [tmdb].api_key is configured",
+                    m.external_id
+                );
+                vec![]
+            }
         },
         _ => match non_empty(state.tvdb_api_key.as_deref()) {
             Some(key) => {
@@ -420,7 +443,14 @@ async fn remote_images_inner(
                     .list_images(m.kind, &m.external_id)
                     .await
             }
-            None => vec![],
+            None => {
+                tracing::warn!(
+                    item = id_str,
+                    "RemoteImages: empty — item matched tvdb:{} but no [tvdb].api_key is configured",
+                    m.external_id
+                );
+                vec![]
+            }
         },
     };
     let want = q.image_type.as_deref();
