@@ -185,7 +185,14 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// anchor to the video grid instead of the nominal `seg*6.0`. Stale
 /// `_audiohls` dirs carry nominal-anchored segments that desync against the
 /// video — orphan them so a fresh, aligned session regenerates on demand.
-const HLS_GEN_VERSION: u32 = 4;
+///
+/// v5: segment boundaries are computed in exact frames, and a source whose
+/// `frame_rate_mille` was really the 90 kHz container clock no longer snaps to
+/// a bogus grid (see `pharos_core::FrameRate`). Segments cached under the old
+/// grid start a sub-frame away from where the new playlist says they do — the
+/// encoder duplicated or dropped the boundary frame when producing them, which
+/// is the stutter this fixes — so they must not be reused.
+const HLS_GEN_VERSION: u32 = 5;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
