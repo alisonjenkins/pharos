@@ -163,3 +163,22 @@ change, or it proves nothing.
 - [ ] `just test`, clippy `--release --all-targets`, push, PR, rebase-merge.
 - [ ] After deploy: re-run the live measurement from the spec §1.2 against
   Fringe S01E02 and confirm the audio ratio is an integer.
+
+## Task 10: Follow-up investigation (AFTER this ships)
+
+User report 2026-07-25: a **long hang on the same frame** in Fringe S01E02 at
+~27:05, "particularly bad there". 27:05 = 1625 s → segment ~270 (1625 / 6.006).
+
+Distinct from the audio-continuity defect this plan fixes: a hang pinned to one
+timestamp points at a specific segment, not a per-boundary property. Candidate
+causes to test, in order:
+1. Fetch segments 269/270/271 and measure frame count, PTS continuity and byte
+   size against neighbours — a short/truncated segment would freeze the picture
+   until the next one lands.
+2. Check whether that segment straddles a source-side anomaly (a keyframe gap,
+   a container edit point, or a corrupt region of the m4v).
+3. Check the burn: whether a subtitle event at that timestamp makes the segment
+   far more expensive to encode than its neighbours.
+4. Check Loki for that segment's `transcode_ms` during the user's session.
+
+Do NOT assume it is the same root cause as the audio defect.

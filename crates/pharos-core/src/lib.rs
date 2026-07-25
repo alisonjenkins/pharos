@@ -3,7 +3,13 @@
 
 pub mod auth;
 pub mod secret;
+pub mod segment_grid;
 pub mod time;
+
+pub use segment_grid::{
+    frame_snapped_start, segment_range, segment_seek_bias, SegmentGrid, SegmentIndex,
+    SEGMENT_SECONDS,
+};
 
 pub use auth::{
     AccessSchedule, AuthBackend, AuthError, AuthResult, AuthToken, TokenRecord, TokenStore, User,
