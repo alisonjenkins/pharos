@@ -425,7 +425,10 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
             // Sidecar-less: extract the embedded cover / frame (the expensive
             // NFS-bound step). A coverless / unseekable source errors and is now
             // negatively cached — `.ok()` drops it, nothing to scale.
-            None => ic.primary(item.id, item.kind, &item.path).await.ok(),
+            None => ic
+                .primary(item.id, item.kind, &item.path, item.probe.duration_ms)
+                .await
+                .ok(),
         };
         if let Some(src) = source {
             ic.scaled_artwork(&src, GRID_PRIMARY_WIDTH).await;

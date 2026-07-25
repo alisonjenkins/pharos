@@ -231,8 +231,10 @@ impl ImageCache {
         id: u64,
         kind: MediaKind,
         source: &Path,
+        duration_ms: Option<u64>,
     ) -> Result<PathBuf, ImageCacheError> {
-        self.fetch(id, ImageRole::Primary, kind, source, 0).await
+        self.fetch(id, ImageRole::Primary, kind, source, 0, duration_ms)
+            .await
     }
 
     /// Fetch any role + index. On extractable roles (Primary, Backdrop,
@@ -251,13 +253,14 @@ impl ImageCache {
         kind: MediaKind,
         source: &Path,
         index: u32,
+        duration_ms: Option<u64>,
     ) -> Result<PathBuf, ImageCacheError> {
         let out_path = image_path(&self.root, role, kind, id, index);
         if tokio::fs::try_exists(&out_path).await.unwrap_or(false) {
             // Self-heal a poster/thumb/backdrop that a previous build extracted
             // as an all-black frame (fixed-seek landed on a title card / fade).
             if role.is_extractable() {
-                self.heal_if_blank(id, role, kind, source, index, &out_path)
+                self.heal_if_blank(id, role, kind, source, index, duration_ms, &out_path)
                     .await;
             }
             return Ok(out_path);
@@ -291,7 +294,10 @@ impl ImageCache {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp_path = out_path.with_extension("jpg.tmp");
-        match self.extract(source, kind, role, &tmp_path).await {
+        match self
+            .extract(source, kind, role, duration_ms, &tmp_path)
+            .await
+        {
             Ok(()) => {}
             Err(ImageCacheError::NoContent) => {
                 // Record the "nothing here" verdict so the next request skips
@@ -315,6 +321,9 @@ impl ImageCache {
     /// are never disturbed. Best-effort: any failure leaves the existing file
     /// in place and still marks the slot so a persistently-blank source isn't
     /// re-attempted on every library-grid render.
+    // All eight are distinct scalars threaded straight from `fetch`; bundling
+    // them into a struct would only add indirection at the one call site.
+    #[allow(clippy::too_many_arguments)]
     async fn heal_if_blank(
         &self,
         id: u64,
@@ -322,6 +331,7 @@ impl ImageCache {
         kind: MediaKind,
         source: &Path,
         index: u32,
+        duration_ms: Option<u64>,
         out_path: &Path,
     ) {
         let marker = healed_marker(out_path);
@@ -356,7 +366,10 @@ impl ImageCache {
             return;
         }
         let tmp_path = out_path.with_extension("heal.tmp");
-        match self.extract(source, kind, role, &tmp_path).await {
+        match self
+            .extract(source, kind, role, duration_ms, &tmp_path)
+            .await
+        {
             Ok(()) => {
                 let _ = tokio::fs::rename(&tmp_path, out_path).await;
             }
@@ -919,11 +932,41 @@ impl ImageCache {
         total
     }
 
+    /// The `-ss` timestamp for an extractable role, kept inside the source.
+    ///
+    /// Backdrop deliberately sits deeper into the runtime than Primary so the
+    /// frame is visually distinct from the poster — but `seek_seconds * 4` is
+    /// 120 s at the default config, and nothing clamped it against the item's
+    /// length. Any Movie/Episode shorter than that seeked PAST EOF, decoded no
+    /// frame, and the extraction failed outright: `get_image_indexed` turned
+    /// that into a plain 404 with no fallback (`heal_if_blank` only re-runs on
+    /// an already-cached blank file, never on an extraction error). The old
+    /// trailing `.max(self.seek_seconds)` could not help — `saturating_mul(4)`
+    /// is never below its input.
+    ///
+    /// Capped at 90% of the runtime so the seek always lands on real content
+    /// even for a very short item. `None` (unknown duration) keeps the
+    /// unclamped request, which is the pre-existing behaviour.
+    fn extract_seek_secs(&self, role: ImageRole, duration_ms: Option<u64>) -> u32 {
+        let want = match role {
+            ImageRole::Backdrop => self.seek_seconds.saturating_mul(4),
+            _ => self.seek_seconds,
+        };
+        match duration_ms {
+            Some(ms) if ms > 0 => {
+                let inside = (ms.saturating_mul(9) / 10 / 1_000).min(u32::MAX as u64) as u32;
+                want.min(inside)
+            }
+            _ => want,
+        }
+    }
+
     async fn extract(
         &self,
         source: &Path,
         kind: MediaKind,
         role: ImageRole,
+        duration_ms: Option<u64>,
         out: &Path,
     ) -> Result<(), ImageCacheError> {
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
@@ -931,12 +974,7 @@ impl ImageCache {
             // Video-frame roles go through the resident worker. Audio
             // cover art (embedded attached-pic remux) stays on spawn.
             if matches!(kind, MediaKind::Movie | MediaKind::Episode) {
-                let seek = match role {
-                    ImageRole::Backdrop => {
-                        self.seek_seconds.saturating_mul(4).max(self.seek_seconds)
-                    }
-                    _ => self.seek_seconds,
-                };
+                let seek = self.extract_seek_secs(role, duration_ms);
                 let width = match role {
                     ImageRole::Backdrop => 1280,
                     ImageRole::Thumb => 640,
@@ -959,14 +997,7 @@ impl ImageCache {
         // Explicit `-f mjpeg` because the cache writes to a `.tmp`
         // suffix path — ffmpeg can't infer the muxer from the .jpg.tmp
         // extension and dies with "Unable to choose an output format".
-        let seek = match role {
-            // Backdrop sits deeper into the runtime than Primary so the
-            // resulting frame is more visually distinct from the poster.
-            // Falls back to `seek_seconds` on short fixtures.
-            ImageRole::Backdrop => self.seek_seconds.saturating_mul(4).max(self.seek_seconds),
-            _ => self.seek_seconds,
-        };
-        let seek = seek.to_string();
+        let seek = self.extract_seek_secs(role, duration_ms).to_string();
         // `thumbnail` picks the most representative frame from a 100-frame
         // batch before scaling, so a black opening title / fade at the seek
         // point doesn't become an all-black poster (the libav path scans for
@@ -1127,7 +1158,14 @@ mod tests {
         // Fetch on the same upload-only role now returns the path
         // (file is on disk; no ffmpeg required).
         let again = cache
-            .fetch(42, ImageRole::Logo, MediaKind::Movie, Path::new("/n"), 0)
+            .fetch(
+                42,
+                ImageRole::Logo,
+                MediaKind::Movie,
+                Path::new("/n"),
+                0,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(again, path);
@@ -1152,6 +1190,7 @@ mod tests {
                 MediaKind::Audio,
                 Path::new("/coverless.mp3"),
                 0,
+                None,
             )
             .await;
         assert!(
@@ -1173,7 +1212,7 @@ mod tests {
         // A tiny (blank-looking) poster — below the size floor.
         tokio::fs::write(&p, vec![0u8; 512]).await.unwrap();
         let got = cache
-            .primary(42, MediaKind::Movie, Path::new("/no/source"))
+            .primary(42, MediaKind::Movie, Path::new("/no/source"), None)
             .await
             .unwrap();
         assert_eq!(got, p);
@@ -1197,7 +1236,7 @@ mod tests {
         let real = vec![0xABu8; 20 * 1024];
         tokio::fs::write(&p, &real).await.unwrap();
         let got = cache
-            .primary(7, MediaKind::Movie, Path::new("/no/source"))
+            .primary(7, MediaKind::Movie, Path::new("/no/source"), None)
             .await
             .unwrap();
         assert_eq!(got, p);
@@ -1225,10 +1264,31 @@ mod tests {
         );
         // A subsequent fetch serves it untouched despite its small size.
         let got = cache
-            .primary(55, MediaKind::Movie, Path::new("/no/source"))
+            .primary(55, MediaKind::Movie, Path::new("/no/source"), None)
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(&got).await.unwrap(), body);
+    }
+
+    #[test]
+    fn extract_seek_stays_inside_short_sources() {
+        let cache = ImageCache::new(Path::new("/c")); // seek_seconds = 30
+                                                      // Long enough: both roles get their intended offsets.
+        let long = Some(3_600_000);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Primary, long), 30);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Backdrop, long), 120);
+        // A 90 s item: Backdrop wanted 120 s — past EOF, which decoded no frame
+        // and 404'd the image outright. Clamped inside the runtime instead.
+        let short = Some(90_000);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Backdrop, short), 81);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Primary, short), 30);
+        // A 20 s extra: even Primary's 30 s overshoots.
+        let tiny = Some(20_000);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Primary, tiny), 18);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Backdrop, tiny), 18);
+        // Unknown / zero duration keeps the unclamped request.
+        assert_eq!(cache.extract_seek_secs(ImageRole::Backdrop, None), 120);
+        assert_eq!(cache.extract_seek_secs(ImageRole::Backdrop, Some(0)), 120);
     }
 
     #[tokio::test]
@@ -1236,7 +1296,14 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
         let res = cache
-            .fetch(99, ImageRole::Logo, MediaKind::Movie, Path::new("/n"), 0)
+            .fetch(
+                99,
+                ImageRole::Logo,
+                MediaKind::Movie,
+                Path::new("/n"),
+                0,
+                None,
+            )
             .await;
         assert!(matches!(res, Err(ImageCacheError::UploadOnly)));
     }
@@ -1302,7 +1369,7 @@ mod tests {
             .unwrap();
         tokio::fs::write(&p, b"fake-jpeg").await.unwrap();
         let got = cache
-            .primary(42, MediaKind::Movie, Path::new("/no/source"))
+            .primary(42, MediaKind::Movie, Path::new("/no/source"), None)
             .await
             .unwrap();
         assert_eq!(got, p);
@@ -1313,7 +1380,7 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
         let res = cache
-            .primary(99, MediaKind::Movie, Path::new("/no/source"))
+            .primary(99, MediaKind::Movie, Path::new("/no/source"), None)
             .await;
         assert!(matches!(res, Err(ImageCacheError::Io(_))));
     }

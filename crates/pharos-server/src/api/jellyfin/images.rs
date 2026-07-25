@@ -498,7 +498,17 @@ async fn serve_image(
     {
         return Ok(HttpResponse::NotFound().body(""));
     }
-    let jpeg_path = match cache.fetch(id, role, item.kind, &item.path, index).await {
+    let jpeg_path = match cache
+        .fetch(
+            id,
+            role,
+            item.kind,
+            &item.path,
+            index,
+            item.probe.duration_ms,
+        )
+        .await
+    {
         Ok(p) => p,
         // Upload-only roles (Logo/Banner/Art/Disc) report
         // `UploadOnly` when no upload has happened — surface as 404
