@@ -1215,26 +1215,7 @@ fn segment_etag(
     sub_idx: Option<u32>,
     opts: &SegmentOpts,
 ) -> String {
-    use xxhash_rust::xxh3::xxh3_64;
-    let key = format!(
-        "{media_id}-{seg}-{audio}-{sub}-{vbr}-{vcodec}-{abr}-{acodec}-{container:?}",
-        audio = audio_idx.map_or_else(|| "d".to_string(), |n| n.to_string()),
-        sub = sub_idx.map_or_else(|| "off".to_string(), |n| n.to_string()),
-        vbr = opts
-            .video_bitrate_bps
-            .map_or_else(|| "auto".to_string(), |b| b.to_string()),
-        vcodec = opts.video.map(|c| c.ffmpeg_codec()).unwrap_or("none"),
-        abr = opts
-            .audio_bitrate_bps
-            .map_or_else(|| "auto".to_string(), |b| b.to_string()),
-        acodec = opts
-            .audio
-            .map(|c| pharos_transcode::AudioCodec::from(c).ffmpeg_codec())
-            .unwrap_or("none"),
-        container = opts.container,
-    );
-    let h = xxh3_64(key.as_bytes()) & 0x7FFFFFFFFFFFFFFF;
-    format!("W/\"seg-{h:016x}\"")
+    pharos_cache::hls_cache::SegmentIdentity::new(media_id, seg, audio_idx, sub_idx, opts).etag()
 }
 
 /// Resolve the per-segment [`SegmentOpts`] for this request.
