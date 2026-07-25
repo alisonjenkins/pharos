@@ -45,6 +45,59 @@ pub enum HlsCacheError {
     /// into a generic failure makes deliberate load-shedding read as breakage.
     #[error("transcode scheduler had no spare capacity")]
     SchedulerBusy,
+    /// An audio-rendition file did not appear before the read wait's budget ran
+    /// out. Carries WHICH budget expired and what the session had produced by
+    /// then — a bare `NotFound` here is indistinguishable from "the client asked
+    /// for a segment past the end of the media", and the two need opposite
+    /// responses.
+    #[error(
+        "audio segment {name} not ready: {reason} after {waited_ms}ms (session progress: {})",
+        match last_progress { Some(n) => format!("a{n}.m4s"), None => "nothing produced".into() }
+    )]
+    AudioNotReady {
+        name: String,
+        reason: AudioWaitGiveUp,
+        waited_ms: u64,
+        last_progress: Option<u32>,
+    },
+}
+
+/// Which of the three read-wait budgets expired, as a bounded metric label.
+///
+/// The three mean different things and want different fixes: `NeverStarted` is
+/// an ffmpeg that failed to spawn or died before its first segment,
+/// `Stalled` is a session that produced and then stopped advancing (finished,
+/// wedged, or — the Ghost in the Shell shape — merely slower than the stall
+/// budget under load), and `BudgetExhausted` is a session that kept advancing
+/// for the whole 30 s and still never reached the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioWaitGiveUp {
+    NeverStarted,
+    Stalled,
+    BudgetExhausted,
+}
+
+impl AudioWaitGiveUp {
+    /// The `outcome` label. Stable strings — a dashboard keyed on these breaks
+    /// silently if renamed, so the mapping lives here and is asserted distinct
+    /// in a test rather than written inline at each emission site.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeverStarted => "never_started",
+            Self::Stalled => "stalled",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+impl std::fmt::Display for AudioWaitGiveUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NeverStarted => "session never produced a segment",
+            Self::Stalled => "session stopped advancing",
+            Self::BudgetExhausted => "overall wait budget exhausted",
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -147,7 +200,15 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
         HlsCacheError::Transcode(_) => "transcode",
         HlsCacheError::NonUtf8Path => "bad_path",
         HlsCacheError::SchedulerBusy => "scheduler_busy",
+        HlsCacheError::AudioNotReady { .. } => "audio_not_ready",
     }
+}
+
+/// Count one audio-rendition read wait. Emitted on BOTH outcomes: a counter
+/// that only fires on failure cannot answer "what fraction of waits 404?",
+/// which is the question the Ghost in the Shell stall actually posed.
+fn record_audio_wait(outcome: &'static str) {
+    metrics::counter!("pharos_audio_wait_total", "outcome" => outcome).increment(1);
 }
 
 /// Count one segment production attempt.
@@ -1703,13 +1764,17 @@ impl HlsSegmentCache {
         }
         let mut last_progress: Option<u32> = None;
         let mut stalls = 0usize;
+        let mut polls = 0usize;
+        let mut give_up = AudioWaitGiveUp::BudgetExhausted;
         for i in 0..max_polls {
+            polls = i;
             // Resolve across the rendition's sessions each poll: the file may
             // not exist yet, and which session ends up owning it is only known
             // once one has written it.
             if let Some(path) = Self::resolve_audio_file(dir, name).await {
                 if let Ok(b) = tokio::fs::read(&path).await {
                     if !b.is_empty() {
+                        record_audio_wait("served");
                         return Ok(b);
                     }
                 }
@@ -1721,6 +1786,7 @@ impl HlsSegmentCache {
                     if Some(prog) == last_progress {
                         stalls += 1;
                         if stalls >= stall_polls {
+                            give_up = AudioWaitGiveUp::Stalled;
                             break;
                         }
                     } else {
@@ -1732,6 +1798,7 @@ impl HlsSegmentCache {
                 // segment. Allow a bounded grace, then declare the session dead.
                 None => {
                     if i >= no_progress_polls {
+                        give_up = AudioWaitGiveUp::NeverStarted;
                         break;
                     }
                 }
@@ -1741,9 +1808,22 @@ impl HlsSegmentCache {
             ))
             .await;
         }
-        Err(HlsCacheError::Io(std::io::Error::from(
-            std::io::ErrorKind::NotFound,
-        )))
+        let waited_ms = polls as u64 * Self::AUDIO_POLL_INTERVAL_MS;
+        record_audio_wait(give_up.label());
+        tracing::warn!(
+            audio.file = name,
+            audio.dir = %dir.display(),
+            reason = give_up.label(),
+            waited_ms,
+            last_progress,
+            "audio rendition read gave up — client will see 404"
+        );
+        Err(HlsCacheError::AudioNotReady {
+            name: name.to_string(),
+            reason: give_up,
+            waited_ms,
+            last_progress,
+        })
     }
 
     async fn touch(&self, key: SegmentIdentity) {
@@ -2741,7 +2821,16 @@ mod tests {
         let dir = td.path().join("s");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let res = cache.audio_hls_file_budget(&dir, "a3.m4s", 200, 6, 6).await;
-        assert!(matches!(res, Err(HlsCacheError::Io(_))));
+        // The give-up branch is part of the contract, not just "an error":
+        // "never started" and "stalled" want opposite fixes.
+        assert!(matches!(
+            res,
+            Err(HlsCacheError::AudioNotReady {
+                reason: AudioWaitGiveUp::NeverStarted,
+                last_progress: None,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2756,6 +2845,47 @@ mod tests {
         let res = cache
             .audio_hls_file_budget(&dir, "a9.m4s", 200, 100, 6)
             .await;
-        assert!(matches!(res, Err(HlsCacheError::Io(_))));
+        // Distinct from the never-started case, and it must name what the
+        // session HAD reached — "a2" is what tells you it was alive.
+        assert!(matches!(
+            res,
+            Err(HlsCacheError::AudioNotReady {
+                reason: AudioWaitGiveUp::Stalled,
+                last_progress: Some(2),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn audio_wait_give_up_labels_are_stable_and_distinct() {
+        let all = [
+            AudioWaitGiveUp::NeverStarted,
+            AudioWaitGiveUp::Stalled,
+            AudioWaitGiveUp::BudgetExhausted,
+        ];
+        let labels: Vec<&str> = all.iter().map(|r| r.label()).collect();
+        assert_eq!(labels, vec!["never_started", "stalled", "budget_exhausted"]);
+        let mut uniq = labels.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), labels.len(), "labels must be distinct");
+        // "served" shares the label space and must not collide with a give-up.
+        assert!(!labels.contains(&"served"));
+    }
+
+    #[test]
+    fn audio_not_ready_names_the_cause_not_just_the_class() {
+        let e = HlsCacheError::AudioNotReady {
+            name: "a48.m4s".into(),
+            reason: AudioWaitGiveUp::Stalled,
+            waited_ms: 3000,
+            last_progress: Some(41),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("a48.m4s"), "{msg}");
+        assert!(msg.contains("stopped advancing"), "{msg}");
+        assert!(msg.contains("3000ms"), "{msg}");
+        assert!(msg.contains("a41.m4s"), "{msg}");
     }
 }
