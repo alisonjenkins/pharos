@@ -36,8 +36,8 @@ use std::process::Command;
 
 use pharos_core::time::TICKS_PER_SECOND;
 use pharos_transcode::{
-    ffmpeg_transcode_args, protocol::DeviceId, SegmentAudio, SegmentContainer, SegmentOpts,
-    SegmentVideo,
+    ffmpeg_transcode_args, protocol::DeviceId, AudioDelivery, ContinuousAudio, SegmentAudio,
+    SegmentContainer, SegmentOpts, SegmentVideo,
 };
 
 /// 23.976 fps, so the frame-snapped grid produces non-round boundaries — the
@@ -96,9 +96,13 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> (PathBuf, f64, f64) {
     let opts = SegmentOpts {
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
-        audio: Some(SegmentAudio::Aac),
+        audio: AudioDelivery::Muxed(ContinuousAudio {
+            codec: SegmentAudio::Aac,
+
+            bitrate_bps: Some(128_000),
+        }),
+
         video_bitrate_bps: Some(2_000_000),
-        audio_bitrate_bps: Some(128_000),
         start_position_ticks: (start * TICKS_PER_SECOND as f64) as u64,
         duration_ticks: Some((dur * TICKS_PER_SECOND as f64) as u64),
         audio_source_stream_index: None,

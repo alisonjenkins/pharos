@@ -21,8 +21,8 @@ use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
 use pharos_transcode::scheduler::JobClass;
 use pharos_transcode::{
-    AudioCodec, Container, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
-    SegmentVideo, VideoCodec,
+    AudioCodec, AudioDelivery, Container, ContinuousAudio, FfmpegTranscoder, SegmentAudio,
+    SegmentContainer, SegmentOpts, SegmentVideo, VideoCodec,
 };
 
 /// Segment length in seconds — re-exported from [`super::seek`], which owns the
@@ -1057,7 +1057,13 @@ async fn serve_segment(
                 opts.video_bitrate_bps = Some(target);
             }
             AnyVariant::Audio(av) => {
-                opts.audio_bitrate_bps = Some(av.audio_bitrate_bps());
+                // An audio-only rung still copies from the continuous encode;
+                // only its bitrate differs, and that is part of that encode's
+                // key.
+                opts.audio = AudioDelivery::Muxed(ContinuousAudio {
+                    codec: opts.audio_codec().unwrap_or(SegmentAudio::Aac),
+                    bitrate_bps: Some(av.audio_bitrate_bps()),
+                });
                 opts.video = None;
                 opts.video_bitrate_bps = None;
                 // Drop subtitle burn-in: makes no sense in an audio-
@@ -1358,13 +1364,18 @@ fn build_segment_opts(
                 return SegmentOpts {
                     container,
                     video,
-                    audio,
+                    audio: match audio {
+                        Some(codec) => AudioDelivery::Muxed(ContinuousAudio {
+                            codec,
+                            bitrate_bps: Some(128_000),
+                        }),
+                        None => AudioDelivery::Separate,
+                    },
                     // B50 — honour the negotiated cap, bounded by source.
                     video_bitrate_bps: Some(effective_video_bitrate(
                         max_video_bitrate_bps,
                         item.probe.bitrate_bps,
                     )),
-                    audio_bitrate_bps: Some(128_000),
                     start_position_ticks: start_ticks,
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
@@ -1390,9 +1401,13 @@ fn build_segment_opts(
                 return SegmentOpts {
                     container: SegmentContainer::Mpegts,
                     video: Some(SegmentVideo::H264),
-                    audio: Some(SegmentAudio::Aac),
+                    audio: AudioDelivery::Muxed(ContinuousAudio {
+                        codec: SegmentAudio::Aac,
+
+                        bitrate_bps: Some(128_000),
+                    }),
+
                     video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
-                    audio_bitrate_bps: Some(128_000),
                     start_position_ticks: start_ticks,
                     duration_ticks: Some(duration_ticks),
                     audio_source_stream_index: audio_stream_index,
@@ -1418,9 +1433,13 @@ fn build_segment_opts(
     SegmentOpts {
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
-        audio: Some(SegmentAudio::Aac),
+        audio: AudioDelivery::Muxed(ContinuousAudio {
+            codec: SegmentAudio::Aac,
+
+            bitrate_bps: Some(128_000),
+        }),
+
         video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
-        audio_bitrate_bps: Some(128_000),
         start_position_ticks: start_ticks,
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: audio_stream_index,
@@ -2726,9 +2745,8 @@ async fn fmp4_segment_opts(
         // separate continuous-encode rendition (see vp9_audio_playlist), so it
         // carries no per-segment Opus preskip. `audio: None` → `-an`. This also
         // makes the video segments faster (no per-segment audio mux/encode).
-        audio: None,
+        audio: AudioDelivery::Separate,
         video_bitrate_bps: Some(bitrate),
-        audio_bitrate_bps: None,
         start_position_ticks: start_ticks,
         duration_ticks: Some(duration_ticks),
         audio_source_stream_index: None,
@@ -3794,7 +3812,7 @@ mod tests {
             "re-encode needs a -b:v cap"
         );
         assert!(matches!(
-            opts.audio,
+            opts.audio_codec(),
             Some(pharos_transcode::SegmentAudio::Aac)
         ));
         assert!(matches!(
@@ -3956,14 +3974,14 @@ mod tests {
             fmp4_segment_opts(&state, &req, &item, 0, SegmentVideo::H264, Some(1), None).await;
         assert_eq!(opts.container, SegmentContainer::Fmp4);
         assert_eq!(opts.video, Some(SegmentVideo::H264));
-        assert_eq!(opts.audio, None, "video segment must be audio-free");
+        assert_eq!(opts.audio_codec(), None, "video segment must be audio-free");
         assert_eq!(opts.audio_source_stream_index, None);
 
         // A DIFFERENT audio index yields identical audio-affecting fields, so the
         // segment cache key is audio-independent.
         let opts2 =
             fmp4_segment_opts(&state, &req, &item, 0, SegmentVideo::H264, Some(2), None).await;
-        assert_eq!(opts2.audio, None);
+        assert_eq!(opts2.audio_codec(), None);
         assert_eq!(opts2.audio_source_stream_index, None);
         assert_eq!(opts.video_bitrate_bps, opts2.video_bitrate_bps);
     }

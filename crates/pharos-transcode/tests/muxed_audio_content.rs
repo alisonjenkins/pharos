@@ -33,8 +33,8 @@ use std::process::Command;
 
 use pharos_core::time::TICKS_PER_SECOND;
 use pharos_transcode::{
-    ffmpeg_transcode_args, protocol::DeviceId, MuxedAudio, SegmentAudio, SegmentContainer,
-    SegmentOpts, SegmentVideo,
+    ffmpeg_transcode_args, protocol::DeviceId, AudioDelivery, ContinuousAudio, MuxedAudio,
+    SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
 };
 
 const FPS_MILLE: u32 = 23_976;
@@ -141,9 +141,13 @@ fn encode_segment(src: &Path, audio: &MuxedAudio, dir: &Path, seg: u32) -> PathB
     let opts = SegmentOpts {
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
-        audio: Some(SegmentAudio::Aac),
+        audio: AudioDelivery::Muxed(ContinuousAudio {
+            codec: SegmentAudio::Aac,
+
+            bitrate_bps: Some(128_000),
+        }),
+
         video_bitrate_bps: Some(2_000_000),
-        audio_bitrate_bps: Some(128_000),
         start_position_ticks: (start * TICKS_PER_SECOND as f64) as u64,
         duration_ticks: Some((dur * TICKS_PER_SECOND as f64) as u64),
         audio_source_stream_index: None,

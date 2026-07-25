@@ -36,7 +36,9 @@ pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, Wavefo
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
 pub use options::{AudioCodec, Container, MuxedAudio, TranscodeOptions, VideoCodec};
-pub use segment::{SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo};
+pub use segment::{
+    AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
+};
 
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
