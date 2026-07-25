@@ -296,6 +296,13 @@ struct JobCtx {
     /// snapshot attribute each device's occupancy to the jobs holding it,
     /// instead of reporting a bare count with nothing behind it.
     device: Option<DeviceId>,
+    /// The job's own span, opened at dispatch (when the device — and so the
+    /// decode path — is finally known) and carried here so the completion
+    /// arm, which runs in the ACTOR and not inside the job's task, can still
+    /// record the outcome on it. Every event the job emits, and every trace
+    /// exported to Tempo, carries the placement facts as a result: a wedged
+    /// segment can be read without joining three log lines by job id.
+    span: tracing::Span,
 }
 
 struct SchedState {
@@ -453,6 +460,8 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 dispatched: None,
                 class,
                 device: None,
+                // Replaced at dispatch, once the device is known.
+                span: tracing::Span::none(),
             };
             place(state, job_id, ctx, self_tx);
         }
@@ -576,16 +585,26 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         .dispatched
                         .map(|d| now.saturating_duration_since(d).as_millis() as u64)
                         .unwrap_or(0);
-                    tracing::info!(
-                        %job_id,
-                        %device,
-                        out_bytes,
-                        class = %ctx.class,
-                        queue_wait_ms = queue_ms,
-                        encode_ms,
-                        retries = ctx.retries,
-                        "transcode job done"
-                    );
+                    // Close the loop on the span opened at dispatch, so the
+                    // trace carries the outcome next to the placement that
+                    // produced it rather than in a separate line to be joined
+                    // by job id.
+                    ctx.span.record("queue_wait_ms", queue_ms);
+                    ctx.span.record("encode_ms", encode_ms);
+                    ctx.span.record("out_bytes", out_bytes);
+                    ctx.span.record("outcome", "done");
+                    ctx.span.in_scope(|| {
+                        tracing::info!(
+                            %job_id,
+                            %device,
+                            out_bytes,
+                            class = %ctx.class,
+                            queue_wait_ms = queue_ms,
+                            encode_ms,
+                            retries = ctx.retries,
+                            "transcode job done"
+                        );
+                    });
                     let _ = ctx.reply.send(Ok(JobDone {
                         device,
                         out_bytes,
@@ -594,7 +613,14 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     }));
                 }
                 WorkerRunResult::Failed(err) if !err.is_transient() => {
-                    tracing::warn!(%job_id, %device, error = %err, "transcode job failed (non-recoverable)");
+                    // Symmetry: whatever the success path records, the failure
+                    // path records too. A span that only ever carries an
+                    // outcome when the job succeeded is the shape that hides
+                    // outages.
+                    ctx.span.record("outcome", "failed");
+                    ctx.span.in_scope(|| {
+                        tracing::warn!(%job_id, %device, error = %err, "transcode job failed (non-recoverable)");
+                    });
                     let _ = ctx.reply.send(Err(SchedError::Failed(err)));
                 }
                 WorkerRunResult::Failed(err) => {
@@ -609,6 +635,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                             .set_cooldown(device, Instant::now() + state.cfg.cooldown);
                         ctx.excluded.push(device);
                     }
+                    ctx.span.record("outcome", "transient_retry");
                     ctx.retries += 1;
                     ctx.last_error = Some(err);
                     retry_or_fail(state, job_id, ctx, self_tx);
@@ -617,7 +644,10 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     // Worker death is not the device's fault — don't cool
                     // the device, but count the retry and re-place. A
                     // fresh worker is spawned on the next dispatch.
-                    tracing::warn!(%job_id, %device, "transcode worker died mid-job; retrying");
+                    ctx.span.record("outcome", "worker_died");
+                    ctx.span.in_scope(|| {
+                        tracing::warn!(%job_id, %device, "transcode worker died mid-job; retrying");
+                    });
                     ctx.retries += 1;
                     ctx.last_error = Some(WorkerError::Other("worker died".into()));
                     retry_or_fail(state, job_id, ctx, self_tx);
@@ -759,6 +789,72 @@ fn warn_if_long_wait(
     );
 }
 
+/// Open the job's span and record where it was placed — including whether its
+/// SOURCE DECODE landed on the GPU.
+///
+/// Both dispatch paths (first attempt and a queued job draining onto a freed
+/// permit) go through here, so a job that waited is described exactly like one
+/// that did not.
+///
+/// The decode verdict comes from the same [`crate::DecodeAccel`] the argv
+/// builder emits `-hwaccel` from, so what the dashboard reports and what
+/// ffmpeg is told are one decision. Before this, the only thing recorded was
+/// the DEVICE — and a job on `Nvenc:0` may still decode every frame in
+/// software, which is indistinguishable in a log that names the device alone.
+///
+/// At INFO because that is the level the deployment runs at. The line naming
+/// the winning device sat at DEBUG while prod placed 60% of its segments on
+/// the CPU, so the record that would have said so was never emitted.
+fn record_placement(
+    job_id: JobId,
+    dev: DeviceId,
+    ctx: &JobCtx,
+    candidates: &[DeviceId],
+) -> tracing::Span {
+    let decode = crate::DecodeAccel::of(&ctx.opts, dev);
+    // `queue_wait_ms`/`encode_ms`/`out_bytes`/`outcome` are declared empty and
+    // recorded when the job finishes, so one span carries the whole life of a
+    // segment: what it was, where it went, how long it waited, how it ended.
+    let span = tracing::info_span!(
+        "transcode_job",
+        job_id = %job_id,
+        device = %dev,
+        class = %ctx.class,
+        decode_accel = %decode,
+        decode_on_gpu = decode.is_gpu(),
+        video = ?ctx.opts.video,
+        audio = ?ctx.opts.audio,
+        container = ?ctx.opts.container,
+        seek_secs = ctx.opts.start_position_ticks as f64 / 10_000_000.0,
+        dur_secs = ctx.opts.duration_ticks.map(|t| t as f64 / 10_000_000.0),
+        retries = ctx.retries,
+        queue_wait_ms = tracing::field::Empty,
+        encode_ms = tracing::field::Empty,
+        out_bytes = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        input = %ctx.input.display(),
+    );
+    // Which device won and what it beat. A deployment silently serving
+    // everything from the CPU — because the GPU is in cooldown or was excluded
+    // by an earlier transient failure — is indistinguishable from one with no
+    // GPU at all unless the losing candidates are named alongside the winner.
+    span.in_scope(|| {
+        tracing::info!(
+            candidates = ?candidates,
+            excluded = ?ctx.excluded,
+            "transcode dispatch"
+        );
+    });
+    metrics::counter!(
+        "pharos_transcode_decode_accel_total",
+        "verdict" => decode.label(),
+        "device" => dev.to_string(),
+        "class" => ctx.class.label(),
+    )
+    .increment(1);
+    span
+}
+
 /// Try to dispatch `ctx` to its best eligible device; queue if all
 /// permits are busy; fail if no device can ever take it.
 fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc::Sender<SchedMsg>) {
@@ -825,19 +921,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             continue;
         };
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
-            // Which device won, and what it beat. A deployment silently
-            // serving everything from the CPU — because the GPU is in cooldown
-            // or was excluded by an earlier transient failure — is
-            // indistinguishable from one with no GPU at all unless the losing
-            // candidates are named alongside the winner.
-            tracing::debug!(
-                %job_id,
-                device = %dev,
-                class = %ctx.class,
-                candidates = ?candidates,
-                excluded = ?ctx.excluded,
-                "transcode job placed"
-            );
+            let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
@@ -849,9 +933,13 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 sink: to_output_sink(&ctx.sink),
             };
             let dispatched_at = Instant::now();
-            warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at);
+            // The long-wait warning belongs INSIDE the span: the queue
+            // composition it reports is only actionable beside what the job
+            // was and where it landed.
+            span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
             ctx.device = Some(dev);
+            ctx.span = span.clone();
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
                 state.spawner.clone(),
@@ -861,6 +949,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 spec,
                 dev,
                 self_tx.clone(),
+                span,
             );
             return;
         }
@@ -931,6 +1020,7 @@ fn try_place_no_queue(
             continue;
         };
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
+            let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
@@ -942,9 +1032,13 @@ fn try_place_no_queue(
                 sink: to_output_sink(&ctx.sink),
             };
             let dispatched_at = Instant::now();
-            warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at);
+            // The long-wait warning belongs INSIDE the span: the queue
+            // composition it reports is only actionable beside what the job
+            // was and where it landed.
+            span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
             ctx.device = Some(dev);
+            ctx.span = span.clone();
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
                 state.spawner.clone(),
@@ -954,6 +1048,7 @@ fn try_place_no_queue(
                 spec,
                 dev,
                 self_tx.clone(),
+                span,
             );
             return;
         }
@@ -986,9 +1081,13 @@ fn spawn_run_task(
     spec: JobSpec,
     device: DeviceId,
     self_tx: mpsc::Sender<SchedMsg>,
+    // The job's span, so a worker-spawn failure or a mid-job death is
+    // reported with the placement facts attached rather than a bare job id.
+    span: tracing::Span,
 ) {
     let job_id = spec.job_id;
     tokio::spawn(async move {
+        let _guard = span.enter();
         let worker = match worker {
             Some(w) => w,
             None => match spawner.spawn(worker_id).await {
@@ -1303,6 +1402,129 @@ mod tests {
             .unwrap();
         assert_ne!(done.device, DeviceId::hw(HwAccel::Nvenc, 0));
         assert_eq!(done.out_bytes, 7);
+    }
+
+    /// Collects the fields of every event, so a test can assert what the
+    /// deployment would actually be able to read.
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for EventCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit(String);
+            impl tracing::field::Visit for Visit {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!(" {}={:?}", f.name(), v));
+                }
+            }
+            let mut v = Visit(String::new());
+            event.record(&mut v);
+            // Span fields are the point of the exercise: an event is only as
+            // debuggable as the span it was emitted inside.
+            let mut fields = v.0;
+            if let Some(scope) = ctx.event_scope(event) {
+                for span in scope {
+                    if let Some(f) = span
+                        .extensions()
+                        .get::<tracing_subscriber::fmt::FormattedFields<
+                            tracing_subscriber::fmt::format::DefaultFields,
+                        >>()
+                    {
+                        fields.push_str(&format!(" [{}: {}]", span.name(), f.fields));
+                    }
+                }
+            }
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.metadata().name().to_string(), fields));
+        }
+    }
+
+    /// The placement record is a contract, not a convenience: it is the ONLY
+    /// thing that can answer "is this deployment decoding on the GPU?".
+    ///
+    /// A production incident turned on exactly this gap — 60% of segments were
+    /// placed on the CPU while the line naming the winning device sat at
+    /// DEBUG, so the deployment's own logs could not distinguish a working GPU
+    /// from an idle one. Asserting the fields (not just that something was
+    /// logged) is what makes a later refactor unable to quietly drop them.
+    #[tokio::test]
+    async fn a_dispatch_records_its_device_and_whether_decode_is_on_the_gpu() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let cap = EventCapture::default();
+        // INFO, because that is what the deployment runs at. Without this
+        // filter the test would pass with the record at DEBUG — which is
+        // precisely the state that made a production incident undiagnosable,
+        // so a subscriber that captures every level would assert nothing.
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            // `with_ansi(false)`: the fmt layer is only here to populate the
+            // span's `FormattedFields`, and styled output would interleave
+            // escape codes between the field names being asserted.
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::io::sink),
+            )
+            .with(cap.clone());
+
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 7,
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        {
+            let _g = tracing::subscriber::set_default(subscriber);
+            s.submit(
+                PathBuf::from("/m/x.mkv"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
+            .unwrap();
+        }
+
+        let events = cap.0.lock().unwrap().clone();
+        let dispatch = events
+            .iter()
+            .find(|(_, fields)| fields.contains("transcode dispatch"))
+            .unwrap_or_else(|| {
+                panic!("no \"transcode dispatch\" event was recorded; events: {events:?}")
+            });
+        // The table's best device is the GPU, so this job decodes there — and
+        // the record must SAY so rather than leaving it to be inferred from
+        // the device name (a job on Nvenc:0 can still decode in software).
+        assert!(
+            dispatch.1.contains("decode_accel=gpu:cuda"),
+            "dispatch record must name the decode path, got: {}",
+            dispatch.1
+        );
+        assert!(
+            dispatch.1.contains("decode_on_gpu=true"),
+            "dispatch record must state whether decode was offloaded, got: {}",
+            dispatch.1
+        );
+        assert!(
+            dispatch.1.contains("device=Nvenc:0") && dispatch.1.contains("class=interactive"),
+            "dispatch record must carry device + class, got: {}",
+            dispatch.1
+        );
+        // Losing candidates: a CPU-only deployment and one whose GPU is in
+        // cooldown look identical without them.
+        assert!(
+            dispatch.1.contains("candidates="),
+            "dispatch record must name what the winner beat, got: {}",
+            dispatch.1
+        );
     }
 
     #[tokio::test]
