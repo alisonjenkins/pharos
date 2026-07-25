@@ -215,6 +215,16 @@ pub struct TranscodeOptions {
     /// font CONTENT, so index-named files are fine. `None` renders with
     /// system/default fonts. Only consulted on the TEXT/ASS-sidecar path.
     pub burn_fonts_dir: Option<std::path::PathBuf>,
+    /// Overrides [`crate::DECODE_PREROLL_SECONDS`] — how far before
+    /// `start_position_ticks` the decoder is seeded before the surplus is
+    /// trimmed back off. `None` takes the default.
+    ///
+    /// Raised on a re-attempt when a produced segment came back short of
+    /// frames: the container index claimed a random-access point the decoder
+    /// could not actually start from, and the default preroll did not reach
+    /// far enough back to find a real one.
+    #[serde(default)]
+    pub decode_preroll_seconds: Option<f64>,
 }
 
 impl TranscodeOptions {
@@ -252,6 +262,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -272,6 +283,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }

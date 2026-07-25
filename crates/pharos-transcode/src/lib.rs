@@ -397,6 +397,22 @@ fn hwaccel_to_device(h: HwAccel) -> crate::protocol::DeviceId {
 /// short are caught downstream rather than served.
 pub const DECODE_PREROLL_SECONDS: f64 = 15.0;
 
+/// The preroll used to re-attempt a segment that came back short of frames:
+/// the default did not reach a point the decoder could genuinely start from.
+/// Sized past the widest gap between real recovery points measured on the
+/// source that surfaced this (26.4 s).
+pub const DECODE_PREROLL_RETRY_SECONDS: f64 = 45.0;
+
+/// Where ffmpeg is told to write its machine-readable progress report for a
+/// file output — `frame=` and `out_time_us=`, which say how much the encoder
+/// actually produced. A decoder that silently drops frames still exits 0, so
+/// this is the only in-band signal that a segment came up short.
+pub fn progress_sidecar_path(output: &Path) -> PathBuf {
+    let mut s = output.as_os_str().to_os_string();
+    s.push(".progress");
+    PathBuf::from(s)
+}
+
 /// Build the ffmpeg argv for a transcode whose output goes to `output`
 /// (`"pipe:1"` for streaming, or a file path for the worker's
 /// `FileDirect` sink) on a concrete `device`. Exposed so the
@@ -411,35 +427,16 @@ pub fn ffmpeg_transcode_args(
     build_args_for_device(input, opts, device, output)
 }
 
-/// `ffmpeg_transcode_args` with an explicit decode preroll, for a retry
-/// after a produced segment was found to be short of frames.
-pub fn ffmpeg_transcode_args_with_preroll(
-    input: &str,
-    opts: &TranscodeOptions,
-    device: crate::protocol::DeviceId,
-    output: &str,
-    preroll_seconds: f64,
-) -> Vec<String> {
-    build_args_inner(input, opts, device, output, preroll_seconds)
-}
-
 fn build_args_for_device(
     input: &str,
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
     output: &str,
 ) -> Vec<String> {
-    build_args_inner(input, opts, device, output, DECODE_PREROLL_SECONDS)
-}
-
-fn build_args_inner(
-    input: &str,
-    opts: &TranscodeOptions,
-    device: crate::protocol::DeviceId,
-    output: &str,
-    preroll_seconds: f64,
-) -> Vec<String> {
     use crate::protocol::DeviceId;
+    let preroll_seconds = opts
+        .decode_preroll_seconds
+        .unwrap_or(DECODE_PREROLL_SECONDS);
     let hwaccel = device.hwaccel();
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
@@ -857,6 +854,18 @@ fn build_args_inner(
     // us a fresh `.tmp` path so clobbering is intended.
     if output != "pipe:1" {
         a.push("-y".into());
+        // Report what was actually produced. A decoder that cannot rebuild
+        // its reference list drops frames and ffmpeg still exits 0, so the
+        // exit status says nothing; `frame=` and `out_time_us=` in this
+        // sidecar are the only in-band evidence that a segment came up
+        // short. A file output has a stable name to hang it off; the
+        // streaming output owns stdout and gets no sidecar.
+        a.push("-progress".into());
+        a.push(
+            progress_sidecar_path(Path::new(output))
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     a.push(output.to_string());
     a
@@ -900,6 +909,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         }
     }
 
@@ -1024,6 +1034,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -1080,6 +1091,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -1113,6 +1125,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         let nvenc =
             build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.m4s")
@@ -1198,6 +1211,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -1222,6 +1236,7 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            decode_preroll_seconds: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");

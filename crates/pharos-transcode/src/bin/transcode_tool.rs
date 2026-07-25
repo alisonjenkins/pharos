@@ -166,6 +166,7 @@ fn tool_opts(out: &std::path::Path) -> pharos_transcode::options::TranscodeOptio
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
+        decode_preroll_seconds: None,
     }
 }
 
