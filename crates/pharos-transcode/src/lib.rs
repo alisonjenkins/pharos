@@ -140,6 +140,33 @@ impl TranscodeStream {
         }
     }
 
+    /// Reap the ffmpeg child and return its exit status.
+    ///
+    /// EOF on stdout is NOT success: a child that dies mid-encode — OOM-killed,
+    /// signalled, or exiting non-zero after a decode error — closes the pipe
+    /// exactly like one that finished, so a reader that stops at EOF cannot
+    /// tell a complete segment from a truncated one. A caller that persists the
+    /// bytes (the segment cache) must check this before treating the output as
+    /// a finished segment, or it caches a truncated file under a key it will
+    /// then serve forever.
+    ///
+    /// Call after draining stdout to EOF; the child has already exited or is
+    /// about to, so this does not block meaningfully.
+    pub async fn wait(self) -> std::io::Result<std::process::ExitStatus> {
+        let Self {
+            mut _kill_guard,
+            stdout,
+        } = self;
+        // Drop the read end first so the child is never blocked writing into a
+        // full pipe while we wait for it.
+        drop(stdout);
+        match _kill_guard.0.take() {
+            Some(mut child) => child.wait().await,
+            // Already reaped — nothing left to report.
+            None => Err(std::io::Error::other("transcode child already reaped")),
+        }
+    }
+
     /// Wrap stdout in a `ReaderStream` to feed HTTP frameworks that
     /// expect `Stream<Item = io::Result<Bytes>>`. The kill guard is
     /// moved into the stream so the subprocess outlives the consumer
@@ -299,9 +326,9 @@ fn push_video_filters(
             let mut chain: Vec<String> = Vec::new();
             match start_seconds {
                 Some(start) if start > 0.0 => {
-                    chain.push(format!("setpts=PTS+{start:.3}/TB"));
+                    chain.push(format!("setpts=PTS+{start:.6}/TB"));
                     chain.push(subtitles);
-                    chain.push(format!("setpts=PTS-{start:.3}/TB"));
+                    chain.push(format!("setpts=PTS-{start:.6}/TB"));
                 }
                 _ => chain.push(subtitles),
             }
@@ -415,16 +442,24 @@ fn build_args_for_device(
         a.push("-threads".into());
         a.push(sw_encode_threads().to_string());
     }
+    // Six decimals (microseconds), not three. A segment boundary is computed as
+    // an exact frame index and the segments are kept from dropping the boundary
+    // frame by a HALF-FRAME margin — 20.8 ms at 23.976 fps, but only 1.04 ms at
+    // 480 fps. Millisecond-quantising the seek and duration here threw away the
+    // frame-exact grid and spent up to 1 ms of that margin on rounding alone,
+    // which is most of it at high frame rates. Microseconds are far below any
+    // real frame duration, so the margin is now spent only on the thing it
+    // exists for.
     let start = opts.start_position_seconds();
     if let Some(pos) = start {
         a.push("-ss".into());
-        a.push(format!("{pos:.3}"));
+        a.push(format!("{pos:.6}"));
     }
     a.push("-i".into());
     a.push(input.to_string());
     if let Some(dur) = opts.duration_seconds() {
         a.push("-t".into());
-        a.push(format!("{dur:.3}"));
+        a.push(format!("{dur:.6}"));
     }
     // W1 — when the caller specifies an audio stream, route the video + the
     // chosen audio track explicitly. Map only the PRIMARY video (`0:v:0`), not
@@ -713,7 +748,7 @@ fn build_args_for_device(
             a.push("-avoid_negative_ts".into());
             a.push("disabled".into());
             a.push("-output_ts_offset".into());
-            a.push(format!("{:.3}", start.unwrap_or(0.0)));
+            a.push(format!("{:.6}", start.unwrap_or(0.0)));
         } else {
             a.push("+empty_moov+frag_keyframe+default_base_moof".into());
         }
@@ -739,7 +774,7 @@ fn build_args_for_device(
         a.push("0".into());
         if let Some(pos) = start {
             a.push("-output_ts_offset".into());
-            a.push(format!("{pos:.3}"));
+            a.push(format!("{pos:.6}"));
         }
     }
     // File-direct outputs are written by the worker; ffmpeg refuses to
@@ -1202,7 +1237,7 @@ mod tests {
         let joined = a.join(" ");
         assert!(
             joined.contains(
-                "-vf setpts=PTS+27.000/TB,subtitles=filename=/m/x.mkv:si=2,setpts=PTS-27.000/TB"
+                "-vf setpts=PTS+27.000000/TB,subtitles=filename=/m/x.mkv:si=2,setpts=PTS-27.000000/TB"
             ),
             "{joined}"
         );
@@ -1232,9 +1267,9 @@ mod tests {
         let joined = build_args("/m/whole-source.mkv", &o).join(" ");
         assert!(
             joined.contains(
-                "-vf setpts=PTS+27.000/TB,\
+                "-vf setpts=PTS+27.000000/TB,\
                  subtitles=filename=/cache/subs/x.ass:fontsdir=/cache/fonts/9,\
-                 setpts=PTS-27.000/TB"
+                 setpts=PTS-27.000000/TB"
             ),
             "{joined}"
         );
