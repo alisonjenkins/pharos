@@ -10,8 +10,8 @@ use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
         device_profile::{
-            negotiate, CodecCap, Decision, DeviceProfile, ServerCodecSupport, SourceMedia,
-            SubtitleProfileDto,
+            negotiate_explained, CodecCap, Decision, DeviceProfile, ServerCodecSupport,
+            SourceMedia, SubtitleProfileDto,
         },
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
@@ -2009,7 +2009,12 @@ async fn playback_info(
     // server encode capabilities (empty in tests → h264 fallback, matching the
     // old hardcode).
     let server_codecs = server_codec_support(&state.encode_capabilities);
-    let decision = negotiate(&profile, &source, &server_codecs);
+    let (decision, direct_play_block) = negotiate_explained(&profile, &source, &server_codecs);
+    // Which post-negotiation override (if any) replaced the negotiator's
+    // decision. These fire AFTER `negotiate` and can turn a DirectPlay into a
+    // transcode, so a log carrying only the negotiator's reason would name a
+    // cause that no longer applies.
+    let mut downgrade: Option<&'static str> = None;
     // Connection-aware transcode ceiling (Lace incident, 2026-07-16). A remote
     // client on jellyfin-web's "Auto" quality advertises an effectively-
     // unlimited MaxStreamingBitrate, so `negotiate` leaves the transcode
@@ -2118,6 +2123,7 @@ async fn playback_info(
         source_is_matroska,
         webm_relabel_playable,
     ) {
+        downgrade = Some("browser_matroska");
         Decision::Transcode {
             target_container: "ts".into(),
             target_video_codec: Some("h264".into()),
@@ -2182,6 +2188,7 @@ async fn playback_info(
     let decision =
         if subtitle_selection_forces_transcode(&decision, selected_sub, &profile.subtitle_profiles)
         {
+            downgrade = Some("subtitle_burn");
             Decision::Transcode {
                 target_container: "ts".into(),
                 target_video_codec: Some("h264".into()),
@@ -2405,17 +2412,60 @@ async fn playback_info(
         Some(_) => "other",
         None => "direct",
     };
+    // The decision itself, as a class — `route` describes the URL shape, not
+    // what the negotiator resolved, and a DirectPlay that got downgraded looks
+    // identical to a source that never qualified.
+    let decision_kind = match &decision {
+        Decision::DirectPlay => "direct_play",
+        Decision::AudioRemux { .. } => "audio_remux",
+        Decision::VideoRemux { .. } => "video_remux",
+        Decision::Transcode { .. } => "transcode",
+    };
+    let bitrate_cap = match &decision {
+        Decision::Transcode {
+            max_video_bitrate_bps,
+            ..
+        } => *max_video_bitrate_bps,
+        _ => None,
+    };
+    // Everything needed to answer "why did THIS client get THIS treatment for
+    // THIS file" from one line. Carries `play_session_id` because that is the
+    // key every downstream segment request repeats — without it, joining a
+    // failing segment back to the decision that produced it means matching on
+    // timestamps and hoping only one session was active.
     tracing::info!(
         media.id = id,
         user.name = %user.0.name,
+        play_session_id = %play_session_id,
         is_video,
         is_web_client,
         renditions = %renditions_param,
-        source_codec = source.video_codec.as_deref().unwrap_or("?"),
+        source.container = %source.container,
+        source.video_codec = source.video_codec.as_deref().unwrap_or("?"),
+        source.audio_codec = source.audio_codec.as_deref().unwrap_or("?"),
+        source.bitrate_bps = source.bitrate_bps,
+        decision = decision_kind,
+        // Why direct play was ruled out, from the negotiator itself: the check
+        // that rejected it and the value that failed. `downgrade` names an
+        // override that fired AFTER negotiation and replaced its verdict.
+        direct_play_block = direct_play_block.label(),
+        direct_play_block.detail = %direct_play_block,
+        downgrade = downgrade.unwrap_or("none"),
         negotiated_video_codec = negotiated_video_codec.as_deref().unwrap_or("-"),
+        bitrate_cap_bps = bitrate_cap,
         route,
-        "playbackinfo: codec decision"
+        "playbackinfo: playback decision"
     );
+    // The same verdict as a metric, so "how many sessions are transcoding, and
+    // for what reason" is a query rather than a log trawl. Label cardinality is
+    // bounded: 4 decisions × 7 block reasons × 3 downgrades.
+    metrics::counter!(
+        "pharos_playback_decision_total",
+        "decision" => decision_kind,
+        "direct_play_block" => direct_play_block.label(),
+        "downgrade" => downgrade.unwrap_or("none"),
+    )
+    .increment(1);
 
     // Register the negotiated Decision under this PlaySessionId. For a
     // transcode the HLS segment generator reads it back to honour the target
