@@ -106,7 +106,10 @@ async fn image_cache_extracts_primary_jpeg_from_real_video() {
     let cache_dir = td.path().join("cache");
     // Fixture is 3 s — seek to 1 s so ffmpeg can decode a frame.
     let cache = ImageCache::new(&cache_dir).with_seek_seconds(1);
-    let p = cache.primary(1, MediaKind::Movie, &fixture).await.unwrap();
+    let p = cache
+        .primary(1, MediaKind::Movie, &fixture, None)
+        .await
+        .unwrap();
     let bytes = tokio::fs::read(&p).await.unwrap();
     // JPEG SOI marker.
     assert_eq!(&bytes[..2], &[0xFF, 0xD8], "expected JPEG magic");
@@ -119,7 +122,7 @@ async fn image_cache_extracts_primary_jpeg_from_real_video() {
     // simpler check: it just resolves to the same path without
     // erroring (which it would on a missing ffmpeg).
     let p2 = cache
-        .primary(1, MediaKind::Movie, Path::new("/no/such/source"))
+        .primary(1, MediaKind::Movie, Path::new("/no/such/source"), None)
         .await
         .unwrap();
     assert_eq!(p, p2);
@@ -229,7 +232,7 @@ async fn image_cache_extracts_audio_cover_art() {
     let cache_dir = td.path().join("cache");
     let cache = ImageCache::new(&cache_dir);
     let p = cache
-        .primary(2, MediaKind::Audio, &fixture)
+        .primary(2, MediaKind::Audio, &fixture, None)
         .await
         .expect("audio cover extracts");
     let bytes = tokio::fs::read(&p).await.unwrap();
