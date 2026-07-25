@@ -171,6 +171,24 @@ impl AudioCodec {
     }
 }
 
+/// The title's one continuous audio encode, and where in the SOURCE its
+/// first sample sits.
+///
+/// The start is not decoration. `-ss` on an input is relative to that
+/// input's own start time, so seeking this file by an absolute source
+/// position lands at `start + position` — measured on ffmpeg 8.1 with a
+/// tone-marked fixture, a file spanning source 30..40 s served silence for
+/// `-ss 32` and the correct content for `-ss 2`. A segment therefore has to
+/// seek it by `position - start`, and cannot do that without knowing the
+/// start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MuxedAudio {
+    pub path: std::path::PathBuf,
+    /// Source position of this file's first sample. 0 for a whole-title
+    /// encode.
+    pub start_seconds: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodeOptions {
     pub container: Container,
@@ -240,7 +258,7 @@ pub struct TranscodeOptions {
     /// by different amounts and the audio would land offset from the video by
     /// the difference.
     #[serde(default)]
-    pub muxed_audio_source: Option<std::path::PathBuf>,
+    pub muxed_audio_source: Option<MuxedAudio>,
 }
 
 impl TranscodeOptions {

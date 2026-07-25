@@ -131,7 +131,7 @@ pub struct SegmentOpts {
     ///
     /// `None` alongside `audio: None` is the separate-rendition surface
     /// (fMP4), which carries no audio in the segment at all.
-    pub muxed_audio_source: Option<std::path::PathBuf>,
+    pub muxed_audio_source: Option<crate::options::MuxedAudio>,
 }
 
 impl SegmentOpts {
