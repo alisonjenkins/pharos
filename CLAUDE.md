@@ -13,7 +13,15 @@
   - `just test-changed [from=main]` — `cargo-guppy` enumerates packages touched vs `from`, then `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'` runs only the transitively-affected tests.
   - `just test` — full workspace (strips macOS Gatekeeper quarantine attr first).
   - `just test-thorough` — full workspace with `PROPTEST_CASES=512` for nightly / pre-release.
+  - `just test-postgres` — store suite against a real sandboxed postgres.
   - **Workflow**: iterate with `test-fast` / `test-changed` (blast-radius only) for tight loops; always run the full `just test` before a commit.
+  - **`just test` does NOT cover postgres.** The postgres arms skip themselves
+    when `PHAROS_TEST_POSTGRES_URL` is unset — they are the bulk of the
+    "N skipped" line — and sqlx does not check placeholder arity or column
+    names at compile time. So a broken query passes `cargo check --features
+    postgres` AND `just test`, then fails `nix flake check` in CI. After
+    touching any `sqlx::query*` string in `pharos-store-sqlx`, run
+    `just test-postgres`.
 - After a dep change in any crate's `Cargo.toml`, run `just hakari-regen` to
   refresh `workspace-hack` (CI's `just hakari-check` fails on a stale hack
   crate). The `nix build .#pharos` / `.#oci` jobs build via `buildRustPackage`
