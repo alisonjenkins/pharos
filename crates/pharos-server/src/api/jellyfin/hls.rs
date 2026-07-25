@@ -1771,7 +1771,11 @@ async fn vp9_audio_file(
     let bytes = cache
         .audio_hls_file(&dir, &name)
         .await
-        .map_err(|_| error::ErrorNotFound("audio segment not ready"))?;
+        // Carry the cache's give-up reason into the response body. A bare
+        // "audio segment not ready" made the Ghost in the Shell stall
+        // indistinguishable from a request past the end of the media, and
+        // reconstructing which of the three budgets expired took a code read.
+        .map_err(|e| error::ErrorNotFound(e.to_string()))?;
     let ctype = if name.ends_with(".mp4") {
         "video/mp4"
     } else {
