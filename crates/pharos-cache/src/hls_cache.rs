@@ -278,8 +278,8 @@ async fn read_progress(out: &Path) -> Option<(u64, f64)> {
 /// handful of frames would need the source frame rate here, which this layer
 /// has no honest way to know; the decode preroll is what prevents those, and
 /// `tests/segment_frame_completeness.rs` is what keeps it working.
-async fn short_of_frames(out: &Path, opts: &TranscodeOptions) -> Option<String> {
-    let (frames, out_time_secs) = read_progress(out).await?;
+fn short_of_frames(progress: Option<(u64, f64)>, opts: &TranscodeOptions) -> Option<String> {
+    let (frames, out_time_secs) = progress?;
     let encoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
     if encoding_video && frames == 0 {
         return Some("no video frames at all".to_string());
@@ -746,6 +746,11 @@ impl HlsSegmentCache {
         // it seeds the decoder much further back, past the point the container
         // index lied about.
         let mut shortfall = None;
+        // What ffmpeg reported the WINNING attempt produced: `(frames,
+        // out_time_secs)`. Kept past the retry loop so the success path can
+        // account for the frames rather than discarding the only evidence of
+        // what was actually encoded.
+        let mut reported: Option<(u64, f64)> = None;
         for attempt in 0..2 {
             if attempt == 1 {
                 attempt_opts.decode_preroll_seconds =
@@ -802,7 +807,12 @@ impl HlsSegmentCache {
                     return Err(e);
                 }
             };
-            shortfall = short_of_frames(&tmp, &attempt_opts).await;
+            // Read the `-progress` sidecar ONCE. It is consumed (deleted) on
+            // read, and what ffmpeg reported it produced is needed twice: for
+            // the gross completeness check here, and for the per-frame
+            // accounting on the success path below.
+            reported = read_progress(&tmp).await;
+            shortfall = short_of_frames(reported, &attempt_opts);
             match &shortfall {
                 None => break,
                 Some(why) => {
@@ -894,6 +904,18 @@ impl HlsSegmentCache {
         // Always known now that the window comes from the grid — it used to
         // be an Option because a caller could omit the duration.
         let seg_secs = opts.window.duration_seconds();
+        // What the segment was SUPPOSED to contain, and what ffmpeg says it
+        // did. The gross check above only rejects a segment that missed 10% of
+        // its duration — at 6 s that is 600 ms, ~14 frames, a plainly visible
+        // stutter that reads as a healthy segment. These fields make the
+        // difference queryable instead of invisible.
+        let expected_frames = opts.window.expected_frames();
+        let produced_frames = reported.map(|(f, _)| f);
+        let frame_deficit = match (expected_frames, produced_frames) {
+            // Only meaningful when this segment actually encodes video.
+            (Some(want), Some(got)) if opts.video.is_some() => Some(want as i64 - got as i64),
+            _ => None,
+        };
         tracing::info!(
             media.id = media_id,
             seg = seg_index,
@@ -908,8 +930,38 @@ impl HlsSegmentCache {
             burn_idx = opts.burn_subtitle_stream_index,
             audio_idx = opts.audio_source_stream_index,
             seek_secs,
+            expected_frames,
+            produced_frames,
+            frame_deficit,
+            produced_secs = reported.map(|(_, s)| s),
             "hls segment transcoded (cache miss)"
         );
+        // A segment short by even ONE frame is a visible hitch at its boundary,
+        // and it is cached — so it replays identically on every later view.
+        // Counted (bounded label: whether the source rate was known at all) and
+        // warned, because a fault that only shows as a missing field on an INFO
+        // line is a fault nobody queries for.
+        if let Some(deficit) = frame_deficit {
+            metrics::counter!(
+                "pharos_segment_frames_total",
+                "result" => if deficit > 0 { "short" } else { "complete" },
+            )
+            .increment(1);
+            if deficit > 0 {
+                tracing::warn!(
+                    media.id = media_id,
+                    seg = seg_index,
+                    expected_frames,
+                    produced_frames,
+                    deficit,
+                    seek_secs,
+                    seg_secs,
+                    device = timing.as_ref().map(|t| t.device.to_string()),
+                    "hls segment is short of the frames its window implies — \
+                     expect a hitch at this boundary"
+                );
+            }
+        }
         // A segment covering N seconds of content that takes >3×N to encode
         // is drowning (client consumes 1×; even prefetch can't hide a 3×
         // deficit for long). Surface it at WARN with every dimension needed
@@ -2052,7 +2104,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         write_progress(&out, 144, 6.006).await;
-        assert_eq!(short_of_frames(&out, &segment_transcode_opts()).await, None);
+        let got = read_progress(&out).await;
+        assert_eq!(short_of_frames(got, &segment_transcode_opts()), None);
     }
 
     #[tokio::test]
@@ -2064,8 +2117,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         write_progress(&out, 0, 6.006).await;
-        let why = short_of_frames(&out, &segment_transcode_opts())
-            .await
+        let got = read_progress(&out).await;
+        let why = short_of_frames(got, &segment_transcode_opts())
             .expect("a video segment with zero frames must be rejected");
         assert!(why.contains("no video frames"), "{why}");
     }
@@ -2079,7 +2132,8 @@ mod tests {
         let mut opts = segment_transcode_opts();
         opts.video = None;
         opts.video_bitrate_bps = None;
-        assert_eq!(short_of_frames(&out, &opts).await, None);
+        let got = read_progress(&out).await;
+        assert_eq!(short_of_frames(got, &opts), None);
     }
 
     #[tokio::test]
@@ -2087,8 +2141,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         write_progress(&out, 90, 3.5).await;
-        let why = short_of_frames(&out, &segment_transcode_opts())
-            .await
+        let got = read_progress(&out).await;
+        let why = short_of_frames(got, &segment_transcode_opts())
             .expect("a segment that stopped early must be rejected");
         assert!(why.contains("3.500") && why.contains("6.006"), "{why}");
     }
@@ -2100,7 +2154,8 @@ mod tests {
         // one — an outage, in exchange for no information.
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
-        assert_eq!(short_of_frames(&out, &segment_transcode_opts()).await, None);
+        let got = read_progress(&out).await;
+        assert_eq!(short_of_frames(got, &segment_transcode_opts()), None);
     }
 
     #[tokio::test]
@@ -2111,13 +2166,42 @@ mod tests {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         write_progress(&out, 144, 6.006).await;
-        let _ = short_of_frames(&out, &segment_transcode_opts()).await;
+        // The sidecar is consumed by the READ now, not by the check — the read
+        // moved out so its numbers can be reported as well as judged.
+        let _ = read_progress(&out).await;
         assert!(
             !tokio::fs::try_exists(progress_sidecar_path(&out))
                 .await
                 .unwrap(),
             "sidecar left behind"
         );
+    }
+
+    #[test]
+    fn a_segment_missing_frames_is_measurable_even_though_the_gross_check_passes() {
+        // The gap this instrumentation exists to close. `short_of_frames` only
+        // rejects a segment that missed 10% of its duration; a 6.006 s window
+        // that produced 5.9 s and 141 of its 144 frames sails through — and
+        // three missing frames at a boundary is a visible hitch, cached, so it
+        // replays on every later view.
+        let opts = segment_transcode_opts();
+        assert_eq!(
+            short_of_frames(Some((141, 5.9)), &opts),
+            None,
+            "the gross duration check cannot see a three-frame shortfall"
+        );
+
+        // The window CAN see it, because it kept the source frame rate.
+        let rate = pharos_core::FrameRate::from_mille(23_976);
+        let w = pharos_core::SegmentWindow::for_segment(1, rate, Some(1372.121));
+        let want = w.expected_frames().expect("rate known");
+        assert_eq!(want, 144);
+        assert_eq!(want as i64 - 141i64, 3, "deficit is measurable in frames");
+
+        // And an unprobed source yields no expectation at all rather than a
+        // guessed one, so it cannot manufacture a phantom deficit.
+        let unknown = pharos_core::SegmentWindow::for_segment(1, None, Some(1372.121));
+        assert_eq!(unknown.expected_frames(), None);
     }
 
     /// Build a `SegmentOpts` carrying just the identity-relevant fields.

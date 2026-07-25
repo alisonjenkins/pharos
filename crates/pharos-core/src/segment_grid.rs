@@ -234,6 +234,18 @@ mod tests {
 pub struct SegmentWindow {
     start_ticks: u64,
     duration_ticks: u64,
+    /// The frame rate this window was snapped to.
+    ///
+    /// Kept, not discarded, so a layer holding only the window can say how many
+    /// frames the window IMPLIES. Without it the segment completeness check had
+    /// no honest way to know the source rate, so it could only test the gross
+    /// "reached 90% of the requested duration" bound — which passes a segment
+    /// missing up to 600 ms of video, i.e. a plainly visible stutter.
+    ///
+    /// `default` for wire compatibility: this type crosses the worker IPC
+    /// boundary, and an older peer's payload simply carries no rate.
+    #[serde(default)]
+    rate: Option<crate::FrameRate>,
 }
 
 impl SegmentWindow {
@@ -282,7 +294,55 @@ impl SegmentWindow {
         Self {
             start_ticks: crate::time::Ticks::from_seconds(start).0,
             duration_ticks: crate::time::Ticks::from_seconds(dur).0,
+            rate,
         }
+    }
+
+    /// The frame rate this window was snapped to, when the source had a usable
+    /// one.
+    pub fn rate(self) -> Option<crate::FrameRate> {
+        self.rate
+    }
+
+    /// How many video frames this window implies, when the rate is known.
+    ///
+    /// Counts the frames whose presentation time falls in `[start, end)`, NOT
+    /// `duration * fps` — the latter drifts for long titles, which is the whole
+    /// reason `FrameRate` keeps the rational.
+    ///
+    /// Uses `ceil`, not `round`. The window's bounds carry the half-frame seek
+    /// bias, so both ends land on EXACTLY `n + 0.5` frames and `round` would be
+    /// deciding a frame's ownership on the last bit of a float. `ceil` asks the
+    /// question that actually matters — "the first frame at or after this
+    /// instant" — and is stable against that error either way.
+    ///
+    /// Segments therefore alternate 143/144 frames at 24000/1001, because the
+    /// grid is a 6.000 s nominal snapped to frames, not a 6.006 s stride. The
+    /// invariant is that adjacent windows TILE, not that each holds the same
+    /// count.
+    ///
+    /// `None` when the source rate is unknown, because a guessed expectation is
+    /// worse than none: it would make every segment of an unprobed source read
+    /// as short.
+    pub fn expected_frames(self) -> Option<u64> {
+        let rate = self.rate?;
+        let first = Self::first_frame_at_or_after(rate, self.start_seconds());
+        let end =
+            Self::first_frame_at_or_after(rate, self.start_seconds() + self.duration_seconds());
+        Some(end.saturating_sub(first))
+    }
+
+    /// Index of the first frame presented at or after `secs`.
+    fn first_frame_at_or_after(rate: crate::FrameRate, secs: f64) -> u64 {
+        if !secs.is_finite() || secs <= 0.0 {
+            return 0;
+        }
+        let (num, den) = rate.as_ratio();
+        let scaled = secs * f64::from(num) / f64::from(den);
+        if scaled >= u64::MAX as f64 {
+            return u64::MAX;
+        }
+        scaled.ceil() as u64
     }
 
     pub fn start_ticks(self) -> u64 {
@@ -306,6 +366,69 @@ impl SegmentWindow {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod window_tests {
     use super::*;
+
+    #[test]
+    fn a_window_knows_how_many_frames_it_implies() {
+        // The rate is what makes a shortfall measurable in FRAMES. Without it
+        // the completeness check can only ask whether the encoder reached 90%
+        // of the duration, which passes a segment missing ~14 frames at 23.976
+        // — a visible stutter that reads as a healthy segment.
+        let rate = FrameRate::from_mille(23_976);
+        let total = 1372.121;
+        let w = SegmentWindow::for_segment(3, rate, Some(total));
+        let want = w.expected_frames().expect("rate known → frames known");
+        // The grid is a 6.000 s nominal snapped to frames, not a 6.006 s
+        // stride, so segments alternate 143/144 at 24000/1001. Both are
+        // correct; what must hold is that they tile.
+        assert!(
+            (143..=144).contains(&want),
+            "window {:?} implied {want} frames",
+            (w.start_seconds(), w.duration_seconds())
+        );
+
+        // The real invariant: every window from 0..n covers a contiguous run of
+        // frames with none dropped and none repeated. A frame lost at a
+        // boundary IS the stutter, so this is the property worth asserting.
+        let mut next = SegmentWindow::for_segment(0, rate, Some(total))
+            .expected_frames()
+            .unwrap();
+        let mut cursor = SegmentWindow::for_segment(0, rate, Some(total));
+        // Compared in TICKS, not seconds: a window stores its bounds as ticks,
+        // so a start and its predecessor's end can differ by the last
+        // representable unit (100 ns — 400 000× shorter than a frame). That is
+        // the type's resolution, not a gap, and integers say so without float
+        // fuzz. The frame accounting below is what proves nothing falls in it.
+        for seg in 1..40u32 {
+            let w = SegmentWindow::for_segment(seg, rate, Some(total));
+            let prev_end = cursor.start_ticks() + cursor.duration_ticks();
+            assert!(
+                prev_end.abs_diff(w.start_ticks()) <= 1,
+                "segment {seg} does not abut its predecessor: {prev_end} vs {}",
+                w.start_ticks()
+            );
+            next += w.expected_frames().unwrap();
+            cursor = w;
+        }
+        // Frames accumulated across 40 tiled windows must equal the frames the
+        // whole span holds — the sum cannot hide a gap or an overlap.
+        let r = rate.expect("rate");
+        let span_end = cursor.start_seconds() + cursor.duration_seconds();
+        let total_frames = SegmentWindow::first_frame_at_or_after(r, span_end)
+            - SegmentWindow::first_frame_at_or_after(r, 0.0);
+        assert_eq!(
+            next, total_frames,
+            "tiled windows must account for every frame exactly once"
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_known_rate_implies_no_frame_count() {
+        // A guessed expectation is worse than none: it would make every segment
+        // of an unprobed source read as short.
+        let w = SegmentWindow::for_segment(3, None, Some(600.0));
+        assert_eq!(w.expected_frames(), None);
+        assert_eq!(w.rate(), None);
+    }
 
     #[test]
     fn the_final_segments_window_stops_at_the_end_of_the_media() {
