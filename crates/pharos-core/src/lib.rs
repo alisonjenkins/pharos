@@ -1579,6 +1579,11 @@ impl FrameRate {
     pub fn secs_of_frame(self, idx: u64) -> f64 {
         (idx as f64) * f64::from(self.den) / f64::from(self.num)
     }
+
+    /// Duration of one frame, in seconds.
+    pub fn frame_duration_secs(self) -> f64 {
+        f64::from(self.den) / f64::from(self.num)
+    }
 }
 
 /// Binary GCD for reducing a frame-rate rational. `gcd(n, 0) == n`.

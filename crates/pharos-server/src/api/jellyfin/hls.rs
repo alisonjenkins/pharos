@@ -2143,45 +2143,27 @@ fn segment_prefetch_ahead(hw_budget: Option<u32>) -> u32 {
     }
 }
 
-/// Frame-aligned start time (seconds) of segment `seg`: the nominal
-/// `seg * SEGMENT_SECONDS` boundary snapped to the nearest source video frame.
+/// Validate a source's `frame_rate_mille` into a usable [`pharos_core::FrameRate`].
 ///
-/// Why: each HLS segment is an INDEPENDENT transcode seeked to its boundary.
-/// When the source fps doesn't divide the segment length evenly (23.976 fps →
-/// 143.856 frames per 6 s), the nominal boundary lands mid-frame and the
-/// encoder snaps the video's first frame to the frame grid — so the video's
-/// real start walks off the audio's exact-seconds grid, a little more each
-/// segment. That accumulates into audible A/V desync over an episode
-/// (~6 ms/segment measured for 23.976 fps → >1 s across a 25-min title).
-/// Snapping BOTH tracks' seek + tfdt anchor to the SAME frame time locks them
-/// together (measured: a constant −preskip offset, zero accumulation).
-///
-/// This is the ONE place the untrusted `frame_rate_mille` scalar is turned into
-/// a validated [`FrameRate`]. Everything downstream of this choke point works
-/// in exact frames, so it cannot re-derive a subtly different grid — and an
-/// implausible scalar (the MPEG-TS 90 kHz container clock, which a probe with
-/// no `avg_frame_rate` falls back to) is rejected here instead of flattening
-/// the snap into a no-op.
-fn segment_start_secs(seg: u32, fps_mille: Option<u32>) -> f64 {
-    // ONE canonical frame-snap definition, shared with `seek::SegmentGrid` so
-    // the playlist EXTINF, each segment's `-ss`, the audio anchor and the
-    // SyncPlay prewarm provably read the same grid.
-    super::seek::frame_snapped_start(seg, source_frame_rate(fps_mille))
-}
-
-/// Validate a source's `frame_rate_mille` into a usable [`FrameRate`].
-/// `None` — no usable rate — means there is no frame grid to snap to; see
-/// [`segment_start_secs`].
+/// This is the ONE place the untrusted scalar is turned into a validated rate.
+/// Everything downstream works in exact frames, so it cannot re-derive a subtly
+/// different grid — and an implausible scalar (the MPEG-TS 90 kHz container
+/// clock, which a probe with no `avg_frame_rate` falls back to) is rejected
+/// here instead of flattening the frame snap into a no-op. `None` — no usable
+/// rate — means there is no frame grid to snap to.
 fn source_frame_rate(fps_mille: Option<u32>) -> Option<pharos_core::FrameRate> {
     fps_mille.and_then(pharos_core::FrameRate::from_mille)
 }
 
 /// The `(start, duration)` of segment `seg` in seconds, both frame-aligned so
-/// consecutive segments butt-join exactly (segment N ends where N+1 begins).
+/// consecutive segments butt-join exactly (segment N ends where N+1 begins),
+/// and each pulled back half a frame so a source frame sitting microseconds
+/// below a boundary cannot fall between two segments (see
+/// [`super::seek::segment_seek_bias`] — that gap silently dropped a frame at
+/// nearly every boundary). Playlist and encoder both read this, so they cannot
+/// describe different windows.
 fn segment_time_range(seg: u32, fps_mille: Option<u32>) -> (f64, f64) {
-    let start = segment_start_secs(seg, fps_mille);
-    let end = segment_start_secs(seg + 1, fps_mille);
-    (start, (end - start).max(0.001))
+    super::seek::segment_range(seg, source_frame_rate(fps_mille))
 }
 
 /// The segment indices to prefetch after serving `base_seg`: the next
@@ -2905,20 +2887,28 @@ mod tests {
         // walked off the real frame grid over a title (~7 ms by 2 h).
         for seg in (0..20u32).chain([100, 600, 1200]) {
             let (start, dur) = segment_time_range(seg, fps);
-            // Start is an exact multiple of the true frame duration.
-            let frames = start / frame;
-            assert!(
-                (frames - frames.round()).abs() < 1e-6,
-                "seg {seg} start {start} is not on a real frame boundary"
-            );
+            // The BOUNDARY this segment claims — i.e. the seek with its
+            // half-frame bias added back — is an exact multiple of the true
+            // frame duration. (Segment 0 clamps at 0 and so sits half a frame
+            // off the grid by construction.)
+            if seg > 0 {
+                let frames = (start + frame / 2.0) / frame;
+                assert!(
+                    (frames - frames.round()).abs() < 1e-6,
+                    "seg {seg} boundary {start} is not on a real frame boundary"
+                );
+            }
             // Duration is a WHOLE number of frames — the property that makes
             // segment N end exactly where N+1 begins, so the encoder never
-            // duplicates or drops the boundary frame.
-            let dur_frames = dur / frame;
-            assert!(
-                (dur_frames - dur_frames.round()).abs() < 1e-6,
-                "seg {seg} duration {dur} is not a whole number of frames"
-            );
+            // duplicates or drops the boundary frame. (Segment 0 is shorter by
+            // the half-frame bias, since it cannot seek before 0.)
+            if seg > 0 {
+                let dur_frames = dur / frame;
+                assert!(
+                    (dur_frames - dur_frames.round()).abs() < 1e-6,
+                    "seg {seg} duration {dur} is not a whole number of frames"
+                );
+            }
             // Duration stays within a frame of the nominal 6 s.
             assert!((dur - SEGMENT_SECONDS).abs() < 0.05, "seg {seg} dur {dur}");
             if seg < 20 {
@@ -2932,6 +2922,40 @@ mod tests {
         }
         // Unknown fps → exact nominal grid (no snapping possible).
         assert_eq!(segment_time_range(3, None), (18.0, 6.0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn segments_are_seeked_half_a_frame_early_so_no_frame_falls_between_them() {
+        // Measured against a real 23.976 fps HEVC source (Fringe S01E01): a
+        // frame sat at 12.011997, microseconds BELOW the 12.012000 boundary.
+        // Seeking segment N+1 to exactly the boundary excluded it (pts below
+        // the seek) while segment N's `-t` also excluded it (it fell on the
+        // cut) — the frame existed in neither segment and was dropped, giving a
+        // visible hitch at nearly every boundary. Encoding the real file
+        // confirmed it: 143 frames per segment with a one-frame gap at each
+        // join; with the bias, 144 and every join within 3 µs.
+        let fps = Some(23_976);
+        let frame = 1001.0 / 24_000.0;
+        // Segment 1 is seeked half a frame BEFORE its 6.006 boundary, so a
+        // frame sitting just under the boundary is still captured.
+        let (start1, _) = segment_time_range(1, fps);
+        assert!(
+            start1 < 6.006 && (6.006 - start1 - frame / 2.0).abs() < 1e-9,
+            "segment 1 must start half a frame before 6.006, got {start1}"
+        );
+        // Segment 0 clamps at 0 rather than seeking negative.
+        assert_eq!(segment_time_range(0, fps).0, 0.0);
+        // Crucially the segments still TILE: N ends exactly where N+1 starts,
+        // so biasing the seek cannot introduce a duplicated frame either.
+        let mut prev_end = 0.0_f64;
+        for seg in 0..40u32 {
+            let (start, dur) = segment_time_range(seg, fps);
+            assert!(
+                (start - prev_end).abs() < 1e-9,
+                "seg {seg} starts {start}, previous ended {prev_end}"
+            );
+            prev_end = start + dur;
+        }
     }
 
     #[::core::prelude::v1::test]
