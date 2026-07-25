@@ -2151,6 +2151,26 @@ async fn playback_info(
     // container's default), used by both the downgrade below and the
     // URL-forward predicate further down — one source of truth (Task 4/5).
     let selected_sub = resolve_selected_subtitle(explicit_subtitle_index, probe);
+    // Whether a client asked for "no subtitle" by sending -1 or by OMITTING
+    // the field is invisible in the access log — PlaybackInfo carries it in
+    // the body — and the two mean opposite things here: -1 resolves to no
+    // subtitle, while an absent field falls back to the container's
+    // default-disposition track. For an image subtitle that fallback is a
+    // burn, which cannot then be turned off client-side, so a client that
+    // omits the field instead of sending -1 can never remove its subtitles.
+    // Log what actually arrived so that distinction is answerable from a
+    // single reproduction.
+    tracing::info!(
+        media.id = item.id,
+        subtitle.requested = ?explicit_subtitle_index,
+        subtitle.resolved = ?selected_sub.map(|t| t.stream_index),
+        subtitle.codec = ?selected_sub.and_then(|t| t.codec.as_deref()),
+        subtitle.delivery = ?selected_sub.map(|t| decide_subtitle_delivery(
+            t.codec.as_deref(),
+            &profile.subtitle_profiles
+        )),
+        "playbackinfo subtitle selection"
+    );
 
     // No-gap fix: a client that would DIRECT-PLAY the file but selects (or
     // defaults to) a subtitle it can't render externally has no video stream
