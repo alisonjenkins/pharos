@@ -102,9 +102,27 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     //
     // Registration order IS load-bearing between routes of the same segment
     // count: actix takes the first pattern that matches, so a literal segment
-    // only wins over a parameter if it is registered first. See the chapter
-    // route below.
+    // only wins over a parameter if it is registered first. Every `chapter`
+    // route below is therefore listed ahead of the `{image_type}` pattern of
+    // the same arity.
     cfg.route("/items/{id}/images", web::get().to(get_item_images))
+        // P32 — chapter thumbnails, BOTH client spellings, and both registered
+        // ahead of the `{image_type}` patterns of the same arity. `chapter` is
+        // not an `ImageRole`, so whichever generic route matches first answers
+        // `400 unknown image type` from a handler the request never reached.
+        // Dispatches to `ImageCache::chapter`, which seeks ffmpeg to the
+        // chapter's start_ms.
+        //
+        // jellyfin-web:            /images/chapter/{index}
+        // jellyfin-sdk-kotlin:     /images/chapter?imageIndex={index}
+        .route(
+            "/items/{id}/images/chapter",
+            web::get().to(get_chapter_image_by_query),
+        )
+        .route(
+            "/items/{id}/images/chapter/{image_index}",
+            web::get().to(get_chapter_image),
+        )
         .route("/items/{id}/images/{image_type}", web::get().to(get_image))
         .route(
             "/items/{id}/images/{image_type}",
@@ -117,17 +135,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route(
             "/items/{id}/images/{image_type}",
             web::delete().to(delete_image),
-        )
-        // P32 — chapter image thumbnails. MUST precede the generic
-        // `/{image_type}/{image_index}` route below: actix matches in
-        // REGISTRATION order, not by literal-beats-parameter specificity, so a
-        // generic route registered first swallows every `chapter` request and
-        // answers `400 unknown image type` (`chapter` is not an `ImageRole`).
-        // Dispatches to `ImageCache::chapter`, which seeks ffmpeg to the
-        // chapter's start_ms.
-        .route(
-            "/items/{id}/images/chapter/{image_index}",
-            web::get().to(get_chapter_image),
         )
         .route(
             "/items/{id}/images/{image_type}/{image_index}",
@@ -193,13 +200,35 @@ async fn get_item_images(
     Ok(crate::api::jellyfin::wire::json(&infos))
 }
 
+/// `GET /Items/{id}/Images/chapter?imageIndex=N` — the kotlin-SDK spelling of
+/// the chapter thumbnail, index in the query rather than the path.
+async fn get_chapter_image_by_query(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let idx = requested_image_index(req.query_string());
+    let id = path.into_inner();
+    serve_chapter_image(&state, &req, &id, idx).await
+}
+
 async fn get_chapter_image(
     state: web::Data<AppState>,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id_str, idx) = path.into_inner();
-    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
+    serve_chapter_image(&state, &req, &id_str, idx).await
+}
+
+/// One chapter-thumbnail implementation behind both URL spellings.
+async fn serve_chapter_image(
+    state: &AppState,
+    req: &HttpRequest,
+    id_str: &str,
+    idx: u32,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
@@ -220,7 +249,7 @@ async fn get_chapter_image(
         .map_err(|e| error::ErrorInternalServerError(format!("chapter image: {e}")))?;
     // B89 — chapter thumbs are the heaviest per-item image after B88 turned
     // them on; cache them client-side like every other artwork.
-    Ok(deliver_image(&path, "image/jpeg", false, if_none_match_of(&req)).await)
+    Ok(deliver_image(&path, "image/jpeg", false, if_none_match_of(req)).await)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,6 +1034,26 @@ fn requested_width(qs: &str) -> Option<u32> {
         }
     }
     width_kind.or(height_kind)
+}
+
+/// `imageIndex` from the query string.
+///
+/// The jellyfin-sdk-kotlin clients (Android / Google TV) address an indexed
+/// image as `/Images/{type}?imageIndex=N` where jellyfin-web uses
+/// `/Images/{type}/{N}`. Both are Jellyfin-legal; pharos only routed the path
+/// form, so every Android TV chapter thumbnail 400'd.
+fn requested_image_index(qs: &str) -> u32 {
+    for kv in qs.split('&') {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        if k.eq_ignore_ascii_case("imageIndex") {
+            if let Ok(n) = v.parse::<u32>() {
+                return n;
+            }
+        }
+    }
+    0
 }
 
 /// Cap a client-requested width by the role's sane maximum so a client asking
