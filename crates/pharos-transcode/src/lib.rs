@@ -35,7 +35,7 @@ pub use backend::SpawnBackend;
 pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, WaveformPoint};
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
-pub use options::{AudioCodec, Container, TranscodeOptions, VideoCodec};
+pub use options::{AudioCodec, Container, MuxedAudio, TranscodeOptions, VideoCodec};
 pub use segment::{SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo};
 
 use bytes::Bytes;
@@ -528,12 +528,23 @@ fn build_args_for_device(
     // seeked differently would put the audio out by the difference. It needs
     // no preroll of its own — nothing is decoded from it.
     if let Some(muxed) = &opts.muxed_audio_source {
-        if input_seek > 0.0 {
+        // RELATIVE to this file's own first sample, not the absolute source
+        // position. `-ss` on an input is measured from that input's start
+        // time, so seeking a continuous encode that begins at 1320 s by an
+        // absolute 1335 s lands at 2655 s — past the end for any seek
+        // session. The result is correct video with silence or an unrelated
+        // stretch of the title under it, which is what shipped.
+        //
+        // The cache guarantees the session starts at or before this point, so
+        // the clamp is a backstop, not a routine case: a negative value would
+        // mean the audio does not cover the segment at all.
+        let rel = (input_seek - muxed.start_seconds).max(0.0);
+        if rel > 0.0 {
             a.push("-ss".into());
-            a.push(format!("{input_seek:.6}"));
+            a.push(format!("{rel:.6}"));
         }
         a.push("-i".into());
-        a.push(muxed.to_string_lossy().into_owned());
+        a.push(muxed.path.to_string_lossy().into_owned());
     }
     if decode_trim > 0.0 {
         // OUTPUT-side `-ss`: decode and throw away, then re-base the kept

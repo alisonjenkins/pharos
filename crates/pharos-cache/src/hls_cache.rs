@@ -298,7 +298,14 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// encode instead of encoding it per segment. Every v6 segment carries audio
 /// on its own frame grid, phase-shifted against its neighbours' — the drift
 /// this fixes — so they must not be reused.
-const HLS_GEN_VERSION: u32 = 7;
+///
+/// v8: v7 segments took their muxed audio from the WRONG position. `-ss` on
+/// an input is relative to that input's own start time, so a segment seeking
+/// the continuous encode by an absolute source position landed at
+/// `session_start + position` — past the end for any seek session, so the
+/// audio was silence or an unrelated stretch of the title under correct
+/// video. Every v7 segment served from a seek session is poisoned.
+const HLS_GEN_VERSION: u32 = 8;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
@@ -1304,7 +1311,7 @@ impl HlsSegmentCache {
         audio_bitrate_bps: Option<u64>,
         want_start_secs: f64,
         want_end_secs: f64,
-    ) -> Result<PathBuf, HlsCacheError> {
+    ) -> Result<pharos_transcode::MuxedAudio, HlsCacheError> {
         let root = self.continuous_audio_root(media_id, audio_index, audio_bitrate_bps);
         let start_secs = Self::continuous_audio_session_start_secs(want_start_secs);
         // A whole-file session that has already got this far serves the
@@ -1319,12 +1326,22 @@ impl HlsSegmentCache {
                 .await
                 .is_some_and(|c| c >= want_end_secs)
             {
-                return Ok(dir.join("audio.ts"));
+                return Ok(pharos_transcode::MuxedAudio {
+                    path: dir.join("audio.ts"),
+                    start_seconds: candidate,
+                });
             }
         }
 
         let dir = Self::continuous_audio_session_dir(&root, start_secs);
         let file = dir.join("audio.ts");
+        // The session start travels WITH the path: a segment has to seek this
+        // file relative to its own first sample, and cannot do that from the
+        // path alone.
+        let produced = pharos_transcode::MuxedAudio {
+            path: file.clone(),
+            start_seconds: start_secs,
+        };
         let running = root.join(format!(".running-cont-{}", start_secs as u64));
         let lock = {
             let mut state = self.state.lock().await;
@@ -1391,14 +1408,14 @@ impl HlsSegmentCache {
                 .await
                 .is_some_and(|c| c >= want_end_secs)
             {
-                return Ok(file);
+                return Ok(produced);
             }
             // The encode finished without reaching the request: it ran out of
             // source. Whatever it wrote is final, so stop waiting for more.
             if !tokio::fs::try_exists(&running).await.unwrap_or(false)
                 && tokio::fs::try_exists(&file).await.unwrap_or(false)
             {
-                return Ok(file);
+                return Ok(produced);
             }
             tokio::time::sleep(std::time::Duration::from_millis(
                 Self::AUDIO_POLL_INTERVAL_MS,
