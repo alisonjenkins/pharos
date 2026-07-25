@@ -1732,9 +1732,20 @@ impl HlsSegmentCache {
     /// Give up this many polls (12 s) after the session has produced NOTHING at
     /// all — the ffmpeg failed to start or died before its first segment.
     const AUDIO_POLL_NO_PROGRESS: usize = 240;
-    /// Give up this many polls (3 s) after a session that WAS producing stops
+    /// Give up this many polls (10 s) after a session that WAS producing stops
     /// advancing — it finished (target genuinely absent) or wedged.
-    const AUDIO_POLL_STALL: usize = 60;
+    ///
+    /// This is an inter-segment interval, not a latency budget: a continuous
+    /// audio session emits one 6 s segment at a time, so at 2× realtime it
+    /// writes one every 3 s. The previous 3 s sat exactly on that cliff, and
+    /// any I/O contention pushed a HEALTHY session over it. Ghost in the Shell
+    /// (2026-07-25) did precisely that — the doubled video ladder saturated the
+    /// same NFS stream, the audio session fell below one segment per 3 s, and
+    /// the read declared a live session wedged, 404ing `a5.m4s` and `a48.m4s`
+    /// so hls.js stalled. A false 404 breaks playback; a slow 404 on a
+    /// genuinely-absent segment only costs latency, and the 30 s
+    /// `AUDIO_POLL_MAX` still bounds it.
+    const AUDIO_POLL_STALL: usize = 200;
 
     /// Read a produced audio-rendition file (`init.mp4`, `aN.m4s`, or
     /// `audio.m3u8`) from an [`ensure_audio_hls`](Self::ensure_audio_hls)
@@ -2904,6 +2915,24 @@ mod tests {
             SegmentIdentity::new(1, 7, Some(0), None, &opts),
             SegmentIdentity::new(1, 7, Some(1), None, &opts)
         );
+    }
+
+    #[test]
+    fn the_stall_budget_outlasts_a_realtime_audio_session() {
+        // The stall detector must never fire on a session that is merely SLOW.
+        // A continuous audio session emits one segment at a time, so at 1×
+        // realtime the gap between writes is one segment duration; the budget
+        // has to clear that with margin, or ordinary I/O contention reads as a
+        // wedge and 404s a live session.
+        let stall_ms = HlsSegmentCache::AUDIO_POLL_STALL as f64
+            * HlsSegmentCache::AUDIO_POLL_INTERVAL_MS as f64;
+        assert!(
+            stall_ms > pharos_core::segment_grid::SEGMENT_SECONDS * 1000.0,
+            "stall budget {stall_ms}ms must exceed one segment duration"
+        );
+        // And it must still leave the overall cap room for several windows, so
+        // a genuinely dead session fails inside 30 s rather than at it.
+        assert!(HlsSegmentCache::AUDIO_POLL_STALL * 2 < HlsSegmentCache::AUDIO_POLL_MAX);
     }
 
     #[test]
