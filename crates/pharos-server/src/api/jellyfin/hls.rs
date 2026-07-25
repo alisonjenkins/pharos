@@ -2155,12 +2155,25 @@ fn segment_prefetch_ahead(hw_budget: Option<u32>) -> u32 {
 /// (~6 ms/segment measured for 23.976 fps → >1 s across a 25-min title).
 /// Snapping BOTH tracks' seek + tfdt anchor to the SAME frame time locks them
 /// together (measured: a constant −preskip offset, zero accumulation).
-/// Falls back to the nominal grid when fps is unknown.
+///
+/// This is the ONE place the untrusted `frame_rate_mille` scalar is turned into
+/// a validated [`FrameRate`]. Everything downstream of this choke point works
+/// in exact frames, so it cannot re-derive a subtly different grid — and an
+/// implausible scalar (the MPEG-TS 90 kHz container clock, which a probe with
+/// no `avg_frame_rate` falls back to) is rejected here instead of flattening
+/// the snap into a no-op.
 fn segment_start_secs(seg: u32, fps_mille: Option<u32>) -> f64 {
     // ONE canonical frame-snap definition, shared with `seek::SegmentGrid` so
     // the playlist EXTINF, each segment's `-ss`, the audio anchor and the
     // SyncPlay prewarm provably read the same grid.
-    super::seek::frame_snapped_start(seg, fps_mille)
+    super::seek::frame_snapped_start(seg, source_frame_rate(fps_mille))
+}
+
+/// Validate a source's `frame_rate_mille` into a usable [`FrameRate`].
+/// `None` — no usable rate — means there is no frame grid to snap to; see
+/// [`segment_start_secs`].
+fn source_frame_rate(fps_mille: Option<u32>) -> Option<pharos_core::FrameRate> {
+    fps_mille.and_then(pharos_core::FrameRate::from_mille)
 }
 
 /// The `(start, duration)` of segment `seg` in seconds, both frame-aligned so
@@ -2884,26 +2897,64 @@ mod tests {
         // they snap to the frame grid — and consecutive segments must join
         // exactly (segment N end == segment N+1 start) with no gap/overlap.
         let fps = Some(23_976);
+        // The TRUE frame duration is 1001/24000 — not 1/23.976. Asserting
+        // against the decimal is what let a drifting grid look aligned.
+        let frame = 1001.0 / 24_000.0;
         let mut prev_end = 0.0_f64;
-        for seg in 0..20u32 {
+        // Deep indices too: the old decimal grid stayed plausible early on and
+        // walked off the real frame grid over a title (~7 ms by 2 h).
+        for seg in (0..20u32).chain([100, 600, 1200]) {
             let (start, dur) = segment_time_range(seg, fps);
-            // Butt-join: this segment starts where the previous ended.
-            assert!(
-                (start - prev_end).abs() < 1e-6,
-                "seg {seg} start {start} != prev end {prev_end}"
-            );
-            // Start is snapped to an exact frame boundary.
-            let frames = start * 23_976.0 / 1000.0;
+            // Start is an exact multiple of the true frame duration.
+            let frames = start / frame;
             assert!(
                 (frames - frames.round()).abs() < 1e-6,
-                "seg {seg} start {start} not on a frame boundary"
+                "seg {seg} start {start} is not on a real frame boundary"
+            );
+            // Duration is a WHOLE number of frames — the property that makes
+            // segment N end exactly where N+1 begins, so the encoder never
+            // duplicates or drops the boundary frame.
+            let dur_frames = dur / frame;
+            assert!(
+                (dur_frames - dur_frames.round()).abs() < 1e-6,
+                "seg {seg} duration {dur} is not a whole number of frames"
             );
             // Duration stays within a frame of the nominal 6 s.
             assert!((dur - SEGMENT_SECONDS).abs() < 0.05, "seg {seg} dur {dur}");
-            prev_end = start + dur;
+            if seg < 20 {
+                // Butt-join: this segment starts where the previous ended.
+                assert!(
+                    (start - prev_end).abs() < 1e-9,
+                    "seg {seg} start {start} != prev end {prev_end}"
+                );
+                prev_end = start + dur;
+            }
         }
         // Unknown fps → exact nominal grid (no snapping possible).
         assert_eq!(segment_time_range(3, None), (18.0, 6.0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn container_clock_is_not_mistaken_for_a_frame_rate() {
+        // A probe with no `avg_frame_rate` falls back to `r_frame_rate`, which
+        // for MPEG-TS is the 90 kHz container clock (frame_rate_mille =
+        // 90_000_000). Snapping to a "90 kHz frame grid" is a no-op, which
+        // silently reverted every boundary to the unsnapped nominal grid —
+        // measured at −6 ms per boundary plus a dropped frame when the error
+        // wrapped, i.e. continuous playback stutter. The rate must be rejected
+        // and fall back explicitly, identically to a genuinely absent rate.
+        for bogus in [90_000_000, 500_000, 0] {
+            assert_eq!(
+                segment_time_range(7, Some(bogus)),
+                segment_time_range(7, None),
+                "bogus fps {bogus} must not produce its own grid"
+            );
+        }
+        // A real rate still snaps (i.e. the guard rejects only nonsense).
+        assert_ne!(
+            segment_time_range(7, Some(23_976)),
+            segment_time_range(7, None)
+        );
     }
 
     #[::core::prelude::v1::test]

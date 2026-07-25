@@ -313,20 +313,32 @@ impl ResyncWitness {
 
 // ──────────────────────────── SegmentGrid ──────────────────────────────────
 
-/// Frame-snapped start time (seconds) of segment `seg`: nominal `seg*6` rounded
-/// to the nearest source-frame boundary. The SINGLE definition of the segment
-/// seek grid on the server — [`SegmentGrid`] and the HLS/VP9 segment handlers
-/// all snap to this, so the video segments, the audio-rendition anchor and the
-/// SyncPlay prewarm cannot compute independent grids that drift apart. Falls
-/// back to the nominal grid when fps is unknown.
-pub fn frame_snapped_start(seg: u32, fps_mille: Option<u32>) -> f64 {
+/// Frame-snapped start time (seconds) of segment `seg`: the nominal `seg*6`
+/// boundary moved onto the nearest real source frame. The SINGLE definition of
+/// the segment seek grid on the server — [`SegmentGrid`] and the HLS/VP9
+/// segment handlers all snap to this, so the video segments, the
+/// audio-rendition anchor and the SyncPlay prewarm cannot compute independent
+/// grids that drift apart.
+///
+/// The boundary is computed as a FRAME INDEX and converted back through
+/// [`FrameRate::secs_of_frame`], so consecutive boundaries differ by a whole
+/// number of frames *by construction*. That is the property that makes segment
+/// N end exactly where N+1 begins; computing the boundary as `round(t*fps)/fps`
+/// against a decimal fps instead leaves a sub-frame residue that the encoder
+/// resolves by duplicating or dropping the boundary frame — a per-segment
+/// stutter on every client.
+///
+/// `rate` is `None` only when the source has no usable frame rate (see
+/// [`FrameRate`], which rejects the MPEG-TS 90 kHz container clock rather than
+/// letting it masquerade as one). There is no frame grid to snap to in that
+/// case, so the nominal grid is the honest answer — callers that care log it,
+/// and the software encoders additionally receive `-enc_time_base` so the
+/// boundary frame is still placed exactly.
+pub fn frame_snapped_start(seg: u32, rate: Option<pharos_core::FrameRate>) -> f64 {
     let nominal = seg as f64 * SEGMENT_SECONDS;
-    match fps_mille {
-        Some(m) if m > 0 => {
-            let fps = m as f64 / 1000.0;
-            (nominal * fps).round() / fps
-        }
-        _ => nominal,
+    match rate {
+        Some(r) => r.secs_of_frame(r.frame_index_at(nominal)),
+        None => nominal,
     }
 }
 
@@ -352,19 +364,31 @@ impl SegmentIndex {
 pub struct SegmentGrid {
     count: u32,
     duration_secs: f64,
-    frame_rate_mille: Option<u32>,
+    /// Validated source frame rate; `None` when the source has none usable.
+    rate: Option<pharos_core::FrameRate>,
 }
 
 impl SegmentGrid {
-    /// Build from a title's duration and (optional) frame rate. `count` is
+    /// Build from a title's duration and the source's `frame_rate_mille`
+    /// scalar. The scalar is validated into a [`FrameRate`] here — an
+    /// implausible one (the MPEG-TS 90 kHz container clock) becomes `None`
+    /// rather than a rate that silently flattens the grid. `count` is
     /// `ceil(duration / 6)`, min 1 — the number of segments the VOD playlist
     /// enumerates.
     pub fn new(duration_secs: f64, frame_rate_mille: Option<u32>) -> Self {
+        Self::with_rate(
+            duration_secs,
+            frame_rate_mille.and_then(pharos_core::FrameRate::from_mille),
+        )
+    }
+
+    /// Build from an already-validated [`FrameRate`].
+    pub fn with_rate(duration_secs: f64, rate: Option<pharos_core::FrameRate>) -> Self {
         let count = ((duration_secs / SEGMENT_SECONDS).ceil() as u32).max(1);
         Self {
             count,
             duration_secs,
-            frame_rate_mille,
+            rate,
         }
     }
 
@@ -393,8 +417,8 @@ impl SegmentGrid {
     /// clamped by the remaining media. This is the single definition of a
     /// segment boundary; the audio rendition seeks to the same grid.
     pub fn frame_snapped_range(&self, idx: SegmentIndex) -> (f64, f64) {
-        let start = frame_snapped_start(idx.0, self.frame_rate_mille);
-        let next = frame_snapped_start(idx.0 + 1, self.frame_rate_mille);
+        let start = frame_snapped_start(idx.0, self.rate);
+        let next = frame_snapped_start(idx.0 + 1, self.rate);
         let remaining = (self.duration_secs - start).max(0.01);
         let dur = (next - start).min(remaining);
         (start, dur)
