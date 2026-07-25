@@ -1457,6 +1457,141 @@ impl SeriesInfo {
     }
 }
 
+/// An EXACT video frame rate, as the rational `num/den` the container
+/// actually declares (24000/1001, not 23.976).
+///
+/// ## Why this type exists (B-class: segment-boundary stutter)
+///
+/// HLS segments are independent transcodes seeked to their own boundary. For
+/// consecutive segments to butt-join without a duplicated or dropped frame,
+/// every boundary must land EXACTLY on a source frame, and consecutive
+/// boundaries must differ by a whole number of frames. Two properties are
+/// load-bearing there, and both were previously left to a bare `u32`
+/// frames-per-second×1000 scalar:
+///
+/// 1. **Exactness.** `frame_rate_mille = 23976` is a lossy decimal of the true
+///    24000/1001. Frame times computed from the decimal drift off the real
+///    frame grid (~7 ms across a 2 h title). Rational arithmetic does not.
+/// 2. **Plausibility.** A probe that cannot determine the rate falls back to
+///    the container clock — MPEG-TS reports `r_frame_rate = 90000/1`, i.e.
+///    `frame_rate_mille = 90_000_000`. Snapping to a "90 kHz frame grid" is a
+///    no-op, silently degrading every segment boundary back to the unsnapped
+///    grid: a measured −6 ms hitch per boundary plus a dropped frame whenever
+///    the error wraps — continuous playback stutter on every client.
+///
+/// [`FrameRate`] makes both unrepresentable: it is constructible only through
+/// validating constructors that reject a rate outside [`MIN_FPS`]..=[`MAX_FPS`],
+/// and it stores the exact rational, so `secs_of_frame` is drift-free. Code
+/// holding a `FrameRate` therefore holds a *usable* rate — "unknown" is the
+/// `Option::None` case the caller must handle explicitly, not a poisoned value
+/// that silently produces a broken grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameRate {
+    num: u32,
+    den: u32,
+}
+
+/// Slowest frame rate accepted as a real video rate. Below this a "rate" is a
+/// probe artefact, not something you can build a frame grid from.
+pub const MIN_FPS: f64 = 1.0;
+
+/// Fastest frame rate accepted as a real video rate. Comfortably above every
+/// real delivery format (600 fps high-speed capture is not a thing pharos
+/// serves) and far below the 90 kHz container clock that leaks in from
+/// MPEG-TS `r_frame_rate`.
+pub const MAX_FPS: f64 = 480.0;
+
+impl FrameRate {
+    /// Build from an exact rational. `None` when the rational is degenerate
+    /// (zero numerator/denominator) or implies an implausible rate — this is
+    /// the gate that keeps a 90000/1 container clock from becoming a frame
+    /// rate. Stored reduced so equal rates compare equal.
+    pub fn new(num: u32, den: u32) -> Option<Self> {
+        if num == 0 || den == 0 {
+            return None;
+        }
+        let fps = f64::from(num) / f64::from(den);
+        if !(MIN_FPS..=MAX_FPS).contains(&fps) {
+            return None;
+        }
+        let g = gcd_u32(num, den);
+        Some(Self {
+            num: num / g,
+            den: den / g,
+        })
+    }
+
+    /// Recover the exact rational from the legacy `fps × 1000` scalar.
+    ///
+    /// The NTSC-family rates are *defined* as `N000/1001` and round to a
+    /// repeating decimal, so they are mapped explicitly rather than
+    /// reconstructed from the lossy scalar; everything else is exactly
+    /// `mille/1000` reduced. Implausible scalars (the 90 kHz clock, a 500 fps
+    /// artefact) yield `None`, exactly as [`new`](Self::new) would.
+    pub fn from_mille(mille: u32) -> Option<Self> {
+        // NTSC pull-down family: the true rate is N000/1001, whose decimal is
+        // 23.976023…, 29.970029…, etc. Probes report the rounded scalar, so
+        // accept the near neighbours each one is reported as.
+        let ntsc = match mille {
+            23_970..=23_981 => Some((24_000, 1001)),
+            29_960..=29_975 => Some((30_000, 1001)),
+            47_940..=47_960 => Some((48_000, 1001)),
+            59_930..=59_945 => Some((60_000, 1001)),
+            119_870..=119_890 => Some((120_000, 1001)),
+            _ => None,
+        };
+        match ntsc {
+            Some((n, d)) => Self::new(n, d),
+            None => Self::new(mille, 1000),
+        }
+    }
+
+    /// The exact rational, reduced.
+    pub const fn as_ratio(self) -> (u32, u32) {
+        (self.num, self.den)
+    }
+
+    /// Frames per second as a float — for display and for the DTO boundary
+    /// only. Never use this to compute a frame boundary; that is what
+    /// [`secs_of_frame`](Self::secs_of_frame) is for.
+    pub fn fps(self) -> f64 {
+        f64::from(self.num) / f64::from(self.den)
+    }
+
+    /// Index of the frame nearest `secs`. Exact rational arithmetic in
+    /// `u128`, so it does not drift for long titles the way `secs * fps`
+    /// does. Negative/NaN inputs clamp to frame 0.
+    pub fn frame_index_at(self, secs: f64) -> u64 {
+        if !secs.is_finite() || secs <= 0.0 {
+            return 0;
+        }
+        // round(secs * num / den) without ever forming secs*fps.
+        let scaled = secs * f64::from(self.num) / f64::from(self.den);
+        if scaled >= u64::MAX as f64 {
+            return u64::MAX;
+        }
+        scaled.round() as u64
+    }
+
+    /// Exact presentation time of frame `idx`, in seconds. Consecutive frame
+    /// indices are therefore exactly one frame apart — the property the
+    /// segment grid relies on to butt-join without a dup/dropped frame.
+    pub fn secs_of_frame(self, idx: u64) -> f64 {
+        (idx as f64) * f64::from(self.den) / f64::from(self.num)
+    }
+}
+
+/// Binary GCD for reducing a frame-rate rational. `gcd(n, 0) == n`.
+const fn gcd_u32(a: u32, b: u32) -> u32 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
 /// Stream/format metadata pulled by `Prober::probe` (today: ffprobe).
 /// Persisted on `MediaItem` so the API surface (PlaybackInfo, BaseItemDto)
 /// reports real codec / container / size / runtime per file.
