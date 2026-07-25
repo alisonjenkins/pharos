@@ -2428,6 +2428,34 @@ async fn playback_info(
         } => *max_video_bitrate_bps,
         _ => None,
     };
+    // The containers this client declared it can direct-play, deduped in
+    // declaration order. A container decision is a comparison between two
+    // values, and logging only pharos's side made a mismatch unfalsifiable:
+    // B107 was a Matroska announced to the negotiator as `webm`, and no log
+    // said whether the client had ever claimed to accept `webm` — or `mkv`.
+    let client_direct_play_containers = {
+        let mut seen: Vec<&str> = Vec::new();
+        for p in &profile.direct_play_profiles {
+            if !p.kind.is_empty()
+                && !p
+                    .kind
+                    .eq_ignore_ascii_case(if is_video { "Video" } else { "Audio" })
+            {
+                continue;
+            }
+            for c in p
+                .container
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                if !seen.iter().any(|s| s.eq_ignore_ascii_case(c)) {
+                    seen.push(c);
+                }
+            }
+        }
+        seen.join(",")
+    };
     // Everything needed to answer "why did THIS client get THIS treatment for
     // THIS file" from one line. Carries `play_session_id` because that is the
     // key every downstream segment request repeats — without it, joining a
@@ -2441,6 +2469,12 @@ async fn playback_info(
         is_web_client,
         renditions = %renditions_param,
         source.container = %source.container,
+        // The RAW ffprobe alias list, beside the single token pharos derived
+        // from it. ffprobe names one demuxer for a whole family ("matroska,webm"
+        // for every .mkv AND every .webm), so the derived token is a CHOICE —
+        // and when that choice is wrong, only the pair shows it (B107).
+        source.container_probe = probe.container.as_deref().unwrap_or("?"),
+        client.direct_play_containers = %client_direct_play_containers,
         source.video_codec = source.video_codec.as_deref().unwrap_or("?"),
         source.audio_codec = source.audio_codec.as_deref().unwrap_or("?"),
         source.bitrate_bps = source.bitrate_bps,
