@@ -119,9 +119,41 @@ impl SegmentOutcome {
     }
 }
 
+/// Which KIND of failure ended a segment, as a bounded metric label.
+///
+/// `outcome="failed"` alone cannot distinguish "the source file vanished"
+/// (a storage incident — the mergerfs outage shape) from "ffmpeg rejected the
+/// encode" (a transcode bug). Those need opposite responses, and telling them
+/// apart used to mean reading the error string out of a log line that the
+/// failure path never wrote.
+fn failure_reason(err: &HlsCacheError) -> &'static str {
+    match err {
+        HlsCacheError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => "source_missing",
+        HlsCacheError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => "permission",
+        HlsCacheError::Io(_) => "io",
+        HlsCacheError::Transcode(_) => "transcode",
+        HlsCacheError::NonUtf8Path => "bad_path",
+    }
+}
+
 /// Count one segment production attempt.
 fn record_segment_outcome(outcome: SegmentOutcome) {
-    metrics::counter!("pharos_segment_produced_total", "outcome" => outcome.label()).increment(1);
+    metrics::counter!(
+        "pharos_segment_produced_total",
+        "outcome" => outcome.label(),
+        "reason" => "none",
+    )
+    .increment(1);
+}
+
+/// Count one FAILED segment, keeping the reason alongside the outcome.
+fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str) {
+    metrics::counter!(
+        "pharos_segment_produced_total",
+        "outcome" => outcome.label(),
+        "reason" => reason,
+    )
+    .increment(1);
 }
 
 /// What ffmpeg reported it actually produced, read from the `-progress`
@@ -632,7 +664,30 @@ impl HlsSegmentCache {
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
-                    record_segment_outcome(SegmentOutcome::Failed);
+                    // The success path below records twelve fields about a
+                    // segment that WORKED and this path recorded none about one
+                    // that did not: a failing segment reached the client as a
+                    // bare 500 with no media id, no burn index, no device and no
+                    // ffmpeg reason. That inversion is what made the
+                    // browser-playback outage a guess — the only evidence a
+                    // subtitle burn was failing was the proxy's 499s. Same
+                    // dimensions as the success line, at ERROR.
+                    tracing::error!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        attempt,
+                        reason = failure_reason(&e),
+                        error = %e,
+                        codec = codec_tag(opts.video, opts.audio, opts.container),
+                        burn = opts.burn_subtitle_stream_index.is_some(),
+                        burn_idx = opts.burn_subtitle_stream_index,
+                        audio_idx = opts.audio_source_stream_index,
+                        seek_secs = opts.start_position_ticks as f64 / 10_000_000.0,
+                        preroll_secs = attempt_opts.decode_preroll_seconds,
+                        source = %source.display(),
+                        "hls segment transcode failed"
+                    );
+                    record_segment_failure(SegmentOutcome::Failed, failure_reason(&e));
                     return Err(e);
                 }
             };
@@ -1701,6 +1756,26 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
+
+    /// A storage failure and an encode failure must not share a label — they
+    /// call for opposite responses (check the mount vs read the ffmpeg error),
+    /// and `outcome="failed"` alone cannot tell them apart.
+    #[test]
+    fn a_missing_source_is_labelled_apart_from_an_encode_failure() {
+        let missing = HlsCacheError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ));
+        let denied = HlsCacheError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        let encode = HlsCacheError::Transcode("ffmpeg exploded".into());
+        assert_eq!(failure_reason(&missing), "source_missing");
+        assert_eq!(failure_reason(&denied), "permission");
+        assert_eq!(failure_reason(&encode), "transcode");
+        assert_ne!(failure_reason(&missing), failure_reason(&encode));
+    }
 
     /// A 6.006 s video segment's options, matching the production grid.
     fn segment_transcode_opts() -> TranscodeOptions {
