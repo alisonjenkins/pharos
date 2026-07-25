@@ -1102,8 +1102,7 @@ async fn serve_segment(
         seg,
         opts.audio_source_stream_index,
         opts.burn_subtitle_stream_index,
-        opts.video_bitrate_bps,
-        opts.video.map(|c| c.ffmpeg_codec()).unwrap_or("none"),
+        &opts,
     );
 
     // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
@@ -1199,23 +1198,41 @@ async fn serve_segment(
         .streaming(stream.into_stream()))
 }
 
-/// P18 — stable weak-ETag string for a segment. Encodes every
-/// dimension that drives the disk-cache filename so mutating any of
-/// them produces a different ETag.
+/// P18 — stable weak-ETag string for a segment. Encodes every dimension that
+/// drives the disk-cache filename so mutating any of them produces a different
+/// ETag.
+///
+/// Takes the whole [`SegmentOpts`] rather than a hand-picked argument list: the
+/// list drifted from the cache key and dropped the AUDIO codec + bitrate, so
+/// the five rungs of an audio-only item's bitrate ladder — which differ in
+/// nothing else — all hashed to the same ETag and a client switching rungs got
+/// a `304 Not Modified` for bytes at the other bitrate. Reading the fields off
+/// one struct means a new byte-affecting option shows up here as a compile-time
+/// site to update, not a silent omission.
 fn segment_etag(
     media_id: u64,
     seg: u32,
     audio_idx: Option<u32>,
     sub_idx: Option<u32>,
-    bitrate: Option<u64>,
-    video_codec: &str,
+    opts: &SegmentOpts,
 ) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let key = format!(
-        "{media_id}-{seg}-{audio}-{sub}-{br}-{video_codec}",
+        "{media_id}-{seg}-{audio}-{sub}-{vbr}-{vcodec}-{abr}-{acodec}-{container:?}",
         audio = audio_idx.map_or_else(|| "d".to_string(), |n| n.to_string()),
         sub = sub_idx.map_or_else(|| "off".to_string(), |n| n.to_string()),
-        br = bitrate.map_or_else(|| "auto".to_string(), |b| b.to_string()),
+        vbr = opts
+            .video_bitrate_bps
+            .map_or_else(|| "auto".to_string(), |b| b.to_string()),
+        vcodec = opts.video.map(|c| c.ffmpeg_codec()).unwrap_or("none"),
+        abr = opts
+            .audio_bitrate_bps
+            .map_or_else(|| "auto".to_string(), |b| b.to_string()),
+        acodec = opts
+            .audio
+            .map(|c| pharos_transcode::AudioCodec::from(c).ffmpeg_codec())
+            .unwrap_or("none"),
+        container = opts.container,
     );
     let h = xxh3_64(key.as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("W/\"seg-{h:016x}\"")
