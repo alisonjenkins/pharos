@@ -163,16 +163,20 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        muxed_audio_source: Some(pharos_transcode::MuxedAudio {
-            path: cont_audio.to_path_buf(),
-            // Whole-title encode: its first sample IS the source's.
-            start_seconds: 0.0,
-        }),
     };
     let out = dir.join(format!("seg{seg}.ts"));
     let args = ffmpeg_transcode_args(
         src.to_str().unwrap(),
-        &opts.to_transcode_options(),
+        &opts
+            .resolve_with(|_| {
+                Ok::<_, ()>(pharos_transcode::MuxedAudio {
+                    path: cont_audio.to_path_buf(),
+                    // Whole-title encode: its first sample IS the source's.
+                    start_seconds: 0.0,
+                })
+            })
+            .expect("slice supplied")
+            .to_transcode_options(),
         DeviceId::Cpu,
         out.to_str().unwrap(),
     );

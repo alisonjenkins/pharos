@@ -1167,9 +1167,22 @@ async fn serve_segment(
     // Uncached live path. Prefer the load-balancing scheduler (spreads
     // across every GPU + CPU, crash-isolated worker) when available;
     // fall back to a direct inline ffmpeg otherwise.
+    //
+    // A MUXED segment copies its audio from the title's continuous encode, and
+    // producing that encode is the segment cache's job — this path has no cache
+    // by definition. So it cannot serve one, and says so. Silently lowering
+    // anyway is what shipped video-only segments to Google TV; an explicit 500
+    // naming the reason is the honest answer for a configuration that cannot
+    // satisfy the request.
+    let resolved = opts.clone().resolve_with(|_| {
+        Err(error::ErrorInternalServerError(
+            "muxed-audio segment needs the continuous audio encode, which only \
+             the HLS cache produces; configure a cache directory to serve this rung",
+        ))
+    })?;
     if let Some(sched) = state.transcode_scheduler.as_ref() {
         match sched
-            .submit_live(item.path.clone(), opts.to_transcode_options())
+            .submit_live(item.path.clone(), resolved.to_transcode_options())
             .await
         {
             Ok(stream) => {
@@ -1192,7 +1205,7 @@ async fn serve_segment(
 
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
-        .transcode(&item.path, &opts.to_transcode_options())
+        .transcode(&item.path, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok(HttpResponse::Ok()
@@ -1387,7 +1400,6 @@ fn build_segment_opts(
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
-                    muxed_audio_source: None,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1418,7 +1430,6 @@ fn build_segment_opts(
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
-                    muxed_audio_source: None,
                 };
             }
             _ => {}
@@ -1449,7 +1460,6 @@ fn build_segment_opts(
         burn_subtitle_is_text: subtitle_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        muxed_audio_source: None,
     }
 }
 
@@ -2764,7 +2774,6 @@ async fn fmp4_segment_opts(
         burn_subtitle_is_text: sub_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        muxed_audio_source: None,
     }
 }
 
@@ -2838,9 +2847,18 @@ async fn vp9_segment_raw(
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));
     }
+    // Same as the h264 live fallback: no cache means no continuous audio
+    // encode, so a muxed rung cannot be served here. (VP9 rungs are
+    // `AudioDelivery::Separate` in practice, so this resolves silently.)
+    let resolved = opts.clone().resolve_with(|_| {
+        Err(error::ErrorInternalServerError(
+            "muxed-audio segment needs the continuous audio encode, which only \
+             the HLS cache produces; configure a cache directory to serve this rung",
+        ))
+    })?;
     if let Some(sched) = state.transcode_scheduler.as_ref() {
         match sched
-            .submit_live(item.path.clone(), opts.to_transcode_options())
+            .submit_live(item.path.clone(), resolved.to_transcode_options())
             .await
         {
             Ok(stream) => return collect_stream(stream).await,
@@ -2851,7 +2869,7 @@ async fn vp9_segment_raw(
     }
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
-        .transcode(&item.path, &opts.to_transcode_options())
+        .transcode(&item.path, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     collect_stream(stream.into_stream()).await
