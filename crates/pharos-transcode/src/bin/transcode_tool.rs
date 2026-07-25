@@ -224,7 +224,7 @@ fn build_table(
 #[cfg(unix)]
 async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
     use pharos_transcode::hwaccel::detect_available;
-    use pharos_transcode::scheduler::{SchedConfig, SinkRequest, TranscodeScheduler};
+    use pharos_transcode::scheduler::{JobClass, SchedConfig, SinkRequest, TranscodeScheduler};
     use pharos_transcode::worker::{exec, ProcSpawner};
     use std::sync::Arc;
     use std::time::Instant;
@@ -243,6 +243,7 @@ async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
             SinkRequest::FileDirect {
                 out_path: output.clone(),
             },
+            JobClass::Interactive,
         )
         .await;
     let elapsed = t0.elapsed();
@@ -266,7 +267,7 @@ async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
 #[cfg(unix)]
 async fn stress(input: std::path::PathBuf, n: usize, saturate: bool) -> i32 {
     use pharos_transcode::hwaccel::detect_available;
-    use pharos_transcode::scheduler::{SchedConfig, SinkRequest, TranscodeScheduler};
+    use pharos_transcode::scheduler::{JobClass, SchedConfig, SinkRequest, TranscodeScheduler};
     use pharos_transcode::worker::{exec, ProcSpawner};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -297,7 +298,12 @@ async fn stress(input: std::path::PathBuf, n: usize, saturate: bool) -> i32 {
         let opts = tool_opts(&out);
         handles.push(tokio::spawn(async move {
             sched
-                .submit(input, opts, SinkRequest::FileDirect { out_path: out })
+                .submit(
+                    input,
+                    opts,
+                    SinkRequest::FileDirect { out_path: out },
+                    JobClass::Interactive,
+                )
                 .await
         }));
     }
@@ -357,7 +363,7 @@ async fn bench(input: std::path::PathBuf) -> i32 {
     use pharos_transcode::device::DeviceTable;
     use pharos_transcode::hwaccel::detect_available;
     use pharos_transcode::protocol::DeviceId;
-    use pharos_transcode::scheduler::{SchedConfig, SinkRequest, TranscodeScheduler};
+    use pharos_transcode::scheduler::{JobClass, SchedConfig, SinkRequest, TranscodeScheduler};
     use pharos_transcode::worker::{exec, ProcSpawner};
     use std::sync::Arc;
     use std::time::Instant;
@@ -389,6 +395,7 @@ async fn bench(input: std::path::PathBuf) -> i32 {
                 input.clone(),
                 opts,
                 SinkRequest::FileDirect { out_path: out },
+                JobClass::Interactive,
             )
             .await;
         let el = t0.elapsed().as_secs_f64();

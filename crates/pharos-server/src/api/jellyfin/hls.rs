@@ -19,6 +19,7 @@ use crate::{
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
+use pharos_transcode::scheduler::JobClass;
 use pharos_transcode::{
     AudioCodec, Container, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
     SegmentVideo, VideoCodec,
@@ -1146,6 +1147,7 @@ async fn serve_segment(
                 opts.burn_subtitle_stream_index,
                 &item.path,
                 &opts,
+                JobClass::Interactive,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
@@ -2285,6 +2287,7 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             o.burn_subtitle_stream_index,
                             &item.path,
                             &o,
+                            JobClass::Background,
                         )
                         .await;
                 });
@@ -2388,6 +2391,7 @@ pub(super) fn prewarm_cold_start(
                         opts.burn_subtitle_stream_index,
                         &item.path,
                         &opts,
+                        JobClass::Background,
                     )
                     .await
                 {
@@ -2457,6 +2461,7 @@ fn spawn_one_prefetch(
                 o.burn_subtitle_stream_index,
                 &item.path,
                 &o,
+                JobClass::Background,
             )
             .await
         {
@@ -2800,6 +2805,7 @@ async fn vp9_segment_raw(
                 opts.burn_subtitle_stream_index,
                 &item.path,
                 opts,
+                JobClass::Interactive,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));

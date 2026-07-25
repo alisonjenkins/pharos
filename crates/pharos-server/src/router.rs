@@ -24,6 +24,24 @@ async fn sample_scheduler(state: Option<&crate::state::AppState>) {
     };
     metrics::gauge!("pharos_transcode_pending_jobs").set(snap.pending as f64);
     metrics::gauge!("pharos_transcode_idle_workers").set(snap.idle_workers as f64);
+    // Who the queue is full of. `pending_jobs` says the queue is deep; only
+    // this says whether the depth is client requests (real overload — add
+    // capacity) or speculative warm-up sitting in front of them (a scheduling
+    // defect — the segment a browser is blocked on waits behind segments
+    // nobody asked for). The two look identical in every other signal.
+    metrics::gauge!("pharos_transcode_pending_by_class", "class" => "interactive")
+        .set(snap.pending_interactive as f64);
+    metrics::gauge!("pharos_transcode_pending_by_class", "class" => "background")
+        .set(snap.pending_background as f64);
+    // A deep queue that drains fast is healthy; a shallow one whose head has
+    // been waiting a minute is not. Depth alone cannot tell them apart.
+    metrics::gauge!("pharos_transcode_pending_oldest_seconds")
+        .set(snap.oldest_pending_ms.unwrap_or(0) as f64 / 1000.0);
+    metrics::gauge!("pharos_transcode_inflight_jobs").set(snap.inflight as f64);
+    // Live streams hold a device permit for as long as the client reads, and
+    // report no job completion — so they are occupancy with nothing to
+    // attribute it to. `in_use` minus inflight minus this is unexplained.
+    metrics::gauge!("pharos_transcode_live_streams").set(snap.live_streams as f64);
     for d in snap.devices {
         let device = d.id.to_string();
         metrics::gauge!("pharos_transcode_device_capacity", "device" => device.clone())
