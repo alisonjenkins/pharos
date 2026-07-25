@@ -131,7 +131,12 @@ jobs:
     name: jellyfin-web crawl
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
-    needs: [test]
+    # NO `needs: [test]`. This job builds what it needs through `just`, so
+    # nothing it does depends on the flake check having passed — waiting for
+    # it only serialised ~2m45s onto the end of every PR run (measured: the
+    # crawl is consistently the LAST job to finish, and is what sets the PR's
+    # total wall clock). `publish` still needs `test`, so a failing check
+    # cannot ship an image regardless of what this job does.
     steps:
       - uses: actions/checkout@v4
       - uses: alisonjenkins/setup-host-nix@v1
