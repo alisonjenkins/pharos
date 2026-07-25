@@ -559,6 +559,12 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             .last_error
             .clone()
             .unwrap_or(WorkerError::Other("no device left".into()));
+        tracing::warn!(
+            %job_id,
+            excluded = ?ctx.excluded,
+            error = %err,
+            "transcode job has no device left to try"
+        );
         let _ = ctx.reply.send(Err(SchedError::Failed(err)));
         return;
     }
@@ -568,6 +574,18 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             continue;
         };
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
+            // Which device won, and what it beat. A deployment silently
+            // serving everything from the CPU — because the GPU is in cooldown
+            // or was excluded by an earlier transient failure — is
+            // indistinguishable from one with no GPU at all unless the losing
+            // candidates are named alongside the winner.
+            tracing::debug!(
+                %job_id,
+                device = %dev,
+                candidates = ?candidates,
+                excluded = ?ctx.excluded,
+                "transcode job placed"
+            );
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
