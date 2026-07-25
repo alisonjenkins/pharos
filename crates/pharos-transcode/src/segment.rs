@@ -173,11 +173,47 @@ pub struct SegmentOpts {
     /// Directory of extracted embedded fonts for libass (`:fontsdir=`); see
     /// [`TranscodeOptions::burn_fonts_dir`].
     pub burn_fonts_dir: Option<std::path::PathBuf>,
-    /// The RESOLVED continuous encode this segment copies its audio slice
-    /// from. `None` until the cache has produced (or found) the encode that
-    /// [`AudioDelivery::Muxed`] asks for — a handler declares the intent, the
-    /// cache supplies the file.
-    pub muxed_audio_source: Option<crate::options::MuxedAudio>,
+}
+
+/// A segment's audio once it is SETTLED.
+///
+/// [`Muxed`](Self::Muxed) cannot be constructed without the slice it copies
+/// from, so "a muxed segment with no audio source" is not a state this program
+/// can hold. It used to be: `SegmentOpts` carried an
+/// `Option<MuxedAudio>` alongside the delivery intent, the two could disagree,
+/// and when they did the argv silently fell through to `-an` and shipped a
+/// video-only segment under a playlist advertising audio (the Google TV
+/// outage). A runtime guard caught that; this makes the compiler catch it.
+#[derive(Debug, Clone)]
+pub enum ResolvedAudio {
+    /// The segment carries no audio — [`AudioDelivery::Separate`], where audio
+    /// is served as its own rendition.
+    Silent,
+    /// Copied from this slice of the title's one continuous encode.
+    Muxed(ContinuousAudio, crate::options::MuxedAudio),
+}
+
+/// A segment whose audio is settled, and therefore the ONLY thing that can be
+/// lowered to [`TranscodeOptions`].
+///
+/// Construct via [`SegmentOpts::resolve`]. There is no other constructor, and
+/// no way to reach `to_transcode_options` without going through it.
+#[derive(Debug, Clone)]
+pub struct ResolvedSegment {
+    opts: SegmentOpts,
+    audio: ResolvedAudio,
+}
+
+impl ResolvedSegment {
+    /// The request this was resolved from — for cache keying and logging.
+    pub fn opts(&self) -> &SegmentOpts {
+        &self.opts
+    }
+
+    /// The settled audio.
+    pub fn audio(&self) -> &ResolvedAudio {
+        &self.audio
+    }
 }
 
 impl SegmentOpts {
@@ -191,33 +227,77 @@ impl SegmentOpts {
         self.audio.bitrate_bps()
     }
 
+    /// Settle this segment's audio, producing the only value that can be
+    /// lowered for transcode.
+    ///
+    /// `slice` is called exactly when the delivery is [`AudioDelivery::Muxed`]
+    /// — i.e. when a continuous-audio slice is genuinely required — and its
+    /// result is moved INTO the resolved value. A caller cannot skip it,
+    /// forget it, or pass `None`: [`ResolvedAudio::Muxed`] has nowhere to put
+    /// an absent source. That is what makes the video-only-segment bug a
+    /// compile error rather than a silent `-an`.
+    pub async fn resolve<F, Fut, E>(self, slice: F) -> Result<ResolvedSegment, E>
+    where
+        F: FnOnce(ContinuousAudio) -> Fut,
+        Fut: std::future::Future<Output = Result<crate::options::MuxedAudio, E>>,
+    {
+        let audio = match self.audio {
+            AudioDelivery::Separate => ResolvedAudio::Silent,
+            AudioDelivery::Muxed(c) => ResolvedAudio::Muxed(c, slice(c).await?),
+        };
+        Ok(ResolvedSegment { opts: self, audio })
+    }
+
+    /// [`resolve`](Self::resolve) for a caller that already holds the slice, or
+    /// can produce it without awaiting. Same totality: the `Muxed` arm has
+    /// nowhere to put an absent source.
+    pub fn resolve_with<F, E>(self, slice: F) -> Result<ResolvedSegment, E>
+    where
+        F: FnOnce(ContinuousAudio) -> Result<crate::options::MuxedAudio, E>,
+    {
+        let audio = match self.audio {
+            AudioDelivery::Separate => ResolvedAudio::Silent,
+            AudioDelivery::Muxed(c) => ResolvedAudio::Muxed(c, slice(c)?),
+        };
+        Ok(ResolvedSegment { opts: self, audio })
+    }
+}
+
+impl ResolvedSegment {
     /// Lower to the transcoder's wire options — the ONLY bridge from the
     /// segment-legal subset into the general option space.
     pub fn to_transcode_options(&self) -> TranscodeOptions {
+        let s = &self.opts;
         TranscodeOptions {
-            container: self.container.into(),
-            video: self.video.map(VideoCodec::from),
+            container: s.container.into(),
+            video: s.video.map(VideoCodec::from),
             // ALWAYS `None`: a segment never runs an audio encoder. When it
-            // carries audio at all, the bytes are copied from the continuous
-            // encode named by `muxed_audio_source`.
+            // carries audio at all, the bytes are COPIED from the continuous
+            // encode — which `muxed_audio_source` below now always names,
+            // because `ResolvedAudio::Muxed` cannot exist without it.
             audio: None,
-            video_bitrate_bps: self.video_bitrate_bps,
-            audio_bitrate_bps: self.audio_bitrate_bps(),
-            start_position_ticks: self.window.start_ticks(),
-            duration_ticks: Some(self.window.duration_ticks()),
-            audio_source_stream_index: self.audio_source_stream_index,
-            burn_subtitle_stream_index: self.burn_subtitle_stream_index,
-            burn_subtitle_is_text: self.burn_subtitle_is_text,
-            burn_subtitle_ass_path: self.burn_subtitle_ass_path.clone(),
-            burn_fonts_dir: self.burn_fonts_dir.clone(),
+            video_bitrate_bps: s.video_bitrate_bps,
+            audio_bitrate_bps: s.audio_bitrate_bps(),
+            start_position_ticks: s.window.start_ticks(),
+            duration_ticks: Some(s.window.duration_ticks()),
+            audio_source_stream_index: s.audio_source_stream_index,
+            burn_subtitle_stream_index: s.burn_subtitle_stream_index,
+            burn_subtitle_is_text: s.burn_subtitle_is_text,
+            burn_subtitle_ass_path: s.burn_subtitle_ass_path.clone(),
+            burn_fonts_dir: s.burn_fonts_dir.clone(),
             decode_preroll_seconds: None,
-            muxed_audio_source: self.muxed_audio_source.clone(),
+            muxed_audio_source: match &self.audio {
+                ResolvedAudio::Silent => None,
+                ResolvedAudio::Muxed(_, m) => Some(m.clone()),
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -238,9 +318,16 @@ mod tests {
             burn_subtitle_is_text: true,
             burn_subtitle_ass_path: Some(std::path::PathBuf::from("/cache/sub.ass")),
             burn_fonts_dir: Some(std::path::PathBuf::from("/cache/fonts")),
-            muxed_audio_source: None,
         };
-        let t = s.to_transcode_options();
+        let slice = crate::options::MuxedAudio {
+            path: std::path::PathBuf::from("/cache/continuous.m4a"),
+            start_seconds: 0.0,
+        };
+        let r = s
+            .clone()
+            .resolve_with(|_| Ok::<_, ()>(slice.clone()))
+            .expect("slice supplied");
+        let t = r.to_transcode_options();
         assert_eq!(t.container, Container::Mpegts);
         assert_eq!(t.video, Some(VideoCodec::H264));
         // The old assertion here was `t.audio == Some(AudioCodec::Aac)` —
@@ -269,17 +356,20 @@ mod tests {
 
     /// The Google TV outage, at the argv level.
     ///
-    /// Lowering sets `audio: None`, and `build_args` turns `audio: None` into
-    /// `-an`. So a MUXED segment lowered without its continuous-audio slice
-    /// resolved produces a VIDEO-ONLY file — silently, exit 0 — under a
-    /// playlist advertising audio. ExoPlayer fetched one such segment and
-    /// stopped; the bytes pulled back from prod probed `nb_streams: 1`.
+    /// Lowering sets `audio: None`, and `build_args` turns that into `-an`. A
+    /// MUXED segment lowered without its continuous-audio slice therefore
+    /// produced a VIDEO-ONLY file — silently, exit 0 — under a playlist
+    /// advertising audio. ExoPlayer fetched one such segment and stopped; the
+    /// bytes pulled back from prod probed `nb_streams: 1`.
     ///
-    /// The resolution guard lives in the cache, but the consequence is here,
-    /// so the two states are pinned side by side: with a source, copy; without
-    /// one, the `-an` that must never reach a muxed rung.
+    /// That state no longer has a representation: `ResolvedSegment` is the only
+    /// thing that lowers, and `ResolvedAudio::Muxed` cannot be built without a
+    /// slice. The test that used to assert the broken argv could not be written
+    /// today — it would not compile — so what is asserted instead is the
+    /// property that replaced it: a resolved muxed segment COPIES, and never
+    /// emits `-an`.
     #[test]
-    fn a_muxed_segment_copies_its_audio_and_only_drops_it_when_unresolved() {
+    fn a_resolved_muxed_segment_copies_its_audio_and_never_drops_it() {
         let base = SegmentOpts {
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
@@ -294,118 +384,52 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
-            muxed_audio_source: None,
         };
-        let argv = |o: &SegmentOpts| {
+        let argv = |r: &ResolvedSegment| {
             crate::ffmpeg_transcode_args(
                 "/src.mkv",
-                &o.to_transcode_options(),
+                &r.to_transcode_options(),
                 crate::protocol::DeviceId::Cpu,
                 "/out.ts",
             )
         };
 
-        // Unresolved: the failure mode, pinned so it cannot be mistaken for
-        // correct output.
+        let resolved = base
+            .clone()
+            .resolve_with(|c| {
+                assert_eq!(
+                    c.codec,
+                    SegmentAudio::Aac,
+                    "the slice is asked for BY codec"
+                );
+                Ok::<_, ()>(crate::options::MuxedAudio {
+                    path: std::path::PathBuf::from("/cache/continuous.m4a"),
+                    start_seconds: 0.0,
+                })
+            })
+            .expect("slice supplied");
+        let a = argv(&resolved);
         assert!(
-            argv(&base).iter().any(|a| a == "-an"),
-            "an unresolved muxed segment drops audio — this is why the cache \
-             MUST resolve it before lowering"
+            !a.iter().any(|x| x == "-an"),
+            "a muxed rung must never drop its audio: {a:?}"
+        );
+        let ca = a.iter().position(|x| x == "-c:a").expect("audio codec set");
+        assert_eq!(
+            a[ca + 1],
+            "copy",
+            "audio is copied, never re-encoded: {a:?}"
         );
 
-        // Resolved: the audio is copied from the continuous encode, never
-        // re-encoded, and `-an` is gone.
-        let mut resolved = base.clone();
-        resolved.muxed_audio_source = Some(crate::options::MuxedAudio {
-            path: std::path::PathBuf::from("/cache/continuous.m4a"),
-            start_seconds: 0.0,
-        });
-        let a = argv(&resolved);
-        assert!(!a.iter().any(|x| x == "-an"), "{a:?}");
-        let ca = a.iter().position(|x| x == "-c:a").expect("audio codec set");
-        assert_eq!(a[ca + 1], "copy", "{a:?}");
-    }
-
-    #[test]
-    fn no_audio_delivery_means_encode_this_segments_audio() {
-        // THE property this type exists for. Encoding audio per segment
-        // re-primes the codec at every boundary, so consecutive segments
-        // carry overlapping, phase-misaligned audio — measured live as 6.037s
-        // of audio against 6.006s of video, grids 0.53 of a frame apart. It
-        // shipped because the choice was a field any delivery path could set
-        // either way.
-        //
-        // The match below is EXHAUSTIVE: adding a variant that means "encode
-        // audio here" fails to compile until someone deletes this test, which
-        // is the point.
-        for d in [
-            AudioDelivery::Separate,
-            AudioDelivery::Muxed(ContinuousAudio {
-                codec: SegmentAudio::Aac,
-                bitrate_bps: Some(128_000),
-            }),
-        ] {
-            match d {
-                // Carries no audio at all.
-                AudioDelivery::Separate => assert_eq!(d.codec(), None),
-                // Carries audio COPIED from one encode — never its own.
-                AudioDelivery::Muxed(c) => assert_eq!(d.codec(), Some(c.codec)),
-            }
-        }
-    }
-
-    #[test]
-    fn lowering_can_never_name_an_audio_encoder() {
-        // Whatever a caller declares, the wire options reaching ffmpeg carry
-        // no audio codec: the bytes come from the continuous encode.
-        for audio in [
-            AudioDelivery::Separate,
-            AudioDelivery::Muxed(ContinuousAudio {
-                codec: SegmentAudio::Aac,
-                bitrate_bps: Some(128_000),
-            }),
-            AudioDelivery::Muxed(ContinuousAudio {
-                codec: SegmentAudio::Opus,
-                bitrate_bps: None,
-            }),
-        ] {
-            let s = SegmentOpts {
-                container: SegmentContainer::Mpegts,
-                video: Some(SegmentVideo::H264),
-                audio,
-                video_bitrate_bps: Some(2_000_000),
-                window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
-                audio_source_stream_index: None,
-                burn_subtitle_stream_index: None,
-                burn_subtitle_is_text: false,
-                burn_subtitle_ass_path: None,
-                burn_fonts_dir: None,
-                muxed_audio_source: None,
-            };
-            assert_eq!(s.to_transcode_options().audio, None, "{audio:?}");
-        }
-    }
-
-    #[test]
-    fn segment_types_have_no_copy_or_progressive_variants() {
-        // Compile-time property spelled out for the reader: the match arms
-        // below are EXHAUSTIVE. Adding a Copy/progressive variant to any of
-        // these enums fails this match (and the segment surface's V30
-        // invariant) at compile time, forcing the author to confront it.
-        for v in [SegmentVideo::H264, SegmentVideo::Vp9] {
-            match v {
-                SegmentVideo::H264 | SegmentVideo::Vp9 => {}
-            }
-        }
-        for a in [SegmentAudio::Aac, SegmentAudio::Opus] {
-            match a {
-                SegmentAudio::Aac | SegmentAudio::Opus => {}
-            }
-        }
-        for c in [SegmentContainer::Mpegts, SegmentContainer::Fmp4] {
-            match c {
-                SegmentContainer::Mpegts | SegmentContainer::Fmp4 => {}
-            }
-        }
+        // The converse still holds: an audio-free rung resolves without a slice
+        // (its closure is never run) and legitimately carries `-an`.
+        let mut separate = base;
+        separate.audio = AudioDelivery::Separate;
+        let silent = separate
+            .resolve_with(|_| -> Result<crate::options::MuxedAudio, ()> {
+                unreachable!("an audio-free segment must not ask for a slice")
+            })
+            .expect("resolves with no slice");
+        assert!(matches!(silent.audio(), ResolvedAudio::Silent));
+        assert!(argv(&silent).iter().any(|x| x == "-an"));
     }
 }

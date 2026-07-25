@@ -125,12 +125,14 @@ fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        muxed_audio_source: None,
     };
     let out = dir.join(format!("seg{seg}.m4s"));
     let args = ffmpeg_transcode_args(
         src.to_str().unwrap(),
-        &opts.to_transcode_options(),
+        &opts
+            .resolve_with(|_| Err::<pharos_transcode::MuxedAudio, ()>(()))
+            .expect("audio-free segment resolves without a slice")
+            .to_transcode_options(),
         DeviceId::Cpu,
         out.to_str().unwrap(),
     );

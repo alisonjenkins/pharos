@@ -204,22 +204,6 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
     }
 }
 
-/// Whether this segment still needs its continuous-audio slice resolved.
-///
-/// Reads the SEGMENT's own delivery intent, never the lowered
-/// [`TranscodeOptions`]. `SegmentOpts::to_transcode_options` sets `audio: None`
-/// unconditionally — a segment never runs an audio encoder — so a guard written
-/// against the lowered field is testing a constant that is always `None`, and
-/// silently never fires.
-///
-/// That is exactly what happened: the guard predated the refactor that made a
-/// per-segment audio encode unrepresentable, and the refactor turned it off
-/// without touching it. Every muxed mpegts segment then fell through to `-an`
-/// and shipped video-only under a playlist advertising audio.
-fn needs_muxed_audio(opts: &SegmentOpts) -> bool {
-    opts.audio_codec().is_some() && opts.muxed_audio_source.is_none()
-}
-
 /// Count one audio-rendition read wait. Emitted on BOTH outcomes: a counter
 /// that only fires on failure cannot answer "what fraction of waits 404?",
 /// which is the question the Ghost in the Shell stall actually posed.
@@ -735,26 +719,30 @@ impl HlsSegmentCache {
         // client will stall. Logged per miss so Loki/Tempo show exactly which
         // segments are slow and why (codec + subtitle burn are the usual cost).
         let started = std::time::Instant::now();
-        let mut attempt_opts = opts.to_transcode_options();
-        // Resolved HERE rather than by each delivery handler, so no path can
-        // mint a segment that encodes its own audio. That is exactly how the
-        // muxed mpegts surface ended up with a per-segment AAC encode while
-        // the browser surface had a continuous one.
-        if needs_muxed_audio(opts) {
-            let start_secs = opts.window.start_seconds();
-            let dur_secs = opts.window.duration_seconds();
-            attempt_opts.muxed_audio_source = Some(
+        // Resolve the audio HERE rather than in each delivery handler, so no
+        // path can mint a segment that encodes its own audio. That is exactly
+        // how the muxed mpegts surface ended up with a per-segment AAC encode
+        // while the browser surface had a continuous one.
+        //
+        // `resolve` runs the closure for exactly the deliveries that need a
+        // slice, and moves the result into the value being built — so lowering
+        // a muxed segment without one is not something this code can express.
+        let start_secs = opts.window.start_seconds();
+        let dur_secs = opts.window.duration_seconds();
+        let resolved = opts
+            .clone()
+            .resolve(|c| {
                 self.ensure_continuous_audio_covering(
                     source,
                     media_id,
                     opts.audio_source_stream_index,
-                    opts.audio_bitrate_bps(),
+                    c.bitrate_bps,
                     start_secs,
                     start_secs + dur_secs,
                 )
-                .await?,
-            );
-        }
+            })
+            .await?;
+        let mut attempt_opts = resolved.to_transcode_options();
         let mut timing = None;
         // A produced segment can be short of video frames while ffmpeg exits 0
         // (see `short_of_frames`). That is not transient — re-running the same
@@ -2097,8 +2085,14 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
-            muxed_audio_source: None,
         }
+        .resolve_with(|_| {
+            Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
+                path: std::path::PathBuf::from("/cache/continuous.m4a"),
+                start_seconds: 0.0,
+            })
+        })
+        .expect("slice supplied")
         .to_transcode_options()
     }
 
@@ -2198,14 +2192,21 @@ mod tests {
     /// ExoPlayer fetched one segment and stopped. Confirmed on the real bytes
     /// pulled back from prod.
     ///
-    /// The guard that resolves the continuous-audio slice read
-    /// `to_transcode_options().audio`, which is set to `None` UNCONDITIONALLY
-    /// ("a segment never runs an audio encoder"). So it could never fire, the
-    /// muxed source was never resolved, and the argv fell through to `-an`.
-    /// Browsers were unaffected: their fMP4 rungs deliver audio as a separate
-    /// rendition and genuinely carry none in the segment.
-    #[test]
-    fn a_muxed_segment_is_recognised_as_needing_its_continuous_audio() {
+    /// The cause was a guard reading `to_transcode_options().audio`, which is
+    /// `None` UNCONDITIONALLY ("a segment never runs an audio encoder"), so it
+    /// could never fire and the argv fell through to `-an`. That guard is now
+    /// gone: `SegmentOpts::resolve` runs its closure for exactly the deliveries
+    /// that need a slice and moves the result in, so the broken state has no
+    /// representation. This test pins the two halves of that.
+    #[tokio::test]
+    async fn only_a_muxed_segment_asks_for_a_continuous_audio_slice() {
+        let slice = pharos_transcode::options::MuxedAudio {
+            path: std::path::PathBuf::from("/tmp/continuous.m4a"),
+            start_seconds: 0.0,
+        };
+
+        // Muxed: the closure IS called, and its result reaches the argv as a
+        // copy source — never `-an`.
         let muxed = ident_opts(
             Some(SegmentVideo::H264),
             Some(SegmentAudio::Aac),
@@ -2213,20 +2214,20 @@ mod tests {
             Some(4_000_000),
             Some(128_000),
         );
-        assert!(
-            needs_muxed_audio(&muxed),
-            "a muxed segment with no resolved source must ask for one"
-        );
+        let mut asked = false;
+        let resolved = muxed
+            .resolve(|c| {
+                asked = true;
+                assert_eq!(c.codec, SegmentAudio::Aac);
+                std::future::ready(Ok::<_, HlsCacheError>(slice.clone()))
+            })
+            .await
+            .unwrap();
+        assert!(asked, "a muxed segment must ask for its slice");
+        assert!(resolved.to_transcode_options().muxed_audio_source.is_some());
 
-        // The trap, pinned: the LOWERED options can never answer this question,
-        // so a guard written against them is dead code that looks alive.
-        assert!(
-            muxed.to_transcode_options().audio.is_none(),
-            "lowering never carries an audio encoder — so it cannot be the test"
-        );
-
-        // A video-only rung genuinely carries no audio and must NOT spawn a
-        // continuous encode it will never mux.
+        // Separate: a video-only rung must NOT spawn a continuous encode it
+        // will never mux.
         let separate = ident_opts(
             Some(SegmentVideo::Vp9),
             None,
@@ -2234,15 +2235,16 @@ mod tests {
             Some(4_000_000),
             None,
         );
-        assert!(!needs_muxed_audio(&separate));
-
-        // Already resolved → not asked for twice.
-        let mut resolved = muxed.clone();
-        resolved.muxed_audio_source = Some(pharos_transcode::options::MuxedAudio {
-            path: std::path::PathBuf::from("/tmp/continuous.m4a"),
-            start_seconds: 0.0,
-        });
-        assert!(!needs_muxed_audio(&resolved));
+        let mut asked = false;
+        let resolved = separate
+            .resolve(|_| {
+                asked = true;
+                std::future::ready(Ok::<_, HlsCacheError>(slice.clone()))
+            })
+            .await
+            .unwrap();
+        assert!(!asked, "an audio-free segment must not request a slice");
+        assert!(resolved.to_transcode_options().muxed_audio_source.is_none());
     }
 
     #[test]
@@ -2297,7 +2299,6 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
-            muxed_audio_source: None,
         }
     }
 
@@ -2670,7 +2671,6 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
-            muxed_audio_source: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -2694,7 +2694,6 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
-            muxed_audio_source: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -2721,7 +2720,6 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
-            muxed_audio_source: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -2761,7 +2759,6 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
-                muxed_audio_source: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -2781,7 +2778,6 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
-                muxed_audio_source: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)

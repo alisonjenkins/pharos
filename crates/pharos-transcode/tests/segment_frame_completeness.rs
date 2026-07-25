@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use pharos_transcode::{
-    ffmpeg_transcode_args, protocol::DeviceId, AudioDelivery, ContinuousAudio, SegmentAudio,
-    SegmentContainer, SegmentOpts, SegmentVideo,
+    ffmpeg_transcode_args, protocol::DeviceId, AudioDelivery, SegmentContainer, SegmentOpts,
+    SegmentVideo,
 };
 
 /// 23.976 fps, so the frame-snapped grid produces non-round boundaries — the
@@ -95,11 +95,12 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> (PathBuf, f64, f64) {
     let opts = SegmentOpts {
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
-        audio: AudioDelivery::Muxed(ContinuousAudio {
-            codec: SegmentAudio::Aac,
-
-            bitrate_bps: Some(128_000),
-        }),
+        // Video-only: this test counts VIDEO frames, and it never had a
+        // continuous-audio encode to copy from. It declared `Muxed` with no
+        // source, which silently produced a video-only segment anyway — the
+        // exact contradiction `ResolvedAudio` now makes unrepresentable. Saying
+        // `Separate` states what the test actually encodes.
+        audio: AudioDelivery::Separate,
 
         video_bitrate_bps: Some(2_000_000),
         window: pharos_core::SegmentWindow::for_segment(seg, Some(frame_rate()), Some(60.0)),
@@ -108,12 +109,14 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> (PathBuf, f64, f64) {
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        muxed_audio_source: None,
     };
     let out = dir.join(format!("seg{seg}.ts"));
     let args = ffmpeg_transcode_args(
         src.to_str().unwrap(),
-        &opts.to_transcode_options(),
+        &opts
+            .resolve_with(|_| Err::<pharos_transcode::MuxedAudio, ()>(()))
+            .expect("audio-free segment resolves without a slice")
+            .to_transcode_options(),
         DeviceId::Cpu,
         out.to_str().unwrap(),
     );
