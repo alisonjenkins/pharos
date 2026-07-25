@@ -43,6 +43,16 @@ pub struct TranscodeSession {
     pub media_id: MediaId,
     pub decision: Decision,
     pub source_probe: MediaProbe,
+    /// ABSOLUTE subtitle stream indices that must be BURNED for this client,
+    /// resolved at PlaybackInfo from the SubtitleProfiles it declared.
+    ///
+    /// The client's profile is only ever visible on that one request, and the
+    /// segment URLs it later fetches carry a bare `SubtitleStreamIndex` with no
+    /// indication of whether the client can render that track itself. Without
+    /// this set the segment handler had to assume every requested subtitle
+    /// needed burning — so a browser that renders `subrip` natively got a
+    /// filter graph on every segment anyway.
+    pub burn_subtitle_indices: std::collections::BTreeSet<u32>,
 }
 
 /// Drop in-memory sessions idle for longer than this. Five minutes covers a
@@ -134,6 +144,7 @@ where
             media_id: session.media_id,
             decision_json: serde_json::to_string(&session.decision)?,
             source_probe_json: serde_json::to_string(&session.source_probe)?,
+            burn_subtitle_indices_json: serde_json::to_string(&session.burn_subtitle_indices)?,
         })
     }
 
@@ -144,6 +155,7 @@ where
             media_id: p.media_id,
             decision: serde_json::from_str(&p.decision_json)?,
             source_probe: serde_json::from_str(&p.source_probe_json)?,
+            burn_subtitle_indices: serde_json::from_str(&p.burn_subtitle_indices_json)?,
         })
     }
 
@@ -302,6 +314,7 @@ mod tests {
                 max_video_bitrate_bps: Some(2_500_000),
             },
             source_probe: MediaProbe::default(),
+            burn_subtitle_indices: Default::default(),
         }
     }
 

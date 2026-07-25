@@ -24,18 +24,21 @@ impl TranscodeSessionStore for SqliteStore {
         let media_id = media_id_i64(session.media_id)?;
         sqlx::query(
             "INSERT INTO transcode_sessions \
-             (play_session_id, media_id, decision_json, source_probe_json, updated_at) \
-             VALUES (?, ?, ?, ?, ?) \
+             (play_session_id, media_id, decision_json, source_probe_json, \
+              burn_subtitle_indices_json, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
              ON CONFLICT(play_session_id) DO UPDATE SET \
                media_id = excluded.media_id, \
                decision_json = excluded.decision_json, \
                source_probe_json = excluded.source_probe_json, \
+               burn_subtitle_indices_json = excluded.burn_subtitle_indices_json, \
                updated_at = excluded.updated_at",
         )
         .bind(play_session_id)
         .bind(media_id)
         .bind(&session.decision_json)
         .bind(&session.source_probe_json)
+        .bind(&session.burn_subtitle_indices_json)
         .bind(now_unix_secs)
         .execute(self.pool())
         .await
@@ -48,8 +51,9 @@ impl TranscodeSessionStore for SqliteStore {
         &self,
         play_session_id: &str,
     ) -> DomainResult<Option<PersistedTranscodeSession>> {
-        let row: Option<(i64, String, String)> = sqlx::query_as(
-            "SELECT media_id, decision_json, source_probe_json \
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT media_id, decision_json, source_probe_json, \
+                    burn_subtitle_indices_json \
              FROM transcode_sessions WHERE play_session_id = ?",
         )
         .bind(play_session_id)
@@ -57,10 +61,13 @@ impl TranscodeSessionStore for SqliteStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(row.map(
-            |(media_id, decision_json, source_probe_json)| PersistedTranscodeSession {
-                media_id: media_id as u64,
-                decision_json,
-                source_probe_json,
+            |(media_id, decision_json, source_probe_json, burn_subtitle_indices_json)| {
+                PersistedTranscodeSession {
+                    media_id: media_id as u64,
+                    decision_json,
+                    source_probe_json,
+                    burn_subtitle_indices_json,
+                }
             },
         ))
     }

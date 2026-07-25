@@ -1007,7 +1007,6 @@ mod tests {
                     value: "41".into(),
                     is_required: true,
                 }],
-                ..Default::default()
             }],
             ..Default::default()
         };

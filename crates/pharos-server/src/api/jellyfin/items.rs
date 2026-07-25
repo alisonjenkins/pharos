@@ -2483,6 +2483,11 @@ async fn playback_info(
                 media_id: id,
                 decision: decision.clone(),
                 source_probe: probe.clone(),
+                // The ONLY request on which this client's SubtitleProfiles are
+                // visible. Every segment URL it fetches later carries a bare
+                // SubtitleStreamIndex, so without carrying the verdict forward
+                // the segment handler must assume each one needs burning.
+                burn_subtitle_indices: burn_text_indices.clone(),
             },
         )
         .await;
@@ -2514,6 +2519,11 @@ async fn playback_info(
                 media_id: id,
                 decision: decision.clone(),
                 source_probe: probe.clone(),
+                // The ONLY request on which this client's SubtitleProfiles are
+                // visible. Every segment URL it fetches later carries a bare
+                // SubtitleStreamIndex, so without carrying the verdict forward
+                // the segment handler must assume each one needs burning.
+                burn_subtitle_indices: burn_text_indices.clone(),
             },
             audio_idx,
             sub_idx,

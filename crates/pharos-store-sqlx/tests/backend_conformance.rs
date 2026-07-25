@@ -450,6 +450,9 @@ where
         media_id: item_id,
         decision_json: r#"{"Transcode":{"target_container":"mp4"}}"#.into(),
         source_probe_json: r#"{"container":"mkv"}"#.into(),
+        // Distinct from sess2's, so the round-trip below proves this column is
+        // actually stored and re-read rather than defaulted.
+        burn_subtitle_indices_json: "[3,7]".into(),
     };
     TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 100)
         .await
@@ -465,6 +468,7 @@ where
         media_id: item_id,
         decision_json: r#"{"DirectPlay":null}"#.into(),
         source_probe_json: r#"{"container":"mp4"}"#.into(),
+        burn_subtitle_indices_json: "[]".into(),
     };
     TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess2, 200)
         .await
