@@ -352,6 +352,95 @@ fn compare_string(op: &str, source: Option<&str>, target: Option<&str>) -> bool 
     }
 }
 
+/// Why this client could not DIRECT-PLAY the source, as the negotiator ruled
+/// it out.
+///
+/// "Why is this transcoding?" is the first question of every playback
+/// incident, and the answer used to exist only inside this function's control
+/// flow: [`negotiate`] returned `Transcode` with no record of which check
+/// rejected direct play, so diagnosing one meant re-deriving the client's
+/// whole DeviceProfile by hand against the source probe. This is that answer,
+/// returned as data.
+///
+/// When several checks would fail, the reported reason is the one a profile
+/// got FURTHEST through — a client whose container and video codec both match
+/// and whose audio does not is an audio problem, not a container problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectPlayBlock {
+    /// Nothing blocked it — the decision is `DirectPlay`.
+    NotBlocked,
+    /// The client declared no DirectPlayProfile at all, so there was never a
+    /// direct-play candidate to test.
+    NoProfile,
+    /// No DirectPlayProfile accepts the source's container.
+    Container { source: String },
+    /// A profile accepts the container but not the source's video codec.
+    VideoCodec { source: String },
+    /// A profile accepts the container and video codec but not the audio
+    /// codec. This is the audio-remux shape.
+    AudioCodec { source: String },
+    /// Container and both codecs match, but the source exceeds the client's
+    /// declared bitrate ceiling.
+    Bitrate { source_bps: u64, cap_bps: u64 },
+    /// Container and both codecs match and the bitrate fits, but a
+    /// CodecProfile condition (level, profile, bit depth, channel count)
+    /// rejected the source — see [`codec_profile_passes`].
+    CodecCondition,
+}
+
+impl DirectPlayBlock {
+    /// Stable label for metrics and log fields. A dashboard keyed on these
+    /// breaks silently if they are renamed, so the mapping is spelled out
+    /// here rather than formatted at each emission site.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotBlocked => "not_blocked",
+            Self::NoProfile => "no_profile",
+            Self::Container { .. } => "container",
+            Self::VideoCodec { .. } => "video_codec",
+            Self::AudioCodec { .. } => "audio_codec",
+            Self::Bitrate { .. } => "bitrate",
+            Self::CodecCondition => "codec_condition",
+        }
+    }
+
+    /// How far a profile got before this reason stopped it. Higher wins when
+    /// several profiles fail at different points, so the reported reason is
+    /// the most specific one any candidate reached.
+    fn progress(&self) -> u8 {
+        match self {
+            Self::NoProfile => 0,
+            Self::Container { .. } => 1,
+            Self::VideoCodec { .. } => 2,
+            Self::AudioCodec { .. } => 3,
+            Self::Bitrate { .. } => 4,
+            Self::CodecCondition => 5,
+            Self::NotBlocked => 6,
+        }
+    }
+}
+
+impl std::fmt::Display for DirectPlayBlock {
+    /// Carries the offending VALUE, not just the class — "the container is
+    /// wrong" without naming the container is another round of guessing.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBlocked => write!(f, "not blocked"),
+            Self::NoProfile => write!(f, "client declared no DirectPlayProfile"),
+            Self::Container { source } => {
+                write!(f, "no DirectPlayProfile accepts container {source}")
+            }
+            Self::VideoCodec { source } => write!(f, "video codec {source} not accepted"),
+            Self::AudioCodec { source } => write!(f, "audio codec {source} not accepted"),
+            Self::Bitrate {
+                source_bps,
+                cap_bps,
+            } => write!(f, "source {source_bps} bps over client cap {cap_bps} bps"),
+            Self::CodecCondition => write!(f, "a CodecProfile condition rejected the source"),
+        }
+    }
+}
+
 /// Pick the right action given the source + a client profile. Caller
 /// is expected to use `DeviceProfile::default()` when the client
 /// didn't send a body (matches Jellyfin's permissive default).
@@ -360,6 +449,19 @@ pub fn negotiate(
     source: &SourceMedia,
     server: &ServerCodecSupport,
 ) -> Decision {
+    negotiate_explained(profile, source, server).0
+}
+
+/// [`negotiate`], plus the reason direct play was ruled out.
+///
+/// The reason is reported for EVERY decision, not only `Transcode`: an
+/// `AudioRemux` or `VideoRemux` is also a "why is this not direct play?"
+/// question, and the answer is the same check.
+pub fn negotiate_explained(
+    profile: &DeviceProfile,
+    source: &SourceMedia,
+    server: &ServerCodecSupport,
+) -> (Decision, DirectPlayBlock) {
     let want_kind = if source.is_video { "Video" } else { "Audio" };
 
     let bitrate_cap = profile.max_streaming_bitrate.or(profile.max_static_bitrate);
@@ -367,6 +469,20 @@ pub fn negotiate(
         (bitrate_cap, source.bitrate_bps),
         (Some(cap), Some(have)) if have > cap
     );
+
+    let mut block = if profile.direct_play_profiles.is_empty() {
+        DirectPlayBlock::NoProfile
+    } else {
+        DirectPlayBlock::Container {
+            source: source.container.clone(),
+        }
+    };
+    let note = |candidate: DirectPlayBlock, block: &mut DirectPlayBlock| {
+        if candidate.progress() > block.progress() {
+            *block = candidate;
+        }
+    };
+    let named = |codec: Option<&str>| codec.unwrap_or("unknown").to_string();
 
     // Look for an exact direct-play match first.
     let mut audio_remux_candidate: Option<&DirectPlayProfile> = None;
@@ -392,8 +508,33 @@ pub fn negotiate(
                 source.video_profile.as_deref(),
                 source.audio_channels,
             ) {
-                return Decision::DirectPlay;
+                return (Decision::DirectPlay, DirectPlayBlock::NotBlocked);
             }
+            note(DirectPlayBlock::CodecCondition, &mut block);
+        } else if !video_ok {
+            note(
+                DirectPlayBlock::VideoCodec {
+                    source: named(source.video_codec.as_deref()),
+                },
+                &mut block,
+            );
+        } else if !audio_ok {
+            note(
+                DirectPlayBlock::AudioCodec {
+                    source: named(source.audio_codec.as_deref()),
+                },
+                &mut block,
+            );
+        } else if let (Some(cap_bps), Some(source_bps)) = (bitrate_cap, source.bitrate_bps) {
+            // Both codecs and the container matched; the ceiling is what is
+            // left, and it is the only way to reach this arm.
+            note(
+                DirectPlayBlock::Bitrate {
+                    source_bps,
+                    cap_bps,
+                },
+                &mut block,
+            );
         }
         // Video matches but audio doesn't → audio-remux is viable
         // (container + video codec stay).
@@ -404,9 +545,12 @@ pub fn negotiate(
     if let Some(_p) = audio_remux_candidate {
         // Pick the first sensible target codec the client *can* play.
         // For now AAC is the de-facto Jellyfin lowest-common-denominator.
-        return Decision::AudioRemux {
-            target_audio_codec: "aac".into(),
-        };
+        return (
+            Decision::AudioRemux {
+                target_audio_codec: "aac".into(),
+            },
+            block,
+        );
     }
 
     // P9 — Video remux: relax the container check. When the source's
@@ -431,10 +575,13 @@ pub fn negotiate(
             let target_container = pick_first_csv(&p.container)
                 .unwrap_or_else(|| default_container(source.is_video).into());
             let audio_ok = matches_codec(&p.audio_codec, source.audio_codec.as_deref());
-            return Decision::VideoRemux {
-                target_container,
-                target_audio_codec: if audio_ok { None } else { Some("aac".into()) },
-            };
+            return (
+                Decision::VideoRemux {
+                    target_container,
+                    target_audio_codec: if audio_ok { None } else { Some("aac".into()) },
+                },
+                block,
+            );
         }
     }
 
@@ -444,36 +591,42 @@ pub fn negotiate(
         .iter()
         .find(|t| t.kind.is_empty() || t.kind.eq_ignore_ascii_case(want_kind))
     {
-        return Decision::Transcode {
-            target_container: pick_first_csv(&tp.container)
-                .unwrap_or_else(|| default_container(source.is_video).into()),
-            // Capability-aware: best codec in (client-decodable ∩
-            // server-encodable), hardware-preferred, h264 tiebreak for B59
-            // SyncPlay convergence. Audio keeps first-listed.
-            target_video_codec: if source.is_video {
-                pick_transcode_video_codec(&tp.video_codec, server)
-            } else {
-                pick_first_csv(&tp.video_codec)
+        return (
+            Decision::Transcode {
+                target_container: pick_first_csv(&tp.container)
+                    .unwrap_or_else(|| default_container(source.is_video).into()),
+                // Capability-aware: best codec in (client-decodable ∩
+                // server-encodable), hardware-preferred, h264 tiebreak for B59
+                // SyncPlay convergence. Audio keeps first-listed.
+                target_video_codec: if source.is_video {
+                    pick_transcode_video_codec(&tp.video_codec, server)
+                } else {
+                    pick_first_csv(&tp.video_codec)
+                },
+                target_audio_codec: pick_first_csv(&tp.audio_codec),
+                max_video_bitrate_bps: bitrate_cap,
             },
-            target_audio_codec: pick_first_csv(&tp.audio_codec),
-            max_video_bitrate_bps: bitrate_cap,
-        };
+            block,
+        );
     }
 
     // No profile supplied → permissive default: HLS + H264 + AAC for
     // video, mp3 for audio. Matches what jellyfin-web requests when its
     // built-in browser profile applies.
-    Decision::Transcode {
-        target_container: default_container(source.is_video).into(),
-        // No client profile → pick the server's safe target (h264 if encodable).
-        target_video_codec: source.is_video.then(|| server.fallback_target()),
-        target_audio_codec: Some(if source.is_video {
-            "aac".into()
-        } else {
-            "mp3".into()
-        }),
-        max_video_bitrate_bps: bitrate_cap,
-    }
+    (
+        Decision::Transcode {
+            target_container: default_container(source.is_video).into(),
+            // No client profile → pick the server's safe target (h264 if encodable).
+            target_video_codec: source.is_video.then(|| server.fallback_target()),
+            target_audio_codec: Some(if source.is_video {
+                "aac".into()
+            } else {
+                "mp3".into()
+            }),
+            max_video_bitrate_bps: bitrate_cap,
+        },
+        block,
+    )
 }
 
 fn default_container(is_video: bool) -> &'static str {
@@ -752,6 +905,166 @@ mod tests {
             is_video: true,
             ..Default::default()
         }
+    }
+
+    /// The reason direct play was ruled out, for a client profile built from
+    /// `dp` entries against `source`.
+    fn why(profiles: Vec<DirectPlayProfile>, source: &SourceMedia) -> DirectPlayBlock {
+        let profile = DeviceProfile {
+            direct_play_profiles: profiles,
+            ..Default::default()
+        };
+        negotiate_explained(&profile, source, &ServerCodecSupport::default()).1
+    }
+
+    #[test]
+    fn a_direct_play_reports_nothing_blocking_it() {
+        let block = why(
+            vec![dp("webm", "vp9", "opus", "Video")],
+            &webm_vp9_opus_source(),
+        );
+        assert_eq!(block, DirectPlayBlock::NotBlocked);
+    }
+
+    #[test]
+    fn no_profile_accepting_the_container_names_the_container() {
+        let block = why(
+            vec![dp("mp4", "vp9", "opus", "Video")],
+            &webm_vp9_opus_source(),
+        );
+        assert_eq!(
+            block,
+            DirectPlayBlock::Container {
+                source: "webm".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_container_match_with_a_wrong_codec_names_that_codec() {
+        assert_eq!(
+            why(
+                vec![dp("webm", "av1", "opus", "Video")],
+                &webm_vp9_opus_source()
+            ),
+            DirectPlayBlock::VideoCodec {
+                source: "vp9".into()
+            }
+        );
+        assert_eq!(
+            why(
+                vec![dp("webm", "vp9", "aac", "Video")],
+                &webm_vp9_opus_source()
+            ),
+            DirectPlayBlock::AudioCodec {
+                source: "opus".into()
+            }
+        );
+    }
+
+    /// A client whose container AND both codecs match, stopped only by its own
+    /// bitrate ceiling. Reporting "container" here — the first check that any
+    /// profile failed — would send an investigation down the wrong path, so the
+    /// reason is the furthest a candidate reached.
+    #[test]
+    fn a_full_match_over_the_ceiling_names_the_bitrate_not_the_container() {
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![
+                dp("mp4", "h264", "aac", "Video"),
+                dp("webm", "vp9", "opus", "Video"),
+            ],
+            max_streaming_bitrate: Some(1_000_000),
+            ..Default::default()
+        };
+        let (_d, block) = negotiate_explained(
+            &profile,
+            &webm_vp9_opus_source(),
+            &ServerCodecSupport::default(),
+        );
+        assert_eq!(
+            block,
+            DirectPlayBlock::Bitrate {
+                source_bps: 2_000_000,
+                cap_bps: 1_000_000
+            }
+        );
+    }
+
+    /// P27 — everything matches and a CodecProfile condition is what rejects
+    /// the source. Indistinguishable from a codec mismatch without this.
+    #[test]
+    fn a_codec_profile_condition_is_named_as_itself() {
+        let mut source = webm_vp9_opus_source();
+        source.video_level = Some(51);
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![dp("webm", "vp9", "opus", "Video")],
+            codec_profiles: vec![CodecProfileDto {
+                kind: "Video".into(),
+                codec: "vp9".into(),
+                conditions: vec![ProfileCondition {
+                    condition: "LessThanEqual".into(),
+                    property: "VideoLevel".into(),
+                    value: "41".into(),
+                    is_required: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (_d, block) = negotiate_explained(&profile, &source, &ServerCodecSupport::default());
+        assert_eq!(block, DirectPlayBlock::CodecCondition);
+    }
+
+    #[test]
+    fn a_client_with_no_direct_play_profile_says_so() {
+        assert_eq!(
+            why(vec![], &webm_vp9_opus_source()),
+            DirectPlayBlock::NoProfile
+        );
+    }
+
+    /// The reason travels with a remux decision too — "not direct play" is the
+    /// same question whether the fallback is a remux or a full transcode.
+    #[test]
+    fn a_remux_still_reports_why_direct_play_was_ruled_out() {
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![dp("webm", "vp9", "aac", "Video")],
+            ..Default::default()
+        };
+        let (decision, block) = negotiate_explained(
+            &profile,
+            &webm_vp9_opus_source(),
+            &ServerCodecSupport::default(),
+        );
+        assert!(matches!(decision, Decision::AudioRemux { .. }));
+        assert_eq!(
+            block,
+            DirectPlayBlock::AudioCodec {
+                source: "opus".into()
+            }
+        );
+    }
+
+    /// Every variant has a distinct, stable metric label.
+    #[test]
+    fn block_labels_are_distinct() {
+        let all = [
+            DirectPlayBlock::NotBlocked,
+            DirectPlayBlock::NoProfile,
+            DirectPlayBlock::Container { source: "x".into() },
+            DirectPlayBlock::VideoCodec { source: "x".into() },
+            DirectPlayBlock::AudioCodec { source: "x".into() },
+            DirectPlayBlock::Bitrate {
+                source_bps: 1,
+                cap_bps: 2,
+            },
+            DirectPlayBlock::CodecCondition,
+        ];
+        let labels: std::collections::BTreeSet<_> = all.iter().map(|b| b.label()).collect();
+        assert_eq!(labels.len(), all.len());
+        // The Display form must carry the offending value, not just the class.
+        assert!(all[2].to_string().contains('x'));
+        assert!(all[5].to_string().contains('2'));
     }
 
     #[test]
