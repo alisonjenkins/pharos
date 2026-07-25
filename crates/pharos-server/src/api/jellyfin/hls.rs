@@ -865,39 +865,20 @@ async fn render_variant_playlist(
     variant: &str,
 ) -> Result<impl Responder, actix_web::Error> {
     let item = load_hls_item(&state, &id).await?;
-    let duration = item.duration_seconds;
-    let segments: Vec<(u32, f64, f64)> =
-        playlist_segments(duration, item.frame_rate_mille).collect();
-    let segment_count = segments.len();
     let qs = playback_qs(&req);
-    let mut body = String::with_capacity(256 + segment_count * 80);
-    body.push_str("#EXTM3U\n");
-    body.push_str("#EXT-X-VERSION:3\n");
-    body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
-    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    body.push_str(&format!(
-        "#EXT-X-TARGETDURATION:{}\n",
-        SEGMENT_SECONDS as u32
-    ));
-    // P18 — resume hint. When the client embedded `StartTimeTicks`
-    // in the playlist URL, advertise the offset so the player jumps
-    // straight there instead of scanning from segment 0.
-    let start_ticks = parse_start_time_ticks_qs(req.query_string());
-    if start_ticks > 0 {
-        let secs = Ticks(start_ticks).seconds();
-        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    let body = MediaPlaylist {
+        version: 3,
+        independent_segments: true,
+        // mpegts carries its own PAT/PMT; there is no init segment.
+        init_uri: None,
+        // P18 — resume hint, so a client that embedded `StartTimeTicks` jumps
+        // straight there instead of scanning from segment 0.
+        start_offset_secs: resume_offset_secs(&req),
+        // Lowercase: T31 routes are registered lowercase; emit the canonical
+        // form so HLS players don't pay a middleware rewrite per segment.
+        segment_uri: &|seg| format!("/videos/{id}/hls1/{variant}/{seg}.ts?{qs}"),
     }
-    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    for (seg, _start, len) in segments {
-        // Frame-aligned duration matching the transcoder's actual cut points,
-        // clamped by the remaining media at the tail.
-        body.push_str(&format!("#EXTINF:{len:.3},\n"));
-        // Lowercase: T31 routes are registered lowercase; emit the
-        // canonical form so HLS players don't pay a middleware rewrite
-        // for every segment.
-        body.push_str(&format!("/videos/{id}/hls1/{variant}/{seg}.ts?{qs}\n"));
-    }
-    body.push_str("#EXT-X-ENDLIST\n");
+    .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(false))
@@ -1673,25 +1654,21 @@ async fn vp9_audio_playlist(
     // the first segment (the same `.max(1)` truncation the video variant
     // already guards against via this path).
     let duration = load_hls_item(&state, &id).await?.duration_seconds.max(0.0);
-    let segments: Vec<(u32, f64, f64)> =
-        playlist_segments(duration, item.probe.frame_rate_mille).collect();
-    let mut body = String::with_capacity(128 + segments.len() * 48);
-    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
-    body.push_str(&format!(
-        "#EXT-X-TARGETDURATION:{}\n",
-        SEGMENT_SECONDS as u32
-    ));
-    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n");
-    body.push_str(&format!(
-        "#EXT-X-MAP:URI=\"/videos/{id}/vp9/audio/init.mp4?{qs}\"\n"
-    ));
-    for (seg, _start, len) in segments {
-        // B105 — the audio playlist enumerates the same grid the video variant
-        // does, so a client maps a time to the same index on both renditions.
-        body.push_str(&format!("#EXTINF:{len:.3},\n"));
-        body.push_str(&format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}\n"));
+    // B105 — the audio rendition enumerates the SAME grid the video variant
+    // does, so a client maps a time to the same index on both. Going through
+    // the shared renderer is what keeps that true.
+    let body = MediaPlaylist {
+        version: 7,
+        // The audio rendition is listed under a master that already declares
+        // `#EXT-X-INDEPENDENT-SEGMENTS` for every variant.
+        independent_segments: false,
+        init_uri: Some(format!("/videos/{id}/vp9/audio/init.mp4?{qs}")),
+        // No resume hint: the rendition is PTS-synced to the video variant,
+        // which carries the seek target.
+        start_offset_secs: None,
+        segment_uri: &|seg| format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}"),
     }
-    body.push_str("#EXT-X-ENDLIST\n");
+    .render(duration, item.probe.frame_rate_mille);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(false))
@@ -1759,36 +1736,15 @@ async fn vp9_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
-    let duration = item.duration_seconds;
-    let segments: Vec<(u32, f64, f64)> =
-        playlist_segments(duration, item.frame_rate_mille).collect();
     let qs = playback_qs(&req);
-
-    let mut body = String::with_capacity(256 + segments.len() * 48);
-    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    body.push_str(&format!(
-        "#EXT-X-TARGETDURATION:{}\n",
-        SEGMENT_SECONDS as u32
-    ));
-    // fMP4 requires the init segment be declared before any media.
-    body.push_str(&format!(
-        "#EXT-X-MAP:URI=\"/videos/{id}/vp9/init.mp4?{qs}\"\n"
-    ));
-    let start_ticks = parse_start_time_ticks_qs(req.query_string());
-    if start_ticks > 0 {
-        let secs = Ticks(start_ticks).seconds();
-        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    let body = MediaPlaylist {
+        version: 7,
+        independent_segments: true,
+        init_uri: Some(format!("/videos/{id}/vp9/init.mp4?{qs}")),
+        start_offset_secs: resume_offset_secs(&req),
+        segment_uri: &|seg| format!("/videos/{id}/vp9/{seg}.m4s?{qs}"),
     }
-    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    for (seg, _start, len) in segments {
-        // Frame-aligned EXTINF matching the transcoder's actual cut points —
-        // a fixed 6.0 drifts against the real video timeline on a non-integer-
-        // fps source and desyncs A/V over a long title.
-        body.push_str(&format!("#EXTINF:{len:.3},\n"));
-        body.push_str(&format!("/videos/{id}/vp9/{seg}.m4s?{qs}\n"));
-    }
-    body.push_str("#EXT-X-ENDLIST\n");
+    .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(false))
@@ -1945,33 +1901,15 @@ async fn h264cmaf_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
-    let duration = item.duration_seconds;
-    let segments: Vec<(u32, f64, f64)> =
-        playlist_segments(duration, item.frame_rate_mille).collect();
     let qs = playback_qs(&req);
-
-    let mut body = String::with_capacity(256 + segments.len() * 48);
-    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    body.push_str(&format!(
-        "#EXT-X-TARGETDURATION:{}\n",
-        SEGMENT_SECONDS as u32
-    ));
-    body.push_str(&format!(
-        "#EXT-X-MAP:URI=\"/videos/{id}/h264cmaf/init.mp4?{qs}\"\n"
-    ));
-    let start_ticks = parse_start_time_ticks_qs(req.query_string());
-    if start_ticks > 0 {
-        let secs = Ticks(start_ticks).seconds();
-        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    let body = MediaPlaylist {
+        version: 7,
+        independent_segments: true,
+        init_uri: Some(format!("/videos/{id}/h264cmaf/init.mp4?{qs}")),
+        start_offset_secs: resume_offset_secs(&req),
+        segment_uri: &|seg| format!("/videos/{id}/h264cmaf/{seg}.m4s?{qs}"),
     }
-    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    for (seg, _start, len) in segments {
-        body.push_str(&format!(
-            "#EXTINF:{len:.3},\n/videos/{id}/h264cmaf/{seg}.m4s?{qs}\n"
-        ));
-    }
-    body.push_str("#EXT-X-ENDLIST\n");
+    .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(false))
@@ -2155,6 +2093,71 @@ fn segment_time_range(seg: u32, fps_mille: Option<u32>) -> (f64, f64) {
 /// the encoder and the playlist drift apart in the first place. Going through
 /// `SegmentGrid` means every playlist enumerates exactly the segments the
 /// bounds check will accept and advertises exactly the window the encoder is
+/// One VOD media playlist, rendered once for every delivery surface.
+///
+/// The four surfaces (mpegts `hls1`, VP9 CMAF, h264 CMAF, and the separate
+/// audio rendition) each used to build their own body. The tags are identical
+/// apart from the fields below, so every copy was a place for a tag to be
+/// added to three playlists and forgotten in the fourth.
+struct MediaPlaylist<'a> {
+    version: u8,
+    independent_segments: bool,
+    /// `#EXT-X-MAP` init URI. `Some` for the fMP4 surfaces; `None` for
+    /// mpegts, which is self-initialising.
+    init_uri: Option<String>,
+    /// `#EXT-X-START` resume hint, when the surface advertises one.
+    start_offset_secs: Option<f64>,
+    segment_uri: &'a dyn Fn(u32) -> String,
+}
+
+impl MediaPlaylist<'_> {
+    /// Enumerate exactly the segments the grid defines — the same call the
+    /// segment bounds check makes, so a playlist can never advertise a
+    /// segment the server would 404.
+    fn render(&self, duration_secs: f64, frame_rate_mille: Option<u32>) -> String {
+        let segments: Vec<(u32, f64, f64)> =
+            playlist_segments(duration_secs, frame_rate_mille).collect();
+        let mut body = String::with_capacity(256 + segments.len() * 72);
+        body.push_str("#EXTM3U\n");
+        body.push_str(&format!("#EXT-X-VERSION:{}\n", self.version));
+        if self.independent_segments {
+            body.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+        }
+        body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+        body.push_str(&format!(
+            "#EXT-X-TARGETDURATION:{}\n",
+            SEGMENT_SECONDS as u32
+        ));
+        // fMP4 requires the init segment be declared before any media.
+        if let Some(uri) = &self.init_uri {
+            body.push_str(&format!("#EXT-X-MAP:URI=\"{uri}\"\n"));
+        }
+        if let Some(secs) = self.start_offset_secs {
+            body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+        }
+        body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+        for (seg, _start, len) in segments {
+            // Frame-aligned duration matching the transcoder's actual cut
+            // points, clamped by the remaining media at the tail. A fixed 6.0
+            // drifts against the real timeline on a non-integer-fps source and
+            // desyncs A/V over a long title.
+            body.push_str(&format!("#EXTINF:{len:.3},\n"));
+            body.push_str(&(self.segment_uri)(seg));
+            body.push('\n');
+        }
+        body.push_str("#EXT-X-ENDLIST\n");
+        body
+    }
+}
+
+/// The `#EXT-X-START` resume hint a playlist should advertise, from the
+/// `StartTimeTicks` the client embedded in the playlist URL. `None` when it
+/// asked for the beginning, so the tag is simply absent.
+fn resume_offset_secs(req: &HttpRequest) -> Option<f64> {
+    let ticks = parse_start_time_ticks_qs(req.query_string());
+    (ticks > 0).then(|| Ticks(ticks).seconds())
+}
+
 /// handed.
 fn playlist_segments(
     duration_secs: f64,
@@ -3893,5 +3896,121 @@ mod tests {
         let body = test::call_and_read_body(&app, req).await;
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("/videos/9/hls1/720p/0.ts"), "{s}");
+    }
+
+    /// Tag order is fixed by the shared renderer, so these read as one list.
+    fn tags(body: &str) -> Vec<&str> {
+        body.lines().filter(|l| l.starts_with("#EXT")).collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn every_surface_renders_one_playlist_skeleton() {
+        // Four surfaces used to build four bodies. The tags they share are
+        // now emitted once, so a tag cannot be added to three playlists and
+        // forgotten in the fourth.
+        let uri = |seg: u32| format!("/videos/9/hls1/720p/{seg}.ts?q=1");
+        let mpegts = MediaPlaylist {
+            version: 3,
+            independent_segments: true,
+            init_uri: None,
+            start_offset_secs: None,
+            segment_uri: &uri,
+        }
+        .render(20.0, Some(23_976));
+
+        let cmaf_uri = |seg: u32| format!("/videos/9/h264cmaf/{seg}.m4s?q=1");
+        let cmaf = MediaPlaylist {
+            version: 7,
+            independent_segments: true,
+            init_uri: Some("/videos/9/h264cmaf/init.mp4?q=1".into()),
+            start_offset_secs: Some(12.5),
+            segment_uri: &cmaf_uri,
+        }
+        .render(20.0, Some(23_976));
+
+        // The header is fixed; the EXTINFs come from the grid, so this
+        // asserts the skeleton without re-stating frame-snapped durations
+        // (a literal here would agree with a drifting grid and prove nothing).
+        let mut expected = vec![
+            "#EXTM3U".to_string(),
+            "#EXT-X-VERSION:3".to_string(),
+            "#EXT-X-INDEPENDENT-SEGMENTS".to_string(),
+            "#EXT-X-PLAYLIST-TYPE:VOD".to_string(),
+            "#EXT-X-TARGETDURATION:6".to_string(),
+            "#EXT-X-MEDIA-SEQUENCE:0".to_string(),
+        ];
+        for (_seg, _start, len) in playlist_segments(20.0, Some(23_976)) {
+            expected.push(format!("#EXTINF:{len:.3},"));
+        }
+        expected.push("#EXT-X-ENDLIST".to_string());
+        assert_eq!(tags(&mpegts), expected, "{mpegts}");
+
+        // The fMP4 surface differs by exactly two tags, both in fixed
+        // positions: the init map (which must precede any media) and the
+        // resume hint.
+        assert!(
+            cmaf.contains("#EXT-X-MAP:URI=\"/videos/9/h264cmaf/init.mp4?q=1\"\n"),
+            "{cmaf}"
+        );
+        let map_at = cmaf.find("#EXT-X-MAP").expect("map tag");
+        let first_media = cmaf.find("#EXTINF").expect("media");
+        assert!(map_at < first_media, "init map must precede media: {cmaf}");
+        assert!(
+            cmaf.contains("#EXT-X-START:TIME-OFFSET=12.500,PRECISE=YES"),
+            "{cmaf}"
+        );
+
+        // Everything else is shared, tag for tag.
+        let strip = |b: &str| {
+            tags(b)
+                .into_iter()
+                .filter(|t| !t.starts_with("#EXT-X-MAP") && !t.starts_with("#EXT-X-START"))
+                .map(|t| t.replace("VERSION:7", "VERSION:3"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&mpegts), strip(&cmaf));
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_playlist_advertises_exactly_the_segments_the_grid_defines() {
+        // A playlist that enumerated more segments than the bounds check
+        // accepts would 404 its own tail.
+        let uri = |seg: u32| format!("/videos/9/vp9/{seg}.m4s");
+        let body = MediaPlaylist {
+            version: 7,
+            independent_segments: true,
+            init_uri: None,
+            start_offset_secs: None,
+            segment_uri: &uri,
+        }
+        .render(20.0, Some(23_976));
+        let expected: Vec<(u32, f64, f64)> = playlist_segments(20.0, Some(23_976)).collect();
+        assert_eq!(
+            body.matches("#EXTINF").count(),
+            expected.len(),
+            "one EXTINF per grid segment: {body}"
+        );
+        for (seg, _s, _l) in expected {
+            assert_eq!(
+                body.matches(&format!("/videos/9/vp9/{seg}.m4s")).count(),
+                1,
+                "segment {seg} listed exactly once: {body}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_playlist_omits_the_resume_hint_when_starting_from_zero() {
+        let uri = |seg: u32| format!("/videos/9/vp9/{seg}.m4s");
+        let body = MediaPlaylist {
+            version: 7,
+            independent_segments: false,
+            init_uri: None,
+            start_offset_secs: None,
+            segment_uri: &uri,
+        }
+        .render(12.0, None);
+        assert!(!body.contains("#EXT-X-START"), "{body}");
+        assert!(!body.contains("#EXT-X-INDEPENDENT-SEGMENTS"), "{body}");
     }
 }
