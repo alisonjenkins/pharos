@@ -152,9 +152,11 @@ pub struct SegmentOpts {
     /// value here meaning "encode audio for this segment".
     pub audio: AudioDelivery,
     pub video_bitrate_bps: Option<u64>,
-    /// Jellyfin-style ticks (10,000,000 per second). 0 = start of stream.
-    pub start_position_ticks: u64,
-    pub duration_ticks: Option<u64>,
+    /// Where this segment sits on the shared timeline. Built only from a
+    /// segment index and the source frame rate — see
+    /// [`pharos_core::SegmentWindow`], whose fields are private precisely so
+    /// a delivery path cannot state a position of its own.
+    pub window: pharos_core::SegmentWindow,
     /// Source-relative audio-stream index (`-map 0:a:{N}`).
     pub audio_source_stream_index: Option<u32>,
     /// Subtitle-relative stream index for subtitle burn-in (image OR text).
@@ -201,8 +203,8 @@ impl SegmentOpts {
             audio: None,
             video_bitrate_bps: self.video_bitrate_bps,
             audio_bitrate_bps: self.audio_bitrate_bps(),
-            start_position_ticks: self.start_position_ticks,
-            duration_ticks: self.duration_ticks,
+            start_position_ticks: self.window.start_ticks(),
+            duration_ticks: Some(self.window.duration_ticks()),
             audio_source_stream_index: self.audio_source_stream_index,
             burn_subtitle_stream_index: self.burn_subtitle_stream_index,
             burn_subtitle_is_text: self.burn_subtitle_is_text,
@@ -230,8 +232,7 @@ mod tests {
             }),
 
             video_bitrate_bps: Some(3_000_000),
-            start_position_ticks: 60_060_000,
-            duration_ticks: Some(60_060_000),
+            window: pharos_core::SegmentWindow::for_segment(10, None),
             audio_source_stream_index: Some(1),
             burn_subtitle_stream_index: Some(0),
             burn_subtitle_is_text: true,
@@ -251,8 +252,8 @@ mod tests {
         assert_eq!(s.audio_codec(), Some(SegmentAudio::Aac));
         assert_eq!(t.audio_bitrate_bps, Some(128_000));
         assert_eq!(t.video_bitrate_bps, Some(3_000_000));
-        assert_eq!(t.start_position_ticks, 60_060_000);
-        assert_eq!(t.duration_ticks, Some(60_060_000));
+        assert_eq!(t.start_position_ticks, s.window.start_ticks());
+        assert_eq!(t.duration_ticks, Some(s.window.duration_ticks()));
         assert_eq!(t.audio_source_stream_index, Some(1));
         assert_eq!(t.burn_subtitle_stream_index, Some(0));
         assert!(t.burn_subtitle_is_text);
@@ -314,8 +315,7 @@ mod tests {
                 video: Some(SegmentVideo::H264),
                 audio,
                 video_bitrate_bps: Some(2_000_000),
-                start_position_ticks: 0,
-                duration_ticks: Some(60_060_000),
+                window: pharos_core::SegmentWindow::for_segment(0, None),
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
                 burn_subtitle_is_text: false,

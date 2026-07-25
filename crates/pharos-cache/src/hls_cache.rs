@@ -656,10 +656,8 @@ impl HlsSegmentCache {
         // muxed mpegts surface ended up with a per-segment AAC encode while
         // the browser surface had a continuous one.
         if attempt_opts.audio.is_some() && attempt_opts.muxed_audio_source.is_none() {
-            let start_secs = opts.start_position_ticks as f64 / 10_000_000.0;
-            let dur_secs = opts
-                .duration_ticks
-                .map_or(pharos_core::SEGMENT_SECONDS, |t| t as f64 / 10_000_000.0);
+            let start_secs = opts.window.start_seconds();
+            let dur_secs = opts.window.duration_seconds();
             attempt_opts.muxed_audio_source = Some(
                 self.ensure_continuous_audio_covering(
                     source,
@@ -726,7 +724,7 @@ impl HlsSegmentCache {
                         burn = opts.burn_subtitle_stream_index.is_some(),
                         burn_idx = opts.burn_subtitle_stream_index,
                         audio_idx = opts.audio_source_stream_index,
-                        seek_secs = opts.start_position_ticks as f64 / 10_000_000.0,
+                        seek_secs = opts.window.start_seconds(),
                         preroll_secs = attempt_opts.decode_preroll_seconds,
                         source = %source.display(),
                         "hls segment transcode failed"
@@ -823,8 +821,10 @@ impl HlsSegmentCache {
         // devices / failed-device retry churn (e.g. phantom GPUs), high
         // encode_ms = a genuinely slow encoder. Fields land on the HTTP request
         // span this runs under.
-        let seek_secs = opts.start_position_ticks as f64 / 10_000_000.0;
-        let seg_secs = opts.duration_ticks.map(|t| t as f64 / 10_000_000.0);
+        let seek_secs = opts.window.start_seconds();
+        // Always known now that the window comes from the grid — it used to
+        // be an Option because a caller could omit the duration.
+        let seg_secs = opts.window.duration_seconds();
         tracing::info!(
             media.id = media_id,
             seg = seg_index,
@@ -847,7 +847,7 @@ impl HlsSegmentCache {
         // to attribute the stall — the 170-225 s outliers observed live
         // (2026-07-14, Avatar burn path) were only findable by correlating
         // INFO lines after the fact.
-        let realtime_budget_ms = seg_secs.unwrap_or(6.0) * 1000.0;
+        let realtime_budget_ms = seg_secs * 1000.0;
         if (transcode_ms as f64) > 3.0 * realtime_budget_ms {
             tracing::warn!(
                 media.id = media_id,
@@ -1858,8 +1858,10 @@ mod tests {
             }),
 
             video_bitrate_bps: Some(2_000_000),
-            start_position_ticks: 1_625_000_000,
-            duration_ticks: Some(60_060_000),
+            window: pharos_core::SegmentWindow::for_segment(
+                27,
+                pharos_core::FrameRate::from_mille(23_976),
+            ),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
@@ -1975,8 +1977,7 @@ mod tests {
                 None => AudioDelivery::Separate,
             },
             video_bitrate_bps,
-            start_position_ticks: 0,
-            duration_ticks: Some(60_060_000),
+            window: pharos_core::SegmentWindow::for_segment(0, None),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
@@ -2349,8 +2350,7 @@ mod tests {
             video: None,
             audio: AudioDelivery::Separate,
             video_bitrate_bps: None,
-            start_position_ticks: 0,
-            duration_ticks: None,
+            window: pharos_core::SegmentWindow::for_segment(0, None),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
@@ -2374,8 +2374,7 @@ mod tests {
             video: None,
             audio: AudioDelivery::Separate,
             video_bitrate_bps: None,
-            start_position_ticks: 0,
-            duration_ticks: None,
+            window: pharos_core::SegmentWindow::for_segment(0, None),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
@@ -2402,8 +2401,7 @@ mod tests {
             video: None,
             audio: AudioDelivery::Separate,
             video_bitrate_bps: None,
-            start_position_ticks: 0,
-            duration_ticks: None,
+            window: pharos_core::SegmentWindow::for_segment(0, None),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
             burn_subtitle_is_text: false,
@@ -2443,8 +2441,7 @@ mod tests {
                 video: None,
                 audio: AudioDelivery::Separate,
                 video_bitrate_bps: None,
-                start_position_ticks: 0,
-                duration_ticks: None,
+                window: pharos_core::SegmentWindow::for_segment(0, None),
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
                 burn_subtitle_is_text: false,
@@ -2464,8 +2461,7 @@ mod tests {
                 video: None,
                 audio: AudioDelivery::Separate,
                 video_bitrate_bps: None,
-                start_position_ticks: 0,
-                duration_ticks: None,
+                window: pharos_core::SegmentWindow::for_segment(0, None),
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
                 burn_subtitle_is_text: false,
