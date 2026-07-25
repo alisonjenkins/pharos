@@ -2852,6 +2852,14 @@ pub struct PersistedTranscodeSession {
     pub media_id: MediaId,
     pub decision_json: String,
     pub source_probe_json: String,
+    /// JSON array of ABSOLUTE subtitle stream indices this client must have
+    /// BURNED, resolved from the SubtitleProfiles it declared at PlaybackInfo.
+    ///
+    /// Persisted rather than recomputed because the client's profile is visible
+    /// on that one request only — a rehydrated session that lost it would fall
+    /// back to burning every requested subtitle, which is exactly the expensive
+    /// default this set exists to avoid.
+    pub burn_subtitle_indices_json: String,
 }
 
 /// Cross-replica store for [`PersistedTranscodeSession`]s keyed on

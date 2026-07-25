@@ -131,6 +131,7 @@ async fn segment_410s_after_session_removed_even_when_cached() {
                     bitrate_bps: Some(500_000),
                     ..Default::default()
                 },
+                burn_subtitle_indices: Default::default(),
             },
         )
         .await

@@ -834,6 +834,28 @@ async fn extract_session_bitrate_cap(state: &AppState, req: &HttpRequest) -> Opt
     }
 }
 
+/// The subtitle streams this play session established must be BURNED for its
+/// client, or `None` when no session is on the request (or it has expired).
+///
+/// `None` and an EMPTY set mean different things and must not be conflated: an
+/// empty set is a client that renders every text track itself, while `None` is
+/// a client whose capabilities are simply unknown — see
+/// [`super::subtitle_burn::decide_segment_burn`], which burns on the latter so
+/// an unidentifiable client is never left with no subtitle at all.
+async fn session_burn_indices(
+    state: &AppState,
+    req: &HttpRequest,
+) -> Option<std::collections::BTreeSet<u32>> {
+    let psid = req
+        .query_string()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("PlaySessionId"))
+        .map(|(_, v)| v.to_string())?;
+    let session = state.transcode_sessions.get(&psid).await.ok().flatten()?;
+    Some(session.burn_subtitle_indices)
+}
+
 async fn variant_playlist_main(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1232,37 +1254,53 @@ fn build_segment_opts(
     let audio_stream_index = audio_stream_index.and_then(|abs| {
         codec_relative_index(item.probe.audio_tracks.iter().map(|t| t.stream_index), abs)
     });
-    // Task 6 — burn either IMAGE subtitles (PGS/VOBSUB, unchanged) OR a
-    // TEXT/ASS subtitle the client explicitly asked to burn (Tasks 4/5 only
-    // forward a text index here for burn-required clients; the default path
-    // still delivers text subs out-of-band as a separate External
-    // rendition). `burn_subtitle_is_text` tells Task 7's transcoder which
+    // Burn either IMAGE subtitles (PGS/VOBSUB — no text rendition can be
+    // derived from a bitmap) or a TEXT/ASS subtitle THIS client cannot render
+    // itself. The session carries that judgement, resolved from the
+    // SubtitleProfiles the client declared at PlaybackInfo; a client merely
+    // ASKING for a subtitle index does not make a burn necessary, and honouring
+    // the request literally is what put a filter graph on every segment of an
+    // all-`subrip` file. `burn_subtitle_is_text` tells the transcoder which
     // ffmpeg filter graph to build.
-    let mut subtitle_is_text = false;
-    let subtitle_stream_index = subtitle_stream_index.and_then(|abs| {
-        let codec = item
-            .probe
+    let codec = subtitle_stream_index.and_then(|abs| {
+        item.probe
             .subtitle_tracks
             .iter()
             .find(|t| t.stream_index == abs)
-            .map(|t| t.codec.clone().unwrap_or_default());
-        let is_image = codec
-            .as_deref()
-            .map(super::subtitles::is_image_subtitle_codec)
-            .unwrap_or(false);
-        let is_text = codec
-            .as_deref()
-            .map(|c| pharos_jellyfin_api::dto::is_text_subtitle_codec(Some(c)))
-            .unwrap_or(false);
-        if !is_image && !is_text {
-            return None;
-        }
-        subtitle_is_text = is_text;
-        codec_relative_index(
-            item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
-            abs,
-        )
+            .and_then(|t| t.codec.clone())
     });
+    let verdict = super::subtitle_burn::decide_segment_burn(
+        codec.as_deref(),
+        subtitle_stream_index,
+        session.as_ref().map(|s| &s.burn_subtitle_indices),
+    );
+    let mut subtitle_is_text = false;
+    let subtitle_stream_index = verdict
+        .burns()
+        .then(|| {
+            subtitle_is_text = codec
+                .as_deref()
+                .map(|c| pharos_jellyfin_api::dto::is_text_subtitle_codec(Some(c)))
+                .unwrap_or(false);
+            subtitle_stream_index.and_then(|abs| {
+                codec_relative_index(
+                    item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
+                    abs,
+                )
+            })
+        })
+        .flatten();
+    if !matches!(verdict, super::subtitle_burn::BurnVerdict::NotRequested) {
+        tracing::debug!(
+            media.id = item.id,
+            subtitle.codec = codec.as_deref().unwrap_or("?"),
+            subtitle.verdict = verdict.label(),
+            burns = verdict.burns(),
+            session_known = session.is_some(),
+            "mpegts segment subtitle burn decision"
+        );
+    }
+    metrics::counter!("pharos_subtitle_burn_total", "verdict" => verdict.label()).increment(1);
 
     if let Some(session) = session {
         match session.decision {
@@ -2625,31 +2663,57 @@ async fn fmp4_segment_opts(
     // still delivers text subs out-of-band as a separate External
     // rendition). `burn_subtitle_is_text` tells Task 7's transcoder which
     // ffmpeg filter graph to build.
-    let mut sub_is_text = false;
-    let sub_rel = subtitle_stream_index.and_then(|abs| {
-        let codec = item
-            .probe
+    // A client ASKING for a burn does not make one necessary. jellyfin-web
+    // appends `SubtitleStreamIndex` to every segment URL whenever the viewer
+    // has subtitles switched on, including for the plain-text tracks it renders
+    // perfectly well itself — so honouring the request literally put a filter
+    // graph on every segment of a file whose 32 tracks were all `subrip`, and
+    // the resulting encode queue timed the player out. The session records what
+    // THIS client actually cannot render (resolved from its SubtitleProfiles at
+    // PlaybackInfo); consult that instead of assuming.
+    let session_burn = session_burn_indices(state, req).await;
+    let codec = subtitle_stream_index.and_then(|abs| {
+        item.probe
             .subtitle_tracks
             .iter()
             .find(|t| t.stream_index == abs)
-            .map(|t| t.codec.clone().unwrap_or_default());
-        let is_image = codec
-            .as_deref()
-            .map(super::subtitles::is_image_subtitle_codec)
-            .unwrap_or(false);
-        let is_text = codec
+            .and_then(|t| t.codec.clone())
+    });
+    let verdict = super::subtitle_burn::decide_segment_burn(
+        codec.as_deref(),
+        subtitle_stream_index,
+        session_burn.as_ref(),
+    );
+    let mut sub_is_text = false;
+    let sub_rel = verdict.burns().then(|| {
+        sub_is_text = codec
             .as_deref()
             .map(|c| pharos_jellyfin_api::dto::is_text_subtitle_codec(Some(c)))
             .unwrap_or(false);
-        if !is_image && !is_text {
-            return None;
-        }
-        sub_is_text = is_text;
-        codec_relative_index(
-            item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
-            abs,
-        )
+        subtitle_stream_index.and_then(|abs| {
+            codec_relative_index(
+                item.probe.subtitle_tracks.iter().map(|t| t.stream_index),
+                abs,
+            )
+        })
     });
+    let sub_rel = sub_rel.flatten();
+    // The verdict, at the point it is made. `burn=true` used to appear only
+    // downstream in the cache line with nothing saying what asked for it, so a
+    // needless burn and a necessary one looked identical.
+    if !matches!(verdict, super::subtitle_burn::BurnVerdict::NotRequested) {
+        tracing::debug!(
+            media.id = item.id,
+            seg,
+            subtitle.requested = subtitle_stream_index,
+            subtitle.codec = codec.as_deref().unwrap_or("?"),
+            subtitle.verdict = verdict.label(),
+            burns = verdict.burns(),
+            session_known = session_burn.is_some(),
+            "segment subtitle burn decision"
+        );
+    }
+    metrics::counter!("pharos_subtitle_burn_total", "verdict" => verdict.label()).increment(1);
     SegmentOpts {
         container: SegmentContainer::Fmp4,
         video: Some(video),
@@ -3712,6 +3776,7 @@ mod tests {
                 target_audio_codec: Some("aac".into()),
             },
             source_probe: item.probe.clone(),
+            burn_subtitle_indices: Default::default(),
         };
         let opts = build_segment_opts(Some(session), &item, 0, 60_000_000, None, None);
         assert!(matches!(
@@ -3730,6 +3795,76 @@ mod tests {
             opts.container,
             pharos_transcode::SegmentContainer::Mpegts
         ));
+    }
+
+    /// A session for a client that renders text subtitles itself. The empty
+    /// burn set is the point: it means "this client needs nothing burned",
+    /// which is different from having no session at all.
+    fn session_burning_nothing(
+        item: &pharos_core::MediaItem,
+    ) -> crate::transcode_sessions::TranscodeSession {
+        crate::transcode_sessions::TranscodeSession {
+            media_id: item.id,
+            decision: crate::api::jellyfin::device_profile::Decision::Transcode {
+                target_container: "ts".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: None,
+            },
+            source_probe: item.probe.clone(),
+            burn_subtitle_indices: Default::default(),
+        }
+    }
+
+    /// The live outage: jellyfin-web puts `SubtitleStreamIndex=3` on every
+    /// segment URL whenever the viewer has subtitles on, including for the
+    /// `subrip` tracks Firefox renders itself. Burning it cost a filter graph
+    /// per segment and a 60-second encode queue — the client timed out at 20 s
+    /// and retried, which made the queue worse.
+    #[::core::prelude::v1::test]
+    fn a_text_sub_the_session_says_the_client_renders_is_not_burned() {
+        let item = item_with_subs(); // abs 3 = "ass" (text), abs 2 = image
+        let opts = build_segment_opts(
+            Some(session_burning_nothing(&item)),
+            &item,
+            0,
+            60_000_000,
+            None,
+            Some(3),
+        );
+        assert_eq!(
+            opts.burn_subtitle_stream_index, None,
+            "a text sub the client renders itself must not be burned"
+        );
+        assert!(!opts.burn_subtitle_is_text);
+    }
+
+    /// An image subtitle has no text rendition to fall back to, so an empty
+    /// burn set must NOT stop it burning — otherwise the viewer gets nothing.
+    #[::core::prelude::v1::test]
+    fn an_image_sub_still_burns_even_when_the_session_burns_nothing() {
+        let item = item_with_subs();
+        let opts = build_segment_opts(
+            Some(session_burning_nothing(&item)),
+            &item,
+            0,
+            60_000_000,
+            None,
+            Some(2),
+        );
+        assert_eq!(opts.burn_subtitle_stream_index, Some(0));
+    }
+
+    /// A track the session DOES list still burns — the ASS-on-Android case
+    /// (B104) must not regress into "never burn text".
+    #[::core::prelude::v1::test]
+    fn a_text_sub_the_session_lists_still_burns() {
+        let item = item_with_subs();
+        let mut session = session_burning_nothing(&item);
+        session.burn_subtitle_indices.insert(3);
+        let opts = build_segment_opts(Some(session), &item, 0, 60_000_000, None, Some(3));
+        assert_eq!(opts.burn_subtitle_stream_index, Some(1));
+        assert!(opts.burn_subtitle_is_text);
     }
 
     #[::core::prelude::v1::test]
