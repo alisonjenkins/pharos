@@ -68,6 +68,40 @@ async fn a_chapter_image_request_reaches_the_chapter_handler() {
     );
 }
 
+/// The Android / Google TV kotlin SDK spells the same request
+/// `/Images/chapter?imageIndex=N` — index in the QUERY, not the path. Observed
+/// live 2026-07-25 as a burst of 400s while the app rendered a chapter strip.
+/// Both spellings are Jellyfin-legal; pharos routed only the path form.
+#[actix_web::test]
+async fn the_kotlin_sdk_chapter_spelling_reaches_the_chapter_handler() {
+    let cache = tempfile::tempdir().unwrap();
+    let (state, id) = seed_movie(cache.path()).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri(&format!(
+            "/Items/{id:032x}/Images/chapter?tag=70eac286f5b08f71&imageIndex=2"
+        ))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_ne!(
+        resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST,
+        "`chapter` with a query index must not be parsed as an ImageRole"
+    );
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::NOT_FOUND,
+        "an item with no chapters answers 'chapter index out of range'"
+    );
+}
+
 /// The fix must not cost the generic indexed route its own dispatch: a real
 /// `ImageRole` with an index still resolves, and a genuinely unknown type is
 /// still a 400.
