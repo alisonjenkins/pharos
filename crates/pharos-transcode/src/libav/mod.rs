@@ -18,11 +18,13 @@ pub mod frames;
 #[cfg(feature = "backend-lib")]
 pub mod image;
 #[cfg(feature = "backend-lib")]
+mod logbridge;
+#[cfg(feature = "backend-lib")]
 pub mod probe;
 
 /// Initialise libav once and quiet its logging. Drop-in for `ffmpeg::init()`
 /// — same return type — but the first call also caps libav's global log
-/// level and enables duplicate-collapsing.
+/// level and redirects its output onto `tracing`.
 ///
 /// libav writes decoder/demuxer diagnostics straight to the process's
 /// stderr (fd 2), which in the crash-isolated `transcode-worker` is
@@ -31,8 +33,10 @@ pub mod probe;
 /// in a sequence", swscaler "deprecated pixel format") emitted ~25k lines in
 /// ~13s — a firehose that evicted every structured JSON log from `kubectl
 /// logs` within minutes and made an incident nearly undiagnosable. Capping
-/// to `Error` drops that per-frame chatter while still surfacing genuine
-/// faults; `SKIP_REPEATED` collapses consecutive identical lines.
+/// to `Error` drops the per-frame chatter *below* that level, but the worst
+/// offenders (damaged sources: "Invalid NAL unit size", "EBML header parsing
+/// failed") log AT `Error` and so survived the cap. See [`logbridge`] for the
+/// rest of the story.
 #[cfg(feature = "backend-lib")]
 pub fn init() -> Result<(), ffmpeg_the_third::Error> {
     use ffmpeg_the_third as ffmpeg;
@@ -40,7 +44,7 @@ pub fn init() -> Result<(), ffmpeg_the_third::Error> {
     static QUIET: std::sync::Once = std::sync::Once::new();
     QUIET.call_once(|| {
         ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Error);
-        ffmpeg::util::log::set_flags(ffmpeg::util::log::Flags::SKIP_REPEATED);
+        logbridge::install();
     });
     Ok(())
 }

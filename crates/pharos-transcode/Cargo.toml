@@ -12,6 +12,7 @@ bincode = "1"
 bytes.workspace = true
 futures-core = "0.3"
 libc = "0.2"
+metrics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec = { version = "1", features = ["serde"] }

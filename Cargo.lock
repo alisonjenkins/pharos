@@ -3119,6 +3119,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "libc",
+ "metrics",
  "pharos-core",
  "rusty-chromaprint",
  "serde",
