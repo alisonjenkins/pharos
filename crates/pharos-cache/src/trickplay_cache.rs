@@ -50,6 +50,31 @@ pub struct Layout {
 pub const TILE_GRID: u32 = 10;
 const TILES_PER_FILE: u32 = TILE_GRID * TILE_GRID;
 
+/// The height ffmpeg's `scale={target_width}:-2` actually produces for a
+/// `src_width × src_height` source — i.e. the aspect-preserved height rounded
+/// to the NEAREST multiple of 2.
+///
+/// This must mirror the scaler exactly, because the tiles are rendered by
+/// ffmpeg (`scale=W:-2,tile=10x10`) while the `Height` a client uses to crop a
+/// row out of the sheet comes from [`Layout`]. Two independent roundings is the
+/// whole bug class: the previous form truncated the exact height and *then*
+/// floored to even, which is a different function. For a 1920×800 source (the
+/// common 2.40:1 scope framing) at width 320 the exact height is 133.33 — ffmpeg
+/// emits 134, the old formula advertised 132, so a client cropping row `r` at
+/// `r * 132` drifted 2 px per row and by the last row of the 10×10 grid was 18 px
+/// out, bleeding the neighbouring thumbnail into every seek preview.
+///
+/// Integer-only so it cannot disagree with the scaler through float rounding:
+/// `round(exact / 2) * 2`, with the halving rounded by `(num + den) / (2 * den)`.
+/// Exact `.5` cases truncate down, which is what ffmpeg does too (verified
+/// against `scale=320:-2` for 1920×804 and 1920×1080).
+fn even_scaled_height(src_width: u32, src_height: u32, target_width: u32) -> u32 {
+    let num = target_width as u64 * src_height as u64;
+    let den = src_width as u64;
+    let halves = (num + den) / (2 * den);
+    ((halves * 2).max(2)).min(u32::MAX as u64) as u32
+}
+
 impl Layout {
     /// Compute layout from duration + source dimensions + the
     /// configured width + interval. Returns `None` when duration or
@@ -72,13 +97,7 @@ impl Layout {
             return None;
         }
         let tile_count = thumb_count.div_ceil(TILES_PER_FILE);
-        let height = {
-            let h = (target_width as u64 * src_height as u64 + (src_width as u64 / 2))
-                / src_width as u64;
-            // Even (ffmpeg's `-2` scale flag does the same).
-            let h = (h / 2) * 2;
-            h.max(2) as u32
-        };
+        let height = even_scaled_height(src_width, src_height, target_width);
         Some(Layout {
             width: target_width,
             height,
@@ -889,6 +908,30 @@ mod tests {
         assert_eq!(l.height, 180);
         assert_eq!(l.thumb_count, 9);
         assert_eq!(l.tile_count, 1);
+    }
+
+    #[test]
+    fn advertised_height_matches_the_scaler_for_scope_aspect() {
+        // The tiles are rendered by ffmpeg `scale=W:-2` (round to the NEAREST
+        // even height); the advertised Height is what a client multiplies by the
+        // row index to crop one thumbnail out of the 10×10 sheet. A 1920×800
+        // source (2.40:1 scope, extremely common for films) has an exact height
+        // of 133.33 at width 320: ffmpeg emits 134. Advertising 132 — what
+        // truncate-then-floor-to-even produced — put the last row 18 px out and
+        // bled the next thumbnail into every seek preview. Verified against a
+        // real `scale=320:-2` run.
+        assert_eq!(even_scaled_height(1920, 800, 320), 134);
+        assert_eq!(even_scaled_height(1920, 800, 1280), 534);
+        let l = Layout::compute(90_000, 1920, 800, 320, 10_000).unwrap();
+        assert_eq!(l.height, 134);
+        // Already-even and already-exact cases are unchanged.
+        assert_eq!(even_scaled_height(1920, 1080, 320), 180);
+        assert_eq!(even_scaled_height(1920, 804, 320), 134);
+        // An exact .5 in half-height units truncates down — matching ffmpeg
+        // (1920×804 → 67.5 halves → 134, 1920×1080 → 90.5 halves → 180).
+        assert_eq!(even_scaled_height(1280, 534, 1280), 534);
+        // Degenerate sources still yield a legal even height.
+        assert_eq!(even_scaled_height(1920, 1, 2), 2);
     }
 
     #[test]
