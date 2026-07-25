@@ -58,13 +58,35 @@ const REQUEST_SPACING: Duration = Duration::from_millis(120);
 /// nothing the loop switches to the long `refresh_interval_secs` idle instead.
 const DRAIN_GAP: Duration = Duration::from_secs(30);
 
-/// How long the enrichment loop waits before its next pass, given how many
-/// items the pass just enriched. Non-zero → the pool likely still holds work
-/// (or the batch was capped), so re-run after the short `drain` gap. Zero →
-/// drained; idle the long `idle` interval, which also re-admits newly-scanned
-/// media and TTL-expired rows on the next wake.
-fn next_delay(enriched: usize, drain: Duration, idle: Duration) -> Duration {
-    if enriched > 0 {
+/// Outcome of one enrichment pass, driving both the log line and the loop
+/// cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassStats {
+    /// Items newly matched + persisted this pass (search/nfo hits) — the
+    /// observable "enriched" count.
+    pub enriched: usize,
+    /// Whether the pass had any eligible work at all (the item query returned
+    /// rows, or the series query returned candidates). This — NOT the hit
+    /// count — decides the cadence: a pass that pulls 5000 items and marks
+    /// them all `none`/transient enriches zero HITS but still made real
+    /// progress (those rows now drop out), so the loop must keep draining, not
+    /// idle for hours. Only a genuinely empty pass (nothing eligible) idles.
+    pub had_work: bool,
+}
+
+/// How long the enrichment loop waits before its next pass. `had_work` → the
+/// eligible set was non-empty, so drain progress was made and more likely
+/// remains: re-run after the short `drain` gap. `!had_work` → nothing was
+/// eligible (fully drained), so idle the long `idle` interval, which also
+/// re-admits newly-scanned media and TTL-expired rows on the next wake.
+///
+/// Keying on `had_work` rather than the hit count is load-bearing: the backlog
+/// is dominated by rows that resolve to `none` (no confident match) or a
+/// transient miss, neither of which is a "hit" — but processing them IS
+/// progress (they get stamped and leave the eligible set). Idling 6h after
+/// every such pass stalled convergence for days.
+fn next_delay(had_work: bool, drain: Duration, idle: Duration) -> Duration {
+    if had_work {
         drain
     } else {
         idle
@@ -132,7 +154,7 @@ pub fn spawn(
                 continue;
             }
             let now = now_secs();
-            let enriched = match run(
+            let stats = match run(
                 &stores,
                 &bg_io,
                 cache.as_ref(),
@@ -143,16 +165,22 @@ pub fn spawn(
             )
             .await
             {
-                Ok(n) => {
-                    tracing::info!(enriched = n, "T9 metadata backfill: pass complete");
-                    n
+                Ok(s) => {
+                    tracing::info!(enriched = s.enriched, "T9 metadata backfill: pass complete");
+                    s
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "T9 metadata backfill: pass aborted");
-                    0
+                    // Treat a hard pass error as "no work" → back off on the
+                    // long idle rather than hammering a failing provider on the
+                    // short drain cadence.
+                    PassStats {
+                        enriched: 0,
+                        had_work: false,
+                    }
                 }
             };
-            tokio::time::sleep(next_delay(enriched, DRAIN_GAP, idle)).await;
+            tokio::time::sleep(next_delay(stats.had_work, DRAIN_GAP, idle)).await;
         }
     });
 }
@@ -172,7 +200,7 @@ pub(crate) async fn run<Tm, Tv, S>(
     tvdb: Option<&Tv>,
     cfg: &MetadataConfig,
     now: i64,
-) -> DomainResult<usize>
+) -> DomainResult<PassStats>
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
@@ -180,7 +208,10 @@ where
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
     if tmdb.is_none() && tvdb.is_none() {
-        return Ok(0);
+        return Ok(PassStats {
+            enriched: 0,
+            had_work: false,
+        });
     }
     // Items whose last enrichment predates this cutoff (or never matched) are
     // eligible; `manual`/`nfo_id` rows are excluded by the query itself.
@@ -189,6 +220,9 @@ where
         .items_needing_match(cfg.max_per_pass, ttl_cutoff)
         .await?;
     let mut enriched = 0usize;
+    // Any eligible row (even one that resolves to `none`/transient) is work:
+    // processing it advances the backlog, so the loop should keep draining.
+    let mut had_work = !items.is_empty();
     if !items.is_empty() {
         tracing::info!(total = items.len(), "T9 metadata backfill: enriching items");
         for item in items {
@@ -207,16 +241,17 @@ where
     // when no items needed matching: episodes and shows drain independently.
     if let Some(tv) = tvdb {
         match enrich_series_pass(store, bg_io, cache, tv, cfg, now).await {
-            Ok(n) => {
+            Ok((n, series_had_work)) => {
                 if n > 0 {
                     tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
                 }
                 enriched += n;
+                had_work |= series_had_work;
             }
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
         }
     }
-    Ok(enriched)
+    Ok(PassStats { enriched, had_work })
 }
 
 /// The outcome of resolving one item against a single provider.
@@ -748,7 +783,7 @@ async fn enrich_series_pass<Tv, S>(
     tvdb: &Tv,
     cfg: &MetadataConfig,
     now: i64,
-) -> DomainResult<usize>
+) -> DomainResult<(usize, bool)>
 where
     Tv: OnlineEnricher,
     S: SeriesMetadataStore,
@@ -757,6 +792,9 @@ where
     let candidates = store
         .series_needing_match(cfg.max_per_pass, ttl_cutoff)
         .await?;
+    // Any eligible show is work (even one that resolves to `none`), so the loop
+    // keeps draining rather than idling — see [`PassStats::had_work`].
+    let had_work = !candidates.is_empty();
     let mut enriched = 0usize;
     for cand in candidates {
         // V6 — one bad show never aborts the pass; log it and carry on.
@@ -767,7 +805,7 @@ where
         }
         tokio::time::sleep(REQUEST_SPACING).await;
     }
-    Ok(enriched)
+    Ok((enriched, had_work))
 }
 
 /// Enrich one show end-to-end: search TVDB by name (+year), fetch the
@@ -924,16 +962,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn next_delay_drains_fast_then_idles_when_pass_is_empty() {
+    fn next_delay_drains_while_work_remains_then_idles_when_empty() {
         let drain = Duration::from_secs(30);
         let idle = Duration::from_secs(21_600);
-        // A pass that enriched anything → come back after the short drain gap;
-        // more items (or a maxed-out batch) likely remain in the pool.
-        assert_eq!(next_delay(1, drain, idle), drain);
-        assert_eq!(next_delay(4999, drain, idle), drain);
-        // A pass that enriched nothing → the pool is drained; idle the long
+        // A pass that had eligible work → come back after the short drain gap,
+        // regardless of whether any of it produced a match hit (rows that
+        // resolve to none/transient are still progress and still drain).
+        assert_eq!(next_delay(true, drain, idle), drain);
+        // A pass with nothing eligible → the pool is drained; idle the long
         // interval before re-checking for new scans / TTL re-admissions.
-        assert_eq!(next_delay(0, drain, idle), idle);
+        assert_eq!(next_delay(false, drain, idle), idle);
     }
 
     /// A network-free [`OnlineEnricher`]: returns a fixed candidate list for
@@ -1081,7 +1119,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n.enriched, 1);
 
         let got = s.get(900_100).await.unwrap();
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
@@ -1131,7 +1169,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n.enriched, 1);
 
         let art = s.artwork_for(900_103).await.unwrap();
         let roles: Vec<&str> = art.iter().map(|(role, _, _)| role.as_str()).collect();
@@ -1161,7 +1199,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(n.enriched, 0);
         // Its id is untouched by the pass.
         assert_eq!(
             s.get(900_101).await.unwrap().match_external_id.as_deref(),
@@ -1188,7 +1226,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(n.enriched, 0);
         assert_eq!(
             s.get(900_102).await.unwrap().match_source.as_deref(),
             Some("none")
@@ -1219,7 +1257,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(n, 0, "a transient miss is not a hit");
+        assert_eq!(n.enriched, 0, "a transient miss is not a hit");
 
         let got = s.get(900_104).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("search"));
@@ -1456,7 +1494,10 @@ mod tests {
         .unwrap();
         // 2 episodes (item loop) + 1 show (series pass) all match the same
         // candidate and enrich in one pass.
-        assert_eq!(n, 3, "two episodes plus the show container enriched");
+        assert_eq!(
+            n.enriched, 3,
+            "two episodes plus the show container enriched"
+        );
 
         let got = s
             .series_metadata_by_keys(&["/tv/Buffy (1997)".into()])
@@ -1493,7 +1534,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            n2, 0,
+            n2.enriched, 0,
             "already-enriched show is not re-processed within the TTL"
         );
     }
@@ -1520,7 +1561,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(n, 0, "no confident hit → nothing counted");
+        assert_eq!(n.enriched, 0, "no confident hit → nothing counted");
 
         let got = s
             .series_metadata_by_keys(&["/tv/Obscure Show".into()])
