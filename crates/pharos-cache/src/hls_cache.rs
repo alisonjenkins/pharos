@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use pharos_transcode::{
-    FfmpegTranscoder, SegmentContainer, SegmentOpts, SegmentVideo, TranscodeOptions,
+    FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo, TranscodeOptions,
 };
 use tokio::io::AsyncReadExt;
 
@@ -66,7 +66,9 @@ struct SegmentKey {
     audio_index: u32,
     /// `NO_SUBTITLE` (-1) = no burn-in.
     subtitle_index: i32,
-    /// kbps; 0 = negotiator default.
+    /// kbps of whichever stream governs these bytes — the video bitrate for a
+    /// video segment, the AUDIO bitrate for an audio-only rendition segment
+    /// (which carries no video bitrate at all). 0 = negotiator default.
     bitrate_kbps: u32,
     /// See `codec_tag` — distinguishes output codec generations.
     codec_tag: u32,
@@ -82,7 +84,11 @@ const NO_SUBTITLE: i32 = -1;
 /// alone made them COLLIDE: an h264-CMAF request read a previously-cached
 /// mpegts segment, fed those bytes to the mp4 parser, and 500'd
 /// ("truncated box at offset 0") — a live prod break.
-fn codec_tag(video: Option<SegmentVideo>, container: SegmentContainer) -> u32 {
+fn codec_tag(
+    video: Option<SegmentVideo>,
+    audio: Option<SegmentAudio>,
+    container: SegmentContainer,
+) -> u32 {
     // Bumping a tag orphans every pre-existing cached segment for that codec
     // (LRU reclaims them) — the mechanism used whenever a change alters the
     // BYTES of a segment for a given (media, index) key.
@@ -91,7 +97,18 @@ fn codec_tag(video: Option<SegmentVideo>, container: SegmentContainer) -> u32 {
     // `SegmentVideo` type (V30). Tag values for the live codecs are preserved
     // so a warm cache survives: muxed-mpegts H264 KEEPS 8, VP9 fMP4 KEEPS 12.
     match (video, container) {
-        (None, _) => 0,
+        // Audio-ONLY rendition segment (music, and the `/hls1/{A64..A256}`
+        // audio ladder). There is no video bitrate to key on, so the AUDIO
+        // codec + container have to carry the distinction here — otherwise
+        // every audio rung of every container collapsed onto tag 0 and the
+        // ladder's rungs served each other's bytes.
+        (None, _) => match (audio, container) {
+            (None, _) => 0,
+            (Some(SegmentAudio::Aac), SegmentContainer::Mpegts) => 20,
+            (Some(SegmentAudio::Aac), SegmentContainer::Fmp4) => 21,
+            (Some(SegmentAudio::Opus), SegmentContainer::Mpegts) => 22,
+            (Some(SegmentAudio::Opus), SegmentContainer::Fmp4) => 23,
+        },
         // Muxed mpegts H264 (the `hls1/*.ts` surface) — unchanged tag so the
         // large warm mpegts cache is preserved across this fix.
         (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 8,
@@ -104,23 +121,38 @@ fn codec_tag(video: Option<SegmentVideo>, container: SegmentContainer) -> u32 {
     }
 }
 
+/// The bitrate that actually determines a segment's bytes: the video bitrate
+/// when there is video, else the audio bitrate.
+///
+/// An audio-only rendition segment carries `video_bitrate_bps: None`, so keying
+/// on the video bitrate alone gave EVERY rung of the audio ladder
+/// (`/hls1/{A64,A96,A128,A192,A256}/{seg}.ts`, advertised as separate
+/// `EXT-X-STREAM-INF`s for music items) the identical key — whichever rung
+/// transcoded first was then served for all of them, silently defeating audio
+/// ABR and handing a 64 kbps client the 256 kbps bytes (or the reverse).
+fn governing_bitrate_bps(video_bitrate_bps: Option<u64>, audio_bitrate_bps: Option<u64>) -> u32 {
+    video_bitrate_bps
+        .or(audio_bitrate_bps)
+        .map(|b| (b / 1000).min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
 fn make_key(
     media_id: u64,
     seg_index: u32,
     audio_index: Option<u32>,
     subtitle_index: Option<u32>,
     video_bitrate_bps: Option<u64>,
-    video_codec_tag: u32,
+    audio_bitrate_bps: Option<u64>,
+    codec_tag: u32,
 ) -> SegmentKey {
     SegmentKey {
         media_id,
         seg_index,
         audio_index: audio_index.unwrap_or(0),
         subtitle_index: subtitle_index.map(|n| n as i32).unwrap_or(NO_SUBTITLE),
-        bitrate_kbps: video_bitrate_bps
-            .map(|b| (b / 1000).min(u32::MAX as u64) as u32)
-            .unwrap_or(0),
-        codec_tag: video_codec_tag,
+        bitrate_kbps: governing_bitrate_bps(video_bitrate_bps, audio_bitrate_bps),
+        codec_tag,
     }
 }
 
@@ -310,7 +342,8 @@ impl HlsSegmentCache {
             audio_index,
             subtitle_index,
             opts.video_bitrate_bps,
-            codec_tag(opts.video, opts.container),
+            opts.audio_bitrate_bps,
+            codec_tag(opts.video, opts.audio, opts.container),
         );
         let path = self.segment_path_keyed(key);
 
@@ -401,7 +434,7 @@ impl HlsSegmentCache {
                 media.id = media_id,
                 seg = seg_index,
                 bytes = produced,
-                codec = codec_tag(opts.video, opts.container),
+                codec = codec_tag(opts.video, opts.audio, opts.container),
                 "hls segment transcode produced empty/truncated output — not caching"
             );
             return Err(HlsCacheError::Transcode(format!(
@@ -429,7 +462,7 @@ impl HlsSegmentCache {
             encode_ms = timing.as_ref().map(|t| t.encode_ms),
             device = timing.as_ref().map(|t| t.device.to_string()),
             bytes = bytes.len(),
-            codec = codec_tag(opts.video, opts.container),
+            codec = codec_tag(opts.video, opts.audio, opts.container),
             burn = opts.burn_subtitle_stream_index.is_some(),
             burn_idx = opts.burn_subtitle_stream_index,
             audio_idx = opts.audio_source_stream_index,
@@ -451,7 +484,7 @@ impl HlsSegmentCache {
                 queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
                 encode_ms = timing.as_ref().map(|t| t.encode_ms),
                 device = timing.as_ref().map(|t| t.device.to_string()),
-                codec = codec_tag(opts.video, opts.container),
+                codec = codec_tag(opts.video, opts.audio, opts.container),
                 burn = opts.burn_subtitle_stream_index.is_some(),
                 seek_secs,
                 seg_secs,
@@ -1094,18 +1127,65 @@ mod tests {
         // previously-cached mpegts segment, feed those bytes to the mp4 parser,
         // and 500 ("truncated box at offset 0") in ~4 ms (a cache hit on the
         // wrong bytes). The container must be part of the key.
-        let mpegts = codec_tag(Some(SegmentVideo::H264), SegmentContainer::Mpegts);
-        let fmp4 = codec_tag(Some(SegmentVideo::H264), SegmentContainer::Fmp4);
-        let vp9 = codec_tag(Some(SegmentVideo::Vp9), SegmentContainer::Fmp4);
+        let mpegts = codec_tag(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+        );
+        let fmp4 = codec_tag(Some(SegmentVideo::H264), None, SegmentContainer::Fmp4);
+        let vp9 = codec_tag(Some(SegmentVideo::Vp9), None, SegmentContainer::Fmp4);
         assert_ne!(mpegts, fmp4, "muxed h264 and fMP4 h264 must not collide");
         assert_ne!(fmp4, vp9);
         assert_eq!(mpegts, 8, "warm muxed-h264 cache tag preserved");
         assert_eq!(vp9, 12, "warm vp9 cache tag preserved");
 
         // The on-disk keys differ for the same (media, seg, audio, bitrate).
-        let key_ts = make_key(1, 0, Some(1), None, Some(4_000_000), mpegts);
-        let key_m4 = make_key(1, 0, Some(1), None, Some(4_000_000), fmp4);
+        let key_ts = make_key(1, 0, Some(1), None, Some(4_000_000), None, mpegts);
+        let key_m4 = make_key(1, 0, Some(1), None, Some(4_000_000), None, fmp4);
         assert_ne!(key_ts, key_m4, "distinct cache keys per container");
+    }
+
+    #[test]
+    fn audio_ladder_rungs_do_not_share_one_cache_entry() {
+        // An audio-only item advertises a whole bitrate ladder
+        // (/hls1/{A64,A96,A128,A192,A256}) as separate EXT-X-STREAM-INFs, and
+        // the audio-variant branch clears `video`/`video_bitrate_bps`. Keying
+        // the bitrate off the VIDEO bitrate alone therefore gave every rung the
+        // same key (bitrate 0, codec tag 0): the first rung to transcode was
+        // served for all of them, so ABR silently did nothing and a 64 kbps
+        // client got 256 kbps bytes.
+        let tag = codec_tag(None, Some(SegmentAudio::Aac), SegmentContainer::Mpegts);
+        let a64 = make_key(1, 0, None, None, None, Some(64_000), tag);
+        let a256 = make_key(1, 0, None, None, None, Some(256_000), tag);
+        assert_ne!(a64, a256, "audio rungs must key on their own bitrate");
+        assert_eq!(a64.bitrate_kbps, 64);
+        assert_eq!(a256.bitrate_kbps, 256);
+
+        // The audio CODEC + container must separate audio-only segments too —
+        // they all collapsed onto tag 0 while the video tag carried everything.
+        let aac_ts = codec_tag(None, Some(SegmentAudio::Aac), SegmentContainer::Mpegts);
+        let aac_m4 = codec_tag(None, Some(SegmentAudio::Aac), SegmentContainer::Fmp4);
+        let opus_ts = codec_tag(None, Some(SegmentAudio::Opus), SegmentContainer::Mpegts);
+        assert_ne!(aac_ts, aac_m4);
+        assert_ne!(aac_ts, opus_ts);
+        assert_ne!(aac_ts, 0, "an audio-only segment is not the 'no codec' tag");
+
+        // A video segment is unaffected: its video bitrate still governs, so
+        // every warm on-disk entry keeps its filename.
+        let v = make_key(
+            1,
+            0,
+            Some(1),
+            None,
+            Some(4_000_000),
+            Some(128_000),
+            codec_tag(
+                Some(SegmentVideo::H264),
+                Some(SegmentAudio::Aac),
+                SegmentContainer::Mpegts,
+            ),
+        );
+        assert_eq!(v.bitrate_kbps, 4_000);
     }
 
     #[tokio::test]
