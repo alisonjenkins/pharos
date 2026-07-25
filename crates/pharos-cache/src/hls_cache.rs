@@ -293,7 +293,12 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// each, so nothing marked them bad. They cannot be told apart from good ones
 /// on disk, and a re-request would serve the frozen picture forever. Orphan
 /// the generation.
-const HLS_GEN_VERSION: u32 = 6;
+///
+/// v7: segments mux their audio by COPY from the title's one continuous
+/// encode instead of encoding it per segment. Every v6 segment carries audio
+/// on its own frame grid, phase-shifted against its neighbours' — the drift
+/// this fixes — so they must not be reused.
+const HLS_GEN_VERSION: u32 = 7;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
@@ -474,6 +479,27 @@ impl HlsSegmentCache {
         // segments are slow and why (codec + subtitle burn are the usual cost).
         let started = std::time::Instant::now();
         let mut attempt_opts = opts.to_transcode_options();
+        // Resolved HERE rather than by each delivery handler, so no path can
+        // mint a segment that encodes its own audio. That is exactly how the
+        // muxed mpegts surface ended up with a per-segment AAC encode while
+        // the browser surface had a continuous one.
+        if attempt_opts.audio.is_some() && attempt_opts.muxed_audio_source.is_none() {
+            let start_secs = opts.start_position_ticks as f64 / 10_000_000.0;
+            let dur_secs = opts
+                .duration_ticks
+                .map_or(pharos_core::SEGMENT_SECONDS, |t| t as f64 / 10_000_000.0);
+            attempt_opts.muxed_audio_source = Some(
+                self.ensure_continuous_audio_covering(
+                    source,
+                    media_id,
+                    opts.audio_source_stream_index,
+                    opts.audio_bitrate_bps,
+                    start_secs,
+                    start_secs + dur_secs,
+                )
+                .await?,
+            );
+        }
         let mut timing = None;
         // A produced segment can be short of video frames while ffmpeg exits 0
         // (see `short_of_frames`). That is not transient — re-running the same

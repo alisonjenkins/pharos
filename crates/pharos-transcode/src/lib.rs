@@ -570,8 +570,10 @@ fn build_args_for_device(
         // "best" audio across BOTH and could take the source's. The audio
         // always comes from input 1 here; the track choice was already made
         // when the continuous encode was produced.
-        a.push("-map".into());
-        a.push("0:v:0?".into());
+        if opts.video.is_some() {
+            a.push("-map".into());
+            a.push("0:v:0?".into());
+        }
         a.push("-map".into());
         a.push("1:a:0".into());
     } else if let Some(audio_idx) = opts.audio_source_stream_index {
