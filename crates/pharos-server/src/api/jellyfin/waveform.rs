@@ -8,9 +8,12 @@
 //!
 //! The endpoint streams ffmpeg `-af astats` lines from stderr and
 //! parses the `lavfi.astats.Overall.RMS_level` metadata key — one
-//! reading per `asetnsamples` window. Window count == bin count so
-//! the output is exactly `bins` long (truncated / zero-padded when
-//! ffmpeg emits an unexpected count).
+//! reading per `asetnsamples` window. The window size is derived from the
+//! PROBED sample rate while `astats` counts the REAL decoded stream, so the
+//! window count only matches the bin count when the probe was right;
+//! [`resample_peaks`] groups whatever ffmpeg produced onto exactly `bins`
+//! (see its docs — the previous truncate silently dropped the end of the
+//! track whenever the rates disagreed).
 //!
 //! T97/B72 — the `astats` pass decodes the WHOLE audio stream, which over an
 //! NFS-backed lossless track is far from the "well under a second" once assumed.
@@ -193,17 +196,80 @@ async fn run_astats(
             }
         }
     }
-    while peaks.len() < target_bins as usize {
-        peaks.push(0.0);
+    Ok(resample_peaks(peaks, target_bins as usize))
+}
+
+/// Fit however many `astats` windows ffmpeg actually produced onto exactly
+/// `target_bins` output bins, taking the peak of each group.
+///
+/// The window size handed to `asetnsamples` is derived from the PROBED sample
+/// rate, but `astats` counts the REAL decoded stream. When the probe carries no
+/// sample rate the code assumes 44100, so a 48 kHz file yields
+/// `48000/44100 ≈ 1.088x` as many windows as bins. The previous code padded
+/// short and then `truncate`d long — and since the windows arrive in time
+/// order, truncating threw away the LAST ~8% of the track: the returned array
+/// claimed to span `DurationMs` but stopped early. Grouping instead keeps the
+/// array spanning the whole track whatever the real rate turns out to be.
+///
+/// Still pads with silence when ffmpeg produced FEWER windows than requested
+/// (a short or partly-unreadable file), so the array is always exactly
+/// `target_bins` long.
+fn resample_peaks(peaks: Vec<f32>, target_bins: usize) -> Vec<f32> {
+    if target_bins == 0 {
+        return Vec::new();
     }
-    peaks.truncate(target_bins as usize);
-    Ok(peaks)
+    if peaks.len() <= target_bins {
+        let mut out = peaks;
+        out.resize(target_bins, 0.0);
+        return out;
+    }
+    let n = peaks.len();
+    (0..target_bins)
+        .map(|i| {
+            // Half-open [lo, hi) over the input, so every input window lands in
+            // exactly one output bin and none is dropped.
+            let lo = i * n / target_bins;
+            let hi = ((i + 1) * n / target_bins).max(lo + 1);
+            peaks[lo..hi.min(n)].iter().copied().fold(0.0f32, f32::max)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surplus_windows_are_grouped_not_truncated_off_the_end() {
+        // A 48 kHz file whose probe carries no sample rate is binned as if it
+        // were 44100, so ffmpeg emits ~8.8% more windows than bins. Truncating
+        // dropped that many windows off the END of the track. Grouping keeps
+        // the last window represented.
+        let peaks: Vec<f32> = (0..279).map(|i| i as f32 / 278.0).collect();
+        let out = resample_peaks(peaks, 256);
+        assert_eq!(out.len(), 256);
+        // The final bin must carry the track's final window (1.0), not the
+        // value 256/278 that truncation would have left there.
+        assert!(
+            (out[255] - 1.0).abs() < 1e-6,
+            "last bin must reach the end of the track, got {}",
+            out[255]
+        );
+        assert!(out[0] < 0.01, "first bin still comes from the start");
+        // Monotonic input stays monotonic — no bin is skipped or reordered.
+        assert!(out.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn short_or_exact_window_counts_are_padded_to_the_bin_count() {
+        assert_eq!(
+            resample_peaks(vec![0.5, 0.25], 4),
+            vec![0.5, 0.25, 0.0, 0.0]
+        );
+        assert_eq!(resample_peaks(vec![0.5, 0.25], 2), vec![0.5, 0.25]);
+        assert!(resample_peaks(vec![0.5], 0).is_empty());
+    }
 
     #[tokio::test]
     async fn waveform_cache_memoises_by_key() {
