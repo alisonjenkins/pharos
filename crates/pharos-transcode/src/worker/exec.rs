@@ -26,6 +26,50 @@ pub async fn openable_devices() -> SmallVec<[DeviceId; 4]> {
     v
 }
 
+/// True for lines ffmpeg's dependencies emit in bulk and that never name the
+/// reason a run failed.
+///
+/// ffmpeg does not stop writing once it has reported its fatal error, so a
+/// library that repeats itself can push that error clean out of any
+/// fixed-size tail. A burn-in whose fontconfig had no writable cache did
+/// exactly that: the reported error was four repetitions of "No writable
+/// cache directories" and the actual cause was never visible.
+fn is_stderr_noise(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty()
+        // Continuation lines of a multi-line library complaint.
+        || line.starts_with('\t')
+        || trimmed.starts_with("Fontconfig error")
+        || trimmed.starts_with("Fontconfig warning")
+        // ffmpeg's own periodic progress and per-frame chatter.
+        || trimmed.starts_with("frame=")
+        || trimmed.starts_with("size=")
+        || trimmed.starts_with("Past duration")
+        || trimmed.starts_with("Last message repeated")
+}
+
+/// `stderr` with the known-noise lines removed. Falls back to the original
+/// when filtering would leave nothing — reporting noise beats reporting an
+/// empty string.
+fn without_noise(stderr: &str) -> String {
+    let kept = stderr
+        .lines()
+        .filter(|l| !is_stderr_noise(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if kept.trim().is_empty() {
+        stderr.to_owned()
+    } else {
+        kept
+    }
+}
+
+fn tail_chars(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.trim_end().chars().collect();
+    let start = chars.len().saturating_sub(max_chars);
+    chars[start..].iter().collect()
+}
+
 /// Map an ffmpeg failure (stderr text + nonzero exit) to a `WorkerError`
 /// the scheduler can route on.
 ///
@@ -44,19 +88,20 @@ pub async fn openable_devices() -> SmallVec<[DeviceId; 4]> {
 /// 3. A failure on the **CPU** device that isn't a source error is
 ///    `Other` — a genuine, non-recoverable encode error.
 pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
+    // Drop the chatter first: the reported window is only useful if it is
+    // spent on lines that can name a cause.
+    let meaningful = without_noise(stderr);
+    // The stderr tail is the actual ffmpeg reason — carry it on every
+    // classification so the log names the cause, never a bare class.
+    let tail = tail_chars(&meaningful, 400);
+    // Classify on the WHOLE dump, not the reported tail: a decisive line can
+    // sit further back than the window we quote.
     let s = stderr.to_ascii_lowercase();
     let hard_bad_input = s.contains("invalid data found")
         || s.contains("could not find codec")
         || s.contains("decoder not found")
         || s.contains("no such file")
         || s.contains("unable to find a suitable output format");
-    // The stderr tail is the actual ffmpeg reason — carry it on every
-    // classification so the log names the cause, never a bare class.
-    let tail: String = {
-        let chars: Vec<char> = stderr.trim_end().chars().collect();
-        let start = chars.len().saturating_sub(400);
-        chars[start..].iter().collect()
-    };
     if hard_bad_input {
         return WorkerError::BadInput(tail);
     }
@@ -135,6 +180,60 @@ mod tests {
     fn cpu_non_source_failure_is_other() {
         match classify_failure("some weird libx264 explosion", false) {
             WorkerError::Other(s) => assert!(s.contains("explosion")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// Shape of a real burn-in failure: ffmpeg named its reason, then
+    /// fontconfig repeated itself until the reason was outside any
+    /// fixed-size tail. The reported error must still name the reason.
+    #[test]
+    fn library_chatter_cannot_push_the_reason_out_of_the_reported_tail() {
+        let mut stderr = String::from(
+            "[AVFilterGraph] Error initializing filter 'subtitles'\n\
+             Error opening filters!\n",
+        );
+        for _ in 0..40 {
+            stderr.push_str(
+                "Fontconfig error: No writable cache directories\n\
+                 \t/var/cache/fontconfig\n\
+                 \t/var/lib/pharos/.cache/fontconfig\n\n",
+            );
+        }
+        match classify_failure(&stderr, false) {
+            WorkerError::Other(s) => {
+                assert!(
+                    s.contains("Error opening filters!"),
+                    "reported tail must name the reason, got: {s}"
+                );
+                assert!(
+                    !s.contains("Fontconfig"),
+                    "chatter must not fill the window, got: {s}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// A decisive line further back than the reported window still decides
+    /// the class — the quote is truncated, the classification is not.
+    #[test]
+    fn a_decisive_line_beyond_the_window_still_classifies() {
+        let mut stderr = String::from("x.mkv: No such file or directory\n");
+        for i in 0..80 {
+            stderr.push_str(&format!("[hevc] concealing errors in frame {i}\n"));
+        }
+        assert!(matches!(
+            classify_failure(&stderr, false),
+            WorkerError::BadInput(_)
+        ));
+    }
+
+    #[test]
+    fn an_all_noise_dump_still_reports_something() {
+        let stderr = "Fontconfig error: No writable cache directories\n\t/var/cache/fontconfig\n";
+        match classify_failure(stderr, false) {
+            WorkerError::Other(s) => assert!(s.contains("Fontconfig")),
             other => panic!("expected Other, got {other:?}"),
         }
     }
