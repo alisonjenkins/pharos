@@ -204,6 +204,22 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
     }
 }
 
+/// Whether this segment still needs its continuous-audio slice resolved.
+///
+/// Reads the SEGMENT's own delivery intent, never the lowered
+/// [`TranscodeOptions`]. `SegmentOpts::to_transcode_options` sets `audio: None`
+/// unconditionally — a segment never runs an audio encoder — so a guard written
+/// against the lowered field is testing a constant that is always `None`, and
+/// silently never fires.
+///
+/// That is exactly what happened: the guard predated the refactor that made a
+/// per-segment audio encode unrepresentable, and the refactor turned it off
+/// without touching it. Every muxed mpegts segment then fell through to `-an`
+/// and shipped video-only under a playlist advertising audio.
+fn needs_muxed_audio(opts: &SegmentOpts) -> bool {
+    opts.audio_codec().is_some() && opts.muxed_audio_source.is_none()
+}
+
 /// Count one audio-rendition read wait. Emitted on BOTH outcomes: a counter
 /// that only fires on failure cannot answer "what fraction of waits 404?",
 /// which is the question the Ghost in the Shell stall actually posed.
@@ -724,7 +740,7 @@ impl HlsSegmentCache {
         // mint a segment that encodes its own audio. That is exactly how the
         // muxed mpegts surface ended up with a per-segment AAC encode while
         // the browser surface had a continuous one.
-        if attempt_opts.audio.is_some() && attempt_opts.muxed_audio_source.is_none() {
+        if needs_muxed_audio(opts) {
             let start_secs = opts.window.start_seconds();
             let dur_secs = opts.window.duration_seconds();
             attempt_opts.muxed_audio_source = Some(
@@ -2175,6 +2191,58 @@ mod tests {
                 .unwrap(),
             "sidecar left behind"
         );
+    }
+
+    /// The Google TV outage: `hls1/*.ts` segments shipped with NO audio stream
+    /// (`nb_streams: 1`, video only) under a playlist advertising audio, so
+    /// ExoPlayer fetched one segment and stopped. Confirmed on the real bytes
+    /// pulled back from prod.
+    ///
+    /// The guard that resolves the continuous-audio slice read
+    /// `to_transcode_options().audio`, which is set to `None` UNCONDITIONALLY
+    /// ("a segment never runs an audio encoder"). So it could never fire, the
+    /// muxed source was never resolved, and the argv fell through to `-an`.
+    /// Browsers were unaffected: their fMP4 rungs deliver audio as a separate
+    /// rendition and genuinely carry none in the segment.
+    #[test]
+    fn a_muxed_segment_is_recognised_as_needing_its_continuous_audio() {
+        let muxed = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        assert!(
+            needs_muxed_audio(&muxed),
+            "a muxed segment with no resolved source must ask for one"
+        );
+
+        // The trap, pinned: the LOWERED options can never answer this question,
+        // so a guard written against them is dead code that looks alive.
+        assert!(
+            muxed.to_transcode_options().audio.is_none(),
+            "lowering never carries an audio encoder — so it cannot be the test"
+        );
+
+        // A video-only rung genuinely carries no audio and must NOT spawn a
+        // continuous encode it will never mux.
+        let separate = ident_opts(
+            Some(SegmentVideo::Vp9),
+            None,
+            SegmentContainer::Fmp4,
+            Some(4_000_000),
+            None,
+        );
+        assert!(!needs_muxed_audio(&separate));
+
+        // Already resolved → not asked for twice.
+        let mut resolved = muxed.clone();
+        resolved.muxed_audio_source = Some(pharos_transcode::options::MuxedAudio {
+            path: std::path::PathBuf::from("/tmp/continuous.m4a"),
+            start_seconds: 0.0,
+        });
+        assert!(!needs_muxed_audio(&resolved));
     }
 
     #[test]

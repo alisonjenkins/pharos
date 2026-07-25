@@ -267,6 +267,65 @@ mod tests {
         );
     }
 
+    /// The Google TV outage, at the argv level.
+    ///
+    /// Lowering sets `audio: None`, and `build_args` turns `audio: None` into
+    /// `-an`. So a MUXED segment lowered without its continuous-audio slice
+    /// resolved produces a VIDEO-ONLY file — silently, exit 0 — under a
+    /// playlist advertising audio. ExoPlayer fetched one such segment and
+    /// stopped; the bytes pulled back from prod probed `nb_streams: 1`.
+    ///
+    /// The resolution guard lives in the cache, but the consequence is here,
+    /// so the two states are pinned side by side: with a source, copy; without
+    /// one, the `-an` that must never reach a muxed rung.
+    #[test]
+    fn a_muxed_segment_copies_its_audio_and_only_drops_it_when_unresolved() {
+        let base = SegmentOpts {
+            container: SegmentContainer::Mpegts,
+            video: Some(SegmentVideo::H264),
+            audio: AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Aac,
+                bitrate_bps: Some(128_000),
+            }),
+            video_bitrate_bps: Some(3_000_000),
+            window: pharos_core::SegmentWindow::for_segment(1, None, Some(600.0)),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            muxed_audio_source: None,
+        };
+        let argv = |o: &SegmentOpts| {
+            crate::ffmpeg_transcode_args(
+                "/src.mkv",
+                &o.to_transcode_options(),
+                crate::protocol::DeviceId::Cpu,
+                "/out.ts",
+            )
+        };
+
+        // Unresolved: the failure mode, pinned so it cannot be mistaken for
+        // correct output.
+        assert!(
+            argv(&base).iter().any(|a| a == "-an"),
+            "an unresolved muxed segment drops audio — this is why the cache \
+             MUST resolve it before lowering"
+        );
+
+        // Resolved: the audio is copied from the continuous encode, never
+        // re-encoded, and `-an` is gone.
+        let mut resolved = base.clone();
+        resolved.muxed_audio_source = Some(crate::options::MuxedAudio {
+            path: std::path::PathBuf::from("/cache/continuous.m4a"),
+            start_seconds: 0.0,
+        });
+        let a = argv(&resolved);
+        assert!(!a.iter().any(|x| x == "-an"), "{a:?}");
+        let ca = a.iter().position(|x| x == "-c:a").expect("audio codec set");
+        assert_eq!(a[ca + 1], "copy", "{a:?}");
+    }
+
     #[test]
     fn no_audio_delivery_means_encode_this_segments_audio() {
         // THE property this type exists for. Encoding audio per segment
