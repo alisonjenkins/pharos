@@ -232,7 +232,7 @@ mod tests {
             }),
 
             video_bitrate_bps: Some(3_000_000),
-            window: pharos_core::SegmentWindow::for_segment(10, None),
+            window: pharos_core::SegmentWindow::for_segment(10, None, Some(600.0)),
             audio_source_stream_index: Some(1),
             burn_subtitle_stream_index: Some(0),
             burn_subtitle_is_text: true,
@@ -315,7 +315,7 @@ mod tests {
                 video: Some(SegmentVideo::H264),
                 audio,
                 video_bitrate_bps: Some(2_000_000),
-                window: pharos_core::SegmentWindow::for_segment(0, None),
+                window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
                 burn_subtitle_is_text: false,

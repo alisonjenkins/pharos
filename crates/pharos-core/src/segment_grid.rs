@@ -237,9 +237,48 @@ pub struct SegmentWindow {
 }
 
 impl SegmentWindow {
-    /// The window segment `index` occupies, frame-snapped to `rate`.
-    pub fn for_segment(index: u32, rate: Option<FrameRate>) -> Self {
-        let (start, dur) = segment_range(index, rate);
+    /// The window segment `index` occupies, frame-snapped to `rate` and
+    /// CLAMPED by the media remaining after its start.
+    ///
+    /// The clamp is load-bearing. A title's final segment is shorter than a
+    /// full 6 s, the playlist advertises that shortened EXTINF, and the
+    /// encoder stops at end-of-file regardless — so an unclamped window there
+    /// describes something the source cannot produce. Anything comparing what
+    /// was produced against what was asked for then reads the last segment of
+    /// every title as truncated, which is exactly what the completeness check
+    /// did: it rejected the tail of a 1372 s title and returned 500 rather
+    /// than serving it.
+    ///
+    /// Routed through [`SegmentGrid::frame_snapped_range`] so there is ONE
+    /// clamp, shared with the playlist that advertises it.
+    ///
+    /// `total_duration_secs` is an `Option` because a source's duration is
+    /// genuinely unknown until it is probed, and there is nothing to clamp
+    /// against then. It must not be spelled `0.0`: the grid floors its
+    /// remaining media at 0.01 s, so a zero total would hand back a 10 ms
+    /// window for EVERY index, not just the tail — the encoder produces 10 ms
+    /// of video per segment and playback never advances. A non-positive
+    /// duration is treated as the same absence for that reason.
+    pub fn for_segment(
+        index: u32,
+        rate: Option<FrameRate>,
+        total_duration_secs: Option<f64>,
+    ) -> Self {
+        let (start, dur) = match total_duration_secs.filter(|t| *t > 0.0) {
+            Some(total) => {
+                let grid = SegmentGrid::with_rate(total, rate);
+                match grid.checked(index) {
+                    Some(i) => grid.frame_snapped_range(i),
+                    // Past the end of the grid: the bounds check upstream turns
+                    // this into a 404, so describe the nominal window rather
+                    // than invent a clamped one.
+                    None => segment_range(index, rate),
+                }
+            }
+            // No probed duration: the nominal grid is the honest answer, and
+            // the encoder stopping at EOF is the only clamp available.
+            None => segment_range(index, rate),
+        };
         Self {
             start_ticks: crate::time::Ticks::from_seconds(start).0,
             duration_ticks: crate::time::Ticks::from_seconds(dur).0,
@@ -260,5 +299,68 @@ impl SegmentWindow {
 
     pub fn duration_seconds(self) -> f64 {
         crate::time::Ticks(self.duration_ticks).seconds()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn the_final_segments_window_stops_at_the_end_of_the_media() {
+        // A completeness check compares what ffmpeg produced against what the
+        // window asked for. An unclamped tail asks for a full 6 s the source
+        // cannot supply, so the last segment of nearly every title reads as
+        // truncated — measured in production as a 500 on the final segment of
+        // a 1372 s title.
+        let total = 1372.121;
+        let rate = FrameRate::from_mille(23_976);
+        let grid = SegmentGrid::with_rate(total, rate);
+        let last = grid.count() - 1;
+
+        let w = SegmentWindow::for_segment(last, rate, Some(total));
+        assert!(
+            w.start_seconds() + w.duration_seconds() <= total + 0.01,
+            "tail window runs past the media: {} + {} > {total}",
+            w.start_seconds(),
+            w.duration_seconds()
+        );
+        assert!(
+            w.duration_seconds() < SEGMENT_SECONDS,
+            "the tail is shorter than a full segment, got {}",
+            w.duration_seconds()
+        );
+
+        // And it agrees with what the playlist advertises for that segment —
+        // one clamp, not two.
+        let (_, playlist_dur) = grid.frame_snapped_range(grid.checked(last).unwrap());
+        assert!((w.duration_seconds() - playlist_dur).abs() < 1e-6);
+
+        // A mid-file segment is untouched by the clamp.
+        let mid = SegmentWindow::for_segment(10, rate, Some(total));
+        assert!((mid.duration_seconds() - SEGMENT_SECONDS).abs() < 0.05);
+    }
+
+    #[test]
+    fn an_unprobed_duration_does_not_clamp_every_window_to_a_sliver() {
+        // The grid floors its remaining media at 0.01 s, so clamping against a
+        // duration of zero returns a 10 ms window for EVERY index — not just
+        // the tail. A source whose duration was never probed (a row the scan
+        // has not reached, a legacy row) would then transcode 10 ms per
+        // segment and playback would never advance past the first frame.
+        let rate = FrameRate::from_mille(15_000);
+        for total in [None, Some(0.0), Some(-1.0)] {
+            for seg in [0, 1, 7] {
+                let w = SegmentWindow::for_segment(seg, rate, total);
+                let (nominal_start, nominal_dur) = segment_range(seg, rate);
+                assert!(
+                    (w.duration_seconds() - nominal_dur).abs() < 1e-6,
+                    "total {total:?} seg {seg}: got {} s, want the nominal {nominal_dur} s",
+                    w.duration_seconds()
+                );
+                assert!((w.start_seconds() - nominal_start).abs() < 1e-6);
+            }
+        }
     }
 }
