@@ -454,6 +454,36 @@ fn build_args_for_device(
         a.push("-vaapi_device".into());
         a.push(node);
     }
+    // Only for a real decode: `-c:v copy` decodes nothing, and an audio-only
+    // job has no video decoder to accelerate.
+    let decoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
+    // Decode on the GPU as well as encode there. pharos chose hardware
+    // ENCODERS but never emitted `-hwaccel`, so a GPU transcode still carried
+    // every frame of source decode on the CPU — the largest remaining cost in
+    // the segment pipeline on the deployment.
+    //
+    // Gated on the scheduler having actually placed this job on a hardware
+    // device. Measured against ffmpeg 8.1, that gate is load-bearing: with the
+    // device missing, ffmpeg reports `Device creation failed` and exits 255
+    // rather than falling back, so emitting this speculatively would break
+    // every transcode on a box without the device. With the device present but
+    // the codec unsupported by its decoder, it falls back to software and
+    // exits 0 — which is why an odd codec on a real GPU is safe.
+    if decoding_video && matches!(device, DeviceId::Hw { .. }) {
+        if let Some(name) = hwaccel.decoder_hwaccel() {
+            a.push("-hwaccel".into());
+            a.push(name.into());
+            // Decode on the SAME GPU that will encode. Without this a
+            // multi-GPU box decodes on device 0 and encodes on device N,
+            // adding a cross-device copy of every frame.
+            if name == "cuda" {
+                if let Some(idx) = device.index() {
+                    a.push("-hwaccel_device".into());
+                    a.push(idx.to_string());
+                }
+            }
+        }
+    }
     // B40 — image-subtitle burn-in rides `overlay` on the SAME single input
     // (`[0:v:0][0:s:N]overlay`), so input seeking (`-ss` before `-i`) moves
     // video and subtitle streams together and stays fast. The old text
@@ -505,7 +535,6 @@ fn build_args_for_device(
     //
     // Only for a real decode: `-c:v copy` has no reference list to prime, and
     // trimming its output would cost work for nothing.
-    let decoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
     let (input_seek, decode_trim) = match start {
         Some(s) if decoding_video && preroll_seconds > 0.0 => {
             // Nothing precedes t=0, so an early segment simply decodes from
@@ -1656,6 +1685,55 @@ mod tests {
                 .map(|p| range[p + 1].parse().expect("-ss takes a number"))
         };
         (at(&a[..i]), at(&a[i..]))
+    }
+
+    #[test]
+    fn a_hardware_job_decodes_on_the_gpu_too() {
+        use crate::protocol::DeviceId;
+        // pharos picked hardware ENCODERS but never emitted `-hwaccel`, so a
+        // GPU transcode still decoded every source frame on the CPU.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 1), "out.ts");
+        let i = a.iter().position(|x| x == "-i").expect("input");
+        let h = a.iter().position(|x| x == "-hwaccel").expect("-hwaccel");
+        assert!(h < i, "-hwaccel is an INPUT option: {a:?}");
+        assert_eq!(a[h + 1], "cuda", "{a:?}");
+        // Decode on the same GPU that encodes, or a multi-GPU box copies every
+        // frame across devices.
+        let d = a
+            .iter()
+            .position(|x| x == "-hwaccel_device")
+            .expect("-hwaccel_device");
+        assert_eq!(a[d + 1], "1", "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-gpu" && w[1] == "1"), "{a:?}");
+
+        let v = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Vaapi, 0), "out.ts");
+        let vh = v.iter().position(|x| x == "-hwaccel").expect("-hwaccel");
+        assert_eq!(v[vh + 1], "vaapi", "{v:?}");
+    }
+
+    #[test]
+    fn a_software_job_never_asks_for_a_hardware_decoder() {
+        use crate::protocol::DeviceId;
+        // Load-bearing, not cosmetic: measured on ffmpeg 8.1, `-hwaccel cuda`
+        // with no CUDA device reports "Device creation failed" and exits 255
+        // — it does NOT fall back to software. Emitting it on the CPU device
+        // would break every software transcode.
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::Cpu, "out.ts");
+        assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
+    }
+
+    #[test]
+    fn a_stream_copy_asks_for_no_decoder_at_all() {
+        use crate::protocol::DeviceId;
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.video = Some(VideoCodec::Copy);
+        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.ts");
+        assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
     }
 
     #[test]

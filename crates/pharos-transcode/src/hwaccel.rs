@@ -94,6 +94,43 @@ impl HwAccel {
         }
     }
 
+    /// ffmpeg `-hwaccel` name for DECODING on this family, or `None` for the
+    /// software-only variants.
+    ///
+    /// Separate from the encoder names above because pharos was only ever
+    /// choosing hardware ENCODERS: no `-hwaccel` was emitted anywhere, so a
+    /// GPU transcode still decoded its source entirely on the CPU. On the
+    /// deployment that is the single largest cost in the segment pipeline —
+    /// the encode runs on NVENC while the CPU carries every frame of HEVC
+    /// decode.
+    ///
+    /// MUST only be emitted when the job is actually running on a device of
+    /// this family. Measured against ffmpeg 8.1:
+    ///
+    /// - device missing → `Device creation failed` and ffmpeg exits 255. It
+    ///   does NOT fall back to software, so emitting this speculatively would
+    ///   break every transcode on a box without the device.
+    /// - device present, codec not supported by its decoder (VAAPI + ffv1,
+    ///   VAAPI + VP9 on a card without a VP9 block) → silently decodes in
+    ///   software and exits 0.
+    ///
+    /// So the flag is safe exactly when the scheduler has already placed the
+    /// job on a detected hardware device, and unsafe anywhere else.
+    pub fn decoder_hwaccel(self) -> Option<&'static str> {
+        match self {
+            Self::VideoToolbox => Some("videotoolbox"),
+            // NVDEC. Deliberately WITHOUT `-hwaccel_output_format cuda`:
+            // frames come back to system memory, so the software filter chain
+            // (subtitle burn via libass, scaling) keeps working and the
+            // encoder uploads them again. Keeping frames on the GPU would
+            // avoid the round trip but breaks every software filter.
+            Self::Nvenc => Some("cuda"),
+            Self::Vaapi => Some("vaapi"),
+            Self::Qsv => Some("qsv"),
+            Self::Off | Self::Auto => None,
+        }
+    }
+
     /// Resolve `Auto` against the detected-encoder set. Pure function
     /// on a snapshot — the snapshot itself comes from
     /// [`detect_available`].
