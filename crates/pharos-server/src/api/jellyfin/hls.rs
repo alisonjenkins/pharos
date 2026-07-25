@@ -1251,6 +1251,7 @@ fn build_segment_opts(
     let window = pharos_core::SegmentWindow::for_segment(
         seg,
         source_frame_rate(item.probe.frame_rate_mille),
+        item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
     );
     use crate::api::jellyfin::device_profile::Decision;
 
@@ -2293,6 +2294,7 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                 o.window = pharos_core::SegmentWindow::for_segment(
                     seg,
                     source_frame_rate(item.probe.frame_rate_mille),
+                    item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
                 );
                 actix_web::rt::spawn(async move {
                     // B46 — gate per TARGET segment (the hinted opts carry the
@@ -2454,6 +2456,7 @@ fn spawn_one_prefetch(
     o.window = pharos_core::SegmentWindow::for_segment(
         seg,
         source_frame_rate(item.probe.frame_rate_mille),
+        item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
     );
     // B51 — carry the client's ACTUAL subtitle pick, NOT the requesting
     // segment's gated value. The old code cloned the served segment's opts,
@@ -2669,6 +2672,7 @@ async fn fmp4_segment_opts(
     let window = pharos_core::SegmentWindow::for_segment(
         seg,
         source_frame_rate(item.probe.frame_rate_mille),
+        item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
     );
     // Fold the live-session cap with any URL-carried `VideoBitrate` ceiling
     // (Lace incident) so a remote Firefox on VP9 is capped too.

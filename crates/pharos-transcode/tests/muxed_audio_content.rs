@@ -147,7 +147,7 @@ fn encode_segment(src: &Path, audio: &MuxedAudio, dir: &Path, seg: u32) -> PathB
         }),
 
         video_bitrate_bps: Some(2_000_000),
-        window: pharos_core::SegmentWindow::for_segment(seg, Some(frame_rate())),
+        window: pharos_core::SegmentWindow::for_segment(seg, Some(frame_rate()), Some(45.0)),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
         burn_subtitle_is_text: false,
