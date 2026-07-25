@@ -137,6 +137,29 @@ compat-openapi addr="127.0.0.1:18096":
     @echo "      --hypothesis-max-examples 50 \\"
     @echo "      target/jellyfin-openapi.json"
 
+# Does a real player accept these bytes? Replays a captured segment window
+# through the hls.js jellyfin-web ships, in a real browser. `browser` is
+# playwright-firefox (default), playwright-chromium, or system-firefox — the
+# last for the h264 rung, which Playwright's Firefox cannot decode at all.
+# Exits non-zero on a refetch storm or a stall, so it gates like a test.
+probe-bytes dir rung="h264cmaf" browser="playwright-firefox":
+    nix develop --command bash -c 'cd compat-playwright && node tools/hlsjs-bytes-probe.cjs {{ absolute_path(dir) }} --rung {{ rung }} --browser {{ browser }}'
+
+# Capture the exact bytes a running pharos serves, in the layout probe-bytes
+# replays. Needs a LIVE api_key + PlaySessionId (segment routes 410 without
+# one); both appear in the server's http.target span field.
+probe-capture base item key session out="./capture" segs="18-21":
+    nix develop --command bash compat-playwright/tools/capture-segments.sh --base {{ base }} --item {{ item }} --key {{ key }} --session {{ session }} --out {{ out }} --segs {{ segs }}
+
+# Can a player tell two ffmpeg output-flag variants apart? Builds both ladders
+# from one synthetic source and plays each with real hls.js. Run it BEFORE
+# claiming an output defect explains a player symptom — it is what refuted the
+# "stray chapter track breaks hls.js" diagnosis. Flags within a variant are
+# comma-separated (just re-splits recipe args on whitespace), e.g.
+#   just probe-flags --variant with-chapters: --variant no-chapters:-map_chapters,-1
+probe-flags *ARGS:
+    nix develop --command bash -c 'cd compat-playwright && node tools/hlsjs-flag-probe.cjs {{ ARGS }}'
+
 # Run the in-process Jellyfin client roundtrip test (Layer B).
 compat-client:
     nix develop --command cargo nextest run --workspace --test client_compat
