@@ -150,8 +150,22 @@ where
         .decoder()
         .video()
         .map_err(|e| FrameError::BadInput(format!("video decoder: {e}")))?;
-    // Each sample lands on the nearest keyframe anyway, so decode keyframes
-    // only — the seek target's keyframe is the first (and only) frame we need.
+    // Decode keyframes only: the seek below lands on one, and it is the first
+    // (and only) frame we need.
+    //
+    // Be precise about what that costs, because the old wording here ("the
+    // nearest keyframe") was wrong in a way that hides a real limitation. The
+    // seek is `..=ts`, so it resolves to the keyframe at or BEFORE the target —
+    // never after. The frame this returns can therefore be up to one full GOP
+    // EARLIER than the timestamp its tile is labelled with, and on a source
+    // whose GOP is longer than the sampling interval two consecutive targets
+    // can resolve to the same keyframe and produce duplicate tiles. With the
+    // default 10 s trickplay interval and typical 2-10 s GOPs that is at the
+    // edge of biting. Fixing it properly means decoding forward from the
+    // keyframe to each target — up to a GOP of extra frames per sample, i.e.
+    // the whole file rather than just its keyframes — which is the cost this
+    // path exists to avoid. Keyframe-accurate sampling is the deliberate trade
+    // (Jellyfin makes the same one), not an oversight.
     decoder.skip_frame(ffmpeg::Discard::NonKey);
 
     let mut graph = build_video_filter_graph(&decoder, time_base, filter_spec, sink_format)?;
