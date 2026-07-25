@@ -225,6 +225,22 @@ pub struct TranscodeOptions {
     /// far enough back to find a real one.
     #[serde(default)]
     pub decode_preroll_seconds: Option<f64>,
+    /// Take this segment's audio by COPY from the title's one continuous
+    /// audio encode at this path, instead of encoding audio here.
+    ///
+    /// Encoding audio per segment re-primes the codec at every boundary: each
+    /// segment emits its own priming frame and starts a fresh frame grid at
+    /// its own seek point, so consecutive segments carry overlapping,
+    /// phase-misaligned audio. Copying from one encode leaves a single global
+    /// grid, so every audio frame belongs to exactly one segment at a
+    /// deterministic timestamp and there is nothing to drift against.
+    ///
+    /// The file is added as a second input seeked to the SAME position as the
+    /// source, because two inputs seeked to different positions are re-based
+    /// by different amounts and the audio would land offset from the video by
+    /// the difference.
+    #[serde(default)]
+    pub muxed_audio_source: Option<std::path::PathBuf>,
 }
 
 impl TranscodeOptions {
@@ -263,6 +279,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -284,6 +301,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }

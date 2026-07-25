@@ -295,6 +295,9 @@ fn push_video_filters(
     audio_source_stream_index: Option<u32>,
     burn_ass_path: Option<&Path>,
     burn_fonts_dir: Option<&Path>,
+    // The segment's audio is copied from a second input, so the image-burn
+    // graph must map it from there rather than from the source.
+    muxed_audio: bool,
 ) {
     match (burn_subtitle_stream_index, burn_is_text) {
         (Some(si), true) => {
@@ -350,9 +353,10 @@ fn push_video_filters(
             a.push("-map".into());
             a.push("[vout]".into());
             a.push("-map".into());
-            a.push(match audio_source_stream_index {
-                Some(i) => format!("0:a:{i}"),
-                None => "0:a:0?".into(),
+            a.push(match (muxed_audio, audio_source_stream_index) {
+                (true, _) => "1:a:0".into(),
+                (false, Some(i)) => format!("0:a:{i}"),
+                (false, None) => "0:a:0?".into(),
             });
         }
         (None, _) => {
@@ -518,6 +522,19 @@ fn build_args_for_device(
     }
     a.push("-i".into());
     a.push(input.to_string());
+    // The title's one continuous audio encode, as a SECOND input to copy the
+    // slice from. Seeked to the same point as the source: ffmpeg re-bases each
+    // input's timestamps by that input's own seek position, so two inputs
+    // seeked differently would put the audio out by the difference. It needs
+    // no preroll of its own — nothing is decoded from it.
+    if let Some(muxed) = &opts.muxed_audio_source {
+        if input_seek > 0.0 {
+            a.push("-ss".into());
+            a.push(format!("{input_seek:.6}"));
+        }
+        a.push("-i".into());
+        a.push(muxed.to_string_lossy().into_owned());
+    }
     if decode_trim > 0.0 {
         // OUTPUT-side `-ss`: decode and throw away, then re-base the kept
         // frames to zero. `-t` below measures from that re-based origin, and
@@ -548,6 +565,15 @@ fn build_args_for_device(
         // (`-map [vout]`); adding `0:v:0?` here would map the source video a
         // second time. (Text-sub burn uses `-vf` + default selection, so it is
         // deliberately excluded from `burning_image_subs` and handled here.)
+    } else if opts.muxed_audio_source.is_some() {
+        // Two inputs, so ffmpeg's default stream selection would pick the
+        // "best" audio across BOTH and could take the source's. The audio
+        // always comes from input 1 here; the track choice was already made
+        // when the continuous encode was produced.
+        a.push("-map".into());
+        a.push("0:v:0?".into());
+        a.push("-map".into());
+        a.push("1:a:0".into());
     } else if let Some(audio_idx) = opts.audio_source_stream_index {
         a.push("-map".into());
         a.push("0:v:0?".into());
@@ -589,6 +615,7 @@ fn build_args_for_device(
                     opts.audio_source_stream_index,
                     opts.burn_subtitle_ass_path.as_deref(),
                     opts.burn_fonts_dir.as_deref(),
+                    opts.muxed_audio_source.is_some(),
                 );
                 a.push("-c:v".into());
                 a.push(
@@ -623,6 +650,7 @@ fn build_args_for_device(
                     opts.audio_source_stream_index,
                     opts.burn_subtitle_ass_path.as_deref(),
                     opts.burn_fonts_dir.as_deref(),
+                    opts.muxed_audio_source.is_some(),
                 );
                 a.push("-c:v".into());
                 a.push(encoder.into());
@@ -720,6 +748,15 @@ fn build_args_for_device(
         }
     }
     match opts.audio {
+        // Sliced out of the title's one continuous encode: copy the packets,
+        // never re-encode them. Re-encoding here is exactly the defect this
+        // input exists to remove — it would re-prime the codec and start a
+        // fresh frame grid at this segment's seek point. Bitrate and channel
+        // layout were settled when the continuous encode was produced.
+        _ if opts.muxed_audio_source.is_some() => {
+            a.push("-c:a".into());
+            a.push("copy".into());
+        }
         Some(AudioCodec::Copy) => {
             a.push("-c:a".into());
             a.push("copy".into());
@@ -910,6 +947,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         }
     }
 
@@ -1035,6 +1073,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -1092,6 +1131,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -1126,6 +1166,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         let nvenc =
             build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.m4s")
@@ -1212,6 +1253,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -1237,6 +1279,7 @@ mod tests {
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
+            muxed_audio_source: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
