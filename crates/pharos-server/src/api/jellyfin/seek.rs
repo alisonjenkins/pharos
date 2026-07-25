@@ -342,6 +342,40 @@ pub fn frame_snapped_start(seg: u32, rate: Option<pharos_core::FrameRate>) -> f6
     }
 }
 
+/// How far BEFORE its frame boundary a segment is seeked, in seconds: half a
+/// frame (zero when the frame rate is unknown, since there is no frame to
+/// measure).
+///
+/// A source frame can sit microseconds below a segment boundary — a real
+/// measured case: the boundary is 12.012000 and the frame is at 12.011997.
+/// Seeking segment N+1 to exactly the boundary then excludes that frame (its
+/// pts is below the seek point) while segment N's `-t` also excludes it (it
+/// falls on the cut). The frame belongs to neither segment and is silently
+/// DROPPED — a visible hitch at almost every boundary, which is what made
+/// certain titles stutter continuously.
+///
+/// Biasing the seek half a frame earlier makes the claim unambiguous: the
+/// boundary frame is always the first frame of segment N+1, and never also the
+/// last frame of segment N (which now ends half a frame early too). Every
+/// segment shifts by the same amount, so consecutive segments still tile the
+/// timeline exactly — verified against the real source: the previously dropped
+/// frames reappear and every boundary joins to within 3 µs.
+pub fn segment_seek_bias(rate: Option<pharos_core::FrameRate>) -> f64 {
+    rate.map_or(0.0, |r| r.frame_duration_secs() / 2.0)
+}
+
+/// The canonical `(start, duration)` a segment is BOTH encoded with and
+/// advertised as: the frame-snapped boundaries, each pulled back by
+/// [`segment_seek_bias`] so no frame can fall between two segments. Start is
+/// clamped at 0 for segment 0. One definition, so the playlist and the encoder
+/// cannot describe different windows.
+pub fn segment_range(seg: u32, rate: Option<pharos_core::FrameRate>) -> (f64, f64) {
+    let bias = segment_seek_bias(rate);
+    let start = (frame_snapped_start(seg, rate) - bias).max(0.0);
+    let end = (frame_snapped_start(seg + 1, rate) - bias).max(0.0);
+    (start, (end - start).max(0.001))
+}
+
 /// A segment index PROVEN in `[0, count)` for a title. Constructible only via
 /// [`SegmentGrid::checked`] / [`SegmentGrid::resolve`], so an over-index request
 /// becomes a typed absence the handler turns into `404`/`416` — never the vp9
@@ -417,11 +451,9 @@ impl SegmentGrid {
     /// clamped by the remaining media. This is the single definition of a
     /// segment boundary; the audio rendition seeks to the same grid.
     pub fn frame_snapped_range(&self, idx: SegmentIndex) -> (f64, f64) {
-        let start = frame_snapped_start(idx.0, self.rate);
-        let next = frame_snapped_start(idx.0 + 1, self.rate);
+        let (start, dur) = segment_range(idx.0, self.rate);
         let remaining = (self.duration_secs - start).max(0.01);
-        let dur = (next - start).min(remaining);
-        (start, dur)
+        (start, dur.min(remaining))
     }
 }
 
@@ -717,15 +749,19 @@ mod tests {
 
     #[test]
     fn segment_grid_frame_snaps_to_source_fps() {
-        // 23.976 fps: segment 1's nominal 6.000 s snaps to 6.006 s (matches the
-        // audio rendition's -ss anchor so the two renditions stay locked).
+        // 23.976 fps: segment 1's nominal 6.000 s snaps to the 6.006 s frame
+        // boundary (matching the audio rendition's anchor so the two renditions
+        // stay locked), then the seek is pulled back half a frame so a frame
+        // sitting microseconds under the boundary cannot fall between segments.
+        let half_frame = (1001.0 / 24_000.0) / 2.0;
         let grid = SegmentGrid::new(600.0, Some(23_976));
         let (start, _dur) = grid.frame_snapped_range(grid.checked(1).unwrap());
-        assert!((start - 6.006).abs() < 0.0005, "got {start}");
-        // Integer fps: no snap.
+        assert!((start - (6.006 - half_frame)).abs() < 0.0005, "got {start}");
+        // Integer fps: the boundary is already 6.0, still seeked half a frame
+        // early for the same reason.
         let grid30 = SegmentGrid::new(600.0, Some(30_000));
         let (s30, _) = grid30.frame_snapped_range(grid30.checked(1).unwrap());
-        assert!((s30 - 6.0).abs() < 1e-9, "got {s30}");
+        assert!((s30 - (6.0 - 1.0 / 60.0)).abs() < 1e-9, "got {s30}");
     }
 
     #[test]
