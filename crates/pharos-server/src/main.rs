@@ -501,6 +501,21 @@ async fn create_user(
         .await
         .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
 
+    // The same `[user_defaults]` the API path applies — a user bootstrapped
+    // from the CLI must not start on different preferences from one created
+    // in the dashboard. Only for an account this call actually created.
+    if matches!(outcome, CreateUserOutcome::Created) {
+        use pharos_core::UserStore;
+        if let Ok(rec) = stores.lookup_by_name(name).await {
+            pharos_server::api::jellyfin::user_prefs::seed_default_configuration(
+                &stores,
+                &cfg.user_defaults,
+                rec.id,
+            )
+            .await;
+        }
+    }
+
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     match outcome {
@@ -1049,6 +1064,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         web: cfg.server.ui_dir.clone(),
     });
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
+    state = state.with_user_defaults(cfg.user_defaults.clone());
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);

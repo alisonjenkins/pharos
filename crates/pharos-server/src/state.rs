@@ -218,6 +218,9 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
+    /// Track preferences a newly created user starts with (`[user_defaults]`).
+    /// Stock by default, in which case creation writes no preferences row.
+    pub user_defaults: crate::config::UserDefaultsConfig,
     /// Connection-aware default transcode ceiling (bps) for REMOTE clients.
     /// jellyfin-web's "Auto" quality advertises an effectively-unlimited
     /// MaxStreamingBitrate, so a remote (WAN) transcode otherwise targets the
@@ -543,6 +546,7 @@ impl AppState {
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             played_threshold_pct: 90,
+            user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
@@ -627,6 +631,7 @@ impl AppState {
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             played_threshold_pct: 90,
+            user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
@@ -681,6 +686,13 @@ impl AppState {
 
     pub fn with_played_threshold_pct(mut self, pct: u32) -> Self {
         self.played_threshold_pct = pct.clamp(50, 100);
+        self
+    }
+
+    /// The track preferences newly created users start with
+    /// (`[user_defaults]`).
+    pub fn with_user_defaults(mut self, defaults: crate::config::UserDefaultsConfig) -> Self {
+        self.user_defaults = defaults;
         self
     }
 

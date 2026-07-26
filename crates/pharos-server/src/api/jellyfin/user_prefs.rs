@@ -84,6 +84,51 @@ impl TrackPreference {
     }
 }
 
+/// Give a newly created user the server's default track preferences.
+///
+/// Jellyfin has no server-wide default — every account starts at the stock
+/// values and each person re-picks them by hand, which on a shared server
+/// means everyone hits the same wrong-language playback until they do. A
+/// stock `[user_defaults]` writes nothing at all, so the row only exists when
+/// the operator actually chose something; the user can still change any of it
+/// afterwards, and their own write simply replaces this one.
+///
+/// Best-effort: a failure here must not fail user creation. The account is
+/// already created at this point, and a missing preferences row is exactly
+/// what every account had before this existed.
+pub async fn seed_default_configuration(
+    stores: &crate::state::Stores,
+    defaults: &crate::config::UserDefaultsConfig,
+    user: UserId,
+) {
+    if defaults.is_stock() {
+        return;
+    }
+    let cfg = defaults.to_configuration();
+    let json = match serde_json::to_string(&cfg) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(user.id = %user, error = %e, "could not encode default user configuration");
+            return;
+        }
+    };
+    match stores.set_user_configuration(user, &json).await {
+        Ok(()) => tracing::info!(
+            user.id = %user,
+            audio_language_preference = %defaults.audio_language_preference,
+            subtitle_mode = %defaults.subtitle_mode,
+            play_default_audio_track = defaults.play_default_audio_track,
+            "seeded a new user with the server's default track preferences"
+        ),
+        Err(e) => tracing::warn!(
+            user.id = %user,
+            error = %e,
+            "could not store the default track preferences for a new user — \
+             they start at Jellyfin's defaults"
+        ),
+    }
+}
+
 /// Load one user's track preferences. A missing or unparseable configuration
 /// yields the defaults rather than an error — a corrupt blob must not stop
 /// playback, and the defaults are what an unconfigured user gets anyway.
@@ -116,6 +161,7 @@ pub async fn track_preference(state: &AppState, user: UserId) -> TrackPreference
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -158,6 +204,79 @@ mod tests {
         assert_eq!(p.audio_languages_for(Some("jpn")), vec!["ja", "jpn"]);
         // Nothing recorded for the item → no preference, not a wrong one.
         assert!(p.audio_languages_for(None).is_empty());
+    }
+
+    /// A stock `[user_defaults]` must write nothing: an operator who has not
+    /// configured anything should leave no trace on new accounts, and an
+    /// absent row is what every account had before this existed.
+    #[tokio::test]
+    async fn stock_defaults_write_no_configuration_at_all() {
+        use pharos_core::{PreferenceStore, SecretString, UserPolicy, UserRecord, UserStore};
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        let uid = UserId::new();
+        stores
+            .create(UserRecord {
+                id: uid,
+                name: "u".into(),
+                password_hash: SecretString::new("h"),
+                policy: UserPolicy::default(),
+            })
+            .await
+            .expect("create");
+
+        seed_default_configuration(&stores, &crate::config::UserDefaultsConfig::default(), uid)
+            .await;
+
+        assert_eq!(
+            stores.get_user_configuration(uid).await.expect("read"),
+            None
+        );
+    }
+
+    /// A configured default lands as a real stored configuration, in the
+    /// shape jellyfin-web reads back.
+    #[tokio::test]
+    async fn a_configured_default_is_stored_for_a_new_user() {
+        use pharos_core::{PreferenceStore, SecretString, UserPolicy, UserRecord, UserStore};
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .expect("store");
+        let uid = UserId::new();
+        stores
+            .create(UserRecord {
+                id: uid,
+                name: "u".into(),
+                password_hash: SecretString::new("h"),
+                policy: UserPolicy::default(),
+            })
+            .await
+            .expect("create");
+
+        let defaults = crate::config::UserDefaultsConfig {
+            audio_language_preference: "OriginalLanguage".into(),
+            subtitle_language_preference: "eng".into(),
+            subtitle_mode: "Smart".into(),
+            play_default_audio_track: false,
+        };
+        seed_default_configuration(&stores, &defaults, uid).await;
+
+        let raw = stores
+            .get_user_configuration(uid)
+            .await
+            .expect("read")
+            .expect("a configuration was written");
+        let cfg: UserConfigurationDto = serde_json::from_str(&raw).expect("parses");
+        assert_eq!(cfg.audio_language_preference, "OriginalLanguage");
+        assert_eq!(cfg.subtitle_mode, "Smart");
+        assert!(!cfg.play_default_audio_track);
+
+        // And it resolves into the preferences selection actually uses.
+        let prefs = TrackPreference::from_configuration(&cfg);
+        assert!(prefs.audio_original_language);
+        assert_eq!(prefs.subtitle_mode, SubtitleMode::Smart);
+        assert!(!prefs.prefer_default_audio_track);
     }
 
     #[test]
