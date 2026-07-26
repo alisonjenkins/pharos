@@ -288,6 +288,77 @@ enum Resolved {
     },
 }
 
+/// Terminal outcome of one item's enrichment attempt, recorded as
+/// `pharos_metadata_enrich_total{kind,outcome}`. The DB residue cannot tell
+/// these apart: an episode that resolved but whose detail fetch came back
+/// empty (`Transient`), and one whose record simply carried no still
+/// (`HitNoArt`), both end `match_source='nfo_id'`, `metadata_refreshed_at=now`,
+/// no `Primary` — so the "5 of 76 Code Geass episodes got a still" gap is
+/// invisible in production without this counter. The reason travels with the
+/// value (provider + external id + season/episode + offered roles) in the
+/// decision log, never a bare class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnrichOutcome {
+    /// Resolved and cached at least one artwork role.
+    HitArt,
+    /// Resolved to a record but cached NO artwork — the record offered no
+    /// role this path caches, or every offered image failed to download.
+    HitNoArt,
+    /// The id resolved but the detail fetch returned nothing (rate-limit /
+    /// network). Stamped and retried once the TTL re-admits the row.
+    Transient,
+    /// No confident match; the row was recorded `none`.
+    NoMatch,
+    /// A concurrent manual Identify won mid-flight; this sweep's write was
+    /// skipped rather than reverting the user's choice.
+    SkippedManual,
+    /// No provider configured for the kind, or an audio item — nothing tried.
+    Skipped,
+}
+
+impl EnrichOutcome {
+    /// Stable, bounded-cardinality metric label. Asserted distinct in a test —
+    /// a rename here breaks the dashboard/alert contract silently otherwise.
+    fn label(self) -> &'static str {
+        match self {
+            Self::HitArt => "hit_art",
+            Self::HitNoArt => "hit_no_art",
+            Self::Transient => "transient",
+            Self::NoMatch => "no_match",
+            Self::SkippedManual => "skipped_manual",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// A `Hit`'s outcome is decided by whether any art actually landed — the whole
+/// point of the signal, split out so it can be unit-tested without a live
+/// provider.
+fn hit_outcome(cached_art_roles: usize) -> EnrichOutcome {
+    if cached_art_roles > 0 {
+        EnrichOutcome::HitArt
+    } else {
+        EnrichOutcome::HitNoArt
+    }
+}
+
+fn kind_label(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Movie => "movie",
+        MediaKind::Episode => "episode",
+        MediaKind::Audio => "audio",
+    }
+}
+
+fn record_enrich(kind: MediaKind, outcome: EnrichOutcome) {
+    metrics::counter!(
+        "pharos_metadata_enrich_total",
+        "kind" => kind_label(kind),
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+}
+
 /// Enrich a single item end-to-end. Returns `Ok(true)` when a record was
 /// fetched + persisted (counts toward the pass total), `Ok(false)` when the
 /// item was skipped, marked `none`, or hit a transient miss.
@@ -346,7 +417,10 @@ where
             )
         }
         // No provider covers audio here — skip (never marked).
-        MediaKind::Audio => return Ok(false),
+        MediaKind::Audio => {
+            record_enrich(MediaKind::Audio, EnrichOutcome::Skipped);
+            return Ok(false);
+        }
     };
 
     // Provider by kind: Episode prefers TVDB (fallback TMDB when TVDB isn't
@@ -371,7 +445,10 @@ where
                 )
                 .await,
             ),
-            None => return Ok(false),
+            None => {
+                record_enrich(item.kind, EnrichOutcome::Skipped);
+                return Ok(false);
+            }
         },
         MediaKind::Episode => {
             if let Some(t) = tvdb {
@@ -409,10 +486,14 @@ where
                     .await,
                 )
             } else {
+                record_enrich(item.kind, EnrichOutcome::Skipped);
                 return Ok(false);
             }
         }
-        MediaKind::Audio => return Ok(false),
+        MediaKind::Audio => {
+            record_enrich(MediaKind::Audio, EnrichOutcome::Skipped);
+            return Ok(false);
+        }
     };
 
     let (external_id, source, confidence, enriched) = match resolved {
@@ -423,11 +504,13 @@ where
             // item's search was in flight (FR1 TOCTOU) — a user override
             // must never be reverted by the sweep's trailing write.
             if is_manual(store, item.id).await {
+                record_enrich(item.kind, EnrichOutcome::SkippedManual);
                 tracing::debug!(
                     media.id = item.id,
                     "T9 metadata backfill: skipping none-write, item matched manually mid-flight"
                 );
             } else {
+                record_enrich(item.kind, EnrichOutcome::NoMatch);
                 store
                     .set_item_match(item.id, matched_provider, "", "none", None, now)
                     .await?;
@@ -446,11 +529,26 @@ where
             // same manual-override TOCTOU as the other terminal writes — never
             // revert a user's Identify that landed mid-flight.
             if is_manual(store, item.id).await {
+                record_enrich(item.kind, EnrichOutcome::SkippedManual);
                 tracing::debug!(
                     media.id = item.id,
                     "T9 metadata backfill: skipping transient stamp, item matched manually mid-flight"
                 );
             } else {
+                record_enrich(item.kind, EnrichOutcome::Transient);
+                // A transient miss on an already-identified episode is the
+                // shape that silently starves stills (issue #113): the row is
+                // stamped refreshed and frozen till the TTL with no art. Name
+                // it with the value, not a bare class.
+                tracing::info!(
+                    media.id = item.id,
+                    kind = kind_label(item.kind),
+                    provider = matched_provider,
+                    external_id = %external_id,
+                    season,
+                    episode,
+                    "T9 metadata backfill: detail fetch returned nothing — id resolved but no record; stamped, retried at TTL"
+                );
                 store
                     .set_item_match(
                         item.id,
@@ -540,12 +638,17 @@ where
         .map(|(role, _, _)| role.to_ascii_lowercase())
         .collect();
 
+    // How many art roles this item ends up covered by — newly cached here, or
+    // already held by a local sidecar. Zero on a Hit is the #113 signal: the
+    // record resolved but left the item with no image.
+    let mut art_covered = 0usize;
     for (prov, art) in &chosen {
         if !CACHED_ART_ROLES.contains(&art.role) {
             tracing::debug!(role = ?art.role, item = item.id, "T9 metadata backfill: skipping art role (not cached)");
             continue;
         }
         if local_roles.contains(&art.role.as_str().to_ascii_lowercase()) {
+            art_covered += 1;
             tracing::debug!(role = ?art.role, item = item.id, "T9 metadata backfill: skipping art role (local sidecar present)");
             continue;
         }
@@ -564,9 +667,33 @@ where
             }
         };
         let Some(bytes) = bytes else { continue };
-        if let Err(e) = download_and_cache_art(cache, store, &item, prov, art, bytes).await {
-            tracing::warn!(error = %e, role = ?art.role, "T9 metadata backfill: art cache failed");
+        match download_and_cache_art(cache, store, &item, prov, art, bytes).await {
+            Ok(()) => art_covered += 1,
+            Err(e) => {
+                tracing::warn!(error = %e, role = ?art.role, "T9 metadata backfill: art cache failed")
+            }
         }
+    }
+
+    // The signal (#113): a Hit that cached no art is indistinguishable from a
+    // transient miss in the DB, so name it here with the roles the record DID
+    // offer — an empty `offered` says the provider record carried no image;
+    // a non-empty one that still produced no cover says every image failed to
+    // download or fell to a role this path does not cache.
+    let outcome = hit_outcome(art_covered);
+    record_enrich(item.kind, outcome);
+    if outcome == EnrichOutcome::HitNoArt {
+        let offered: Vec<&str> = enriched.artwork.iter().map(|a| a.role.as_str()).collect();
+        tracing::info!(
+            media.id = item.id,
+            kind = kind_label(item.kind),
+            provider = matched_provider,
+            external_id = %external_id,
+            season,
+            episode,
+            offered = ?offered,
+            "T9 metadata backfill: record resolved but cached no art"
+        );
     }
 
     // Record the match state last — the row now carries the enrichment, so a
@@ -1073,6 +1200,36 @@ mod tests {
     use pharos_core::{MediaItem, SearchCandidate};
     use pharos_store_sqlx::sqlite::SqliteStore;
     use tempfile::TempDir;
+
+    #[test]
+    fn enrich_outcome_labels_are_stable_and_distinct() {
+        use std::collections::BTreeSet;
+        let all = [
+            EnrichOutcome::HitArt,
+            EnrichOutcome::HitNoArt,
+            EnrichOutcome::Transient,
+            EnrichOutcome::NoMatch,
+            EnrichOutcome::SkippedManual,
+            EnrichOutcome::Skipped,
+        ];
+        // The label strings are a metric contract — bounded and all distinct.
+        let labels: BTreeSet<&str> = all.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), all.len(), "duplicate metric label");
+        // Pin the exact strings a dashboard/alert queries.
+        assert_eq!(EnrichOutcome::HitArt.label(), "hit_art");
+        assert_eq!(EnrichOutcome::HitNoArt.label(), "hit_no_art");
+        assert_eq!(EnrichOutcome::Transient.label(), "transient");
+    }
+
+    #[test]
+    fn hit_with_no_cached_art_is_the_no_art_signal() {
+        // The whole point of #113: a Hit that landed zero art is hit_no_art,
+        // the state that looks identical to a transient miss in the DB. One
+        // cached role or more is hit_art.
+        assert_eq!(hit_outcome(0), EnrichOutcome::HitNoArt);
+        assert_eq!(hit_outcome(1), EnrichOutcome::HitArt);
+        assert_eq!(hit_outcome(3), EnrichOutcome::HitArt);
+    }
 
     #[test]
     fn next_delay_drains_while_work_remains_then_idles_when_empty() {
