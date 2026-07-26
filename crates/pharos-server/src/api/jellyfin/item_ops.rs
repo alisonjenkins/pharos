@@ -310,7 +310,7 @@ fn provider_token(display: &str) -> Option<&'static str> {
 }
 
 /// A requested Jellyfin `Type` token → [`pharos_core::ArtworkRole`], restricted
-/// to the three roles the picker supports. `None` for any other type (→ 400 on
+/// to the roles the picker supports. `None` for any other type (→ 400 on
 /// download). `ArtworkRole` has no `from_str_ci`; `ImageRole` does, so parse via
 /// it.
 fn artwork_role_from_type(t: &str) -> Option<pharos_core::ArtworkRole> {
@@ -319,6 +319,10 @@ fn artwork_role_from_type(t: &str) -> Option<pharos_core::ArtworkRole> {
         ImageRole::Primary => Some(pharos_core::ArtworkRole::Primary),
         ImageRole::Backdrop => Some(pharos_core::ArtworkRole::Backdrop),
         ImageRole::Logo => Some(pharos_core::ArtworkRole::Logo),
+        // B122 — the picker offers backdrops as Thumb candidates, so the
+        // download of one has to be storable as the item's Thumb; without this
+        // every pick from that tab 400'd on "unsupported image Type".
+        ImageRole::Thumb => Some(pharos_core::ArtworkRole::Thumb),
         _ => None,
     }
 }
@@ -329,6 +333,12 @@ struct ImageMatch {
     provider: &'static str, // "tmdb" | "tvdb"
     external_id: String,
     kind: MediaKind,
+    /// A real `media_items` row (as opposed to a synthesised Series/Season
+    /// container). Only a real row has a per-role `artwork` table to store a
+    /// downloaded Thumb in — `series_metadata` carries poster/backdrop
+    /// locators and nothing else — so Thumb candidates are offered for these
+    /// only, and never for a container whose pick could not be persisted.
+    real_item: bool,
 }
 
 /// Resolve the (provider, id, kind) to list images for.
@@ -345,6 +355,7 @@ async fn resolve_image_match(state: &AppState, id_str: &str) -> Option<ImageMatc
                     provider: "tmdb",
                     external_id: tmdb.to_string(),
                     kind: item.kind,
+                    real_item: true,
                 });
             }
             if let Some(tvdb) = ids.tvdb.as_deref().filter(|s| !s.is_empty()) {
@@ -352,6 +363,7 @@ async fn resolve_image_match(state: &AppState, id_str: &str) -> Option<ImageMatc
                     provider: "tvdb",
                     external_id: tvdb.to_string(),
                     kind: item.kind,
+                    real_item: true,
                 });
             }
             return None;
@@ -376,7 +388,51 @@ async fn resolve_image_match(state: &AppState, id_str: &str) -> Option<ImageMatc
         external_id: meta.match_external_id.clone()?,
         // Series-level, exactly as the enrichment path resolves a show.
         kind: MediaKind::Episode,
+        real_item: false,
     })
+}
+
+/// The provider's candidates narrowed to the requested `Type` and rendered as
+/// the picker's DTO.
+///
+/// B122 — Thumb candidates. Neither provider publishes a thumb image type
+/// (TMDB's `/images` carries `posters` / `backdrops` / `logos`, TVDB the same),
+/// so filtering the list to `Thumb` always produced an empty picker even for a
+/// matched item: "the search button is there but if I hit it it returns no
+/// images". A backdrop is the landscape still a Thumb wants — the same
+/// reasoning the serve path uses when it falls back to the backdrop — so offer
+/// backdrops under the Thumb role, and download a chosen one into the item's
+/// Thumb artwork row. Containers are excluded ([`ImageMatch::real_item`]):
+/// `series_metadata` has nowhere to record a Thumb.
+fn candidates_for_type(
+    images: Vec<crate::online_enrich::RemoteImage>,
+    want: Option<&str>,
+    m: &ImageMatch,
+) -> Vec<RemoteImageInfoDto> {
+    let as_thumb = m.real_item && want.is_some_and(|t| t.eq_ignore_ascii_case("Thumb"));
+    images
+        .into_iter()
+        .filter(|img| match want {
+            Some(_) if as_thumb => img.role.as_str().eq_ignore_ascii_case("Backdrop"),
+            Some(t) => img.role.as_str().eq_ignore_ascii_case(t),
+            None => true,
+        })
+        .map(|img| RemoteImageInfoDto {
+            provider_name: provider_display(m.provider).to_string(),
+            url: img.url,
+            image_type: if as_thumb {
+                "Thumb".to_string()
+            } else {
+                img.role.as_str().to_string()
+            },
+            height: img.height,
+            width: img.width,
+            language: img.language,
+            community_rating: img.community_rating,
+            vote_count: img.vote_count,
+            rating_type: "Score",
+        })
+        .collect()
 }
 
 /// Core of `GET /Items/{id}/RemoteImages`. Empty (200) on no key / no match /
@@ -453,25 +509,7 @@ async fn remote_images_inner(
             }
         },
     };
-    let want = q.image_type.as_deref();
-    let dtos: Vec<RemoteImageInfoDto> = images
-        .into_iter()
-        .filter(|img| match want {
-            Some(t) => img.role.as_str().eq_ignore_ascii_case(t),
-            None => true,
-        })
-        .map(|img| RemoteImageInfoDto {
-            provider_name: provider_display(m.provider).to_string(),
-            url: img.url,
-            image_type: img.role.as_str().to_string(),
-            height: img.height,
-            width: img.width,
-            language: img.language,
-            community_rating: img.community_rating,
-            vote_count: img.vote_count,
-            rating_type: "Score",
-        })
-        .collect();
+    let dtos = candidates_for_type(images, q.image_type.as_deref(), &m);
     let providers = if dtos.is_empty() {
         vec![]
     } else {
@@ -631,6 +669,16 @@ async fn apply_downloaded_art(
     // existing row (else `resolve_image_match` returned None → 400 above), so
     // the row is present; the fabrication fallback only guards a resolve/remove
     // race and carries `m`'s identity so it is never half-populated.
+    // B122 — a container's art lives in `series_metadata`, which carries a
+    // poster and a backdrop locator and nothing else. Thumb candidates are
+    // therefore offered for real items only; refuse a Thumb here rather than
+    // write bytes nowhere the serve path will ever look for them AND freeze
+    // the show to `manual` for a pick that silently did nothing.
+    if matches!(role, pharos_core::ArtworkRole::Thumb) {
+        return Err(error::ErrorBadRequest(
+            "a Series/Season container stores no Thumb; pick a Primary or Backdrop",
+        ));
+    }
     let item = crate::api::jellyfin::images::resolve_synth_image_item(state, id_str)
         .await
         .ok_or_else(|| error::ErrorNotFound("not found"))?;
@@ -1174,6 +1222,82 @@ mod tests {
         let m = resolve_image_match(&state, "50").await.unwrap();
         assert_eq!(m.provider, "tmdb");
         assert_eq!(m.external_id, "603");
+    }
+
+    /// The two candidates every TMDB movie response yields, as
+    /// `parse_tmdb_images` produces them.
+    fn provider_candidates() -> Vec<crate::online_enrich::RemoteImage> {
+        crate::tmdb::parse_tmdb_images(
+            r#"{"posters":[{"file_path":"/p.jpg","width":1000,"height":1500}],
+                "backdrops":[{"file_path":"/b.jpg","width":1920,"height":1080}],
+                "logos":[{"file_path":"/l.png","width":500,"height":200}]}"#,
+        )
+    }
+
+    fn movie_match(real_item: bool) -> ImageMatch {
+        ImageMatch {
+            provider: "tmdb",
+            external_id: "330459".into(),
+            kind: MediaKind::Movie,
+            real_item,
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_thumb_search_offers_the_backdrops() {
+        // TMDB publishes no thumb image type, so the plain filter left the
+        // picker empty for an item that plainly has art to offer.
+        let got = candidates_for_type(provider_candidates(), Some("Thumb"), &movie_match(true));
+        assert_eq!(
+            got.len(),
+            1,
+            "a Thumb search must offer the backdrop, not nothing: {got:?}"
+        );
+        assert_eq!(
+            got[0].image_type, "Thumb",
+            "offered under the asked-for role"
+        );
+        assert!(
+            got[0].url.ends_with("/b.jpg"),
+            "the backdrop is the candidate"
+        );
+        assert_eq!(got[0].width, Some(1920));
+    }
+
+    #[actix_web::test]
+    async fn a_container_offers_no_thumb_candidates() {
+        // `series_metadata` records a poster and a backdrop locator and nothing
+        // else, so a Thumb pick on a show could not be persisted.
+        let got = candidates_for_type(provider_candidates(), Some("Thumb"), &movie_match(false));
+        assert!(got.is_empty(), "no un-storable candidates: {got:?}");
+    }
+
+    #[actix_web::test]
+    async fn the_other_types_are_unaffected() {
+        let m = movie_match(true);
+        let primary = candidates_for_type(provider_candidates(), Some("Primary"), &m);
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].image_type, "Primary");
+        assert!(primary[0].url.ends_with("/p.jpg"));
+
+        let backdrop = candidates_for_type(provider_candidates(), Some("Backdrop"), &m);
+        assert_eq!(backdrop.len(), 1);
+        assert_eq!(backdrop[0].image_type, "Backdrop");
+
+        // Unfiltered still lists every real role, with no Thumb invented.
+        let all = candidates_for_type(provider_candidates(), None, &m);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|i| i.image_type != "Thumb"));
+    }
+
+    #[actix_web::test]
+    async fn a_thumb_download_is_storable() {
+        // The picker offers Thumb candidates, so the download of one must map
+        // to a role; it 400'd as "unsupported image Type" before.
+        assert_eq!(
+            artwork_role_from_type("Thumb"),
+            Some(pharos_core::ArtworkRole::Thumb)
+        );
     }
 
     #[actix_web::test]
