@@ -253,9 +253,28 @@ async fn handle_connection<S>(
     // polling. Cleared on `ScheduledTasksInfoStop` / disconnect.
     let mut tasks_info_tick: Option<tokio::time::Interval> = None;
 
+    // #1 — set when a rolling-deploy drain closes this socket, so the pump can
+    // send an explicit close frame (the B26 teardown returns early on drain and
+    // would otherwise let the socket linger until TCP timeout).
+    let mut drain_close = false;
     'pump: loop {
+        // React to a socket-drain at once: close so the client reconnects to
+        // the already-Ready new pod instead of riding its post-deploy
+        // exponential backoff. Gated on `sockets_draining()` (fired AFTER the
+        // LB drain), NOT `is_shutting_down()` — closing at SIGTERM, before the
+        // pod leaves the Service, would bounce the reconnect back here. The
+        // top-of-loop poll catches a signal that fired between selects; the
+        // `notified()` arm makes the common case instant.
+        if crate::state::sockets_draining() {
+            drain_close = true;
+            break 'pump;
+        }
         tokio::select! {
             biased;
+            _ = crate::state::shutdown_signal().notified() => {
+                drain_close = true;
+                break 'pump;
+            }
             _ = keepalive_tick.tick() => {
                 if last_client_seen.elapsed() > IDLE_DROP {
                     break 'pump;
@@ -420,6 +439,23 @@ async fn handle_connection<S>(
         }
     }
 
+    // #1 — a drain-initiated close: tell the client explicitly (WS 1012
+    // Service Restart) so it reconnects NOW, rather than letting the socket
+    // linger until its idle timeout. The B26 branch below then returns early
+    // and preserves the membership for the new pod to recover. Depends on the
+    // pod having already left the Service endpoints (chart preStop delay), so
+    // the reconnect lands on the new pod, not this draining one.
+    if drain_close {
+        tracing::info!(
+            device_id = %device_key, %member_id,
+            "syncplay: draining — closing /socket so the client reconnects to the new pod"
+        );
+        metrics::counter!("pharos_syncplay_socket_drain_close_total").increment(1);
+        let _ = session
+            .clone()
+            .close(Some(actix_ws::CloseCode::Restart.into()))
+            .await;
+    }
     tracing::info!(device_id = %device_key, %member_id, "syncplay: /socket disconnected");
     // B26 — a socket that broke because WE are draining (SIGTERM: rolling
     // deploy) must NOT dismantle the membership: the whole point of the

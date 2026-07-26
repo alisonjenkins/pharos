@@ -1321,6 +1321,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         );
         let _ = drain_readiness.drain().await;
         tokio::time::sleep(std::time::Duration::from_secs(drain_grace)).await;
+        // #1 — the pod has now been unready for `drain_grace`, long enough for
+        // the LB / k8s Service to drop it from the endpoints. Close the live
+        // SyncPlay /sockets so their clients reconnect immediately to the
+        // already-Ready new pod (which is the only endpoint left), instead of
+        // riding jellyfin-web's post-deploy exponential backoff. Membership is
+        // preserved (B26) for the new pod to recover; commands issued in the
+        // reconnect gap are recovered from the persisted membership.
+        pharos_server::state::drain_sockets();
         drain_handle.stop(true).await;
     });
 
