@@ -86,6 +86,7 @@ async fn seed_two_users() -> Fixture {
                 last_played_position_ticks: 300_000_000,
                 is_favorite: true,
                 last_played_at: 1_700_000_000,
+                ..Default::default()
             },
         )
         .await

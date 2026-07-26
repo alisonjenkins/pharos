@@ -2628,8 +2628,23 @@ async fn playback_info(
     // `OriginalLanguage` preference degrades to the container's own order
     // rather than to a wrong language.
     let audio_languages = track_prefs.audio_languages_for(None);
+    // What this user last played THIS item with. An explicit choice they made
+    // outranks any language rule — it is the same person, saying the same
+    // thing, one session later.
+    let remembered = state
+        .stores
+        .get_user_data(user.0.id, id)
+        .await
+        .unwrap_or_default();
+    let remembered_audio = track_prefs
+        .remember_audio
+        .then_some(remembered.audio_stream_index)
+        .flatten()
+        .and_then(|i| u32::try_from(i).ok())
+        .filter(|idx| audio_facts.iter().any(|s| s.index == *idx));
     let default_audio_stream_index: Option<u32> = explicit_audio_index
         .filter(|idx| audio_facts.iter().any(|s| s.index == *idx))
+        .or(remembered_audio)
         .or_else(|| {
             super::stream_select::default_audio_stream_index(
                 &audio_facts,
@@ -2678,7 +2693,21 @@ async fn playback_info(
                 .iter()
                 .any(|s| s.kind == "Subtitle" && s.index == *idx)
         }),
-        // No choice stated — the user's SubtitleMode decides.
+        // No choice stated on this request — a remembered one still counts,
+        // including a remembered -1 (subtitles OFF), which is a choice like
+        // any other and must survive a resume.
+        None if track_prefs.remember_subtitle && remembered.subtitle_stream_index.is_some() => {
+            remembered
+                .subtitle_stream_index
+                .filter(|i| *i >= 0)
+                .and_then(|i| u32::try_from(i).ok())
+                .filter(|idx| {
+                    streams
+                        .iter()
+                        .any(|s| s.kind == "Subtitle" && s.index == *idx)
+                })
+        }
+        // Nothing chosen, ever — the user's SubtitleMode decides.
         //
         // This replaces a hand-rolled ladder (default flag → first English →
         // ANY subtitle track). Its last rung is the reason subtitles appeared

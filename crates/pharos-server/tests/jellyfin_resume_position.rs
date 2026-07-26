@@ -68,6 +68,7 @@ async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String
                 last_played_position_ticks: position_ticks,
                 is_favorite: false,
                 last_played_at: 0,
+                ..Default::default()
             },
         )
         .await
@@ -316,6 +317,7 @@ async fn resume_list_filters_by_media_types() {
                     last_played_position_ticks: 60_000_000_000,
                     is_favorite: false,
                     last_played_at: 0,
+                    ..Default::default()
                 },
             )
             .await

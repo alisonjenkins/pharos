@@ -658,19 +658,42 @@ async fn copy_user_data(
     sp: &SqlitePool,
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<u64, StoreError> {
-    let rows: Vec<(Vec<u8>, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(
+        Vec<u8>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
         "SELECT user_id, item_id, played, play_count, last_played_position_ticks, \
-         is_favorite, last_played_at FROM user_data",
+             is_favorite, last_played_at, audio_stream_index, subtitle_stream_index \
+             FROM user_data",
     )
     .fetch_all(sp)
     .await
     .map_err(StoreError::Sqlx)?;
     let n = rows.len() as u64;
-    for (user_id, item_id, played, play_count, ticks, is_favorite, last_played_at) in rows {
+    for (
+        user_id,
+        item_id,
+        played,
+        play_count,
+        ticks,
+        is_favorite,
+        last_played_at,
+        audio,
+        subtitle,
+    ) in rows
+    {
         sqlx::query(
             "INSERT INTO user_data (user_id, item_id, played, play_count, \
-             last_played_position_ticks, is_favorite, last_played_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             last_played_position_ticks, is_favorite, last_played_at, \
+             audio_stream_index, subtitle_stream_index) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(user_id)
         .bind(item_id)
@@ -679,6 +702,8 @@ async fn copy_user_data(
         .bind(ticks)
         .bind(is_favorite)
         .bind(last_played_at)
+        .bind(audio.and_then(|v| i32::try_from(v).ok()))
+        .bind(subtitle.and_then(|v| i32::try_from(v).ok()))
         .execute(&mut **tx)
         .await
         .map_err(StoreError::Sqlx)?;

@@ -165,6 +165,7 @@ async fn seed(store: &SqliteStore) -> (UserId, UserId, MediaId) {
         last_played_position_ticks: 12_345,
         is_favorite: true,
         last_played_at: 1_700_000_500,
+        ..Default::default()
     };
     UserDataStore::set_user_data(store, uid1, item1, data)
         .await
