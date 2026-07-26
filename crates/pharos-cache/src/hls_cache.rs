@@ -313,7 +313,7 @@ fn codec_tag(
     //
     // Historical tags 1 (Copy), 9 (H265), 10 (Av1) retired with the
     // `SegmentVideo` type (V30). Tag values for the live codecs are preserved
-    // so a warm cache survives: muxed-mpegts H264 KEEPS 8, VP9 fMP4 KEEPS 12.
+    // so a warm cache survives where the bytes did not change: VP9 fMP4 KEEPS 12.
     match (video, container) {
         // Audio-ONLY rendition segment (music, and the `/hls1/{A64..A256}`
         // audio ladder). There is no video bitrate to key on, so the AUDIO
@@ -327,9 +327,19 @@ fn codec_tag(
             (Some(SegmentAudio::Opus), SegmentContainer::Mpegts) => 22,
             (Some(SegmentAudio::Opus), SegmentContainer::Fmp4) => 23,
         },
-        // Muxed mpegts H264 (the `hls1/*.ts` surface) — unchanged tag so the
-        // large warm mpegts cache is preserved across this fix.
-        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 8,
+        // Muxed mpegts H264 (the `hls1/*.ts` surface).
+        //
+        // 24 (was 8): every segment cached while B116 was live is VIDEO-ONLY —
+        // the muxed-audio slice was never resolved and the argv fell through to
+        // `-an`. Those bytes are cached under the old tag and would be served
+        // forever, so the fix alone does not heal a title anyone played during
+        // the window: verified by refetching the exact segment after deploying
+        // the fix and probing it (`nb_streams: 1`, still). Bumping the tag
+        // orphans them and re-transcodes on next request.
+        //
+        // Only THIS tag moves. The fMP4 rungs (13, 12) are audio-free by
+        // design, were never affected, and keep their warm cache.
+        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 24,
         // Audio-free fMP4 H264 (the demuxed `h264cmaf/*` surface) — a DISTINCT
         // namespace so it never reads muxed mpegts bytes (or vice versa).
         (Some(SegmentVideo::H264), SegmentContainer::Fmp4) => 13,
@@ -2564,8 +2574,12 @@ mod tests {
         let vp9 = codec_tag(Some(SegmentVideo::Vp9), None, SegmentContainer::Fmp4);
         assert_ne!(mpegts, fmp4, "muxed h264 and fMP4 h264 must not collide");
         assert_ne!(fmp4, vp9);
-        assert_eq!(mpegts, 8, "warm muxed-h264 cache tag preserved");
-        assert_eq!(vp9, 12, "warm vp9 cache tag preserved");
+        // 24, not 8: B116 cached video-only muxed segments under tag 8, and a
+        // cached poisoned segment outlives the fix that stopped producing it.
+        // Verified against prod — refetching the exact segment after the fix
+        // deployed still probed `nb_streams: 1` until this moved.
+        assert_eq!(mpegts, 24, "muxed-h264 tag bumped past the B116 poison");
+        assert_eq!(vp9, 12, "warm vp9 cache tag preserved — never affected");
 
         // The on-disk keys differ for the same (media, seg, audio, bitrate).
         let key_ts = SegmentIdentity::new(
