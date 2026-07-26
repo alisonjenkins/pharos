@@ -48,6 +48,13 @@ fn aliens_tracks() -> Vec<AudioTrack> {
 }
 
 async fn seed(configuration: Option<&str>) -> (web::Data<AppState>, String) {
+    seed_with_original_language(configuration, None).await
+}
+
+async fn seed_with_original_language(
+    configuration: Option<&str>,
+    original_language: Option<&str>,
+) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -78,6 +85,10 @@ async fn seed(configuration: Option<&str>) -> (web::Data<AppState>, String) {
                 height: Some(1080),
                 bitrate_bps: Some(4_000_000),
                 audio_tracks: aliens_tracks(),
+                ..Default::default()
+            },
+            metadata: pharos_core::MediaMetadata {
+                original_language: original_language.map(str::to_string),
                 ..Default::default()
             },
             ..Default::default()
@@ -216,6 +227,43 @@ async fn a_stale_remembered_index_falls_back_to_the_preference() {
         &token,
         r#"{"ItemId":"00000000000000000000000000000009","PositionTicks":10,"AudioStreamIndex":99}"#,
     )
+    .await;
+    assert_eq!(default_audio_index(&state, &token).await, Some(1));
+}
+
+/// `OriginalLanguage` is the setting that expresses "each title in the
+/// language it was made in" — the only way to want Japanese for anime and
+/// English for everything else without maintaining per-library rules.
+#[actix_web::test]
+async fn original_language_ranks_by_the_titles_own_language() {
+    // A Japanese title: the enriched original language selects a Japanese
+    // track even though the user never named that language anywhere.
+    let (state, token) = seed_with_original_language(
+        Some(r#"{"AudioLanguagePreference":"OriginalLanguage","PlayDefaultAudioTrack":false}"#),
+        Some("uk"),
+    )
+    .await;
+    // The fixture's "original" language is Ukrainian here, so the preference
+    // must land on a Ukrainian track rather than the English one.
+    assert_eq!(default_audio_index(&state, &token).await, Some(1));
+
+    // An English original picks English out of the same file.
+    let (state, token) = seed_with_original_language(
+        Some(r#"{"AudioLanguagePreference":"OriginalLanguage","PlayDefaultAudioTrack":false}"#),
+        Some("en"),
+    )
+    .await;
+    assert_eq!(default_audio_index(&state, &token).await, Some(4));
+}
+
+/// An item nothing has enriched yet records no original language; the
+/// preference must degrade to the container's own order rather than to some
+/// arbitrary language.
+#[actix_web::test]
+async fn original_language_degrades_when_the_item_has_none() {
+    let (state, token) = seed(Some(
+        r#"{"AudioLanguagePreference":"OriginalLanguage","PlayDefaultAudioTrack":false}"#,
+    ))
     .await;
     assert_eq!(default_audio_index(&state, &token).await, Some(1));
 }

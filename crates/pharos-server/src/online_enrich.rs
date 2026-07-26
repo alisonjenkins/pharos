@@ -61,6 +61,8 @@ pub struct EnrichedMetadata {
     /// TMDB's artwork for the same title.
     pub also_tmdb_id: Option<String>,
     pub artwork: Vec<RemoteArt>,
+    /// The language the title was made in, as the provider states it.
+    pub original_language: Option<String>,
 }
 
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The
@@ -153,6 +155,7 @@ pub fn apply_enrichment(
     fill(&mut md.tagline, e.tagline.clone());
     fill(&mut md.production_year, e.production_year);
     fill(&mut md.premiere_date, e.premiere_date);
+    fill(&mut md.original_language, e.original_language.clone());
     fill(&mut md.community_rating, e.community_rating);
     fill(&mut md.official_rating, e.official_rating.clone());
     AppliedEnrichment {

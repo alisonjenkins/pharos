@@ -37,7 +37,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
     series_folder, series_year, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, has_primary_art, \
-    match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at";
+    match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
+    original_language";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -591,12 +592,12 @@ impl MediaStore for PostgresStore {
                 series_folder, series_year, title_fold, attachments_json, \
                 track_number, disc_number, release_year, \
                 production_locations_json, trailers_json, \
-                synopsis, content_rating, network, release_date) \
+                synopsis, content_rating, network, release_date, original_language) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
                      $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, \
-                     $48, $49, $50, $51, $52, $53)
+                     $48, $49, $50, $51, $52, $53, $54)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             title_fold = EXCLUDED.title_fold,
@@ -643,6 +644,7 @@ impl MediaStore for PostgresStore {
                                             disc_number = EXCLUDED.disc_number,
                                             release_year = EXCLUDED.release_year,
                                             production_locations_json = EXCLUDED.production_locations_json,
+                                            original_language = EXCLUDED.original_language,
                                             trailers_json = EXCLUDED.trailers_json,
                                             synopsis = EXCLUDED.synopsis,
                                             content_rating = EXCLUDED.content_rating,
@@ -704,6 +706,7 @@ impl MediaStore for PostgresStore {
         .bind(p.content_rating.as_deref())
         .bind(p.network.as_deref())
         .bind(p.release_date.as_deref())
+        .bind(item.metadata.original_language.clone())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -3046,6 +3049,7 @@ struct MediaRow {
     match_source: Option<String>,
     match_confidence: Option<f32>,
     metadata_refreshed_at: Option<i64>,
+    original_language: Option<String>,
 }
 
 impl SeriesMetadataStore for PostgresStore {
@@ -3236,6 +3240,7 @@ impl MediaRow {
                 self.production_locations_json.as_deref(),
             ),
             trailers: crate::string_list_json::decode(self.trailers_json.as_deref()),
+            original_language: self.original_language.clone(),
         };
         Ok(MediaItem {
             id,

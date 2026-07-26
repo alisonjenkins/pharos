@@ -122,6 +122,12 @@ pub struct MediaMetadata {
     /// Trailer URLs (Kodi NFO `<trailer>`) → Jellyfin `RemoteTrailers`
     /// (`[{Url, Name}]`). Empty when none.
     pub trailers: Vec<String>,
+    /// The language the title was made in, as the provider states it (TMDB
+    /// gives ISO 639-1, e.g. `ja`). Drives the `OriginalLanguage` audio
+    /// preference — "play each title in its own language" — which is the only
+    /// way to want Japanese for anime and English for everything else from a
+    /// single setting.
+    pub original_language: Option<String>,
 }
 
 /// LIB-C9 — external metadata-provider identifiers. Persisted as a JSON

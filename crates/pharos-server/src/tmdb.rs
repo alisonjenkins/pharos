@@ -438,6 +438,11 @@ pub(crate) fn parse_movie_detail(body: &str) -> Option<crate::online_enrich::Enr
             .get("release_date")
             .and_then(|x| x.as_str())
             .and_then(year_of),
+        original_language: v
+            .get("original_language")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         premiere_date: v
             .get("release_date")
             .and_then(|x| x.as_str())
@@ -492,6 +497,11 @@ pub(crate) fn parse_tv_detail(body: &str) -> Option<crate::online_enrich::Enrich
             .get("first_air_date")
             .and_then(|x| x.as_str())
             .and_then(year_of),
+        original_language: v
+            .get("original_language")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         premiere_date: v
             .get("first_air_date")
             .and_then(|x| x.as_str())

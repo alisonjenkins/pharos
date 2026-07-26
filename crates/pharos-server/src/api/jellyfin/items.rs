@@ -2624,10 +2624,12 @@ async fn playback_info(
     let explicit_audio_index: Option<u32> = query_param(req.query_string(), "AudioStreamIndex")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .or(body_audio_index);
-    // No original language is recorded for any item yet, so an
-    // `OriginalLanguage` preference degrades to the container's own order
+    // An `OriginalLanguage` preference ranks by the language THIS title was
+    // made in — Japanese for anime, English for Hollywood, from one setting.
+    // Unenriched items record none and degrade to the container's own order
     // rather than to a wrong language.
-    let audio_languages = track_prefs.audio_languages_for(None);
+    let audio_languages =
+        track_prefs.audio_languages_for(item.metadata.original_language.as_deref());
     // What this user last played THIS item with. An explicit choice they made
     // outranks any language rule — it is the same person, saying the same
     // thing, one session later.

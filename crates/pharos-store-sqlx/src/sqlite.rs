@@ -22,7 +22,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
     series_folder, series_year, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, has_primary_art, \
-    match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at";
+    match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
+    original_language";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -616,9 +617,10 @@ impl MediaStore for SqliteStore {
                 premiere_date, overview, tagline, provider_ids, \
                 production_locations_json, trailers_json, \
                 series_folder, series_year, track_number, disc_number, release_year, \
-                synopsis, content_rating, network, release_date, title_fold) \
+                synopsis, content_rating, network, release_date, title_fold, \
+                original_language) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            title_fold = excluded.title_fold,
@@ -660,6 +662,7 @@ impl MediaStore for SqliteStore {
                                            tagline = excluded.tagline,
                                            provider_ids = excluded.provider_ids,
                                            production_locations_json = excluded.production_locations_json,
+                                           original_language = excluded.original_language,
                                            trailers_json = excluded.trailers_json,
                                            series_folder = excluded.series_folder,
                                            series_year = excluded.series_year,
@@ -731,6 +734,7 @@ impl MediaStore for SqliteStore {
         .bind(p.release_date.as_deref())
         // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
         .bind(item.title.to_lowercase())
+        .bind(item.metadata.original_language.clone())
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -2871,6 +2875,7 @@ struct MediaRow {
     match_source: Option<String>,
     match_confidence: Option<f32>,
     metadata_refreshed_at: Option<i64>,
+    original_language: Option<String>,
 }
 
 impl SeriesMetadataStore for SqliteStore {
@@ -3065,6 +3070,7 @@ impl MediaRow {
                 self.production_locations_json.as_deref(),
             ),
             trailers: crate::string_list_json::decode(self.trailers_json.as_deref()),
+            original_language: self.original_language.clone(),
         };
         Ok(MediaItem {
             id,
