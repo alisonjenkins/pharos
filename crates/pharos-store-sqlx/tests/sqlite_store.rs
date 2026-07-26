@@ -384,6 +384,7 @@ async fn metadata_roundtrips_through_store() {
     let s = fresh().await;
     let mut it = item(7, "/m/matrix.mkv", "The Matrix", MediaKind::Movie);
     it.metadata = MediaMetadata {
+        original_language: Some("ja".into()),
         community_rating: Some(8.7),
         critic_rating: Some(83.0),
         official_rating: Some("R".into()),
