@@ -366,6 +366,33 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
             url: img.to_string(),
         });
     }
+    // B126 — `data.image` is the poster and nothing else, so a show could never
+    // acquire a backdrop or a logo: 0 of 178 shows in the deployed library had
+    // one. The SAME response already carries `data.artworks[]` (this is the
+    // `/series/{id}/extended` body `parse_tvdb_artworks` reads for the image
+    // picker), so take the best-scored candidate per missing role from it
+    // rather than fetching anything more.
+    let mut candidates = parse_tvdb_artworks(body);
+    candidates.sort_by(|a, b| {
+        b.community_rating
+            .unwrap_or(0.0)
+            .total_cmp(&a.community_rating.unwrap_or(0.0))
+    });
+    for role in [
+        ArtworkRole::Backdrop,
+        ArtworkRole::Logo,
+        ArtworkRole::Primary,
+    ] {
+        if art.iter().any(|a: &RemoteArt| a.role == role) {
+            continue;
+        }
+        if let Some(best) = candidates.iter().find(|c| c.role == role) {
+            art.push(RemoteArt {
+                role,
+                url: best.url.clone(),
+            });
+        }
+    }
     Some(EnrichedMetadata {
         title: data
             .get("name")
@@ -700,6 +727,43 @@ mod tests {
         assert_eq!(e.also_tmdb_id, None);
         assert!(e.artwork.is_empty());
         assert_eq!(e.premiere_date, None); // no firstAired in this sparse fixture
+    }
+
+    #[test]
+    /// B126 — a show must be able to acquire a BACKDROP. `data.image` is the
+    /// poster and nothing else, so every show in the deployed library (0 of
+    /// 178) had one, and its detail page fell back to a video frame. The same
+    /// `/series/{id}/extended` body already carries `artworks[]`.
+    #[test]
+    fn series_detail_takes_backdrop_and_logo_from_artworks() {
+        let body = r#"{"data":{"name":"Death Note","image":"https://art/poster.jpg",
+            "artworks":[
+              {"type":3,"image":"https://art/fanart-low.jpg","score":10},
+              {"type":3,"image":"https://art/fanart-best.jpg","score":99},
+              {"type":23,"image":"https://art/logo.png","score":50},
+              {"type":2,"image":"https://art/other-poster.jpg","score":80}
+            ]}}"#;
+        let e = super::parse_series_detail(body).expect("parses");
+        let of = |r: ArtworkRole| {
+            e.artwork
+                .iter()
+                .find(|a| a.role == r)
+                .map(|a| a.url.clone())
+        };
+        assert_eq!(
+            of(ArtworkRole::Backdrop).as_deref(),
+            Some("https://art/fanart-best.jpg"),
+            "the highest-scored background wins, not the first listed"
+        );
+        assert_eq!(
+            of(ArtworkRole::Logo).as_deref(),
+            Some("https://art/logo.png")
+        );
+        assert_eq!(
+            of(ArtworkRole::Primary).as_deref(),
+            Some("https://art/poster.jpg"),
+            "`data.image` stays authoritative for the poster"
+        );
     }
 
     #[test]
