@@ -706,6 +706,19 @@ impl GroupState {
     /// mutates group state (esp. never advances `playing_index`).
     fn send_catch_up(&self, member_id: MemberId) {
         if !self.queue.items.is_empty() {
+            // Instrument the outbound handshake: the PLI a member is hydrated
+            // with is what its later Ready must echo to satisfy a gate. A
+            // seeded group mints a server-side PLI the creator never received,
+            // so logging exactly which PLI each member was handed makes the
+            // seed mismatch visible instead of inferred.
+            tracing::info!(
+                group = %self.id,
+                member = %member_id,
+                pli = self.current_playlist_item_id().unwrap_or(""),
+                position_ms = self.current_position_ms(),
+                is_playing = matches!(self.playback, PlaybackState::Playing { .. }),
+                "syncplay: sent catch-up PlayQueue to member"
+            );
             self.send_one(
                 member_id,
                 ServerMsg::PlayQueue {
@@ -772,6 +785,15 @@ impl GroupState {
     /// `LastUpdate <=` staleness guard.
     fn broadcast_play_queue(&mut self, reason: &str, is_playing: bool, start_position_ms: u64) {
         self.queue.updated_unix_ms = unix_now_ms().max(self.queue.updated_unix_ms + 1);
+        tracing::info!(
+            group = %self.id,
+            reason,
+            pli = self.current_playlist_item_id().unwrap_or(""),
+            start_position_ms,
+            is_playing,
+            recipients = self.members.len(),
+            "syncplay: broadcast PlayQueue"
+        );
         self.broadcast(ServerMsg::PlayQueue {
             reason: reason.to_string(),
             items: self.queue.item_infos(),
@@ -809,6 +831,12 @@ impl GroupState {
     /// client drops this as a duplicate while a behind client (the one whose
     /// stale Ready triggered it) applies it and loads the right item.
     fn send_play_queue_to(&self, member_id: MemberId) {
+        tracing::info!(
+            group = %self.id,
+            member = %member_id,
+            pli = self.current_playlist_item_id().unwrap_or(""),
+            "syncplay: re-sent PlayQueue to one member"
+        );
         self.send_one(
             member_id,
             ServerMsg::PlayQueue {
@@ -1016,10 +1044,25 @@ impl GroupState {
             );
             return false;
         }
-        let resolved = self.waiting.as_mut().is_some_and(|w| {
-            w.pending.remove(&member_id);
-            w.pending.is_empty()
-        });
+        let (was_pending, remaining) = self
+            .waiting
+            .as_mut()
+            .map(|w| (w.pending.remove(&member_id), w.pending.len()))
+            .unwrap_or((false, 0));
+        let resolved = was_pending && remaining == 0;
+        // Instrument the gate-ack receipt: the success path was previously
+        // silent, so a gate that ran to the anti-wedge timeout gave no way to
+        // tell whether NO ack arrived or an arriving ack was not counted. Name
+        // the member, whether it was actually in the pending set, and how many
+        // holdouts remain (0 + resolved = this ack released the group).
+        tracing::info!(
+            group = %self.id,
+            member = %member_id,
+            was_pending,
+            remaining_pending = remaining,
+            resolved,
+            "syncplay: readiness gate ack"
+        );
         if resolved {
             self.resolve_waiting();
         }
@@ -2259,7 +2302,17 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 }
             };
             tracing::info!(
-                group = %state.id, position_ms, is_paused,
+                group = %state.id,
+                position_ms,
+                is_paused,
+                pli = state.current_playlist_item_id().unwrap_or(""),
+                // The load-bearing choice: seeding fills SERVER state only and
+                // sends the creator NO PlayQueue, so the creator's player never
+                // learns this server-minted PLI and is not SyncPlay-managed for
+                // the item. Its later Ready cannot match, so any gate it is in
+                // (the first seek) runs to the anti-wedge. Named here so the
+                // trace shows the creator was left unbound at seed time.
+                creator_bound = false,
                 "syncplay: seeded group queue from creator's active playback"
             );
         }
@@ -3314,6 +3367,58 @@ mod tests {
         assert!(
             saw_queue,
             "reconnect catch-up must still resend the PlayQueue"
+        );
+    }
+
+    /// ODD signal test for the seed-path instrumentation: a group seeded from
+    /// the creator's already-active playback (`SeedQueue`) leaves the creator
+    /// UNBOUND — it receives no PlayQueue, so its player never learns the
+    /// server-minted `playlist_item_id`. A LATER joiner's catch-up, by contrast,
+    /// DOES carry that server PLI. The two never match, which is why the
+    /// creator's Ready can't satisfy a gate (the live wedge, 2026-07-26). This
+    /// pins the facts the `creator_bound=false` seed log and the
+    /// `sent catch-up PlayQueue` log narrate; if seeding is ever changed to bind
+    /// the creator, this test must be updated in lockstep with the trace.
+    #[tokio::test]
+    async fn seed_leaves_creator_unbound_but_hydrates_joiner_with_server_pli() {
+        let (h, sinks, mut creator_rx, _creator) = fresh().await;
+        let _ = snapshot_of(&h).await; // flush the join
+        while creator_rx.try_recv().is_ok() {} // drain join traffic
+
+        // Creator hits "create group" while already playing: SeedQueue fills
+        // server state only.
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "nge_ep1".into(),
+            position_ms: 31_667,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await; // flush the seed
+
+        // The creator was sent NOTHING (creator_bound=false): no PlayQueue that
+        // would hand it the server PLI.
+        while let Ok(msg) = creator_rx.try_recv() {
+            assert!(
+                !matches!(msg, ServerMsg::PlayQueue { .. }),
+                "seed must NOT send the creator a PlayQueue (unbound), got {msg:?}"
+            );
+        }
+
+        // A later joiner's catch-up DOES carry the server-minted PLI — the value
+        // the creator never received, and thus can never echo in a Ready.
+        let (_joiner, mut joiner_rx) = add_member(&h, &sinks, "jana").await;
+        let _ = snapshot_of(&h).await;
+        let mut server_pli = None;
+        while let Ok(msg) = joiner_rx.try_recv() {
+            if let ServerMsg::PlayQueue { items, .. } = msg {
+                server_pli = items.first().map(|i| i.playlist_item_id.clone());
+            }
+        }
+        let server_pli = server_pli.expect("joiner catch-up must carry a PlayQueue");
+        assert!(
+            !server_pli.is_empty(),
+            "seeded queue must mint a non-empty server PLI the creator never saw"
         );
     }
 
