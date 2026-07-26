@@ -243,10 +243,10 @@ where
         }
     }
 
-    // Series-container pass (TVDB only — the series-level record). Runs even
-    // when no items needed matching: episodes and shows drain independently.
-    if let Some(tv) = tvdb {
-        match enrich_series_pass(store, bg_io, cache, tv, cfg, now).await {
+    // Series-container pass (the series-level record). Runs even when no items
+    // needed matching: episodes and shows drain independently.
+    if tvdb.is_some() || tmdb.is_some() {
+        match enrich_series_pass(store, bg_io, cache, tvdb, tmdb, cfg, now).await {
             Ok((n, series_had_work)) => {
                 if n > 0 {
                     tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
@@ -783,16 +783,18 @@ fn upsert_art(
 /// Returns how many shows were newly enriched (counts toward the pass total, so
 /// the loop keeps draining while shows remain). Series are TV-only, so this is
 /// a no-op when `tvdb` is `None`.
-async fn enrich_series_pass<Tv, S>(
+async fn enrich_series_pass<Tv, Tm, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
     cache: &ImageCache,
-    tvdb: &Tv,
+    tvdb: Option<&Tv>,
+    tmdb: Option<&Tm>,
     cfg: &MetadataConfig,
     now: i64,
 ) -> DomainResult<(usize, bool)>
 where
     Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
     S: SeriesMetadataStore,
 {
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -805,7 +807,7 @@ where
     let mut enriched = 0usize;
     for cand in candidates {
         // V6 — one bad show never aborts the pass; log it and carry on.
-        match enrich_one_series(store, bg_io, cache, tvdb, cfg, cand, now).await {
+        match enrich_one_series(store, bg_io, cache, tvdb, tmdb, cfg, cand, now).await {
             Ok(true) => enriched += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: show failed"),
@@ -821,26 +823,155 @@ where
 /// match, `Ok(false)` when it marked the show `none` (no confident hit) or hit
 /// a transient miss (left for the next pass). Local data can't be clobbered —
 /// a show has no curated local metadata, so this simply writes the record.
-async fn enrich_one_series<Tv, S>(
+async fn enrich_one_series<Tv, Tm, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
     cache: &ImageCache,
-    tvdb: &Tv,
+    tvdb: Option<&Tv>,
+    tmdb: Option<&Tm>,
     cfg: &MetadataConfig,
     cand: SeriesMatchCandidate,
     now: i64,
 ) -> DomainResult<bool>
 where
     Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
     S: SeriesMetadataStore,
 {
+    // B127 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
+    // deployed library's 178 shows were marked `none` by TVDB alone, almost all
+    // of them anime — Death Note, Dragon Ball GT, Code Geass — which TMDB
+    // carries. A show marked `none` has no poster, so its tile falls back to a
+    // representative episode and then to an extracted frame.
+    let mut outcome = None;
+    // A provider BLIP is not a provider saying no. If any attempt was
+    // transient we leave the row untouched for the next pass rather than
+    // freezing the show as `none` for the whole TTL.
+    let mut transient = false;
+    if let Some(tv) = tvdb {
+        match resolve_series(tv, "tvdb", bg_io, cache, cfg, &cand).await {
+            SeriesAttempt::Hit(h) => outcome = Some(h),
+            SeriesAttempt::Transient => transient = true,
+            SeriesAttempt::NoMatch => {}
+        }
+    }
+    let mut fell_back = false;
+    if outcome.is_none() {
+        if let Some(tm) = tmdb {
+            match resolve_series(tm, "tmdb", bg_io, cache, cfg, &cand).await {
+                SeriesAttempt::Hit(h) => {
+                    outcome = Some(h);
+                    fell_back = true;
+                }
+                SeriesAttempt::Transient => transient = true,
+                SeriesAttempt::NoMatch => {}
+            }
+        }
+    }
+    if outcome.is_none() && transient {
+        return Ok(false);
+    }
+    let Some(hit) = outcome else {
+        // Every configured provider searched and found nothing over the
+        // confidence floor → record `none` so the show isn't re-searched until
+        // the TTL re-admits it. Attributed to whichever provider ran last.
+        let provider = if tmdb.is_some() { "tmdb" } else { "tvdb" };
+        store
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: cand.series_key.clone(),
+                series_name: cand.series_name.clone(),
+                match_provider: Some(provider.into()),
+                match_source: Some("none".into()),
+                metadata_refreshed_at: Some(now),
+                ..Default::default()
+            })
+            .await?;
+        return Ok(false);
+    };
+    if fell_back {
+        tracing::info!(
+            series = %cand.series_name,
+            provider = hit.provider,
+            "T9-series metadata backfill: matched by the fallback provider"
+        );
+    }
+
+    let provider_ids = match hit.provider {
+        "tmdb" => ProviderIds {
+            tmdb: Some(hit.external_id.clone()),
+            ..Default::default()
+        },
+        _ => ProviderIds {
+            tvdb: Some(hit.external_id.clone()),
+            // The series-level record's `also_tmdb_id` IS series-scoped
+            // (unlike an episode's), so it's safe to carry as the show's
+            // TMDB id.
+            tmdb: hit.enriched.also_tmdb_id.clone(),
+            ..Default::default()
+        },
+    };
+    store
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: cand.series_key.clone(),
+            series_name: cand.series_name.clone(),
+            match_provider: Some(hit.provider.into()),
+            match_external_id: Some(hit.external_id),
+            match_source: Some("search".into()),
+            match_confidence: hit.confidence,
+            metadata_refreshed_at: Some(now),
+            overview: hit.enriched.overview.clone(),
+            community_rating: hit.enriched.community_rating,
+            premiere_date: hit.enriched.premiere_date,
+            official_rating: hit.enriched.official_rating.clone(),
+            original_language: hit.enriched.original_language.clone(),
+            genres: hit.enriched.genres.clone(),
+            // Neither series-detail parse carries studios/networks today.
+            studios: Vec::new(),
+            provider_ids,
+            poster_locator: hit.poster_locator,
+            backdrop_locator: hit.backdrop_locator,
+        })
+        .await?;
+    Ok(true)
+}
+
+/// One provider's answer for a show, with its artwork already cached.
+struct SeriesHit {
+    provider: &'static str,
+    external_id: String,
+    confidence: Option<f32>,
+    enriched: EnrichedMetadata,
+    poster_locator: Option<String>,
+    backdrop_locator: Option<String>,
+}
+
+/// What one provider had to say about a show. `Transient` is kept distinct
+/// from `NoMatch` because only the latter justifies freezing the row as
+/// `none` until the TTL re-admits it.
+enum SeriesAttempt {
+    Hit(Box<SeriesHit>),
+    NoMatch,
+    Transient,
+}
+
+/// Search `enricher` for `cand` and, on a confident hit, cache the show's
+/// poster + backdrop.
+async fn resolve_series<E: OnlineEnricher>(
+    enricher: &E,
+    provider: &'static str,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+) -> SeriesAttempt {
     // Reuse the item resolver: kind=Episode + season/episode=None routes to the
     // provider's SERIES-level search+fetch (TvdbEnricher: search_series →
-    // get_series). No nfo id for a synthesised show, so it always searches.
+    // get_series; TmdbEnricher: search_tv → tv_detail). No nfo id for a
+    // synthesised show, so it always searches.
     let resolved = resolve(
-        tvdb,
+        enricher,
         MediaKind::Episode,
-        "tvdb",
+        provider,
         &cand.series_name,
         cand.series_year,
         None,
@@ -851,25 +982,8 @@ where
     )
     .await;
     let (external_id, confidence, enriched) = match resolved {
-        Resolved::NoMatch => {
-            // Searched, nothing over the confidence floor → record `none` so the
-            // show isn't re-searched until the TTL re-admits it.
-            store
-                .upsert_series_metadata(SeriesMetadata {
-                    series_key: cand.series_key.clone(),
-                    series_name: cand.series_name.clone(),
-                    match_provider: Some("tvdb".into()),
-                    match_source: Some("none".into()),
-                    metadata_refreshed_at: Some(now),
-                    ..Default::default()
-                })
-                .await?;
-            return Ok(false);
-        }
-        // Transient fetch miss — leave the show's row untouched so the next
-        // pass retries. (A synth series has no persisted id to stamp the way an
-        // item does; the whole-series retry is cheap and infrequent.)
-        Resolved::Transient { .. } => return Ok(false),
+        Resolved::NoMatch => return SeriesAttempt::NoMatch,
+        Resolved::Transient { .. } => return SeriesAttempt::Transient,
         Resolved::Hit {
             external_id,
             confidence,
@@ -877,10 +991,9 @@ where
             ..
         } => (external_id, confidence, *enriched),
     };
-
     let poster_locator = cache_series_art(
         cache,
-        tvdb,
+        enricher,
         bg_io,
         &cand.series_key,
         ArtworkRole::Primary,
@@ -890,7 +1003,7 @@ where
     .await;
     let backdrop_locator = cache_series_art(
         cache,
-        tvdb,
+        enricher,
         bg_io,
         &cand.series_key,
         ArtworkRole::Backdrop,
@@ -898,37 +1011,14 @@ where
         &enriched,
     )
     .await;
-
-    store
-        .upsert_series_metadata(SeriesMetadata {
-            series_key: cand.series_key.clone(),
-            series_name: cand.series_name.clone(),
-            match_provider: Some("tvdb".into()),
-            match_external_id: Some(external_id.clone()),
-            match_source: Some("search".into()),
-            match_confidence: confidence,
-            metadata_refreshed_at: Some(now),
-            overview: enriched.overview.clone(),
-            community_rating: enriched.community_rating,
-            premiere_date: enriched.premiere_date,
-            official_rating: enriched.official_rating.clone(),
-            original_language: enriched.original_language.clone(),
-            genres: enriched.genres.clone(),
-            // TVDB's series-detail parse carries no studios/networks today.
-            studios: Vec::new(),
-            provider_ids: ProviderIds {
-                tvdb: Some(external_id),
-                // The series-level record's `also_tmdb_id` IS series-scoped
-                // (unlike an episode's), so it's safe to carry as the show's
-                // TMDB id.
-                tmdb: enriched.also_tmdb_id.clone(),
-                ..Default::default()
-            },
-            poster_locator,
-            backdrop_locator,
-        })
-        .await?;
-    Ok(true)
+    SeriesAttempt::Hit(Box::new(SeriesHit {
+        provider,
+        external_id,
+        confidence,
+        enriched,
+        poster_locator,
+        backdrop_locator,
+    }))
 }
 
 /// Download the show's artwork of role `want` (if the record offers it) and
@@ -1462,6 +1552,69 @@ mod tests {
             ..MediaItem::default()
         };
         store.put(item).await.unwrap();
+    }
+
+    /// B127 — TVDB is not the only show provider. 44 of the deployed library's
+    /// 178 shows were frozen as `none` by TVDB alone, nearly all anime, and a
+    /// show with no poster falls back to a representative episode and then to
+    /// an extracted frame.
+    #[tokio::test]
+    async fn a_show_tvdb_cannot_match_falls_back_to_tmdb() {
+        let s = store().await;
+        put_episode(&s, 1, "Death Note", "/tv/Death Note").await;
+        put_episode(&s, 2, "Death Note", "/tv/Death Note").await;
+        let (_td, cache) = cache();
+        // TVDB searches and offers nothing that clears the floor.
+        let tvdb = FakeEnricher::tvdb().with_search(vec![]);
+        let tmdb = FakeEnricher::tmdb()
+            // `put_episode` stamps every fixture show with year 1997, and a
+            // 9-year gap scores 0.6 — below the floor. A provider result with
+            // no year (common on TMDB search rows) is the realistic shape here.
+            .with_search(vec![("13916", "Death Note", None)])
+            .with_detail(EnrichedMetadata {
+                overview: Some("A shinigami's notebook.".into()),
+                artwork: vec![RemoteArt {
+                    role: pharos_core::ArtworkRole::Primary,
+                    url: "https://image.tmdb.org/poster.jpg".into(),
+                }],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(b"\xff\xd8\xff\xe0jpegbytes".to_vec());
+
+        run(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let got = s
+            .series_metadata_by_keys(&["/tv/Death Note".into()])
+            .await
+            .unwrap();
+        let meta = got.get("/tv/Death Note").expect("show row written");
+        assert_eq!(
+            meta.match_source.as_deref(),
+            Some("search"),
+            "the fallback matched it, so it must not be frozen as `none`: {meta:?}"
+        );
+        assert_eq!(meta.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(meta.match_external_id.as_deref(), Some("13916"));
+        assert_eq!(
+            meta.provider_ids.tmdb.as_deref(),
+            Some("13916"),
+            "a TMDB-matched show carries a TMDB id, not a TVDB one"
+        );
+        assert!(meta.provider_ids.tvdb.is_none());
+        assert!(
+            meta.poster_locator.is_some(),
+            "the fallback provider's poster is cached, which is the whole point"
+        );
     }
 
     #[tokio::test]
