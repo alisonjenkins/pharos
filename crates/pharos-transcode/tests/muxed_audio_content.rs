@@ -436,3 +436,114 @@ fn first_audio_pts(path: &Path) -> f64 {
         .and_then(|v| v.trim().parse().ok())
         .expect("a first audio pts")
 }
+
+/// The Rogue One desync, isolated — and the contract that fixes it.
+///
+/// `MuxedAudio::start_seconds` must be the file's TRUE first-sample time, not
+/// the start its session was asked for. The segment seeks this file by
+/// `input_seek - start_seconds`, and `-ss` on an input is measured FROM THAT
+/// INPUT'S OWN START TIME, so any error in the field shifts the audio under the
+/// video by exactly that much.
+///
+/// For a source whose AUDIO stream starts late, a from-0 session's first sample
+/// sits at the stream's own start (1.700 s on the real title), not at 0 — so
+/// recording `0.0` put every frame's audio 1.7 s late in the source. Measured
+/// against the real file at the 600 s mark: our audio correlated with the
+/// source at +1680 ms. Heard as audio running ahead of picture for the whole
+/// title, because once a from-0 session exists every later segment reuses it.
+///
+/// The tone is SHORT and sits just after a segment boundary, so a 1.7 s shift
+/// carries it into the PREVIOUS segment. A wide tone cannot detect this at all:
+/// the first version of this test used a 2 s tone against 6 s segments and
+/// passed against the bug, because the tone stayed in the same segment either
+/// way.
+#[test]
+fn the_slice_seek_honours_the_files_true_start_not_its_requested_one() {
+    const DELAY: f64 = 1.7;
+    let rate = frame_rate();
+
+    let target = 6u32;
+    let (seg_start, _) = pharos_core::segment_range(target, Some(rate));
+    let tone_at = seg_start + 0.30;
+    let tone_end = tone_at + 0.40;
+    assert!(
+        tone_at - DELAY < seg_start,
+        "fixture must be able to tell the two cases apart"
+    );
+
+    let td = tempfile::TempDir::new().unwrap();
+    let src = make_tone_source(td.path(), DELAY, tone_at - DELAY, tone_end - DELAY);
+    let session = make_continuous_audio_from_zero(&src, td.path());
+
+    // The file really does start late — otherwise this fixture proves nothing.
+    let actual = first_audio_pts(&session.path);
+    assert!(
+        (actual - DELAY).abs() < 0.1,
+        "fixture must reproduce a late-starting session: first sample at {actual:.3}s"
+    );
+
+    // WITH the true start, the tone lands under the video it belongs to.
+    let truthful = MuxedAudio {
+        path: session.path.clone(),
+        start_seconds: actual,
+    };
+    let here = mean_volume_db(&encode_segment(&src, &truthful, td.path(), target));
+    let before = mean_volume_db(&encode_segment(&src, &truthful, td.path(), target - 1));
+    assert!(
+        here > before + 10.0,
+        "with the file's true start ({actual:.3}s) the tone at {tone_at:.3}s must \
+         land in segment {target}: got {here} dBFS there vs {before} dBFS in {}",
+        target - 1
+    );
+
+    // WITH the requested start, it lands a whole segment early. This is the
+    // shipped bug, pinned so the field's meaning cannot quietly revert.
+    let naive = MuxedAudio {
+        path: session.path,
+        start_seconds: 0.0,
+    };
+    let n_here = mean_volume_db(&encode_segment(&src, &naive, td.path(), target));
+    let n_before = mean_volume_db(&encode_segment(&src, &naive, td.path(), target - 1));
+    assert!(
+        n_before > n_here + 10.0,
+        "claiming start_seconds 0.0 for a file starting at {actual:.3}s must shift \
+         the audio EARLY — if this no longer holds, the slice seek changed and \
+         the comment on MuxedAudio::start_seconds is stale: seg{target}={n_here} \
+         dBFS seg{}={n_before} dBFS",
+        target - 1
+    );
+}
+
+/// Video throughout; a SHORT tone at a chosen point, with the whole audio
+/// stream shifted late by `delay` so its container start_time is `delay`.
+fn make_tone_source(dir: &Path, delay: f64, from: f64, to: f64) -> PathBuf {
+    let src = dir.join("src_tone.mkv");
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=duration=60:size=320x180:rate=24000/1001",
+            "-itsoffset",
+            &format!("{delay}"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("aevalsrc=sin(2*PI*1000*t)*between(t\\,{from}\\,{to}):d=60:s=48000"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-y",
+            src.to_str().unwrap(),
+        ],
+        "tone source synth",
+    );
+    src
+}
