@@ -9,12 +9,13 @@
 //! (ADR-0018 #2).
 //!
 //! Compiled on unix only (the libav worker pool). A season is (re)analyzed
-//! when any of its episodes lacks a current-`SEGMENT_SCHEMA_VERSION` segment.
+//! when any of its episodes has not been analysed at the current
+//! `SEGMENT_DETECT_VERSION`.
 
 use crate::state::Stores;
 use pharos_core::{
     DetectedSegment, FingerprintKind, MediaItem, MediaSegmentKind, MediaSegmentStore, MediaStore,
-    SEGMENT_SCHEMA_VERSION,
+    SEGMENT_DETECT_VERSION, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_transcode::fingerprint::align::AlignConfig;
 use pharos_transcode::fingerprint::season::{
@@ -116,7 +117,7 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
 }
 
 /// A season is "current" when EVERY episode has been ANALYSED at the current
-/// `SEGMENT_SCHEMA_VERSION` — whatever that analysis found (cheap DB reads).
+/// `SEGMENT_DETECT_VERSION` — whatever that analysis found (cheap DB reads).
 ///
 /// B123: this used to ask whether each episode had any segment ROW, which
 /// conflated "not analysed" with "analysed, nothing there". Most shows have no
@@ -128,7 +129,7 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
 async fn season_is_current(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
     for ep in eps {
         match ctx.stores.segment_scan_version(ep.id).await {
-            Ok(Some(v)) if v == SEGMENT_SCHEMA_VERSION => {}
+            Ok(Some(v)) if v == SEGMENT_DETECT_VERSION => {}
             _ => return false,
         }
     }
@@ -256,7 +257,7 @@ async fn analyze_season(ctx: &Ctx, season_key: &str, eps: &[&MediaItem]) -> bool
         let segs = by_item.remove(&ep.id).unwrap_or_default();
         if let Err(e) = ctx
             .stores
-            .set_media_segments(ep.id, &segs, SEGMENT_SCHEMA_VERSION)
+            .set_media_segments(ep.id, &segs, SEGMENT_DETECT_VERSION)
             .await
         {
             tracing::warn!(error = %e, media.id = ep.id, "segment backfill: persist failed");
@@ -268,7 +269,7 @@ async fn analyze_season(ctx: &Ctx, season_key: &str, eps: &[&MediaItem]) -> bool
         // results are safely persisted, so a failed write is retried.
         if let Err(e) = ctx
             .stores
-            .set_segment_scan(ep.id, SEGMENT_SCHEMA_VERSION)
+            .set_segment_scan(ep.id, SEGMENT_DETECT_VERSION)
             .await
         {
             tracing::warn!(error = %e, media.id = ep.id, "segment backfill: scan stamp failed");
