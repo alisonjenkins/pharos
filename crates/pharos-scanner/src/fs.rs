@@ -1048,6 +1048,7 @@ impl<P: Prober> FsScanner<P> {
                     // local Primary sidecar (it runs after this row is put);
                     // false here so a coverless item stays false.
                     has_primary_art: false,
+                    art_version: 0,
                     match_provider: None,
                     match_external_id: None,
                     match_source: None,
@@ -2022,6 +2023,18 @@ mod tests {
                     (item_id, role.to_string()),
                     (source.to_string(), locator.to_string()),
                 );
+            Ok(())
+        }
+
+        async fn bump_art_version(&self, item_id: MediaId) -> DomainResult<()> {
+            if let Some(it) = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get_mut(&item_id)
+            {
+                it.art_version += 1;
+            }
             Ok(())
         }
 

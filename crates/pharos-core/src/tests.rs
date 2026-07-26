@@ -314,6 +314,18 @@ impl MediaStore for MemStore {
         Ok(())
     }
 
+    async fn bump_art_version(&self, item_id: MediaId) -> DomainResult<()> {
+        if let Some(it) = self
+            .inner
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .get_mut(&item_id)
+        {
+            it.art_version += 1;
+        }
+        Ok(())
+    }
+
     async fn artwork_for(&self, item_id: MediaId) -> DomainResult<Vec<(String, String, String)>> {
         let map = self
             .artwork

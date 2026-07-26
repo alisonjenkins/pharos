@@ -23,7 +23,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     series_folder, series_year, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, has_primary_art, \
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
-    original_language";
+    original_language, art_version";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -1120,6 +1120,17 @@ impl MediaStore for SqliteStore {
                 .await
                 .map_err(|e| DomainError::Backend(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    async fn bump_art_version(&self, item_id: MediaId) -> DomainResult<()> {
+        let id_i64 = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        sqlx::query("UPDATE media_items SET art_version = art_version + 1 WHERE id = ?")
+            .bind(id_i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(())
     }
 
@@ -2898,6 +2909,7 @@ struct MediaRow {
     network: Option<String>,
     release_date: Option<String>,
     has_primary_art: bool,
+    art_version: i64,
     match_provider: Option<String>,
     match_external_id: Option<String>,
     match_source: Option<String>,
@@ -3112,6 +3124,7 @@ impl MediaRow {
             created_at,
             metadata,
             has_primary_art: self.has_primary_art,
+            art_version: self.art_version,
             match_provider: self.match_provider,
             match_external_id: self.match_external_id,
             match_source: self.match_source,

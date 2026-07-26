@@ -73,6 +73,12 @@ pub struct MediaItem {
     /// the audio Primary tag on this so that invalid state is unrepresentable.
     /// `Default` = `false`.
     pub has_primary_art: bool,
+    /// B124 — how many times this item's artwork BYTES have been replaced.
+    /// Part of every `ImageTag`, so replacing art changes the image URL a
+    /// client requests. Without it the tag was a pure function of (item, role)
+    /// and a downloaded poster stayed invisible behind `Cache-Control:
+    /// max-age=604800` for a week. `Default` = `0`.
+    pub art_version: i64,
     /// Online-enrichment match state. Which provider (`"tmdb"`/`"tvdb"`) and
     /// id authoritatively identified this item, and how (`match_source`:
     /// `"nfo_id"`/`"search"`/`"manual"`/`"none"`). `None` = never matched
@@ -2755,6 +2761,19 @@ pub trait MediaStore: Send + Sync {
         role: &str,
         source: &str,
         locator: &str,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// B124 — record that this item's artwork BYTES were replaced, rotating
+    /// every `ImageTag` it advertises so clients fetch the new picture instead
+    /// of the copy they cached for a week.
+    ///
+    /// Called where bytes change (a provider download, a manual upload, a
+    /// delete) — NOT from `set_artwork`, which the scanner calls on every pass
+    /// to re-record the same sidecar path and which would otherwise invalidate
+    /// every client's image cache on every scan.
+    fn bump_art_version(
+        &self,
+        item_id: MediaId,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
     /// LIB-D4 — every artwork row for `item_id` as `(role, source,

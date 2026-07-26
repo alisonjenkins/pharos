@@ -3532,6 +3532,7 @@ mod trickplay_helper_tests {
         // advertise Primary — the image route serves the local artwork.
         let audio_with_cover = MediaItem {
             has_primary_art: true,
+            art_version: 0,
             ..audio.clone()
         };
         assert!(
