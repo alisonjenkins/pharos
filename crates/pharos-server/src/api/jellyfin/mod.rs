@@ -16,6 +16,7 @@ pub mod seek;
 pub mod sessions;
 pub mod socket;
 pub mod stream;
+pub mod stream_select;
 pub mod stubs;
 pub mod subtitle_burn;
 pub mod subtitle_delivery;
