@@ -58,56 +58,155 @@ fn no_content() -> HttpResponse {
     HttpResponse::NoContent().finish()
 }
 
+/// The disposition of a dispatched SyncPlay command — the observability
+/// contract for `pharos_syncplay_command_total`. Bounded, stable strings from
+/// [`CommandOutcome::label`] (a renamed label breaks the dashboard silently);
+/// asserted distinct in a test. Every path through [`dispatch`] records exactly
+/// one of these, so a dropped command is never invisible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommandOutcome {
+    /// Applied via the caller's live `/socket` session — the normal path.
+    Dispatched,
+    /// No live socket (a fresh pod within the post-deploy reconnect gap), but
+    /// the caller's persisted membership named a group — applied there. The
+    /// caller's own view heals via catch-up when its `/socket` reconnects (B24).
+    Recovered,
+    /// A live socket, but the session is in no group AND no persisted group
+    /// claims the member — the client is told `NotInGroup`.
+    NotInGroup,
+    /// No live socket AND no persisted membership — nothing to apply to.
+    DroppedNoSocket,
+    /// The request carried no `deviceId` at all.
+    NoDevice,
+}
+
+impl CommandOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dispatched => "dispatched",
+            Self::Recovered => "recovered",
+            Self::NotInGroup => "not_in_group",
+            Self::DroppedNoSocket => "dropped_no_socket",
+            Self::NoDevice => "no_device",
+        }
+    }
+}
+
+/// Count one command dispatch. `command` is the fixed route label (pause, seek,
+/// …), so the label set is bounded on both axes.
+fn record_command(command: &str, outcome: CommandOutcome) {
+    metrics::counter!(
+        "pharos_syncplay_command_total",
+        "command" => command.to_string(),
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+}
+
+/// Apply a command via the caller's PERSISTED membership when there is no live
+/// socket to resolve it through — the deploy-reconnect gap. The device's member
+/// id is deterministic ([`member_id_for_device`]), so the persisted snapshots
+/// still name its group; `get_or_create` re-owns/hydrates it (ownership-aware
+/// under Postgres) and the command applies to group state. The caller receives
+/// nothing now — it has no socket here — but its own player already performed
+/// the action locally (jellyfin-web pauses/seeks first, then POSTs), and its
+/// view reconciles via catch-up the instant its `/socket` reconnects (B24).
+/// Returns whether a group was found and the command sent.
+async fn recover_and_apply(
+    registry: &GroupRegistry,
+    stores: &crate::state::Stores,
+    member_id: MemberId,
+    device_id: &str,
+    label: &str,
+    make: impl FnOnce(MemberId) -> GroupMsg,
+) -> bool {
+    let Some(gid) = crate::sync_recovery::find_persisted_group(stores, member_id).await else {
+        return false;
+    };
+    let h = match registry.get_or_create(gid).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                command = label, device_id = %device_id, group = %gid, error = %e,
+                "syncplay: recovery get_or_create failed — command dropped"
+            );
+            return false;
+        }
+    };
+    tracing::info!(
+        command = label, device_id = %device_id, %member_id, group = %gid,
+        "syncplay: command applied from persisted membership (no live socket — deploy reconnect gap)"
+    );
+    let _ = h.tx.send(make(member_id)).await;
+    record_command(label, CommandOutcome::Recovered);
+    true
+}
+
 /// Resolve the caller's group and send it a `GroupMsg` built from the caller's
-/// member id. The common shape of every command handler: no device / no socket
-/// / not in a group all collapse to a `204` no-op.
+/// member id. The common shape of every command handler. A command that finds
+/// no live socket is NOT dropped — it is recovered against the caller's
+/// persisted membership (the rolling-deploy wedge of 2026-07-26, where
+/// next/unpause/seek issued during the socket-reconnect gap were silently
+/// lost). Every terminal path records a [`CommandOutcome`].
 async fn dispatch(
     hub: &SessionHub,
+    registry: &GroupRegistry,
+    stores: &crate::state::Stores,
     device_id: Option<String>,
     label: &str,
     make: impl FnOnce(MemberId) -> GroupMsg,
 ) -> HttpResponse {
-    match device_id.as_deref() {
-        None => tracing::warn!(
+    let Some(dev) = device_id.as_deref() else {
+        tracing::warn!(
             command = label,
             "syncplay: command with no deviceId — dropped"
-        ),
-        // B54 — resolve WITH RETRY: the group-forming commands (SetNewQueue
-        // especially — it hands the group its media) can arrive in the same
-        // open-socket-then-POST race as New/Join. A single resolve then drops
-        // SetNewQueue and the group has nothing to play. A member with a live
-        // socket resolves on the first try (no added latency); only the race
-        // window or a genuine disconnect waits.
-        Some(dev) => match resolve_with_retry(hub, dev).await {
-            None => tracing::warn!(
-                command = label,
-                device_id = %dev,
-                "syncplay: no /socket registered for this deviceId after retry — command \
-                 dropped (client must open /socket before commanding)"
-            ),
-            Some(sess) => match sess.group {
-                None => {
+        );
+        record_command(label, CommandOutcome::NoDevice);
+        return no_content();
+    };
+    // B54 — resolve WITH RETRY: the group-forming commands (SetNewQueue
+    // especially — it hands the group its media) can arrive in the same
+    // open-socket-then-POST race as New/Join. A member with a live socket
+    // resolves on the first try (no added latency); only the race window or a
+    // genuine disconnect waits.
+    match resolve_with_retry(hub, dev).await {
+        Some(sess) => match sess.group {
+            Some(h) => {
+                tracing::info!(command = label, device_id = %dev, group = %h.group_id, "syncplay: command dispatched");
+                let _ = h.tx.send(make(sess.member_id)).await;
+                record_command(label, CommandOutcome::Dispatched);
+            }
+            // A live socket but no attached group here: its B24 re-attach may
+            // not have run yet, so try persisted recovery before giving up.
+            None => {
+                if !recover_and_apply(registry, stores, sess.member_id, dev, label, make).await {
                     tracing::warn!(
-                        command = label,
-                        device_id = %dev,
+                        command = label, device_id = %dev,
                         "syncplay: session is in no group — telling client NotInGroup"
                     );
-                    // B24 — never drop silently: the client that sent this
-                    // still believes it's grouped (its group died with a
-                    // restart and no snapshot recovered it, or it was pruned).
-                    // NotInGroup makes stock jellyfin-web disable SyncPlay
-                    // visibly instead of desyncing one-sidedly.
+                    // B24 — never drop silently: NotInGroup makes stock
+                    // jellyfin-web disable SyncPlay visibly instead of
+                    // desyncing one-sidedly.
                     let _ = sess
                         .sink
                         .send(pharos_sync::messages::ServerMsg::NotInGroup)
                         .await;
+                    record_command(label, CommandOutcome::NotInGroup);
                 }
-                Some(h) => {
-                    tracing::info!(command = label, device_id = %dev, group = %h.group_id, "syncplay: command dispatched");
-                    let _ = h.tx.send(make(sess.member_id)).await;
-                }
-            },
+            }
         },
+        // No live socket — the fresh-pod-after-deploy window. Recover from the
+        // persisted membership instead of dropping (was: silent WARN + drop).
+        None => {
+            let member_id = pharos_sync::hub::member_id_for_device(dev);
+            if !recover_and_apply(registry, stores, member_id, dev, label, make).await {
+                tracing::warn!(
+                    command = label, device_id = %dev,
+                    "syncplay: no /socket registered and no persisted group — command dropped"
+                );
+                record_command(label, CommandOutcome::DroppedNoSocket);
+            }
+        }
     }
     no_content()
 }
@@ -116,10 +215,20 @@ async fn dispatch(
 /// `{Ping: <ms>}`, ignored). Routed through `dispatch` for its two side
 /// effects: the member's liveness TTL refreshes (T83 ghost prune), and a
 /// group-less caller is answered with NotInGroup.
-async fn ping(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.sync_key(), "ping", |mid| GroupMsg::MemberPing {
-        member_id: mid,
-    })
+async fn ping(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+) -> HttpResponse {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "ping",
+        |mid| GroupMsg::MemberPing { member_id: mid },
+    )
     .await
 }
 
@@ -399,38 +508,66 @@ async fn leave_group(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpRespo
 async fn set_new_queue(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<SetNewQueueBody>,
 ) -> HttpResponse {
     let body = body.into_inner();
     let start_ms = body.start_position_ticks / POSITION_TICKS_PER_MS;
-    dispatch(&hub, auth.sync_key(), "setnewqueue", move |mid| {
-        GroupMsg::SetNewQueue {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "setnewqueue",
+        move |mid| GroupMsg::SetNewQueue {
             sender: mid,
             item_ids: body.playing_queue,
             playing_index: body.playing_item_position,
             start_position_ms: start_ms,
-        }
-    })
+        },
+    )
     .await
 }
 
-async fn unpause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.sync_key(), "unpause", |mid| GroupMsg::Unpause {
-        sender: mid,
-    })
+async fn unpause(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+) -> HttpResponse {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "unpause",
+        |mid| GroupMsg::Unpause { sender: mid },
+    )
     .await
 }
 
-async fn pause(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
-    dispatch(&hub, auth.sync_key(), "pause", |mid| {
-        GroupMsg::PauseShared { sender: mid }
-    })
+async fn pause(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+) -> HttpResponse {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "pause",
+        |mid| GroupMsg::PauseShared { sender: mid },
+    )
     .await
 }
 
 async fn seek(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
     state: web::Data<crate::state::AppState>,
     body: web::Json<SeekBody>,
 ) -> HttpResponse {
@@ -458,46 +595,67 @@ async fn seek(
             }
         });
     }
-    dispatch(&hub, auth.sync_key(), "seek", move |mid| GroupMsg::SeekTo {
-        sender: mid,
-        position_ms: pos,
-    })
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "seek",
+        move |mid| GroupMsg::SeekTo {
+            sender: mid,
+            position_ms: pos,
+        },
+    )
     .await
 }
 
 async fn buffering(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<ReadyBody>,
 ) -> HttpResponse {
     let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
     let pli = body.playlist_item_id;
-    dispatch(&hub, auth.sync_key(), "buffering", move |mid| {
-        GroupMsg::BufferingStart {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "buffering",
+        move |mid| GroupMsg::BufferingStart {
             member_id: mid,
             position_ms: pos,
             playlist_item_id: pli,
-        }
-    })
+        },
+    )
     .await
 }
 
 async fn ready(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<ReadyBody>,
 ) -> HttpResponse {
     let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
     let pli = body.playlist_item_id;
-    dispatch(&hub, auth.sync_key(), "ready", move |mid| {
-        GroupMsg::MemberReady {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "ready",
+        move |mid| GroupMsg::MemberReady {
             member_id: mid,
             position_ms: pos,
             playlist_item_id: pli,
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -508,89 +666,131 @@ async fn ready(
 async fn set_ignore_wait(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<IgnoreWaitBody>,
 ) -> HttpResponse {
     let ignore = body.ignore_wait;
-    dispatch(&hub, auth.sync_key(), "setignorewait", move |mid| {
-        GroupMsg::SetIgnoreWait {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "setignorewait",
+        move |mid| GroupMsg::SetIgnoreWait {
             member_id: mid,
             ignore,
-        }
-    })
+        },
+    )
     .await
 }
 
 async fn set_playlist_item(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<SetPlaylistItemBody>,
 ) -> HttpResponse {
     let pli = body.into_inner().playlist_item_id;
-    dispatch(&hub, auth.sync_key(), "setplaylistitem", move |mid| {
-        GroupMsg::SetPlaylistItem {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "setplaylistitem",
+        move |mid| GroupMsg::SetPlaylistItem {
             sender: mid,
             playlist_item_id: pli,
-        }
-    })
+        },
+    )
     .await
 }
 
 async fn next_item(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Bytes,
 ) -> HttpResponse {
     // Bytes + lenient parse: tolerate clients that post no body at all.
     let pli = serde_json::from_slice::<NextItemBody>(&body)
         .unwrap_or_default()
         .playlist_item_id;
-    dispatch(&hub, auth.sync_key(), "nextitem", move |mid| {
-        GroupMsg::NextItem {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "nextitem",
+        move |mid| GroupMsg::NextItem {
             sender: mid,
             playlist_item_id: pli,
-        }
-    })
+        },
+    )
     .await
 }
 
 async fn previous_item(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Bytes,
 ) -> HttpResponse {
     let pli = serde_json::from_slice::<NextItemBody>(&body)
         .unwrap_or_default()
         .playlist_item_id;
-    dispatch(&hub, auth.sync_key(), "previousitem", move |mid| {
-        GroupMsg::PreviousItem {
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "previousitem",
+        move |mid| GroupMsg::PreviousItem {
             sender: mid,
             playlist_item_id: pli,
-        }
-    })
+        },
+    )
     .await
 }
 
 async fn set_repeat_mode(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<ModeBody>,
 ) -> HttpResponse {
     let mode = body.into_inner().mode;
-    dispatch(&hub, auth.sync_key(), "setrepeatmode", move |mid| {
-        GroupMsg::SetRepeatMode { sender: mid, mode }
-    })
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "setrepeatmode",
+        move |mid| GroupMsg::SetRepeatMode { sender: mid, mode },
+    )
     .await
 }
 
 async fn set_shuffle_mode(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<ModeBody>,
 ) -> HttpResponse {
     let mode = body.into_inner().mode;
-    dispatch(&hub, auth.sync_key(), "setshufflemode", move |mid| {
-        GroupMsg::SetShuffleMode { sender: mid, mode }
-    })
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "setshufflemode",
+        move |mid| GroupMsg::SetShuffleMode { sender: mid, mode },
+    )
     .await
 }
 
@@ -717,6 +917,62 @@ mod tests {
         let token = stores.issue(uid, "t").await.unwrap();
         let state = web::Data::new(crate::state::AppState::new(stores, "t".into()));
         (state, token.0.expose().to_string())
+    }
+
+    /// The `pharos_syncplay_command_total{outcome}` label set is a dashboard
+    /// contract: bounded, stable, and DISTINCT (two outcomes sharing a string
+    /// would silently merge on the graph). Every dispatch path records exactly
+    /// one, so a dropped command is never invisible — the whole point of the
+    /// 2026-07-26 rolling-deploy instrumentation.
+    #[actix_web::test]
+    async fn command_outcome_labels_are_stable_and_distinct() {
+        use std::collections::HashSet;
+        let all = [
+            CommandOutcome::Dispatched,
+            CommandOutcome::Recovered,
+            CommandOutcome::NotInGroup,
+            CommandOutcome::DroppedNoSocket,
+            CommandOutcome::NoDevice,
+        ];
+        let labels: HashSet<&str> = all.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels.len(),
+            all.len(),
+            "every outcome has a distinct label"
+        );
+        // Pin the exact strings — a rename must be a conscious, reviewed change
+        // because it breaks existing alerts/queries.
+        assert_eq!(CommandOutcome::Dispatched.label(), "dispatched");
+        assert_eq!(CommandOutcome::Recovered.label(), "recovered");
+        assert_eq!(CommandOutcome::NotInGroup.label(), "not_in_group");
+        assert_eq!(CommandOutcome::DroppedNoSocket.label(), "dropped_no_socket");
+        assert_eq!(CommandOutcome::NoDevice.label(), "no_device");
+    }
+
+    /// The recovery guard: a device that no persisted snapshot claims must NOT
+    /// be recovered — the command drops (and is counted `dropped_no_socket`)
+    /// rather than being misapplied to some unrelated group.
+    #[actix_web::test]
+    async fn recovery_returns_false_when_no_persisted_group_claims_the_member() {
+        use crate::state::Stores;
+        use pharos_sync::delivery::{LocalDelivery, MemberSinks};
+        use pharos_sync::messages::MemberId;
+        use std::sync::Arc;
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let registry = GroupRegistry::spawn(Arc::new(LocalDelivery::new(MemberSinks::new())));
+        let applied = recover_and_apply(
+            &registry,
+            &stores,
+            MemberId::new(),
+            "dev-in-no-group",
+            "pause",
+            |mid| GroupMsg::PauseShared { sender: mid },
+        )
+        .await;
+        assert!(
+            !applied,
+            "no persisted group claims this member — must drop, never misapply"
+        );
     }
 
     #[actix_web::test]
