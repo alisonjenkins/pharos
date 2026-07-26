@@ -3,8 +3,8 @@
 //! The intro-skipper plugin keeps the single LONGEST pairwise match per
 //! episode — one coincidental musical match then sets a bogus intro. We
 //! instead pairwise-compare every episode, CLUSTER each episode's located
-//! spans, and emit the consensus span with a **confidence** = fraction of
-//! comparisons that agreed. A segment is only served when confidence clears a
+//! spans, and emit the consensus span with a **confidence** = fraction of the
+//! comparisons that located a span at all which agreed. A segment is only served when confidence clears a
 //! threshold, so outliers are dropped, not enshrined.
 //!
 //! Pure (operates on already-computed fingerprints), so the whole
@@ -30,8 +30,9 @@ pub struct SeasonSegment {
     pub id: u64,
     pub start_secs: f64,
     pub end_secs: f64,
-    /// Fraction of this episode's comparisons that landed in the winning
-    /// cluster — 0..=1. Higher = more episodes independently agreed.
+    /// Fraction of this episode's SPAN-PRODUCING comparisons that landed in
+    /// the winning cluster — 0..=1. A peer that located nothing offered no
+    /// evidence either way and is not counted against it (B123).
     pub confidence: f64,
     /// How many comparisons agreed (the winning cluster size).
     pub agreeing: u32,
@@ -47,7 +48,9 @@ pub struct SeasonConfig {
     /// Minimum comparisons that must agree to emit a segment (≥2 stops a
     /// single coincidental pair from setting a segment).
     pub min_agreeing: u32,
-    /// Minimum confidence (agreeing / comparisons) to emit.
+    /// Minimum confidence (agreeing / comparisons that located a span) to
+    /// emit — a purity gate on the evidence obtained, not a quorum of the
+    /// season.
     pub min_confidence: f64,
 }
 
@@ -108,7 +111,8 @@ pub enum Verdict {
     NoSpan,
     /// A cluster formed but fewer than `min_agreeing` comparisons agreed.
     FewAgreeing,
-    /// Enough agreed, but the agreement fraction was below `min_confidence`.
+    /// Enough agreed, but they were outnumbered by comparisons that located a
+    /// DIFFERENT span — the agreement fraction was below `min_confidence`.
     LowConfidence,
 }
 
@@ -191,7 +195,6 @@ pub fn detect_season_verbose(
             }
         }
     }
-    let comparisons_per_ep = (n - 1) as f64;
     let mut out = Vec::with_capacity(n);
     for (idx, spans) in located.iter().enumerate() {
         let matched = spans.len() as u32;
@@ -206,7 +209,15 @@ pub fn detect_season_verbose(
             });
             continue;
         };
-        let confidence = agreeing as f64 / comparisons_per_ep;
+        // B123 — the denominator is the comparisons that LOCATED a span for
+        // this episode, not every peer in the season. A peer that produced no
+        // span is not a peer that disagreed; it is a peer that offered no
+        // evidence, and counting it as dissent made recall fall as a season
+        // got longer. Measured on a real 20-episode season: episode 12 had
+        // NINE independent episodes agree on the same 22.0 s span — the same
+        // intro length as every emitted one — and was discarded because
+        // 9 < half of 19. Against matched comparisons it scores 1.00.
+        let confidence = agreeing as f64 / matched.max(1) as f64;
         let verdict = if agreeing < cfg.min_agreeing {
             Verdict::FewAgreeing
         } else if confidence < cfg.min_confidence {
@@ -320,6 +331,44 @@ mod tests {
             segs.is_empty(),
             "1 agreeing comparison < min_agreeing, got {segs:?}"
         );
+    }
+
+    /// B123 — the recall bug, in miniature. A season where only some pairs
+    /// align must still emit for the episodes whose alignments all agreed:
+    /// a peer that located nothing offered no evidence, and counting it as
+    /// dissent is what dropped an episode nine peers agreed with on a real
+    /// 20-episode season.
+    #[test]
+    fn agreement_is_measured_against_the_evidence_obtained() {
+        let intro = intro_block(160);
+        // Six episodes share the intro; four more share nothing with anyone,
+        // so every sharer matches 5 of its 9 peers — a minority of the season.
+        let mut eps: Vec<EpisodeFingerprint> = (1..=6)
+            .map(|i| ep(i, 8 + (i as usize * 5), &intro, 0.0))
+            .collect();
+        for i in 7..=10u64 {
+            eps.push(EpisodeFingerprint {
+                id: i,
+                points: filler(i as u32 * 31, 300),
+                window_offset_secs: 0.0,
+            });
+        }
+        let segs = detect_season(&eps, &SeasonConfig::default());
+        let ids: Vec<u64> = segs.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5, 6],
+            "every episode carrying the shared intro must be emitted; \
+             against ALL peers each scores 5/9 = 0.56 and a season with more \
+             non-sharers would fall under the gate purely for being longer"
+        );
+        for s in &segs {
+            assert!(
+                s.confidence > 0.99,
+                "all five located spans agreed, so the evidence is unanimous: {}",
+                s.confidence
+            );
+        }
     }
 
     #[test]

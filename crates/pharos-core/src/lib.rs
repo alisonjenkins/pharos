@@ -2012,10 +2012,18 @@ pub struct ScanState {
 // currently holding a container clock record an honest "unknown" instead.
 pub const PROBE_SCHEMA_VERSION: i64 = 5;
 
-/// T86/ADR-0018 — bump when the intro/outro detection ALGORITHM changes in a
-/// way that invalidates stored segments or fingerprints. A season whose stored
-/// segments carry an older version is re-analyzed by the backfill.
+/// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
+/// cached points (a different chromaprint configuration, a different analysis
+/// window). Every episode is then re-decoded from its source, so this is the
+/// expensive one: 10k+ NFS reads on the deployed library.
 pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
+
+/// B123 — bump when the CONSENSUS changes in a way that invalidates stored
+/// segments, without invalidating the fingerprints that produced them. Kept
+/// apart from [`SEGMENT_SCHEMA_VERSION`] precisely so a gate change re-runs
+/// the cheap half (pairwise comparison over cached points) and not the
+/// expensive one.
+pub const SEGMENT_DETECT_VERSION: i64 = 2;
 
 /// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
 /// jellyfin-web's Skip Intro / Skip Outro overlay.
