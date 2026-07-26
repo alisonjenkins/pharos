@@ -1778,7 +1778,7 @@ async fn vp9_audio_file(
         .ensure_audio_hls_covering(&item.path, media_id, audio_rel, Some(128_000), want_seg)
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
-    let bytes = cache
+    let file = cache
         .audio_hls_file(&dir, &name)
         .await
         // Carry the cache's give-up reason into the response body. A bare
@@ -1786,6 +1786,7 @@ async fn vp9_audio_file(
         // indistinguishable from a request past the end of the media, and
         // reconstructing which of the three budgets expired took a code read.
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
+    let bytes = file.bytes;
     let ctype = if name.ends_with(".mp4") {
         "video/mp4"
     } else {
