@@ -2858,8 +2858,9 @@ impl UserDataStore for PostgresStore {
     async fn get_user_data(&self, user: UserId, item: MediaId) -> DomainResult<UserItemData> {
         let id_bytes = user.0.as_bytes().to_vec();
         let item_i64 = media_id_i64(item)?;
-        let row: Option<(i32, i32, i64, i32, i64)> = sqlx::query_as(
-            "SELECT played, play_count, last_played_position_ticks, is_favorite, last_played_at
+        let row: Option<PgUserDataRow> = sqlx::query_as(
+            "SELECT played, play_count, last_played_position_ticks, is_favorite, last_played_at,
+                    audio_stream_index, subtitle_stream_index
              FROM user_data WHERE user_id = $1 AND item_id = $2",
         )
         .bind(id_bytes)
@@ -2888,14 +2889,21 @@ impl UserDataStore for PostgresStore {
         sqlx::query(
             "INSERT INTO user_data
                (user_id, item_id, played, play_count, last_played_position_ticks,
-                is_favorite, last_played_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                is_favorite, last_played_at, audio_stream_index, subtitle_stream_index)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (user_id, item_id) DO UPDATE SET
                played = EXCLUDED.played,
                play_count = EXCLUDED.play_count,
                last_played_position_ticks = EXCLUDED.last_played_position_ticks,
                is_favorite = EXCLUDED.is_favorite,
-               last_played_at = EXCLUDED.last_played_at",
+               last_played_at = EXCLUDED.last_played_at,
+               -- A write that carries no selection must not erase one already
+               -- recorded: progress reports arrive far more often than track
+               -- changes, and most of them know nothing about tracks.
+               audio_stream_index =
+                 COALESCE(EXCLUDED.audio_stream_index, user_data.audio_stream_index),
+               subtitle_stream_index =
+                 COALESCE(EXCLUDED.subtitle_stream_index, user_data.subtitle_stream_index)",
         )
         .bind(id_bytes)
         .bind(item_i64)
@@ -2904,6 +2912,8 @@ impl UserDataStore for PostgresStore {
         .bind(pos_i64)
         .bind(fav)
         .bind(data.last_played_at)
+        .bind(data.audio_stream_index)
+        .bind(data.subtitle_stream_index)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -2926,9 +2936,9 @@ impl UserDataStore for PostgresStore {
             .iter()
             .map(|id| media_id_i64(*id))
             .collect::<DomainResult<_>>()?;
-        let rows: Vec<(i64, i32, i32, i64, i32, i64)> = sqlx::query_as(
+        let rows: Vec<PgUserDataRowWithId> = sqlx::query_as(
             "SELECT item_id, played, play_count, last_played_position_ticks,
-                    is_favorite, last_played_at
+                    is_favorite, last_played_at, audio_stream_index, subtitle_stream_index
              FROM user_data
              WHERE user_id = $1 AND item_id = ANY($2)",
         )
@@ -2939,8 +2949,8 @@ impl UserDataStore for PostgresStore {
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         let mut by_id: std::collections::HashMap<i64, UserItemData> =
             std::collections::HashMap::with_capacity(rows.len());
-        for (id, played, pc, pos, fav, lp) in rows {
-            by_id.insert(id, row_to_user_data((played, pc, pos, fav, lp)));
+        for (id, played, pc, pos, fav, lp, ai, si) in rows {
+            by_id.insert(id, row_to_user_data((played, pc, pos, fav, lp, ai, si)));
         }
         Ok(ids_i64
             .iter()
@@ -3504,13 +3514,21 @@ fn record_from_row(row: PgUserRow) -> AuthResult<UserRecord> {
     })
 }
 
-fn row_to_user_data(row: (i32, i32, i64, i32, i64)) -> UserItemData {
-    let (played, pc, pos, fav, lp) = row;
+/// One `user_data` row as SELECTed here: played, play_count, position ticks,
+/// is_favorite, last_played_at, then the two nullable track selections.
+type PgUserDataRow = (i32, i32, i64, i32, i64, Option<i32>, Option<i32>);
+/// The same row with its `item_id` in front, for the bulk read.
+type PgUserDataRowWithId = (i64, i32, i32, i64, i32, i64, Option<i32>, Option<i32>);
+
+fn row_to_user_data(row: PgUserDataRow) -> UserItemData {
+    let (played, pc, pos, fav, lp, audio, subtitle) = row;
     UserItemData {
         played: played != 0,
         play_count: u32::try_from(pc).unwrap_or(0),
         last_played_position_ticks: u64::try_from(pos).unwrap_or(0),
         is_favorite: fav != 0,
         last_played_at: lp,
+        audio_stream_index: audio,
+        subtitle_stream_index: subtitle,
     }
 }

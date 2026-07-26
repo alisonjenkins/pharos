@@ -65,6 +65,13 @@ struct ProgressBody {
     position_ticks: Option<u64>,
     #[serde(default)]
     is_paused: bool,
+    /// The tracks the client is actually playing. Recorded so a resume
+    /// returns to them (`RememberAudioSelections`); absent in reports that
+    /// know nothing about tracks, which must not erase a stored choice.
+    #[serde(default)]
+    audio_stream_index: Option<i32>,
+    #[serde(default)]
+    subtitle_stream_index: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +83,10 @@ struct StoppedBody {
     item_id: Option<String>,
     #[serde(default)]
     position_ticks: Option<u64>,
+    #[serde(default)]
+    audio_stream_index: Option<i32>,
+    #[serde(default)]
+    subtitle_stream_index: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -217,6 +228,14 @@ async fn playing_progress(
         if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
             data.last_played_position_ticks = position_ticks;
             data.last_played_at = now_unix();
+            // Only when the report names them — a report that is silent about
+            // tracks is not a statement that the user chose none.
+            if body.audio_stream_index.is_some() {
+                data.audio_stream_index = body.audio_stream_index;
+            }
+            if body.subtitle_stream_index.is_some() {
+                data.subtitle_stream_index = body.subtitle_stream_index;
+            }
             if state
                 .stores
                 .set_user_data(user.0.id, item_id, data)
@@ -300,6 +319,12 @@ async fn playing_stopped(
                     data.last_played_position_ticks = position;
                 }
                 data.last_played_at = now_unix();
+                if body.audio_stream_index.is_some() {
+                    data.audio_stream_index = body.audio_stream_index;
+                }
+                if body.subtitle_stream_index.is_some() {
+                    data.subtitle_stream_index = body.subtitle_stream_index;
+                }
                 if state
                     .stores
                     .set_user_data(user.0.id, item_id, data)

@@ -2774,6 +2774,14 @@ pub struct UserItemData {
     /// `0` means "never played" — kept separate from `played` so a
     /// favourited-but-never-played item still reports last_played=0.
     pub last_played_at: i64,
+    /// The audio track this user last played the item with, so a resume
+    /// returns to it instead of re-running the language preference. `None`
+    /// means they never chose one.
+    pub audio_stream_index: Option<i32>,
+    /// The subtitle track this user last played the item with. Signed and
+    /// distinct from `None`: `-1` is subtitles explicitly OFF, a choice that
+    /// must survive a resume exactly as a chosen track does.
+    pub subtitle_stream_index: Option<i32>,
 }
 
 pub trait UserDataStore: Send + Sync {
