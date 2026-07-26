@@ -95,6 +95,47 @@ fn make_source(dir: &Path) -> PathBuf {
     src
 }
 
+/// The Rogue One shape: the audio STREAM starts late in the container.
+///
+/// `-itsoffset` before the audio input shifts that stream's start_time, so the
+/// tone generated at `TONE_FROM` sits at `TONE_FROM + delay` on the container
+/// timeline — which is where a correct player puts it, and where the video at
+/// that instant expects it.
+///
+/// Measured on the real file: Rogue One's eac3 track reports
+/// `start_time 1.700000` against a video stream starting at 0.
+fn make_source_with_audio_delay(dir: &Path, delay: f64) -> PathBuf {
+    let src = dir.join("src_delayed.mkv");
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=duration=45:size=320x180:rate=24000/1001",
+            "-itsoffset",
+            &format!("{delay}"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("aevalsrc=sin(2*PI*1000*t)*between(t\\,{TONE_FROM}\\,{TONE_TO}):d=45:s=48000"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-y",
+            src.to_str().unwrap(),
+        ],
+        "delayed-audio source synth",
+    );
+    src
+}
+
 /// A SEEK session of the continuous encode: starts partway into the source
 /// and carries absolute PTS, exactly as `HlsSegmentCache` produces it.
 fn make_continuous_audio(src: &Path, dir: &Path) -> MuxedAudio {
@@ -257,4 +298,141 @@ fn a_segment_carries_the_audio_that_belongs_under_its_video() {
          dBFS against the tone segment's {loud_db} — its audio came from \
          somewhere else in the title"
     );
+}
+
+/// The audio stream of a container may start LATER than the video — a real and
+/// common authoring choice. Rogue One's eac3 track starts at 1.700 s.
+///
+/// pharos records no per-stream start time and the continuous-audio encode
+/// re-stamps audio onto its own timeline, so that relationship has nowhere to
+/// survive: the tone ends up under the wrong video. Reported as "the audio is
+/// lagged behind the video by what feels like 500ms".
+///
+/// The assertion is on CONTENT, like the test above: the segment whose video
+/// covers the tone's CONTAINER position must be the loud one.
+#[test]
+fn a_delayed_audio_stream_still_lands_under_the_right_video() {
+    const DELAY: f64 = 1.7;
+    let td = tempfile::TempDir::new().unwrap();
+    let src = make_source_with_audio_delay(td.path(), DELAY);
+    let audio = make_continuous_audio(&src, td.path());
+    let rate = frame_rate();
+
+    // Where the tone actually is on the container timeline.
+    let tone_from = TONE_FROM + DELAY;
+    let tone_to = TONE_TO + DELAY;
+
+    let mut loud = None;
+    for seg in 0..8u32 {
+        let (start, dur) = pharos_core::segment_range(seg, Some(rate));
+        if start - pharos_transcode::DECODE_PREROLL_SECONDS < SESSION_START {
+            continue;
+        }
+        let overlap = (start + dur).min(tone_to) - start.max(tone_from);
+        if overlap > 1.0 {
+            loud = Some(seg);
+            break;
+        }
+    }
+    let loud = loud.expect("a segment must overlap the delayed tone");
+
+    let db = mean_volume_db(&encode_segment(&src, &audio, td.path(), loud));
+    assert!(
+        db > -40.0,
+        "segment {loud} covers the tone at {tone_from}..{tone_to}s but is silent \
+         ({db} dBFS) — the source's {DELAY}s audio start offset was dropped, so the \
+         audio under this video came from {DELAY}s away"
+    );
+}
+
+/// The FROM-ZERO continuous session — what plays at the start of a title.
+///
+/// `continuous_audio_args` emits neither `-ss` nor `-output_ts_offset` when the
+/// session starts at 0, so nothing pins the output to the source timeline and
+/// the mpegts muxer's `-avoid_negative_ts` default is free to shift the first
+/// sample to zero. For a source whose audio stream starts LATE, that erases the
+/// gap: every sample arrives early by the stream's start offset, from the very
+/// first second of playback.
+fn make_continuous_audio_from_zero(src: &Path, dir: &Path) -> MuxedAudio {
+    let out = dir.join("audio0.ts");
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-i",
+            src.to_str().unwrap(),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128000",
+            "-ac",
+            "2",
+            "-f",
+            "mpegts",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            "-y",
+            out.to_str().unwrap(),
+        ],
+        "from-zero continuous audio encode",
+    );
+    MuxedAudio {
+        path: out,
+        start_seconds: 0.0,
+    }
+}
+
+/// The Rogue One report: "the audio desync started almost immediately".
+///
+/// The seek-session test above passes because `-ss`/`-output_ts_offset` pin
+/// that encode to the source timeline. The from-0 session has no such anchor,
+/// and it is the one serving the opening of every title.
+#[test]
+fn a_from_zero_session_keeps_a_late_audio_streams_offset() {
+    const DELAY: f64 = 1.7;
+    let td = tempfile::TempDir::new().unwrap();
+    let src = make_source_with_audio_delay(td.path(), DELAY);
+    let audio = make_continuous_audio_from_zero(&src, td.path());
+
+    // Where the first audio sample sits on the source timeline, per the
+    // continuous encode's own packets.
+    let first = first_audio_pts(&audio.path);
+    assert!(
+        (first - DELAY).abs() < 0.2,
+        "the continuous encode starts at {first:.3}s but the source's audio \
+         stream starts at {DELAY}s — the offset was erased, so every sample \
+         plays {:.3}s early for the whole title",
+        DELAY - first
+    );
+}
+
+/// PTS of the first audio packet in a file, in seconds.
+fn first_audio_pts(path: &Path) -> f64 {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            "-read_intervals",
+            "%+#1",
+        ])
+        .arg(path)
+        .output()
+        .expect("spawn ffprobe");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.split(',').next())
+        .and_then(|v| v.trim().parse().ok())
+        .expect("a first audio pts")
 }
