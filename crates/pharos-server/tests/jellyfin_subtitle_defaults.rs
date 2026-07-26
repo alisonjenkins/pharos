@@ -1,7 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! P12 — `DefaultSubtitleStreamIndex` resolution.
 //!
-//! Priority: is_default → English → first track → None.
+//! Priority: the client's explicit pick → the user's `SubtitleMode` → None.
+//!
+//! The ladder this once pinned (is_default → first English → ANY track) was
+//! pharos', not Jellyfin's, and its last two rungs turned subtitles ON for
+//! titles nobody asked them for: a container carrying a single incidental
+//! English track always selected it. Selection now runs Jellyfin's
+//! `SubtitleMode`, configured from stock jellyfin-web, whose Default mode
+//! picks only external/default/forced tracks — so an unconfigured user gets
+//! subtitles when the CONTAINER says so and not otherwise. `Always` is the
+//! mode that restores "give me the English track"; `Smart` gives it only when
+//! the audio is in a language the user does not read.
 
 use actix_web::{test, web, App};
 use pharos_core::{
@@ -104,11 +114,13 @@ async fn picks_default_flagged_track() {
         },
     ];
     let (state, token) = seed(tracks).await;
+    // The container states this one, so every mode but None honours it —
+    // B44's forced track and B104's default ASS still select, and still burn.
     assert_eq!(fetch_default(state, token).await, Some(3));
 }
 
 #[actix_web::test]
-async fn picks_english_when_no_default() {
+async fn leaves_an_incidental_english_track_off_under_the_default_mode() {
     let tracks = vec![
         SubtitleTrack {
             stream_index: 2,
@@ -130,11 +142,14 @@ async fn picks_english_when_no_default() {
         },
     ];
     let (state, token) = seed(tracks).await;
-    assert_eq!(fetch_default(state, token).await, Some(3));
+    // Neither track is external, default or forced, so Jellyfin's Default mode
+    // selects nothing — the old ladder picked the English one and switched
+    // subtitles on unbidden.
+    assert_eq!(fetch_default(state, token).await, None);
 }
 
 #[actix_web::test]
-async fn picks_first_track_when_no_default_and_no_english() {
+async fn does_not_fall_back_to_an_arbitrary_track() {
     let tracks = vec![
         SubtitleTrack {
             stream_index: 2,
@@ -156,7 +171,9 @@ async fn picks_first_track_when_no_default_and_no_english() {
         },
     ];
     let (state, token) = seed(tracks).await;
-    assert_eq!(fetch_default(state, token).await, Some(2));
+    // A lone non-default, non-forced track is not a statement that it should
+    // play; the old ladder's final rung treated it as one.
+    assert_eq!(fetch_default(state, token).await, None);
 }
 
 #[actix_web::test]

@@ -25,6 +25,7 @@ pub mod syncplay;
 pub mod system;
 pub mod trickplay;
 pub mod user_data;
+pub mod user_prefs;
 pub mod users;
 pub mod waveform;
 pub mod wire;
