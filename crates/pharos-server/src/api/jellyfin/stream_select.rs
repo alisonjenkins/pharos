@@ -58,6 +58,39 @@ impl SubtitleMode {
     }
 }
 
+impl StreamFacts {
+    /// The selection-relevant properties of an advertised stream.
+    fn from_dto(s: &pharos_jellyfin_api::dto::MediaStreamDto) -> Self {
+        Self {
+            index: s.index,
+            language: s.language.clone(),
+            is_default: s.is_default,
+            is_forced: s.is_forced,
+            is_external: s.is_external,
+            supports_external_stream: s.supports_external_stream,
+            is_text_subtitle_stream: s.is_text_subtitle_stream,
+        }
+    }
+}
+
+/// The audio tracks of an advertised stream list, in container order.
+pub fn audio_facts(streams: &[pharos_jellyfin_api::dto::MediaStreamDto]) -> Vec<StreamFacts> {
+    streams
+        .iter()
+        .filter(|s| s.kind == "Audio")
+        .map(StreamFacts::from_dto)
+        .collect()
+}
+
+/// The subtitle tracks of an advertised stream list, in container order.
+pub fn subtitle_facts(streams: &[pharos_jellyfin_api::dto::MediaStreamDto]) -> Vec<StreamFacts> {
+    streams
+        .iter()
+        .filter(|s| s.kind == "Subtitle")
+        .map(StreamFacts::from_dto)
+        .collect()
+}
+
 /// Upstream's `GetStreamScore`, digit for digit.
 ///
 /// The language term dominates by three orders of magnitude, so the flag terms

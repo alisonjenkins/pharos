@@ -2612,8 +2612,39 @@ async fn playback_info(
     // Find the audio stream's actual index (or skip if there isn't one).
     // Hard-coding `1` for silent-video files made jellyfin-web's player
     // try to select a track that doesn't exist.
-    let default_audio_stream_index: Option<u32> =
-        streams.iter().find(|s| s.kind == "Audio").map(|s| s.index);
+    // Which tracks THIS user should start on. Until now this was "the first
+    // audio stream in the container", which is how Aliens — three Ukrainian
+    // tracks ahead of its English DTS-HD MA — played in Ukrainian every time.
+    // The preferences have been stored per user since `/Users/{id}/Configuration`
+    // existed; this is the first thing to read them.
+    let track_prefs = super::user_prefs::track_preference(&state, user.0.id).await;
+    let audio_facts = super::stream_select::audio_facts(&streams);
+    // A client that names a track on THIS request has the final say, exactly as
+    // for subtitles below: the pick is the user acting, not a preference.
+    let explicit_audio_index: Option<u32> = query_param(req.query_string(), "AudioStreamIndex")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .or(body_audio_index);
+    // No original language is recorded for any item yet, so an
+    // `OriginalLanguage` preference degrades to the container's own order
+    // rather than to a wrong language.
+    let audio_languages = track_prefs.audio_languages_for(None);
+    let default_audio_stream_index: Option<u32> = explicit_audio_index
+        .filter(|idx| audio_facts.iter().any(|s| s.index == *idx))
+        .or_else(|| {
+            super::stream_select::default_audio_stream_index(
+                &audio_facts,
+                &audio_languages,
+                track_prefs.prefer_default_audio_track,
+            )
+        });
+    // The language of the track actually chosen — Smart subtitles turn on
+    // precisely when this is NOT a language the user reads.
+    let chosen_audio_language: Option<String> = default_audio_stream_index.and_then(|idx| {
+        streams
+            .iter()
+            .find(|s| s.kind == "Audio" && s.index == idx)
+            .and_then(|s| s.language.clone())
+    });
 
     // P12 — `DefaultSubtitleStreamIndex` resolution priority:
     //   0. What the CLIENT asked for on THIS request, if it asked at all.
@@ -2647,31 +2678,21 @@ async fn playback_info(
                 .iter()
                 .any(|s| s.kind == "Subtitle" && s.index == *idx)
         }),
-        // No choice stated — fall through to the container's own preference.
-        None => streams
-            .iter()
-            .find(|s| s.kind == "Subtitle" && s.is_default)
-            .map(|s| s.index)
-            .or_else(|| {
-                streams
-                    .iter()
-                    .find(|s| {
-                        s.kind == "Subtitle"
-                            && s.language
-                                .as_deref()
-                                .map(|l| {
-                                    l.eq_ignore_ascii_case("eng") || l.eq_ignore_ascii_case("en")
-                                })
-                                .unwrap_or(false)
-                    })
-                    .map(|s| s.index)
-            })
-            .or_else(|| {
-                streams
-                    .iter()
-                    .find(|s| s.kind == "Subtitle")
-                    .map(|s| s.index)
-            }),
+        // No choice stated — the user's SubtitleMode decides.
+        //
+        // This replaces a hand-rolled ladder (default flag → first English →
+        // ANY subtitle track). Its last rung is the reason subtitles appeared
+        // on titles nobody asked them for: a container with one non-default,
+        // non-forced track always selected it. Jellyfin's Default mode picks
+        // only external/default/forced, so B44's forced track and B104's
+        // default ASS still select — and still burn — while an incidental
+        // track no longer switches itself on.
+        None => super::stream_select::default_subtitle_stream_index(
+            &super::stream_select::subtitle_facts(&streams),
+            &track_prefs.subtitle_languages,
+            track_prefs.subtitle_mode,
+            chosen_audio_language.as_deref(),
+        ),
     };
 
     // TranscodingSubProtocol only makes sense alongside a real TranscodingUrl.
