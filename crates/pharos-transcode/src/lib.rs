@@ -1024,6 +1024,24 @@ fn build_args_for_device(
             a.push("disabled".into());
             a.push("-output_ts_offset".into());
             a.push(format!("{:.6}", start.unwrap_or(0.0)));
+            // Pin the TRACK timescale at the muxer so it stops being a
+            // side-effect of which device encoded this segment. Left alone the
+            // mp4 muxer inherits it from the encoder: the software path's
+            // `-enc_time_base 1:90000` writes an mdhd of 90000, while the
+            // hardware path (which rejects that flag and is pinned with `-r`
+            // instead) writes the frame rate's 24000. Both are internally
+            // consistent and both are correct on their own — but the scheduler
+            // load-balances ONE session's segments across both devices, and
+            // they all decode under the single init segment 0 produced. A
+            // segment on the other device's timescale is then read on the
+            // init's clock: measured live, a burned-subtitle Fringe episode
+            // spilled from NVENC to CPU and its segment 7 arrived claiming
+            // 157.7 s instead of 42.1 s (90000/24000 = 3.75x). hls.js will not
+            // join a fragment that far outside the range the playlist
+            // promised, so it refetched it forever — a black screen buffering
+            // against a server answering 200 to everything.
+            a.push("-video_track_timescale".into());
+            a.push(FMP4_TRACK_TIMESCALE.to_string());
         } else {
             a.push("+empty_moov+frag_keyframe+default_base_moof".into());
         }
@@ -1160,6 +1178,47 @@ mod tests {
             .expect("software keeps -enc_time_base");
         assert_eq!(sw[e + 1], "1:90000", "{sw:?}");
         assert!(!sw.iter().any(|x| x == "-r"), "{sw:?}");
+    }
+
+    /// Both devices must mux an fMP4 segment on the SAME track timescale.
+    ///
+    /// The two frame-grid routes above are what pulled them apart: the
+    /// software route's `-enc_time_base 1:90000` leaves the muxer an mdhd of
+    /// 90000, the hardware route's `-r 24000/1001` leaves it 24000. Segments
+    /// from both devices share one init, so the disagreement time-stretches
+    /// whichever half did not produce that init.
+    #[test]
+    fn every_device_muxes_a_segment_on_one_timescale() {
+        let mut o = opts();
+        o.container = Container::Fmp4;
+        o.video = Some(VideoCodec::H264);
+        o.source_frame_rate = pharos_core::FrameRate::from_mille(23_976);
+        o.duration_ticks = Some(60_060_000);
+
+        let pinned = |args: &[String], who: &str| {
+            let i = args
+                .iter()
+                .position(|x| x == "-video_track_timescale")
+                .unwrap_or_else(|| panic!("{who} segment must pin the track timescale: {args:?}"));
+            assert_eq!(args[i + 1], FMP4_TRACK_TIMESCALE.to_string(), "{args:?}");
+        };
+        let hw = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Hw {
+                accel: HwAccel::Nvenc,
+                index: 0,
+            },
+            "/out.m4s",
+        );
+        let sw =
+            build_args_for_device("/m/foo.mkv", &o, crate::protocol::DeviceId::Cpu, "/out.m4s");
+        pinned(&hw, "hardware");
+        pinned(&sw, "software");
+        // The frame-grid routes stay device-specific — the timescale pin is
+        // what makes their outputs interchangeable, not a merge of the two.
+        assert!(hw.iter().any(|x| x == "-r"), "{hw:?}");
+        assert!(sw.iter().any(|x| x == "-enc_time_base"), "{sw:?}");
     }
 
     /// A guessed frame rate would resample the picture, so an unprobed source

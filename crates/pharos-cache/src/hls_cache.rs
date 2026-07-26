@@ -582,7 +582,13 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// bitrate whenever there was one. v8 names cannot be parsed under the new
 /// scheme and, worse, v8 entries conflated two clients whose audio bitrates
 /// differed.
-const HLS_GEN_VERSION: u32 = 10;
+/// v11: every fMP4 segment now carries a pinned track timescale
+/// ([`pharos_transcode::FMP4_TRACK_TIMESCALE`]) instead of inheriting one from
+/// whichever device encoded it. Cached v10 segments are a mix of 90000
+/// (software) and 24000 (hardware) entries, and the mismatched half is read on
+/// the init's clock and lands nowhere near its true position — so they cannot
+/// be reused alongside the pinned ones.
+const HLS_GEN_VERSION: u32 = 11;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
