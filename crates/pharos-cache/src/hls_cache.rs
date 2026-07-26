@@ -329,6 +329,12 @@ fn codec_tag(
         },
         // Muxed mpegts H264 (the `hls1/*.ts` surface).
         //
+        // 25 (was 24, was 8): the hardware encoders dropped one frame per
+        // segment until `-r` pinned them to the source grid, so every segment
+        // NVENC produced under tag 24 is 143 frames where the window implies
+        // 144. Those bytes are cached and would keep drifting playback by 0.7%
+        // forever; bumping orphans them.
+        //
         // 24 (was 8): every segment cached while B116 was live is VIDEO-ONLY —
         // the muxed-audio slice was never resolved and the argv fell through to
         // `-an`. Those bytes are cached under the old tag and would be served
@@ -339,13 +345,22 @@ fn codec_tag(
         //
         // Only THIS tag moves. The fMP4 rungs (13, 12) are audio-free by
         // design, were never affected, and keep their warm cache.
-        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 24,
+        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 25,
         // Audio-free fMP4 H264 (the demuxed `h264cmaf/*` surface) — a DISTINCT
         // namespace so it never reads muxed mpegts bytes (or vice versa).
-        (Some(SegmentVideo::H264), SegmentContainer::Fmp4) => 13,
-        // 12 (was 7): VP9 fMP4 segments are AUDIO-FREE (audio is a separate
-        // continuous rendition, the A/V-sync fix). VP9 only ever emits fMP4.
-        (Some(SegmentVideo::Vp9), _) => 12,
+        //
+        // 26 (was 13): the dropped-frame defect was in the ENCODER, not the
+        // container, so every hardware-encoded segment of this rung is short
+        // too. Browsers hit this surface.
+        (Some(SegmentVideo::H264), SegmentContainer::Fmp4) => 26,
+        // VP9 fMP4 segments are AUDIO-FREE (audio is a separate continuous
+        // rendition, the A/V-sync fix). VP9 only ever emits fMP4.
+        //
+        // 27 (was 12, was 7): same encoder-side frame drop. VP9 has no hardware
+        // encoder configured today, so this is precautionary rather than
+        // known-bad — but a tag that MIGHT name short segments is not one to
+        // keep serving.
+        (Some(SegmentVideo::Vp9), _) => 27,
     }
 }
 
@@ -2578,8 +2593,10 @@ mod tests {
         // cached poisoned segment outlives the fix that stopped producing it.
         // Verified against prod — refetching the exact segment after the fix
         // deployed still probed `nb_streams: 1` until this moved.
-        assert_eq!(mpegts, 24, "muxed-h264 tag bumped past the B116 poison");
-        assert_eq!(vp9, 12, "warm vp9 cache tag preserved — never affected");
+        // Bumped again past the dropped-frame generation: every hardware
+        // encode under the previous tags is one frame short per segment.
+        assert_eq!(mpegts, 25, "muxed-h264 tag bumped past the short-frame gen");
+        assert_eq!(vp9, 27, "vp9 tag bumped past the short-frame gen");
 
         // The on-disk keys differ for the same (media, seg, audio, bitrate).
         let key_ts = SegmentIdentity::new(
