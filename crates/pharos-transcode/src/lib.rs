@@ -409,6 +409,22 @@ pub const DECODE_PREROLL_SECONDS: f64 = 15.0;
 /// source that surfaced this (26.4 s).
 pub const DECODE_PREROLL_RETRY_SECONDS: f64 = 45.0;
 
+/// The media timescale every fragmented-MP4 HLS segment is muxed on.
+///
+/// A rendition's segments are decoded under ONE shared init segment, so the
+/// `mdhd` timescale in that init is the divisor the player applies to EVERY
+/// segment's `tfdt` and sample durations. The timescale therefore cannot be
+/// allowed to vary per segment — and left to itself it does: the software
+/// encoder's `-enc_time_base 1:90000` yields a 90000 track while a hardware
+/// encode pinned with `-r 24000/1001` yields 24000. The scheduler load-balances
+/// one session's segments across both, so the segments that landed on the other
+/// device are read on the wrong clock and stretch by the ratio (measured live:
+/// 90000/24000 = 3.75x, a segment at 42 s claiming 157 s).
+///
+/// 90000 is the MPEG 90 kHz clock the mpegts segments already use, and it
+/// divides no frame rate exactly — timestamps round to under 3 µs.
+pub const FMP4_TRACK_TIMESCALE: u32 = 90_000;
+
 /// Where ffmpeg is told to write its machine-readable progress report for a
 /// file output — `frame=` and `out_time_us=`, which say how much the encoder
 /// actually produced. A decoder that silently drops frames still exits 0, so

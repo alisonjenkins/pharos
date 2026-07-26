@@ -48,6 +48,13 @@
 //! settings ⇒ same `stsd`/`vpcC`/timescale; only cosmetic `mvhd`/`mdhd`
 //! duration fields vary), so serving segment 0's init for every media segment
 //! is correct — the init route just extracts and caches it.
+//!
+//! "Same encoder settings" is the load-bearing half of that, and it is not
+//! free: the scheduler spreads ONE session's segments across every device it
+//! has, and the argv differs per device. When that difference reached the
+//! muxer's track timescale, segments stopped sharing their init's clock —
+//! see [`record_track_timescale`], which asserts the part the sentence above
+//! assumes.
 
 #[derive(Debug, thiserror::Error)]
 pub enum Fmp4Error {
@@ -243,6 +250,67 @@ pub fn segment_track_timing(raw: &[u8]) -> Vec<TrackTiming> {
             }
         })
         .collect()
+}
+
+/// Whether a produced segment sits on the one timescale its rendition's init
+/// declares. Carries the offending value so the log names it rather than a
+/// bare class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimescaleVerdict {
+    /// The segment is on [`FMP4_TRACK_TIMESCALE`] — it tiles under the init.
+    Pinned,
+    /// The segment is on a DIFFERENT timescale. The player divides its `tfdt`
+    /// and sample durations by the init's timescale regardless, so the whole
+    /// segment lands at `actual / expected` times its true position.
+    Adrift { actual: u32 },
+    /// No `moov`/`traf` to read a timescale from — nothing asserted.
+    Unknown,
+}
+
+impl TimescaleVerdict {
+    /// Bounded metric label — three stable strings, never the raw timescale
+    /// (that belongs in the log line, not in a label's cardinality).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Adrift { .. } => "adrift",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Judge one produced segment's video-track timescale against the pinned one.
+pub fn check_track_timescale(raw: &[u8], expected: u32) -> TimescaleVerdict {
+    // traf index 0 is the video track: the fMP4 rungs are video-only, and the
+    // muxed VP9 rung maps video first.
+    match segment_track_timing(raw).first().map(|t| t.timescale) {
+        None => TimescaleVerdict::Unknown,
+        Some(ts) if ts == expected => TimescaleVerdict::Pinned,
+        Some(actual) => TimescaleVerdict::Adrift { actual },
+    }
+}
+
+/// Record that judgement. A segment muxed on a timescale its init does not
+/// declare plays back time-stretched by the ratio of the two — the client sees
+/// a fragment far outside the range the playlist promised, refuses to join it
+/// to the buffer, and refetches it forever (black screen, perpetual buffering).
+/// Nothing on the success path revealed this: the encoder produced exactly the
+/// frames asked for, so the frame-completeness check passed while the clock the
+/// frames were stamped on was wrong.
+pub fn record_track_timescale(raw: &[u8], media_id: u64, seg: u32) {
+    let verdict = check_track_timescale(raw, pharos_transcode::FMP4_TRACK_TIMESCALE);
+    metrics::counter!("pharos_segment_timescale_total", "verdict" => verdict.label()).increment(1);
+    if let TimescaleVerdict::Adrift { actual } = verdict {
+        tracing::warn!(
+            media.id = media_id,
+            seg,
+            timescale = actual,
+            expected = pharos_transcode::FMP4_TRACK_TIMESCALE,
+            stretch = pharos_transcode::FMP4_TRACK_TIMESCALE as f64 / actual.max(1) as f64,
+            "fmp4 segment muxed on a timescale its init does not declare — the \
+             client reads it on the init's clock and lands it off its true position"
+        );
+    }
 }
 
 /// The `tfdt` base decode time (0-clamped) from a traf's children, if present.
@@ -542,6 +610,64 @@ mod tests {
         seg.extend_from_slice(&mdat);
         seg.extend_from_slice(&mfra);
         seg
+    }
+
+    /// A segment carrying ONE video track on the given timescale.
+    fn segment_on_timescale(timescale: u32) -> Vec<u8> {
+        let ftyp = mk_box(b"ftyp", b"isom");
+        let moov = mk_box(b"moov", &trak(timescale));
+        let moof = mk_box(b"moof", &traf(0));
+        let mdat = mk_box(b"mdat", &[0xAA; 32]);
+        let mut seg = Vec::new();
+        for part in [&ftyp, &moov, &moof, &mdat] {
+            seg.extend_from_slice(part);
+        }
+        seg
+    }
+
+    #[test]
+    fn a_segment_on_the_pinned_timescale_is_accepted() {
+        let seg = segment_on_timescale(pharos_transcode::FMP4_TRACK_TIMESCALE);
+        assert_eq!(
+            check_track_timescale(&seg, pharos_transcode::FMP4_TRACK_TIMESCALE),
+            TimescaleVerdict::Pinned
+        );
+    }
+
+    #[test]
+    fn a_segment_on_another_timescale_is_flagged_with_the_value() {
+        // The live shape: the init declared 24000 (a hardware encode pinned by
+        // `-r 24000/1001`) while this segment came off the software encoder's
+        // 90000 grid, so the client read it 3.75x out.
+        let seg = segment_on_timescale(24_000);
+        assert_eq!(
+            check_track_timescale(&seg, 90_000),
+            TimescaleVerdict::Adrift { actual: 24_000 },
+            "the verdict must carry the offending timescale, not a bare class"
+        );
+    }
+
+    #[test]
+    fn a_segment_with_no_moov_asserts_nothing() {
+        let seg = mk_box(b"mdat", &[0xAA; 8]);
+        assert_eq!(
+            check_track_timescale(&seg, 90_000),
+            TimescaleVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn timescale_verdict_labels_are_distinct_and_bounded() {
+        let labels = [
+            TimescaleVerdict::Pinned.label(),
+            TimescaleVerdict::Adrift { actual: 24_000 }.label(),
+            TimescaleVerdict::Unknown.label(),
+        ];
+        let distinct: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "labels collide: {labels:?}");
+        // The raw timescale must never reach a label — that is unbounded
+        // cardinality on a dashboard contract.
+        assert!(!labels.iter().any(|l| l.contains("24000")));
     }
 
     #[test]
