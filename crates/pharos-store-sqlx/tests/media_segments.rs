@@ -90,3 +90,42 @@ async fn fingerprints_round_trip_and_version_gated() {
         .unwrap()
         .is_none());
 }
+
+/// B123 — an episode with no detectable intro must still be recorded as
+/// ANALYSED. Results alone cannot express that: an empty detection writes no
+/// segment row, which is indistinguishable from never having looked, so the
+/// sweep re-analysed such a season on every pass forever.
+#[tokio::test]
+async fn an_empty_analysis_is_still_recorded_as_done() {
+    let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let item = 77u64;
+    assert_eq!(s.segment_scan_version(item).await.unwrap(), None);
+
+    // The detector found nothing for this episode.
+    s.set_media_segments(item, &[], SEGMENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
+    s.set_segment_scan(item, SEGMENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
+
+    assert!(
+        s.media_segments_for(item).await.unwrap().is_empty(),
+        "nothing was detected, so nothing is served"
+    );
+    assert_eq!(
+        s.segment_scan_version(item).await.unwrap(),
+        Some(SEGMENT_SCHEMA_VERSION),
+        "but the analysis itself must be recorded, or it runs again forever"
+    );
+
+    // A later algorithm version supersedes the stamp, which is what makes a
+    // SEGMENT_SCHEMA_VERSION bump able to force re-detection.
+    s.set_segment_scan(item, SEGMENT_SCHEMA_VERSION + 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.segment_scan_version(item).await.unwrap(),
+        Some(SEGMENT_SCHEMA_VERSION + 1)
+    );
+}

@@ -115,12 +115,20 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
     }
 }
 
-/// A season is "current" when EVERY episode already has at least one detected
-/// segment stamped with the current schema version (cheap DB reads).
+/// A season is "current" when EVERY episode has been ANALYSED at the current
+/// `SEGMENT_SCHEMA_VERSION` — whatever that analysis found (cheap DB reads).
+///
+/// B123: this used to ask whether each episode had any segment ROW, which
+/// conflated "not analysed" with "analysed, nothing there". Most shows have no
+/// shared intro, and an empty result writes no row, so those seasons failed the
+/// check on every pass and were re-analysed forever — while a season that HAD
+/// segments could never be re-analysed at all, leaving the version stamp
+/// unable to force re-detection after a detector change. The scan stamp
+/// separates the question from the answer.
 async fn season_is_current(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
     for ep in eps {
-        match ctx.stores.media_segments_for(ep.id).await {
-            Ok(segs) if !segs.is_empty() => {}
+        match ctx.stores.segment_scan_version(ep.id).await {
+            Ok(Some(v)) if v == SEGMENT_SCHEMA_VERSION => {}
             _ => return false,
         }
     }
@@ -245,8 +253,6 @@ async fn analyze_season(ctx: &Ctx, season_key: &str, eps: &[&MediaItem]) -> bool
 
     let mut wrote = false;
     for ep in eps {
-        // Even an empty set is written (stamped current) so a season with no
-        // detectable intro isn't re-analyzed every pass.
         let segs = by_item.remove(&ep.id).unwrap_or_default();
         if let Err(e) = ctx
             .stores
@@ -254,9 +260,21 @@ async fn analyze_season(ctx: &Ctx, season_key: &str, eps: &[&MediaItem]) -> bool
             .await
         {
             tracing::warn!(error = %e, media.id = ep.id, "segment backfill: persist failed");
-        } else {
-            wrote = true;
+            continue;
         }
+        // Stamp the ANALYSIS, not its result — an episode with no detectable
+        // intro writes no segment row, and without this stamp its season is
+        // re-analysed on every pass for the life of the server. Only after the
+        // results are safely persisted, so a failed write is retried.
+        if let Err(e) = ctx
+            .stores
+            .set_segment_scan(ep.id, SEGMENT_SCHEMA_VERSION)
+            .await
+        {
+            tracing::warn!(error = %e, media.id = ep.id, "segment backfill: scan stamp failed");
+            continue;
+        }
+        wrote = true;
     }
     wrote
 }

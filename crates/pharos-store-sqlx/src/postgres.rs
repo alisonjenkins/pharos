@@ -1246,6 +1246,34 @@ impl pharos_core::MediaSegmentStore for PostgresStore {
                 .collect()
         }))
     }
+
+    async fn set_segment_scan(&self, item_id: MediaId, schema_version: i64) -> DomainResult<()> {
+        let id = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        sqlx::query(
+            "INSERT INTO media_segment_scans (item_id, schema_version) VALUES ($1, $2) \
+             ON CONFLICT (item_id) DO UPDATE SET schema_version = EXCLUDED.schema_version",
+        )
+        .bind(id)
+        .bind(schema_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn segment_scan_version(&self, item_id: MediaId) -> DomainResult<Option<i64>> {
+        let id = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let row = sqlx::query_as::<_, (i64,)>(
+            "SELECT schema_version FROM media_segment_scans WHERE item_id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(v,)| v))
+    }
 }
 
 impl GenreStore for PostgresStore {
