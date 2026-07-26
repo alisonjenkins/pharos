@@ -1446,16 +1446,20 @@ impl BaseItemDto {
     /// already set stay in place; this fills the upload-only roles a
     /// client otherwise wouldn't request. Backdrop, being a list role,
     /// also gets its tag appended to `backdrop_image_tags` if absent.
-    pub fn with_local_artwork_tags(mut self, id: u64, roles: &[String]) -> Self {
+    pub fn with_local_artwork_tags(mut self, id: u64, art_version: i64, roles: &[String]) -> Self {
         for role in roles {
             if role.eq_ignore_ascii_case("backdrop") {
-                let tag = image_tag_for(id, "backdrop");
+                let tag = image_tag_for(id, art_version, "backdrop");
                 if !self.backdrop_image_tags.contains(&tag) {
                     self.backdrop_image_tags.push(tag);
                 }
             }
             self.image_tags.entry(role.clone()).or_insert_with(|| {
-                serde_json::Value::String(image_tag_for(id, &role.to_ascii_lowercase()))
+                serde_json::Value::String(image_tag_for(
+                    id,
+                    art_version,
+                    &role.to_ascii_lowercase(),
+                ))
             });
         }
         self
@@ -1662,7 +1666,11 @@ impl BaseItemDto {
                     image_tag: if matches!(item.kind, pharos_core::MediaKind::Audio) {
                         None
                     } else {
-                        Some(image_tag_for(item.id, &format!("chapter:{idx}")))
+                        Some(image_tag_for(
+                            item.id,
+                            item.art_version,
+                            &format!("chapter:{idx}"),
+                        ))
                     },
                 })
                 .collect(),
@@ -1677,7 +1685,7 @@ impl BaseItemDto {
             backdrop_image_tags: if matches!(item.kind, pharos_core::MediaKind::Audio) {
                 vec![]
             } else {
-                vec![image_tag_for(item.id, "backdrop")]
+                vec![image_tag_for(item.id, item.art_version, "backdrop")]
             },
             screenshot_image_tags: vec![],
             date_created: item.created_at.map(format_iso8601),
@@ -1838,17 +1846,17 @@ pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, 
     if has_primary {
         m.insert(
             "Primary".into(),
-            serde_json::Value::String(image_tag_for(item.id, "primary")),
+            serde_json::Value::String(image_tag_for(item.id, item.art_version, "primary")),
         );
     }
     if !matches!(item.kind, pharos_core::MediaKind::Audio) {
         m.insert(
             "Backdrop".into(),
-            serde_json::Value::String(image_tag_for(item.id, "backdrop")),
+            serde_json::Value::String(image_tag_for(item.id, item.art_version, "backdrop")),
         );
         m.insert(
             "Thumb".into(),
-            serde_json::Value::String(image_tag_for(item.id, "thumb")),
+            serde_json::Value::String(image_tag_for(item.id, item.art_version, "thumb")),
         );
     }
     m
@@ -1900,7 +1908,7 @@ pub fn image_infos_for(item: &pharos_core::MediaItem, local_roles: &[String]) ->
             } else {
                 None
             },
-            image_tag: image_tag_for(item.id, &role.to_ascii_lowercase()),
+            image_tag: image_tag_for(item.id, item.art_version, &role.to_ascii_lowercase()),
             image_type: role,
         })
         .collect()
@@ -1919,11 +1927,19 @@ fn canonical_image_role(role: &str) -> String {
     }
 }
 
-/// Per-(item, role) stable hex tag (16 chars — Jellyfin's `?tag=` is
+/// Per-(item, role, artwork version) hex tag (16 chars — Jellyfin's `?tag=` is
 /// usually a hex string and the length doesn't matter to the client).
-pub fn image_tag_for(item_id: u64, role: &str) -> String {
+///
+/// B124 — `art_version` is what makes this a VERSION rather than an identity.
+/// jellyfin-web builds `/Items/{id}/Images/{role}?tag={tag}` and pharos serves
+/// it `Cache-Control: private, max-age=604800`, so a tag that cannot change
+/// means a replaced image is invisible for a week: the browser has a fresh
+/// cache entry for that exact URL and never revalidates, so the (correct,
+/// size+mtime derived) ETag is never consulted. Downloading a poster from the
+/// Edit Images dialog appeared to do nothing for precisely this reason.
+pub fn image_tag_for(item_id: u64, art_version: i64, role: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;
-    let h = xxh3_64(format!("img:{item_id}:{role}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
+    let h = xxh3_64(format!("img:{item_id}:{art_version}:{role}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}")
 }
 
@@ -3418,8 +3434,11 @@ mod trickplay_helper_tests {
             kind: MediaKind::Movie,
             ..Default::default()
         };
-        let dto = super::BaseItemDto::from_domain(&item, "srv")
-            .with_local_artwork_tags(5, &["Logo".into(), "Backdrop".into()]);
+        let dto = super::BaseItemDto::from_domain(&item, "srv").with_local_artwork_tags(
+            5,
+            0,
+            &["Logo".into(), "Backdrop".into()],
+        );
         // Existing frame-extract Primary tag stays.
         assert!(dto.image_tags.contains_key("Primary"));
         // Upload-only Logo now advertised.
@@ -3428,7 +3447,7 @@ mod trickplay_helper_tests {
         assert_eq!(dto.backdrop_image_tags.len(), 1);
         assert_eq!(
             dto.backdrop_image_tags[0],
-            super::image_tag_for(5, "backdrop")
+            super::image_tag_for(5, 0, "backdrop")
         );
     }
 
@@ -3451,9 +3470,12 @@ mod trickplay_helper_tests {
         // Every tag matches what the BaseItemDto advertises → no editor 404.
         assert_eq!(
             by_type["Primary"].image_tag,
-            super::image_tag_for(5, "primary")
+            super::image_tag_for(5, 0, "primary")
         );
-        assert_eq!(by_type["Logo"].image_tag, super::image_tag_for(5, "logo"));
+        assert_eq!(
+            by_type["Logo"].image_tag,
+            super::image_tag_for(5, 0, "logo")
+        );
         // Backdrop is the only indexed (list) role.
         assert_eq!(by_type["Backdrop"].image_index, Some(0));
         assert_eq!(by_type["Primary"].image_index, None);
@@ -3550,7 +3572,7 @@ mod trickplay_helper_tests {
         };
         assert_eq!(
             super::BaseItemDto::from_domain(&movie, "srv").backdrop_image_tags,
-            vec![super::image_tag_for(1, "backdrop")]
+            vec![super::image_tag_for(1, 0, "backdrop")]
         );
     }
 }

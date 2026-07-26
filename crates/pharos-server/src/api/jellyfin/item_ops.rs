@@ -661,6 +661,10 @@ async fn apply_downloaded_art(
                 .set_item_match(id, m.provider, &m.external_id, "manual", None, now)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            // B124 — the chosen image overwrites the item's deterministic cache
+            // slot, so the URL a client already has is now stale. Rotate the
+            // tags, or the picker looks like it did nothing.
+            crate::api::jellyfin::images::bump_art_version(state, id).await;
             return Ok(());
         }
     }
@@ -1385,6 +1389,7 @@ mod tests {
         };
         state.stores.put(item).await.unwrap();
         let m = resolve_image_match(&state, "60").await.unwrap();
+        let tag_before = pharos_jellyfin_api::dto::image_tag_for(60, 0, "primary");
 
         apply_downloaded_art(
             &state,
@@ -1402,6 +1407,20 @@ mod tests {
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
         assert_eq!(got.match_external_id.as_deref(), Some("603"));
+        // B124 — the item's artwork version advanced, so every image URL a
+        // client builds changes. Without this the picked poster is written to
+        // the same deterministic cache slot behind an identical `?tag=`, and
+        // `Cache-Control: max-age=604800` keeps the browser on the old picture
+        // for a week — the "download button does nothing" report.
+        assert_eq!(
+            got.art_version, 1,
+            "replacing the bytes must advance the artwork version"
+        );
+        let tag_after = pharos_jellyfin_api::dto::image_tag_for(60, got.art_version, "primary");
+        assert_ne!(
+            tag_before, tag_after,
+            "the ImageTag must change when the image does, or the client never re-requests it"
+        );
         // A Primary artwork row now exists, sourced from tmdb, pointing at a
         // real cached file holding the bytes.
         let rows = state.stores.artwork_for(60).await.unwrap();

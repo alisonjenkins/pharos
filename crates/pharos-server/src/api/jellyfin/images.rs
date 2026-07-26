@@ -1155,8 +1155,30 @@ async fn upload_image(
         .upload(id, role, item.kind, index, body)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // B124 — the bytes behind an unchanged URL just changed. Rotate the item's
+    // image tags or every client keeps its week-cached copy of the old picture.
+    bump_art_version(state, id).await;
     state.notify_library_changed();
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// B124 — record that an item's artwork bytes were replaced, so every
+/// `ImageTag` it advertises rotates and clients request the new picture.
+///
+/// Best-effort: the art is already on disk and serving it is more useful than
+/// failing the request, so a store error is logged (naming the item) rather
+/// than surfaced — but it IS logged, because the visible symptom of a silent
+/// failure here is "the download button does nothing".
+pub(crate) async fn bump_art_version(state: &AppState, id: u64) {
+    use pharos_core::MediaStore;
+    if let Err(e) = state.stores.bump_art_version(id).await {
+        tracing::warn!(
+            error = %e,
+            media.id = id,
+            "artwork replaced but its version could not be bumped; clients will \
+             keep serving the previous image from cache until it expires"
+        );
+    }
 }
 
 async fn remove_image(
@@ -1185,6 +1207,7 @@ async fn remove_image(
         .remove(id, role, item.kind, index)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    bump_art_version(state, id).await;
     state.notify_library_changed();
     Ok(HttpResponse::NoContent().finish())
 }
