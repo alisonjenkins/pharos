@@ -576,7 +576,10 @@ pub(crate) fn parse_tmdb_images(body: &str) -> Vec<crate::online_enrich::RemoteI
 /// carry `name` (the episode title), `overview`, `air_date` (bare
 /// `YYYY-MM-DD`, parsed to unix seconds via
 /// [`pharos_core::parse_ymd_to_unix`]), and `still_path` (a single
-/// per-episode still, mapped to [`pharos_core::ArtworkRole::Thumb`]).
+/// per-episode still, mapped to [`pharos_core::ArtworkRole::Primary`] —
+/// B125: an episode's still IS its poster in Jellyfin, and filing it under
+/// Thumb left the episode with no Primary at all, so the image route fell
+/// through to extracting an arbitrary video frame).
 pub(crate) fn parse_episode_detail(body: &str) -> Option<crate::online_enrich::EnrichedMetadata> {
     use crate::online_enrich::{EnrichedMetadata, RemoteArt};
     use pharos_core::ArtworkRole;
@@ -584,7 +587,7 @@ pub(crate) fn parse_episode_detail(body: &str) -> Option<crate::online_enrich::E
     let mut art = vec![];
     if let Some(s) = v.get("still_path").and_then(|x| x.as_str()) {
         art.push(RemoteArt {
-            role: ArtworkRole::Thumb,
+            role: ArtworkRole::Primary,
             url: format!("{IMAGE_BASE_ORIGINAL}{s}"),
         });
     }
@@ -779,10 +782,13 @@ mod tests {
         assert_eq!(e.title.as_deref(), Some("Pilot"));
         assert_eq!(e.overview.as_deref(), Some("Walter White, a struggling..."));
         assert_eq!(e.community_rating, Some(8.2));
+        // B125 — the still is the episode's PRIMARY. Under Thumb the episode
+        // advertised no poster and the image route answered with an extracted
+        // frame, which is what "random frames for anime episodes" was.
         assert!(e
             .artwork
             .iter()
-            .any(|a| a.role == pharos_core::ArtworkRole::Thumb && a.url.ends_with("/still.jpg")));
+            .any(|a| a.role == pharos_core::ArtworkRole::Primary && a.url.ends_with("/still.jpg")));
         // air_date "2008-01-20" -> unix seconds at UTC midnight (Task 11.5).
         assert_eq!(e.premiere_date, Some(1_200_787_200));
     }
