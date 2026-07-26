@@ -506,16 +506,27 @@ async fn user_configuration_update(
     path: web::Path<String>,
     body: web::Json<serde_json::Value>,
 ) -> Result<impl Responder, actix_web::Error> {
-    // V9 spirit: bearer must match path.
+    // V9 spirit: a bearer may write its OWN configuration. An ADMIN may write
+    // anyone's — jellyfin-web's "Edit user -> Playback" page posts here for the
+    // account being edited, so self-only made that page silently 403 and left
+    // an operator unable to set up an account for someone else. Jellyfin gates
+    // the same endpoint on elevation rather than identity. Nothing here carries
+    // policy or credentials, so this widens preference-setting only.
+    let target_str = path.into_inner();
     let bearer = user.0.id.0.simple().to_string();
-    if path.into_inner() != bearer {
-        return Err(error::ErrorForbidden("user mismatch"));
-    }
+    let target = if target_str == bearer {
+        user.0.id
+    } else {
+        crate::api::jellyfin::admin::require_admin(&user)?;
+        let parsed = uuid::Uuid::parse_str(&target_str)
+            .map_err(|_| error::ErrorBadRequest("invalid user id"))?;
+        pharos_core::UserId(parsed)
+    };
     let json = serde_json::to_string(&body.into_inner())
         .map_err(|e| error::ErrorBadRequest(e.to_string()))?;
     state
         .stores
-        .set_user_configuration(user.0.id, &json)
+        .set_user_configuration(target, &json)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())

@@ -243,6 +243,96 @@ async fn user_configuration_persists_across_request() {
     assert_eq!(v["Configuration"]["SubtitleMode"], "Always");
 }
 
+/// An ADMIN may set another account's preferences — jellyfin-web's
+/// "Edit user -> Playback" page posts here for the account being edited, and
+/// an operator setting a household member up should not have to log in as
+/// them. A NON-admin still may not touch anyone else's.
+#[actix_web::test]
+async fn admin_may_write_another_users_configuration_but_a_peer_may_not() {
+    use pharos_core::{SecretString, TokenStore, UserPolicy, UserRecord, UserStore};
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+
+    let admin_id = UserId::new();
+    stores
+        .create(UserRecord {
+            id: admin_id,
+            name: "admin".into(),
+            password_hash: hash.clone(),
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let target_id = UserId::new();
+    stores
+        .create(UserRecord {
+            id: target_id,
+            name: "target".into(),
+            password_hash: hash.clone(),
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let peer_id = UserId::new();
+    stores
+        .create(UserRecord {
+            id: peer_id,
+            name: "peer".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+
+    let admin_token = stores.issue(admin_id, "t").await.unwrap();
+    let peer_token = stores.issue(peer_id, "t").await.unwrap();
+    let state = actix_web::web::Data::new(AppState::new(stores.clone(), "t".into()));
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(pharos_server::api::jellyfin::configure),
+    )
+    .await;
+
+    let post = |token: String, target: UserId| {
+        actix_web::test::TestRequest::post()
+            .uri(&format!("/Users/{}/Configuration", target.0.simple()))
+            .insert_header(("X-Emby-Token", token))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(r#"{"AudioLanguagePreference":"OriginalLanguage","SubtitleMode":"Smart"}"#)
+            .to_request()
+    };
+
+    let resp =
+        actix_web::test::call_service(&app, post(admin_token.0.expose().to_string(), target_id))
+            .await;
+    assert_eq!(resp.status(), 204, "an admin may configure another account");
+
+    let resp =
+        actix_web::test::call_service(&app, post(peer_token.0.expose().to_string(), target_id))
+            .await;
+    assert_eq!(
+        resp.status(),
+        403,
+        "a non-admin must not reach another account"
+    );
+
+    // The admin's write landed on the TARGET, not on the admin.
+    use pharos_core::PreferenceStore;
+    let stored = stores
+        .get_user_configuration(target_id)
+        .await
+        .unwrap()
+        .expect("target has a configuration");
+    assert!(stored.contains("OriginalLanguage"));
+    assert_eq!(stores.get_user_configuration(admin_id).await.unwrap(), None);
+}
+
 #[actix_web::test]
 async fn display_preferences_round_trip_per_user() {
     use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
