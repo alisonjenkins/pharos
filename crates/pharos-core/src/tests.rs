@@ -511,6 +511,56 @@ fn title_similarity_ignores_case_and_punctuation() {
 }
 
 #[test]
+fn title_similarity_tolerates_appended_subtitle() {
+    // The local folder carries the bare show name; the provider's canonical
+    // title appends a subtitle. The shared portion is a whole-token prefix, so
+    // the match must clear the 0.7 floor rather than being penalised for the
+    // length gap (was ~0.29 with pure Levenshtein).
+    let s = title_similarity("Code Geass", "Code Geass: Lelouch of the Rebellion");
+    assert!(s >= 0.9, "appended-subtitle score too low: {s}");
+    assert!(match_best(
+        "Code Geass",
+        None,
+        &[SearchCandidate {
+            id: "cg".into(),
+            title: "Code Geass: Lelouch of the Rebellion".into(),
+            year: None,
+        }],
+        0.7
+    )
+    .is_some());
+}
+
+#[test]
+fn title_similarity_tolerates_country_qualifier() {
+    // The local title decorates the name with a "(US)" qualifier the provider
+    // does not carry; "us" is the appended tail. Symmetric with the subtitle
+    // case — the shorter title (provider) is a whole-token prefix of the local.
+    let s = title_similarity("Forever (US)", "Forever");
+    assert!(s >= 0.9, "country-qualifier score too low: {s}");
+    assert!(match_best(
+        "Forever (US)",
+        None,
+        &[SearchCandidate {
+            id: "fv".into(),
+            title: "Forever".into(),
+            year: None,
+        }],
+        0.7
+    )
+    .is_some());
+}
+
+#[test]
+fn title_similarity_short_prefix_does_not_blanket_match() {
+    // A trivially short prefix must NOT count as a subtitle match, or every
+    // "Code …" / "The …" show would collide. Guarded by a minimum shared
+    // length; here the whole-string Levenshtein still governs and stays low.
+    assert!(title_similarity("Code", "Code Geass: Lelouch of the Rebellion") < 0.7);
+    assert!(title_similarity("24", "24 Hours in A&E") < 0.7);
+}
+
+#[test]
 fn parse_ymd_epoch_and_known_dates() {
     assert_eq!(parse_ymd_to_unix("1970-01-01"), Some(0));
     assert_eq!(parse_ymd_to_unix("2021-10-01"), Some(1_633_046_400)); // 2021-10-01T00:00:00Z

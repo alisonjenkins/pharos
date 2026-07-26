@@ -628,7 +628,42 @@ pub fn title_similarity(a: &str, b: &str) -> f32 {
     }
     let dist = prev[m] as f32;
     let maxlen = n.max(m) as f32;
-    1.0 - dist / maxlen
+    let levenshtein = 1.0 - dist / maxlen;
+    levenshtein.max(prefix_containment(&a, &b))
+}
+
+/// Fewest characters a shared whole-token prefix must span before it counts as
+/// a subtitle/qualifier match. Below this, the whole-string Levenshtein still
+/// governs, so a bare `Code` cannot blanket-match every `Code …` show.
+const MIN_PREFIX_MATCH_CHARS: usize = 6;
+
+/// Subtitle/qualifier-tolerant similarity for the shape Levenshtein punishes:
+/// one canonical title extends the other with an appended tail — a provider
+/// subtitle (`Code Geass` ⊂ `Code Geass: Lelouch of the Rebellion`) or a local
+/// qualifier (`Forever` ⊂ `Forever (US)`). When the shorter normalized title
+/// is an exact whole-token prefix of the longer, the shared portion is a
+/// perfect match and only the dropped tail is uncertain, so it scores high
+/// (0.9 + a small credit for how much of the longer title the prefix covers)
+/// rather than being penalised in proportion to the length gap. Returns 0 when
+/// there is no whole-token prefix relationship, or when the shared prefix is
+/// too short (< [`MIN_PREFIX_MATCH_CHARS`]) to trust — the guard that stops a
+/// trivial leading word from matching an unrelated show. Inputs are already
+/// normalized by [`title_similarity`].
+fn prefix_containment(a: &str, b: &str) -> f32 {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.len() < MIN_PREFIX_MATCH_CHARS {
+        return 0.0;
+    }
+    // Whole-token prefix: `long` must be `short` followed by nothing or a space
+    // (so `forever` matches `forever us` but not `forevermore`).
+    let is_prefix = long == short
+        || long
+            .strip_prefix(short)
+            .is_some_and(|rest| rest.starts_with(' '));
+    if !is_prefix {
+        return 0.0;
+    }
+    0.9 + 0.1 * (short.len() as f32 / long.len() as f32)
 }
 
 /// Year agreement multiplier: exact = 1.0, ±1 = 0.9, else 0.6; unknown = 0.85.
