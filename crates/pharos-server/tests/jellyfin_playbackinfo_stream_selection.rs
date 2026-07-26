@@ -462,4 +462,52 @@ async fn explicit_subtitles_off_beats_the_default_track() {
         !url.contains("SubtitleStreamIndex=5"),
         "explicit off must beat the default track: {url:?}"
     );
+    // The transcode URL was already right — and subtitles STILL would not turn
+    // off on Google TV, because the response kept advertising the track that
+    // had just been switched off. `DefaultSubtitleStreamIndex` is pharos
+    // telling the client what to select for this playback, so answering an
+    // explicit `-1` with "the default is 5" had the client re-select it one
+    // second later (measured live 2026-07-26).
+    assert!(
+        v["MediaSources"][0]["DefaultSubtitleStreamIndex"].is_null(),
+        "explicit off must not be handed back the track it turned off: {}",
+        v["MediaSources"][0]
+    );
+}
+
+#[actix_web::test]
+async fn an_explicit_subtitle_pick_is_echoed_as_the_default() {
+    // The converse of the "off" case: a client that picked a track is told that
+    // track is the one selected, not whatever the container prefers. Otherwise
+    // the same re-selection loop happens in the other direction.
+    let (state, token) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let body = serde_json::json!({
+        "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_FIREFOX).unwrap()["DeviceProfile"],
+        "SubtitleStreamIndex": 6,
+    });
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", UA_FIREFOX))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body.to_string())
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    // 6, not the container's default+forced 5 — the client's own choice wins.
+    assert_eq!(
+        v["MediaSources"][0]["DefaultSubtitleStreamIndex"], 6,
+        "an explicit pick must be echoed back, not the container default: {}",
+        v["MediaSources"][0]
+    );
 }

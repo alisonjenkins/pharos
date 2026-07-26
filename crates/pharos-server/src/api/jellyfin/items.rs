@@ -2616,33 +2616,63 @@ async fn playback_info(
         streams.iter().find(|s| s.kind == "Audio").map(|s| s.index);
 
     // P12 — `DefaultSubtitleStreamIndex` resolution priority:
+    //   0. What the CLIENT asked for on THIS request, if it asked at all.
     //   1. Any subtitle track flagged `is_default` (probed from the
     //      container's disposition bits).
     //   2. The first English-language track.
     //   3. The first subtitle track of any kind.
     // None when no subtitle tracks exist — client renders no default.
-    let default_subtitle_stream_index: Option<u32> = streams
-        .iter()
-        .find(|s| s.kind == "Subtitle" && s.is_default)
-        .map(|s| s.index)
-        .or_else(|| {
+    //
+    // Step 0 is what makes "subtitles off" STICK. This field is not a
+    // description of the file, it is pharos telling the client what to select
+    // for this playback — so computing it from the container alone answered a
+    // client that had just sent `SubtitleStreamIndex=-1` with "the default
+    // subtitle is 2", and the client obediently selected it. Measured live
+    // 2026-07-26, one second apart:
+    //
+    //   04:06:29  requested Some(-1) → resolved None
+    //   04:06:30  requested Some(2)  → resolved Some(2), delivery Burn
+    //
+    // The re-selection was the client obeying this field, which is why turning
+    // subtitles off appeared to do nothing on Google TV. An explicit pick is
+    // echoed back; explicit off answers None; only an absent field falls
+    // through to the container's own preference (so B44's forced-Na'vi track
+    // and B104's default ASS are untouched).
+    let default_subtitle_stream_index: Option<u32> = match explicit_subtitle_index {
+        // The client stated a choice on THIS request — echo it back, including
+        // "off" (-1 → None). Filtered against the advertised streams so a stale
+        // index cannot name a track that isn't there.
+        Some(n) => u32::try_from(n).ok().filter(|idx| {
             streams
                 .iter()
-                .find(|s| {
-                    s.kind == "Subtitle"
-                        && s.language
-                            .as_deref()
-                            .map(|l| l.eq_ignore_ascii_case("eng") || l.eq_ignore_ascii_case("en"))
-                            .unwrap_or(false)
-                })
-                .map(|s| s.index)
-        })
-        .or_else(|| {
-            streams
-                .iter()
-                .find(|s| s.kind == "Subtitle")
-                .map(|s| s.index)
-        });
+                .any(|s| s.kind == "Subtitle" && s.index == *idx)
+        }),
+        // No choice stated — fall through to the container's own preference.
+        None => streams
+            .iter()
+            .find(|s| s.kind == "Subtitle" && s.is_default)
+            .map(|s| s.index)
+            .or_else(|| {
+                streams
+                    .iter()
+                    .find(|s| {
+                        s.kind == "Subtitle"
+                            && s.language
+                                .as_deref()
+                                .map(|l| {
+                                    l.eq_ignore_ascii_case("eng") || l.eq_ignore_ascii_case("en")
+                                })
+                                .unwrap_or(false)
+                    })
+                    .map(|s| s.index)
+            })
+            .or_else(|| {
+                streams
+                    .iter()
+                    .find(|s| s.kind == "Subtitle")
+                    .map(|s| s.index)
+            }),
+    };
 
     // TranscodingSubProtocol only makes sense alongside a real TranscodingUrl.
     // Every video transcode pharos emits is now an HLS `.m3u8` surface (H.264
