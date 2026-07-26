@@ -588,7 +588,12 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// (software) and 24000 (hardware) entries, and the mismatched half is read on
 /// the init's clock and lands nowhere near its true position — so they cannot
 /// be reused alongside the pinned ones.
-const HLS_GEN_VERSION: u32 = 11;
+/// v12: h264 CMAF (fMP4) segments are now pinned to libx264 (CPU) so a whole
+/// shared-init rendition comes from ONE encoder. v11 CMAF caches hold a mix of
+/// NVENC-init + libx264-segment (and vice versa) entries whose SPS is
+/// incompatible with the init — undecodable in the browser (issue #114) — so
+/// every v11 h264 CMAF entry must be orphaned.
+const HLS_GEN_VERSION: u32 = 12;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {

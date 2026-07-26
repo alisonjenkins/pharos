@@ -16,7 +16,7 @@
 //! `Semaphore`s aren't serialisable so the runtime table stays here.
 
 use crate::hwaccel::HwAccel;
-use crate::options::TranscodeOptions;
+use crate::options::{Container, TranscodeOptions, VideoCodec};
 use crate::protocol::DeviceId;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -148,6 +148,23 @@ pub fn device_supports(device: DeviceId, opts: &TranscodeOptions) -> bool {
     match device {
         DeviceId::Cpu => true,
         DeviceId::Hw { accel, .. } => match opts.video {
+            // A shared-init fMP4 (CMAF) H264 rendition serves EVERY segment
+            // under ONE init whose avcC carries seg0's SPS, and the media
+            // segments carry no inband parameter sets. libx264 and the hardware
+            // H264 encoders emit incompatible SPS — not just profile/level but
+            // the slice-header determinants (POC type, log2_max_frame_num, ref
+            // structure) that no `-profile`/`-level`/`-refs` flag can align — so
+            // a segment that the load-balancer spilled to a different encoder
+            // than seg0 is undecodable under the init: the client reads its
+            // slices with the wrong SPS and the video decoder rejects the packet
+            // (`avcodec_send_packet: Invalid data`, issue #114). B126 was the
+            // timescale sibling of this — a mux param, forceable; the parameter
+            // set is not. Pin the whole CMAF H264 rendition to ONE encoder by
+            // making hardware ineligible: CPU/libx264 is realtime at
+            // `-preset veryfast`, self-consistent across init + every segment,
+            // and frees the GPU for the heavier jobs. (H265 fMP4 would carry the
+            // identical hazard, but no hevc CMAF rung exists today.)
+            Some(VideoCodec::H264) if opts.container == Container::Fmp4 => false,
             // A hardware device is eligible for a codec when its family names an
             // encoder for it (h264/hevc always; vp9 on VAAPI; av1 on
             // VAAPI/NVENC/QSV). The negotiator only TARGETS a hardware codec the
@@ -302,6 +319,34 @@ mod tests {
         assert_eq!(
             elig.as_slice(),
             &[DeviceId::hw(HwAccel::Vaapi, 0), DeviceId::Cpu]
+        );
+    }
+
+    #[test]
+    fn h264_fmp4_cmaf_routes_cpu_only_but_mpegts_keeps_hardware() {
+        // A shared-init CMAF (fMP4) H264 rendition must come from ONE encoder,
+        // so hardware is ineligible and the whole rendition runs on libx264
+        // (issue #114). The mpegts H264 variants repeat parameter sets per
+        // segment and are self-describing, so they KEEP hardware — the gate is
+        // scoped to Fmp4, not to H264 generally.
+        let t = table();
+        let mut cmaf = h264_opts();
+        cmaf.container = Container::Fmp4;
+        assert_eq!(
+            t.eligible_for(&cmaf, Instant::now()).as_slice(),
+            &[DeviceId::Cpu],
+            "CMAF H264 must be CPU-only"
+        );
+        // Same codec, mpegts container → hardware still leads.
+        let mpegts = h264_opts(); // container: Mpegts
+        assert_eq!(
+            t.eligible_for(&mpegts, Instant::now()).as_slice(),
+            &[
+                DeviceId::hw(HwAccel::Nvenc, 0),
+                DeviceId::hw(HwAccel::Vaapi, 0),
+                DeviceId::Cpu
+            ],
+            "mpegts H264 keeps hardware"
         );
     }
 
