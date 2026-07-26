@@ -912,6 +912,7 @@ where
             community_rating: enriched.community_rating,
             premiere_date: enriched.premiere_date,
             official_rating: enriched.official_rating.clone(),
+            original_language: enriched.original_language.clone(),
             genres: enriched.genres.clone(),
             // TVDB's series-detail parse carries no studios/networks today.
             studios: Vec::new(),

@@ -25,7 +25,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
+use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesMetadataStore, UserDataStore, UserId};
 use pharos_store_sqlx::ServerConfigStore;
 use serde::{Deserialize, Serialize};
 
@@ -2628,8 +2628,30 @@ async fn playback_info(
     // made in — Japanese for anime, English for Hollywood, from one setting.
     // Unenriched items record none and degrade to the container's own order
     // rather than to a wrong language.
-    let audio_languages =
-        track_prefs.audio_languages_for(item.metadata.original_language.as_deref());
+    //
+    // An EPISODE never carries one: providers report the original language on
+    // the series record, because it is a property of the show. Measured on the
+    // live library mid-backfill — 9 of 32 refreshed movies had one, 0 of 14
+    // episodes — so resolving TV through its series is not an optimisation,
+    // it is the difference between the preference working for anime and not
+    // working at all.
+    let original_language = match item.metadata.original_language.clone() {
+        Some(l) => Some(l),
+        None if track_prefs.audio_original_language => match &item.series {
+            Some(series) => state
+                .stores
+                .series_metadata_by_keys(&[series.series_key().to_string()])
+                .await
+                .ok()
+                .and_then(|m| {
+                    m.get(series.series_key())
+                        .and_then(|s| s.original_language.clone())
+                }),
+            None => None,
+        },
+        None => None,
+    };
+    let audio_languages = track_prefs.audio_languages_for(original_language.as_deref());
     // What this user last played THIS item with. An explicit choice they made
     // outranks any language rule — it is the same person, saying the same
     // thing, one session later.

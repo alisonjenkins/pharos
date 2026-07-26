@@ -384,6 +384,14 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
             .get("firstAired")
             .and_then(|x| x.as_str())
             .and_then(pharos_core::parse_ymd_to_unix),
+        // TVDB reports this on the SERIES record only. Episodes inherit it —
+        // it is what makes `OriginalLanguage` work for anime, whose audio
+        // preference is the whole reason the field is captured.
+        original_language: data
+            .get("originalLanguage")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         genres: data
             .get("genres")
             .and_then(|g| g.as_array())

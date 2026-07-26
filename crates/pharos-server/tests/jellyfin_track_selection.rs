@@ -55,6 +55,16 @@ async fn seed_with_original_language(
     configuration: Option<&str>,
     original_language: Option<&str>,
 ) -> (web::Data<AppState>, String) {
+    seed_full(configuration, original_language, None).await
+}
+
+/// `series_original_language` seeds a SERIES record and makes item 9 an
+/// episode of it, so the inheritance path is exercised.
+async fn seed_full(
+    configuration: Option<&str>,
+    original_language: Option<&str>,
+    series_original_language: Option<&str>,
+) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -78,7 +88,18 @@ async fn seed_with_original_language(
             id: 9,
             path: "/no/such.mkv".into(),
             title: "Aliens".into(),
-            kind: MediaKind::Movie,
+            kind: if series_original_language.is_some() {
+                MediaKind::Episode
+            } else {
+                MediaKind::Movie
+            },
+            series: series_original_language.map(|_| pharos_core::SeriesInfo {
+                series_name: "Cowboy Bebop".into(),
+                series_folder: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+                ..Default::default()
+            }),
             probe: MediaProbe {
                 duration_ms: Some(60_000),
                 width: Some(1920),
@@ -95,6 +116,18 @@ async fn seed_with_original_language(
         })
         .await
         .unwrap();
+    if let Some(lang) = series_original_language {
+        use pharos_core::{SeriesMetadata, SeriesMetadataStore};
+        stores
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: "Cowboy Bebop".into(),
+                series_name: "Cowboy Bebop".into(),
+                original_language: Some(lang.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
     let state = web::Data::new(AppState::new(stores, "t".into()));
     (state, token.0.expose().to_string())
 }
@@ -266,4 +299,21 @@ async fn original_language_degrades_when_the_item_has_none() {
     ))
     .await;
     assert_eq!(default_audio_index(&state, &token).await, Some(1));
+}
+
+/// An EPISODE inherits its show's original language. Providers report it on
+/// the series record only, so without this the `OriginalLanguage` preference
+/// does nothing for TV — measured live: 0 of 14 refreshed episodes carried
+/// one, against 9 of 32 movies. Anime is episodes, so this IS the anime case.
+#[actix_web::test]
+async fn an_episode_inherits_its_shows_original_language() {
+    let (state, token) = seed_full(
+        Some(r#"{"AudioLanguagePreference":"OriginalLanguage","PlayDefaultAudioTrack":false}"#),
+        None,
+        Some("eng"),
+    )
+    .await;
+    // The show is English, so the English track wins over the Ukrainian ones
+    // even though the episode row itself records no language.
+    assert_eq!(default_audio_index(&state, &token).await, Some(4));
 }

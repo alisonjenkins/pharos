@@ -1084,6 +1084,11 @@ pub struct SeriesMetadata {
     /// First-aired date, Unix seconds.
     pub premiere_date: Option<i64>,
     pub official_rating: Option<String>,
+    /// The language the SHOW was made in. Providers report it on the series
+    /// record and never per episode — it is a property of the show — so an
+    /// episode's own `MediaMetadata::original_language` is always `None` and
+    /// the `OriginalLanguage` audio preference resolves TV through here.
+    pub original_language: Option<String>,
     pub genres: Vec<String>,
     pub studios: Vec<String>,
     pub provider_ids: ProviderIds,
