@@ -760,6 +760,47 @@ mod tests {
         );
     }
 
+    /// The section the Helm chart renders must parse, and an absent one must
+    /// leave Jellyfin's defaults — the two states an operator can be in.
+    #[test]
+    fn user_defaults_parse_and_default_to_jellyfins_values() {
+        let absent = Config::from_toml_str(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+        "#,
+        )
+        .unwrap();
+        assert!(absent.user_defaults.is_stock());
+        assert!(absent.user_defaults.play_default_audio_track);
+        assert_eq!(absent.user_defaults.subtitle_mode, "Default");
+
+        // Exactly what charts/pharos renders.
+        let configured = Config::from_toml_str(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+            [user_defaults]
+            audio_language_preference = "OriginalLanguage"
+            subtitle_language_preference = "eng"
+            subtitle_mode = "Smart"
+            play_default_audio_track = false
+        "#,
+        )
+        .unwrap();
+        assert!(!configured.user_defaults.is_stock());
+        assert_eq!(
+            configured.user_defaults.audio_language_preference,
+            "OriginalLanguage"
+        );
+        assert_eq!(configured.user_defaults.subtitle_mode, "Smart");
+        assert!(!configured.user_defaults.play_default_audio_track);
+    }
+
     #[test]
     fn metadata_defaults_and_tvdb_env_override() {
         // Minimal TOML omitting [tvdb]/[metadata] so the `#[serde(default)]`
