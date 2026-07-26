@@ -485,6 +485,22 @@ struct CacheState {
     /// TRUE first-sample time of each continuous-audio session file, probed
     /// once and reused. See `probed_session_start`.
     audio_session_starts: HashMap<PathBuf, f64>,
+    /// Where each source's audio track begins, in seconds, keyed by
+    /// `(source, audio-relative index)`. A property of the file, so probed once
+    /// and reused. See `source_audio_start`.
+    source_audio_starts: HashMap<(PathBuf, u32), f64>,
+}
+
+/// One file of the demuxed audio rendition, with the session that produced it.
+///
+/// The session start is not bookkeeping: ffmpeg's HLS muxer numbers `tfdt` from
+/// a session's OWN first fragment, so `a300.m4s` written by a session that
+/// started at segment 225 carries 450 s — its position WITHIN the session — not
+/// the 1800 s the playlist places it at. Only the caller that knows the start
+/// can put the fragment back on the timeline (B121).
+pub struct AudioRenditionFile {
+    pub bytes: Vec<u8>,
+    pub session_start_seg: u32,
 }
 
 /// Outcome of [`HlsSegmentCache::choose_audio_start_seg`]: reuse a session
@@ -566,7 +582,7 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// bitrate whenever there was one. v8 names cannot be parsed under the new
 /// scheme and, worse, v8 entries conflated two clients whose audio bitrates
 /// differed.
-const HLS_GEN_VERSION: u32 = 9;
+const HLS_GEN_VERSION: u32 = 10;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
@@ -1156,7 +1172,7 @@ impl HlsSegmentCache {
     /// cuts every `hls_time` seconds measured from the session's OWN first
     /// packet — so a session that starts anywhere other than a multiple of this
     /// produces boundaries no other session can reproduce.
-    const AUDIO_SEGMENT_SECONDS: f64 = 6.0;
+    pub const AUDIO_SEGMENT_SECONDS: f64 = 6.0;
 
     /// Start time (seconds) of audio segment `seg`: the plain uniform grid.
     ///
@@ -1226,7 +1242,11 @@ impl HlsSegmentCache {
     /// segment instead of alternating with the whole-file session as it catches
     /// up. Non-segment names (`init.mp4`) take the first session that has one;
     /// the init is codec configuration and is identical across sessions.
-    async fn resolve_audio_file(root: &Path, name: &str) -> Option<PathBuf> {
+    /// Returns the file AND the segment its session started at — the caller
+    /// needs that to place the fragment on the timeline (see B121: ffmpeg
+    /// numbers a session's `tfdt` from ITS OWN first fragment, not from the
+    /// absolute grid).
+    async fn resolve_audio_file(root: &Path, name: &str) -> Option<(PathBuf, u32)> {
         let want = name
             .strip_prefix('a')
             .and_then(|r| r.strip_suffix(".m4s"))
@@ -1237,7 +1257,7 @@ impl HlsSegmentCache {
             }
             let p = Self::audio_session_dir(root, start).join(name);
             if tokio::fs::try_exists(&p).await.unwrap_or(false) {
-                return Some(p);
+                return Some((p, start));
             }
         }
         None
@@ -1353,7 +1373,15 @@ impl HlsSegmentCache {
         tokio::fs::create_dir_all(Self::audio_session_dir(&dir, start_seg)).await?;
         tokio::fs::write(&running, b"").await?;
 
-        let args = Self::audio_hls_args(source, &dir, audio_index, audio_bitrate_bps, start_seg)?;
+        let audio_start = self.source_audio_start(source, audio_index).await;
+        let args = Self::audio_hls_args(
+            source,
+            &dir,
+            audio_index,
+            audio_bitrate_bps,
+            start_seg,
+            audio_start,
+        )?;
         if start_seg > 0 {
             tracing::info!(
                 media.id = media_id,
@@ -1474,6 +1502,72 @@ impl HlsSegmentCache {
         resolved
     }
 
+    /// Where the SOURCE's chosen audio track begins, in seconds.
+    ///
+    /// Zero for almost every file. When it is not — a track authored to start
+    /// after the video — every encode of that track inherits the offset, and
+    /// anything that assumes "audio time == video time" is wrong by exactly
+    /// this much (B119 on the muxed path, B120 on the demuxed rendition).
+    /// Probed once per `(source, track)`; it cannot change while the file does
+    /// not. An unprobeable source reports 0.0, which is the old behaviour.
+    async fn source_audio_start(&self, source: &Path, audio_index: Option<u32>) -> f64 {
+        let idx = audio_index.unwrap_or(0);
+        let key = (source.to_path_buf(), idx);
+        if let Some(v) = self
+            .state
+            .lock()
+            .await
+            .source_audio_starts
+            .get(&key)
+            .copied()
+        {
+            return v;
+        }
+        let start = Self::audio_stream_start(self.transcoder.binary(), source, idx)
+            .await
+            .unwrap_or(0.0)
+            .max(0.0);
+        if start > 0.0 {
+            tracing::info!(
+                source = %source.display(),
+                audio_index = idx,
+                audio_start_secs = start,
+                "source audio track starts after its video — encodes of it are \
+                 padded to keep the source timeline"
+            );
+        }
+        self.state
+            .lock()
+            .await
+            .source_audio_starts
+            .insert(key, start);
+        start
+    }
+
+    /// `start_time` of the `a:{index}` stream of `path`, in seconds.
+    async fn audio_stream_start(ffmpeg_bin: &Path, path: &Path, index: u32) -> Option<f64> {
+        let probe = ffmpeg_bin.with_file_name("ffprobe");
+        let out = tokio::process::Command::new(&probe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                &format!("a:{index}"),
+                "-show_entries",
+                "stream=start_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .await
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<f64>().ok())
+    }
+
     /// PTS of the first audio packet in `path`, in seconds.
     async fn first_audio_pts(ffmpeg_bin: &Path, path: &Path) -> Option<f64> {
         let probe = ffmpeg_bin.with_file_name("ffprobe");
@@ -1576,6 +1670,7 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
         start_seg: u32,
+        audio_start_secs: f64,
     ) -> Result<Vec<String>, HlsCacheError> {
         let src = source
             .to_str()
@@ -1618,6 +1713,26 @@ impl HlsSegmentCache {
         } else {
             args.push("-map".into());
             args.push("0:a:0?".into());
+        }
+        // A from-0 session must carry the audio stream's OWN start time, or its
+        // fragments hold content from `audio_start_secs` later than the grid
+        // position they are served at.
+        //
+        // ffmpeg re-bases the only mapped stream so its first sample sits at
+        // zero, and for a track that begins after the video (Rogue One: eac3 at
+        // 1.700 s against video at 0) that silently discards the offset: a17
+        // then carried source 103.700 s while the playlist placed it at
+        // 101.997 s — audio 1.7 s AHEAD of picture for the whole title.
+        // `-output_ts_offset`, `-copyts` and `-avoid_negative_ts disabled` all
+        // leave it at zero (measured, ffmpeg 8.1); padding the front is what
+        // actually restores the source timeline. A SEEK session needs no pad —
+        // `-ss X` lands on source X exactly.
+        if start_seg == 0 && audio_start_secs > 0.0 {
+            args.push("-af".into());
+            args.push(format!(
+                "adelay=delays={:.3}ms:all=1",
+                audio_start_secs * 1000.0
+            ));
         }
         args.extend(
             ["-c:a", "libopus", "-b:a", &bitrate.to_string(), "-ac", "2"]
@@ -1997,7 +2112,11 @@ impl HlsSegmentCache {
     /// only when the session stalls or never starts — so a slow-but-progressing
     /// cold seek is served instead of a false 404, while a dead session still
     /// fails promptly. Returns `NotFound` past the budget.
-    pub async fn audio_hls_file(&self, dir: &Path, name: &str) -> Result<Vec<u8>, HlsCacheError> {
+    pub async fn audio_hls_file(
+        &self,
+        dir: &Path,
+        name: &str,
+    ) -> Result<AudioRenditionFile, HlsCacheError> {
         self.audio_hls_file_budget(
             dir,
             name,
@@ -2017,7 +2136,7 @@ impl HlsSegmentCache {
         max_polls: usize,
         no_progress_polls: usize,
         stall_polls: usize,
-    ) -> Result<Vec<u8>, HlsCacheError> {
+    ) -> Result<AudioRenditionFile, HlsCacheError> {
         // Basic traversal guard: names are simple file basenames.
         if name.contains('/') || name.contains("..") {
             return Err(HlsCacheError::Io(std::io::Error::from(
@@ -2033,11 +2152,14 @@ impl HlsSegmentCache {
             // Resolve across the rendition's sessions each poll: the file may
             // not exist yet, and which session ends up owning it is only known
             // once one has written it.
-            if let Some(path) = Self::resolve_audio_file(dir, name).await {
+            if let Some((path, session_start_seg)) = Self::resolve_audio_file(dir, name).await {
                 if let Ok(b) = tokio::fs::read(&path).await {
                     if !b.is_empty() {
                         record_audio_wait("served");
-                        return Ok(b);
+                        return Ok(AudioRenditionFile {
+                            bytes: b,
+                            session_start_seg,
+                        });
                     }
                 }
             }
@@ -2933,6 +3055,7 @@ mod tests {
             Some(1),
             Some(128_000),
             0,
+            0.0,
         )
         .unwrap();
         let joined = a.join(" ");
@@ -2946,11 +3069,73 @@ mod tests {
         assert!(joined.contains("-map 0:a:1"), "{joined}");
     }
 
+    /// B120 — a whole-file session must carry the audio track's own start time
+    /// forward, or its fragments hold content from that much later than the
+    /// grid position they are served at.
+    #[test]
+    fn a_from_zero_session_pads_a_late_starting_audio_track() {
+        let a = HlsSegmentCache::audio_hls_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/d"),
+            None,
+            Some(128_000),
+            0,
+            1.7,
+        )
+        .unwrap();
+        let joined = a.join(" ");
+        assert!(
+            joined.contains("-af adelay=delays=1700.000ms:all=1"),
+            "{joined}"
+        );
+        // The pad belongs before the encoder, not after it.
+        let af = a.iter().position(|x| x == "-af").unwrap();
+        let ca = a.iter().position(|x| x == "-c:a").unwrap();
+        assert!(af < ca, "{joined}");
+    }
+
+    /// A track that starts with its video needs no pad — the overwhelming
+    /// majority of files, which must keep the argv they always had.
+    #[test]
+    fn a_punctual_audio_track_is_not_padded() {
+        let a = HlsSegmentCache::audio_hls_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/d"),
+            None,
+            Some(128_000),
+            0,
+            0.0,
+        )
+        .unwrap();
+        assert!(!a.join(" ").contains("adelay"), "{a:?}");
+    }
+
+    /// A SEEK session lands on the requested source position exactly, so
+    /// padding it would push its content late by the offset instead.
+    #[test]
+    fn a_seek_session_is_never_padded() {
+        let a = HlsSegmentCache::audio_hls_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/d"),
+            None,
+            Some(128_000),
+            30,
+            1.7,
+        )
+        .unwrap();
+        assert!(!a.join(" ").contains("adelay"), "{a:?}");
+    }
+
     /// B42 — a seek session must be source-anchored: input-seek to the
-    /// segment boundary, absolute segment numbering, and true-timeline
-    /// fragment timestamps (a PTS-0 fragment buffers at 0:00 in hls.js —
-    /// the B41 failure class). Its playlist must not clobber the from-0
+    /// segment boundary and absolute segment numbering, so its files line up
+    /// with the whole-file session's. Its playlist must not clobber the from-0
     /// session's done-marker.
+    ///
+    /// `-output_ts_offset` does NOT reach the fragment timestamps — ffmpeg's
+    /// HLS muxer numbers `tfdt` from the session's own first sample whatever it
+    /// is passed (B121, measured on ffmpeg 8.1). The anchor is corrected when
+    /// the fragment is served; the option stays because it costs nothing and
+    /// keeps the seek and the offset cancelling for content selection.
     #[test]
     fn audio_hls_args_seek_session_is_source_anchored() {
         let a = HlsSegmentCache::audio_hls_args(
@@ -2959,6 +3144,7 @@ mod tests {
             None,
             Some(128_000),
             30,
+            0.0,
         )
         .unwrap();
         let joined = a.join(" ");
@@ -2996,6 +3182,7 @@ mod tests {
                 None,
                 Some(128_000),
                 seg,
+                0.0,
             )
             .unwrap();
             let at = |flag: &str| {
@@ -3047,7 +3234,7 @@ mod tests {
         let read = |name: &'static str| {
             let root = root.to_path_buf();
             async move {
-                let p = HlsSegmentCache::resolve_audio_file(&root, name)
+                let (p, _start) = HlsSegmentCache::resolve_audio_file(&root, name)
                     .await
                     .unwrap();
                 tokio::fs::read(p).await.unwrap()
@@ -3143,7 +3330,7 @@ mod tests {
             .audio_hls_file_budget(&dir, "a3.m4s", 40, 10, 6)
             .await
             .unwrap();
-        assert_eq!(got, b"seg3");
+        assert_eq!(got.bytes, b"seg3");
     }
 
     #[tokio::test]
@@ -3172,7 +3359,7 @@ mod tests {
             .audio_hls_file_budget(&dir, "a5.m4s", 200, 10, 6)
             .await
             .unwrap();
-        assert_eq!(got, b"y");
+        assert_eq!(got.bytes, b"y");
     }
 
     #[tokio::test]
