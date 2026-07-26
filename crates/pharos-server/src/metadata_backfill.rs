@@ -779,10 +779,10 @@ fn upsert_art(
 /// One enrichment pass over the Series *containers* (T9-series). A show has no
 /// `media_items` row, so this can't ride the item loop — it enumerates distinct
 /// shows via [`SeriesMetadataStore::series_needing_match`] and enriches each
-/// against TVDB (the only provider that carries a series-level record here).
-/// Returns how many shows were newly enriched (counts toward the pass total, so
-/// the loop keeps draining while shows remain). Series are TV-only, so this is
-/// a no-op when `tvdb` is `None`.
+/// against the show providers in order. Returns how many shows were newly
+/// enriched (counts toward the pass total, so the loop keeps draining while
+/// shows remain). Series are TV-only, so this is a no-op when neither provider
+/// is configured.
 async fn enrich_series_pass<Tv, Tm, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
@@ -797,6 +797,7 @@ where
     Tm: OnlineEnricher,
     S: SeriesMetadataStore,
 {
+    let providers = SeriesProviders { tvdb, tmdb };
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
     let candidates = store
         .series_needing_match(cfg.max_per_pass, ttl_cutoff)
@@ -807,7 +808,7 @@ where
     let mut enriched = 0usize;
     for cand in candidates {
         // V6 — one bad show never aborts the pass; log it and carry on.
-        match enrich_one_series(store, bg_io, cache, tvdb, tmdb, cfg, cand, now).await {
+        match enrich_one_series(store, bg_io, cache, &providers, cfg, cand, now).await {
             Ok(true) => enriched += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: show failed"),
@@ -815,6 +816,17 @@ where
         tokio::time::sleep(REQUEST_SPACING).await;
     }
     Ok((enriched, had_work))
+}
+
+/// The show providers, in the order they are asked.
+///
+/// TVDB first (it is the show-shaped provider), then TMDB. Bundled because
+/// they are one decision — "who can identify this show" — rather than two
+/// independent inputs, and because a resolver that takes both individually
+/// invites a call site that passes only one.
+struct SeriesProviders<'a, Tv, Tm> {
+    tvdb: Option<&'a Tv>,
+    tmdb: Option<&'a Tm>,
 }
 
 /// Enrich one show end-to-end: search TVDB by name (+year), fetch the
@@ -827,8 +839,7 @@ async fn enrich_one_series<Tv, Tm, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
     cache: &ImageCache,
-    tvdb: Option<&Tv>,
-    tmdb: Option<&Tm>,
+    providers: &SeriesProviders<'_, Tv, Tm>,
     cfg: &MetadataConfig,
     cand: SeriesMatchCandidate,
     now: i64,
@@ -838,7 +849,7 @@ where
     Tm: OnlineEnricher,
     S: SeriesMetadataStore,
 {
-    // B127 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
+    // B125 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
     // deployed library's 178 shows were marked `none` by TVDB alone, almost all
     // of them anime — Death Note, Dragon Ball GT, Code Geass — which TMDB
     // carries. A show marked `none` has no poster, so its tile falls back to a
@@ -848,7 +859,7 @@ where
     // transient we leave the row untouched for the next pass rather than
     // freezing the show as `none` for the whole TTL.
     let mut transient = false;
-    if let Some(tv) = tvdb {
+    if let Some(tv) = providers.tvdb {
         match resolve_series(tv, "tvdb", bg_io, cache, cfg, &cand).await {
             SeriesAttempt::Hit(h) => outcome = Some(h),
             SeriesAttempt::Transient => transient = true,
@@ -857,7 +868,7 @@ where
     }
     let mut fell_back = false;
     if outcome.is_none() {
-        if let Some(tm) = tmdb {
+        if let Some(tm) = providers.tmdb {
             match resolve_series(tm, "tmdb", bg_io, cache, cfg, &cand).await {
                 SeriesAttempt::Hit(h) => {
                     outcome = Some(h);
@@ -875,7 +886,11 @@ where
         // Every configured provider searched and found nothing over the
         // confidence floor → record `none` so the show isn't re-searched until
         // the TTL re-admits it. Attributed to whichever provider ran last.
-        let provider = if tmdb.is_some() { "tmdb" } else { "tvdb" };
+        let provider = if providers.tmdb.is_some() {
+            "tmdb"
+        } else {
+            "tvdb"
+        };
         store
             .upsert_series_metadata(SeriesMetadata {
                 series_key: cand.series_key.clone(),
@@ -1554,7 +1569,7 @@ mod tests {
         store.put(item).await.unwrap();
     }
 
-    /// B127 — TVDB is not the only show provider. 44 of the deployed library's
+    /// B125 — TVDB is not the only show provider. 44 of the deployed library's
     /// 178 shows were frozen as `none` by TVDB alone, nearly all anime, and a
     /// show with no poster falls back to a representative episode and then to
     /// an extracted frame.

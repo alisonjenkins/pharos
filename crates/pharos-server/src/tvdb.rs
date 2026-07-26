@@ -366,7 +366,7 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
             url: img.to_string(),
         });
     }
-    // B126 — `data.image` is the poster and nothing else, so a show could never
+    // B125 — `data.image` is the poster and nothing else, so a show could never
     // acquire a backdrop or a logo: 0 of 178 shows in the deployed library had
     // one. The SAME response already carries `data.artworks[]` (this is the
     // `/series/{id}/extended` body `parse_tvdb_artworks` reads for the image
@@ -729,8 +729,7 @@ mod tests {
         assert_eq!(e.premiere_date, None); // no firstAired in this sparse fixture
     }
 
-    #[test]
-    /// B126 — a show must be able to acquire a BACKDROP. `data.image` is the
+    /// B125 — a show must be able to acquire a BACKDROP. `data.image` is the
     /// poster and nothing else, so every show in the deployed library (0 of
     /// 178) had one, and its detail page fell back to a video frame. The same
     /// `/series/{id}/extended` body already carries `artworks[]`.
