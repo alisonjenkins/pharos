@@ -2118,6 +2118,28 @@ pub trait MediaSegmentStore: Send + Sync {
         kind: FingerprintKind,
         schema_version: i64,
     ) -> impl std::future::Future<Output = DomainResult<Option<Vec<u32>>>> + Send;
+
+    /// Record that `item_id` was ANALYSED at `schema_version`, whatever the
+    /// analysis found.
+    ///
+    /// Detection finding nothing is the common case — most shows have no
+    /// shared intro — and `set_media_segments` with an empty slice writes no
+    /// row, so results alone cannot express "analysed, nothing there". Without
+    /// this stamp the sweep re-analyses such a season on every pass forever,
+    /// and a `SEGMENT_SCHEMA_VERSION` bump cannot reach an episode that has no
+    /// row to carry a version.
+    fn set_segment_scan(
+        &self,
+        item_id: MediaId,
+        schema_version: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// The `schema_version` `item_id` was last analysed at, or `None` when it
+    /// never was.
+    fn segment_scan_version(
+        &self,
+        item_id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<i64>>> + Send;
 }
 
 /// LIB-A4 — structured result of an incremental scan. Replaces the bare

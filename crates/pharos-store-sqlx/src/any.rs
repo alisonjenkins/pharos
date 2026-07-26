@@ -382,6 +382,18 @@ impl pharos_core::MediaSegmentStore for AnyStore {
             }
         }
     }
+    async fn set_segment_scan(&self, item_id: MediaId, schema_version: i64) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.set_segment_scan(item_id, schema_version).await,
+            AnyStore::Postgres(p) => p.set_segment_scan(item_id, schema_version).await,
+        }
+    }
+    async fn segment_scan_version(&self, item_id: MediaId) -> DomainResult<Option<i64>> {
+        match self {
+            AnyStore::Sqlite(s) => s.segment_scan_version(item_id).await,
+            AnyStore::Postgres(p) => p.segment_scan_version(item_id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

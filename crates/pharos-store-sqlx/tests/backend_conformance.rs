@@ -11,12 +11,12 @@
 
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
-    CollectionStore, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind,
-    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup,
-    PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
-    SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore, StudioStore, SyncGroupStore,
-    TagStore, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy,
-    UserRecord, UserStore,
+    CollectionStore, DetectedSegment, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem,
+    MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaSegmentKind, MediaSegmentStore,
+    MediaStore, PersistedSyncGroup, PersistedTranscodeSession, PersonKind, PersonRef, PersonStore,
+    PlaylistStore, PreferenceStore, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
+    StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, UserDataStore,
+    UserId, UserItemData, UserPolicy, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -67,6 +67,7 @@ where
         + pharos_core::TranscodeSessionStore
         + pharos_core::SyncGroupStore
         + pharos_core::SeriesMetadataStore
+        + pharos_core::MediaSegmentStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
         + Send
@@ -669,6 +670,59 @@ where
     assert!(!need2
         .iter()
         .any(|c| c.series_key == "/media/conformance/Conformance Show (2001)"));
+
+    // -----------------------------------------------------------------
+    // MediaSegmentStore (T86 / B123). The scan stamp is what separates
+    // "analysed, found nothing" from "never analysed", and it had no
+    // conformance coverage at all — its Postgres placeholders were only
+    // ever type-checked, never executed.
+    // -----------------------------------------------------------------
+    let seg_item: MediaId = 951;
+    assert_eq!(
+        MediaSegmentStore::segment_scan_version(&store, seg_item)
+            .await
+            .unwrap(),
+        None
+    );
+    MediaSegmentStore::set_media_segments(
+        &store,
+        seg_item,
+        &[DetectedSegment {
+            kind: MediaSegmentKind::Intro,
+            start_ms: 12_000,
+            end_ms: 32_000,
+            detector: "chromaprint".into(),
+            confidence: 0.75,
+        }],
+        SEGMENT_SCHEMA_VERSION,
+    )
+    .await
+    .unwrap();
+    MediaSegmentStore::set_segment_scan(&store, seg_item, SEGMENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
+    let segs = MediaSegmentStore::media_segments_for(&store, seg_item)
+        .await
+        .unwrap();
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].start_ms, 12_000);
+    assert_eq!(
+        MediaSegmentStore::segment_scan_version(&store, seg_item)
+            .await
+            .unwrap(),
+        Some(SEGMENT_SCHEMA_VERSION)
+    );
+    // Re-stamping the same item UPDATES rather than duplicating (the primary
+    // key is the item), so a later algorithm version supersedes the old one.
+    MediaSegmentStore::set_segment_scan(&store, seg_item, SEGMENT_SCHEMA_VERSION + 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaSegmentStore::segment_scan_version(&store, seg_item)
+            .await
+            .unwrap(),
+        Some(SEGMENT_SCHEMA_VERSION + 7)
+    );
 }
 
 #[cfg(feature = "sqlite")]
