@@ -192,6 +192,15 @@ pub struct MuxedAudio {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodeOptions {
     pub container: Container,
+    /// The SOURCE frame rate this segment's window was snapped to, when known.
+    ///
+    /// Carried because the HARDWARE encoders need it: they reject
+    /// `-enc_time_base`, so without an explicit `-r` they quantize output to
+    /// their default 1/framerate timebase, place the first frame half a frame
+    /// late and lose the last one — one dropped frame per segment. See the
+    /// `-r` block in `build_args_for_device`.
+    #[serde(default)]
+    pub source_frame_rate: Option<pharos_core::FrameRate>,
     pub video: Option<VideoCodec>,
     pub audio: Option<AudioCodec>,
     pub video_bitrate_bps: Option<u64>,
@@ -284,6 +293,7 @@ mod tests {
     #[test]
     fn ticks_to_seconds_roundtrip() {
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Mp4,
             video: None,
             audio: None,
@@ -306,6 +316,7 @@ mod tests {
     #[test]
     fn zero_start_returns_none() {
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Mp4,
             video: None,
             audio: None,

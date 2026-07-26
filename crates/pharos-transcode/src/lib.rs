@@ -945,17 +945,40 @@ fn build_args_for_device(
     // EVERY segment container needs this, not just fMP4: an mpegts segment is
     // tiled onto the same shared timeline and suffers the same ±1-frame
     // boundary dup/drop when the encoder quantizes the zero-based first-frame
-    // pts to its default 1/framerate timebase. The grid now snaps boundaries to
-    // real frames, which fixes the boundary on every encoder including the
-    // hardware ones; this keeps the software path frame-exact even for a source
-    // whose frame rate could not be determined (no grid to snap to).
-    if opts.container.is_hls_segment()
-        && software_video
+    // pts to its default 1/framerate timebase.
+    let encoding_segment_video = opts.container.is_hls_segment()
         && opts.video.is_some()
-        && !matches!(opts.video, Some(VideoCodec::Copy))
-    {
+        && !matches!(opts.video, Some(VideoCodec::Copy));
+    if encoding_segment_video && software_video {
         a.push("-enc_time_base".into());
         a.push("1:90000".into());
+    } else if encoding_segment_video {
+        // HARDWARE encoders reject `-enc_time_base`, and the comment here used
+        // to claim the frame-snapped grid was enough for them. It is not.
+        // Measured on the real argv against a real source, one flag apart:
+        //
+        //   with    -enc_time_base: 144 frames, first pts 12.012000 (the boundary)
+        //   without -enc_time_base: 143 frames, first pts 12.032856 (+half a frame)
+        //
+        // and confirmed in production, same segment on two devices:
+        // `seg 40 dev Nvenc:0 expF 144 gotF 143 def 1` beside
+        // `seg 40 dev cpu expF 144 gotF 144 def 0`.
+        //
+        // One frame lost per 6.006 s segment is 0.7% of the picture. Each
+        // segment's timestamps stay individually correct, so it does not show
+        // as a fixed A/V skew — it accumulates, reaching ~500 ms of drift after
+        // roughly 70 s of playback. Reported as a stutter AND as an audio
+        // desync; they were the same defect.
+        //
+        // `-r` pins the encoder to the source's frame grid instead, which
+        // hardware DOES accept: the frame count is restored and consecutive
+        // segments tile exactly. Only when the rate is actually known — a
+        // guessed rate would resample the picture.
+        if let Some(rate) = opts.source_frame_rate {
+            let (num, den) = rate.as_ratio();
+            a.push("-r".into());
+            a.push(format!("{num}/{den}"));
+        }
     }
     a.push("-f".into());
     a.push(opts.container.ffmpeg_muxer().into());
@@ -1061,6 +1084,7 @@ mod tests {
 
     fn opts() -> TranscodeOptions {
         TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Mp4,
             video: Some(VideoCodec::H264),
             audio: Some(AudioCodec::Aac),
@@ -1076,6 +1100,70 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
         }
+    }
+
+    /// A hardware encoder must be pinned to the source frame grid.
+    ///
+    /// It rejects `-enc_time_base`, so without `-r` it quantizes to its default
+    /// 1/framerate timebase, places the first frame half a frame late and loses
+    /// the last one — one frame per segment. Measured on the real argv one flag
+    /// apart (144 frames vs 143) and in production on two devices (`Nvenc:0
+    /// def 1` beside `cpu def 0`).
+    #[test]
+    fn a_hardware_segment_encode_is_pinned_to_the_source_frame_grid() {
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.video = Some(VideoCodec::H264);
+        o.source_frame_rate = pharos_core::FrameRate::from_mille(23_976);
+        o.duration_ticks = Some(60_060_000);
+
+        let hw = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Hw {
+                accel: HwAccel::Nvenc,
+                index: 0,
+            },
+            "/out.ts",
+        );
+        assert!(
+            !hw.iter().any(|x| x == "-enc_time_base"),
+            "hardware encoders reject it: {hw:?}"
+        );
+        let r = hw
+            .iter()
+            .position(|x| x == "-r")
+            .expect("hardware segment encode must pin the frame grid");
+        assert_eq!(hw[r + 1], "24000/1001", "{hw:?}");
+
+        // Software keeps the exact-timebase route and must NOT be changed.
+        let sw = build_args_for_device("/m/foo.mkv", &o, crate::protocol::DeviceId::Cpu, "/out.ts");
+        let e = sw
+            .iter()
+            .position(|x| x == "-enc_time_base")
+            .expect("software keeps -enc_time_base");
+        assert_eq!(sw[e + 1], "1:90000", "{sw:?}");
+        assert!(!sw.iter().any(|x| x == "-r"), "{sw:?}");
+    }
+
+    /// A guessed frame rate would resample the picture, so an unprobed source
+    /// gets no `-r` at all.
+    #[test]
+    fn an_unknown_frame_rate_pins_nothing() {
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.video = Some(VideoCodec::H264);
+        o.source_frame_rate = None;
+        let hw = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Hw {
+                accel: HwAccel::Nvenc,
+                index: 0,
+            },
+            "/out.ts",
+        );
+        assert!(!hw.iter().any(|x| x == "-r"), "{hw:?}");
     }
 
     #[test]
@@ -1187,6 +1275,7 @@ mod tests {
     #[test]
     fn vp9_webm_args_are_realtime_and_skip_movflags() {
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::WebM,
             video: Some(VideoCodec::Vp9),
             audio: Some(AudioCodec::Opus),
@@ -1245,6 +1334,7 @@ mod tests {
         //   negative; fmp4.rs clamps that).
         // - `+frag_discont`: per-segment runs are discontinuous by design.
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(VideoCodec::Vp9),
             audio: Some(AudioCodec::Opus),
@@ -1280,6 +1370,7 @@ mod tests {
         // codec/encoder-agnostic and MUST still be present so hw fMP4 segments
         // tile on one timeline.
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(VideoCodec::H264),
             audio: None,
@@ -1367,6 +1458,7 @@ mod tests {
     #[test]
     fn copy_codecs_skip_bitrate() {
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Mp4,
             video: Some(VideoCodec::Copy),
             audio: Some(AudioCodec::Copy),
@@ -1393,6 +1485,7 @@ mod tests {
     #[test]
     fn no_video_emits_vn() {
         let o = TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Mp3,
             video: None,
             audio: Some(AudioCodec::Mp3),

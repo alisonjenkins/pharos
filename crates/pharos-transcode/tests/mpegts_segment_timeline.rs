@@ -85,6 +85,7 @@ fn probe_json(path: &std::path::Path, args: &[&str]) -> serde_json::Value {
 fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path::PathBuf {
     let seg = dir.join("seg1.ts");
     let opts = pharos_transcode::TranscodeOptions {
+        source_frame_rate: None,
         container: pharos_transcode::Container::Mpegts,
         video: Some(pharos_transcode::VideoCodec::H264),
         audio: Some(pharos_transcode::AudioCodec::Aac),

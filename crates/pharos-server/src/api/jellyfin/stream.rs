@@ -534,6 +534,7 @@ async fn stream_transcoded_webm(
     let sub_rel = parse_query_u32(qs, "SubtitleStreamIndex")
         .and_then(|abs| codec_relative_index(&sub_abs, abs));
     let opts = TranscodeOptions {
+        source_frame_rate: None,
         container: Container::WebM,
         video: Some(VideoCodec::Vp9),
         audio: Some(AudioCodec::Opus),

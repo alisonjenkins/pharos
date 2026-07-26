@@ -402,6 +402,7 @@ mod tests {
             job_id: JobId(7),
             input: PathBuf::from("/m/in.mkv"),
             opts: TranscodeOptions {
+                source_frame_rate: None,
                 container: Container::Mpegts,
                 video: Some(VideoCodec::H264),
                 audio: Some(AudioCodec::Aac),
