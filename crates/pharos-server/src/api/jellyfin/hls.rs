@@ -1892,6 +1892,9 @@ async fn vp9_init(
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
     let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    // The init IS the rendition's clock. Judge it too: an init on the wrong
+    // timescale mis-reads every segment that follows it, not just itself.
+    fmp4::record_track_timescale(&raw, item.id, 0);
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
     Ok(HttpResponse::Ok()
@@ -1969,6 +1972,7 @@ async fn vp9_segment(
     // so real playback reveals a per-segment gap/overlap or an audio-vs-video
     // duration mismatch — the mechanism behind the reported drift + clicks.
     // traf order: 0 = video, 1 = audio (the -map order in the encoder args).
+    fmp4::record_track_timescale(&raw, item.id, seg);
     let timing = fmp4::segment_track_timing(&raw);
     if let (Some(v), Some(a)) = (timing.first(), timing.get(1)) {
         tracing::info!(
@@ -2054,6 +2058,9 @@ async fn h264cmaf_init(
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
     let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    // The init IS the rendition's clock. Judge it too: an init on the wrong
+    // timescale mis-reads every segment that follows it, not just itself.
+    fmp4::record_track_timescale(&raw, item.id, 0);
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))?;
     Ok(HttpResponse::Ok()
@@ -2115,6 +2122,7 @@ async fn h264cmaf_segment(
         q.play_session_id.as_deref(),
     );
     let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    fmp4::record_track_timescale(&raw, item.id, seg);
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
     Ok(HttpResponse::Ok()
