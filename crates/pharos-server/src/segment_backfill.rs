@@ -17,7 +17,9 @@ use pharos_core::{
     SEGMENT_SCHEMA_VERSION,
 };
 use pharos_transcode::fingerprint::align::AlignConfig;
-use pharos_transcode::fingerprint::season::{detect_season, EpisodeFingerprint, SeasonConfig};
+use pharos_transcode::fingerprint::season::{
+    detect_season_verbose, EpisodeFingerprint, EpisodeVerdict, SeasonConfig, Verdict,
+};
 use pharos_transcode::worker::LibavWorkerPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,7 +105,7 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
         if season_is_current(ctx, &eps).await {
             continue;
         }
-        if analyze_season(ctx, &eps).await {
+        if analyze_season(ctx, &key, &eps).await {
             analyzed += 1;
             tracing::info!(season = %key, episodes = eps.len(), "segment backfill: season analyzed");
         }
@@ -125,10 +127,62 @@ async fn season_is_current(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
     true
 }
 
+/// Record WHY each episode did or did not get a segment.
+///
+/// Detection failing is not an error — most of the time it means the show has
+/// no shared intro — so the only way to tell "correctly found nothing" from
+/// "found it and threw it away" is to state the gate's inputs. Without this the
+/// recall problem is invisible: a season simply produces no rows, exactly as a
+/// season with no intro does. The per-season line carries the drop reasons; the
+/// counter makes the ratio queryable across the library.
+fn record_verdicts(season: &str, kind: &'static str, verdicts: &[EpisodeVerdict]) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for v in verdicts {
+        *counts.entry(v.verdict.label()).or_default() += 1;
+        metrics::counter!(
+            "pharos_segment_detect_total",
+            "kind" => kind,
+            "outcome" => v.verdict.label(),
+        )
+        .increment(1);
+    }
+    // The dropped episodes' own numbers — an episode nine peers agreed with is
+    // a very different miss from one nothing matched, and the aggregate cannot
+    // tell them apart.
+    let dropped: Vec<String> = verdicts
+        .iter()
+        .filter(|v| v.verdict != Verdict::Emitted)
+        .map(|v| {
+            format!(
+                "{}:{}({} matched/{} agreeing/conf {:.2})",
+                v.id,
+                v.verdict.label(),
+                v.matched,
+                v.agreeing,
+                v.confidence
+            )
+        })
+        .collect();
+    tracing::info!(
+        season = %season,
+        kind,
+        episodes = verdicts.len(),
+        emitted = counts.get("emitted").copied().unwrap_or(0),
+        low_confidence = counts.get("low_confidence").copied().unwrap_or(0),
+        few_agreeing = counts.get("few_agreeing").copied().unwrap_or(0),
+        no_span = counts.get("no_span").copied().unwrap_or(0),
+        dropped = %dropped.join(" "),
+        "segment backfill: season detection verdicts"
+    );
+}
+
 /// Fingerprint the intro + credits windows of every episode (cached), run the
 /// consensus detector for each, and persist the segments. Returns `true` when
 /// it did work.
-async fn analyze_season(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
+async fn analyze_season(ctx: &Ctx, season_key: &str, eps: &[&MediaItem]) -> bool {
     let mut intro_fps: Vec<EpisodeFingerprint> = Vec::new();
     let mut credit_fps: Vec<EpisodeFingerprint> = Vec::new();
 
@@ -165,29 +219,28 @@ async fn analyze_season(ctx: &Ctx, eps: &[&MediaItem]) -> bool {
         align: AlignConfig::default(),
         ..SeasonConfig::default()
     };
-    let intro_segs = detect_season(&intro_fps, &cfg);
-    let outro_segs = detect_season(&credit_fps, &cfg);
+    let intro_verdicts = detect_season_verbose(&intro_fps, &cfg);
+    let outro_verdicts = detect_season_verbose(&credit_fps, &cfg);
+    record_verdicts(season_key, "Intro", &intro_verdicts);
+    record_verdicts(season_key, "Outro", &outro_verdicts);
 
     // Persist per episode: an episode may get an Intro, an Outro, both, or
     // neither. Replace the item's segment set atomically.
     let mut by_item: HashMap<u64, Vec<DetectedSegment>> = HashMap::new();
-    for s in &intro_segs {
-        by_item.entry(s.id).or_default().push(DetectedSegment {
-            kind: MediaSegmentKind::Intro,
-            start_ms: (s.start_secs * 1000.0).max(0.0) as u64,
-            end_ms: (s.end_secs * 1000.0).max(0.0) as u64,
-            detector: "chromaprint".into(),
-            confidence: s.confidence as f32,
-        });
-    }
-    for s in &outro_segs {
-        by_item.entry(s.id).or_default().push(DetectedSegment {
-            kind: MediaSegmentKind::Outro,
-            start_ms: (s.start_secs * 1000.0).max(0.0) as u64,
-            end_ms: (s.end_secs * 1000.0).max(0.0) as u64,
-            detector: "chromaprint".into(),
-            confidence: s.confidence as f32,
-        });
+    for (kind, verdicts) in [
+        (MediaSegmentKind::Intro, &intro_verdicts),
+        (MediaSegmentKind::Outro, &outro_verdicts),
+    ] {
+        for v in verdicts.iter().filter(|v| v.verdict == Verdict::Emitted) {
+            let Some(span) = v.span else { continue };
+            by_item.entry(v.id).or_default().push(DetectedSegment {
+                kind,
+                start_ms: (span.start * 1000.0).max(0.0) as u64,
+                end_ms: (span.end * 1000.0).max(0.0) as u64,
+                detector: "chromaprint".into(),
+                confidence: v.confidence as f32,
+            });
+        }
     }
 
     let mut wrote = false;
@@ -308,6 +361,70 @@ async fn compute_fp(
         Err(e) => {
             tracing::debug!(error = %e, media.id = ep.id, ?kind, "segment backfill: fingerprint failed");
             None
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use pharos_transcode::fingerprint::align::Span;
+
+    fn verdict(
+        id: u64,
+        matched: u32,
+        agreeing: u32,
+        confidence: f64,
+        v: Verdict,
+    ) -> EpisodeVerdict {
+        EpisodeVerdict {
+            id,
+            matched,
+            agreeing,
+            confidence,
+            span: Some(Span {
+                start: 10.0,
+                end: 30.0,
+            }),
+            verdict: v,
+        }
+    }
+
+    /// The signal is the contract: an episode the detector threw away must be
+    /// countable BY REASON, and the reason must carry the numbers that produced
+    /// it. A season that emits nothing looks identical to one with no intro
+    /// until this exists.
+    #[test]
+    fn a_dropped_episode_is_countable_by_reason() {
+        let _ = crate::obs::init("info", None);
+        record_verdicts(
+            "/media/TV/Fringe::1",
+            "Intro",
+            &[
+                verdict(1, 12, 12, 0.63, Verdict::Emitted),
+                verdict(2, 9, 9, 0.47, Verdict::LowConfidence),
+                verdict(3, 2, 1, 0.05, Verdict::FewAgreeing),
+                EpisodeVerdict {
+                    id: 4,
+                    matched: 0,
+                    agreeing: 0,
+                    confidence: 0.0,
+                    span: None,
+                    verdict: Verdict::NoSpan,
+                },
+            ],
+        );
+        let rendered = crate::obs::render();
+        for outcome in ["emitted", "low_confidence", "few_agreeing", "no_span"] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|l| l.starts_with("pharos_segment_detect_total")
+                        && l.contains(&format!("outcome=\"{outcome}\""))
+                        && l.contains("kind=\"Intro\"")),
+                "every verdict must be countable; {outcome} missing from:\n{rendered}"
+            );
         }
     }
 }
