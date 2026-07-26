@@ -74,6 +74,7 @@ async fn seed(
             created_at: None,
             metadata: Default::default(),
             has_primary_art: false,
+            art_version: 0,
             match_provider: None,
             match_external_id: None,
             match_source: None,

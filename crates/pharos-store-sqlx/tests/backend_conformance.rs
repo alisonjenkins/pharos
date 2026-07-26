@@ -33,6 +33,7 @@ fn media_item(id: MediaId, title: &str) -> MediaItem {
         created_at: Some(1_700_000_000 + id as i64),
         metadata: MediaMetadata::default(),
         has_primary_art: false,
+        art_version: 0,
         match_provider: None,
         match_external_id: None,
         match_source: None,
