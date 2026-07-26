@@ -98,6 +98,48 @@ fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32)> {
     best
 }
 
+/// Why an episode did or did not receive a segment. A bounded set — it is a
+/// metric label, so a new variant is a dashboard change, not a free addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Cleared both gates; a segment was emitted.
+    Emitted,
+    /// No comparison located a span for this episode at all.
+    NoSpan,
+    /// A cluster formed but fewer than `min_agreeing` comparisons agreed.
+    FewAgreeing,
+    /// Enough agreed, but the agreement fraction was below `min_confidence`.
+    LowConfidence,
+}
+
+impl Verdict {
+    /// Stable label for metrics. Renaming one breaks a dashboard silently.
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Emitted => "emitted",
+            Verdict::NoSpan => "no_span",
+            Verdict::FewAgreeing => "few_agreeing",
+            Verdict::LowConfidence => "low_confidence",
+        }
+    }
+}
+
+/// One episode's full detection record — the inputs to the gate as well as its
+/// outcome, so a dropped episode can be explained rather than merely counted.
+#[derive(Debug, Clone, Copy)]
+pub struct EpisodeVerdict {
+    pub id: u64,
+    /// Comparisons that located a span for this episode (0..=n-1).
+    pub matched: u32,
+    /// Size of the winning cluster.
+    pub agreeing: u32,
+    pub confidence: f64,
+    /// The consensus span, on the episode's own timeline. `None` when nothing
+    /// clustered.
+    pub span: Option<Span>,
+    pub verdict: Verdict,
+}
+
 /// Detect the shared span (intro OR credits — the caller picks the window)
 /// across a season's episodes, returning a consensus segment per episode that
 /// cleared the confidence gate. Episodes with too few agreeing comparisons are
@@ -106,6 +148,29 @@ fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32)> {
 /// `O(n²)` pairwise `compare`. For incremental single-episode adds, prefer a
 /// stored reference fingerprint (ADR-0018 improvement #2) rather than this.
 pub fn detect_season(eps: &[EpisodeFingerprint], cfg: &SeasonConfig) -> Vec<SeasonSegment> {
+    detect_season_verbose(eps, cfg)
+        .into_iter()
+        .filter(|v| v.verdict == Verdict::Emitted)
+        .filter_map(|v| {
+            v.span.map(|s| SeasonSegment {
+                id: v.id,
+                start_secs: s.start,
+                end_secs: s.end,
+                confidence: v.confidence,
+                agreeing: v.agreeing,
+            })
+        })
+        .collect()
+}
+
+/// [`detect_season`] with every episode's verdict retained, including the ones
+/// that were dropped and why. The caller instruments from this: a detector that
+/// silently emits nothing for two thirds of a library is the shape that hides
+/// a recall problem, and the counts that explain it exist only here.
+pub fn detect_season_verbose(
+    eps: &[EpisodeFingerprint],
+    cfg: &SeasonConfig,
+) -> Vec<EpisodeVerdict> {
     let n = eps.len();
     if n < 2 {
         return Vec::new();
@@ -127,22 +192,39 @@ pub fn detect_season(eps: &[EpisodeFingerprint], cfg: &SeasonConfig) -> Vec<Seas
         }
     }
     let comparisons_per_ep = (n - 1) as f64;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(n);
     for (idx, spans) in located.iter().enumerate() {
+        let matched = spans.len() as u32;
         let Some((consensus, agreeing)) = best_cluster(spans, cfg.cluster_tolerance_secs) else {
+            out.push(EpisodeVerdict {
+                id: eps[idx].id,
+                matched,
+                agreeing: 0,
+                confidence: 0.0,
+                span: None,
+                verdict: Verdict::NoSpan,
+            });
             continue;
         };
         let confidence = agreeing as f64 / comparisons_per_ep;
-        if agreeing < cfg.min_agreeing || confidence < cfg.min_confidence {
-            continue;
-        }
+        let verdict = if agreeing < cfg.min_agreeing {
+            Verdict::FewAgreeing
+        } else if confidence < cfg.min_confidence {
+            Verdict::LowConfidence
+        } else {
+            Verdict::Emitted
+        };
         let off = eps[idx].window_offset_secs;
-        out.push(SeasonSegment {
+        out.push(EpisodeVerdict {
             id: eps[idx].id,
-            start_secs: consensus.start + off,
-            end_secs: consensus.end + off,
-            confidence,
+            matched,
             agreeing,
+            confidence,
+            span: Some(Span {
+                start: consensus.start + off,
+                end: consensus.end + off,
+            }),
+            verdict,
         });
     }
     out
