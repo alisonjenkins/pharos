@@ -91,6 +91,15 @@ library_watch_enabled = {{ $s.libraryWatchEnabled }}
 library_poll_interval_secs = {{ $s.libraryPollIntervalSecs | int64 }}
 drain_grace_secs = {{ $s.drainGraceSecs | int64 }}
 
+{{- with .Values.config.userDefaults }}
+
+[user_defaults]
+audio_language_preference = {{ .audioLanguagePreference | quote }}
+subtitle_language_preference = {{ .subtitleLanguagePreference | quote }}
+subtitle_mode = {{ .subtitleMode | quote }}
+play_default_audio_track = {{ .playDefaultAudioTrack }}
+{{- end }}
+
 [obs]
 log_level = {{ .Values.config.obs.logLevel | quote }}
 {{- if .Values.config.obs.otlpEndpoint }}

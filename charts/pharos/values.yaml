@@ -99,6 +99,25 @@ config:
     # graceful stop. /readyz flips 503 immediately so the LB stops new traffic;
     # this window lets active segment/stream reads finish (zero-downtime deploy).
     drainGraceSecs: 10
+  # Track preferences a NEWLY created user starts with (Jellyfin has no
+  # server-wide default, so without this every new account meets the same
+  # wrong-language playback). Existing accounts are untouched; anyone can
+  # still change these in jellyfin-web.
+  userDefaults:
+    # "OriginalLanguage" ranks each title by the language it was MADE in —
+    # Japanese for anime, English for Hollywood, from one setting. Falls back
+    # to the container's own order for items metadata enrichment has not
+    # matched yet.
+    audioLanguagePreference: "OriginalLanguage"
+    subtitleLanguagePreference: "eng"
+    # "Smart" shows subtitles only when the audio is NOT in a language you
+    # read — the other half of the anime split.
+    subtitleMode: "Smart"
+    # Jellyfin defaults this true, which lets a container's default-flagged
+    # track BEAT the language preference (Aliens' Ukrainian dub is flagged
+    # default; that is why it played in Ukrainian). False lets the preference
+    # decide.
+    playDefaultAudioTrack: false
   obs:
     logLevel: "info"
     otlpEndpoint: null
