@@ -329,6 +329,13 @@ fn codec_tag(
         },
         // Muxed mpegts H264 (the `hls1/*.ts` surface).
         //
+        // 28 (was 25): every muxed segment sliced from a from-0 continuous
+        // session on a source whose AUDIO stream starts late carries audio from
+        // that offset LATER in the film — measured +1680 ms on a title whose
+        // audio starts at 1.700 s. The bytes are cached and would keep playing
+        // ahead of picture. Only THIS rung: the fMP4 surfaces are audio-free
+        // (`AudioDelivery::Separate`) and slice nothing.
+        //
         // 25 (was 24, was 8): the hardware encoders dropped one frame per
         // segment until `-r` pinned them to the source grid, so every segment
         // NVENC produced under tag 24 is 143 frames where the window implies
@@ -345,7 +352,7 @@ fn codec_tag(
         //
         // Only THIS tag moves. The fMP4 rungs (13, 12) are audio-free by
         // design, were never affected, and keep their warm cache.
-        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 25,
+        (Some(SegmentVideo::H264), SegmentContainer::Mpegts) => 28,
         // Audio-free fMP4 H264 (the demuxed `h264cmaf/*` surface) — a DISTINCT
         // namespace so it never reads muxed mpegts bytes (or vice versa).
         //
@@ -475,6 +482,9 @@ struct CacheState {
     entries: HashMap<SegmentIdentity, EntryMeta>,
     total_bytes: u64,
     access_counter: u64,
+    /// TRUE first-sample time of each continuous-audio session file, probed
+    /// once and reused. See `probed_session_start`.
+    audio_session_starts: HashMap<PathBuf, f64>,
 }
 
 /// Outcome of [`HlsSegmentCache::choose_audio_start_seg`]: reuse a session
@@ -1411,6 +1421,86 @@ impl HlsSegmentCache {
         best
     }
 
+    /// The TRUE source position of a continuous-audio file's first sample.
+    ///
+    /// A session records the start it was ASKED for, but that is not always
+    /// where its audio begins: for a source whose audio stream starts late, a
+    /// from-0 session's first sample sits at the stream's own start, not at 0.
+    /// The segment slice seeks this file by `input_seek - start_seconds`, and
+    /// `-ss` on an input is measured from that input's own start time, so a
+    /// wrong `start_seconds` puts the audio under the wrong video by exactly
+    /// the difference — measured at +1680 ms on a title whose audio stream
+    /// starts at 1.700 s, heard as audio running ahead of picture.
+    ///
+    /// Probed once per session file and cached: the value cannot change once
+    /// the file exists. Falls back to the requested start when the file cannot
+    /// be probed yet, which is the previous behaviour and no worse.
+    async fn probed_session_start(&self, path: &Path, requested: f64) -> f64 {
+        if let Some(v) = self
+            .state
+            .lock()
+            .await
+            .audio_session_starts
+            .get(path)
+            .copied()
+        {
+            return v;
+        }
+        let Some(actual) = Self::first_audio_pts(self.transcoder.binary(), path).await else {
+            return requested;
+        };
+        // Only ever LATER than requested: a session cannot begin before the
+        // point it was seeked to, and a small negative would be muxer jitter.
+        let resolved = if actual > requested {
+            actual
+        } else {
+            requested
+        };
+        if (resolved - requested).abs() > 0.05 {
+            tracing::info!(
+                audio.session = %path.display(),
+                requested_start = requested,
+                actual_start = actual,
+                skew_ms = ((actual - requested) * 1000.0) as i64,
+                "continuous audio session does not start where it was asked to — \
+                 slicing it by the requested start would shift the audio"
+            );
+        }
+        self.state
+            .lock()
+            .await
+            .audio_session_starts
+            .insert(path.to_path_buf(), resolved);
+        resolved
+    }
+
+    /// PTS of the first audio packet in `path`, in seconds.
+    async fn first_audio_pts(ffmpeg_bin: &Path, path: &Path) -> Option<f64> {
+        let probe = ffmpeg_bin.with_file_name("ffprobe");
+        let out = tokio::process::Command::new(&probe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+                "-read_intervals",
+                "%+#1",
+            ])
+            .arg(path)
+            .output()
+            .await
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.split(',').next())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    }
+
     /// Highest `aN.m4s` index written by one session directory.
     async fn session_dir_progress(dir: &Path) -> Option<u32> {
         let mut best: Option<u32> = None;
@@ -1751,9 +1841,13 @@ impl HlsSegmentCache {
                 .await
                 .is_some_and(|c| c >= want_end_secs)
             {
+                // The file EXISTS and is covered, so its true first sample is
+                // knowable — take that over the start it was asked for.
+                let path = dir.join("audio.ts");
+                let start_seconds = self.probed_session_start(&path, candidate).await;
                 return Ok(pharos_transcode::MuxedAudio {
-                    path: dir.join("audio.ts"),
-                    start_seconds: candidate,
+                    path,
+                    start_seconds,
                 });
             }
         }
@@ -1843,14 +1937,20 @@ impl HlsSegmentCache {
                 .await
                 .is_some_and(|c| c >= want_end_secs)
             {
-                return Ok(produced);
+                return Ok(pharos_transcode::MuxedAudio {
+                    start_seconds: self.probed_session_start(&file, start_secs).await,
+                    ..produced
+                });
             }
             // The encode finished without reaching the request: it ran out of
             // source. Whatever it wrote is final, so stop waiting for more.
             if !tokio::fs::try_exists(&running).await.unwrap_or(false)
                 && tokio::fs::try_exists(&file).await.unwrap_or(false)
             {
-                return Ok(produced);
+                return Ok(pharos_transcode::MuxedAudio {
+                    start_seconds: self.probed_session_start(&file, start_secs).await,
+                    ..produced
+                });
             }
             tokio::time::sleep(std::time::Duration::from_millis(
                 Self::AUDIO_POLL_INTERVAL_MS,
@@ -2595,7 +2695,10 @@ mod tests {
         // deployed still probed `nb_streams: 1` until this moved.
         // Bumped again past the dropped-frame generation: every hardware
         // encode under the previous tags is one frame short per segment.
-        assert_eq!(mpegts, 25, "muxed-h264 tag bumped past the short-frame gen");
+        assert_eq!(
+            mpegts, 28,
+            "muxed-h264 tag bumped past the shifted-audio gen"
+        );
         assert_eq!(vp9, 27, "vp9 tag bumped past the short-frame gen");
 
         // The on-disk keys differ for the same (media, seg, audio, bitrate).
