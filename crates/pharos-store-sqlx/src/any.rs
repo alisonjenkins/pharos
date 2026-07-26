@@ -256,6 +256,13 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn bump_art_version(&self, item_id: MediaId) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.bump_art_version(item_id).await,
+            AnyStore::Postgres(p) => p.bump_art_version(item_id).await,
+        }
+    }
+
     async fn artwork_for(&self, item_id: MediaId) -> DomainResult<Vec<(String, String, String)>> {
         match self {
             AnyStore::Sqlite(s) => s.artwork_for(item_id).await,

@@ -5198,7 +5198,7 @@ async fn fetch_item_dto(
                 &state.generated_trickplay_widths(item.id),
                 state.trickplay_interval_ms,
             )
-            .with_local_artwork_tags(id, &local_art_roles)
+            .with_local_artwork_tags(id, item.art_version, &local_art_roles)
             .with_people(&people)
             .with_studios(&studios)
             .with_tags(&tags),
