@@ -331,6 +331,78 @@ fn read_trun_duration(raw: &[u8], children: &[Box]) -> u64 {
     sum
 }
 
+/// The media timescale of an init segment's first track, if it has one.
+pub fn init_timescale(init: &[u8]) -> Option<u32> {
+    let top = walk(init, 0..init.len()).ok()?;
+    let moov = top.iter().find(|b| &b.kind == b"moov")?;
+    track_timescales(init, moov)
+        .ok()?
+        .into_iter()
+        .find(|ts| *ts > 0)
+}
+
+/// Move every `tfdt` in `data` by `delta` ticks, in place.
+///
+/// The demuxed audio rendition is produced by ffmpeg's HLS muxer, which numbers
+/// each session's fragments from that session's own first sample — a fragment
+/// written by a session that began mid-title carries its offset WITHIN the
+/// session, so a player that trusts it puts the audio minutes early (B121).
+/// The fragments themselves are correct; only their anchor needs moving, and
+/// shifting rather than overwriting keeps any internal multi-fragment spacing.
+///
+/// A `tfdt` too small to absorb a negative `delta` is clamped to 0 rather than
+/// wrapped: an unsigned reader treats a wrapped value as an astronomical time
+/// and drops the fragment.
+pub fn shift_tfdt(data: &mut [u8], delta: i64) -> Result<(), Fmp4Error> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let top = walk(data, 0..data.len())?;
+    let moofs: Vec<(usize, usize, usize)> = top
+        .iter()
+        .filter(|b| &b.kind == b"moof")
+        .map(|b| (b.start, b.header, b.end))
+        .collect();
+    for (start, header, end) in moofs {
+        let trafs: Vec<(usize, usize, usize)> = walk(data, start + header..end)?
+            .iter()
+            .filter(|b| &b.kind == b"traf")
+            .map(|b| (b.start, b.header, b.end))
+            .collect();
+        for (t_start, t_header, t_end) in trafs {
+            let tfdts: Vec<(usize, usize, usize)> = walk(data, t_start + t_header..t_end)?
+                .iter()
+                .filter(|b| &b.kind == b"tfdt")
+                .map(|b| (b.start, b.header, b.end))
+                .collect();
+            for (b_start, b_header, b_end) in tfdts {
+                let body = b_start + b_header;
+                let version = data.get(body).copied().unwrap_or(0);
+                if version == 1 {
+                    if body + 12 <= b_end {
+                        let cur = u64::from_be_bytes(
+                            data[body + 4..body + 12].try_into().unwrap_or([0; 8]),
+                        );
+                        let next = cur.saturating_add_signed(delta);
+                        data[body + 4..body + 12].copy_from_slice(&next.to_be_bytes());
+                    }
+                } else if body + 8 <= b_end {
+                    let cur =
+                        u32::from_be_bytes(data[body + 4..body + 8].try_into().unwrap_or([0; 4]));
+                    // v0 is 32-bit; a shifted value past its range would wrap,
+                    // so saturate — the caller's own range check is what keeps
+                    // this from mattering in practice.
+                    let next = u64::from(cur)
+                        .saturating_add_signed(delta)
+                        .min(u64::from(u32::MAX)) as u32;
+                    data[body + 4..body + 8].copy_from_slice(&next.to_be_bytes());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Split a self-contained fragmented-mp4 segment into a shared init and a
 /// media segment whose (already source-anchored) `tfdt`s are passed through
 /// verbatim, with negatives clamped to 0 (see the module docs).
@@ -537,6 +609,46 @@ mod tests {
         let seg = sample_segment();
         let p = process_segment(&seg).unwrap();
         assert_eq!(read_tfdt(&p.media), vec![0, 0]);
+    }
+
+    /// B121 — a seek session's fragments carry their offset WITHIN that
+    /// session; shifting by the session's start puts them back on the timeline,
+    /// and every track in the fragment moves together (they share one clock).
+    #[test]
+    fn shifting_moves_every_tfdt_by_the_same_delta() {
+        let mut media = Vec::new();
+        media.extend_from_slice(&mk_box(b"moof", &[traf(0), traf(0)].concat()));
+        media.extend_from_slice(&mk_box(b"mdat", b"xx"));
+        media.extend_from_slice(&mk_box(b"moof", &[traf(288_000), traf(288_000)].concat()));
+        media.extend_from_slice(&mk_box(b"mdat", b"yy"));
+
+        shift_tfdt(&mut media, 225 * 6 * 48_000).unwrap();
+
+        let want = 225 * 6 * 48_000;
+        assert_eq!(
+            read_tfdt(&media),
+            vec![want, want, want + 288_000, want + 288_000]
+        );
+    }
+
+    /// A fragment already on the timeline (the whole-file session's) must come
+    /// through untouched — the shift is only ever the session's own start.
+    #[test]
+    fn shifting_by_zero_changes_nothing() {
+        let mut media = mk_box(b"moof", &traf(4_896_000));
+        let before = media.clone();
+        shift_tfdt(&mut media, 0).unwrap();
+        assert_eq!(media, before);
+    }
+
+    /// A shift that would take a `tfdt` below zero saturates instead of
+    /// wrapping: an unsigned reader treats a wrapped value as an astronomical
+    /// decode time and drops the fragment.
+    #[test]
+    fn shifting_below_zero_saturates() {
+        let mut media = mk_box(b"moof", &traf(100));
+        shift_tfdt(&mut media, -500).unwrap();
+        assert_eq!(read_tfdt(&media), vec![0]);
     }
 
     #[test]

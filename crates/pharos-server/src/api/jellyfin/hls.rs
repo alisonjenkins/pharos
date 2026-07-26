@@ -17,6 +17,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
+use pharos_cache::HlsSegmentCache;
 use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
 use pharos_transcode::scheduler::JobClass;
@@ -1786,7 +1787,40 @@ async fn vp9_audio_file(
         // indistinguishable from a request past the end of the media, and
         // reconstructing which of the three budgets expired took a code read.
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
-    let bytes = file.bytes;
+    let mut bytes = file.bytes;
+    // B121 — put the fragment back on the timeline. ffmpeg's HLS muxer numbers
+    // a session's `tfdt` from that session's OWN first fragment, so a fragment
+    // produced by a seek session carries its offset within the session: a300
+    // written by a session that started at segment 225 read 450 s where the
+    // playlist places it at 1800 s, and hls.js buffered the audio 22 minutes
+    // early. `-output_ts_offset` does not reach it (measured on ffmpeg 8.1 —
+    // neither does `-copyts` nor `-avoid_negative_ts disabled`), so the anchor
+    // is corrected here, where the producing session is known.
+    if file.session_start_seg > 0 && name.ends_with(".m4s") {
+        let init = cache
+            .audio_hls_file(&dir, "init.mp4")
+            .await
+            .map_err(|e| error::ErrorNotFound(format!("audio init: {e}")))?;
+        let Some(timescale) = fmp4::init_timescale(&init.bytes) else {
+            return Err(error::ErrorInternalServerError(
+                "audio rendition init carries no media timescale — cannot anchor \
+                 a seek session's fragment to the timeline",
+            ));
+        };
+        let delta = (f64::from(file.session_start_seg)
+            * HlsSegmentCache::AUDIO_SEGMENT_SECONDS
+            * f64::from(timescale)) as i64;
+        fmp4::shift_tfdt(&mut bytes, delta)
+            .map_err(|e| error::ErrorInternalServerError(format!("audio fragment anchor: {e}")))?;
+        tracing::debug!(
+            media.id = media_id,
+            fragment = %name,
+            session_start_seg = file.session_start_seg,
+            timescale,
+            delta_secs = delta as f64 / f64::from(timescale),
+            "audio rendition: re-anchored a seek session's fragment"
+        );
+    }
     let ctype = if name.ends_with(".mp4") {
         "video/mp4"
     } else {

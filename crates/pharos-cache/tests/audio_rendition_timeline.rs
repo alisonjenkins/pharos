@@ -1,15 +1,18 @@
 //! The demuxed audio rendition must sit on the source timeline.
 //!
-//! B120 — invisible to any assertion that only looked at fragment SIZES or
-//! timestamps:
+//! Two ways it did not (B120, B121), both invisible to any assertion that only
+//! looked at fragment SIZES or timestamps:
 //!
 //! * a title whose audio track starts after its video (Rogue One: eac3 at
 //!   1.700 s, video at 0) had that offset silently discarded by ffmpeg, so
 //!   every fragment of the whole-file session carried content 1.7 s later than
 //!   the grid position it is served at — audio ahead of picture for the whole
 //!   film;
-//! It is a content bug, so the test decodes real audio and asks where a known
-//! beep lands, rather than trusting any header.
+//! * a fragment written by a SEEK session carried its offset within that
+//!   session rather than on the timeline, so it buffered minutes early.
+//!
+//! Both are content/anchor bugs, so both tests here decode real audio and ask
+//! where a known beep lands, rather than trusting any header.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -201,4 +204,64 @@ async fn a_late_starting_audio_track_still_lands_under_its_own_video() {
         f64::from(SEG) * 6.0,
         want - got,
     );
+}
+
+/// B121 — a fragment produced by a SEEK session must be served anchored to the
+/// timeline, not to that session's own first sample.
+///
+/// The bytes on disk carry `(index - session_start) * 6 s`; only the server
+/// knows the session start, so the cache must report it. A caller that trusts
+/// the raw `tfdt` buffers this fragment at 0:00.
+#[tokio::test]
+async fn a_seek_sessions_fragment_reports_the_session_it_came_from() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let src = make_late_audio_source(td.path());
+    let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
+
+    // Any non-zero target spawns a session seeked to it, so the fragment two
+    // along carries "two segments in" rather than its timeline position.
+    let seek_at = 3u32;
+    let want_seg = seek_at + 2;
+    let dir = cache
+        .ensure_audio_hls_covering(&src, 43, None, Some(128_000), seek_at)
+        .await
+        .expect("audio session");
+    let got = cache
+        .audio_hls_file(&dir, &format!("a{want_seg}.m4s"))
+        .await
+        .expect("fragment produced");
+    assert_eq!(
+        got.session_start_seg, seek_at,
+        "a{want_seg} should come from the session seeked to {seek_at}"
+    );
+    let tfdt = first_tfdt(&got.bytes).expect("fragment carries a tfdt");
+    // What ffmpeg wrote is the fragment's index WITHIN its session. Asserting
+    // it pins the reason `session_start_seg` has to be reported at all: the
+    // bytes alone cannot say where on the timeline this fragment belongs. If a
+    // future ffmpeg anchors it absolutely, this fails and the serve-side shift
+    // should be deleted rather than double-applied.
+    let want = f64::from(want_seg - got.session_start_seg) * 6.0;
+    let got_secs = tfdt as f64 / 48_000.0;
+    assert!(
+        (got_secs - want).abs() < 0.05,
+        "a{want_seg} came from the session starting at {}, so its raw tfdt should be \
+         {want:.3}s (its offset within that session) but was {got_secs:.3}s",
+        got.session_start_seg,
+    );
+}
+
+/// `baseMediaDecodeTime` of the first `tfdt` in a fragment, in timescale ticks.
+/// A deliberately minimal box walk — the fragment is `moof(traf(tfdt))`+`mdat`.
+fn first_tfdt(data: &[u8]) -> Option<u64> {
+    let at = data.windows(4).position(|w| w == b"tfdt").map(|i| i + 4)?;
+    let version = *data.get(at)?;
+    if version == 1 {
+        Some(u64::from_be_bytes(
+            data.get(at + 4..at + 12)?.try_into().ok()?,
+        ))
+    } else {
+        Some(u64::from(u32::from_be_bytes(
+            data.get(at + 4..at + 8)?.try_into().ok()?,
+        )))
+    }
 }
