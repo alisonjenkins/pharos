@@ -1978,6 +1978,26 @@ fn ensure_audio_index_param(url: Option<String>, idx: Option<u32>) -> Option<Str
     }
 }
 
+/// Resolve the audio track to start on and NAME why, in priority order: a track
+/// the client explicitly requested, then one it played before (remembered),
+/// then the language/default-flag rule. The `&'static str` source is the
+/// decision's reason for the ODD selection log — a wrong-language start is
+/// otherwise indistinguishable between "the rule chose it" and "a remembered
+/// pick did" without reading the DB by hand.
+fn resolve_audio_pick(
+    explicit_ok: Option<u32>,
+    remembered: Option<u32>,
+    rule: Option<u32>,
+) -> (Option<u32>, &'static str) {
+    if let Some(i) = explicit_ok {
+        (Some(i), "explicit")
+    } else if let Some(i) = remembered {
+        (Some(i), "remembered")
+    } else {
+        (rule, "rule")
+    }
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -2682,16 +2702,15 @@ async fn playback_info(
         .flatten()
         .and_then(|i| u32::try_from(i).ok())
         .filter(|idx| audio_facts.iter().any(|s| s.index == *idx));
-    let default_audio_stream_index: Option<u32> = explicit_audio_index
-        .filter(|idx| audio_facts.iter().any(|s| s.index == *idx))
-        .or(remembered_audio)
-        .or_else(|| {
-            super::stream_select::default_audio_stream_index(
-                &audio_facts,
-                &audio_languages,
-                track_prefs.prefer_default_audio_track,
-            )
-        });
+    let explicit_audio_ok =
+        explicit_audio_index.filter(|idx| audio_facts.iter().any(|s| s.index == *idx));
+    let rule_audio_index = super::stream_select::default_audio_stream_index(
+        &audio_facts,
+        &audio_languages,
+        track_prefs.prefer_default_audio_track,
+    );
+    let (default_audio_stream_index, audio_pick_source) =
+        resolve_audio_pick(explicit_audio_ok, remembered_audio, rule_audio_index);
     // The language of the track actually chosen — Smart subtitles turn on
     // precisely when this is NOT a language the user reads.
     let chosen_audio_language: Option<String> = default_audio_stream_index.and_then(|idx| {
@@ -2700,6 +2719,44 @@ async fn playback_info(
             .find(|s| s.kind == "Audio" && s.index == idx)
             .and_then(|s| s.language.clone())
     });
+    // ODD: the audio pick was invisible — diagnosing a wrong-language start
+    // (Jana's Code Geass playing English, 2026-07-26) took a hand DB read.
+    // Record the decision: the resolved preference inputs, EVERY candidate with
+    // its language + default flag (the flag is what beats a language preference
+    // when prefer_default is on — the Aliens / Code Geass trap), and the chosen
+    // index/language/source. A surprising pick is now one query away from its
+    // reason. `chosen_index` uses -1 for "no audio" so the field stays numeric.
+    {
+        let chosen_is_default = default_audio_stream_index
+            .and_then(|idx| audio_facts.iter().find(|s| s.index == idx))
+            .is_some_and(|s| s.is_default);
+        let candidates = audio_facts
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}:{}{}",
+                    s.index,
+                    s.language.as_deref().unwrap_or("und"),
+                    if s.is_default { ":default" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(
+            user.id = %user.0.id,
+            item.id = %id,
+            pick_source = audio_pick_source,
+            prefer_default_track = track_prefs.prefer_default_audio_track,
+            original_language_pref = track_prefs.audio_original_language,
+            original_language = original_language.as_deref().unwrap_or(""),
+            preferred_languages = %audio_languages.join(","),
+            candidates = %candidates,
+            chosen_index = default_audio_stream_index.map(i64::from).unwrap_or(-1),
+            chosen_language = chosen_audio_language.as_deref().unwrap_or(""),
+            chosen_is_default,
+            "playback: audio track selected"
+        );
+    }
 
     // The initial TranscodingUrl must carry the SERVER-selected audio track,
     // or the demuxed audio rendition falls to ffmpeg's default (the container's
@@ -6767,7 +6824,25 @@ mod remote_ip_tests {
 
 #[cfg(test)]
 mod audio_index_url_tests {
-    use super::ensure_audio_index_param;
+    use super::{ensure_audio_index_param, resolve_audio_pick};
+
+    #[test]
+    fn audio_pick_priority_is_explicit_then_remembered_then_rule() {
+        // The source string is the ODD decision log's reason field; its
+        // priority order is the contract. An explicit client choice wins over
+        // everything; a remembered choice wins over the rule; the rule is the
+        // fallback and carries through `None` (no audio) unchanged.
+        assert_eq!(
+            resolve_audio_pick(Some(4), Some(2), Some(1)),
+            (Some(4), "explicit")
+        );
+        assert_eq!(
+            resolve_audio_pick(None, Some(2), Some(1)),
+            (Some(2), "remembered")
+        );
+        assert_eq!(resolve_audio_pick(None, None, Some(1)), (Some(1), "rule"));
+        assert_eq!(resolve_audio_pick(None, None, None), (None, "rule"));
+    }
 
     #[test]
     fn appends_server_selected_index_when_url_has_none() {
