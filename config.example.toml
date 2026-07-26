@@ -16,3 +16,27 @@ roots = ["/srv/media"]
 
 [database]
 url = "sqlite:./pharos.db?mode=rwc"
+
+# Track preferences a NEWLY created user starts with. Jellyfin has no
+# server-wide default — every account begins at the stock values and each
+# person re-picks them by hand, which on a shared server means everyone hits
+# the same wrong-language playback first. Existing accounts are untouched;
+# users can still change any of this in jellyfin-web afterwards. Omit the
+# section entirely to keep Jellyfin's own defaults.
+#
+# [user_defaults]
+# # An ISO 639 code ("eng"), or "OriginalLanguage" to rank each title by the
+# # language it was made in — Japanese for anime, English for Hollywood, from
+# # one setting. Needs metadata enrichment to have recorded the title's
+# # original language; unenriched items fall back to the container's order.
+# audio_language_preference = "OriginalLanguage"
+# subtitle_language_preference = "eng"
+# # Default | Always | OnlyForced | None | Smart. "Smart" shows subtitles only
+# # when the audio is NOT in a language you read — the other half of the
+# # anime split.
+# subtitle_mode = "Smart"
+# # Jellyfin defaults this true, which lets a container's default-flagged
+# # track BEAT the language preference (a film whose only default-flagged
+# # audio is a dub keeps playing that dub). Set false for the preference to
+# # decide.
+# play_default_audio_track = false

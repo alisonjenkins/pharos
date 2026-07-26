@@ -454,6 +454,12 @@ async fn create_user(
         Err(AuthError::Conflict) => return Err(error::ErrorConflict("name taken")),
         Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
     }
+    crate::api::jellyfin::user_prefs::seed_default_configuration(
+        &state.stores,
+        &state.user_defaults,
+        record.id,
+    )
+    .await;
     let dto = UserDto::from_domain(&record.into_user(), &state.server_id);
     state.notify_library_changed();
     Ok(crate::api::jellyfin::wire::json(&dto))

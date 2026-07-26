@@ -26,6 +26,81 @@ pub struct Config {
     /// `[metadata]` section is absent.
     #[serde(default)]
     pub metadata: MetadataConfig,
+    /// Track preferences a NEWLY created user starts with. Absent → Jellyfin's
+    /// own defaults, which is what every user got before this existed.
+    #[serde(default)]
+    pub user_defaults: UserDefaultsConfig,
+}
+
+/// `[user_defaults]` — the track preferences a newly created user starts with.
+///
+/// Jellyfin has no notion of a server-wide default: every account begins at the
+/// stock values and each person re-picks them by hand. On a family server the
+/// stock values are wrong for everyone — "the first audio stream in the
+/// container" is how a film with three Ukrainian dubs ahead of its English
+/// track plays in Ukrainian for a household that speaks neither.
+///
+/// Field names and accepted values are Jellyfin's, so what is written here is
+/// exactly what jellyfin-web shows in Settings → Playback and a user can still
+/// change any of it afterwards. Defaults match Jellyfin's, so an absent section
+/// changes nothing.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct UserDefaultsConfig {
+    /// `AudioLanguagePreference`: an ISO 639 code (`eng`), the literal
+    /// `OriginalLanguage` (rank by each title's own language), or empty for
+    /// "no preference". Default empty.
+    #[serde(default)]
+    pub audio_language_preference: String,
+    /// `SubtitleLanguagePreference`, same forms minus `OriginalLanguage`.
+    #[serde(default)]
+    pub subtitle_language_preference: String,
+    /// `SubtitleMode`: `Default` | `Always` | `OnlyForced` | `None` | `Smart`.
+    /// Default `Default`.
+    #[serde(default = "default_subtitle_mode")]
+    pub subtitle_mode: String,
+    /// `PlayDefaultAudioTrack`. Jellyfin defaults this ON, which lets a
+    /// container's default-flagged track BEAT the language preference — set it
+    /// false for the preference to decide. Default true.
+    #[serde(default = "default_play_default_audio_track")]
+    pub play_default_audio_track: bool,
+}
+
+fn default_subtitle_mode() -> String {
+    "Default".into()
+}
+
+fn default_play_default_audio_track() -> bool {
+    true
+}
+
+impl Default for UserDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            audio_language_preference: String::new(),
+            subtitle_language_preference: String::new(),
+            subtitle_mode: default_subtitle_mode(),
+            play_default_audio_track: default_play_default_audio_track(),
+        }
+    }
+}
+
+impl UserDefaultsConfig {
+    /// Whether anything here departs from Jellyfin's defaults — when nothing
+    /// does, user creation writes no configuration row at all.
+    pub fn is_stock(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The stored configuration a new user starts with.
+    pub fn to_configuration(&self) -> pharos_jellyfin_api::dto::UserConfigurationDto {
+        pharos_jellyfin_api::dto::UserConfigurationDto {
+            audio_language_preference: self.audio_language_preference.clone(),
+            subtitle_language_preference: self.subtitle_language_preference.clone(),
+            subtitle_mode: self.subtitle_mode.clone(),
+            play_default_audio_track: self.play_default_audio_track,
+            ..Default::default()
+        }
+    }
 }
 
 /// `[tmdb]` — TMDB (themoviedb.org) integration. Only `api_key` matters
