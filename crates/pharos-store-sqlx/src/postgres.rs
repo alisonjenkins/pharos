@@ -1082,7 +1082,7 @@ impl MediaStore for PostgresStore {
     ) -> DomainResult<Vec<MediaItem>> {
         let sql = format!(
             "SELECT {MEDIA_COLUMNS} FROM media_items \
-             WHERE (match_source IS NULL OR match_source IN ('search','none')) \
+             WHERE (match_source IS NULL OR match_source IN ('search','none','nfo_id')) \
                AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1) \
                AND kind IN ('movie','episode') \
              ORDER BY id ASC LIMIT $2"

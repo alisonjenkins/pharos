@@ -16,9 +16,15 @@
 //! items on top.
 //!
 //! Match-state discipline (mirrors [`items_needing_match`]'s filter): a
-//! `manual` or `nfo_id`-sourced row is NEVER reprocessed — a user override or
-//! a local NFO id survives every pass. A `search`/`none` row is re-admitted
-//! only once its `metadata_refreshed_at` predates the TTL cutoff.
+//! `manual` row is NEVER reprocessed — a user override survives every pass.
+//! Every other row is re-admitted once its `metadata_refreshed_at` predates
+//! the TTL cutoff, `nfo_id` included: an NFO id settles WHICH record the item
+//! is, not what that record currently says, and [`resolve`] feeds a stored id
+//! straight to the detail fetch without ever searching, so re-admitting one
+//! cannot change the match. Excluding them meant three quarters of a
+//! real library (10,564 of 14,072 items) never received an online field at
+//! all — including `original_language`, which the `OriginalLanguage` audio
+//! preference needs.
 //!
 //! [`items_needing_match`]: pharos_core::MediaStore::items_needing_match
 
@@ -214,7 +220,7 @@ where
         });
     }
     // Items whose last enrichment predates this cutoff (or never matched) are
-    // eligible; `manual`/`nfo_id` rows are excluded by the query itself.
+    // eligible; `manual` rows are excluded by the query itself.
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
     let items = store
         .items_needing_match(cfg.max_per_pass, ttl_cutoff)
@@ -620,8 +626,9 @@ async fn is_manual<S: MediaStore>(store: &S, id: pharos_core::MediaId) -> bool {
 /// (`"nfo_id"`, since the id is now pre-resolved rather than searched) — the
 /// manual override is re-asserted afterward UNCONDITIONALLY so the row is
 /// guaranteed to end `match_source = "manual"`, matching the caller-visible
-/// contract (and, incidentally, `items_needing_match` excludes both
-/// `"manual"` and `"nfo_id"` either way — see its doc comment).
+/// contract — and `items_needing_match` excludes `"manual"`, so the user's
+/// pick is never revisited by a later pass (an `"nfo_id"` row WOULD be
+/// re-admitted by the TTL, which is why the re-assertion matters).
 ///
 /// No provider key / no image cache configured → the override is still
 /// persisted (a user's stated identity is honoured regardless of whether
