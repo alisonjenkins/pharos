@@ -1962,6 +1962,22 @@ fn server_codec_support(caps: &pharos_transcode::ServerEncodeCapabilities) -> Se
     }
 }
 
+/// Append `&AudioStreamIndex={idx}` to a transcode URL that doesn't already
+/// carry one, so the server's auto-selected audio track (the same absolute
+/// index that becomes `DefaultAudioStreamIndex`) rides the initial URL. Absent
+/// URL or absent selection → unchanged; an already-present index (the client
+/// named a track on this request) → unchanged, so it is idempotent with a
+/// manual switch. The check is a plain substring: the param name never appears
+/// elsewhere in these URLs.
+fn ensure_audio_index_param(url: Option<String>, idx: Option<u32>) -> Option<String> {
+    match (url, idx) {
+        (Some(u), Some(i)) if !u.contains("AudioStreamIndex") => {
+            Some(format!("{u}&AudioStreamIndex={i}"))
+        }
+        (other, _) => other,
+    }
+}
+
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -2684,6 +2700,23 @@ async fn playback_info(
             .find(|s| s.kind == "Audio" && s.index == idx)
             .and_then(|s| s.language.clone())
     });
+
+    // The initial TranscodingUrl must carry the SERVER-selected audio track,
+    // or the demuxed audio rendition falls to ffmpeg's default (the container's
+    // first / default-disposition track). `stream_selection` above only
+    // forwards a track the CLIENT named on THIS request — but on first play
+    // jellyfin-web names none and trusts the server's pick (it only appends
+    // `AudioStreamIndex` after a manual switch). So the pick that sets
+    // `DefaultAudioStreamIndex` was shown selected in the UI while the audio
+    // rendition played the default track: Aliens (three Ukrainian tracks ahead
+    // of its English DTS-HD MA) selected English yet played Ukrainian; Campfire
+    // (English default ahead of Japanese) selected Japanese yet played English.
+    // The index is ABSOLUTE — the same form the client sends on a switch and
+    // that `resolve_audio_rel` converts — so appending it is idempotent with
+    // the client's own later requests (skipped once the URL already carries
+    // one). Applies to every client that got a transcode URL: native players
+    // use it verbatim, web re-reads it into the audio group's URL.
+    let transcoding_url = ensure_audio_index_param(transcoding_url, default_audio_stream_index);
 
     // P12 — `DefaultSubtitleStreamIndex` resolution priority:
     //   0. What the CLIENT asked for on THIS request, if it asked at all.
@@ -6729,6 +6762,43 @@ mod remote_ip_tests {
         ] {
             assert!(!remote(s), "{s} must be treated as local");
         }
+    }
+}
+
+#[cfg(test)]
+mod audio_index_url_tests {
+    use super::ensure_audio_index_param;
+
+    #[test]
+    fn appends_server_selected_index_when_url_has_none() {
+        // Aliens: three Ukrainian tracks then English at absolute index 4. The
+        // server selects 4, but the initial URL carried no AudioStreamIndex, so
+        // the audio rendition played the container default (Ukrainian). The
+        // pick must ride the URL.
+        let url = Some("/videos/9/master.m3u8?PlaySessionId=abc&renditions=h264".to_string());
+        assert_eq!(
+            ensure_audio_index_param(url, Some(4)).as_deref(),
+            Some("/videos/9/master.m3u8?PlaySessionId=abc&renditions=h264&AudioStreamIndex=4")
+        );
+    }
+
+    #[test]
+    fn leaves_url_untouched_when_it_already_names_a_track() {
+        // A manual switch already put AudioStreamIndex on the URL via
+        // stream_selection — the append must be idempotent, not double it.
+        let url = Some("/videos/9/master.m3u8?AudioStreamIndex=2".to_string());
+        assert_eq!(
+            ensure_audio_index_param(url.clone(), Some(4)),
+            url,
+            "must not append a second index"
+        );
+    }
+
+    #[test]
+    fn no_selection_or_no_url_is_a_noop() {
+        let url = Some("/videos/9/master.m3u8?x=1".to_string());
+        assert_eq!(ensure_audio_index_param(url.clone(), None), url);
+        assert_eq!(ensure_audio_index_param(None, Some(4)), None);
     }
 }
 
