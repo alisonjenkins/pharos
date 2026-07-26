@@ -512,6 +512,10 @@ async fn serve_image(
     // public image route on a stale row).
     if index == 0 {
         if let Some(local) = local_artwork_path(state, id, role).await {
+            if matches!(role, ImageRole::Thumb) {
+                metrics::counter!("pharos_image_thumb_source_total", "source" => "artwork")
+                    .increment(1);
+            }
             return serve_local_artwork(
                 &local,
                 role,
@@ -523,6 +527,31 @@ async fn serve_image(
             )
             .await;
         }
+    }
+    // B122 — a film's Thumb. Neither provider publishes a thumb image for a
+    // movie (`parse_tmdb_images` maps posters→Primary, backdrops→Backdrop,
+    // logos→Logo, and TVDB the same), so an enriched movie carries a Backdrop
+    // row and NO Thumb row, and the frame-extract fallback below served an
+    // arbitrary frame from `image_seek_seconds` — the dark title card users see
+    // on every landscape card. A backdrop IS the curated landscape still a
+    // Thumb wants, so serve it. Frame extraction stays the last resort, for
+    // items with no artwork at all (unmatched, no sidecar).
+    if index == 0 && matches!(role, ImageRole::Thumb) {
+        if let Some(backdrop) = local_artwork_path(state, id, ImageRole::Backdrop).await {
+            metrics::counter!("pharos_image_thumb_source_total", "source" => "backdrop")
+                .increment(1);
+            return serve_local_artwork(
+                &backdrop,
+                role,
+                head_only,
+                format,
+                state,
+                req_width,
+                if_none_match,
+            )
+            .await;
+        }
+        metrics::counter!("pharos_image_thumb_source_total", "source" => "frame").increment(1);
     }
     // An audio track has no video frames, so Backdrop / Thumb can only ever
     // come from a local sidecar (served just above). Don't spawn the ffmpeg
