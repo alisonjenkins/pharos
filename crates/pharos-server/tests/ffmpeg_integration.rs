@@ -137,6 +137,7 @@ async fn transcoder_streams_bytes_from_real_video() {
     let td = TempDir::new().unwrap();
     let fixture = make_video_fixture(td.path());
     let opts = TranscodeOptions {
+        source_frame_rate: None,
         container: pharos_transcode::Container::Mkv,
         video: Some(pharos_transcode::VideoCodec::Copy),
         audio: Some(pharos_transcode::AudioCodec::Copy),
@@ -289,6 +290,7 @@ async fn transcoder_honours_audio_stream_index() {
     let fixture = make_dual_audio_fixture(td.path());
 
     let common = TranscodeOptions {
+        source_frame_rate: None,
         container: pharos_transcode::Container::Mpegts,
         video: Some(pharos_transcode::VideoCodec::H264),
         audio: Some(pharos_transcode::AudioCodec::Aac),
@@ -339,6 +341,7 @@ async fn transcoder_honours_burn_subtitle_index() {
     let fixture = make_dual_subtitle_fixture(td.path());
 
     let base = TranscodeOptions {
+        source_frame_rate: None,
         container: pharos_transcode::Container::Mpegts,
         video: Some(pharos_transcode::VideoCodec::H264),
         audio: Some(pharos_transcode::AudioCodec::Aac),

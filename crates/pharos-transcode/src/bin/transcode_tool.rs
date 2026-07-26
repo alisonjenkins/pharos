@@ -154,6 +154,7 @@ fn tool_opts(out: &std::path::Path) -> pharos_transcode::options::TranscodeOptio
         .and_then(Container::from_name)
         .unwrap_or(Container::Mpegts);
     TranscodeOptions {
+        source_frame_rate: None,
         container,
         video: Some(VideoCodec::H264),
         audio: Some(AudioCodec::Aac),

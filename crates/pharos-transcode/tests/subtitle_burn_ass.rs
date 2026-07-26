@@ -96,6 +96,7 @@ fn transcode_segment(
     burn_text: bool,
 ) -> bool {
     let opts = TranscodeOptions {
+        source_frame_rate: None,
         container: Container::Mp4,
         video: Some(VideoCodec::H264),
         audio: None,
@@ -174,6 +175,7 @@ fn transcode_segment_from_sidecar(
     dur_secs: u64,
 ) -> bool {
     let opts = TranscodeOptions {
+        source_frame_rate: None,
         container: Container::Mp4,
         video: Some(VideoCodec::H264),
         audio: None,

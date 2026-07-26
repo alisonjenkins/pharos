@@ -242,6 +242,7 @@ mod tests {
 
     fn h264_opts() -> TranscodeOptions {
         TranscodeOptions {
+            source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
             audio: Some(AudioCodec::Aac),

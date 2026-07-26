@@ -270,6 +270,7 @@ impl ResolvedSegment {
         let s = &self.opts;
         TranscodeOptions {
             container: s.container.into(),
+            source_frame_rate: s.window.rate(),
             video: s.video.map(VideoCodec::from),
             // ALWAYS `None`: a segment never runs an audio encoder. When it
             // carries audio at all, the bytes are COPIED from the continuous
