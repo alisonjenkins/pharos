@@ -431,9 +431,12 @@ pub(crate) fn parse_episode_detail(
         s == Some(u64::from(season)) && n == Some(u64::from(episode))
     })?;
     let mut art = vec![];
+    // B125 — an episode's still is its PRIMARY in Jellyfin. Filed under Thumb
+    // it left the episode with no poster, and the image route answered with an
+    // arbitrary extracted frame instead.
     if let Some(img) = ep.get("image").and_then(|x| x.as_str()) {
         art.push(RemoteArt {
-            role: ArtworkRole::Thumb,
+            role: ArtworkRole::Primary,
             url: img.to_string(),
         });
     }
@@ -715,10 +718,11 @@ mod tests {
         assert_eq!(e.title.as_deref(), Some("Winter Is Coming"));
         assert_eq!(e.overview.as_deref(), Some("Lord Stark..."));
         assert_eq!(e.provider_id.as_deref(), Some("1"));
+        // B125 — an episode still is its Primary, not its Thumb.
         assert!(e
             .artwork
             .iter()
-            .any(|a| a.role == ArtworkRole::Thumb && a.url.ends_with("ep1.jpg")));
+            .any(|a| a.role == ArtworkRole::Primary && a.url.ends_with("ep1.jpg")));
         // aired "2011-04-17" -> unix seconds at UTC midnight.
         assert_eq!(e.premiere_date, Some(1_302_998_400));
 
