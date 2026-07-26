@@ -1358,6 +1358,47 @@ async fn set_item_match_persists_and_excludes_from_needing() {
     assert!(!need3.iter().any(|i| i.id == 900010));
 }
 
+/// An NFO-matched row must be RE-ADMITTED by the TTL like any other.
+///
+/// It was excluded alongside `manual`, which on a real library meant 10,564 of
+/// 14,072 items never received an online field at all — they were matched from
+/// a local id and then never refreshed, so a newly-captured field
+/// (`original_language`, needed by the `OriginalLanguage` audio preference)
+/// would never reach them. The exclusion was also unnecessary: a stored id
+/// short-circuits the search, so a refresh re-fetches that record without ever
+/// reconsidering WHICH record it is. A `manual` pick stays excluded.
+#[tokio::test]
+async fn an_nfo_matched_item_is_re_admitted_by_the_ttl() {
+    let store = fresh().await;
+    let mut it = item(900011, "/m/akira.mkv", "Akira", MediaKind::Movie);
+    it.id = 900011;
+    store.put(it).await.unwrap();
+
+    store
+        .set_item_match(900011, "tmdb", "149", "nfo_id", None, 1_700_000_000)
+        .await
+        .unwrap();
+
+    // Fresh: excluded by a cutoff below its refresh timestamp.
+    let fresh_pass = store.items_needing_match(10, 1_699_999_999).await.unwrap();
+    assert!(!fresh_pass.iter().any(|i| i.id == 900011));
+
+    // Stale: re-admitted, so a refresh can pick up newly-captured fields.
+    let stale_pass = store.items_needing_match(10, i64::MAX).await.unwrap();
+    assert!(
+        stale_pass.iter().any(|i| i.id == 900011),
+        "an nfo_id row past the TTL must be eligible for a refresh"
+    );
+
+    // A manual pick is still never revisited.
+    store
+        .set_item_match(900011, "tmdb", "1", "manual", None, 1)
+        .await
+        .unwrap();
+    let after_manual = store.items_needing_match(10, i64::MAX).await.unwrap();
+    assert!(!after_manual.iter().any(|i| i.id == 900011));
+}
+
 // --- T9-series: series_metadata store -------------------------------------
 
 fn episode_of(id: u64, series_name: &str, folder: Option<&str>, year: Option<u32>) -> MediaItem {

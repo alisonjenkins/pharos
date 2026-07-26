@@ -76,8 +76,10 @@ pub struct MediaItem {
     /// Online-enrichment match state. Which provider (`"tmdb"`/`"tvdb"`) and
     /// id authoritatively identified this item, and how (`match_source`:
     /// `"nfo_id"`/`"search"`/`"manual"`/`"none"`). `None` = never matched
-    /// (eligible for the background enricher). `manual`/`nfo_id` are never
-    /// re-matched, so a user override / local id survives rescans.
+    /// (eligible for the background enricher). `manual` is never re-matched,
+    /// so a user override survives rescans. `nfo_id` IS re-admitted by the TTL
+    /// — the stored id short-circuits the search, so a refresh re-fetches that
+    /// record's current fields without ever reconsidering which record it is.
     pub match_provider: Option<String>,
     pub match_external_id: Option<String>,
     pub match_source: Option<String>,
@@ -2742,8 +2744,12 @@ pub trait MediaStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
     /// Items eligible for online enrichment: `match_source` NULL or in
-    /// (`search`,`none`), not refreshed since `ttl_cutoff`, kind movie/episode,
-    /// ascending id, capped at `limit`. Excludes `manual`/`nfo_id`.
+    /// (`search`,`none`,`nfo_id`), not refreshed since `ttl_cutoff`, kind
+    /// movie/episode, ascending id, capped at `limit`. Excludes `manual` only —
+    /// a user's explicit pick is never revisited, while an NFO id merely
+    /// settles WHICH record the item is and short-circuits the search on every
+    /// refresh, so re-admitting one re-fetches that record without
+    /// reconsidering the match.
     fn items_needing_match(
         &self,
         limit: i64,
