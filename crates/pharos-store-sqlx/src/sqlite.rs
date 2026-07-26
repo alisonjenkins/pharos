@@ -2928,8 +2928,8 @@ impl SeriesMetadataStore for SqliteStore {
             "INSERT INTO series_metadata (series_key, series_name, match_provider, \
                  match_external_id, match_source, match_confidence, metadata_refreshed_at, \
                  overview, community_rating, premiere_date, official_rating, genres, studios, \
-                 provider_ids, poster_locator, backdrop_locator) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
+                 provider_ids, poster_locator, backdrop_locator, original_language) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
              ON CONFLICT(series_key) DO UPDATE SET \
                  series_name = excluded.series_name, \
                  match_provider = excluded.match_provider, \
@@ -2945,7 +2945,8 @@ impl SeriesMetadataStore for SqliteStore {
                  studios = excluded.studios, \
                  provider_ids = excluded.provider_ids, \
                  poster_locator = excluded.poster_locator, \
-                 backdrop_locator = excluded.backdrop_locator",
+                 backdrop_locator = excluded.backdrop_locator, \
+                 original_language = excluded.original_language",
         )
         .bind(&meta.series_key)
         .bind(&meta.series_name)
@@ -2963,6 +2964,7 @@ impl SeriesMetadataStore for SqliteStore {
         .bind(provider_ids)
         .bind(&meta.poster_locator)
         .bind(&meta.backdrop_locator)
+        .bind(&meta.original_language)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;

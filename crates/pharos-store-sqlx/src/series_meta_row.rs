@@ -9,7 +9,7 @@ use pharos_core::SeriesMetadata;
 pub(crate) const SERIES_META_COLUMNS: &str = "series_key, series_name, match_provider, \
     match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     overview, community_rating, premiere_date, official_rating, genres, studios, \
-    provider_ids, poster_locator, backdrop_locator";
+    provider_ids, poster_locator, backdrop_locator, original_language";
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct SeriesMetaRow {
@@ -29,6 +29,7 @@ pub(crate) struct SeriesMetaRow {
     pub provider_ids: Option<String>,
     pub poster_locator: Option<String>,
     pub backdrop_locator: Option<String>,
+    pub original_language: Option<String>,
 }
 
 impl From<SeriesMetaRow> for SeriesMetadata {
@@ -50,6 +51,7 @@ impl From<SeriesMetaRow> for SeriesMetadata {
             provider_ids: crate::provider_ids_json::decode(r.provider_ids.as_deref()),
             poster_locator: r.poster_locator,
             backdrop_locator: r.backdrop_locator,
+            original_language: r.original_language,
         }
     }
 }
