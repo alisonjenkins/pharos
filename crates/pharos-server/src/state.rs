@@ -1000,7 +1000,21 @@ fn default_ffmpeg_backend() -> Arc<dyn FfmpegBackend> {
 /// its own snapshot — and B24's restart recovery had nothing to recover.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Mark the process as draining. Called from the signal listener in main.
+/// Set (separately from `SHUTTING_DOWN`) only AFTER readiness has gone 503 and
+/// the drain grace has elapsed — i.e. once the pod has left the Service
+/// endpoints. Gates the `/socket` close so a client's reconnect lands on the
+/// already-Ready new pod, never back on this draining one.
+static SOCKETS_DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Woken by `drain_sockets` so long-lived `/socket` pumps close at once instead
+/// of on their next 30 s keep-alive tick. A live socket parks on
+/// `shutdown_signal().notified()`; the `sockets_draining()` poll at the top of
+/// the pump catches a signal that fired between selects.
+static SHUTDOWN_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Mark the process as draining: `/readyz` goes 503 and socket teardown paths
+/// preserve SyncPlay membership (B26). Does NOT yet close sockets — that waits
+/// for [`drain_sockets`] after the LB has drained.
 pub fn begin_shutdown() {
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -1008,4 +1022,68 @@ pub fn begin_shutdown() {
 /// True once SIGTERM/SIGINT has been observed.
 pub fn is_shutting_down() -> bool {
     SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Close every `/socket` pump — called AFTER readiness has flipped to 503 and
+/// the drain grace has let the LB pull this pod from the Service, so the
+/// clients' reconnects land on the already-Ready new pod. Membership is still
+/// preserved (`is_shutting_down()` stays true through teardown, B26).
+pub fn drain_sockets() {
+    SOCKETS_DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+    SHUTDOWN_NOTIFY.notify_waiters();
+}
+
+/// True once [`drain_sockets`] has fired — the `/socket` pump's close gate.
+pub fn sockets_draining() -> bool {
+    SOCKETS_DRAINING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The socket-drain wake-up. A `/socket` pump selects on `.notified()` to close
+/// promptly (the client reconnects to the already-Ready new pod).
+pub fn shutdown_signal() -> &'static tokio::sync::Notify {
+    &SHUTDOWN_NOTIFY
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod shutdown_tests {
+    // The process-global drain flags: each test runs in its own process under
+    // nextest, so mutating them is isolated. This pins the ORDERING contract
+    // that makes the #1 fast-reconnect safe — closing sockets before the LB
+    // drain would bounce reconnects back onto the dying pod.
+    use super::*;
+
+    #[test]
+    fn begin_shutdown_flips_readiness_but_leaves_sockets_open_until_drain() {
+        assert!(!is_shutting_down());
+        assert!(!sockets_draining());
+
+        begin_shutdown();
+        assert!(is_shutting_down(), "readiness must go 503 at SIGTERM");
+        assert!(
+            !sockets_draining(),
+            "sockets must stay open through the LB drain grace — closing now \
+             would bounce the reconnect back onto this draining pod"
+        );
+
+        drain_sockets();
+        assert!(
+            sockets_draining(),
+            "sockets close only after the grace, once the LB has dropped this pod"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_sockets_wakes_a_parked_socket_pump() {
+        // A pump parked on `notified()` must wake the instant `drain_sockets`
+        // fires, not on its 30 s keep-alive tick.
+        let waiter = tokio::spawn(async { shutdown_signal().notified().await });
+        // Yield so the waiter is registered before we notify.
+        tokio::task::yield_now().await;
+        drain_sockets();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("notified() must resolve promptly after drain_sockets")
+            .expect("waiter task joined");
+    }
 }
