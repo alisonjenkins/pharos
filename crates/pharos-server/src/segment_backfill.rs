@@ -63,6 +63,42 @@ async fn acquire_gate(bg_io: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     bg_io.clone().acquire_owned().await.ok()
 }
 
+/// Run season consensus for both windows behind the background-I/O gate, on a
+/// blocking thread. `None` if the detection task itself failed.
+///
+/// B132 — consensus is CPU-bound and, since the exhaustive shift search
+/// (B131), long: a season pairs every episode against every other over
+/// thousands of candidate shifts. Both halves of this matter:
+///
+///   * `spawn_blocking` keeps it off the async runtime's workers. Called
+///     inline it pinned a worker for the whole season, starving the very
+///     executor that also serves playback — the server went unusable mid-film
+///     with no extra I/O happening, because the cost had moved from disk to
+///     CPU and only the disk half was regulated.
+///   * holding a `bg_io` permit makes it DUCK. The regulator parks all but
+///     `BG_IO_BUSY` permits while a client streams, so detection now stands
+///     down during playback exactly as scan probes and trickplay generation
+///     do, instead of competing with it.
+///
+/// Fingerprinting was already gated; this closes the other half.
+async fn detect_gated(
+    bg_io: &Arc<Semaphore>,
+    intro: Vec<EpisodeFingerprint>,
+    credits: Vec<EpisodeFingerprint>,
+    cfg: SeasonConfig,
+) -> Option<(Vec<EpisodeVerdict>, Vec<EpisodeVerdict>)> {
+    let _permit = acquire_gate(bg_io).await;
+    tokio::task::spawn_blocking(move || {
+        (
+            detect_season_verbose(&intro, &cfg),
+            detect_season_verbose(&credits, &cfg),
+        )
+    })
+    .await
+    .inspect_err(|e| tracing::warn!(error = %e, "segment backfill: detection task panicked"))
+    .ok()
+}
+
 async fn run_sweep(ctx: Ctx) {
     tokio::time::sleep(WARMUP).await;
     loop {
@@ -228,8 +264,32 @@ async fn analyze_season(ctx: &Ctx, season_key: &str, eps: &[&MediaItem]) -> bool
         align: AlignConfig::default(),
         ..SeasonConfig::default()
     };
-    let intro_verdicts = detect_season_verbose(&intro_fps, &cfg);
-    let outro_verdicts = detect_season_verbose(&credit_fps, &cfg);
+    // B132 — consensus is CPU-bound and, since the exhaustive shift search
+    // (B131), long: a season pairs every episode against every other over
+    // thousands of candidate shifts. Run it on a blocking thread, holding a
+    // `bg_io` permit, for two separate reasons:
+    //
+    //   * `spawn_blocking` keeps it off the async runtime's workers. Called
+    //     inline it pinned a worker for the whole season, starving the very
+    //     executor that serves playback — the server went unusable mid-film
+    //     even though no extra I/O was happening.
+    //   * the permit makes it DUCK. The regulator parks all but `BG_IO_BUSY`
+    //     permits while a client streams, so detection stands down during
+    //     playback exactly as scan probes and trickplay generation do,
+    //     instead of competing with it.
+    //
+    // Fingerprinting was already gated; this closes the other half.
+    let Some((intro_verdicts, outro_verdicts)) = detect_gated(
+        &ctx.bg_io,
+        std::mem::take(&mut intro_fps),
+        std::mem::take(&mut credit_fps),
+        cfg,
+    )
+    .await
+    else {
+        tracing::warn!(season = %season_key, "segment backfill: detection task failed");
+        return false;
+    };
     record_verdicts(season_key, "Intro", &intro_verdicts);
     record_verdicts(season_key, "Outro", &outro_verdicts);
 
@@ -408,6 +468,46 @@ mod tests {
             }),
             verdict: v,
         }
+    }
+
+    /// B132 — detection must stand down while a client is streaming. The
+    /// regulator expresses "playback is active" by PARKING `bg_io` permits, so
+    /// the only thing that makes consensus duck is holding one for the whole
+    /// run. Drain the semaphore and the work must not start; release and it
+    /// must complete.
+    ///
+    /// Disarm by dropping the `acquire_gate` call in `detect_gated` and this
+    /// goes red on the first assertion — which is the point: before the fix,
+    /// consensus ran regardless of playback, on a runtime worker.
+    #[tokio::test]
+    async fn detection_stands_down_while_playback_holds_the_gate() {
+        let bg_io = Arc::new(Semaphore::new(1));
+        let cfg = SeasonConfig {
+            align: AlignConfig::default(),
+            ..SeasonConfig::default()
+        };
+
+        // The regulator's "playback active" state: no permits left.
+        let parked = bg_io.clone().acquire_owned().await.unwrap();
+
+        let gate = bg_io.clone();
+        let mut task =
+            tokio::spawn(async move { detect_gated(&gate, Vec::new(), Vec::new(), cfg).await });
+
+        // Nothing may run while the stream holds the gate.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            futures_util::poll!(&mut task).is_pending(),
+            "consensus ran while playback held every bg_io permit — it is not ducking"
+        );
+
+        // Playback ends → the regulator returns the permit → work proceeds.
+        drop(parked);
+        let out = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("detection did not resume once the gate reopened")
+            .unwrap();
+        assert!(out.is_some(), "detection task failed");
     }
 
     /// The signal is the contract: an episode the detector threw away must be
