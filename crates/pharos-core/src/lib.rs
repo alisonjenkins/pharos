@@ -2072,7 +2072,11 @@ pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
 /// by comparison COUNT, so several peers agreeing on a full title sequence are
 /// no longer outvoted by a crowd of short coincidental matches. Cheap half
 /// only — fingerprints are untouched.
-pub const SEGMENT_DETECT_VERSION: i64 = 4;
+/// 5 (T107): agreement is met by EITHER the agreeing-comparison share or the
+/// agreeing-seconds share. Duration-only (4) regressed endings — a short true
+/// outro outweighed by a few long spurious matches — costing 78 outro rows
+/// library-wide while intros gained 66. Cheap half only.
+pub const SEGMENT_DETECT_VERSION: i64 = 5;
 
 /// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
 /// jellyfin-web's Skip Intro / Skip Outro overlay.

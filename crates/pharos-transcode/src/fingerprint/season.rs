@@ -3,13 +3,15 @@
 //! The intro-skipper plugin keeps the single LONGEST pairwise match per
 //! episode — one coincidental musical match then sets a bogus intro. We
 //! instead pairwise-compare every episode, CLUSTER each episode's located
-//! spans, and emit the consensus span with a **confidence** = the fraction of
-//! LOCATED AUDIO, measured in seconds, that agreed (T102). A segment is only
-//! served when confidence clears a threshold, so outliers are dropped, not
-//! enshrined. Weighting by duration rather than by comparison count matters
-//! because the two disagree exactly where recall is lost: a handful of short
-//! coincidental matches can outnumber, but not outweigh, several peers
-//! agreeing on a full-length title sequence.
+//! spans, and emit the consensus span when the agreement clears a threshold by
+//! EITHER reading: the share of comparisons that agreed, or the share of
+//! located AUDIO SECONDS that agreed (T102 + T107). Outliers are dropped, not
+//! enshrined.
+//!
+//! Both readings are needed because they fail in opposite directions. By count,
+//! a long true opening loses to a crowd of short coincidences. By duration, a
+//! short true ending loses to a few long spurious matches. Requiring both loses
+//! coverage twice over; `min_agreeing` remains the floor under either.
 //!
 //! Pure (operates on already-computed fingerprints), so the whole
 //! season-aggregation policy is unit-tested without ffmpeg.
@@ -34,9 +36,10 @@ pub struct SeasonSegment {
     pub id: u64,
     pub start_secs: f64,
     pub end_secs: f64,
-    /// Fraction of this episode's LOCATED SECONDS that landed in the winning
-    /// cluster — 0..=1 (T102). A peer that located nothing offered no evidence
-    /// either way and is not counted against it (B123).
+    /// Strength of agreement, 0..=1: the greater of the agreeing COMPARISON
+    /// share and the agreeing SECONDS share (T102 + T107). A peer that located
+    /// nothing offered no evidence either way and is not counted against it
+    /// (B123).
     pub confidence: f64,
     /// How many comparisons agreed (the winning cluster size).
     pub agreeing: u32,
@@ -52,8 +55,9 @@ pub struct SeasonConfig {
     /// Minimum comparisons that must agree to emit a segment (≥2 stops a
     /// single coincidental pair from setting a segment).
     pub min_agreeing: u32,
-    /// Minimum confidence (agreeing SECONDS / located SECONDS) to emit — a
-    /// purity gate on the evidence obtained, not a quorum of the season.
+    /// Minimum confidence to emit, met by EITHER the agreeing-comparison share
+    /// or the agreeing-seconds share — a purity gate on the evidence obtained,
+    /// not a quorum of the season.
     pub min_confidence: f64,
 }
 
@@ -75,19 +79,33 @@ struct Located {
     end: f64,
 }
 
-/// The agreement gate's numerator/denominator, weighted by matched DURATION
-/// rather than by comparison COUNT (T102).
-///
-/// Counting votes treats a 109 s agreement and an 18 s fragment as equal
-/// evidence, so a correct answer can be outvoted by noise. Falls back to the
-/// count ratio only when no span carried any duration at all.
+/// Strength of agreement: the GREATER of the agreeing-comparison share and the
+/// agreeing-seconds share (T102 + T107). See the body for why both are needed.
 fn agreement_confidence(spans: &[Located], agreed_secs: f64, agreeing: u32, matched: u32) -> f64 {
+    let by_count = agreeing as f64 / matched.max(1) as f64;
     let total_secs: f64 = spans.iter().map(|s| (s.end - s.start).max(0.0)).sum();
-    if total_secs > 0.0 {
-        agreed_secs / total_secs
-    } else {
-        agreeing as f64 / matched.max(1) as f64
+    if total_secs <= 0.0 {
+        return by_count;
     }
+    let by_duration = agreed_secs / total_secs;
+    // T107 — agreement counts if EITHER reading finds it, because the two fail
+    // in opposite directions and requiring both loses coverage twice over.
+    //
+    // By count alone, a long true opening loses to a crowd of short
+    // coincidences (T102: Game of Thrones S1 at 3/7 = 0.43, whole season
+    // dropped). By duration alone, a SHORT true ending loses to a few long
+    // spurious matches — measured on the real fingerprints after T102 shipped:
+    // Breaking Bad S5 credits went 6 emitted -> 0, Sabrina S1 9 -> 1,
+    // library-wide outro rows 7025 -> 6947 while intro rows rose 6186 -> 6252.
+    //
+    // Neither ratio is "the" definition of agreement; each is evidence. Taking
+    // the max on the same real fixtures dominates both: GoT S1 0/4/4,
+    // Breaking Bad S5 6/0/6, Sabrina S1 9/3/12, Frieren S1 22/16/23
+    // (count/duration/max). The controls stay silent — Cobra Kai S1 and 24 S2
+    // emit 0 under all three — so this widens recall without inventing spans.
+    //
+    // `min_agreeing` remains the floor that stops a lone coincidence either way.
+    by_count.max(by_duration)
 }
 
 /// Greedy 1-pass clustering: the largest group of spans whose endpoints are
@@ -134,8 +152,8 @@ pub enum Verdict {
     NoSpan,
     /// A cluster formed but fewer than `min_agreeing` comparisons agreed.
     FewAgreeing,
-    /// Enough agreed, but they were OUTWEIGHED by comparisons that located a
-    /// DIFFERENT span — the agreeing share of located seconds was below
+    /// Enough agreed, but comparisons locating a DIFFERENT span both
+    /// outnumbered AND outweighed them — neither agreement share reached
     /// `min_confidence`.
     LowConfidence,
 }
@@ -445,6 +463,47 @@ mod tests {
              by comparison count it would be {:.2} and the real intro would be lost",
             cfg.min_confidence,
             3.0 / matched as f64
+        );
+    }
+
+    /// T107 — the mirror of the T102 case, and the regression it caused. A
+    /// SHORT true ending (6 peers agreeing on 30 s) outweighed by a few LONG
+    /// spurious matches (4 peers at 90 s): by duration that is 180/540 = 0.33
+    /// and the season emits nothing; by count it is 6/10 = 0.60 and it stands.
+    ///
+    /// Measured, not hypothetical: after duration-only weighting shipped,
+    /// Breaking Bad S5 credits went 6 -> 0 and library outro rows fell
+    /// 7025 -> 6947.
+    ///
+    /// Disarm by returning `by_duration` alone and this goes red.
+    #[test]
+    fn a_short_agreement_survives_a_few_long_coincidences() {
+        let mut spans: Vec<Located> = (0..6)
+            .map(|i| Located {
+                start: 100.0 + i as f64 * 0.1,
+                end: 130.0 + i as f64 * 0.1,
+            })
+            .collect();
+        spans.extend((0..4).map(|i| Located {
+            start: 200.0 + i as f64 * 20.0,
+            end: 290.0 + i as f64 * 20.0,
+        }));
+
+        let cfg = SeasonConfig::default();
+        let (_, agreeing, agreed_secs) =
+            best_cluster(&spans, cfg.cluster_tolerance_secs).expect("a cluster");
+        assert_eq!(agreeing, 6, "the six short spans are the cluster");
+
+        let matched = spans.len() as u32;
+        let conf = agreement_confidence(&spans, agreed_secs, agreeing, matched);
+        let by_duration = agreed_secs / spans.iter().map(|s| s.end - s.start).sum::<f64>();
+        assert!(
+            by_duration < cfg.min_confidence,
+            "precondition: by duration alone this must FAIL ({by_duration:.2})"
+        );
+        assert!(
+            conf >= cfg.min_confidence,
+            "a 6-of-10 majority must still emit; got {conf:.2}"
         );
     }
 
