@@ -930,6 +930,31 @@ async fn media_segments(
     crate::api::jellyfin::wire::query_result(items, total, 0)
 }
 
+/// Whether this item has anything for a client to skip — a detected segment or
+/// a chapter whose title classifies as one.
+///
+/// B130 — this is what `MediaSource.HasSegments` must carry.
+/// jellyfin-web's `MediaSegmentManager.onPlayerPlaybackStart` reads that field
+/// and returns BEFORE calling `getItemSegments` when it is false, so a `false`
+/// here makes `/MediaSegments/{id}` unreachable from the web client no matter
+/// how correct its answer would be.
+///
+/// Answered from the same two sources `build_media_segments` serves, so the
+/// advertisement cannot disagree with the response: if this says yes, that
+/// endpoint returns at least one segment.
+pub(crate) async fn item_has_segments(state: &AppState, item: &pharos_core::MediaItem) -> bool {
+    use pharos_core::MediaSegmentStore;
+    if item
+        .probe
+        .chapters
+        .iter()
+        .any(|c| classify_chapter_title(&c.title).is_some())
+    {
+        return true;
+    }
+    matches!(state.stores.media_segments_for(item.id).await, Ok(s) if !s.is_empty())
+}
+
 /// Walk the item's chapter list and project intro / outro / recap
 /// chapters into Jellyfin's MediaSegment shape so jellyfin-web's
 /// "Skip Intro" overlay fires.

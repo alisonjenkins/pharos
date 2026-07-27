@@ -201,3 +201,76 @@ async fn include_segment_types_narrows_the_response() {
         types(&blank)
     );
 }
+
+/// B130 — jellyfin-web NEVER fetches segments unless the MediaSource says it
+/// has them.
+///
+/// `MediaSegmentManager.onPlayerPlaybackStart` reads
+/// `MediaSource.HasSegments` and, when it is false, returns before the
+/// `getItemSegments` call is ever made — no request, no skip button, for every
+/// item, in every browser. pharos carried the field only to satisfy the strict
+/// Kotlin decoder (B13) and hardcoded it to `false`, so the whole Skip Intro /
+/// Skip Outro surface was unreachable from the web client even though
+/// `/MediaSegments/{id}` answered correctly the whole time.
+///
+/// Verified in production before the fix: a browser played an episode whose
+/// intro is stored at 322.3-342.8s and never issued a single `/MediaSegments`
+/// request.
+#[actix_web::test]
+async fn playback_info_advertises_that_the_item_has_segments() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(serde_json::json!({}))
+            .to_request(),
+    )
+    .await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let sources = v["MediaSources"].as_array().expect("MediaSources");
+    assert!(!sources.is_empty(), "at least one source: {v}");
+    assert_eq!(
+        sources[0]["HasSegments"],
+        Value::Bool(true),
+        "the seeded item has a chapter Intro AND two detected segments, so the \
+         source must advertise them or jellyfin-web never asks: {}",
+        sources[0]
+    );
+}
+
+/// The other half of the contract: an item with nothing to skip must NOT claim
+/// it has segments, or every browser issues a pointless request per playback.
+#[actix_web::test]
+async fn playback_info_does_not_claim_segments_an_item_lacks() {
+    let (state, token) = seed().await;
+    // A second item: no chapters, no detected segments.
+    let bare = MediaItem {
+        id: 2,
+        path: "/m/bare.mkv".into(),
+        title: "Bare".into(),
+        kind: MediaKind::Movie,
+        ..Default::default()
+    };
+    state.stores.put(bare).await.unwrap();
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/2/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(serde_json::json!({}))
+            .to_request(),
+    )
+    .await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let sources = v["MediaSources"].as_array().expect("MediaSources");
+    assert_eq!(
+        sources[0]["HasSegments"],
+        Value::Bool(false),
+        "nothing to skip on this item: {}",
+        sources[0]
+    );
+}

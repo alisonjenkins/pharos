@@ -2861,9 +2861,23 @@ async fn playback_info(
     // `MediaSourceInfoDto::default()`; only the item-specific fields are set
     // here. `ETag` (B75) doubles as the direct-play capability token equal to
     // PlaySessionId, disclosed only in this authenticated response.
+    // B130 — jellyfin-web gates its entire media-segment fetch on this field,
+    // so an item with a skippable intro/outro must say so here or the client
+    // never asks and the skip button never appears. Instrumented as a decision
+    // (V75's sibling): the verdict alone cannot distinguish "no segments" from
+    // "never looked".
+    let has_segments = crate::api::jellyfin::system::item_has_segments(&state, &item).await;
+    tracing::debug!(
+        media.id = id,
+        has_segments,
+        chapters = item.probe.chapters.len(),
+        "playbackinfo: media segment advertisement"
+    );
+
     let primary_source = MediaSourceInfoDto {
         id: id_str.clone(),
         container: advertised_container.clone(),
+        has_segments,
         e_tag: play_session_id.clone(),
         run_time_ticks: probe.run_time_ticks(),
         size: probe.size_bytes,
