@@ -2193,6 +2193,20 @@ pub trait MediaSegmentStore: Send + Sync {
         &self,
         item_id: MediaId,
     ) -> impl std::future::Future<Output = DomainResult<Option<i64>>> + Send;
+
+    /// T103 — copy every current segment under `label`, unless `label` already
+    /// holds one. Returns the number of rows copied (0 when a snapshot already
+    /// existed, which is not an error).
+    ///
+    /// A detector change rewrites `media_segments` in place, and once it has,
+    /// "did recall drop?" is unanswerable. Taking the copy BEFORE the sweep is
+    /// the only moment the answer exists. Idempotent on purpose: a second sweep
+    /// at the same detect version must not overwrite the baseline it is meant to
+    /// be compared against.
+    fn snapshot_media_segments(
+        &self,
+        label: &str,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
 }
 
 /// LIB-A4 — structured result of an incremental scan. Replaces the bare

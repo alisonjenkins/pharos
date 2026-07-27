@@ -129,3 +129,44 @@ async fn an_empty_analysis_is_still_recorded_as_done() {
         Some(SEGMENT_SCHEMA_VERSION + 1)
     );
 }
+
+/// T103 — the snapshot exists so a detector change can be judged, so the one
+/// thing it must never do is overwrite itself on a later pass. The sweep calls
+/// it once per pass; only the FIRST call, before anything is replaced, holds
+/// the state worth keeping.
+#[tokio::test]
+async fn a_snapshot_is_taken_once_and_never_overwritten() {
+    let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let item = 91u64;
+    let before = [DetectedSegment {
+        kind: MediaSegmentKind::Intro,
+        start_ms: 0,
+        end_ms: 111_000,
+        detector: "chromaprint".into(),
+        confidence: 0.88,
+    }];
+    s.set_media_segments(item, &before, SEGMENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
+
+    let rows = s.snapshot_media_segments("pre_detect_v4").await.unwrap();
+    assert_eq!(rows, 1, "the pre-change state must be captured");
+
+    // The detector now runs and REPLACES the segment — the exact event that
+    // destroyed the only baseline when SEGMENT_DETECT_VERSION 2->3 ran.
+    s.set_media_segments(item, &[], SEGMENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
+    assert!(s.media_segments_for(item).await.unwrap().is_empty());
+
+    let again = s.snapshot_media_segments("pre_detect_v4").await.unwrap();
+    assert_eq!(
+        again, 0,
+        "a second call must NOT re-snapshot; that would replace the baseline \
+         with the post-change state and make the comparison impossible"
+    );
+
+    // A different detect version gets its own baseline.
+    let next = s.snapshot_media_segments("pre_detect_v5").await.unwrap();
+    assert_eq!(next, 0, "nothing to copy now, but the label is independent");
+}

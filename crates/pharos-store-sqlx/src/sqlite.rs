@@ -1377,6 +1377,30 @@ impl pharos_core::MediaSegmentStore for SqliteStore {
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(row.map(|(v,)| v))
     }
+
+    async fn snapshot_media_segments(&self, label: &str) -> DomainResult<u64> {
+        let existing = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM media_segments_snapshot WHERE label = ?",
+        )
+        .bind(label)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if existing.0 > 0 {
+            return Ok(0);
+        }
+        let res = sqlx::query(
+            "INSERT INTO media_segments_snapshot \
+             (label, item_id, kind, start_ms, end_ms, detector, confidence, schema_version) \
+             SELECT ?, item_id, kind, start_ms, end_ms, detector, confidence, schema_version \
+             FROM media_segments",
+        )
+        .bind(label)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(res.rows_affected())
+    }
 }
 
 impl GenreStore for SqliteStore {
