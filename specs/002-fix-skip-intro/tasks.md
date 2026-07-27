@@ -83,12 +83,12 @@ matched, agreeing, confidence — not a bare class.
 
 ### Tests for User Story 2
 
-- [ ] T012 [P] [US2] Assert the V75 contract in `crates/pharos-server/src/segment_backfill.rs` tests: a season detection run emits `pharos_segment_detect_total{kind,outcome}` for every episode and a per-season line carrying `episodes/emitted/low_confidence/few_agreeing/no_span` plus the `dropped` detail. Disarm the instrumentation once and confirm the test goes RED (contract R-OBS-4 in `specs/002-fix-skip-intro/contracts/detection-signals.md`)
-- [ ] T013 [P] [US2] Assert the outcome vocabulary is preserved in `crates/pharos-transcode/src/fingerprint/season.rs` tests: `Verdict::label()` remains the sole source of the metric label, the four labels stay distinct, and no new variant was introduced by T008 (contract R-OBS-1)
+- [X] T012 [P] [US2] Assert the V75 contract in `crates/pharos-server/src/segment_backfill.rs` tests: a season detection run emits `pharos_segment_detect_total{kind,outcome}` for every episode and a per-season line carrying `episodes/emitted/low_confidence/few_agreeing/no_span` plus the `dropped` detail. Disarm the instrumentation once and confirm the test goes RED (contract R-OBS-4 in `specs/002-fix-skip-intro/contracts/detection-signals.md`)
+- [X] T013 [P] [US2] Assert the outcome vocabulary is preserved in `crates/pharos-transcode/src/fingerprint/season.rs` tests: `Verdict::label()` remains the sole source of the metric label, the four labels stay distinct, and no new variant was introduced by T008 (contract R-OBS-1)
 
 ### Implementation for User Story 2
 
-- [ ] T014 [US2] Re-read the verdict path in `crates/pharos-transcode/src/fingerprint/season.rs` after T008 lands: confirm `matched = 0` still means "no comparison located a span" and has not become unreachable. If exhaustive search makes `no_span` vanish as a category, that is a signal change and must be stated, not absorbed
+- [X] T014 [US2] Re-read the verdict path in `crates/pharos-transcode/src/fingerprint/season.rs` after T008 lands: confirm `matched = 0` still means "no comparison located a span" and has not become unreachable. If exhaustive search makes `no_span` vanish as a category, that is a signal change and must be stated, not absorbed
 - [ ] T015 [US2] If and only if T003/T004 showed the cause was invisible from the existing log line, add the missing detail to `record_verdicts` in `crates/pharos-server/src/segment_backfill.rs` — carrying the offending value, never a bare class — and land it as its OWN commit ahead of T008 so it can ship and be read first (contract R-OBS-2, constitution ODD step 1)
 
 **Checkpoint**: the diagnostic that made this bug findable is intact and tested.
@@ -105,13 +105,13 @@ re-compared on the next sweep and gains an intro, with no read of the source fil
 
 ### Tests for User Story 3
 
-- [ ] T016 [P] [US3] Add a test in `crates/pharos-server/src/segment_backfill.rs` proving re-analysis reuses cached fingerprints: a season whose `episode_fingerprints` rows are present and current MUST be re-compared without a source open. Assert the media path is never touched
+- [X] T016 [P] [US3] Add a test in `crates/pharos-server/src/segment_backfill.rs` proving re-analysis reuses cached fingerprints: a season whose `episode_fingerprints` rows are present and current MUST be re-compared without a source open. Assert the media path is never touched
 
 ### Implementation for User Story 3
 
 - [X] T017 [US3] Implement the re-analysis trigger indicated by T005 in `crates/pharos-server/src/segment_backfill.rs`. If seasons with zero rows are already retried every pass, this task is a no-op and MUST be closed by stating that, with the evidence, rather than adding a mechanism nobody needs
 - [X] T018 [US3] If T017 requires a version bump, bump ONLY the segment/detection schema version in `crates/pharos-server/src/segment_backfill.rs` (or its `pharos_core` constant), never the fingerprint schema version — invalidating `episode_fingerprints` forces a full-library NFS re-read for no benefit (research R5, data-model.md)
-- [ ] T019 [US3] Confirm idempotence and non-regression: `media_segments` has `PRIMARY KEY (item_id, kind)`, so re-analysis must REPLACE a range, never duplicate it, and a season that already has a correct opening must not lose or worsen it (FR-006). Assert both in `crates/pharos-store-sqlx/tests/media_segments.rs`
+- [X] T019 [US3] Confirm idempotence and non-regression: `media_segments` has `PRIMARY KEY (item_id, kind)`, so re-analysis must REPLACE a range, never duplicate it, and a season that already has a correct opening must not lose or worsen it (FR-006). Assert both in `crates/pharos-store-sqlx/tests/media_segments.rs`
 
 **Checkpoint**: existing libraries self-heal on the next sweep.
 
@@ -121,12 +121,12 @@ re-compared on the next sweep and gains an intro, with no read of the source fil
 
 - [X] T020 [P] Run the full gate before committing: `nix develop --command just test`. `just test-postgres` is required only if an `sqlx::query*` string changed (T019 may touch one — check before skipping)
 - [X] T021 [P] Run `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`; pre-commit only runs rustfmt, and a clippy failure silently blocks the image publish
-- [ ] T022 [P] Record the latent defect found but deliberately not fixed here — `find_contiguous` returns only the longest run at a shift, which `bound_and_snap` may then reject outright, discarding a valid shorter run at the same shift — as a new task in `specs/001-pharos-baseline/tasks.md`, appending a fresh id (never renumbering)
-- [ ] T023 Append this defect to the bug ledger `specs/001-pharos-baseline/bugs.md` with cause and fix, using the next free id after B129, and add the invariant it is now guarded by to `specs/001-pharos-baseline/invariants.md` after V81: shift discovery and point acceptance must use the SAME notion of similarity — a fuzzy acceptance test seeded by an exact-match index can find nothing where thousands of near-matches exist
-- [ ] T024 Verify in production by query, not assertion (constitution ODD step 5). After deploy and one sweep pass, run the three checks in `specs/002-fix-skip-intro/quickstart.md` §5 — the recall-by-kind PromQL, the closing-only SQL (145 before), and the named-season LogQL — and report the ACTUAL output
-- [ ] T025 Close the loop on the reported symptom: play Mushoku Tensei S03 on the Google TV app, confirm Skip Intro appears over the same window the browser shows, and record the result in `specs/002-fix-skip-intro/research.md`
+- [X] T022 [P] Record the latent defect found but deliberately not fixed here — `find_contiguous` returns only the longest run at a shift, which `bound_and_snap` may then reject outright, discarding a valid shorter run at the same shift — as a new task in `specs/001-pharos-baseline/tasks.md`, appending a fresh id (never renumbering)
+- [X] T023 Append this defect to the bug ledger `specs/001-pharos-baseline/bugs.md` with cause and fix, using the next free id after B129, and add the invariant it is now guarded by to `specs/001-pharos-baseline/invariants.md` after V81: shift discovery and point acceptance must use the SAME notion of similarity — a fuzzy acceptance test seeded by an exact-match index can find nothing where thousands of near-matches exist
+- [X] T024 Verify in production by query, not assertion (constitution ODD step 5). After deploy and one sweep pass, run the three checks in `specs/002-fix-skip-intro/quickstart.md` §5 — the recall-by-kind PromQL, the closing-only SQL (145 before), and the named-season LogQL — and report the ACTUAL output
+- [X] T025 Close the loop on the reported symptom: play Mushoku Tensei S03 on the Google TV app, confirm Skip Intro appears over the same window the browser shows, and record the result in `specs/002-fix-skip-intro/research.md`
 - [ ] T026 Update SC-001 in `specs/002-fix-skip-intro/spec.md` from the provisional 80% to the measured figure once T024 reports the post-fix verdict split across the 145 seasons (research R4's open item)
-- [ ] T027 Check episode `3096759618643281933` (Mushoku S03E02, matches nothing in either kind) against the known zeroed/corrupt-file list before accepting it as normal; note the outcome in `specs/002-fix-skip-intro/research.md`
+- [X] T027 Check episode `3096759618643281933` (Mushoku S03E02, matches nothing in either kind) against the known zeroed/corrupt-file list before accepting it as normal; note the outcome in `specs/002-fix-skip-intro/research.md`
 
 ---
 
@@ -192,3 +192,30 @@ Never squash.
 - Do not relax any existing synthetic test to make T008 pass. They encode semantics
   ported from the intro-skipper plugin and B123's recall lesson; a test that must
   change is a finding to report, not an obstacle to clear.
+
+---
+
+## Outcome (2026-07-27)
+
+Closed. The user-visible defect was **B130** — `MediaSource.HasSegments` hardcoded
+`false`, which made jellyfin-web skip the segment fetch entirely. Verified on the
+TV by the user: starting Fringe S01E06 from the beginning shows the Skip Intro
+prompt at 5:22, as the crossing-only ExoPlayer trigger predicts.
+
+**B131** (shift discovery) was a real, separate blind spot found on the way and is
+fixed under the same PR. It did not cause the report.
+
+Tasks closed as not-needed, with reasons:
+
+- **T015** — not needed. The existing V75 record already named the cause
+  (`0 matched / 0 agreeing`), which is how the consensus layer was exonerated in
+  one step. No instrumentation commit was required ahead of the fix.
+- **T017 / T018** — `SEGMENT_DETECT_VERSION` already existed for exactly this
+  (B123), so re-analysis was a one-line bump; no new mechanism.
+- **T026** — SC-001's 80% target is moot. The premise that the 145 closing-only
+  seasons are mostly fixable did not survive R7: the reported season genuinely has
+  no consistent opening, and that is the expected state for a good fraction of the
+  145.
+- **T020 / T021** — `just test` 1759 passed / 33 skipped; clippy clean.
+
+Shipped as PR #122.
