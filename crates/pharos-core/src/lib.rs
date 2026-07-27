@@ -2064,7 +2064,11 @@ pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
 /// apart from [`SEGMENT_SCHEMA_VERSION`] precisely so a gate change re-runs
 /// the cheap half (pairwise comparison over cached points) and not the
 /// expensive one.
-pub const SEGMENT_DETECT_VERSION: i64 = 2;
+/// 3 (spec 002): shift discovery in `align::compare` no longer seeds from an
+/// exact-value inverted index, so pairs that share an opening only within the
+/// fuzzy acceptance tolerance are now compared at all. Every season re-runs the
+/// cheap half over its cached fingerprints.
+pub const SEGMENT_DETECT_VERSION: i64 = 3;
 
 /// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
 /// jellyfin-web's Skip Intro / Skip Outro overlay.
