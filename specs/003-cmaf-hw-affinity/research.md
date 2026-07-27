@@ -93,6 +93,27 @@ dead in its current form and the CPU-only rule should stand.
 **Rejected.** Shipping behind a config flag and watching production: the failure is
 silent to the server and appears as unplayable video for the user.
 
+### Attempt log — 2026-07-28, BLOCKED
+
+Tried to settle this from the dev host rather than wait for the GPU box. Two
+routes, both dead ends, recorded so the next attempt does not repeat them:
+
+- **NVENC locally**: not present. The dev host has an AMD RX 9070 XT; `nvidia-smi`
+  is absent. NVENC cannot be exercised here at all.
+- **VAAPI as a same-class proxy**: `vainfo` reports `VAProfileH264High:
+  VAEntrypointEncSlice`, so the GPU can encode H264 — but ffmpeg cannot open the
+  render node (`Failed to set value '/dev/dri/renderD128' for option
+  'vaapi_device': Input/output error`), with both the devShell ffmpeg and the host
+  `ffmpeg-headless`, and with `LIBVA_DRIVER_NAME`/`LIBVA_DRIVERS_PATH` set. The
+  nix ffmpeg build does not reach this Mesa/radeonsi driver.
+
+Worth stating plainly even had it worked: **VAAPI agreeing with itself would not
+prove NVENC does.** The claim is per-encoder. A green proxy would have been weak
+evidence; a red one would have been a strong warning. Neither was obtainable.
+
+**Status: R4 remains unmeasured. T001 must run on the deployment host.** Nothing
+downstream of it has been enabled.
+
 ---
 
 ## R5 — Which device should a rendition pin to?
