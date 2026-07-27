@@ -2068,7 +2068,11 @@ pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
 /// exact-value inverted index, so pairs that share an opening only within the
 /// fuzzy acceptance tolerance are now compared at all. Every season re-runs the
 /// cheap half over its cached fingerprints.
-pub const SEGMENT_DETECT_VERSION: i64 = 3;
+/// 4 (T102): consensus confidence is weighted by matched DURATION rather than
+/// by comparison COUNT, so several peers agreeing on a full title sequence are
+/// no longer outvoted by a crowd of short coincidental matches. Cheap half
+/// only — fingerprints are untouched.
+pub const SEGMENT_DETECT_VERSION: i64 = 4;
 
 /// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
 /// jellyfin-web's Skip Intro / Skip Outro overlay.

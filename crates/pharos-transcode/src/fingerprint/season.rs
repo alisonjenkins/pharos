@@ -3,9 +3,13 @@
 //! The intro-skipper plugin keeps the single LONGEST pairwise match per
 //! episode — one coincidental musical match then sets a bogus intro. We
 //! instead pairwise-compare every episode, CLUSTER each episode's located
-//! spans, and emit the consensus span with a **confidence** = fraction of the
-//! comparisons that located a span at all which agreed. A segment is only served when confidence clears a
-//! threshold, so outliers are dropped, not enshrined.
+//! spans, and emit the consensus span with a **confidence** = the fraction of
+//! LOCATED AUDIO, measured in seconds, that agreed (T102). A segment is only
+//! served when confidence clears a threshold, so outliers are dropped, not
+//! enshrined. Weighting by duration rather than by comparison count matters
+//! because the two disagree exactly where recall is lost: a handful of short
+//! coincidental matches can outnumber, but not outweigh, several peers
+//! agreeing on a full-length title sequence.
 //!
 //! Pure (operates on already-computed fingerprints), so the whole
 //! season-aggregation policy is unit-tested without ffmpeg.
@@ -30,9 +34,9 @@ pub struct SeasonSegment {
     pub id: u64,
     pub start_secs: f64,
     pub end_secs: f64,
-    /// Fraction of this episode's SPAN-PRODUCING comparisons that landed in
-    /// the winning cluster — 0..=1. A peer that located nothing offered no
-    /// evidence either way and is not counted against it (B123).
+    /// Fraction of this episode's LOCATED SECONDS that landed in the winning
+    /// cluster — 0..=1 (T102). A peer that located nothing offered no evidence
+    /// either way and is not counted against it (B123).
     pub confidence: f64,
     /// How many comparisons agreed (the winning cluster size).
     pub agreeing: u32,
@@ -48,9 +52,8 @@ pub struct SeasonConfig {
     /// Minimum comparisons that must agree to emit a segment (≥2 stops a
     /// single coincidental pair from setting a segment).
     pub min_agreeing: u32,
-    /// Minimum confidence (agreeing / comparisons that located a span) to
-    /// emit — a purity gate on the evidence obtained, not a quorum of the
-    /// season.
+    /// Minimum confidence (agreeing SECONDS / located SECONDS) to emit — a
+    /// purity gate on the evidence obtained, not a quorum of the season.
     pub min_confidence: f64,
 }
 
@@ -72,12 +75,27 @@ struct Located {
     end: f64,
 }
 
+/// The agreement gate's numerator/denominator, weighted by matched DURATION
+/// rather than by comparison COUNT (T102).
+///
+/// Counting votes treats a 109 s agreement and an 18 s fragment as equal
+/// evidence, so a correct answer can be outvoted by noise. Falls back to the
+/// count ratio only when no span carried any duration at all.
+fn agreement_confidence(spans: &[Located], agreed_secs: f64, agreeing: u32, matched: u32) -> f64 {
+    let total_secs: f64 = spans.iter().map(|s| (s.end - s.start).max(0.0)).sum();
+    if total_secs > 0.0 {
+        agreed_secs / total_secs
+    } else {
+        agreeing as f64 / matched.max(1) as f64
+    }
+}
+
 /// Greedy 1-pass clustering: the largest group of spans whose endpoints are
 /// all within `tol` of the group seed. Returns (consensus span, group size).
 /// The consensus is the arithmetic mean of the winning group (robust-ish;
 /// endpoints already agree within `tol`).
-fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32)> {
-    let mut best: Option<(Span, u32)> = None;
+fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32, f64)> {
+    let mut best: Option<(Span, u32, f64)> = None;
     for (i, seed) in spans.iter().enumerate() {
         let group: Vec<&Located> = spans
             .iter()
@@ -85,16 +103,21 @@ fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32)> {
             .filter(|s| (s.start - seed.start).abs() <= tol && (s.end - seed.end).abs() <= tol)
             .collect();
         let n = group.len() as u32;
-        let take = best.as_ref().map(|(_, bn)| n > *bn).unwrap_or(true);
+        let take = best.as_ref().map(|(_, bn, _)| n > *bn).unwrap_or(true);
         if take {
             let mean_start = group.iter().map(|s| s.start).sum::<f64>() / n as f64;
             let mean_end = group.iter().map(|s| s.end).sum::<f64>() / n as f64;
+            let agreed_secs = group
+                .iter()
+                .map(|s| (s.end - s.start).max(0.0))
+                .sum::<f64>();
             best = Some((
                 Span {
                     start: mean_start,
                     end: mean_end,
                 },
                 n,
+                agreed_secs,
             ));
         }
     }
@@ -111,8 +134,9 @@ pub enum Verdict {
     NoSpan,
     /// A cluster formed but fewer than `min_agreeing` comparisons agreed.
     FewAgreeing,
-    /// Enough agreed, but they were outnumbered by comparisons that located a
-    /// DIFFERENT span — the agreement fraction was below `min_confidence`.
+    /// Enough agreed, but they were OUTWEIGHED by comparisons that located a
+    /// DIFFERENT span — the agreeing share of located seconds was below
+    /// `min_confidence`.
     LowConfidence,
 }
 
@@ -198,7 +222,9 @@ pub fn detect_season_verbose(
     let mut out = Vec::with_capacity(n);
     for (idx, spans) in located.iter().enumerate() {
         let matched = spans.len() as u32;
-        let Some((consensus, agreeing)) = best_cluster(spans, cfg.cluster_tolerance_secs) else {
+        let Some((consensus, agreeing, agreed_secs)) =
+            best_cluster(spans, cfg.cluster_tolerance_secs)
+        else {
             out.push(EpisodeVerdict {
                 id: eps[idx].id,
                 matched,
@@ -217,7 +243,21 @@ pub fn detect_season_verbose(
         // NINE independent episodes agree on the same 22.0 s span — the same
         // intro length as every emitted one — and was discarded because
         // 9 < half of 19. Against matched comparisons it scores 1.00.
-        let confidence = agreeing as f64 / matched.max(1) as f64;
+        //
+        // T102 — weighted by matched DURATION, not by comparison COUNT. Counting
+        // votes treats a 109 s agreement and an 18 s fragment as equal evidence,
+        // so a correct answer can be outvoted by noise. Measured on the real
+        // stored fingerprints for Game of Thrones S1 (which opens with its full
+        // ~111 s title sequence at t=0 — the span S2 emits at confidence
+        // 0.63-0.88): episode 5 had THREE peers agree on 0.00..109 and four
+        // locate scattered 17-28 s fragments elsewhere. By count that is
+        // 3/7 = 0.43 and the season emits nothing; by duration it is
+        // 327/415 = 0.79 and the true intro survives. Every GoT S1 episode
+        // failed this way, at 0.38-0.43, while adjacent seasons emitted.
+        //
+        // `min_agreeing` still guards the other direction: one long spurious
+        // match cannot carry an episode on its own.
+        let confidence = agreement_confidence(spans, agreed_secs, agreeing, matched);
         let verdict = if agreeing < cfg.min_agreeing {
             Verdict::FewAgreeing
         } else if confidence < cfg.min_confidence {
@@ -343,6 +383,92 @@ mod tests {
         assert!(
             segs.is_empty(),
             "1 agreeing comparison < min_agreeing, got {segs:?}"
+        );
+    }
+
+    /// T102 — the Game of Thrones S1 shape, taken from production. Three peers
+    /// agree on the full ~109 s title sequence; four locate short coincidental
+    /// fragments elsewhere. By COUNT that is 3/7 = 0.43 and the true intro is
+    /// discarded; by DURATION it is 327/415 = 0.79 and it survives.
+    ///
+    /// Disarm by reverting `confidence` to `agreeing / matched` and this goes
+    /// red — which is the whole point: every GoT S1 episode failed exactly here
+    /// at 0.38-0.43 while adjacent seasons emitted the same span at 0.63-0.88.
+    #[test]
+    fn a_long_agreement_outweighs_a_crowd_of_short_coincidences() {
+        let spans = [
+            Located {
+                start: 0.0,
+                end: 109.45,
+            },
+            Located {
+                start: 0.0,
+                end: 107.96,
+            },
+            Located {
+                start: 0.0,
+                end: 109.70,
+            },
+            Located {
+                start: 0.0,
+                end: 17.33,
+            },
+            Located {
+                start: 29.47,
+                end: 48.04,
+            },
+            Located {
+                start: 70.57,
+                end: 94.10,
+            },
+            Located {
+                start: 70.82,
+                end: 99.30,
+            },
+        ];
+        let cfg = SeasonConfig::default();
+        let (consensus, agreeing, agreed_secs) =
+            best_cluster(&spans, cfg.cluster_tolerance_secs).expect("a cluster");
+        assert_eq!(agreeing, 3, "the three full-length spans are the cluster");
+        assert!(
+            consensus.end > 100.0,
+            "consensus should be the title sequence, got {consensus:?}"
+        );
+
+        // Through the SAME function the detector uses, so disarming the rule
+        // fails this rather than leaving the test computing its own answer.
+        let matched = spans.len() as u32;
+        let confidence = agreement_confidence(&spans, agreed_secs, agreeing, matched);
+        assert!(
+            confidence >= cfg.min_confidence,
+            "duration-weighted confidence {confidence:.2} must clear {:.2}; \
+             by comparison count it would be {:.2} and the real intro would be lost",
+            cfg.min_confidence,
+            3.0 / matched as f64
+        );
+    }
+
+    /// The other direction: `min_agreeing` must still stop ONE long
+    /// coincidental match from carrying an episode on its own, which is the
+    /// risk duration weighting introduces.
+    #[test]
+    fn one_long_coincidence_still_cannot_carry_an_episode() {
+        let eps = vec![
+            EpisodeFingerprint {
+                id: 1,
+                points: filler(1, 400),
+                window_offset_secs: 0.0,
+            },
+            EpisodeFingerprint {
+                id: 2,
+                points: filler(2, 400),
+                window_offset_secs: 0.0,
+            },
+        ];
+        let segs = detect_season(&eps, &SeasonConfig::default());
+        assert!(
+            segs.is_empty(),
+            "unrelated filler must not emit under duration weighting, got {segs:?}"
         );
     }
 
