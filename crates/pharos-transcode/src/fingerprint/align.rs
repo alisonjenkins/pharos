@@ -10,8 +10,6 @@
 //! Deliberately dependency-free and deterministic so the whole detector can be
 //! unit-tested on synthetic fingerprint vectors, no ffmpeg in the hot path.
 
-use std::collections::HashMap;
-
 /// Seconds of audio covered by one fingerprint point for the preset our
 /// fingerprinter uses. Measured empirically (`fingerprint_detect` probe):
 /// `rusty-chromaprint`'s `.fingerprint()` emits ONE point per **two** config
@@ -30,9 +28,6 @@ pub struct AlignConfig {
     /// Max Hamming distance (differing bits, of 32) for two points to match.
     /// intro-skipper `MaximumFingerprintPointDifferences` = 6.
     pub max_bit_diff: u32,
-    /// Fuzzy point-value probe range (±) when discovering candidate shifts.
-    /// intro-skipper `InvertedIndexShift` = 2.
-    pub index_shift: i64,
     /// Max gap (seconds) between consecutive matches inside one contiguous
     /// span. intro-skipper `MaximumTimeSkip` = 3.5.
     pub max_time_skip: f64,
@@ -53,7 +48,6 @@ impl Default for AlignConfig {
     fn default() -> Self {
         Self {
             max_bit_diff: 6,
-            index_shift: 2,
             max_time_skip: 3.5,
             min_duration: 15.0,
             max_duration: 120.0,
@@ -126,32 +120,32 @@ fn find_contiguous(times: &[f64], max_skip: f64, secs_per_point: f64) -> Option<
     })
 }
 
-/// Build `point value → last index` (the inverted index). Last-wins matches
-/// the plugin; repeated values are rare and either index works as a shift seed.
-fn inverted_index(fp: &[u32]) -> HashMap<u32, usize> {
-    let mut m = HashMap::with_capacity(fp.len());
-    for (i, &p) in fp.iter().enumerate() {
-        m.insert(p, i);
-    }
-    m
-}
-
-/// Candidate alignment shifts (`rhs_index - lhs_index`) worth testing, found by
-/// fuzzy-probing the inverted indexes (`point ± index_shift`). Far cheaper than
-/// brute-forcing every shift.
-fn candidate_shifts(lhs: &[u32], rhs: &[u32], cfg: &AlignConfig) -> Vec<i64> {
-    let lhs_idx = inverted_index(lhs);
-    let rhs_idx = inverted_index(rhs);
-    let mut shifts = std::collections::HashSet::new();
-    for (&point, &li) in &lhs_idx {
-        for d in -cfg.index_shift..=cfg.index_shift {
-            let modified = point.wrapping_add(d as u32);
-            if let Some(&ri) = rhs_idx.get(&modified) {
-                shifts.insert(ri as i64 - li as i64);
-            }
-        }
-    }
-    shifts.into_iter().collect()
+/// Every alignment shift (`rhs_index - lhs_index`) that could still yield an
+/// in-bounds span — i.e. every shift whose overlap is at least `min_duration`
+/// long. Nothing shorter can clear `bound_and_snap`, so nothing shorter is worth
+/// testing.
+///
+/// This replaces the intro-skipper's inverted-index seeding, which probed for
+/// points equal within `index_shift` as an INTEGER addend. That made discovery
+/// exact while acceptance ([`matches_at_shift`]) is fuzzy to `max_bit_diff`
+/// differing bits — so two episodes could share an entire opening, every point
+/// of it inside the 6-bit tolerance, and still seed ZERO shifts because no pair
+/// of points happened to be numerically adjacent. Measured on a real season
+/// (`tests/fixtures/mushoku_s03_fingerprints.txt`): 9 of 10 intro pairs produced
+/// no candidate shift at all, while the credits window of the same five files
+/// matched 6 of 10. The opening was never compared, not compared and rejected.
+///
+/// Cost is bounded and predictable: `|lhs| + |rhs|` shifts, each scanning at most
+/// the overlap, so a pair is `O(n²)` popcounts — for the ~1400-point windows this
+/// detector uses, single-digit milliseconds.
+fn feasible_shifts(lhs: &[u32], rhs: &[u32], cfg: &AlignConfig) -> std::ops::Range<i64> {
+    // A span needs this many consecutive points to reach `min_duration`.
+    let min_points = (cfg.min_duration / cfg.secs_per_point).ceil() as i64;
+    let (l, r) = (lhs.len() as i64, rhs.len() as i64);
+    // Overlap at shift s is min(l, r - s) - max(0, -s); require >= min_points.
+    let lo = -(l - min_points).max(0);
+    let hi = (r - min_points).max(0) + 1;
+    lo..hi.max(lo)
 }
 
 /// Matched point times in each episode at a fixed `shift` (rhs index = lhs
@@ -207,7 +201,7 @@ pub fn compare(lhs: &[u32], rhs: &[u32], cfg: &AlignConfig) -> Option<MatchResul
         return None;
     }
     let mut best: Option<MatchResult> = None;
-    for shift in candidate_shifts(lhs, rhs, cfg) {
+    for shift in feasible_shifts(lhs, rhs, cfg) {
         let (lhs_times, rhs_times) = matches_at_shift(lhs, rhs, shift, cfg);
         let (Some(lhs_span), Some(rhs_span)) = (
             find_contiguous(&lhs_times, cfg.max_time_skip, cfg.secs_per_point),
@@ -349,5 +343,119 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.start, 0.0);
+    }
+
+    /// Spec 002 — the mechanism, in miniature.
+    ///
+    /// Acceptance is FUZZY: two points match when `(a ^ b).count_ones() <= 6`.
+    /// Shift discovery used to be EXACT: it seeded only where two points were
+    /// numerically equal within `index_shift` (±2 as an integer addend, which on
+    /// a bit-packed chromaprint word means the two low bits and nothing else).
+    ///
+    /// So two episodes could share an entire opening — every point within the
+    /// 6-bit tolerance — and yield ZERO candidate shifts, because not one pair
+    /// of points was numerically near-identical. Nine of ten real intro pairs in
+    /// `tests/fixtures/mushoku_s03_fingerprints.txt` were in exactly this state.
+    ///
+    /// Here every shared point differs by two HIGH bits: Hamming distance 2 (well
+    /// inside the threshold) but numerically 0x30000000 apart (hopelessly outside
+    /// the ±2 probe).
+    #[test]
+    fn a_shared_span_no_point_of_which_is_numerically_near_still_aligns() {
+        const HIGH_BITS: u32 = 0x3000_0000; // 2 bits set, distance 2, value far
+        /// The intro-skipper's `InvertedIndexShift`, the ± integer addend the
+        /// deleted seeding step probed with. Kept as a literal so the test still
+        /// states what the old discovery could reach.
+        const OLD_INDEX_SHIFT: u32 = 2;
+        assert_eq!(HIGH_BITS.count_ones(), 2, "inside max_bit_diff");
+
+        let intro = intro_block(150);
+        let shifted: Vec<u32> = intro.iter().map(|p| p ^ HIGH_BITS).collect();
+        let a = fp(&filler(1, 10), &intro, &filler(2, 200));
+        let b = fp(&filler(3, 60), &shifted, &filler(4, 200));
+
+        let cfg = AlignConfig::default();
+        for (i, (x, y)) in intro.iter().zip(shifted.iter()).enumerate() {
+            assert!(
+                (x ^ y).count_ones() <= cfg.max_bit_diff,
+                "point {i} must be acceptable to the matcher"
+            );
+            assert!(
+                x.abs_diff(*y) > OLD_INDEX_SHIFT,
+                "point {i} must be OUT of reach of an exact-value probe"
+            );
+        }
+
+        let m = compare(&a, &b, &cfg).expect(
+            "a span every point of which is within the matcher's tolerance must be \
+             found; if this is None, shift discovery is using a different notion of \
+             similarity than point acceptance",
+        );
+        assert!(
+            m.lhs.duration() > 15.0,
+            "located {:.1}s of the ~18.6s shared block",
+            m.lhs.duration()
+        );
+    }
+
+    /// Spec 002 — stage attribution, pinned against the real failing input.
+    ///
+    /// The plan's first hypothesis was that a spurious over-long run was being
+    /// chosen as the longest at a shift and then discarded by `bound_and_snap`,
+    /// hiding a valid opening. The fixture refutes it: the failing pairs never
+    /// reached the bounds check, because no shift was ever proposed. This test
+    /// keeps that refutation from being quietly re-adopted — if intro recall
+    /// regresses, it must not be blamed on the duration bounds again.
+    #[test]
+    fn the_bounds_check_is_not_what_discarded_the_real_openings() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mushoku_s03_fingerprints.txt"),
+        )
+        .expect("fixture readable");
+        let intros: Vec<Vec<u32>> = raw
+            .lines()
+            .filter(|l| l.contains(" intro "))
+            .filter_map(|l| l.split(' ').nth(2))
+            .map(|hex| {
+                hex.as_bytes()
+                    .chunks(8)
+                    .filter_map(|c| {
+                        let s = std::str::from_utf8(c).ok()?;
+                        u32::from_str_radix(s, 16).ok().map(u32::swap_bytes)
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(intros.len(), 5, "five episodes of intro fingerprints");
+
+        let cfg = AlignConfig::default();
+        // For every pair, the longest run at every shift the discovery step is
+        // willing to test. If a pair fails, it must NOT be because every such run
+        // fell outside [min_duration, max_duration].
+        for i in 0..intros.len() {
+            for j in (i + 1)..intros.len() {
+                if compare(&intros[i], &intros[j], &cfg).is_some() {
+                    continue;
+                }
+                let mut in_bounds_run_existed = false;
+                for shift in feasible_shifts(&intros[i], &intros[j], &cfg) {
+                    let (lhs_times, _) = matches_at_shift(&intros[i], &intros[j], shift, &cfg);
+                    let Some(span) =
+                        find_contiguous(&lhs_times, cfg.max_time_skip, cfg.secs_per_point)
+                    else {
+                        continue;
+                    };
+                    if bound_and_snap(span, &cfg).is_some() {
+                        in_bounds_run_existed = true;
+                    }
+                }
+                assert!(
+                    !in_bounds_run_existed,
+                    "pair {i}x{j} failed while an in-bounds run existed — the \
+                     discard moved to a stage this test does not cover"
+                );
+            }
+        }
     }
 }
