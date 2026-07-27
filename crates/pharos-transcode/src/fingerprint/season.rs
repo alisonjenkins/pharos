@@ -247,11 +247,24 @@ mod tests {
     use super::super::align::sample_duration_secs;
     use super::*;
 
+    /// Non-shared filler audio. Each point is AVALANCHED, not stepped: an
+    /// arithmetic ramp (`seed*C + i*step`) makes two fillers differ by a
+    /// constant at every index, so under some shift a long run of them lands
+    /// inside the 6-bit acceptance and a pair of unrelated episodes appears to
+    /// share a span. Real chromaprint points do not march in step like that, so
+    /// the ramp was modelling an alignment that cannot occur — it read as
+    /// "unrelated audio" only because shift discovery used to be too narrow to
+    /// find it.
     fn filler(seed: u32, n: usize) -> Vec<u32> {
         (0..n)
             .map(|i| {
-                seed.wrapping_mul(2_654_435_761)
-                    .wrapping_add(i as u32 * 40_503)
+                let mut x = seed
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add((i as u32).wrapping_mul(2_246_822_519));
+                x ^= x >> 15;
+                x = x.wrapping_mul(2_246_822_519);
+                x ^= x >> 13;
+                x
             })
             .collect()
     }
