@@ -32,9 +32,22 @@ Rationale: reproducibility + V17 (`clippy::unwrap_used` / `expect_used` deny) re
 
 ## Workflow
 
-- Spec lives in `SPEC.md`. Mutate only via `/ck:spec` (or `/ck:build` for §T status flips).
-- Tasks numbered T1…T27 in §T. Pick next via `/ck:build --next` or `/ck:build T<n>`.
-- Bugs append to §B with cause + invariant link (`/ck:spec bug: …`).
+Spec-driven via GitHub spec-kit (`/speckit-*` skills). Migrated off cavekit
+(`/ck:*`) on 2026-07-27; `SPEC.md` at the root is a frozen archive — do not mutate it.
+
+- **Constitution**: `.specify/memory/constitution.md` — principles + tech constraints.
+- **Baseline spec**: `specs/001-pharos-baseline/` —
+  `spec.md` (goal + interfaces + user stories), `plan.md` (stack + gates),
+  `tasks.md` (T1…T100, open work listed first), `invariants.md` (V1…V81, normative),
+  `bugs.md` (B1…B129).
+- **Ids are stable and load-bearing.** V/T/B numbers are cited by tests, code
+  comments and each other. Never renumber; always append. New bug → append to
+  `bugs.md` with cause + fix + the invariant that now guards the class; if no
+  invariant covers it, add one to `invariants.md`.
+- **New work**: `/speckit-specify` → `/speckit-clarify` → `/speckit-plan` →
+  `/speckit-tasks` → `/speckit-analyze` → `/speckit-implement`, creating a new
+  `specs/NNN-<slug>/` per feature. Small fixes against existing behaviour go
+  straight to `tasks.md` / `bugs.md` in the baseline.
 
 ## Observability-driven development (ODD)
 
