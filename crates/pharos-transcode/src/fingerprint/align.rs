@@ -89,34 +89,46 @@ fn point_time(index: usize, secs_per_point: f64) -> f64 {
 /// are ≤ `max_skip` apart. Ported from `TimeRangeHelpers.FindContiguous`.
 /// `secs_per_point` extends the last matched point by its own hop so a run's
 /// end covers the point's sample window (the plugin's times are point-centres).
-fn find_contiguous(times: &[f64], max_skip: f64, secs_per_point: f64) -> Option<Span> {
+/// Every contiguous run in `times`, as inclusive index ranges, LONGEST FIRST.
+///
+/// T104 — the caller must be able to try more than one. Taking only the longest
+/// run and handing it to `bound_and_snap` means a run that fails the duration
+/// bounds kills the whole shift, even when a shorter run at that same shift
+/// would have passed: a real intro preceded or followed by a longer spurious
+/// match was discardable in full.
+fn contiguous_runs(times: &[f64], max_skip: f64) -> Vec<(usize, usize)> {
     if times.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let (mut best_start, mut best_end) = (times[0], times[0]);
-    let (mut cur_start, mut cur_end) = (times[0], times[0]);
-    for &t in &times[1..] {
-        if t - cur_end <= max_skip {
-            cur_end = t;
-        } else {
-            if cur_end - cur_start > best_end - best_start {
-                best_start = cur_start;
-                best_end = cur_end;
-            }
-            cur_start = t;
-            cur_end = t;
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    for i in 1..times.len() {
+        if times[i] - times[i - 1] > max_skip {
+            runs.push((start, i - 1));
+            start = i;
         }
     }
-    if cur_end - cur_start > best_end - best_start {
-        best_start = cur_start;
-        best_end = cur_end;
-    }
+    runs.push((start, times.len() - 1));
+    runs.sort_by(|a, b| {
+        let da = times[a.1] - times[a.0];
+        let db = times[b.1] - times[b.0];
+        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    runs
+}
+
+/// The longest contiguous run as a span. Retained for the direct unit tests;
+/// [`compare`] uses [`contiguous_runs`] so it can fall back to a shorter run.
+#[cfg(test)]
+fn find_contiguous(times: &[f64], max_skip: f64, secs_per_point: f64) -> Option<Span> {
+    let runs = contiguous_runs(times, max_skip);
+    let (a, b) = *runs.first()?;
     // A single-point run has zero duration; extend by one hop so the last
     // matched point contributes its own sample window (matches the plugin,
     // whose times are point-centres).
     Some(Span {
-        start: best_start,
-        end: best_end + secs_per_point,
+        start: times[a],
+        end: times[b] + secs_per_point,
     })
 }
 
@@ -203,14 +215,30 @@ pub fn compare(lhs: &[u32], rhs: &[u32], cfg: &AlignConfig) -> Option<MatchResul
     let mut best: Option<MatchResult> = None;
     for shift in feasible_shifts(lhs, rhs, cfg) {
         let (lhs_times, rhs_times) = matches_at_shift(lhs, rhs, shift, cfg);
-        let (Some(lhs_span), Some(rhs_span)) = (
-            find_contiguous(&lhs_times, cfg.max_time_skip, cfg.secs_per_point),
-            find_contiguous(&rhs_times, cfg.max_time_skip, cfg.secs_per_point),
-        ) else {
-            continue;
-        };
-        let (Some(lhs_span), Some(rhs_span)) =
-            (bound_and_snap(lhs_span, cfg), bound_and_snap(rhs_span, cfg))
+        // T104 — try each run at this shift, longest first, and keep the first
+        // whose span clears the bounds on BOTH sides. The two time vectors are
+        // parallel (`rhs_times[i] = lhs_times[i] + shift * hop`), so a run's
+        // index range describes the same matched region in each.
+        let hop = cfg.secs_per_point;
+        let Some((lhs_span, rhs_span)) = contiguous_runs(&lhs_times, cfg.max_time_skip)
+            .into_iter()
+            .find_map(|(a, b)| {
+                let l = bound_and_snap(
+                    Span {
+                        start: lhs_times[a],
+                        end: lhs_times[b] + hop,
+                    },
+                    cfg,
+                )?;
+                let r = bound_and_snap(
+                    Span {
+                        start: rhs_times[a],
+                        end: rhs_times[b] + hop,
+                    },
+                    cfg,
+                )?;
+                Some((l, r))
+            })
         else {
             continue;
         };
@@ -395,6 +423,54 @@ mod tests {
             m.lhs.duration() > 15.0,
             "located {:.1}s of the ~18.6s shared block",
             m.lhs.duration()
+        );
+    }
+
+    /// T104 — a shift must not be written off because its LONGEST run fails the
+    /// bounds. Here one run exceeds `max_duration` and a second, valid one sits
+    /// beyond a gap; taking only the longest discards the shift entirely and the
+    /// real span is lost.
+    ///
+    /// Disarm by reverting `compare` to the single longest run and this goes red.
+    #[test]
+    fn a_shift_whose_longest_run_is_out_of_bounds_falls_back_to_a_valid_one() {
+        let cfg = AlignConfig::default();
+        let hop = cfg.secs_per_point;
+
+        // Run A: longer than max_duration. Run B: comfortably inside the window.
+        let over = (cfg.max_duration / hop) as usize + 40;
+        let good = ((cfg.min_duration + 8.0) / hop) as usize;
+        let mut times: Vec<f64> = (0..over).map(|i| i as f64 * hop).collect();
+        let gap_at = times[times.len() - 1] + cfg.max_time_skip * 4.0;
+        times.extend((0..good).map(|i| gap_at + i as f64 * hop));
+
+        let runs = contiguous_runs(&times, cfg.max_time_skip);
+        assert_eq!(runs.len(), 2, "the gap must split the runs");
+        let (a0, a1) = runs[0];
+        assert!(
+            bound_and_snap(
+                Span {
+                    start: times[a0],
+                    end: times[a1] + hop
+                },
+                &cfg
+            )
+            .is_none(),
+            "the longest run must be the one that fails the bounds"
+        );
+
+        let (b0, b1) = runs[1];
+        let recovered = bound_and_snap(
+            Span {
+                start: times[b0],
+                end: times[b1] + hop,
+            },
+            &cfg,
+        );
+        assert!(
+            recovered.is_some(),
+            "the shorter run is valid and must be reachable; considering only the \
+             longest run throws the whole shift away"
         );
     }
 
