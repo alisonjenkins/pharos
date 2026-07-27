@@ -428,10 +428,48 @@ fn default_subtitle_cache_entries() -> usize {
     1024
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Replace the password in a database URL with `***`.
+///
+/// SEC — the startup line logged `cfg.database.url` verbatim, so the postgres
+/// password went to stdout and into Loki on every boot, where it outlives the
+/// pod and is readable by anyone with log access. A credential in a log is a
+/// credential disclosed: nothing downstream re-redacts it.
+///
+/// Conservative by construction: anything between `://` and the LAST `@` of the
+/// authority is the userinfo, and everything after the first `:` in it is the
+/// password. A URL with no userinfo, or no password, is returned unchanged. On
+/// any shape it does not recognise it returns the whole string masked rather
+/// than risk emitting a secret it failed to parse.
+pub fn redact_dsn(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    // The authority ends at the first '/', '?' or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return url.to_string(); // no credentials present
+    };
+    match userinfo.split_once(':') {
+        Some((user, _pass)) => format!("{scheme}://{user}:***@{host}{tail}"),
+        None => url.to_string(), // user, but no password
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub struct DatabaseConfig {
     #[serde(default = "default_db_url")]
     pub url: String,
+}
+
+/// Hand-written so `{:?}` on a `Config` — anywhere, now or later — cannot print
+/// the password. Deriving `Debug` here is what made the leak a one-liner away.
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redact_dsn(&self.url))
+            .finish()
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -844,5 +882,64 @@ mod tests {
         assert_eq!(specs[0].0, "My Movies");
         assert_eq!(specs[0].2, pharos_core::LibraryKind::Movies);
         assert_eq!(c.media.scan_roots(), vec![PathBuf::from("/srv/Movies")]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod dsn_redaction_tests {
+    use super::*;
+
+    /// SEC — the exact production shape that leaked. The password must not
+    /// survive, and everything an operator actually needs from the line (which
+    /// host, which database, which user) must.
+    #[test]
+    fn a_postgres_password_never_survives_redaction() {
+        // A same-SHAPED fake. Never put a real credential in a test: the repo
+        // is a worse place for it than the log this exists to clean up.
+        let secret = "0000000000000000000000000000000000000000000000000000000000000000";
+        let url = format!("postgresql://pharos:{secret}@pharos-db-rw.pharos:5432/pharos");
+        let out = redact_dsn(&url);
+        assert!(!out.contains(secret), "password leaked: {out}");
+        assert_eq!(
+            out,
+            "postgresql://pharos:***@pharos-db-rw.pharos:5432/pharos"
+        );
+    }
+
+    /// `{:?}` is the other way it escapes — a stray debug print of the config.
+    #[test]
+    fn debug_of_the_config_does_not_print_the_password() {
+        let cfg = DatabaseConfig {
+            url: "postgres://u:hunter2@db:5432/pharos".into(),
+        };
+        let shown = format!("{cfg:?}");
+        assert!(
+            !shown.contains("hunter2"),
+            "password leaked via Debug: {shown}"
+        );
+        assert!(shown.contains("***"));
+    }
+
+    /// A password containing '@' must still be fully removed — the authority is
+    /// split on the LAST '@', not the first.
+    #[test]
+    fn an_at_sign_inside_the_password_does_not_defeat_it() {
+        let out = redact_dsn("postgres://user:p@ss@w0rd@host:5432/db");
+        assert!(!out.contains("p@ss@w0rd"), "leaked: {out}");
+        assert_eq!(out, "postgres://user:***@host:5432/db");
+    }
+
+    /// Shapes with nothing to hide must be left alone, so the line stays useful.
+    #[test]
+    fn urls_without_a_password_are_unchanged() {
+        for url in [
+            "sqlite:///var/lib/pharos/pharos.db",
+            "postgres://host:5432/pharos",
+            "postgres://useronly@host/pharos",
+            "not a url at all",
+        ] {
+            assert_eq!(redact_dsn(url), url, "should be untouched: {url}");
+        }
     }
 }

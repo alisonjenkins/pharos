@@ -796,7 +796,13 @@ async fn await_shutdown_signal() {
 }
 
 async fn serve(cfg: Config) -> Result<(), AppError> {
-    tracing::info!(bind = %cfg.server.bind, db = %cfg.database.url, "starting pharos");
+    // SEC — never log the DSN verbatim: it carries the postgres password, and
+    // a log line outlives the pod (Loki keeps it, kubectl logs does not).
+    tracing::info!(
+        bind = %cfg.server.bind,
+        db = %pharos_server::config::redact_dsn(&cfg.database.url),
+        "starting pharos"
+    );
 
     let stores = Stores::connect(&cfg.database.url).await?;
     let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
