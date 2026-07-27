@@ -259,6 +259,54 @@ rows, so this is not a data drought.
 for `7093100027006938661` (S03E05, wire id `00000000-0000-0000-626f-c0e4ca0fee25`).
 Fetching it needs an auth token, which this session is not permitted to read.
 
+## R9 — RESOLVED: the defect was `HasSegments`, and the app was never broken
+
+**2026-07-27.** Two independent findings closed this out.
+
+**The server defect (ours).** `MediaSource.HasSegments` was hardcoded `false` —
+added for the strict Kotlin decoder (B13), never populated. jellyfin-web's
+`MediaSegmentManager.onPlayerPlaybackStart` reads it and returns BEFORE calling
+`getItemSegments`:
+
+```js
+this.hasSegments = !!(t.MediaSource?.HasSegments);
+if (this.hasSegments && serverId && sourceId) { … fetchMediaSegments(…) }
+else console.info("[MediaSegmentManager] user has no media segment actions enabled")
+```
+
+So `/MediaSegments/{id}` was unreachable from every browser, for every item,
+always — while answering correctly the whole time. Confirmed in production: a
+browser played an episode whose intro is stored at 322.3–342.8 s and issued no
+`/MediaSegments` request in the entire session. Fixed, with the advertisement
+answered from the same two sources `build_media_segments` serves so the two
+cannot disagree.
+
+**The Android TV app is working as designed.** `PlaybackControllerHelper.kt`
+schedules a single ExoPlayer `PlayerMessage` at the segment start:
+
+```kotlin
+.createMessage { _, _ -> fragment?.askToSkip(mediaSegment.end) }
+// Segments at position 0 will never be hit by ExoPlayer so we need to add a minimum value
+.setPosition(mediaSegment.start.inWholeMilliseconds.coerceAtLeast(1))
+.setDeleteAfterDelivery(false)
+```
+
+It fires only on a FORWARD CROSSING of that position — not a periodic check. An
+outro at ~22 min is always crossed; an intro at 3–6 min is missed whenever
+playback resumes past it, which Jellyfin's own resume position causes routinely.
+**Verified by the user**: starting Fringe S01E06 from the beginning, the Skip
+Intro prompt appears at 5:22 as predicted.
+
+Ruled out along the way: the undashed 32-hex `Id` (the SDK's UUID serializer
+normalizes it), stale per-item caching (fetched fresh at `startItem`), any
+Intro/Outro branch in the skip code, and any known 0.19.x issue.
+
+**Consequence for the spec**: US1's premise — that the detector was blind — was
+half right. It was blind in one specific way (R3, fixed), but the reported
+symptom was the `HasSegments` gate. The zero-start intro concern (24% of rows)
+is NOT a defect for either client: the TV app coerces to 1 ms and jellyfin-web
+evaluates by position range.
+
 ## Incidental finding
 
 Episode `3096759618643281933` (S03E02) matched **nothing** in either kind, in both
