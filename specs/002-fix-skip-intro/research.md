@@ -200,6 +200,65 @@ synthetic proof, no regression on real credits data (still 6 of 10 at 91 s), and
 no measurable cost. It removes a blind spot that would otherwise hide behind
 whatever the window turns out to be.
 
+## R7 — Media-level ground truth: this season HAS no consistent opening
+
+**Added 2026-07-27**, from a read-only debug pod (`pharos-fp-debug`, linuxserver
+jellyfin image, `pharos-media` PVC mounted read-only, deleted after use). Audio
+was extracted with ffmpeg and cross-correlated locally — a stronger instrument
+than the fingerprint, since it works on the waveform itself.
+
+**Method control first.** The closing, which production detects successfully,
+reproduces exactly: a 30 s reference from each episode's ending matches the
+others at **0.98–1.00**, except E02, which matches nothing — the same odd file
+production reports `no_span` for. So the extraction picks the same audio stream
+the detector does, and the instrument is sound.
+
+**The opening does not exist in three of the five episodes.** E04's opening
+(136.2–196.4 s) searched across the **entire runtime** of every episode:
+
+| Region searched | E01 | E02 | E03 | E04 | E05 |
+|-----------------|-----|-----|-----|-----|-----|
+| 0–900 s | 0.024 | 0.022 | 0.015 | **1.000** | **0.835** |
+| 880–1280 s | 0.029 | 0.029 | 0.018 | — | — |
+| 1250–1430 s | 0.026 | 0.021 | 0.027 | 0.026 | 0.026 |
+
+~0.02 is noise. A sweep of 30 s references taken every 60 s across the first
+10 minutes of *every* episode against *every* other found only one shared pair:
+E04×E05. E01, E02 and E03 share no opening with anyone, including each other.
+
+**So hypothesis 1 (opening beyond the window) is refuted, and the detector's
+behaviour on this season is CORRECT.** Three episodes have no shared opening to
+find; the two that do are a single agreeing pair, one short of `min_agreeing`,
+which is deliberately not enough — a lone pair is the shape of a coincidence.
+
+## R8 — The reported symptom is therefore NOT this season's detection
+
+The viewer has played episodes that **do** carry an intro segment:
+
+| Episode | Intro | Source |
+|---------|-------|--------|
+| Code Geass S02E12 | 112–200 s, conf 1.00 | detected (chromaprint) |
+| Neon Genesis Evangelion S01E18 | 0–89 s | detected |
+| Fringe S01E05 | 384–403 s | detected |
+| Mushoku S03E01 | 81–166 s | **chapter** titled `Intro` |
+| Mushoku S03E05 | 200–219 s | **chapter** titled `Intro` |
+
+Mushoku S03E01 and S03E05 carry a chapter literally titled `Intro`, which
+`classify_chapter_title` maps to a segment ahead of any detection. That matches
+the wire evidence: the production request for S03E05 returned **351 bytes**
+against **200 bytes** for S03E04 — two segments versus one.
+
+So Skip Intro data reached the client for at least one of the very episodes in
+the report, and the button still did not appear. The remaining candidates are
+client-side: the Android TV app's per-segment-type action setting, or its
+rendering of an Intro segment specifically. Library-wide there are 6113 intro
+rows, so this is not a data drought.
+
+**Next evidence needed**: the actual JSON body of
+`GET /MediaSegments/{id}?includeSegmentTypes=Intro&includeSegmentTypes=Outro`
+for `7093100027006938661` (S03E05, wire id `00000000-0000-0000-626f-c0e4ca0fee25`).
+Fetching it needs an auth token, which this session is not permitted to read.
+
 ## Incidental finding
 
 Episode `3096759618643281933` (S03E02) matched **nothing** in either kind, in both
