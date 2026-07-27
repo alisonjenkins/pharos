@@ -401,6 +401,12 @@ impl pharos_core::MediaSegmentStore for AnyStore {
             AnyStore::Postgres(p) => p.segment_scan_version(item_id).await,
         }
     }
+    async fn snapshot_media_segments(&self, label: &str) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.snapshot_media_segments(label).await,
+            AnyStore::Postgres(p) => p.snapshot_media_segments(label).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

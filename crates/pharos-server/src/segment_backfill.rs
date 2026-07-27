@@ -135,12 +135,31 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
     }
 
     let mut analyzed = 0usize;
+    let mut snapshotted = false;
     for (key, eps) in seasons {
         if eps.len() < MIN_SEASON_EPISODES {
             continue;
         }
         if season_is_current(ctx, &eps).await {
             continue;
+        }
+        // T103 — this season is about to be re-analysed, which REPLACES its
+        // segments. Capture the current table first, once per detect version,
+        // so "did recall drop?" is a diff instead of a recollection. Taken
+        // lazily (only when there is genuinely work to do) and idempotent by
+        // label, so a later pass cannot overwrite the baseline.
+        if !snapshotted {
+            snapshotted = true;
+            let label = format!("pre_detect_v{SEGMENT_DETECT_VERSION}");
+            match ctx.stores.snapshot_media_segments(&label).await {
+                Ok(0) => tracing::debug!(%label, "segment backfill: snapshot already present"),
+                Ok(rows) => {
+                    tracing::info!(%label, rows, "segment backfill: snapshotted segments before re-detection")
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, %label, "segment backfill: snapshot failed; re-detection proceeds unguarded")
+                }
+            }
         }
         if analyze_season(ctx, &key, &eps).await {
             analyzed += 1;
