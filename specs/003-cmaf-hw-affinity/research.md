@@ -272,5 +272,23 @@ rendition whose cached segments predate the change. That is a physical hardware
 change accompanied by a redeploy; bump `HLS_GEN_VERSION` at that point. Noted in
 quickstart rollback.
 
+### CORRECTION 2026-07-28 — this argument had a hole, found in production
+
+The claim "cached entries were necessarily produced by the device the rendition
+still resolves to" holds only while the RULE is fixed. **The deploy that
+introduces the rule is itself the moment it changes**: before it, every CMAF
+H264 segment resolved to CPU; after it, to hardware. Every pre-existing CMAF
+cache entry was therefore stale in exactly the way this spec exists to prevent.
+
+Observed within minutes of rollout, on Fringe S01E07: `1489` cache hits (all
+CPU-era) against `11` fresh NVENC prefetch encodes, with the client holding a
+cached libx264 init — a non-fatal hls.js transmuxer exception, and video that
+would have failed outright once playback reached the newly-encoded segments.
+
+So T006/T007 were NOT superseded after all: the generation bump was required,
+just for a different reason than R3 gave. `HLS_GEN_VERSION` 12 -> 13, and V89
+records the general form — bump when the ASSIGNMENT RULE changes, not only when
+the device table does.
+
 **Supersedes.** The `RenditionPin` entity in `data-model.md` and the pin-map
 tasks (T011-T013, T016) collapse into one pure function plus its tests.
