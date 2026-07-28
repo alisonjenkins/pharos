@@ -328,7 +328,12 @@ impl RenditionKey {
         Self(h.finish())
     }
 
-    /// Short, stable-within-process label for logs and metrics.
+    /// The raw value, for deterministic device selection.
+    pub fn value(&self) -> u64 {
+        self.0
+    }
+
+    /// Short label for logs and metrics.
     pub fn short(&self) -> String {
         format!("{:016x}", self.0)
     }
