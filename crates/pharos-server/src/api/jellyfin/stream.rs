@@ -674,6 +674,24 @@ impl DirectPlayClient {
             Self::Native => "native",
         }
     }
+
+    /// Whether an over-large open-ended `Range` may be answered with a capped
+    /// window instead of the whole tail.
+    ///
+    /// B140 — only a browser. A `<video>`/MSE source buffer treats a short
+    /// response as "this window is done" and issues the next `bytes=X-`, which
+    /// is what makes the Deadpool cap work. A native progressive player does
+    /// not: ExoPlayer's `DefaultHttpDataSource` sizes its read from the
+    /// response's `Content-Length`, and when that many bytes have been consumed
+    /// it returns `RESULT_END_OF_INPUT` to the extractor — the media simply
+    /// *ends* at the cap. Capping a native player's open-ended range therefore
+    /// truncates the film to the first 8 MiB, which is why the Android TV app
+    /// opened Central Intelligence, read one window and gave up. Native clients
+    /// get the whole tail; the reverse-proxy buffering the cap exists to avoid
+    /// is a browser-path problem.
+    fn caps_ranges(self) -> bool {
+        matches!(self, Self::Browser)
+    }
 }
 
 /// What `deliver_stream` actually put on the wire. Recorded for EVERY branch —
@@ -819,7 +837,7 @@ async fn deliver_stream(
     // return a prefix of the requested bytes), so — unlike the StartTimeTicks
     // time→byte cut above — it needs no `ResyncWitness`. Small / suffix / multi
     // ranges fall through to `NamedFile`.
-    if let Some(rh) = range_header.as_deref() {
+    if let Some(rh) = range_header.as_deref().filter(|_| client.caps_ranges()) {
         if let Some(window) = capped_window(rh, total, DIRECTPLAY_RANGE_CAP_BYTES) {
             record_directplay_delivery(
                 &item,

@@ -302,6 +302,10 @@ async fn seed_with_sized_file(size: usize) -> (web::Data<AppState>, String, Temp
 // temp-file the remainder before relaying (unbuffered seeks take minutes) and a
 // stalled/reset progressive connection restarts the player at 0. deliver_stream
 // caps an over-cap range to an 8 MiB window; the client re-requests the next one.
+//
+// B140 — the cap is BROWSER-only, so every request here carries a Firefox
+// User-Agent. See `native_open_ended_range_is_served_whole` for why a native
+// player must not be capped.
 #[actix_web::test]
 async fn oversized_open_ended_range_is_capped_to_a_window() {
     const CAP: usize = 8 * 1024 * 1024;
@@ -315,6 +319,7 @@ async fn oversized_open_ended_range_is_capped_to_a_window() {
         test::TestRequest::get()
             .uri("/Videos/42/stream")
             .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", FIREFOX_UA))
             .insert_header(("Range", "bytes=0-"))
             .to_request(),
     )
@@ -344,6 +349,7 @@ async fn oversized_open_ended_range_is_capped_to_a_window() {
         test::TestRequest::get()
             .uri("/Videos/42/stream")
             .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("User-Agent", FIREFOX_UA))
             .insert_header(("Range", format!("bytes={CAP}-").as_str()))
             .to_request(),
     )
@@ -351,6 +357,54 @@ async fn oversized_open_ended_range_is_capped_to_a_window() {
     assert_eq!(tail.status(), 206);
     let tail_body = test::read_body(tail).await;
     assert_eq!(tail_body.len(), 100, "the sub-cap tail is served whole");
+}
+
+/// jellyfin-web's User-Agent — the only client shape the 8 MiB DirectPlay cap
+/// applies to.
+const FIREFOX_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0";
+/// The Jellyfin Android TV app's fetches, as seen in production.
+const ANDROID_TV_UA: &str = "Jellyfin Android TV/0.19.9 via jellyfin-sdk-kotlin (OkHttp/4.12.0)";
+
+// B140 — a native progressive player sizes its read from the response's
+// Content-Length and reports end-of-input to its extractor once that many bytes
+// are consumed; it does NOT re-request the next window the way a `<video>`
+// source buffer does. Capping its open-ended range truncated the film to the
+// first 8 MiB, so the Android TV app opened the title, read one window and gave
+// up without ever asking for more. A native open-ended range must be answered
+// with the whole tail.
+#[actix_web::test]
+async fn native_open_ended_range_is_served_whole() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let total = CAP + 100; // the same over-cap file the browser test caps
+    let (state, token, _td) = seed_with_sized_file(total).await;
+    let app = test::init_service(build_app(state)).await;
+
+    for ua in [ANDROID_TV_UA, "okhttp/4.12.0"] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/Videos/42/stream")
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .insert_header(("User-Agent", ua))
+                .insert_header(("Range", "bytes=0-"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 206, "{ua}");
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("bytes 0-{}/{}", total - 1, total).as_str()),
+            "{ua}: a native open-ended range must run to EOF, not stop at the cap"
+        );
+        let body = test::read_body(resp).await;
+        assert_eq!(
+            body.len(),
+            total,
+            "{ua}: the body must be the whole tail — a short one ends the media"
+        );
+    }
 }
 
 /// Seed a VP9-in-Matroska item (a real Firefox DirectPlay shape) so the
