@@ -1842,9 +1842,31 @@ impl GroupHandle {
                             // Paused if the freeze engaged around a user pause).
                             state.resume_after_buffering();
                         } else {
-                            // A gate owns the resume; just disarm the freeze so
-                            // this arm doesn't spin.
+                            // A gate owns the resume; disarm the freeze so this
+                            // arm doesn't spin.
                             state.clear_buffering_freeze(FreezeOutcome::AntiWedge);
+                            // B137 — but a `buffering_unpause` gate was opened
+                            // ON these very flags, and we have just given up on
+                            // them. Clearing the cause while leaving the effect
+                            // held the group for a SECOND full timeout: the
+                            // flags went at BUFFERING_MAX_MS and the gate ran
+                            // on to its own deadline waiting for acks from
+                            // members nobody is buffering on any more. Release
+                            // it here. Scoped to the gate the freeze itself
+                            // created — an unrelated Seek gate keeps its own
+                            // deadline, since its members owe a real ack.
+                            let owns = state
+                                .waiting
+                                .as_ref()
+                                .is_some_and(|w| w.reason == GateReason::BufferingUnpause);
+                            if owns {
+                                tracing::warn!(
+                                    group = %state.id,
+                                    reason = "buffering anti-wedge timeout",
+                                    "syncplay: releasing the gate opened on the flags just cleared"
+                                );
+                                state.resolve_waiting(GateOutcome::AntiWedge);
+                            }
                         }
                         state.persist();
                     }
