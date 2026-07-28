@@ -56,6 +56,13 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 /// How many release-group candidates to consider per search.
 const SEARCH_LIMIT: u32 = 8;
 
+/// `(album artist, album)` → the matched release-group id, or `None` when the
+/// search already came back empty.
+type AlbumMemo = Arc<Mutex<HashMap<(String, String), Option<String>>>>;
+
+/// The most recently downloaded cover, keyed by release-group id.
+type CoverSlot = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+
 /// Serialises outbound MusicBrainz calls to at most one per
 /// [`MB_MIN_INTERVAL`].
 ///
@@ -268,6 +275,31 @@ pub(crate) fn looks_like_image(bytes: &[u8]) -> bool {
     bytes.starts_with(JPEG) || bytes.starts_with(PNG) || bytes.starts_with(GIF)
 }
 
+/// Resolves a track's album cover.
+///
+/// Abstracted for the same reason [`crate::tmdb::PersonImageResolver`] is: the
+/// backfill pass that drives it must be testable against a deterministic fake,
+/// and MusicBrainz has no sandbox — its rate limit makes a live test in CI
+/// actively hostile to the service.
+pub trait AlbumArtResolver: Send + Sync {
+    /// Resolve and download the front cover for `(artist, album)`.
+    fn album_art(
+        &self,
+        artist: Option<&str>,
+        album: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<AlbumArt, AlbumArtMiss>> + Send;
+}
+
+impl AlbumArtResolver for MusicBrainzClient {
+    async fn album_art(
+        &self,
+        artist: Option<&str>,
+        album: Option<&str>,
+    ) -> Result<AlbumArt, AlbumArtMiss> {
+        MusicBrainzClient::album_art(self, artist, album).await
+    }
+}
+
 /// MusicBrainz + Cover Art Archive album-art resolver.
 ///
 /// Cheap to clone (shares the connection pool, the rate gate and the memo), so
@@ -280,11 +312,11 @@ pub struct MusicBrainzClient {
     /// search already came back empty. Memoising the misses matters as much as
     /// the hits: without it every track of an unmatched album re-runs a
     /// rate-limited search.
-    memo: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
+    memo: AlbumMemo,
     /// The most recently downloaded cover, keyed by release-group id. Album
     /// tracks arrive together, so a single slot turns a twelve-track album into
     /// one download without holding the whole library's artwork in memory.
-    last_cover: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    last_cover: CoverSlot,
 }
 
 impl MusicBrainzClient {
