@@ -919,6 +919,8 @@ async fn list_artists(
             )
         })
         .collect();
+    let mut items = items;
+    crate::api::jellyfin::images::stamp_synth_image_tags(&state, &mut items).await;
     let total = items.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
@@ -996,6 +998,8 @@ async fn list_albums(
             }
         })
         .collect();
+    let mut items = items;
+    crate::api::jellyfin::images::stamp_synth_image_tags(&state, &mut items).await;
     let total = items.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
@@ -3058,7 +3062,9 @@ async fn user_views(
     _user: AuthUser,
     _path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(crate::api::jellyfin::wire::json(&synth_views_body(&state)))
+    Ok(crate::api::jellyfin::wire::json(
+        &synth_views_body(&state).await,
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -3073,7 +3079,9 @@ async fn user_views_query(
     _user: AuthUser,
     _q: CiQuery<UserViewsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    Ok(crate::api::jellyfin::wire::json(&synth_views_body(&state)))
+    Ok(crate::api::jellyfin::wire::json(
+        &synth_views_body(&state).await,
+    ))
 }
 
 /// Synthesise a `Folder`/`CollectionFolder` view per configured
@@ -3083,8 +3091,8 @@ async fn user_views_query(
 ///
 /// Zero roots → single "All Media" placeholder so the sidebar still
 /// renders (used in tests that hit `AppState::new` without roots).
-fn synth_views_body(state: &AppState) -> serde_json::Value {
-    let views = library_views(state);
+async fn synth_views_body(state: &AppState) -> serde_json::Value {
+    let views = library_views(state).await;
     let count = views.len() as u32;
     serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
         items: views,
@@ -3104,16 +3112,23 @@ fn wire_collection_type(ct: &str) -> serde_json::Value {
     }
 }
 
-fn library_views(state: &AppState) -> Vec<serde_json::Value> {
+async fn library_views(state: &AppState) -> Vec<serde_json::Value> {
     // LIB-C1 — prefer the typed libraries reconciled from config (each
     // carries its own CollectionType). The wire_id is the same
     // library_id_for_root hash a plain root would yield, so client URLs
     // are stable whether or not a library is typed.
     let libraries = state.libraries();
     if !libraries.is_empty() {
-        return libraries
-            .iter()
-            .map(|lib| {
+        // Sequential rather than a `map`: each entry awaits its representative
+        // image. The first call warms the whole synth map, so the rest are memo
+        // hits — a handful of libraries, one scan.
+        let libs: Vec<_> = libraries.iter().cloned().collect();
+        drop(libraries);
+        let mut out = Vec::with_capacity(libs.len());
+        for lib in libs {
+            let image_tags =
+                crate::api::jellyfin::images::synth_primary_tag(state, &lib.wire_id).await;
+            out.push({
                 // B78/V38 — typed CollectionFolderDto (embeds the B68 UserData).
                 serde_json::to_value(CollectionFolderDto {
                     id: lib.wire_id.clone(),
@@ -3126,10 +3141,12 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
                     media_type: "Unknown",
                     is_folder: true,
                     user_data: UserItemDataDto::folder(&lib.wire_id, false, 0, false),
+                    image_tags,
                 })
                 .unwrap_or(serde_json::Value::Null)
-            })
-            .collect();
+            });
+        }
+        return out;
     }
     drop(libraries);
     if state.media_roots.is_empty() {
@@ -3156,6 +3173,7 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
                 media_type: "Unknown",
                 is_folder: true,
                 user_data: UserItemDataDto::folder(&id, false, 0, false),
+                image_tags: None,
             })
             .unwrap_or(serde_json::Value::Null)
         })
@@ -3165,6 +3183,7 @@ fn library_views(state: &AppState) -> Vec<serde_json::Value> {
 fn all_media_placeholder(server_id: &str) -> serde_json::Value {
     const ALL_MEDIA_ID: &str = "00000000000000000000000000000000";
     serde_json::to_value(CollectionFolderDto {
+        image_tags: None,
         id: ALL_MEDIA_ID.to_string(),
         name: "All Media".to_string(),
         server_id: server_id.to_string(),
@@ -3192,7 +3211,7 @@ async fn media_folders(
     state: web::Data<AppState>,
     _user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    let views = library_views(&state);
+    let views = library_views(&state).await;
     let count = views.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(views, count, 0))
 }
@@ -5183,7 +5202,7 @@ async fn fetch_item_dto(
     let numeric_id: Option<u64> = pharos_jellyfin_api::dto::parse_item_id(id_str);
     if numeric_id.is_none() {
         // T-fix-7 follow-up: synthesised library CollectionFolder ids.
-        if let Some(view) = library_view_for_id(state, id_str) {
+        if let Some(view) = library_view_for_id(state, id_str).await {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
         if id_str == "00000000000000000000000000000000" {
@@ -5326,8 +5345,9 @@ async fn fetch_item_dto(
 
 /// If `id_str` matches the library id of any configured root, return
 /// the same CollectionFolder JSON that `/Users/{u}/Views` emits.
-fn library_view_for_id(state: &AppState, id_str: &str) -> Option<serde_json::Value> {
+async fn library_view_for_id(state: &AppState, id_str: &str) -> Option<serde_json::Value> {
     library_views(state)
+        .await
         .into_iter()
         .find(|v| v.get("Id").and_then(|i| i.as_str()) == Some(id_str))
 }

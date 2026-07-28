@@ -2095,3 +2095,75 @@ async fn synth_album_and_artist_ids_resolve_as_single_items() {
     assert_eq!(v["Type"], "MusicArtist", "{v}");
     assert_eq!(v["Name"], "Kevin MacLeod");
 }
+
+/// A synth folder must ADVERTISE the image it can serve.
+///
+/// jellyfin-web gates the image fetch on `ImageTags.Primary`: with no tag it
+/// never calls `/Items/{id}/Images/Primary` and renders the flat coloured icon
+/// card. `SynthItemDto::folder` hardcoded `image_tags: None`, so every album,
+/// artist and library tile was an icon — while the endpoint behind them worked
+/// the whole time. The giveaway in the wild was an Elbow album whose twelve
+/// tracks all carry embedded art showing a blank tile, while the SAME art
+/// rendered in the now-playing bar, which requests the TRACK id and so carries
+/// a real tag.
+///
+/// Same class as B130 (`HasSegments` hardcoded false) and covered by V82: a
+/// capability field a client gates a request on is answered from the source
+/// that would serve the request.
+#[actix_web::test]
+async fn a_music_album_advertises_the_primary_image_it_can_serve() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    stores
+        .put(MediaItem {
+            id: 900,
+            path: "/m/elbow/01.mp3".into(),
+            title: "Starlings".into(),
+            kind: MediaKind::Audio,
+            // The art IS present — this is the case that rendered blank.
+            has_primary_art: true,
+            probe: pharos_core::MediaProbe {
+                album: Some("The Seldom Seen Kid".into()),
+                artist: Some("Elbow".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "test".into()));
+    let app = test::init_service(build_app(state)).await;
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Albums")
+            .insert_header(("X-Emby-Token", token.0.expose()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let album = &v["Items"][0];
+    assert_eq!(album["Type"], "MusicAlbum", "{v:?}");
+    let tag = album["ImageTags"]["Primary"].as_str();
+    assert!(
+        tag.is_some_and(|t| !t.is_empty()),
+        "an album whose tracks carry art must advertise ImageTags.Primary, or \
+         jellyfin-web never requests the image it could serve: {album:?}"
+    );
+}

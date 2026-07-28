@@ -580,6 +580,16 @@ pub struct CollectionFolderDto {
     pub media_type: &'static str,
     pub is_folder: bool,
     pub user_data: UserItemDataDto,
+    /// `{"Primary": "<tag>"}` when the library has a representative image.
+    ///
+    /// jellyfin-web GATES the request on this: with no `ImageTags.Primary` it
+    /// never calls `/Items/{id}/Images/Primary` and renders the library as a
+    /// flat coloured icon tile — the fallback, not a failure. Advertising the
+    /// tag is what turns "My Media" from icons into artwork. Omitted entirely
+    /// when the library has no usable image, so the fallback still applies
+    /// rather than the client fetching a guaranteed 404 per tile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A synthesised `Series` or `Season` folder (pharos stores no Series/Season
