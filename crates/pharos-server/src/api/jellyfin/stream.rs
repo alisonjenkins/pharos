@@ -637,6 +637,104 @@ async fn stream_audio(
 /// keeps every response small and fast. 8 MiB ≈ 10 s at 6 Mbps.
 const DIRECTPLAY_RANGE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Which shape of player asked for a DirectPlay body.
+///
+/// The two consume a byte-range response differently, so the delivery decision
+/// has to name which one it is answering. A browser `<video>`/MSE re-requests
+/// the next window when a response ends short of the file; a native
+/// progressive player (ExoPlayer on Android TV, AVPlayer) trusts the declared
+/// `Content-Length` of an open-ended `bytes=X-` and reports end-of-input to its
+/// extractor when the body runs out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectPlayClient {
+    Browser,
+    Native,
+}
+
+impl DirectPlayClient {
+    /// Same `Mozilla` User-Agent test PlaybackInfo uses for `is_web_client`, so
+    /// the negotiation and the delivery agree on what the client is.
+    fn of(req: &HttpRequest) -> Self {
+        let mozilla = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ua| ua.contains("Mozilla"));
+        if mozilla {
+            Self::Browser
+        } else {
+            Self::Native
+        }
+    }
+
+    /// Stable metric/log label. Bounded cardinality — two values, forever.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Browser => "browser",
+            Self::Native => "native",
+        }
+    }
+}
+
+/// What `deliver_stream` actually put on the wire. Recorded for EVERY branch —
+/// the whole-file open is as interesting as the capped window, because the bug
+/// this exists to expose is "which of these did the player get?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectPlayDelivery {
+    /// `NamedFile` served the request whole (no range, or a range small enough
+    /// / exotic enough to defer to actix-files' own range handling).
+    Whole,
+    /// An over-large open-ended range was answered with a bounded window.
+    CappedWindow,
+    /// A `StartTimeTicks` resume with no `Range`, cut at a byte offset on a
+    /// self-framing container.
+    TicksResume,
+}
+
+impl DirectPlayDelivery {
+    /// Stable metric/log label. Bounded cardinality.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::CappedWindow => "capped_window",
+            Self::TicksResume => "ticks_resume",
+        }
+    }
+}
+
+/// Record the DirectPlay delivery decision: its inputs (client shape, the
+/// `Range` the player asked for, the file size), its verdict, and the window
+/// actually served. Both success shapes go through here, so a truncated
+/// response can be told from a whole one by query rather than by inference —
+/// the Android TV give-up (B140) was invisible precisely because this path
+/// logged nothing while PlaybackInfo beside it logged fourteen fields.
+fn record_directplay_delivery(
+    item: &MediaItem,
+    client: DirectPlayClient,
+    range_header: Option<&str>,
+    total: u64,
+    delivery: DirectPlayDelivery,
+    served: Option<super::seek::ContentRange>,
+) {
+    tracing::info!(
+        media.id = item.id,
+        client = client.label(),
+        range = range_header.unwrap_or("-"),
+        source.total_bytes = total,
+        delivery = delivery.label(),
+        served.offset = served.map(|r| r.offset()).unwrap_or(0),
+        served.len = served.map(|r| r.content_length()).unwrap_or(total),
+        served.truncated = served.is_some_and(|r| r.end() + 1 < r.total()),
+        "directplay: delivery decision"
+    );
+    metrics::counter!(
+        "pharos_directplay_delivery_total",
+        "delivery" => delivery.label(),
+        "client" => client.label(),
+    )
+    .increment(1);
+}
+
 /// Decide whether a DirectPlay `Range` should be answered as a *capped* window
 /// rather than deferred whole to `NamedFile`. `Some` only for a single
 /// `bytes=START-…` range whose served length exceeds `cap`; `None` for small,
@@ -671,6 +769,18 @@ async fn deliver_stream(
     let item = load_item(state, id_str).await?;
     let has_range = req.headers().contains_key(header::RANGE);
     let start_ticks = parse_start_time_ticks(req.query_string());
+    let client = DirectPlayClient::of(req);
+    let range_header = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // Stat once up front so every delivery branch can report the file size it
+    // was deciding against, including the whole-file one.
+    let total = tokio::fs::metadata(&item.path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     if !has_range && start_ticks > 0 {
         // A StartTimeTicks resume with no Range can only be honoured by cutting
@@ -688,6 +798,14 @@ async fn deliver_stream(
         let tolerance = super::seek::CutTolerance::for_source(&item);
         if let Some(witness) = super::seek::ResyncWitness::of(tolerance) {
             if let Some(offset) = byte_offset_from_ticks(&item, start_ticks).await {
+                record_directplay_delivery(
+                    &item,
+                    client,
+                    range_header.as_deref(),
+                    total,
+                    DirectPlayDelivery::TicksResume,
+                    super::seek::ContentRange::from_offset(offset, total),
+                );
                 return serve_from_offset(&item, offset, req, clock, witness).await;
             }
         }
@@ -701,27 +819,28 @@ async fn deliver_stream(
     // return a prefix of the requested bytes), so — unlike the StartTimeTicks
     // time→byte cut above — it needs no `ResyncWitness`. Small / suffix / multi
     // ranges fall through to `NamedFile`.
-    if has_range {
-        if let Some(range_header) = req
-            .headers()
-            .get(header::RANGE)
-            .and_then(|v| v.to_str().ok())
-        {
-            let total = tokio::fs::metadata(&item.path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if let Some(window) = capped_window(range_header, total, DIRECTPLAY_RANGE_CAP_BYTES) {
-                tracing::debug!(
-                    media.id = item.id,
-                    range = range_header,
-                    content_range = %String::from_utf8_lossy(window.header_value().as_bytes()),
-                    "DirectPlay range capped to window"
-                );
-                return serve_content_range(&item, window, req, clock).await;
-            }
+    if let Some(rh) = range_header.as_deref() {
+        if let Some(window) = capped_window(rh, total, DIRECTPLAY_RANGE_CAP_BYTES) {
+            record_directplay_delivery(
+                &item,
+                client,
+                Some(rh),
+                total,
+                DirectPlayDelivery::CappedWindow,
+                Some(window),
+            );
+            return serve_content_range(&item, window, req, clock).await;
         }
     }
+
+    record_directplay_delivery(
+        &item,
+        client,
+        range_header.as_deref(),
+        total,
+        DirectPlayDelivery::Whole,
+        None,
+    );
 
     let file = NamedFile::open_async(&item.path)
         .await
@@ -1196,5 +1315,65 @@ mod tests {
         );
         assert_eq!(parse_max_streaming_bitrate(""), None);
         assert_eq!(parse_max_streaming_bitrate("MaxStreamingBitrate=abc"), None);
+    }
+
+    // The two label sets are a dashboard contract: a rename silently breaks
+    // any panel or alert built on `pharos_directplay_delivery_total`, and two
+    // variants sharing a string would merge distinct outcomes into one series.
+    #[::core::prelude::v1::test]
+    fn directplay_delivery_labels_are_distinct_and_stable() {
+        let all = [
+            DirectPlayDelivery::Whole,
+            DirectPlayDelivery::CappedWindow,
+            DirectPlayDelivery::TicksResume,
+        ];
+        let labels: std::collections::BTreeSet<_> = all.iter().map(|d| d.label()).collect();
+        assert_eq!(labels.len(), all.len(), "delivery labels must be distinct");
+        assert_eq!(DirectPlayDelivery::Whole.label(), "whole");
+        assert_eq!(DirectPlayDelivery::CappedWindow.label(), "capped_window");
+        assert_eq!(DirectPlayDelivery::TicksResume.label(), "ticks_resume");
+    }
+
+    #[::core::prelude::v1::test]
+    fn directplay_client_labels_are_distinct_and_stable() {
+        assert_ne!(
+            DirectPlayClient::Browser.label(),
+            DirectPlayClient::Native.label()
+        );
+        assert_eq!(DirectPlayClient::Browser.label(), "browser");
+        assert_eq!(DirectPlayClient::Native.label(), "native");
+    }
+
+    // The classifier is the input to the capping decision, so it has to agree
+    // with what PlaybackInfo called the same client. jellyfin-web is Mozilla;
+    // the Android TV SDK and its OkHttp fetches are not.
+    #[actix_web::test]
+    async fn directplay_client_classifies_browser_and_native_user_agents() {
+        let browser = actix_web::test::TestRequest::get()
+            .insert_header((
+                header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/152.0",
+            ))
+            .to_http_request();
+        assert_eq!(DirectPlayClient::of(&browser), DirectPlayClient::Browser);
+
+        for ua in [
+            "Jellyfin Android TV/0.19.9 via jellyfin-sdk-kotlin (OkHttp/4.12.0)",
+            "okhttp/4.12.0",
+        ] {
+            let native = actix_web::test::TestRequest::get()
+                .insert_header((header::USER_AGENT, ua))
+                .to_http_request();
+            assert_eq!(
+                DirectPlayClient::of(&native),
+                DirectPlayClient::Native,
+                "{ua} must classify as a native player"
+            );
+        }
+
+        // No User-Agent at all is a native player, not a browser — a browser
+        // always sends one.
+        let bare = actix_web::test::TestRequest::get().to_http_request();
+        assert_eq!(DirectPlayClient::of(&bare), DirectPlayClient::Native);
     }
 }
