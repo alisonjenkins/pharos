@@ -36,12 +36,12 @@ Single Rust workspace. Paths are repo-relative:
 **Purpose**: the rendition identity, and the cache safety that MUST land before
 hardware becomes eligible. No user story can start until this phase completes.
 
-- [ ] T003 Add `RenditionKey` (derive from `TranscodeOptions` with `start_position_ticks` / `duration_ticks` excluded, per data-model.md) in `crates/pharos-transcode/src/options.rs`.
-- [ ] T004 Test in `crates/pharos-transcode/src/options.rs`: two options differing ONLY in start/duration produce the SAME key; options differing in any encode-affecting field (video, container, bitrate, audio index, burn index/flag, frame rate) produce DIFFERENT keys. Verify it fails if a field is dropped from the derivation.
-- [ ] T005 Add a `shared_init_fmp4(opts) -> bool` predicate in `crates/pharos-transcode/src/device.rs` expressing the hazard by CONTAINER contract, not by codec list (R6), and test that H264+Fmp4 and a hypothetical H265+Fmp4 both qualify while mpegts does not.
-- [ ] T006 Include the producing device in the on-disk segment identity in `crates/pharos-cache/src/hls_cache.rs` (R3).
-- [ ] T007 Bump `HLS_GEN_VERSION` in `crates/pharos-cache/src/hls_cache.rs` so the existing CPU-era cache is discarded before any hardware init can be served over it.
-- [ ] T008 Test in `crates/pharos-cache/src/hls_cache.rs`: a segment cached as produced by device A is NOT returned for a lookup whose rendition is pinned to device B (contract test 4). Verify it fails without T006.
+- [X] T003 Add `RenditionKey` (derive from `TranscodeOptions` with `start_position_ticks` / `duration_ticks` excluded, per data-model.md) in `crates/pharos-transcode/src/options.rs`.
+- [X] T004 Test in `crates/pharos-transcode/src/options.rs`: two options differing ONLY in start/duration produce the SAME key; options differing in any encode-affecting field (video, container, bitrate, audio index, burn index/flag, frame rate) produce DIFFERENT keys. Verify it fails if a field is dropped from the derivation.
+- [X] T005 Add a `shared_init_fmp4(opts) -> bool` predicate in `crates/pharos-transcode/src/device.rs` expressing the hazard by CONTAINER contract, not by codec list (R6), and test that H264+Fmp4 and a hypothetical H265+Fmp4 both qualify while mpegts does not.
+- [X] T006 (SUPERSEDED by R8 — a deterministic device makes cached bytes unambiguous; no cache change needed) — Include the producing device in the on-disk segment identity in `crates/pharos-cache/src/hls_cache.rs` (R3).
+- [X] T007 (SUPERSEDED by R8 — no cache identity change, so no generation bump and no 40 GiB regeneration) — Bump `HLS_GEN_VERSION` in `crates/pharos-cache/src/hls_cache.rs` so the existing CPU-era cache is discarded before any hardware init can be served over it.
+- [X] T008 (SUPERSEDED by R8 — nothing can cross pins when the device is a pure function of the rendition) — Test in `crates/pharos-cache/src/hls_cache.rs`: a segment cached as produced by device A is NOT returned for a lookup whose rendition is pinned to device B (contract test 4). Verify it fails without T006.
 
 **Checkpoint**: identity and cache are safe. Hardware is still ineligible — nothing user-visible has changed yet, by design.
 
@@ -61,14 +61,14 @@ is unsafe until this exists. See Dependencies.
 
 ### Tests for User Story 2
 
-- [ ] T009 [US2] Contract test 1 in `crates/pharos-transcode/src/scheduler.rs`: with a synthetic device table, submit N jobs for one `RenditionKey` while the pinned device's permits are exhausted and CPU is free; assert every dispatch names the pinned device and none spills. Verify RED before T011.
-- [ ] T010 [P] [US2] Test in `crates/pharos-transcode/src/scheduler.rs` that a job whose options are NOT shared-init fMP4 still load-balances freely across devices (FR-006, contract test 3).
+- [X] T009 [US2] Contract test 1 in `crates/pharos-transcode/src/scheduler.rs`: with a synthetic device table, submit N jobs for one `RenditionKey` while the pinned device's permits are exhausted and CPU is free; assert every dispatch names the pinned device and none spills. Verify RED before T011.
+- [X] T010 [P] [US2] Test in `crates/pharos-transcode/src/scheduler.rs` that a job whose options are NOT shared-init fMP4 still load-balances freely across devices (FR-006, contract test 3).
 
 ### Implementation for User Story 2
 
-- [ ] T011 [US2] Add the pin map (`RenditionKey → RenditionPin`) to the scheduler actor's own state in `crates/pharos-transcode/src/scheduler.rs` — actor-owned, no shared lock (constitution V).
-- [ ] T012 [US2] In `place()` in `crates/pharos-transcode/src/scheduler.rs`: for a shared-init fMP4 job, record the pin on first placement and restrict candidates to the pinned device thereafter; when its permits are busy, QUEUE rather than widen the candidate set.
-- [ ] T013 [US2] Add pin eviction on idle TTL in `crates/pharos-transcode/src/scheduler.rs` so a finished rendition does not hold a device preference indefinitely.
+- [X] T011 (SUPERSEDED by R8 — no pin map; the device is computed, not stored) — [US2] Add the pin map (`RenditionKey → RenditionPin`) to the scheduler actor's own state in `crates/pharos-transcode/src/scheduler.rs` — actor-owned, no shared lock (constitution V).
+- [X] T012 [US2] In `place()` in `crates/pharos-transcode/src/scheduler.rs`: for a shared-init fMP4 job, record the pin on first placement and restrict candidates to the pinned device thereafter; when its permits are busy, QUEUE rather than widen the candidate set.
+- [X] T013 (SUPERSEDED by R8 — nothing to evict) — [US2] Add pin eviction on idle TTL in `crates/pharos-transcode/src/scheduler.rs` so a finished rendition does not hold a device preference indefinitely.
 
 **Checkpoint**: the guarantee is enforced by adherence rather than by exclusion — still with hardware ineligible, so this is provably a no-op in production until Phase 5.
 
@@ -84,12 +84,12 @@ request errors and no CPU dispatch occurs.
 
 ### Tests for User Story 3
 
-- [ ] T014 [US3] Contract test 2 in `crates/pharos-transcode/src/scheduler.rs`: with a rendition pinned to a hardware device, set that device into cooldown and submit the next segment; assert `SchedError` is returned and assert NO job is dispatched to CPU. Verify RED before T015.
+- [X] T014 [US3] Contract test 2 in `crates/pharos-transcode/src/scheduler.rs`: with a rendition pinned to a hardware device, set that device into cooldown and submit the next segment; assert `SchedError` is returned and assert NO job is dispatched to CPU. Verify RED before T015.
 
 ### Implementation for User Story 3
 
 - [ ] T015 [US3] On pinned-device cooldown or repeated transient failure in `crates/pharos-transcode/src/scheduler.rs`, invalidate the pin and return `SchedError::Failed` rather than re-placing on another device (R2, FR-004).
-- [ ] T016 [US3] Ensure a subsequent submit for the same key after invalidation re-pins from scratch (the client has restarted the stream and re-fetched the init), with a test in `crates/pharos-transcode/src/scheduler.rs`.
+- [X] T016 (SUPERSEDED by R8 — a restart recomputes the same device, so there is no re-pin to test) — [US3] Ensure a subsequent submit for the same key after invalidation re-pins from scratch (the client has restarted the stream and re-fetched the init), with a test in `crates/pharos-transcode/src/scheduler.rs`.
 
 **Checkpoint**: both #114 guards are in place and tested. Only now is it safe to let hardware in.
 
@@ -104,12 +104,12 @@ device, and every one of its segments comes from that device.
 
 ### Tests for User Story 1
 
-- [ ] T017 [US1] Test in `crates/pharos-transcode/src/device.rs` that `eligible_for` on H264+Fmp4 now lists hardware FIRST then CPU (replacing today's `&[DeviceId::Cpu]` assertion in `h264_fmp4_cmaf_routes_cpu_only_but_mpegts_keeps_hardware`), and that mpegts H264 is unchanged.
-- [ ] T018 [US1] Update the existing test named `h264_fmp4_cmaf_routes_cpu_only_but_mpegts_keeps_hardware` in `crates/pharos-transcode/src/device.rs` — rename it and rewrite its comment to explain that the one-encoder guarantee now comes from the pin, citing issue #114 and this spec so the reasoning is not lost.
+- [X] T017 [US1] Test in `crates/pharos-transcode/src/device.rs` that `eligible_for` on H264+Fmp4 now lists hardware FIRST then CPU (replacing today's `&[DeviceId::Cpu]` assertion in `h264_fmp4_cmaf_routes_cpu_only_but_mpegts_keeps_hardware`), and that mpegts H264 is unchanged.
+- [X] T018 [US1] Update the existing test named `h264_fmp4_cmaf_routes_cpu_only_but_mpegts_keeps_hardware` in `crates/pharos-transcode/src/device.rs` — rename it and rewrite its comment to explain that the one-encoder guarantee now comes from the pin, citing issue #114 and this spec so the reasoning is not lost.
 
 ### Implementation for User Story 1
 
-- [ ] T019 [US1] Remove the `Some(VideoCodec::H264) if opts.container == Container::Fmp4 => false` arm from `device_supports` in `crates/pharos-transcode/src/device.rs`, replacing the exclusion with the `shared_init_fmp4` predicate used by the scheduler's pin logic.
+- [X] T019 [US1] Remove the `Some(VideoCodec::H264) if opts.container == Container::Fmp4 => false` arm from `device_supports` in `crates/pharos-transcode/src/device.rs`, replacing the exclusion with the `shared_init_fmp4` predicate used by the scheduler's pin logic.
 
 **Checkpoint**: SC-001/SC-002 become measurable. This is the MVP boundary — the feature is functionally complete here.
 

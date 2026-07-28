@@ -690,15 +690,20 @@ impl std::fmt::Debug for HlsSegmentCache {
 // That holds only while the RULE is fixed; the deploy that introduced the rule
 // is itself the moment it changes. Observed live: 1489 cache hits (CPU-era)
 // against 11 fresh NVENC prefetch encodes for one episode.
-// 14: the CMAF hardware change is REVERTED, which flips the assignment rule
-// back to CPU-only. By V89 that makes the NVENC-era segments cached under 13
-// stale in the same way the libx264-era ones were under 12 — same hazard,
-// opposite direction.
+// 15: the CMAF hardware change is RE-LANDED, flipping the assignment rule from
+// CPU-only back to a deterministic per-rendition device. Third move of this
+// rule, third bump: by V89 every artefact cached under the previous assignment
+// is stale the moment the rule changes, in EITHER direction — the 14 bump was
+// the revert, this one is the re-land. Without it the ~5000 libx264 CMAF
+// segments cached under 14 would be served beneath an NVENC-produced init,
+// which is issue #114 reached from disk instead of from the load balancer.
 /// Public because the HLS playlists embed it in every init/segment URI: a
 /// browser caches those `immutable` for a year, so a generation change must
 /// change the URL or clients keep serving themselves the previous
-/// generation's init (see `hls::rendition_qs`).
-pub const HLS_GEN_VERSION: u32 = 14;
+/// generation's init (see `hls::rendition_qs`). That property is what makes
+/// this re-land safe where the first attempt was not: the bump is now visible
+/// to the CLIENT cache, not only to the server's.
+pub const HLS_GEN_VERSION: u32 = 15;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
