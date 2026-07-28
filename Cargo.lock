@@ -3127,6 +3127,8 @@ dependencies = [
  "actix-ws",
  "dashmap",
  "futures-util",
+ "metrics",
+ "metrics-util",
  "pharos-core",
  "serde",
  "serde_json",

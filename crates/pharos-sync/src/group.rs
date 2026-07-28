@@ -638,6 +638,58 @@ impl GateReason {
     }
 }
 
+/// How a readiness gate ENDED. Every gate terminates in exactly one of these,
+/// so the four buckets sum to the number of gates opened — if they ever fail
+/// to, a code path is dropping a gate without saying so.
+///
+/// The bucket that matters is `AntiWedge`: it is the difference between "the
+/// group waited and then everyone was ready" and "the group hung until a
+/// timeout rescued it". Those were indistinguishable before this existed,
+/// which is why the 2026-07-28 wedge had to be found by reading raw lines
+/// rather than by a query.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateOutcome {
+    /// Every member acked. The healthy path.
+    Resolved,
+    /// The `READY_TIMEOUT_MS` anti-wedge fired: at least one member never
+    /// acked and the group was force-started without it. Always a defect,
+    /// even though the group recovers.
+    AntiWedge,
+    /// A deliberate play/pause overrode the gate before it could resolve.
+    Superseded,
+    /// A new gate opened over this one (e.g. a seek during a queue change).
+    Replaced,
+}
+
+impl GateOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            GateOutcome::Resolved => "resolved",
+            GateOutcome::AntiWedge => "anti_wedge",
+            GateOutcome::Superseded => "superseded",
+            GateOutcome::Replaced => "replaced",
+        }
+    }
+}
+
+/// Record a gate's terminal outcome. One call per gate, on every path that
+/// ends one — the counter is only meaningful if it is exhaustive.
+fn record_gate_outcome(reason: GateReason, opened_at: tokio::time::Instant, outcome: GateOutcome) {
+    let waited = opened_at.elapsed();
+    metrics::counter!(
+        "pharos_syncplay_gate_total",
+        "reason" => reason.label(),
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "pharos_syncplay_gate_wait_seconds",
+        "reason" => reason.label(),
+        "outcome" => outcome.label(),
+    )
+    .record(waited.as_secs_f64());
+}
+
 /// The readiness gate: while `Some`, the group is in `Waiting` and will not
 /// broadcast the pending `Play`/`Pause` until every member in `pending` has
 /// reported `Ready` (or `deadline` fires — the anti-wedge timeout).
@@ -647,6 +699,10 @@ struct WaitingGate {
     /// it too — knowing a gate opened is useless without knowing which gate
     /// the later outcome belongs to.
     reason: GateReason,
+    /// When the gate opened, for `waited_ms` on its outcome. Monotonic, not
+    /// persisted: a gate restored on another pod re-arms from the takeover,
+    /// since an instant from another process's clock means nothing here.
+    opened_at: tokio::time::Instant,
     /// B38 — server-clock instant (the broadcast command's `at_server_ms`)
     /// before which NO legitimate `Ready` can exist: clients execute the
     /// command AT that time, so an earlier Ready is a spurious player
@@ -1040,6 +1096,20 @@ impl GroupState {
         if self.members.is_empty() {
             return;
         }
+        // A gate opening over a live one ends that one. Account for it rather
+        // than dropping it silently, or the outcome counter stops summing to
+        // the number of gates opened and the `anti_wedge` share is understated.
+        if let Some(prev) = self.waiting.take() {
+            tracing::info!(
+                group = %self.id,
+                gate = prev.reason.label(),
+                superseded_by = reason.label(),
+                waited_ms = prev.opened_at.elapsed().as_millis() as u64,
+                pending = prev.pending.len(),
+                "syncplay: readiness gate replaced"
+            );
+            record_gate_outcome(prev.reason, prev.opened_at, GateOutcome::Replaced);
+        }
         // Name the members being waited ON, not just how many. `pending=1` was
         // the whole record of the 2026-07-28 wedge: it could not say WHICH
         // member held the group, so answering "why did play do nothing?"
@@ -1059,6 +1129,7 @@ impl GroupState {
         self.waiting = Some(WaitingGate {
             pending,
             reason,
+            opened_at: tokio::time::Instant::now(),
             resume_playing,
             position_ms,
             not_before_server_ms,
@@ -1068,7 +1139,7 @@ impl GroupState {
         // Nobody to wait on (e.g. every member opted out of waits): resolve
         // straight away — no Waiting broadcast, no timeout detour.
         if self.waiting.as_ref().is_some_and(|w| w.pending.is_empty()) {
-            self.resolve_waiting();
+            self.resolve_waiting(GateOutcome::Resolved);
             return;
         }
         self.broadcast(ServerMsg::StateUpdate {
@@ -1080,16 +1151,23 @@ impl GroupState {
     /// Resolve the readiness gate: schedule the pending `Play` (or settle
     /// `Paused`) and broadcast it. Called when the last member reports
     /// `Ready`, or when the anti-wedge timeout fires.
-    fn resolve_waiting(&mut self) {
+    fn resolve_waiting(&mut self, outcome: GateOutcome) {
         let Some(w) = self.waiting.take() else {
             return;
         };
+        // `outcome` distinguishes "everyone acked" from "the anti-wedge fired
+        // and we started without them" — the same call resolves both, and the
+        // second is a defect that used to be indistinguishable from the first.
         tracing::info!(
             group = %self.id,
             resume_playing = w.resume_playing,
             position_ms = w.position_ms,
+            gate = w.reason.label(),
+            outcome = outcome.label(),
+            waited_ms = w.opened_at.elapsed().as_millis() as u64,
             "syncplay: readiness gate resolved"
         );
+        record_gate_outcome(w.reason, w.opened_at, outcome);
         if w.resume_playing {
             self.start_playing(w.position_ms, "Ready");
         } else {
@@ -1107,6 +1185,26 @@ impl GroupState {
                 reason: "Ready".into(),
             });
         }
+    }
+
+    /// Cancel the open gate because a deliberate play/pause overrode it. Named
+    /// rather than `waiting = None` so the gate is accounted for: a silently
+    /// dropped gate is a gate whose wait time and reason never reach the
+    /// counter, which understates how often gates are opened needlessly.
+    fn cancel_gate(&mut self, outcome: GateOutcome) {
+        let Some(w) = self.waiting.take() else {
+            return;
+        };
+        tracing::info!(
+            group = %self.id,
+            gate = w.reason.label(),
+            outcome = outcome.label(),
+            waited_ms = w.opened_at.elapsed().as_millis() as u64,
+            pending = w.pending.len(),
+            pending_members = ?w.pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+            "syncplay: readiness gate cancelled"
+        );
+        record_gate_outcome(w.reason, w.opened_at, outcome);
     }
 
     /// Ack the open readiness gate for a member that is PRESENT and signalling
@@ -1152,7 +1250,7 @@ impl GroupState {
             "syncplay: readiness gate ack"
         );
         if resolved {
-            self.resolve_waiting();
+            self.resolve_waiting(GateOutcome::Resolved);
         }
         resolved
     }
@@ -1387,6 +1485,7 @@ impl GroupState {
         self.waiting = ps.waiting.map(|w| WaitingGate {
             pending: w.pending.into_iter().collect(),
             reason: GateReason::from_label(&w.reason),
+            opened_at: tokio::time::Instant::now(),
             resume_playing: w.resume_playing,
             position_ms: w.position_ms,
             // Not persisted: the spurious-Ready window is ~lead-sized (≤2.2s)
@@ -1624,10 +1723,13 @@ impl GroupHandle {
                                 group = %state.id,
                                 pending = ?w.pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
                                 reason = "anti-wedge timeout",
+                                gate = w.reason.label(),
+                                waited_ms = w.opened_at.elapsed().as_millis() as u64,
+                                frozen_for_buffering = state.group_paused_due_to_buffering,
                                 "syncplay: readiness gate timed out; starting without stragglers"
                             );
                         }
-                        state.resolve_waiting();
+                        state.resolve_waiting(GateOutcome::AntiWedge);
                         state.persist();
                     }
                     _ = async {
@@ -1775,7 +1877,7 @@ fn release_gate_holds_for(state: &mut GroupState, member_id: MemberId) {
             && state.server_ms_now() >= w.not_before_server_ms
     });
     if resolve {
-        state.resolve_waiting();
+        state.resolve_waiting(GateOutcome::Resolved);
     }
     // B55 — the same member must not wedge the V19 buffering freeze either. If
     // the group is frozen for buffering and this was the last member still
@@ -1993,7 +2095,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             let at_server_ms = server_ms + state.lead_time_ms();
             // B — a deliberate play overrides any pending gate + freeze; clear
             // them so a later resolve_waiting / anti-wedge can't contradict it.
-            state.waiting = None;
+            state.cancel_gate(GateOutcome::Superseded);
             state.clear_buffering_freeze();
             // C — anchor at the scheduled start instant, not `now` (see
             // start_playing): clients play `position_ms` at `at_server_ms`.
@@ -2023,7 +2125,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // survive this pause and, on a follower's later Ready or the 30s
             // anti-wedge, `resolve_waiting → start_playing` would override the
             // pause and force the group back to Playing. Mirrors PauseShared.
-            state.waiting = None;
+            state.cancel_gate(GateOutcome::Superseded);
             // A deliberate pause supersedes an in-flight V19 buffering freeze.
             state.clear_buffering_freeze();
             // Freeze position at the moment we paused so late joiners
@@ -2209,7 +2311,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // a late joiner gets the correct still-frame, then broadcast.
             let at_server_ms = state.server_ms_now() + state.lead_time_ms();
             // Cancel any pending readiness gate — we're pausing, not starting.
-            state.waiting = None;
+            state.cancel_gate(GateOutcome::Superseded);
             // A deliberate pause supersedes an in-flight V19 buffering freeze:
             // clear its bookkeeping so a member's later Ready / the anti-wedge
             // timer can't force-resume the group out from under this pause.
@@ -2583,6 +2685,26 @@ mod tests {
         }
         assert_eq!(GateReason::from_label(""), GateReason::Restored);
         assert_eq!(GateReason::from_label("who_knows"), GateReason::Restored);
+    }
+
+    /// The `outcome` label on `pharos_syncplay_gate_total`. `anti_wedge` is
+    /// the alarm value — if it ever collided with `resolved`, a hanging group
+    /// would sum into the healthy bucket and the alert would never fire.
+    #[test]
+    fn gate_outcome_labels_are_distinct_and_stable() {
+        const ALL: [GateOutcome; 4] = [
+            GateOutcome::Resolved,
+            GateOutcome::AntiWedge,
+            GateOutcome::Superseded,
+            GateOutcome::Replaced,
+        ];
+        assert_eq!(GateOutcome::Resolved.label(), "resolved");
+        assert_eq!(GateOutcome::AntiWedge.label(), "anti_wedge");
+        assert_eq!(GateOutcome::Superseded.label(), "superseded");
+        assert_eq!(GateOutcome::Replaced.label(), "replaced");
+
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), ALL.len(), "gate outcomes collide: {labels:?}");
     }
 
     /// B24 — `snapshot_contains_member` recognises a member id in a REAL
@@ -4327,6 +4449,84 @@ mod tests {
             }
         }
         assert!(m1_play, "the leader that pressed play must receive Play");
+    }
+
+    /// The signal that a group HUNG, as opposed to waiting and then proceeding
+    /// normally. Both end in `resolve_waiting`, and before `GateOutcome` they
+    /// were indistinguishable — a group rescued by the 30s anti-wedge looked
+    /// exactly like one whose members all acked promptly. That is why the
+    /// 2026-07-28 wedge had to be found by reading raw log lines: no query
+    /// could count it. `outcome="anti_wedge"` is the alarm.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_that_times_out_is_counted_as_anti_wedge() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Thread-local: the actor task shares this thread under the
+        // current-thread runtime, so its emissions land in this snapshot.
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Open a gate and let NOBODY ack it.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "precondition: the gate must actually be open"
+        );
+
+        tokio::time::advance(Duration::from_millis(READY_TIMEOUT_MS + 1_000)).await;
+        tokio::task::yield_now().await;
+        let _ = snapshot_of(&h).await;
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_syncplay_gate_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                if labels.iter().any(|l| l == "outcome=anti_wedge") {
+                    Some((labels, v))
+                } else {
+                    None
+                }
+            });
+
+        let (labels, value) = found.expect(
+            "a gate resolved by the anti-wedge timeout must emit \
+             pharos_syncplay_gate_total{outcome=\"anti_wedge\"} — it is the only \
+             signal that the group hung rather than waited",
+        );
+        assert!(
+            labels.contains(&"reason=seek".to_string()),
+            "the outcome must name WHICH gate hung; got {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one timed-out gate, got {value:?}"
+        );
     }
 
     /// B58 — scrubbing the timeline while playing sends a burst of Seeks. Each
