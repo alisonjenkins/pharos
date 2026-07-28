@@ -2479,6 +2479,7 @@ pub(super) fn prewarm_cold_start(
     subtitle_stream_index: Option<u32>,
     video_bitrate_cap: Option<u64>,
     resume_ticks: u64,
+    demuxed_cmaf: bool,
 ) {
     if state.hls.is_none() {
         return;
@@ -2513,6 +2514,8 @@ pub(super) fn prewarm_cold_start(
             prewarm.count = COLD_START_PREWARM_SEGS,
             prewarm.total_segs = total_segs,
             resumed = resume_ticks > 0,
+            demuxed_cmaf,
+            rendition = if demuxed_cmaf { "h264cmaf" } else { "mpegts" },
             "cold-start prewarm: warming from the resume position"
         );
         let Some(base) = base else {
@@ -2524,19 +2527,44 @@ pub(super) fn prewarm_cold_start(
             let session = session.clone();
             actix_web::rt::spawn(async move {
                 let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-                let mut opts = build_segment_opts(
-                    Some(session),
-                    &item,
-                    seg,
-                    audio_stream_index,
-                    subtitle_stream_index,
-                );
-                // Mirror serve_segment's URL-carried VideoBitrate cap + clamp so
-                // the prewarmed key matches the client's eventual request.
-                if let (Some(cap), Some(cur)) = (video_bitrate_cap, opts.video_bitrate_bps) {
-                    opts.video_bitrate_bps =
-                        Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
-                }
+                // B139 — warm the rendition THIS client will actually fetch. A
+                // browser on h264 is served the demuxed all-fMP4 master and
+                // never requests an mpegts segment, so warming one spent three
+                // background encodes on bytes nobody would read AND left the
+                // cold ffmpeg spawn sitting on the first request the prewarm
+                // exists to cover — the same inversion as B136, by container
+                // rather than by position.
+                let mut opts = if demuxed_cmaf {
+                    // Through the SAME function the CMAF route uses (V92): a
+                    // key derived independently drifts from the key requested,
+                    // and both paths just produce segments, so the drift is
+                    // invisible.
+                    fmp4_segment_opts_resolved(
+                        &item,
+                        seg,
+                        SegmentVideo::H264,
+                        subtitle_stream_index,
+                        video_bitrate_cap,
+                        Some(session.burn_subtitle_indices.clone()),
+                    )
+                } else {
+                    let mut opts = build_segment_opts(
+                        Some(session),
+                        &item,
+                        seg,
+                        audio_stream_index,
+                        subtitle_stream_index,
+                    );
+                    // Mirror serve_segment's URL-carried VideoBitrate cap +
+                    // clamp so the prewarmed key matches the client's eventual
+                    // request. The CMAF arm needs no equivalent: its cap is
+                    // folded in by `fmp4_segment_opts_resolved` itself.
+                    if let (Some(cap), Some(cur)) = (video_bitrate_cap, opts.video_bitrate_bps) {
+                        opts.video_bitrate_bps =
+                            Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
+                    }
+                    opts
+                };
                 // Same per-segment burn gating serve_segment applies before the
                 // cache read (the burn index is part of the key).
                 gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
@@ -4087,6 +4115,77 @@ mod tests {
             ..Default::default()
         });
         item
+    }
+
+    /// B139 — the prewarm must warm the CONTAINER the client fetches, and the
+    /// key it builds must be the key the CMAF route asks for.
+    ///
+    /// Warming mpegts for a browser is the B136 inversion by container rather
+    /// than position: three background encodes spent on bytes nobody reads,
+    /// while the cold ffmpeg spawn lands on the very first request the prewarm
+    /// exists to absorb. Both halves of the waste, on the commonest path.
+    ///
+    /// Asserting "it is fMP4" alone would be too weak — a warmed key that
+    /// differs in any encode-affecting field is just as unreachable as an
+    /// mpegts one, and equally silent (V92: both paths simply produce
+    /// segments). So this pins the whole `SegmentOpts` the prewarm builds
+    /// against the one `h264cmaf_segment` builds from identical inputs.
+    #[::core::prelude::v1::test]
+    fn a_browser_prewarm_builds_the_key_the_cmaf_route_requests() {
+        let item = item_with_subs();
+        let seg = 7;
+        let cap = Some(3_000_000u64);
+
+        // The prewarm and the CMAF route now call THIS function with the same
+        // inputs, so key equality holds by construction rather than by
+        // coincidence — which is the point of the refactor, and also why
+        // asserting `warmed == served` here would be tautology dressed as a
+        // test. What is worth pinning is the shape that makes the key
+        // reachable, and the cap folding that the previous prewarm did
+        // differently (it post-clamped, this folds via effective_video_bitrate
+        // — the drift that would have made every warmed browser segment miss).
+        let warmed = fmp4_segment_opts_resolved(&item, seg, SegmentVideo::H264, None, cap, None);
+
+        assert_eq!(
+            warmed.container,
+            SegmentContainer::Fmp4,
+            "a browser is served CMAF; warming mpegts warms bytes it never fetches"
+        );
+        assert_eq!(
+            warmed.audio,
+            AudioDelivery::Separate,
+            "the browser rung's video segments are audio-free — a muxed key is \
+             a different cache entry"
+        );
+        assert_eq!(
+            warmed.video_bitrate_bps,
+            Some(effective_video_bitrate(cap, item.probe.bitrate_bps)),
+            "the cap must be folded the way the CMAF route folds it; the old \
+             prewarm post-clamped instead, which is a different key"
+        );
+        assert_eq!(
+            warmed.window.start_seconds(),
+            pharos_core::SegmentWindow::for_segment(
+                seg,
+                source_frame_rate(item.probe.frame_rate_mille),
+                item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
+            )
+            .start_seconds(),
+            "the warmed window must sit on the grid the playlist enumerates"
+        );
+
+        // And the mpegts path must be untouched for native clients.
+        let native = build_segment_opts(None, &item, seg, None, None);
+        assert_eq!(
+            native.container,
+            SegmentContainer::Mpegts,
+            "native clients keep the mpegts rung"
+        );
+        assert_ne!(
+            native.container, warmed.container,
+            "the two renditions must remain distinct keys — if they collapsed, \
+             this test would pass while proving nothing"
+        );
     }
 
     /// B136 — the prewarm must cover the segment playback STARTS on. Warming
