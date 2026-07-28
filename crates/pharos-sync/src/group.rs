@@ -2333,7 +2333,28 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // resolves on its members' Readys — do NOT replace it. (Replacing
             // reset the anti-wedge deadline, so a user spamming Unpause used
             // to extend the group's hang indefinitely.)
-            if state.waiting.is_some() {
+            if let Some(w) = state.waiting.as_ref() {
+                // A user pressing play and NOTHING happening was, until now,
+                // entirely unrecorded: the press was dropped here in silence,
+                // so the server's account of the 2026-07-28 wedge showed a
+                // frozen group and no evidence anyone had tried to resume it.
+                // Name the gate holding the press and who it waits on — that
+                // is the whole answer to "why did play do nothing?".
+                tracing::info!(
+                    group = %state.id,
+                    sender = %sender,
+                    gate = w.reason.label(),
+                    waited_ms = w.opened_at.elapsed().as_millis() as u64,
+                    pending = w.pending.len(),
+                    pending_members = ?w.pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                    frozen_for_buffering = state.group_paused_due_to_buffering,
+                    "syncplay: unpause ignored — a readiness gate is already open"
+                );
+                metrics::counter!(
+                    "pharos_syncplay_unpause_ignored_total",
+                    "gate" => w.reason.label(),
+                )
+                .increment(1);
                 return;
             }
             // The member that issued the Unpause is asserting "play now"; its
@@ -4209,6 +4230,79 @@ mod tests {
             "sole buffering member leaving must resume the group"
         );
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// A user pressing play while a gate is open is DROPPED — correctly, since
+    /// replacing the gate would reset the anti-wedge deadline and extend the
+    /// hang. But dropping it silently is how "I pressed play twice and nothing
+    /// happened" became unanswerable on 2026-07-28: the press left no trace at
+    /// all, so the record showed a frozen group and no sign anyone had tried.
+    #[tokio::test(start_paused = true)]
+    async fn an_unpause_dropped_by_an_open_gate_is_recorded() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Open a gate nobody acks, then press play into it.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "precondition: a gate must be open for the unpause to hit"
+        );
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_syncplay_unpause_ignored_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = found.expect(
+            "an unpause dropped by an open gate must be counted — a user \
+             pressing play and nothing happening is otherwise invisible",
+        );
+        assert!(
+            labels.contains(&"gate=seek".to_string()),
+            "the drop must name the gate that swallowed it; got {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one dropped unpause, got {value:?}"
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "the drop must remain a DROP — recording it must not start playback"
+        );
     }
 
     /// The 2026-07-28 group-watch shape: a freeze that ends because a HUMAN
