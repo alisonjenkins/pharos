@@ -8,6 +8,7 @@ pub mod health;
 pub mod library_watch;
 pub mod metadata_backfill;
 pub mod middleware;
+pub mod musicbrainz;
 pub mod obs;
 pub mod online_enrich;
 pub mod parental;
