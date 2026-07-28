@@ -2620,6 +2620,12 @@ async fn playback_info(
             audio_idx,
             sub_idx,
             video_bitrate_cap,
+            // B136 — warm the segments playback will actually START on. This is
+            // the same value that rides `start_position_ticks` in the response
+            // (and, for native players, `StartTimeTicks` on the transcoding
+            // URL), so the prewarm covers the client's first request on a
+            // resume instead of warming the opening it will never fetch.
+            resume_ticks,
         );
     }
 

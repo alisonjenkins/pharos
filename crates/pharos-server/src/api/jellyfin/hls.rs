@@ -2416,15 +2416,49 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
     });
 }
 
-/// How many leading segments the cold-start prewarm warms into the cache at
-/// PlaybackInfo time. hls.js needs a few buffered segments before it starts
-/// playback, and segment 0 is otherwise the FIRST time anything spawns ffmpeg
-/// and opens the (often large, NFS-backed) source — a cold hit that overran
-/// hls.js's fragment-load timeout and stalled the very start of playback. Three
-/// covers hls.js's initial buffer; the on-demand prefetch takes over from
-/// segment 0 onward (it only ever warms the segments after the base, never the
-/// base itself).
+/// How many segments the cold-start prewarm warms into the cache at
+/// PlaybackInfo time, starting AT THE POSITION PLAYBACK WILL BEGIN. A player
+/// needs a few buffered segments before it starts, and that first segment is
+/// otherwise the FIRST time anything spawns ffmpeg and opens the (often large,
+/// NFS-backed) source — a cold hit that overran hls.js's fragment-load timeout
+/// and stalled the very start of playback. Three covers hls.js's initial
+/// buffer; the on-demand prefetch takes over from there (it only ever warms the
+/// segments after the base, never the base itself).
 const COLD_START_PREWARM_SEGS: u32 = 3;
+
+/// The segment the cold-start prewarm should begin at, for a resume position in
+/// Jellyfin ticks (100 ns).
+///
+/// B136 — this used to be hardcoded to 0, which is right only for a title
+/// started from the beginning. On a RESUME the client's first request is for
+/// the segment containing the resume point, so warming 0..3 warmed three
+/// segments nobody would fetch and left the one that gates playback cold: the
+/// prewarm did not merely miss, it inverted — the stall it exists to prevent
+/// landed on exactly the request it was meant to cover. Measured live: a viewer
+/// resuming at 91.9 min had segments 0, 1 and 2 warmed while playback began at
+/// segment 918. Episodic viewing is mostly resumes, so this was the common
+/// case, not the edge one.
+///
+/// Resolved through [`pharos_core::SegmentGrid`] — the same grid the playlist
+/// enumerates and `serve_segment` keys on — rather than by dividing here, so
+/// the prewarmed index cannot drift from the one the client asks for. A
+/// position at or past the end resolves to `None` and warms nothing: there is
+/// no segment to warm, and clamping to the last one would warm bytes the client
+/// will never request.
+fn prewarm_base_segment(
+    resume_ticks: u64,
+    duration_ms: Option<u64>,
+    frame_rate_mille: Option<u32>,
+) -> Option<u32> {
+    if resume_ticks == 0 {
+        return Some(0);
+    }
+    // Without a duration there is no grid to bound against; starting from 0
+    // would be actively wrong for a resume, so decline rather than guess.
+    let duration_secs = duration_ms? as f64 / 1000.0;
+    let grid = pharos_core::SegmentGrid::new(duration_secs, frame_rate_mille);
+    grid.resolve(resume_ticks as f64 / 1e7).map(|i| i.get())
+}
 
 /// Cold-start prewarm: transcode the first [`COLD_START_PREWARM_SEGS`] h264/
 /// mpegts `main`-rung segments into the HLS cache the moment PlaybackInfo
@@ -2444,6 +2478,7 @@ pub(super) fn prewarm_cold_start(
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
     video_bitrate_cap: Option<u64>,
+    resume_ticks: u64,
 ) {
     if state.hls.is_none() {
         return;
@@ -2459,7 +2494,31 @@ pub(super) fn prewarm_cold_start(
             .duration_ms
             .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32)
             .unwrap_or(u32::MAX);
-        for seg in 0..COLD_START_PREWARM_SEGS.min(total_segs) {
+        // Where playback will actually START — not segment 0 unless the viewer
+        // is starting from the beginning.
+        let base = prewarm_base_segment(
+            resume_ticks,
+            item.probe.duration_ms,
+            item.probe.frame_rate_mille,
+        );
+        // The prewarm's whole value is that it covers the segment the client
+        // asks for first, so which segments it chose — and why — is the thing
+        // worth being able to query. Silent before: a prewarm warming the wrong
+        // end of the film looked exactly like one warming the right end.
+        tracing::info!(
+            media.id = media_id,
+            resume_ticks,
+            resume_secs = resume_ticks as f64 / 1e7,
+            prewarm.base = base,
+            prewarm.count = COLD_START_PREWARM_SEGS,
+            prewarm.total_segs = total_segs,
+            resumed = resume_ticks > 0,
+            "cold-start prewarm: warming from the resume position"
+        );
+        let Some(base) = base else {
+            return;
+        };
+        for seg in base..(base + COLD_START_PREWARM_SEGS).min(total_segs) {
             let state = state.clone();
             let item = item.clone();
             let session = session.clone();
@@ -4007,6 +4066,54 @@ mod tests {
             ..Default::default()
         });
         item
+    }
+
+    /// B136 — the prewarm must cover the segment playback STARTS on. Warming
+    /// 0..3 on a resume is not a partial win, it is an inversion: the three
+    /// warmed segments are never fetched and the one gating playback is cold,
+    /// so the cold-spawn stall lands on precisely the request the prewarm
+    /// exists to cover. The live case was a resume at 91.9 min warming
+    /// segments 0, 1, 2 while playback began at 918.
+    #[::core::prelude::v1::test]
+    fn prewarm_starts_at_the_resume_segment_not_at_zero() {
+        // 8732.933 s of media at 23.976 fps — the title this was measured on.
+        let dur_ms = Some(8_732_933u64);
+        let fps = Some(23_976u32);
+
+        // From the beginning: still segment 0.
+        assert_eq!(prewarm_base_segment(0, dur_ms, fps), Some(0));
+
+        // The measured resume: 91.9 min = 5514 s -> 5514/6 = segment 919.
+        let ticks = (5514.0f64 * 1e7) as u64;
+        assert_eq!(
+            prewarm_base_segment(ticks, dur_ms, fps),
+            Some(919),
+            "a resume must warm the segment containing the resume point"
+        );
+
+        // The grid, not arithmetic done here, decides the boundary: the last
+        // instant of segment 0 and the first of segment 1 must land either side.
+        assert_eq!(
+            prewarm_base_segment((5.99 * 1e7) as u64, dur_ms, fps),
+            Some(0)
+        );
+        assert_eq!(
+            prewarm_base_segment((6.01 * 1e7) as u64, dur_ms, fps),
+            Some(1)
+        );
+
+        // Past the end warms nothing rather than clamping to the last segment —
+        // clamping would warm bytes no client will request.
+        assert_eq!(
+            prewarm_base_segment((9_000.0 * 1e7) as u64, dur_ms, fps),
+            None
+        );
+
+        // No duration means no grid to bound against. Falling back to 0 would
+        // be actively wrong for a resume, so it declines.
+        assert_eq!(prewarm_base_segment(ticks, None, fps), None);
+        // ...but a from-the-start play still warms the opening.
+        assert_eq!(prewarm_base_segment(0, None, fps), Some(0));
     }
 
     #[::core::prelude::v1::test]
