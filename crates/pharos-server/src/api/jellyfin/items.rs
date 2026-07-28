@@ -2626,6 +2626,15 @@ async fn playback_info(
             // URL), so the prewarm covers the client's first request on a
             // resume instead of warming the opening it will never fetch.
             resume_ticks,
+            // B139 — and warm the CONTAINER it will fetch. This mirrors
+            // `master_playlist`'s `demuxed_h264` exactly: a web client whose
+            // first ranked rendition is h264 gets the demuxed all-fMP4 master
+            // and never requests an mpegts segment. `renditions.first()` is
+            // what `select_master_video` reads off the URL this same response
+            // hands back, so the two cannot disagree.
+            is_web_client
+                && !matches!(item.kind, pharos_core::MediaKind::Audio)
+                && renditions.first().is_some_and(|c| c == "h264"),
         );
     }
 
