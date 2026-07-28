@@ -135,23 +135,6 @@ impl DeviceSlot {
     }
 }
 
-/// Does this encode share ONE init across many segments?
-///
-/// True for fMP4/CMAF video: every segment decodes under a single `avcC`
-/// carrying seg0's parameter sets, and the media segments carry none of their
-/// own. Such a rendition must be produced entirely by ONE encoder — see
-/// [`device_supports`] and spec 003 — because two encoders' SPS are not
-/// interchangeable.
-///
-/// Keyed on the CONTAINER contract, not on a codec list (spec 003 R6). The
-/// hazard belongs to shared-init fMP4 as such: H264 has the CMAF rung today and
-/// H265 would carry it identically, and a VP9 fMP4 rung already exists. mpegts
-/// repeats parameter sets per segment and is self-describing, so it is exempt.
-/// `Copy` and audio-only encodes have no video parameter set to disagree about.
-pub fn shared_init_fmp4(opts: &TranscodeOptions) -> bool {
-    opts.container == Container::Fmp4 && !matches!(opts.video, None | Some(VideoCodec::Copy))
-}
-
 /// Whether `device` can encode the video target in `opts`.
 ///
 /// - CPU encodes anything (software libx264/libx265/libvpx/libaom, or a
@@ -165,28 +148,23 @@ pub fn device_supports(device: DeviceId, opts: &TranscodeOptions) -> bool {
     match device {
         DeviceId::Cpu => true,
         DeviceId::Hw { accel, .. } => match opts.video {
-            // NOTE (spec 003): hardware used to be ineligible here for
-            // H264+fMP4. The hazard is real — a shared-init CMAF rendition
-            // decodes every segment under ONE `avcC` carrying seg0's parameter
-            // sets, and two encoders' SPS are not interchangeable, so a spilled
-            // segment is undecodable (issue #114). Measured on the deployment
-            // GPU: NVENC emits Main profile with log2_max_frame_num 8 where
-            // libx264 emits High with 4, and NO ffmpeg flag reconciles them
-            // (research R7 — `-profile:v main` aligns the profile but not the
-            // slice-header field widths, and libopenh264 is further away
-            // still). It cannot be patched in the container either, because
-            // log2_max_frame_num is the WIDTH of frame_num in every slice
-            // header.
-            //
-            // What changed is HOW the one-encoder guarantee is enforced. It is
-            // no longer "no hardware may ever run this" but "this rendition
-            // resolves to exactly one device", via
-            // `DeviceTable::rendition_device` — a pure function of the
-            // rendition, so it survives a restart, and the scheduler refuses to
-            // place the job anywhere else even under cooldown. Excluding
-            // hardware wholesale cost the entire GPU for browser playback once
-            // PR#70 moved all browser H264 to CMAF (measured: 420 of 423 jobs
-            // on CPU at 1.81x realtime with NVENC idle).
+            // A shared-init fMP4 (CMAF) H264 rendition serves EVERY segment
+            // under ONE init whose avcC carries seg0's SPS, and the media
+            // segments carry no inband parameter sets. libx264 and the hardware
+            // H264 encoders emit incompatible SPS — not just profile/level but
+            // the slice-header determinants (POC type, log2_max_frame_num, ref
+            // structure) that no `-profile`/`-level`/`-refs` flag can align — so
+            // a segment that the load-balancer spilled to a different encoder
+            // than seg0 is undecodable under the init: the client reads its
+            // slices with the wrong SPS and the video decoder rejects the packet
+            // (`avcodec_send_packet: Invalid data`, issue #114). B126 was the
+            // timescale sibling of this — a mux param, forceable; the parameter
+            // set is not. Pin the whole CMAF H264 rendition to ONE encoder by
+            // making hardware ineligible: CPU/libx264 is realtime at
+            // `-preset veryfast`, self-consistent across init + every segment,
+            // and frees the GPU for the heavier jobs. (H265 fMP4 would carry the
+            // identical hazard, but no hevc CMAF rung exists today.)
+            Some(VideoCodec::H264) if opts.container == Container::Fmp4 => false,
             // A hardware device is eligible for a codec when its family names an
             // encoder for it (h264/hevc always; vp9 on VAAPI; av1 on
             // VAAPI/NVENC/QSV). The negotiator only TARGETS a hardware codec the
@@ -236,45 +214,6 @@ impl DeviceTable {
             .filter(|s| device_supports(s.id, opts) && !s.in_cooldown(now))
             .map(|s| s.id)
             .collect()
-    }
-
-    /// The ONE device a shared-init fMP4 rendition must use (spec 003 R8).
-    ///
-    /// A pure function of `rendition_key` over the devices that support the
-    /// encode, so it returns the same answer after a restart — an in-memory pin
-    /// would not, and a rendition re-pinned to a different device mid-playback
-    /// serves segments that no longer match the client's init (issue #114).
-    /// Because it is deterministic, cached segments for a rendition were also
-    /// necessarily produced by the device that rendition still resolves to.
-    ///
-    /// Hardware is preferred as a pool; hashing ACROSS that pool spreads
-    /// renditions over multiple GPUs while keeping each rendition on one.
-    ///
-    /// Deliberately ignores cooldown and load: both are transient, and letting
-    /// them change the answer would reintroduce the non-determinism this
-    /// exists to remove. The caller checks cooldown and FAILS rather than
-    /// choosing elsewhere; a merely busy device is queued for.
-    pub fn rendition_device(
-        &self,
-        opts: &TranscodeOptions,
-        rendition_key: u64,
-    ) -> Option<DeviceId> {
-        let supporting: SmallVec<[DeviceId; 5]> = self
-            .slots
-            .iter()
-            .map(|s| s.id)
-            .filter(|id| device_supports(*id, opts))
-            .collect();
-        if supporting.is_empty() {
-            return None;
-        }
-        let hw: SmallVec<[DeviceId; 5]> = supporting
-            .iter()
-            .copied()
-            .filter(|d| matches!(d, DeviceId::Hw { .. }))
-            .collect();
-        let pool = if hw.is_empty() { supporting } else { hw };
-        Some(pool[(rendition_key % pool.len() as u64) as usize])
     }
 
     pub fn slot(&self, id: DeviceId) -> Option<&DeviceSlot> {
@@ -383,143 +322,23 @@ mod tests {
         );
     }
 
-    /// Spec 003 US2 — the guarantee. The same rendition must resolve to the same
-    /// device every time, including after a restart (the function is pure, so a
-    /// fresh table gives the same answer) and regardless of cooldown or load.
-    ///
-    /// This is the property that replaces the CPU-only exclusion. If it fails,
-    /// issue #114 is back: segments produced by a second encoder are undecodable
-    /// under the init the client already holds.
     #[test]
-    fn a_rendition_always_resolves_to_the_same_device() {
-        let mut cmaf = h264_opts();
-        cmaf.container = Container::Fmp4;
-        let key = 0x1234_5678_9abc_def0u64;
-
-        let t = table();
-        let first = t.rendition_device(&cmaf, key).expect("a device");
-        for _ in 0..50 {
-            assert_eq!(t.rendition_device(&cmaf, key), Some(first));
-        }
-
-        // A FRESH table is the restart case: same answer, nothing remembered.
-        let restarted = table();
-        assert_eq!(restarted.rendition_device(&cmaf, key), Some(first));
-
-        // Cooldown must NOT move it — the caller fails instead of choosing
-        // elsewhere, or determinism is lost through the back door.
-        let mut cooled = table();
-        cooled.set_cooldown(first, Instant::now() + Duration::from_secs(60));
-        assert_eq!(
-            cooled.rendition_device(&cmaf, key),
-            Some(first),
-            "cooldown is transient and must not change which device owns a rendition"
-        );
-    }
-
-    /// Hardware is preferred, and renditions SPREAD across a multi-GPU pool
-    /// rather than all piling onto the first device.
-    #[test]
-    fn renditions_prefer_hardware_and_spread_across_it() {
-        let t = table();
-        let mut cmaf = h264_opts();
-        cmaf.container = Container::Fmp4;
-
-        let picked: Vec<DeviceId> = (0..64)
-            .map(|k| t.rendition_device(&cmaf, k).expect("a device"))
-            .collect();
-        assert!(
-            picked.iter().all(|d| matches!(d, DeviceId::Hw { .. })),
-            "hardware supports h264, so no rendition should land on CPU"
-        );
-        let distinct: std::collections::HashSet<_> = picked.iter().collect();
-        assert!(
-            distinct.len() > 1,
-            "with several hw devices, renditions must spread; got {distinct:?}"
-        );
-    }
-
-    /// With no hardware able to encode the codec, the pool is CPU — still one
-    /// deterministic device, so the guarantee holds on a CPU-only host too.
-    #[test]
-    fn a_codec_no_hardware_can_encode_resolves_to_cpu() {
-        let t = table();
-        let mut o = h264_opts();
-        o.container = Container::Fmp4;
-        o.video = Some(VideoCodec::Vp9);
-        // NVENC has no VP9 encoder; this table's VAAPI does, so force a table
-        // with neither by asking for a codec nothing accelerates.
-        let cpu_only = DeviceTable::from_probe(&[], 4);
-        assert_eq!(cpu_only.rendition_device(&o, 7), Some(DeviceId::Cpu));
-        assert!(t.rendition_device(&o, 7).is_some());
-    }
-
-    /// Spec 003 R6 — the shared-init hazard is a property of the CONTAINER, so
-    /// the predicate must not be a codec list that a future rung falls off.
-    #[test]
-    fn shared_init_is_decided_by_the_container_not_the_codec() {
-        let mut o = h264_opts();
-        o.container = Container::Fmp4;
-        assert!(shared_init_fmp4(&o), "h264 CMAF shares one init");
-
-        o.video = Some(VideoCodec::H265);
-        assert!(
-            shared_init_fmp4(&o),
-            "h265 fMP4 would carry the same hazard"
-        );
-
-        o.video = Some(VideoCodec::Vp9);
-        assert!(shared_init_fmp4(&o), "the vp9 fMP4 rung shares an init too");
-
-        // mpegts repeats parameter sets per segment — self-describing, exempt.
-        let mpegts = h264_opts();
-        assert_eq!(mpegts.container, Container::Mpegts);
-        assert!(!shared_init_fmp4(&mpegts));
-
-        // Nothing to disagree about without a video encode.
-        let mut copy = h264_opts();
-        copy.container = Container::Fmp4;
-        copy.video = Some(VideoCodec::Copy);
-        assert!(!shared_init_fmp4(&copy));
-        copy.video = None;
-        assert!(!shared_init_fmp4(&copy));
-    }
-
-    /// Spec 003 — CMAF H264 now reaches hardware, and mpegts is unchanged.
-    ///
-    /// This test used to assert `&[DeviceId::Cpu]`, because the one-encoder
-    /// guarantee that a shared-init CMAF rendition needs was enforced by making
-    /// hardware ineligible outright. That guarantee now comes from
-    /// `rendition_device` — a rendition resolves to exactly one device and the
-    /// scheduler will not place it elsewhere, even under cooldown — so the
-    /// exclusion is no longer the mechanism and its cost (the whole GPU,
-    /// unreachable for every browser since PR#70) is no longer paid.
-    ///
-    /// The hazard it guarded against is unchanged and still real: NVENC and
-    /// libx264 emit SPS that differ in `log2_max_frame_num`, which is the bit
-    /// WIDTH of `frame_num` in every slice header, so mixing them under one
-    /// init is undecodable (issue #114, re-measured in research R7).
-    #[test]
-    fn cmaf_h264_reaches_hardware_and_mpegts_is_unchanged() {
+    fn h264_fmp4_cmaf_routes_cpu_only_but_mpegts_keeps_hardware() {
+        // A shared-init CMAF (fMP4) H264 rendition must come from ONE encoder,
+        // so hardware is ineligible and the whole rendition runs on libx264
+        // (issue #114). The mpegts H264 variants repeat parameter sets per
+        // segment and are self-describing, so they KEEP hardware — the gate is
+        // scoped to Fmp4, not to H264 generally.
         let t = table();
         let mut cmaf = h264_opts();
         cmaf.container = Container::Fmp4;
         assert_eq!(
             t.eligible_for(&cmaf, Instant::now()).as_slice(),
-            &[
-                DeviceId::hw(HwAccel::Nvenc, 0),
-                DeviceId::hw(HwAccel::Vaapi, 0),
-                DeviceId::Cpu
-            ],
-            "CMAF H264 must now be able to reach hardware"
+            &[DeviceId::Cpu],
+            "CMAF H264 must be CPU-only"
         );
-        // ...but only ONE of them may actually serve the rendition.
-        assert!(matches!(
-            t.rendition_device(&cmaf, 42).expect("a device"),
-            DeviceId::Hw { .. }
-        ));
-
-        let mpegts = h264_opts();
+        // Same codec, mpegts container → hardware still leads.
+        let mpegts = h264_opts(); // container: Mpegts
         assert_eq!(
             t.eligible_for(&mpegts, Instant::now()).as_slice(),
             &[
@@ -528,10 +347,6 @@ mod tests {
                 DeviceId::Cpu
             ],
             "mpegts H264 keeps hardware"
-        );
-        assert!(
-            !shared_init_fmp4(&mpegts),
-            "mpegts keeps free load-balancing: it is self-describing per segment"
         );
     }
 

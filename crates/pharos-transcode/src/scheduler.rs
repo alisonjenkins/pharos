@@ -902,62 +902,12 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         let _ = ctx.reply.send(Err(SchedError::Unsupported));
         return;
     }
-    // Spec 003 — a shared-init fMP4 rendition must come from ONE encoder, so it
-    // does not get a choice of devices. The device is a pure function of the
-    // rendition (see `DeviceTable::rendition_device`), which keeps the answer
-    // stable across a restart; an in-memory pin would not, and a rendition
-    // re-pinned mid-playback serves segments that no longer match the client's
-    // init (issue #114 — undecodable video, served with a 200).
-    //
-    // Cooldown deliberately does NOT re-route it. Spilling to a second encoder
-    // is exactly the failure this prevents, so an unavailable device FAILS the
-    // request instead: the client restarts the stream and re-fetches an init
-    // that matches whatever produces it next. A visible stall that recovers
-    // beats silent corruption.
-    let pinned = if crate::device::shared_init_fmp4(&ctx.opts) {
-        let key = crate::options::RenditionKey::new(&ctx.input, &ctx.opts);
-        match state.devices.rendition_device(&ctx.opts, key.value()) {
-            Some(d) => {
-                if !full_eligible.contains(&d) {
-                    metrics::counter!("pharos_transcode_pin_total", "outcome" => "invalidated")
-                        .increment(1);
-                    tracing::warn!(
-                        %job_id,
-                        rendition = %key.short(),
-                        device = %d,
-                        "rendition device unavailable (cooldown); failing rather than spilling to another encoder"
-                    );
-                    let _ = ctx
-                        .reply
-                        .send(Err(SchedError::Failed(WorkerError::Other(format!(
-                        "rendition device {d} unavailable; refusing to mix encoders under one init"
-                    )))));
-                    return;
-                }
-                metrics::counter!("pharos_transcode_pin_total", "outcome" => "followed")
-                    .increment(1);
-                Some(d)
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    // Candidate devices = eligible minus already-tried. A pinned rendition has
-    // exactly one candidate and never widens.
-    let candidates: SmallVec<[DeviceId; 5]> = match pinned {
-        Some(d) => full_eligible
-            .iter()
-            .copied()
-            .filter(|c| *c == d && !ctx.excluded.contains(c))
-            .collect(),
-        None => full_eligible
-            .iter()
-            .copied()
-            .filter(|d| !ctx.excluded.contains(d))
-            .collect(),
-    };
+    // Candidate devices = eligible minus already-tried.
+    let candidates: SmallVec<[DeviceId; 5]> = full_eligible
+        .iter()
+        .copied()
+        .filter(|d| !ctx.excluded.contains(d))
+        .collect();
     if candidates.is_empty() {
         // Every supporting device has been tried + failed transiently.
         let err = ctx
@@ -1365,125 +1315,6 @@ mod tests {
             .unwrap();
         assert_eq!(done.device, DeviceId::hw(HwAccel::Nvenc, 0)); // best-first
         assert_eq!(done.out_bytes, 42);
-    }
-
-    fn cmaf() -> TranscodeOptions {
-        let mut o = h264();
-        o.container = Container::Fmp4;
-        o
-    }
-
-    /// Spec 003 US2 — every segment of one CMAF rendition must come from the
-    /// SAME device. Dispatch many segments (they differ only in start position,
-    /// so they share a rendition key) and assert they all land together, with
-    /// other devices free to tempt the load-balancer.
-    ///
-    /// If this fails, issue #114 is back: a segment from a second encoder is
-    /// undecodable under the init the client already holds.
-    #[tokio::test]
-    async fn every_segment_of_a_cmaf_rendition_lands_on_one_device() {
-        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
-            out_bytes: 1,
-        });
-        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
-        let mut devices = std::collections::HashSet::new();
-        for seg in 0..12u64 {
-            let mut o = cmaf();
-            o.start_position_ticks = seg * 6 * 10_000_000;
-            o.duration_ticks = Some(6 * 10_000_000);
-            let done = s
-                .submit(
-                    PathBuf::from("/m/show.mkv"),
-                    o,
-                    file_sink(),
-                    JobClass::Interactive,
-                )
-                .await
-                .unwrap();
-            devices.insert(done.device);
-        }
-        assert_eq!(
-            devices.len(),
-            1,
-            "a shared-init rendition must not mix encoders; got {devices:?}"
-        );
-    }
-
-    /// A DIFFERENT rendition of the same file (different audio track) is a
-    /// different init, so it is free to resolve elsewhere — the guarantee is
-    /// per-rendition, not per-file.
-    #[tokio::test]
-    async fn a_different_rendition_is_free_to_choose_again() {
-        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
-            out_bytes: 1,
-        });
-        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
-        let a = s
-            .submit(
-                PathBuf::from("/m/x.mkv"),
-                cmaf(),
-                file_sink(),
-                JobClass::Interactive,
-            )
-            .await
-            .unwrap();
-        let mut other = cmaf();
-        other.audio_source_stream_index = Some(3);
-        let b = s
-            .submit(
-                PathBuf::from("/m/x.mkv"),
-                other,
-                file_sink(),
-                JobClass::Interactive,
-            )
-            .await
-            .unwrap();
-        // Both are valid; the point is that each is internally consistent and
-        // neither is forced to follow the other.
-        assert!(matches!(a.device, DeviceId::Hw { .. }));
-        assert!(matches!(b.device, DeviceId::Hw { .. }));
-    }
-
-    /// Spec 003 US3 — losing the rendition's device must FAIL, not fall back.
-    ///
-    /// Falling back is precisely issue #114: the client keeps an init produced
-    /// by the first encoder and would silently receive segments from a second.
-    /// A visible error makes the player restart the stream and re-fetch an init
-    /// that matches. CPU is left deliberately free here, so a spill would
-    /// succeed if the guard were absent.
-    ///
-    /// Disarm by deleting the `!full_eligible.contains(&d)` arm in `place()`
-    /// and this goes red — the job completes on CPU.
-    #[tokio::test]
-    async fn a_cooled_rendition_device_fails_instead_of_spilling_to_another_encoder() {
-        let mut t = table();
-        let dev = t
-            .rendition_device(&cmaf(), {
-                use crate::options::RenditionKey;
-                RenditionKey::new(std::path::Path::new("/m/show.mkv"), &cmaf()).value()
-            })
-            .expect("a device");
-        assert!(matches!(dev, DeviceId::Hw { .. }), "precondition: hardware");
-        t.set_cooldown(dev, Instant::now() + Duration::from_secs(300));
-
-        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
-            out_bytes: 1,
-        });
-        let s = TranscodeScheduler::spawn(t, spawner, SchedConfig::default());
-        let res = s
-            .submit(
-                PathBuf::from("/m/show.mkv"),
-                cmaf(),
-                file_sink(),
-                JobClass::Interactive,
-            )
-            .await;
-        match res {
-            Err(SchedError::Failed(_)) => {}
-            other => panic!(
-                "a cooled rendition device must fail, not silently re-encode elsewhere; got {other:?}"
-            ),
-        }
     }
 
     #[tokio::test]
