@@ -224,3 +224,53 @@ the obstacle, so nobody need re-investigate that branch.
 **Rejected.** Rewriting `avcC` to match (breaks slice parsing, above); swapping
 libx264 for openh264 (further apart, and a large quality/speed regression);
 hardware-only with no CPU fallback (that is pinning, minus the safety).
+
+---
+
+## R8 — A DETERMINISTIC device beats a pin map (design change, 2026-07-28)
+
+**Decision.** Do not keep a `RenditionKey -> device` map. Choose the device as a
+pure function of the rendition key over the devices that SUPPORT the encode.
+
+```
+pool   = hardware devices supporting opts, else [CPU]
+device = pool[ rendition_key % pool.len() ]
+```
+
+**Rationale — it removes two hazards the pin map could not.**
+
+1. *Restart.* An in-memory pin dies with the process while the on-disk cache and
+   the client's already-fetched init both survive. A restarted server could
+   re-pin a rendition to a different device and serve segments that no longer
+   match the client's init — the #114 failure, arriving after a routine deploy.
+   A pure function returns the same device after a restart, so there is nothing
+   to lose.
+2. *Cache identity (R3).* The reason the cache needed a device tag was that
+   entries could outlive the pin that produced them. With a deterministic
+   device, every cached entry for a rendition was necessarily produced by the
+   device that rendition still resolves to. `HlsSegmentCache` needs no change,
+   and `HLS_GEN_VERSION` need not be bumped — which also spares a full
+   regeneration of the 40 GiB segment cache on deploy.
+
+It is also simpler: no map, no eviction TTL, no lock, and no async pin lookup
+from the cache layer (`SegmentKey` is built synchronously, so consulting a pin
+map there would have meant an actor round-trip inside a sync path).
+
+**Cooldown must not change the choice.** Cooldown is transient, so letting it
+select a different device would reintroduce non-determinism through the back
+door. The chosen device is computed IGNORING cooldown and load; if it is then in
+cooldown the request FAILS (FR-004), and if it is merely busy the job QUEUES.
+
+**Multi-GPU.** Hashing over the pool rather than always taking the first device
+spreads renditions across GPUs while keeping each rendition on one. With a
+single GPU it degenerates to "always that GPU", which is what this deployment
+wants anyway.
+
+**Known limitation, documented rather than hidden.** If the device TABLE changes
+shape — a GPU added or removed — the function's answer can change for a
+rendition whose cached segments predate the change. That is a physical hardware
+change accompanied by a redeploy; bump `HLS_GEN_VERSION` at that point. Noted in
+quickstart rollback.
+
+**Supersedes.** The `RenditionPin` entity in `data-model.md` and the pin-map
+tasks (T011-T013, T016) collapse into one pure function plus its tests.
