@@ -111,8 +111,34 @@ Worth stating plainly even had it worked: **VAAPI agreeing with itself would not
 prove NVENC does.** The claim is per-encoder. A green proxy would have been weak
 evidence; a red one would have been a strong warning. Neither was obtainable.
 
-**Status: R4 remains unmeasured. T001 must run on the deployment host.** Nothing
-downstream of it has been enabled.
+### MEASURED 2026-07-28 — GREEN
+
+Run on the deployment GPU (GTX 1070, driver 580.173.02) from a throwaway
+`nixos/nix` pod holding the node's spare `nvidia.com/gpu`, with
+`runtimeClassName: nvidia` mirroring the pharos deployment. Three INDEPENDENT
+`h264_nvenc` processes plus a libx264 control, all `-pix_fmt yuv420p -b:v 3000k
+-r 25` into fragmented MP4; `avcC` extracted and byte-compared.
+
+```
+nv_a.mp4         len=54 sha=b5b371b117b50dc1  014d4028ffe10027674d4028965280f004...
+nv_a_repeat.mp4  len=54 sha=b5b371b117b50dc1  014d4028ffe10027674d4028965280f004...
+nv_b.mp4         len=54 sha=b5b371b117b50dc1  014d4028ffe10027674d4028965280f004...
+sw_a.mp4         len=46 sha=cc908eee14d60920  01640028ffe1001b67640028acd9407802...
+
+nvenc same window, separate process : IDENTICAL
+nvenc different windows             : IDENTICAL
+nvenc vs libx264                    : DIFFER
+```
+
+**Verdict: a hardware encoder IS self-consistent across processes.** Two
+independent NVENC encodes of different source windows produce byte-identical
+parameter sets, so pinning a rendition to one device satisfies the one-encoder
+requirement. The feature is viable and Phase 2 may start.
+
+The control is worth as much as the result: NVENC emits Main profile (`0x4d`)
+where libx264 emits High (`0x64`), 54 bytes against 46. That re-confirms the
+#114 hazard on this exact hardware rather than taking the original comment on
+trust — mixing the two under one init would hand the client the wrong SPS.
 
 ---
 

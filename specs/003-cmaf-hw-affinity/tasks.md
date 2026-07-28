@@ -24,8 +24,8 @@ Single Rust workspace. Paths are repo-relative:
 
 **This phase can void the feature. Nothing else may start until T001 is green.**
 
-- [ ] T001 Measure R4 on the GPU host: encode two independent segment windows of one source on `nvenc:0` with identical settings via `crates/pharos-transcode/src/bin/transcode_tool.rs`, extract the `avcC` parameter sets from each, and byte-compare. Repeat once after restarting the worker process. Record the actual bytes and the verdict in `specs/003-cmaf-hw-affinity/research.md` under R4.
-- [ ] T002 If T001 shows the parameter sets DIFFER: stop. Record the refutation in `specs/003-cmaf-hw-affinity/research.md`, mark this spec superseded, and append a note to `specs/001-pharos-baseline/tasks.md` T105 that the CPU-only rule in `crates/pharos-transcode/src/device.rs` is correct as written. Do not proceed to Phase 2.
+- [X] T001 Measure R4 on the GPU host: encode two independent segment windows of one source on `nvenc:0` with identical settings via `crates/pharos-transcode/src/bin/transcode_tool.rs`, extract the `avcC` parameter sets from each, and byte-compare. Repeat once after restarting the worker process. Record the actual bytes and the verdict in `specs/003-cmaf-hw-affinity/research.md` under R4.
+- [X] T002 (not triggered — T001 green) If T001 shows the parameter sets DIFFER: stop. Record the refutation in `specs/003-cmaf-hw-affinity/research.md`, mark this spec superseded, and append a note to `specs/001-pharos-baseline/tasks.md` T105 that the CPU-only rule in `crates/pharos-transcode/src/device.rs` is correct as written. Do not proceed to Phase 2.
 
 **Checkpoint**: hardware proven self-consistent across processes, or the feature is dead.
 
