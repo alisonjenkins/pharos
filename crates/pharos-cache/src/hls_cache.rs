@@ -609,7 +609,11 @@ impl std::fmt::Debug for HlsSegmentCache {
 // back to CPU-only. By V89 that makes the NVENC-era segments cached under 13
 // stale in the same way the libx264-era ones were under 12 — same hazard,
 // opposite direction.
-const HLS_GEN_VERSION: u32 = 14;
+/// Public because the HLS playlists embed it in every init/segment URI: a
+/// browser caches those `immutable` for a year, so a generation change must
+/// change the URL or clients keep serving themselves the previous
+/// generation's init (see `hls::rendition_qs`).
+pub const HLS_GEN_VERSION: u32 = 14;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
