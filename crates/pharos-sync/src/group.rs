@@ -2463,11 +2463,35 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 if let Some(rec) = state.members.get_mut(&sender) {
                     rec.buffering = false;
                 }
-                let capped = tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS);
-                if let Some(w) = state.waiting.as_mut() {
-                    if capped < w.deadline {
-                        w.deadline = capped;
+                let press_grace = std::time::Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS);
+                // The cap applies ONLY to a gate the press itself is waiting
+                // out. jellyfin-web sends `Unpause` automatically right after
+                // `SetNewQueue` — measured 8 dropped presses against exactly 8
+                // queue-change gates in the E2E harness, i.e. every single
+                // one — so on a queue change the press is protocol chatter, not
+                // a human watching a spinner. Capping there would put a 5s
+                // bound on precisely the wait that legitimately runs longest:
+                // a new episode's first segment needs a cold transcode, and
+                // measured real acks reach 18.1s. That would trade this hang
+                // for a desync at every episode boundary.
+                //
+                // The ACK below is unconditional and correct either way: the
+                // sender has asserted readiness, whoever sent it.
+                // So the cap is gated on the gate having been open a while. An
+                // automatic press lands within ~1s of the command that opened
+                // the gate; a person presses play after watching nothing happen.
+                // Below the threshold the press is chatter and the gate keeps
+                // its full bound; above it, someone is waiting.
+                let human_press = state
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|w| w.opened_at.elapsed() >= press_grace);
+                if human_press {
+                    let capped = tokio::time::Instant::now() + press_grace;
+                    if let Some(w) = state.waiting.as_mut() {
+                        if capped < w.deadline {
+                            w.deadline = capped;
+                        }
                     }
                 }
                 state.ack_gate(sender);
@@ -4477,6 +4501,59 @@ mod tests {
         );
     }
 
+    /// The regression the E2E harness caught, and the reason verification is
+    /// not a formality: `pharos_syncplay_unpause_ignored_total{gate="queue_change"}`
+    /// read 8 against exactly 8 queue-change gates — jellyfin-web sends
+    /// `Unpause` AUTOMATICALLY right after `SetNewQueue`, so on a queue change
+    /// the press is protocol chatter, not a human watching a spinner.
+    ///
+    /// Capping there would put a 5s bound on the wait that legitimately runs
+    /// longest — a new episode's first segment needs a cold transcode, and
+    /// measured real acks reach 18.1s — trading a rare hang for a desync at
+    /// EVERY episode boundary.
+    #[tokio::test(start_paused = true)]
+    async fn the_automatic_press_after_a_queue_change_does_not_cap_the_gate() {
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["ep2".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "precondition: the queue change must gate"
+        );
+
+        // jellyfin-web's automatic Unpause, immediately after the queue change.
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Well past the press grace but well inside the queue-change bound: a
+        // client still loading the new episode must NOT have been abandoned.
+        tokio::time::advance(Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS * 2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "an automatic post-queue-change press must not shorten the gate — \
+             doing so desyncs every episode boundary whose first segment needs \
+             a cold transcode"
+        );
+    }
+
     /// The other half of the press rule: capping must be one-directional. A
     /// second press, or a press arriving when little time is left, must never
     /// push the deadline back out — that was the spam-play-extends-the-hang
@@ -4500,7 +4577,9 @@ mod tests {
         .unwrap();
         let _ = snapshot_of(&h).await;
 
-        // First press caps the remaining wait to the grace window.
+        // Wait past the chatter threshold so the presses count as human, then
+        // press: the first caps the remaining wait to the grace window.
+        tokio::time::advance(Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS)).await;
         h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
         let _ = snapshot_of(&h).await;
         // Spam more presses right up to the edge of that window.
