@@ -1612,6 +1612,30 @@ async fn resolve_text_burn_assets(
 /// and any client-supplied per-stream picks (`AudioStreamIndex`,
 /// `SubtitleStreamIndex`) so the segment handler resolves the right
 /// `TranscodeOptions` without a server-side state lookup.
+/// The playback query string plus the cache GENERATION, for the URIs of a
+/// shared-init (fMP4) rendition.
+///
+/// Init and media segments are served `Cache-Control: immutable, max-age=1y`,
+/// so a browser keeps its copy indefinitely. That is correct for bytes whose
+/// URL identifies them — and these URLs did not: they named the item and
+/// segment index but nothing about what PRODUCED the bytes. When the encoder
+/// assigned to CMAF changed, clients kept serving themselves the previous
+/// generation's init while fetching new-generation segments, whose SPS the old
+/// init does not describe (issue #114). Wiping the server cache cannot fix
+/// that; the stale copy is in the browser.
+///
+/// Embedding [`HLS_GEN_VERSION`] makes a generation change a URL change, so
+/// the client fetches a matching init instead of reusing an incompatible one.
+fn rendition_qs(req: &HttpRequest) -> String {
+    let qs = playback_qs(req);
+    let gen = pharos_cache::HLS_GEN_VERSION;
+    if qs.is_empty() {
+        format!("g={gen}")
+    } else {
+        format!("{qs}&g={gen}")
+    }
+}
+
 fn playback_qs(req: &HttpRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(t) = extract_token(req) {
@@ -1707,7 +1731,7 @@ async fn vp9_audio_playlist(
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, media_id).await?;
-    let qs = playback_qs(&req);
+    let qs = rendition_qs(&req);
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
     // Geass) so switching track selects a different rendition session.
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
@@ -1846,7 +1870,7 @@ async fn vp9_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
-    let qs = playback_qs(&req);
+    let qs = rendition_qs(&req);
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
@@ -2015,7 +2039,7 @@ async fn h264cmaf_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
-    let qs = playback_qs(&req);
+    let qs = rendition_qs(&req);
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
@@ -4242,5 +4266,40 @@ mod tests {
         .render(12.0, None);
         assert!(!body.contains("#EXT-X-START"), "{body}");
         assert!(!body.contains("#EXT-X-INDEPENDENT-SEGMENTS"), "{body}");
+    }
+    /// The init and every media segment are served `immutable, max-age=1y`, so
+    /// a browser keeps them indefinitely. The URL must therefore identify the
+    /// GENERATION that produced the bytes — otherwise a client keeps serving
+    /// itself an old init while fetching new-generation segments, whose SPS it
+    /// does not describe (issue #114). That failure lives in the browser cache,
+    /// so no amount of server-side cache wiping clears it: observed in
+    /// production when CMAF moved from libx264 to NVENC, where the fault
+    /// survived a full server cache wipe AND a playback restart.
+    #[test]
+    async fn a_shared_init_rendition_uri_carries_the_cache_generation() {
+        let gen = pharos_cache::HLS_GEN_VERSION;
+
+        // With a playback query string, the generation is appended.
+        let req = actix_web::test::TestRequest::get()
+            .uri("/videos/9/h264cmaf.m3u8?PlaySessionId=abc")
+            .to_http_request();
+        let qs = rendition_qs(&req);
+        assert!(
+            qs.ends_with(&format!("g={gen}")),
+            "generation must be present: {qs}"
+        );
+        assert!(
+            qs.contains("PlaySessionId=abc"),
+            "playback params kept: {qs}"
+        );
+
+        // With no playback params the query string is still well-formed —
+        // a bare `?&g=` would be a malformed URI.
+        let bare = actix_web::test::TestRequest::get()
+            .uri("/videos/9/h264cmaf.m3u8")
+            .to_http_request();
+        let qs = rendition_qs(&bare);
+        assert_eq!(qs, format!("g={gen}"), "no stray separator: {qs}");
+        assert!(!qs.starts_with('&'));
     }
 }
