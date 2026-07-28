@@ -65,6 +65,50 @@ impl JobClass {
     }
 }
 
+/// What happened when a shared-init fMP4 rendition was resolved to its encoder.
+///
+/// Spec 003 pins such a rendition to ONE device because its segments all decode
+/// under a single init (V80); `pharos_transcode_pin_total{outcome}` is how that
+/// guarantee is observed rather than merely asserted. The three variants are
+/// exhaustive over the shared-init path, so they sum to the number of
+/// shared-init jobs placed — a bucket that stops adding up means a branch is
+/// resolving devices without saying so.
+///
+/// `Invalidated` is the one to alert on: it means a rendition's device went
+/// unavailable mid-stream and the request was FAILED rather than spilled onto
+/// a second encoder, which is a visible stall for the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// The rendition resolved to an eligible device and was placed on it.
+    Followed,
+    /// The resolved device was not eligible (cooldown / excluded), so the
+    /// request failed rather than mixing encoders under one init (#114).
+    Invalidated,
+    /// No device could be resolved for the rendition at all; placement falls
+    /// through to the normal load-balanced path.
+    Unresolved,
+}
+
+impl PinOutcome {
+    /// Stable metric-label string. Same contract as [`JobClass::label`]: these
+    /// appear as the `outcome` label on `pharos_transcode_pin_total`, so a
+    /// rename breaks dashboards silently and a COLLISION is worse still —
+    /// `invalidated` folded into `followed` would report a broken pin as a
+    /// healthy one. Pinned by a test.
+    pub fn label(self) -> &'static str {
+        match self {
+            PinOutcome::Followed => "followed",
+            PinOutcome::Invalidated => "invalidated",
+            PinOutcome::Unresolved => "unresolved",
+        }
+    }
+
+    /// Record this outcome. One call per shared-init placement decision.
+    fn record(self) {
+        metrics::counter!("pharos_transcode_pin_total", "outcome" => self.label()).increment(1);
+    }
+}
+
 impl std::fmt::Display for JobClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
@@ -919,8 +963,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         match state.devices.rendition_device(&ctx.opts, key.value()) {
             Some(d) => {
                 if !full_eligible.contains(&d) {
-                    metrics::counter!("pharos_transcode_pin_total", "outcome" => "invalidated")
-                        .increment(1);
+                    PinOutcome::Invalidated.record();
                     tracing::warn!(
                         %job_id,
                         rendition = %key.short(),
@@ -934,11 +977,17 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                     )))));
                     return;
                 }
-                metrics::counter!("pharos_transcode_pin_total", "outcome" => "followed")
-                    .increment(1);
+                PinOutcome::Followed.record();
                 Some(d)
             }
-            None => None,
+            None => {
+                // Previously silent. Without it the counter cannot be read as a
+                // total: `followed + invalidated` was always short by however
+                // many shared-init jobs resolved to no device, and there was no
+                // way to tell that from the metric.
+                PinOutcome::Unresolved.record();
+                None
+            }
         }
     } else {
         None
@@ -1966,6 +2015,36 @@ mod tests {
         assert_eq!(snap.devices.len(), 3);
         let total_cap: usize = snap.devices.iter().map(|d| d.capacity).sum();
         assert_eq!(total_cap, 2 + 1 + 2);
+    }
+
+    /// T020a — `pharos_transcode_pin_total{outcome}` is how V80's one-encoder
+    /// guarantee is OBSERVED. A collision here is worse than a rename: fold
+    /// `invalidated` into `followed` and a rendition whose device went away
+    /// mid-stream reports as a healthy pin, so the alert for the #114 failure
+    /// mode never fires while the dashboard looks fine.
+    ///
+    /// This is a real guard only because the strings live on `PinOutcome`.
+    /// Asserting two inline literals at their call sites would have compared
+    /// constants written in the test to constants written beside them —
+    /// tautology that passes whatever the code does.
+    #[test]
+    fn pin_outcome_labels_are_distinct_and_stable() {
+        const ALL: [PinOutcome; 3] = [
+            PinOutcome::Followed,
+            PinOutcome::Invalidated,
+            PinOutcome::Unresolved,
+        ];
+        assert_eq!(PinOutcome::Followed.label(), "followed");
+        assert_eq!(PinOutcome::Invalidated.label(), "invalidated");
+        assert_eq!(PinOutcome::Unresolved.label(), "unresolved");
+
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "pin outcome labels collide: {labels:?} — a folded bucket reports a \
+             broken pin as a healthy one"
+        );
     }
 
     #[test]
