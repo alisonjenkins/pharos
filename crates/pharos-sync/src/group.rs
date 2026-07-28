@@ -58,6 +58,23 @@ pub const READY_TIMEOUT_MS: u64 = 30_000;
 /// is the same order of magnitude as a slow joiner's.
 pub const BUFFERING_MAX_MS: u64 = 30_000;
 
+/// B137 — anti-wedge bound on a gate a HUMAN opened by pressing play, and on
+/// the remaining wait after a play press lands on an already-open gate.
+///
+/// Deliberately far below `READY_TIMEOUT_MS`. That constant is sized for
+/// clients that are genuinely loading, where measured real acks reach 18.1s,
+/// and shortening it globally would start the group without members that were
+/// about to arrive. But a press changes what the wait MEANS: someone is
+/// watching the spinner from the first second, and the members a
+/// `BufferingUnpause` gate holds are the ones B137 showed frequently cannot
+/// ack at all. Three separate 30s hangs in one film on 2026-07-27 were this.
+///
+/// 5s is above the observed bulk of acks (under 3s), so a member that CAN
+/// answer still gets to; one that cannot no longer costs the room half a
+/// minute. A member genuinely still buffering re-reports `BufferingStart` and
+/// re-freezes the group (V19).
+pub const UNPAUSE_GATE_TIMEOUT_MS: u64 = 5_000;
+
 /// T83 — how long a member may stay SILENT (no socket KeepAlive, no
 /// `/SyncPlay/Ping`, no command) before the group prunes it as a ghost.
 /// jellyfin-web KeepAlives every ~30s, so a live client refreshes several
@@ -619,6 +636,36 @@ impl GateReason {
             GateReason::NextItem => "next_item",
             GateReason::PreviousItem => "previous_item",
             GateReason::Restored => "restored",
+        }
+    }
+
+    /// How long this gate may hold the group before the anti-wedge fires.
+    ///
+    /// Not one number, because the two kinds of wait are not alike. A queue
+    /// change or a seek is waiting on clients that are genuinely LOADING, and
+    /// measured real acks run to 18.1s (four days of production gates: bulk
+    /// under 3s, tail 15.5s and 18.1s) — cutting the global bound would
+    /// truncate legitimate waits and start the group without members that were
+    /// about to arrive.
+    ///
+    /// A `BufferingUnpause` gate is different in kind. A human pressed play, so
+    /// the wait is being experienced from the instant it opens rather than
+    /// discovered 30s later; and its holdouts are precisely the members flagged
+    /// buffering, which B137 established frequently CANNOT ack at all — the
+    /// freeze paused them and jellyfin-web posts Ready only on a transition.
+    /// Waiting 30s on a member that has no way to answer is not patience, it is
+    /// a hang. Bound it hard; a member genuinely still buffering re-reports
+    /// `BufferingStart` and re-freezes the group (V19), the same contract the
+    /// supersede in B137 relies on.
+    fn timeout_ms(self) -> u64 {
+        match self {
+            GateReason::BufferingUnpause => UNPAUSE_GATE_TIMEOUT_MS,
+            GateReason::Seek
+            | GateReason::QueueChange
+            | GateReason::PlaylistItem
+            | GateReason::NextItem
+            | GateReason::PreviousItem
+            | GateReason::Restored => READY_TIMEOUT_MS,
         }
     }
 
@@ -1200,7 +1247,7 @@ impl GroupState {
         // 19:51:01 out to 19:51:09. Cap at the earlier of the two — a gate may
         // shorten the wait the group is under, never lengthen it.
         let mut deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(READY_TIMEOUT_MS);
+            tokio::time::Instant::now() + std::time::Duration::from_millis(reason.timeout_ms());
         if let Some(since) = self.buffering_since {
             let freeze_deadline = since + std::time::Duration::from_millis(BUFFERING_MAX_MS);
             if freeze_deadline < deadline {
@@ -4303,6 +4350,56 @@ mod tests {
             "sole buffering member leaving must resume the group"
         );
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// B137 follow-up, hang 3 of 2026-07-27: a `BufferingStart` on an
+    /// already-PAUSED group flags the member without engaging a freeze, so the
+    /// supersede does not apply and the Unpause still gates — on a member that
+    /// may have no transition to make. That cost 30s (22:12:56 -> 22:13:26).
+    /// A gate a human opened by pressing play is bounded far tighter than one
+    /// waiting on clients that are genuinely loading.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_opened_by_a_play_press_is_bounded_tightly() {
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "slow").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Pause, THEN flag m2: no freeze engages, so the Unpause gates.
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "precondition: the press must open a gate on the flagged member"
+        );
+
+        // m2 never acks. Well short of READY_TIMEOUT_MS, the group must move.
+        tokio::time::advance(Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS + 500)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "a gate the user opened must not hold the room for the full \
+             loading-client timeout"
+        );
     }
 
     /// B137 — the 2026-07-28 deadlock. A member reports buffering, the group
