@@ -675,7 +675,11 @@ pub(crate) async fn stamp_synth_image_tags(
         // `Some(Default::default())` — an empty map — which serialises as
         // `"ImageTags": {}` and reads to jellyfin-web exactly like no image at
         // all. Testing only for `None` skipped every one of them.
-        if it.image_tags.as_ref().is_none_or(|m| m.is_empty()) {
+        let missing = match it.image_tags.as_ref() {
+            None => true,
+            Some(m) => m.is_empty(),
+        };
+        if missing {
             if let Some(tags) = synth_primary_tag(state, &it.id).await {
                 it.image_tags = Some(tags);
             }

@@ -3117,13 +3117,17 @@ async fn library_views(state: &AppState) -> Vec<serde_json::Value> {
     // carries its own CollectionType). The wire_id is the same
     // library_id_for_root hash a plain root would yield, so client URLs
     // are stable whether or not a library is typed.
-    let libraries = state.libraries();
-    if !libraries.is_empty() {
+    // Clone out of the guard in its own scope: the loop below awaits per
+    // library, and holding a std RwLock guard across an await can deadlock the
+    // executor.
+    let libs: Vec<pharos_core::Library> = {
+        let libraries = state.libraries();
+        libraries.iter().cloned().collect()
+    };
+    if !libs.is_empty() {
         // Sequential rather than a `map`: each entry awaits its representative
         // image. The first call warms the whole synth map, so the rest are memo
         // hits — a handful of libraries, one scan.
-        let libs: Vec<_> = libraries.iter().cloned().collect();
-        drop(libraries);
         let mut out = Vec::with_capacity(libs.len());
         for lib in libs {
             let image_tags =
@@ -3148,7 +3152,6 @@ async fn library_views(state: &AppState) -> Vec<serde_json::Value> {
         }
         return out;
     }
-    drop(libraries);
     if state.media_roots.is_empty() {
         return vec![all_media_placeholder(&state.server_id)];
     }
