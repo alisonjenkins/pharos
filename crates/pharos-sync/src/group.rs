@@ -2445,6 +2445,32 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     "gate" => w.reason.label(),
                 )
                 .increment(1);
+                // B137 — the gate is NOT replaced (that would reset the
+                // anti-wedge deadline, the old spam-play-to-extend-the-hang
+                // bug), but the press is no longer thrown away either. It
+                // carries two facts worth acting on:
+                //
+                // 1. The sender is asserting it is ready to play NOW. If it is
+                //    a holdout, it has just answered — and it will never answer
+                //    any other way, having no player transition to make while
+                //    the Play it wants is withheld. Ack it; if it was the last
+                //    holdout the group starts immediately instead of waiting
+                //    out the timeout.
+                // 2. A human is watching a spinner. Whatever tolerance the gate
+                //    was sized for, it was sized for a wait nobody had noticed
+                //    yet. Cap the REMAINING wait — strictly shortening, never
+                //    extending, so a second press cannot push recovery out.
+                if let Some(rec) = state.members.get_mut(&sender) {
+                    rec.buffering = false;
+                }
+                let capped = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS);
+                if let Some(w) = state.waiting.as_mut() {
+                    if capped < w.deadline {
+                        w.deadline = capped;
+                    }
+                }
+                state.ack_gate(sender);
                 return;
             }
             // The member that issued the Unpause is asserting "play now"; its
@@ -4399,6 +4425,102 @@ mod tests {
             GroupPlayState::Playing,
             "a gate the user opened must not hold the room for the full \
              loading-client timeout"
+        );
+    }
+
+    /// B137 follow-up, hang 2 of 2026-07-27: a press landing on an ALREADY-open
+    /// gate was discarded outright, so a viewer pressing play during a Seek
+    /// gate's 30s wait changed nothing (22:12:29 press, group moved 22:12:44).
+    /// The press must not REPLACE the gate — that resets the anti-wedge and is
+    /// the old spam-to-extend bug — but it must still be acted on: the sender
+    /// has answered, and the remaining wait is capped.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_into_an_open_gate_acks_the_sender_and_caps_the_wait() {
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        let (_m3, mut _rx3) = add_member(&h, &sinks, "third").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // A seek gates on the followers; nobody acks.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "precondition: a Seek gate must be open"
+        );
+
+        // 10s in, a viewer presses play. The old code dropped this silently and
+        // the group waited out the remaining 20s.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // The wait is now capped, not restarted: the group must move within the
+        // press grace, well before the Seek gate's own 30s would have expired.
+        tokio::time::advance(Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS + 500)).await;
+        tokio::task::yield_now().await;
+        assert_ne!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "a press must shorten the remaining wait, not vanish"
+        );
+    }
+
+    /// The other half of the press rule: capping must be one-directional. A
+    /// second press, or a press arriving when little time is left, must never
+    /// push the deadline back out — that was the spam-play-extends-the-hang
+    /// bug the discard was originally protecting against.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_presses_never_push_the_deadline_back_out() {
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (_m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // First press caps the remaining wait to the grace window.
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        let _ = snapshot_of(&h).await;
+        // Spam more presses right up to the edge of that window.
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS / 5)).await;
+            h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+            let _ = snapshot_of(&h).await;
+        }
+        // Now at first-press + 4/5 of the window. Step just past the FIRST
+        // press's cap and no further: if any later press re-armed the window,
+        // its deadline is ~4/5 of a window away still and the group is stuck
+        // here. Advancing a full window instead would let a re-armed deadline
+        // expire too, and the test would pass either way — it did, until this
+        // was checked by disarming the guard.
+        tokio::time::advance(Duration::from_millis(UNPAUSE_GATE_TIMEOUT_MS / 4)).await;
+        tokio::task::yield_now().await;
+        assert_ne!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "spamming play must not extend the hang — capping is one-way"
         );
     }
 
