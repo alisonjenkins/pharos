@@ -638,6 +638,38 @@ impl GateReason {
     }
 }
 
+/// How a V19 buffering freeze ENDED.
+///
+/// The freeze is the one piece of group state with no client-visible trace:
+/// it broadcasts a bare `Pause`, indistinguishable from a user pressing
+/// pause. So "the group is frozen because someone is buffering" and "the
+/// group is paused" looked identical in the record, and a freeze that ended
+/// only because a viewer manually seeked out of it left nothing behind at
+/// all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreezeOutcome {
+    /// The last buffering member signalled recovery and the group resumed on
+    /// its own. The healthy path.
+    Recovered,
+    /// A deliberate play/pause/seek overrode the freeze. Distinguishes "it
+    /// healed" from "a human had to intervene" — the 2026-07-28 wedge ended
+    /// this way, via a manual seek, after the group sat frozen for 11.3s.
+    Superseded,
+    /// `BUFFERING_MAX_MS` fired: the member never reported recovery and the
+    /// group was force-unfrozen. Always a defect.
+    AntiWedge,
+}
+
+impl FreezeOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            FreezeOutcome::Recovered => "recovered",
+            FreezeOutcome::Superseded => "superseded",
+            FreezeOutcome::AntiWedge => "anti_wedge",
+        }
+    }
+}
+
 /// How a readiness gate ENDED. Every gate terminates in exactly one of these,
 /// so the four buckets sum to the number of gates opened — if they ever fail
 /// to, a code path is dropping a gate without saying so.
@@ -1009,7 +1041,37 @@ impl GroupState {
     /// place those flags are cleared so no path forgets one (a stray
     /// `buffering_since` re-arms the anti-wedge and phantom-resumes the group
     /// ~30s later). Does not touch `playback`.
-    fn clear_buffering_freeze(&mut self) {
+    /// `outcome` attributes the end of the freeze. Only the FIRST call while a
+    /// freeze is live records — later calls see the flag already down and
+    /// no-op, which is what makes attribution correct where the paths nest:
+    /// `resume_after_buffering` reports `Recovered` and then delegates to
+    /// `start_playing`, whose own clear would otherwise re-report it as
+    /// `Superseded`.
+    fn clear_buffering_freeze(&mut self, outcome: FreezeOutcome) {
+        if self.group_paused_due_to_buffering {
+            let held = self
+                .buffering_since
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            let still_buffering = self.members.values().filter(|m| m.buffering).count();
+            tracing::info!(
+                group = %self.id,
+                outcome = outcome.label(),
+                held_ms = held.as_millis() as u64,
+                still_buffering,
+                "syncplay: buffering freeze lifted"
+            );
+            metrics::counter!(
+                "pharos_syncplay_buffering_freeze_total",
+                "outcome" => outcome.label(),
+            )
+            .increment(1);
+            metrics::histogram!(
+                "pharos_syncplay_buffering_freeze_seconds",
+                "outcome" => outcome.label(),
+            )
+            .record(held.as_secs_f64());
+        }
         self.group_paused_due_to_buffering = false;
         self.buffering_since = None;
         self.buffering_resume_playing = false;
@@ -1023,11 +1085,14 @@ impl GroupState {
     /// readiness gate).
     fn resume_after_buffering(&mut self) {
         let position_ms = self.current_position_ms();
-        if self.buffering_resume_playing {
+        let resume_playing = self.buffering_resume_playing;
+        // Report BEFORE delegating: `start_playing` clears the freeze too, and
+        // whichever call lands first owns the attribution.
+        self.clear_buffering_freeze(FreezeOutcome::Recovered);
+        if resume_playing {
             self.start_playing(position_ms, "Ready");
         } else {
             self.playback = PlaybackState::Paused { position_ms };
-            self.clear_buffering_freeze();
             self.broadcast(ServerMsg::StateUpdate {
                 state: GroupPlayState::Paused,
                 reason: "Ready".into(),
@@ -1066,7 +1131,7 @@ impl GroupState {
             position_ms,
             anchor_server_ms: at_server_ms,
         };
-        self.clear_buffering_freeze();
+        self.clear_buffering_freeze(FreezeOutcome::Superseded);
         self.broadcast(ServerMsg::Play {
             at_server_ms,
             position_ms,
@@ -1176,7 +1241,7 @@ impl GroupState {
             // seek→Ready cycle. Just settle the group state. Clear any freeze
             // bookkeeping too (defence: SeekTo clears it up front, but this
             // keeps the invariant that a settled-Paused group holds no freeze).
-            self.clear_buffering_freeze();
+            self.clear_buffering_freeze(FreezeOutcome::Superseded);
             self.playback = PlaybackState::Paused {
                 position_ms: w.position_ms,
             };
@@ -1266,7 +1331,7 @@ impl GroupState {
     fn seek_to(&mut self, position_ms: u64) {
         let was_frozen_playing =
             self.group_paused_due_to_buffering && self.buffering_resume_playing;
-        self.clear_buffering_freeze();
+        self.clear_buffering_freeze(FreezeOutcome::Superseded);
         let resume = match self.waiting.as_ref() {
             Some(w) => w.resume_playing,
             None => was_frozen_playing || matches!(self.playback, PlaybackState::Playing { .. }),
@@ -1758,7 +1823,7 @@ impl GroupHandle {
                         } else {
                             // A gate owns the resume; just disarm the freeze so
                             // this arm doesn't spin.
-                            state.clear_buffering_freeze();
+                            state.clear_buffering_freeze(FreezeOutcome::AntiWedge);
                         }
                         state.persist();
                     }
@@ -2096,7 +2161,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // B — a deliberate play overrides any pending gate + freeze; clear
             // them so a later resolve_waiting / anti-wedge can't contradict it.
             state.cancel_gate(GateOutcome::Superseded);
-            state.clear_buffering_freeze();
+            state.clear_buffering_freeze(FreezeOutcome::Superseded);
             // C — anchor at the scheduled start instant, not `now` (see
             // start_playing): clients play `position_ms` at `at_server_ms`.
             state.playback = PlaybackState::Playing {
@@ -2127,7 +2192,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // pause and force the group back to Playing. Mirrors PauseShared.
             state.cancel_gate(GateOutcome::Superseded);
             // A deliberate pause supersedes an in-flight V19 buffering freeze.
-            state.clear_buffering_freeze();
+            state.clear_buffering_freeze(FreezeOutcome::Superseded);
             // Freeze position at the moment we paused so late joiners
             // get the correct still-frame.
             let position_ms = state.freeze_paused_position();
@@ -2202,7 +2267,17 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 && matches!(state.playback, PlaybackState::Playing { .. })
                 && state.members.values().any(|m| m.buffering)
             {
-                tracing::info!(group = %state.id, member = %member_id, "syncplay: member buffering — freezing group (V19)");
+                // Symmetry with the lift line: the freeze must state where it
+                // stopped the group and how many members it is waiting on, or
+                // a lift 30s later cannot be read against its own start.
+                tracing::info!(
+                    group = %state.id,
+                    member = %member_id,
+                    position_ms = state.current_position_ms(),
+                    buffering_members = state.members.values().filter(|m| m.buffering).count(),
+                    members = state.members.len(),
+                    "syncplay: member buffering — freezing group (V19)"
+                );
                 state.group_paused_due_to_buffering = true;
                 // Capture resume intent BEFORE freeze_paused_position() below
                 // overwrites Playing → Paused. Guarded on Playing above, so this
@@ -2315,7 +2390,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // A deliberate pause supersedes an in-flight V19 buffering freeze:
             // clear its bookkeeping so a member's later Ready / the anti-wedge
             // timer can't force-resume the group out from under this pause.
-            state.clear_buffering_freeze();
+            state.clear_buffering_freeze(FreezeOutcome::Superseded);
             let position_ms = state.freeze_paused_position();
             state.broadcast(ServerMsg::Pause {
                 at_server_ms,
@@ -4134,6 +4209,87 @@ mod tests {
             "sole buffering member leaving must resume the group"
         );
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
+    /// The 2026-07-28 group-watch shape: a freeze that ends because a HUMAN
+    /// seeked out of it, not because the buffering member recovered. Both end
+    /// the freeze, and before `FreezeOutcome` both were equally silent — the
+    /// freeze broadcasts a bare `Pause`, so a group frozen on a stalled member
+    /// and a group a user paused are the same observation. `superseded` is
+    /// what says a viewer had to intervene.
+    #[tokio::test(start_paused = true)]
+    async fn a_freeze_ended_by_a_manual_seek_is_counted_as_superseded() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // m2 stalls: the group freezes and m2 never reports recovery — it has
+        // no player transition to report, which is the whole defect.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "precondition: the group must actually be frozen"
+        );
+
+        // The viewer gives up waiting and seeks — well inside BUFFERING_MAX_MS,
+        // so the anti-wedge cannot be what ends this freeze.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 900,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_syncplay_buffering_freeze_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = found.expect(
+            "a buffering freeze that ends must say HOW it ended — a freeze \
+             lifted by manual intervention is otherwise indistinguishable from \
+             one the group recovered from on its own",
+        );
+        assert!(
+            labels.contains(&"outcome=superseded".to_string()),
+            "a freeze ended by a seek is superseded, not recovered; got {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one freeze end, got {value:?}"
+        );
     }
 
     /// B55 — a member that buffers FOREVER (never sends BufferingEnd, never
