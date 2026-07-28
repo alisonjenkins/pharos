@@ -1191,6 +1191,28 @@ impl GroupState {
             lead_ms = self.lead_time_ms(),
             "syncplay: readiness gate opened"
         );
+        // B137 — a gate opened while a V19 freeze is armed must not RESET the
+        // clock the group is already running against. The freeze's anti-wedge
+        // arm is skipped whenever a gate is in flight ("that path owns the
+        // resume"), so opening a gate silently swapped a deadline that had
+        // already been counting down for a fresh full-length one: on
+        // 2026-07-28 a resume pressed 8s into a freeze pushed recovery from
+        // 19:51:01 out to 19:51:09. Cap at the earlier of the two — a gate may
+        // shorten the wait the group is under, never lengthen it.
+        let mut deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(READY_TIMEOUT_MS);
+        if let Some(since) = self.buffering_since {
+            let freeze_deadline = since + std::time::Duration::from_millis(BUFFERING_MAX_MS);
+            if freeze_deadline < deadline {
+                tracing::info!(
+                    group = %self.id,
+                    gate = reason.label(),
+                    inherited_ms = (freeze_deadline - tokio::time::Instant::now()).as_millis() as u64,
+                    "syncplay: gate inherits the armed buffering deadline rather than restarting it"
+                );
+                deadline = freeze_deadline;
+            }
+        }
         self.waiting = Some(WaitingGate {
             pending,
             reason,
@@ -1198,8 +1220,7 @@ impl GroupState {
             resume_playing,
             position_ms,
             not_before_server_ms,
-            deadline: tokio::time::Instant::now()
-                + std::time::Duration::from_millis(READY_TIMEOUT_MS),
+            deadline,
         });
         // Nobody to wait on (e.g. every member opted out of waits): resolve
         // straight away — no Waiting broadcast, no timeout detour.
@@ -4333,6 +4354,66 @@ mod tests {
             GroupPlayState::Paused,
             "a member genuinely still buffering must be able to re-freeze the \
              group — buffer isolation survives the override"
+        );
+    }
+
+    /// B137, second half: pressing play must not make the hang LONGER. The
+    /// freeze's anti-wedge arm is skipped while a gate is in flight, so opening
+    /// a gate used to swap a deadline already counting down for a fresh
+    /// full-length one — on 2026-07-28 a press 8s into a freeze pushed recovery
+    /// from 19:51:01 out to 19:51:09. A gate may shorten the group's wait,
+    /// never lengthen it.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_opened_during_a_freeze_inherits_the_armed_deadline() {
+        let (h, sinks, mut _rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "stalled").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // 25s into a 30s freeze, a queue change opens a gate. A queue change,
+        // not an Unpause or a Seek: both of those now clear the freeze on their
+        // way in (supersede / seek reconciliation), so neither leaves an armed
+        // deadline to inherit. A SetNewQueue does not, and is the path that
+        // still stacks a gate on top of a live freeze.
+        tokio::time::advance(Duration::from_secs(25)).await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["ep2".into()],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "precondition: the queue change must open a gate over the freeze"
+        );
+
+        // The group must be released within the freeze's REMAINING 5s, not
+        // 30s after the seek. Advance past the original deadline only.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        assert_ne!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "the gate restarted the clock the group was already running \
+             against — a press must never extend the hang"
         );
     }
 
