@@ -292,3 +292,47 @@ the device table does.
 
 **Supersedes.** The `RenditionPin` entity in `data-model.md` and the pin-map
 tasks (T011-T013, T016) collapse into one pure function plus its tests.
+
+---
+
+## R9 — REVERTED in production 2026-07-28: NVENC CMAF output is not accepted by hls.js
+
+**Outcome: the feature was reverted.** Pinning worked exactly as designed; the
+problem is one layer down, in what NVENC produces.
+
+**Evidence.** After the rollout, a browser reported a repeating hls.js
+transmuxer fault:
+
+```
+HLS Error: Type: otherError Details: internalException Fatal: false
+  onWorkerError ... _handleFragmentLoadProgress ... completeInitSegmentLoad
+```
+
+The first hypothesis — stale CPU-era segments paired with a fresh NVENC init —
+was real and worth fixing (V89, `HLS_GEN_VERSION` 12→13), but was NOT the whole
+cause: the fault recurred after the cache was wiped and playback restarted on a
+matching init.
+
+At that point the affinity mechanism was demonstrably correct: **87 fMP4 jobs,
+all on `Nvenc:0`**, none on CPU, no `invalidated` pins, zero server-side errors
+(`{200, 204}` only, no 4xx/5xx). Segments and init came from one encoder, which
+is exactly what the spec set out to guarantee — and the client still rejected
+the stream.
+
+**Therefore the remaining fault is in the NVENC CMAF bitstream/mux itself**, not
+in device selection. A likely suspect worth checking first: pharos patches the
+per-segment `tfdt` in `fmp4.rs` because ffmpeg zeroes it, and that patch may
+make assumptions about box layout that hold for libx264's mux but not NVENC's.
+Unproven — it is the next thing to measure, not a conclusion.
+
+**Why revert rather than iterate.** The failure is in a live viewing path, the
+next step needs bitstream-level analysis, and the CPU path is known-good. The
+PR itself set this as the stop condition.
+
+**What survives the revert:** R4 (NVENC is self-consistent across processes),
+R7 (the encoders cannot be reconciled — measured), R8 + V89 (the assignment
+rule is part of cache identity), and the `RenditionKey` / `rendition_device`
+design, which was never the thing that failed.
+
+**Reverting is itself a rule change**, so `HLS_GEN_VERSION` 13→14 discards the
+NVENC-era segments. Same hazard, opposite direction.

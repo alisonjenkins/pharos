@@ -605,7 +605,11 @@ impl std::fmt::Debug for HlsSegmentCache {
 // That holds only while the RULE is fixed; the deploy that introduced the rule
 // is itself the moment it changes. Observed live: 1489 cache hits (CPU-era)
 // against 11 fresh NVENC prefetch encodes for one episode.
-const HLS_GEN_VERSION: u32 = 13;
+// 14: the CMAF hardware change is REVERTED, which flips the assignment rule
+// back to CPU-only. By V89 that makes the NVENC-era segments cached under 13
+// stale in the same way the libx264-era ones were under 12 — same hazard,
+// opposite direction.
+const HLS_GEN_VERSION: u32 = 14;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
