@@ -2371,6 +2371,36 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&sender) {
                 rec.buffering = false;
             }
+            // B137 — the same argument, one member over. A V19 freeze PAUSES
+            // every member it captures, and a paused player awaiting a withheld
+            // Play undergoes no transition, so it can never post the
+            // Ready/BufferingEnd that would clear its flag. Trusting the
+            // sender's implicit recovery while distrusting everyone else's had
+            // no principled basis: the distrusted member has no mechanism to
+            // prove recovery, so the gate could only end at the anti-wedge.
+            //
+            // An explicit resume is user intent and supersedes the freeze,
+            // exactly as PauseShared already does. The V19 guarantee is
+            // preserved by re-report, not by holding: a member genuinely still
+            // buffering sends BufferingStart again and re-freezes the group.
+            // That is the same contract the sender-clear above has always
+            // relied on — this only stops applying it selectively.
+            if state.group_paused_due_to_buffering {
+                tracing::info!(
+                    group = %state.id,
+                    sender = %sender,
+                    held_ms = state
+                        .buffering_since
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0),
+                    buffering_members = state.members.values().filter(|m| m.buffering).count(),
+                    "syncplay: explicit unpause supersedes the V19 buffering freeze (B137)"
+                );
+                state.clear_buffering_freeze(FreezeOutcome::Superseded);
+                for m in state.members.values_mut() {
+                    m.buffering = false;
+                }
+            }
             let position_ms = state.current_position_ms();
             // jellyfin-web only posts `Ready` on a player transition, so an
             // already-buffered paused player never ACKs a withheld Unpause —
@@ -4232,6 +4262,80 @@ mod tests {
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
     }
 
+    /// B137 — the 2026-07-28 deadlock. A member reports buffering, the group
+    /// freezes, and the freeze PAUSES that member's player: jellyfin-web posts
+    /// `Ready` only on a player transition, so a paused player awaiting a
+    /// withheld `Play` can never clear its own flag. Pressing play used to open
+    /// a gate on exactly that member and hang until the anti-wedge.
+    ///
+    /// An explicit resume is user intent and supersedes the freeze. V19 is
+    /// preserved by re-report, not by holding — asserted below.
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_unpause_supersedes_a_buffering_freeze() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "stalled").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // m2 stalls: the group freezes. m2 will never signal recovery — it has
+        // no transition to report, which is the entire defect.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "precondition: the group must be frozen"
+        );
+        while rx1.try_recv().is_ok() {}
+
+        // A viewer presses play, well inside BUFFERING_MAX_MS so the anti-wedge
+        // cannot be what rescues this.
+        tokio::time::advance(Duration::from_secs(8)).await;
+        h.tx.send(GroupMsg::Unpause { sender: m1 }).await.unwrap();
+        let _ = snapshot_of(&h).await;
+
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "an explicit unpause must supersede the freeze, not gate on a \
+             member that cannot ack"
+        );
+        let mut played = false;
+        while let Ok(msg) = rx1.try_recv() {
+            if matches!(msg, ServerMsg::Play { .. }) {
+                played = true;
+            }
+        }
+        assert!(played, "the group must actually be told to play");
+
+        // V19 is preserved by RE-REPORT: a member genuinely still buffering
+        // says so again and freezes the group afresh. Without this the fix
+        // would trade a deadlock for a loss of buffer isolation.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 1_500,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "a member genuinely still buffering must be able to re-freeze the \
+             group — buffer isolation survives the override"
+        );
+    }
+
     /// A user pressing play while a gate is open is DROPPED — correctly, since
     /// replacing the gate would reset the anti-wedge deadline and extend the
     /// hang. But dropping it silently is how "I pressed play twice and nothing
@@ -4616,7 +4720,16 @@ mod tests {
         })
         .await
         .unwrap();
-        // m2 buffers → freeze.
+        // Pause first: a BufferingStart on a PAUSED group flags the member
+        // without engaging a V19 freeze (there is no playing party to
+        // isolate), which is the path on which an Unpause still gates. Since
+        // B137 an unpause into an ACTIVE freeze supersedes it outright, so
+        // that route no longer opens a gate to resolve — see
+        // `an_explicit_unpause_supersedes_a_buffering_freeze`.
+        h.tx.send(GroupMsg::PauseShared { sender: m1 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 0,
@@ -5026,7 +5139,14 @@ mod tests {
         })
         .await
         .unwrap();
-        // m2 buffers → group pauses.
+        // Pause, THEN let m2 buffer: on a paused group the flag is set without
+        // a V19 freeze, so the Unpause below still gates rather than
+        // superseding (B137). What is under test here is who the gate contains,
+        // which is unchanged: the sender is never in its own gate.
+        h.tx.send(GroupMsg::PauseShared { sender: leader })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 0,
