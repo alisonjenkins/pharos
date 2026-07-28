@@ -233,6 +233,91 @@ fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str, class: 
     .increment(1);
 }
 
+/// Which of the two hit paths served a cached segment. Bounded label (two
+/// values), because the difference is diagnostic: `fast` means the file was
+/// already there on the first look, `post_lock` means this request queued
+/// behind a concurrent mint of the SAME key and got the bytes the winner
+/// produced. A stream that is mostly `post_lock` is one where prefetch and the
+/// client keep colliding on the same segment — which reads as a healthy hit
+/// rate while every one of those requests paid the full single-flight wait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CacheHitPath {
+    Fast,
+    PostLock,
+}
+
+impl CacheHitPath {
+    fn label(self) -> &'static str {
+        match self {
+            CacheHitPath::Fast => "fast",
+            CacheHitPath::PostLock => "post_lock",
+        }
+    }
+}
+
+/// Record one segment served from cache.
+///
+/// V91 — symmetry with the `cache miss` line beside it. The miss path recorded
+/// twelve fields while the hit path recorded a bare counter increment on ONE of
+/// its two branches (the post-lock re-check incremented nothing at all), so
+/// "which of these requests were served from cache, and what produced those
+/// bytes?" was unanswerable — exactly the question the 2026-07-28 "Disclosure
+/// Day" investigation ran aground on, with 647 segment requests and no way to
+/// split them into hits and misses.
+///
+/// Carries the same identity fields as the miss line (codec / burn / audio_idx
+/// / seek_secs) so a single query can join the two and reconstruct what a
+/// session was actually served, plus `age_secs`, which says whether a hit came
+/// from this session's own prefetch or from a cache entry old enough to predate
+/// a deploy — the difference between a warm cache and a stale one.
+#[allow(clippy::too_many_arguments)]
+fn record_cache_hit(
+    media_id: u64,
+    seg_index: u32,
+    bytes: usize,
+    opts: &SegmentOpts,
+    class: JobClass,
+    hit_path: CacheHitPath,
+    read_ms: u64,
+    age_secs: Option<u64>,
+) {
+    metrics::counter!(
+        "pharos_segment_cache_total",
+        "result" => "hit",
+        "class" => class.label(),
+        "hit_path" => hit_path.label(),
+    )
+    .increment(1);
+    // A cache hit is assumed instant; on a contended or cold PVC it is not,
+    // and a slow hit stalls the client exactly like a slow encode while every
+    // transcode metric stays clean.
+    metrics::histogram!("pharos_segment_cache_read_seconds").record(read_ms as f64 / 1000.0);
+    tracing::info!(
+        media.id = media_id,
+        seg = seg_index,
+        bytes,
+        read_ms,
+        age_secs,
+        hit_path = hit_path.label(),
+        codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
+        burn = opts.burn_subtitle_stream_index.is_some(),
+        burn_idx = opts.burn_subtitle_stream_index,
+        audio_idx = opts.audio_source_stream_index,
+        seek_secs = opts.window.start_seconds(),
+        "hls segment served (cache hit)"
+    );
+}
+
+/// Age of a cached segment file, from its mtime. `None` when the filesystem
+/// does not report one — absence is not evidence of a fresh entry, so it stays
+/// an Option rather than defaulting to 0.
+fn cached_age_secs(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| d.as_secs())
+}
+
 /// What ffmpeg reported it actually produced, read from the `-progress`
 /// sidecar next to `out` — which is removed on the way out, success or not.
 /// `(frames, out_time_seconds)`.
@@ -742,14 +827,28 @@ impl HlsSegmentCache {
         let path = self.segment_path_keyed(key);
 
         // Fast hit path: file present, just bump LRU. A concurrent
-        // eviction can delete the file between try_exists and read; treat
+        // eviction can delete the file between the stat and the read; treat
         // that NotFound as a miss and fall through to regenerate rather
         // than surfacing a spurious 500 on a genuine cache hit.
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        //
+        // `metadata` rather than `try_exists`: the same syscall answers "is it
+        // there?" and carries the mtime the hit line reports as `age_secs`, so
+        // the added observability costs no extra stat.
+        let hit_started = std::time::Instant::now();
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
             self.touch(key).await;
             match tokio::fs::read(&path).await {
                 Ok(b) => {
-                    metrics::counter!("pharos_segment_cache_total", "result" => "hit").increment(1);
+                    record_cache_hit(
+                        media_id,
+                        seg_index,
+                        b.len(),
+                        opts,
+                        class,
+                        CacheHitPath::Fast,
+                        hit_started.elapsed().as_millis() as u64,
+                        cached_age_secs(&meta),
+                    );
                     return Ok(b);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
@@ -781,11 +880,27 @@ impl HlsSegmentCache {
         };
         let (_guard, lock_wait_ms) = lock_wait_ms;
 
-        // Re-check: another task may have populated while we waited.
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        // Re-check: another task may have populated while we waited. This is a
+        // cache hit too — it previously returned bytes without touching a
+        // counter or a log line, so every segment served this way was invisible
+        // in both the hit rate AND the miss rate.
+        let relock_started = std::time::Instant::now();
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
             self.touch(key).await;
             match tokio::fs::read(&path).await {
-                Ok(b) => return Ok(b),
+                Ok(b) => {
+                    record_cache_hit(
+                        media_id,
+                        seg_index,
+                        b.len(),
+                        opts,
+                        class,
+                        CacheHitPath::PostLock,
+                        relock_started.elapsed().as_millis() as u64,
+                        cached_age_secs(&meta),
+                    );
+                    return Ok(b);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
                 }
                 Err(e) => return Err(e.into()),
@@ -954,7 +1069,17 @@ impl HlsSegmentCache {
         let bytes = tokio::fs::read(&path).await?;
         let transcode_ms = started.elapsed().as_millis();
         record_segment_outcome(SegmentOutcome::Ok, class);
-        metrics::counter!("pharos_segment_cache_total", "result" => "miss").increment(1);
+        // Same label set as the hit arm so `sum by (result)` stays meaningful
+        // and a hit-rate query does not have to special-case one side.
+        // `hit_path` is "none" on a miss rather than absent: a label that
+        // appears on only one arm of a ratio silently drops series.
+        metrics::counter!(
+            "pharos_segment_cache_total",
+            "result" => "miss",
+            "class" => class.label(),
+            "hit_path" => "none",
+        )
+        .increment(1);
         // The same figure the log line carries, as a histogram: a segment
         // covers SEGMENT_SECONDS of playback, so a p95 above that means the
         // encoder is below realtime and clients are stalling. Answering that
@@ -2372,6 +2497,118 @@ mod tests {
         })
         .expect("slice supplied")
         .to_transcode_options()
+    }
+
+    /// The same shape as [`segment_transcode_opts`], stopping at the
+    /// UNRESOLVED `SegmentOpts` the cache is keyed on.
+    fn segment_opts() -> SegmentOpts {
+        SegmentOpts {
+            container: SegmentContainer::Mpegts,
+            video: Some(SegmentVideo::H264),
+            audio: AudioDelivery::Muxed(ContinuousAudio {
+                codec: SegmentAudio::Aac,
+                bitrate_bps: Some(128_000),
+            }),
+            video_bitrate_bps: Some(2_000_000),
+            window: pharos_core::SegmentWindow::for_segment(
+                27,
+                pharos_core::FrameRate::from_mille(23_976),
+                Some(3_600.0),
+            ),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+        }
+    }
+
+    /// V91 — a segment served from cache must be as countable as one that was
+    /// transcoded. The miss path recorded twelve fields; the hit path recorded
+    /// a bare counter on ONE of its two branches and nothing on the other, so
+    /// "how many of these requests were hits?" had no answer — which is where
+    /// the 2026-07-28 playback investigation stalled, holding 647 segment
+    /// requests it could not split.
+    ///
+    /// Asserts the labels too: they are the dashboard contract, and a hit that
+    /// lands under the wrong `class` or `hit_path` is worse than no signal
+    /// because it reads as a healthy number.
+    #[test]
+    fn a_cache_hit_is_counted_and_labelled() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1 << 30);
+        let opts = segment_opts();
+        let key = SegmentIdentity::new(7, 27, None, None, &opts);
+        let path = cache.segment_path_keyed(key);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // The source path deliberately does not exist: a hit must return
+        // WITHOUT reaching the transcoder, so this test cannot pass by
+        // accidentally encoding something.
+        let bytes = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                tokio::fs::create_dir_all(path.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::write(&path, b"cached-segment-bytes")
+                    .await
+                    .unwrap();
+                cache
+                    .segment_bytes_keyed(
+                        7,
+                        27,
+                        None,
+                        None,
+                        Path::new("/definitely/not/a/real/source.mkv"),
+                        &opts,
+                        JobClass::Interactive,
+                    )
+                    .await
+                    .unwrap()
+            })
+        });
+
+        assert_eq!(
+            bytes, b"cached-segment-bytes",
+            "a hit must return the CACHED bytes"
+        );
+
+        let hit = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_segment_cache_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) =
+            hit.expect("a cache hit must emit pharos_segment_cache_total — it is the signal");
+        for want in ["result=hit", "hit_path=fast", "class=interactive"] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing label {want}; got {labels:?}"
+            );
+        }
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one hit, got {value:?}"
+        );
     }
 
     /// Write an ffmpeg `-progress` sidecar for `out`. Shaped like the real
