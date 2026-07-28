@@ -948,11 +948,7 @@ async fn local_artwork_path(
     let locator = rows
         .into_iter()
         .find(|(r, source, _)| {
-            r.eq_ignore_ascii_case(token)
-                && matches!(
-                    source.to_ascii_lowercase().as_str(),
-                    "local" | "tmdb" | "tvdb"
-                )
+            r.eq_ignore_ascii_case(token) && pharos_core::artwork_source_is_item_servable(source)
         })
         .map(|(_, _, locator)| locator)?;
     let path = std::path::PathBuf::from(locator);

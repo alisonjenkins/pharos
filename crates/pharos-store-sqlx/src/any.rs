@@ -316,6 +316,17 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn audio_items_needing_art(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<MediaItem>> {
+        match self {
+            AnyStore::Sqlite(s) => s.audio_items_needing_art(limit, ttl_cutoff).await,
+            AnyStore::Postgres(p) => p.audio_items_needing_art(limit, ttl_cutoff).await,
+        }
+    }
+
     async fn item_entity_counts(&self, item_id: MediaId) -> DomainResult<EntityCounts> {
         match self {
             AnyStore::Sqlite(s) => s.item_entity_counts(item_id).await,

@@ -240,6 +240,81 @@ where
         .await
         .unwrap();
 
+    // audio_items_needing_art — the album-art pass's eligibility query. Exercised
+    // here rather than only in a unit test because sqlx checks neither
+    // placeholder arity nor column names at compile time, so a `?` vs `$1` slip
+    // or a boolean-literal difference between the engines only surfaces against
+    // a real database.
+    let track_id: MediaId = 3;
+    let mut track = media_item(track_id, "A Coverless Track");
+    track.kind = MediaKind::Audio;
+    track.probe.album = Some("Conformance Album".into());
+    track.probe.album_artist = Some("The Conformance Band".into());
+    MediaStore::put(&store, track.clone()).await.unwrap();
+
+    let needing = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000)
+        .await
+        .unwrap();
+    assert!(
+        needing.iter().any(|i| i.id == track_id),
+        "a coverless audio track must be eligible for an album-art lookup"
+    );
+    assert!(
+        needing.iter().all(|i| i.kind == MediaKind::Audio),
+        "the query must not return movies or episodes"
+    );
+
+    // A cached cover flips has_primary_art, which must drop the track out —
+    // otherwise every track of a resolved album re-runs a rate-limited search.
+    MediaStore::set_artwork(
+        &store,
+        track_id,
+        "Primary",
+        "musicbrainz",
+        "/cache/primary/audio/3.jpg",
+    )
+    .await
+    .unwrap();
+    assert!(
+        MediaStore::get(&store, track_id)
+            .await
+            .unwrap()
+            .has_primary_art,
+        "a downloaded musicbrainz Primary is item-servable"
+    );
+    let after_art = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000)
+        .await
+        .unwrap();
+    assert!(
+        !after_art.iter().any(|i| i.id == track_id),
+        "a track that now has art must leave the eligible set"
+    );
+
+    // A stamped match state also removes it, so an unmatched album is not
+    // re-searched on every pass.
+    let unmatched_id: MediaId = 4;
+    let mut unmatched = media_item(unmatched_id, "An Unmatchable Track");
+    unmatched.kind = MediaKind::Audio;
+    MediaStore::put(&store, unmatched).await.unwrap();
+    MediaStore::set_item_match(
+        &store,
+        unmatched_id,
+        "musicbrainz",
+        "",
+        "none",
+        None,
+        1_900_000_000,
+    )
+    .await
+    .unwrap();
+    let after_stamp = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000)
+        .await
+        .unwrap();
+    assert!(
+        !after_stamp.iter().any(|i| i.id == unmatched_id),
+        "a freshly stamped track waits for the TTL, not the next pass"
+    );
+
     // -----------------------------------------------------------------
     // 5. UserDataStore
     // -----------------------------------------------------------------
