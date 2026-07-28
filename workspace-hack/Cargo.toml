@@ -17,6 +17,7 @@ publish = false
 [dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 actix-rt = { version = "2" }
+aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
@@ -34,9 +35,11 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown = { version = "0.14", default-features = false, features = ["ahash", "raw"] }
+indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
+metrics-util = { version = "0.17" }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
@@ -69,6 +72,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 
 [build-dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
+aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
@@ -83,6 +87,7 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
+indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
