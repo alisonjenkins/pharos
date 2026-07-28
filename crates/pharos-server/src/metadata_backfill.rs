@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bg_io::BgPermit;
 use crate::config::MetadataConfig;
+use crate::musicbrainz::{AlbumArtResolver, MusicBrainzClient};
 use crate::online_enrich::{
     apply_enrichment, download_and_cache_art, EnrichedMetadata, OnlineEnricher, RemoteArt,
 };
@@ -140,12 +141,14 @@ pub(crate) fn now_secs() -> i64 {
 /// rolling-deploy surge never doubles provider API spend; a non-leader replica
 /// polls leadership on the same short cadence and takes over promptly if the
 /// leader goes away.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     stores: Stores,
     bg_io: Arc<Semaphore>,
     cache: Arc<ImageCache>,
     tmdb: Option<TmdbEnricher>,
     tvdb: Option<TvdbEnricher<ReqwestTransport>>,
+    musicbrainz: Option<MusicBrainzClient>,
     cfg: MetadataConfig,
     is_bg_leader: Arc<AtomicBool>,
 ) {
@@ -166,6 +169,7 @@ pub fn spawn(
                 cache.as_ref(),
                 tmdb.as_ref(),
                 tvdb.as_ref(),
+                musicbrainz.as_ref(),
                 &cfg,
                 now,
             )
@@ -198,22 +202,25 @@ pub fn spawn(
 /// in tests with fake enrichers + a real in-memory [`SqliteStore`].
 ///
 /// [`SqliteStore`]: pharos_store_sqlx::sqlite::SqliteStore
-pub(crate) async fn run<Tm, Tv, S>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run<Tm, Tv, Mb, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
     cache: &ImageCache,
     tmdb: Option<&Tm>,
     tvdb: Option<&Tv>,
+    musicbrainz: Option<&Mb>,
     cfg: &MetadataConfig,
     now: i64,
 ) -> DomainResult<PassStats>
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
+    Mb: AlbumArtResolver,
     S: MediaStore + GenreStore + PersonStore + SeriesMetadataStore,
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
-    if tmdb.is_none() && tvdb.is_none() {
+    if tmdb.is_none() && tvdb.is_none() && musicbrainz.is_none() {
         return Ok(PassStats {
             enriched: 0,
             had_work: false,
@@ -240,6 +247,19 @@ where
                 Err(e) => tracing::warn!(error = %e, "T9 metadata backfill: item failed"),
             }
             tokio::time::sleep(REQUEST_SPACING).await;
+        }
+    }
+
+    // Album-art pass. Independent of the item loop above: that query is
+    // restricted to movies and episodes, and audio rows are selected on
+    // "has no cover" rather than "metadata is stale".
+    if let Some(mb) = musicbrainz {
+        match enrich_audio_pass(store, bg_io, cache, mb, cfg, now).await {
+            Ok((n, audio_had_work)) => {
+                enriched += n;
+                had_work |= audio_had_work;
+            }
+            Err(e) => tracing::warn!(error = %e, "musicbrainz album-art pass aborted"),
         }
     }
 
@@ -903,6 +923,169 @@ fn upsert_art(
     }
 }
 
+/// One album-art pass: give every coverless audio track the front cover of its
+/// album.
+///
+/// Deliberately narrow. It does not touch scalars, genres or people — those
+/// come from the file's own tags and are already better than anything a
+/// release-group lookup would add — and it never overwrites art an item
+/// already has, because the query selects on `has_primary_art = false`. What it
+/// buys is the tile: a track with a cached Primary flips `has_primary_art`,
+/// which is what the album, album-artist and artist views synthesise their own
+/// images from.
+///
+/// Every item is stamped with a match state whatever the outcome, so a track
+/// leaves the eligible set either way and a library of unmatched albums does
+/// not re-run the same rate-limited searches on every pass. A miss records
+/// `none` (the TTL re-admits it later, in case the album is added to
+/// MusicBrainz); a hit records the release-group id.
+async fn enrich_audio_pass<Mb, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    mb: &Mb,
+    cfg: &MetadataConfig,
+    now: i64,
+) -> DomainResult<(usize, bool)>
+where
+    Mb: AlbumArtResolver,
+    S: MediaStore,
+{
+    let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
+    let items = store
+        .audio_items_needing_art(cfg.max_per_pass, ttl_cutoff)
+        .await?;
+    let had_work = !items.is_empty();
+    if !had_work {
+        return Ok((0, false));
+    }
+    tracing::info!(
+        total = items.len(),
+        "musicbrainz album-art pass: tracks without cover art"
+    );
+
+    let mut enriched = 0usize;
+    for item in items {
+        // V6 — one bad track never aborts the pass.
+        match enrich_audio_one(store, bg_io, cache, mb, &item, now).await {
+            Ok(true) => enriched += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                media.id = item.id,
+                "musicbrainz album-art: track failed"
+            ),
+        }
+        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+    if enriched > 0 {
+        tracing::info!(enriched, "musicbrainz album-art pass: covers cached");
+    }
+    Ok((enriched, had_work))
+}
+
+/// Resolve and cache one track's album cover. `Ok(true)` when art landed.
+async fn enrich_audio_one<Mb, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    mb: &Mb,
+    item: &MediaItem,
+    now: i64,
+) -> DomainResult<bool>
+where
+    Mb: AlbumArtResolver,
+    S: MediaStore,
+{
+    // The album artist is the right key: on a compilation the per-track artist
+    // is the performer of that track, which would not match the release-group.
+    // Fall back to the track artist when there is no album-artist tag.
+    let artist = item
+        .probe
+        .album_artist
+        .as_deref()
+        .or(item.probe.artist.as_deref());
+    let album = item.probe.album.as_deref();
+
+    // Both the search and the cover download are network calls, so they pace
+    // against live playback on the shared gate exactly like every other sweep
+    // (V34).
+    let permit = BgPermit::acquire(bg_io).await;
+    let result = mb.album_art(artist, album).await;
+    drop(permit);
+
+    let art = match result {
+        Ok(a) => a,
+        Err(miss) => {
+            // Symmetry: the miss says WHY, carrying the offending value, on the
+            // same fields the hit reports. A reason that doesn't name the value
+            // is another round of guessing.
+            tracing::info!(
+                media.id = item.id,
+                artist = artist.unwrap_or("-"),
+                album = album.unwrap_or("-"),
+                outcome = "miss",
+                reason = miss.label(),
+                detail = %miss,
+                "musicbrainz album-art: decision"
+            );
+            record_album_art(miss.label());
+            // A track with no album tag can never be resolved by an album
+            // lookup, so stamping it `none` is right; so is stamping a genuine
+            // no-match. A transport failure is NOT the item's fault — leave it
+            // eligible so the next pass retries rather than burning its TTL.
+            if !matches!(miss, crate::musicbrainz::AlbumArtMiss::Unavailable { .. }) {
+                store
+                    .set_item_match(item.id, "musicbrainz", "", "none", None, now)
+                    .await?;
+            }
+            return Ok(false);
+        }
+    };
+
+    let remote = art.remote_art();
+    download_and_cache_art(
+        cache,
+        store,
+        item,
+        "musicbrainz",
+        &remote,
+        art.bytes.clone(),
+    )
+    .await?;
+    store
+        .set_item_match(
+            item.id,
+            "musicbrainz",
+            &art.mbid,
+            "search",
+            Some(art.confidence),
+            now,
+        )
+        .await?;
+    tracing::info!(
+        media.id = item.id,
+        artist = artist.unwrap_or("-"),
+        album = album.unwrap_or("-"),
+        outcome = "hit",
+        mbid = %art.mbid,
+        confidence = art.confidence,
+        bytes = art.bytes.len(),
+        "musicbrainz album-art: decision"
+    );
+    record_album_art("hit");
+    Ok(true)
+}
+
+/// `pharos_album_art_total{outcome}` — one series per decision the album-art
+/// pass can reach. `hit` plus every [`AlbumArtMiss`] label, so "how much of the
+/// music library still has no cover, and why" is a single query.
+///
+/// [`AlbumArtMiss`]: crate::musicbrainz::AlbumArtMiss
+fn record_album_art(outcome: &'static str) {
+    metrics::counter!("pharos_album_art_total", "outcome" => outcome).increment(1);
+}
+
 /// One enrichment pass over the Series *containers* (T9-series). A show has no
 /// `media_items` row, so this can't ride the item loop — it enumerates distinct
 /// shows via [`SeriesMetadataStore::series_needing_match`] and enriches each
@@ -1197,6 +1380,7 @@ async fn cache_series_art<E: OnlineEnricher>(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::musicbrainz::AlbumArt;
     use pharos_core::{MediaItem, SearchCandidate};
     use pharos_store_sqlx::sqlite::SqliteStore;
     use tempfile::TempDir;
@@ -1369,6 +1553,188 @@ mod tests {
 
     const NOW: i64 = 1_700_000_000;
 
+    /// A deterministic [`AlbumArtResolver`] — MusicBrainz has no sandbox and
+    /// its rate limit makes a live test hostile to the service.
+    struct FakeAlbumArt(Result<AlbumArt, crate::musicbrainz::AlbumArtMiss>);
+
+    impl FakeAlbumArt {
+        fn hit() -> Self {
+            Self(Ok(AlbumArt {
+                mbid: "rg-abc-123".into(),
+                title: "Ocean Eyes".into(),
+                confidence: 0.99,
+                year: Some(2009),
+                // A real JPEG magic prefix: `download_and_cache_art` writes
+                // these bytes to the cache verbatim.
+                bytes: vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3],
+            }))
+        }
+
+        fn miss(m: crate::musicbrainz::AlbumArtMiss) -> Self {
+            Self(Err(m))
+        }
+    }
+
+    impl AlbumArtResolver for FakeAlbumArt {
+        async fn album_art(
+            &self,
+            _artist: Option<&str>,
+            _album: Option<&str>,
+        ) -> Result<AlbumArt, crate::musicbrainz::AlbumArtMiss> {
+            self.0.clone()
+        }
+    }
+
+    async fn put_track(store: &SqliteStore, id: u64, artist: &str, album: &str) {
+        let item = MediaItem {
+            id,
+            path: format!("/music/{artist}/{album}/{id}.flac").into(),
+            title: format!("track {id}"),
+            kind: MediaKind::Audio,
+            probe: pharos_core::MediaProbe {
+                album: Some(album.to_string()),
+                album_artist: Some(artist.to_string()),
+                ..Default::default()
+            },
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    // The whole point of the album-art pass: a coverless track ends up with a
+    // cached Primary, which is what flips `has_primary_art` — the flag every
+    // album / album-artist / artist tile synthesises its own image from.
+    #[tokio::test]
+    async fn album_art_pass_caches_a_cover_and_records_the_match() {
+        let s = store().await;
+        put_track(&s, 900_400, "Owl City", "Ocean Eyes").await;
+        let (_td, cache) = cache();
+
+        let (n, had_work) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::hit(),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        assert!(had_work);
+
+        let got = s.get(900_400).await.unwrap();
+        assert!(got.has_primary_art, "a cached cover must flip the flag");
+        assert_eq!(got.match_provider.as_deref(), Some("musicbrainz"));
+        assert_eq!(got.match_external_id.as_deref(), Some("rg-abc-123"));
+        assert_eq!(got.match_source.as_deref(), Some("search"));
+        assert_eq!(got.metadata_refreshed_at, Some(NOW));
+
+        // The artwork row records the provider, so the served image is
+        // attributable and `local_artwork_path` can find it.
+        let rows = s.artwork_for(900_400).await.unwrap();
+        let (role, source, _) = rows
+            .into_iter()
+            .find(|(r, _, _)| r.eq_ignore_ascii_case("Primary"))
+            .expect("a Primary artwork row");
+        assert_eq!(role, "Primary");
+        assert_eq!(source, "musicbrainz");
+
+        // And it drops out of the eligible set, so the album's other tracks
+        // never re-run a rate-limited search for art that already exists.
+        let still_eligible = s.audio_items_needing_art(10, NOW + 1).await.unwrap();
+        assert!(still_eligible.is_empty());
+    }
+
+    // A genuine no-match is stamped so the track leaves the eligible set — a
+    // library of unmatched albums must not re-run the same searches every pass.
+    #[tokio::test]
+    async fn album_art_no_match_is_stamped_so_it_stops_being_retried() {
+        let s = store().await;
+        put_track(&s, 900_401, "Nobody", "Unreleased Demos").await;
+        let (_td, cache) = cache();
+
+        let (n, had_work) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::miss(crate::musicbrainz::AlbumArtMiss::NoCandidates {
+                query: "releasegroup:\"Unreleased Demos\"".into(),
+            }),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "no art landed");
+        assert!(had_work, "an eligible row is still work");
+
+        let got = s.get(900_401).await.unwrap();
+        assert!(!got.has_primary_art);
+        assert_eq!(got.match_source.as_deref(), Some("none"));
+        assert_eq!(got.metadata_refreshed_at, Some(NOW));
+        // `none` + a fresh timestamp means the TTL, not the next pass, decides
+        // when to look again.
+        assert!(s.audio_items_needing_art(10, NOW).await.unwrap().is_empty());
+    }
+
+    // A transport failure is NOT the track's fault. Burning its TTL on a
+    // MusicBrainz outage would leave the whole music library blank for a month.
+    #[tokio::test]
+    async fn provider_outage_leaves_the_track_eligible_for_the_next_pass() {
+        let s = store().await;
+        put_track(&s, 900_402, "Owl City", "Ocean Eyes").await;
+        let (_td, cache) = cache();
+
+        let (n, _) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::miss(crate::musicbrainz::AlbumArtMiss::Unavailable {
+                cause: "connection refused".into(),
+            }),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+
+        let got = s.get(900_402).await.unwrap();
+        assert_eq!(
+            got.match_source, None,
+            "an outage must not stamp a match state"
+        );
+        assert_eq!(
+            s.audio_items_needing_art(10, NOW).await.unwrap().len(),
+            1,
+            "the track must still be eligible after a provider outage"
+        );
+    }
+
+    // Movies and episodes are the other pass's business; the album-art pass
+    // must never touch them (it would stamp `musicbrainz` over a TMDB match).
+    #[tokio::test]
+    async fn album_art_pass_ignores_video_items() {
+        let s = store().await;
+        put_movie(&s, 900_403, "Dune (2021)").await;
+        let (_td, cache) = cache();
+
+        let (n, had_work) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::hit(),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+        assert!(!had_work, "no audio rows means no work");
+        assert_eq!(s.get(900_403).await.unwrap().match_provider, None);
+    }
+
     #[tokio::test]
     async fn backfill_matches_by_search_and_persists_match_state() {
         let s = store().await;
@@ -1384,6 +1750,7 @@ mod tests {
             &cache,
             Some(&tmdb),
             None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1434,6 +1801,7 @@ mod tests {
             &cache,
             Some(&tmdb),
             None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1464,6 +1832,7 @@ mod tests {
             &cache,
             Some(&tmdb),
             None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1491,6 +1860,7 @@ mod tests {
             &cache,
             Some(&tmdb),
             None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1522,6 +1892,7 @@ mod tests {
             &cache,
             Some(&tmdb),
             None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1759,6 +2130,7 @@ mod tests {
             &cache,
             Some(&tmdb),
             Some(&tvdb),
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1820,6 +2192,7 @@ mod tests {
             &cache,
             None::<&FakeEnricher>,
             Some(&tvdb),
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1861,6 +2234,7 @@ mod tests {
             &cache,
             None::<&FakeEnricher>,
             Some(&tvdb),
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )
@@ -1889,6 +2263,7 @@ mod tests {
             &cache,
             None::<&FakeEnricher>,
             Some(&tvdb),
+            None::<&MusicBrainzClient>,
             &MetadataConfig::default(),
             NOW,
         )

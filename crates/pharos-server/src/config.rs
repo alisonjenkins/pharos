@@ -21,6 +21,10 @@ pub struct Config {
     /// `PHAROS_TVDB_API_KEY` rather than committing it to `config.toml`.
     #[serde(default)]
     pub tvdb: TvdbConfig,
+    /// Optional MusicBrainz + Cover Art Archive album artwork. Gated on
+    /// `contact` rather than a key — see [`MusicBrainzConfig`].
+    #[serde(default)]
+    pub musicbrainz: MusicBrainzConfig,
     /// Online metadata/artwork enrichment tunables (refresh cadence, batch
     /// size, match-confidence floor). All fields default when the
     /// `[metadata]` section is absent.
@@ -122,6 +126,34 @@ pub struct TvdbConfig {
     /// TVDB v4 API key. `None` (the default) disables the feature.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// `[musicbrainz]` — MusicBrainz + Cover Art Archive album artwork.
+///
+/// Unlike `[tmdb]` / `[tvdb]` there is no API key: the gate is `contact`.
+/// MusicBrainz's policy requires an identifying `User-Agent` carrying a way to
+/// reach the operator, and blocks clients that omit one — so rather than
+/// inventing a contact address, the feature stays off until an operator states
+/// theirs. Set it to a URL or email you actually read.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct MusicBrainzConfig {
+    /// Contact URL or email for the `User-Agent`. `None` (the default)
+    /// disables album-art enrichment entirely.
+    #[serde(default)]
+    pub contact: Option<String>,
+}
+
+impl MusicBrainzConfig {
+    /// The contact string, when it is set to something usable. A blank or
+    /// whitespace-only value is treated as unset — sending `pharos/x ( )` would
+    /// be rejected by MusicBrainz anyway, and failing at config time is clearer
+    /// than failing on every request.
+    pub fn contact(&self) -> Option<&str> {
+        self.contact
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
 }
 
 /// `[metadata]` — online metadata/artwork enrichment tunables. All fields
@@ -662,6 +694,16 @@ impl Config {
             let v = v.trim();
             if !v.is_empty() {
                 self.tvdb.api_key = Some(v.to_string());
+            }
+        }
+        // MusicBrainz needs no key, but it does need a contact address in the
+        // User-Agent. Env-overridable for the same reason as the keys above:
+        // the deployment, not the repo, knows who to name. Blank counts as
+        // unset, which leaves album-art enrichment off.
+        if let Ok(v) = std::env::var("PHAROS_MUSICBRAINZ_CONTACT") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.musicbrainz.contact = Some(v.to_string());
             }
         }
         self

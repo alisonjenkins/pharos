@@ -993,7 +993,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             )),
             _ => None,
         };
-        match (tmdb.is_some() || tvdb.is_some(), state.images.clone()) {
+        // MusicBrainz is gated on a contact address rather than a key: their
+        // policy requires an identifying User-Agent and blocks clients without
+        // one, so the feature stays off until an operator states theirs.
+        let musicbrainz = cfg
+            .musicbrainz
+            .contact()
+            .map(pharos_server::musicbrainz::MusicBrainzClient::new);
+        if musicbrainz.is_none() {
+            tracing::info!(
+                "musicbrainz album-art disabled (no [musicbrainz].contact / PHAROS_MUSICBRAINZ_CONTACT)"
+            );
+        }
+        let any_provider = tmdb.is_some() || tvdb.is_some() || musicbrainz.is_some();
+        match (any_provider, state.images.clone()) {
             (true, Some(images)) => {
                 pharos_server::metadata_backfill::spawn(
                     state.stores.clone(),
@@ -1001,6 +1014,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     std::sync::Arc::new(images),
                     tmdb,
                     tvdb,
+                    musicbrainz,
                     cfg.metadata.clone(),
                     state.is_bg_leader.clone(),
                 );
@@ -1011,7 +1025,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 );
             }
             (false, _) => {
-                tracing::info!("T9 metadata backfill disabled (no [tmdb]/[tvdb] api_key)");
+                tracing::info!(
+                    "T9 metadata backfill disabled (no [tmdb]/[tvdb] api_key, no [musicbrainz].contact)"
+                );
             }
         }
     }
