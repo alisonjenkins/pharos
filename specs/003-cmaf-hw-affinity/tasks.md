@@ -88,7 +88,7 @@ request errors and no CPU dispatch occurs.
 
 ### Implementation for User Story 3
 
-- [ ] T015 [US3] On pinned-device cooldown or repeated transient failure in `crates/pharos-transcode/src/scheduler.rs`, invalidate the pin and return `SchedError::Failed` rather than re-placing on another device (R2, FR-004).
+- [X] T015 [US3] On pinned-device cooldown or repeated transient failure in `crates/pharos-transcode/src/scheduler.rs`, invalidate the pin and return `SchedError::Failed` rather than re-placing on another device (R2, FR-004).
 - [X] T016 (SUPERSEDED by R8 — a restart recomputes the same device, so there is no re-pin to test) — [US3] Ensure a subsequent submit for the same key after invalidation re-pins from scratch (the client has restarted the stream and re-fetched the init), with a test in `crates/pharos-transcode/src/scheduler.rs`.
 
 **Checkpoint**: both #114 guards are in place and tested. Only now is it safe to let hardware in.
@@ -117,12 +117,13 @@ device, and every one of its segments comes from that device.
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T020 [P] Add `pharos_transcode_pin_total{outcome}` with the four bounded outcomes (`pinned`, `followed`, `queued_on_pin`, `invalidated`) in `crates/pharos-transcode/src/scheduler.rs`, and assert the label set is distinct in a test (metric labels are a dashboard contract).
-- [ ] T021 [P] Add log lines on pin and on invalidation in `crates/pharos-transcode/src/scheduler.rs` carrying the rendition key hash, the device, and a reason that names the offending value — never a bare class.
-- [ ] T022 Run `nix develop --command just test` and `cargo clippy --workspace --lib --tests -- -D warnings`; both must be clean before push.
-- [ ] T023 Deploy, then verify BY QUERY per `specs/003-cmaf-hw-affinity/quickstart.md` §3: report the actual output of `sum by (device) (pharos_segment_produced_total)` and `sum by (outcome) (pharos_transcode_pin_total)`, against the measured baseline (420 cpu / 3 Nvenc, median 3380 ms vs 1825 ms).
-- [ ] T024 Run the three-browser SyncPlay acceptance (quickstart §4): one title, three browsers, expect GPU encodes, no `outcome="shed"` on interactive jobs, and no `readiness gate timed out`. This is the scenario that failed on 2026-07-27.
-- [ ] T025 Record the outcome in `specs/001-pharos-baseline/`: a B-entry if any defect was found in flight, and an invariant covering "a shared-init rendition is produced by exactly one encoder" so the class is guarded even if this implementation is later replaced.
+- [X] T020 [P] (SCOPE NARROWED by R8 — with the device a pure function of the rendition there is no pin map, so `pinned` and `queued_on_pin` are unreachable states; the emitted set is the two that can occur) Add `pharos_transcode_pin_total{outcome}` with outcomes `followed` and `invalidated` in `crates/pharos-transcode/src/scheduler.rs`.
+- [ ] T020a [P] Assert in `crates/pharos-transcode/src/scheduler.rs` that the `pharos_transcode_pin_total` outcome labels are distinct and stable, alongside `job_class_labels_are_distinct_and_stable` — metric labels are a dashboard contract and this counter has none. Verify it fails if the two arms are given the same string.
+- [X] T021 [P] Add log lines on pin and on invalidation in `crates/pharos-transcode/src/scheduler.rs` carrying the rendition key hash, the device, and a reason that names the offending value — never a bare class.
+- [X] T022 Run `nix develop --command just test` and `cargo clippy --workspace --lib --tests -- -D warnings`; both must be clean before push.
+- [X] T023 Deploy, then verify BY QUERY per `specs/003-cmaf-hw-affinity/quickstart.md` §3. Actual (2026-07-28, post-#144): all 50 segments in a 10-minute window on `Nvenc:0`, encode p50 1820 ms = 3.30x realtime, queue wait p50/p95/max = 0 ms, against the 420 cpu / 3 Nvenc, 3380 ms baseline. Init `avcC` confirmed NVENC by SPS discriminators (profile_idc 77, log2_max_frame_num 8, 62 B) vs libx264 (100, 4, 49 B).
+- [X] T024 Run the three-browser SyncPlay acceptance (quickstart §4). Satisfied by a real three-member group watch on 2026-07-28 (*Central Intelligence*, HEVC->h264 CMAF): every segment on `Nvenc:0`, readiness gate opened -> acked -> resolved cleanly, no `readiness gate timed out`, no shed interactive jobs, consumption 1.0x against 3.30x encode capacity.
+- [X] T025 Record the outcome in `specs/001-pharos-baseline/`: B133 (stale CPU-era cache paired with an NVENC init) recorded in flight, with V89 (a device-assignment RULE change invalidates the cache) and V90 (an `immutable` response carries its identity in the URL) added; V80 already states the one-encoder guarantee.
 
 ---
 
