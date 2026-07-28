@@ -561,11 +561,92 @@ impl PlayQueue {
     }
 }
 
+/// Why a readiness gate was opened.
+///
+/// Two names, deliberately: `wire()` is jellyfin protocol — jellyfin-web
+/// matches `GroupStateUpdate.reason` case-sensitively against its own OSD
+/// strings, so it may only ever be one of those. `label()` is ours, and is
+/// finer-grained on purpose: FIVE distinct situations all broadcast
+/// `"Unpause"` to clients, and collapsing them in telemetry is exactly what
+/// made the 2026-07-28 group-watch wedge unreadable — `gate opened,
+/// reason=Unpause` cannot distinguish a queue advance from a resume being
+/// held on a buffering member, and those two have opposite diagnoses.
+///
+/// Metric labels are a dashboard contract: bounded, stable, and asserted
+/// distinct in `gate_reason_labels_are_distinct_and_stable`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateReason {
+    /// A gated group seek — the only reason carrying a non-zero `not_before`.
+    Seek,
+    /// An explicit resume held on the members currently flagged buffering.
+    BufferingUnpause,
+    /// `SetNewQueue` — every member is loading a fresh queue.
+    QueueChange,
+    /// `SetPlaylistItem` — a jump to another entry in the existing queue.
+    PlaylistItem,
+    NextItem,
+    PreviousItem,
+    /// A gate restored from a snapshot that predates reason persistence. Its
+    /// own bucket rather than a guess: attributing it to a real reason would
+    /// put fabricated counts on a dashboard.
+    Restored,
+}
+
+impl GateReason {
+    /// The `GroupStateUpdate.reason` string broadcast to clients. Matched
+    /// case-sensitively by jellyfin-web — never widen this set to make a
+    /// metric read better; add a `label()` variant instead.
+    fn wire(self) -> &'static str {
+        match self {
+            GateReason::Seek => "Seek",
+            GateReason::BufferingUnpause
+            | GateReason::QueueChange
+            | GateReason::PlaylistItem
+            | GateReason::NextItem
+            | GateReason::PreviousItem
+            | GateReason::Restored => "Unpause",
+        }
+    }
+
+    /// The metric/log label. Exhaustive by construction so a new variant is a
+    /// compile error here rather than a silently mislabelled series.
+    pub fn label(self) -> &'static str {
+        match self {
+            GateReason::Seek => "seek",
+            GateReason::BufferingUnpause => "buffering_unpause",
+            GateReason::QueueChange => "queue_change",
+            GateReason::PlaylistItem => "playlist_item",
+            GateReason::NextItem => "next_item",
+            GateReason::PreviousItem => "previous_item",
+            GateReason::Restored => "restored",
+        }
+    }
+
+    /// Inverse of `label()`, for a gate restored from a snapshot. An unknown
+    /// string (a snapshot written by a NEWER build during a rolling deploy)
+    /// maps to `Restored` rather than panicking or guessing.
+    fn from_label(s: &str) -> GateReason {
+        match s {
+            "seek" => GateReason::Seek,
+            "buffering_unpause" => GateReason::BufferingUnpause,
+            "queue_change" => GateReason::QueueChange,
+            "playlist_item" => GateReason::PlaylistItem,
+            "next_item" => GateReason::NextItem,
+            "previous_item" => GateReason::PreviousItem,
+            _ => GateReason::Restored,
+        }
+    }
+}
+
 /// The readiness gate: while `Some`, the group is in `Waiting` and will not
 /// broadcast the pending `Play`/`Pause` until every member in `pending` has
 /// reported `Ready` (or `deadline` fires — the anti-wedge timeout).
 struct WaitingGate {
     pending: HashSet<MemberId>,
+    /// Why this gate exists. Carried so the RESOLVE and TIMEOUT paths can name
+    /// it too — knowing a gate opened is useless without knowing which gate
+    /// the later outcome belongs to.
+    reason: GateReason,
     /// B38 — server-clock instant (the broadcast command's `at_server_ms`)
     /// before which NO legitimate `Ready` can exist: clients execute the
     /// command AT that time, so an earlier Ready is a spurious player
@@ -952,25 +1033,32 @@ impl GroupState {
         pending: HashSet<MemberId>,
         resume_playing: bool,
         position_ms: u64,
-        reason: &str,
+        reason: GateReason,
         not_before_server_ms: u64,
     ) {
         // An empty group can't resolve a gate; nothing to wait on.
         if self.members.is_empty() {
             return;
         }
+        // Name the members being waited ON, not just how many. `pending=1` was
+        // the whole record of the 2026-07-28 wedge: it could not say WHICH
+        // member held the group, so answering "why did play do nothing?"
+        // required correlating three other log streams by hand.
         tracing::info!(
             group = %self.id,
             pending = pending.len(),
+            pending_members = ?pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
             resume_playing,
             position_ms,
-            reason,
+            reason = reason.wire(),
+            gate = reason.label(),
             not_before_server_ms,
             lead_ms = self.lead_time_ms(),
             "syncplay: readiness gate opened"
         );
         self.waiting = Some(WaitingGate {
             pending,
+            reason,
             resume_playing,
             position_ms,
             not_before_server_ms,
@@ -985,7 +1073,7 @@ impl GroupState {
         }
         self.broadcast(ServerMsg::StateUpdate {
             state: GroupPlayState::Waiting,
-            reason: reason.to_string(),
+            reason: reason.wire().to_string(),
         });
     }
 
@@ -1092,7 +1180,7 @@ impl GroupState {
             position_ms,
         });
         let pending = self.follower_ids();
-        self.enter_waiting(pending, resume, position_ms, "Seek", at_server_ms);
+        self.enter_waiting(pending, resume, position_ms, GateReason::Seek, at_server_ms);
     }
 
     /// Lowest-MemberId-wins election. Deterministic, no voting needed.
@@ -1221,6 +1309,7 @@ impl GroupState {
                 pending: w.pending.iter().copied().collect(),
                 resume_playing: w.resume_playing,
                 position_ms: w.position_ms,
+                reason: w.reason.label().to_string(),
             }),
             group_name: self.group_name.clone(),
         }
@@ -1297,6 +1386,7 @@ impl GroupState {
         self.queue.updated_unix_ms = ps.queue_updated_unix_ms;
         self.waiting = ps.waiting.map(|w| WaitingGate {
             pending: w.pending.into_iter().collect(),
+            reason: GateReason::from_label(&w.reason),
             resume_playing: w.resume_playing,
             position_ms: w.position_ms,
             // Not persisted: the spurious-Ready window is ~lead-sized (≤2.2s)
@@ -1348,6 +1438,10 @@ struct PersistWaiting {
     pending: Vec<MemberId>,
     resume_playing: bool,
     position_ms: u64,
+    /// `GateReason::label()`. `default` (empty) keeps snapshots written before
+    /// this field deserializable; it decodes to `Restored`.
+    #[serde(default)]
+    reason: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2101,7 +2195,13 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // whenever it arrives and must count immediately. (A member still
                 // buffering does not send Ready, so there is no spurious-ack source
                 // to guard against — flooring this rejects legitimate fast acks.)
-                state.enter_waiting(buffering, true, position_ms, "Unpause", 0);
+                state.enter_waiting(
+                    buffering,
+                    true,
+                    position_ms,
+                    GateReason::BufferingUnpause,
+                    0,
+                );
             }
         }
         GroupMsg::PauseShared { sender: _ } => {
@@ -2266,7 +2366,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 position_ms: start_position_ms,
             };
             let pending = state.follower_ids();
-            state.enter_waiting(pending, true, start_position_ms, "Unpause", 0);
+            state.enter_waiting(pending, true, start_position_ms, GateReason::QueueChange, 0);
         }
         GroupMsg::SeedQueue {
             item_id,
@@ -2331,7 +2431,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // Settle at the new item's start before the gate (see SetNewQueue).
                 state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
-                state.enter_waiting(pending, true, 0, "Unpause", 0);
+                state.enter_waiting(pending, true, 0, GateReason::PlaylistItem, 0);
             }
         }
         GroupMsg::NextItem {
@@ -2364,7 +2464,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // the old episode's growing position and stranded mid-gate joiners.
                 state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
-                state.enter_waiting(pending, true, 0, "Unpause", 0);
+                state.enter_waiting(pending, true, 0, GateReason::NextItem, 0);
             }
         }
         GroupMsg::PreviousItem {
@@ -2388,7 +2488,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // Settle at the new item's start before the gate (see SetNewQueue).
                 state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
-                state.enter_waiting(pending, true, 0, "Unpause", 0);
+                state.enter_waiting(pending, true, 0, GateReason::PreviousItem, 0);
             }
         }
         GroupMsg::SetRepeatMode { sender: _, mode } => {
@@ -2436,6 +2536,54 @@ mod tests {
     use crate::delivery::{LocalDelivery, MemberSinks};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    /// The `gate` label is a dashboard contract: it is the only thing that
+    /// distinguishes the five situations that all broadcast `"Unpause"` on the
+    /// wire. A rename or an accidental collision breaks every query silently,
+    /// and a collision is the worse failure — two situations summing into one
+    /// series reads as a healthy bucket rather than a missing one.
+    #[test]
+    fn gate_reason_labels_are_distinct_and_stable() {
+        const ALL: [GateReason; 7] = [
+            GateReason::Seek,
+            GateReason::BufferingUnpause,
+            GateReason::QueueChange,
+            GateReason::PlaylistItem,
+            GateReason::NextItem,
+            GateReason::PreviousItem,
+            GateReason::Restored,
+        ];
+        assert_eq!(GateReason::Seek.label(), "seek");
+        assert_eq!(GateReason::BufferingUnpause.label(), "buffering_unpause");
+        assert_eq!(GateReason::QueueChange.label(), "queue_change");
+        assert_eq!(GateReason::PlaylistItem.label(), "playlist_item");
+        assert_eq!(GateReason::NextItem.label(), "next_item");
+        assert_eq!(GateReason::PreviousItem.label(), "previous_item");
+        assert_eq!(GateReason::Restored.label(), "restored");
+
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), ALL.len(), "gate labels collide: {labels:?}");
+
+        // The WIRE strings are jellyfin protocol and deliberately NOT distinct
+        // — five reasons share "Unpause". Pin the set so a future variant
+        // cannot quietly introduce a string jellyfin-web does not match.
+        for r in ALL {
+            assert!(
+                matches!(r.wire(), "Seek" | "Unpause"),
+                "{:?} broadcasts {:?}, which jellyfin-web will not match",
+                r,
+                r.wire()
+            );
+        }
+
+        // Persistence round-trips the label, so a gate surviving a pod
+        // takeover keeps its reason instead of collapsing into `restored`.
+        for r in ALL {
+            assert_eq!(GateReason::from_label(r.label()), r);
+        }
+        assert_eq!(GateReason::from_label(""), GateReason::Restored);
+        assert_eq!(GateReason::from_label("who_knows"), GateReason::Restored);
+    }
 
     /// B24 — `snapshot_contains_member` recognises a member id in a REAL
     /// persisted snapshot (produced by the actor's own persistence hook, not a
