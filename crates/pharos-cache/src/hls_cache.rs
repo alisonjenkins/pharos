@@ -593,7 +593,19 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// NVENC-init + libx264-segment (and vice versa) entries whose SPS is
 /// incompatible with the init — undecodable in the browser (issue #114) — so
 /// every v11 h264 CMAF entry must be orphaned.
-const HLS_GEN_VERSION: u32 = 12;
+// 13 (spec 003): CMAF H264 renditions moved from "always CPU" to a
+// deterministic device that resolves to hardware. Every segment cached under
+// the old rule was produced by libx264, and the init a client already holds may
+// have been too -- so a freshly encoded NVENC segment would decode under a
+// libx264 init and fail (issue #114). The bytes are not wrong, their PAIRING
+// is, and nothing in the cache path can tell them apart.
+//
+// R8 argued this bump was unnecessary because a deterministic device means
+// cached bytes always came from the device the rendition still resolves to.
+// That holds only while the RULE is fixed; the deploy that introduced the rule
+// is itself the moment it changes. Observed live: 1489 cache hits (CPU-era)
+// against 11 fresh NVENC prefetch encodes for one episode.
+const HLS_GEN_VERSION: u32 = 13;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 impl HlsSegmentCache {
