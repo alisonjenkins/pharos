@@ -633,6 +633,56 @@ async fn serve_image(
     Ok(deliver_image(&final_path, content_type, head_only, if_none_match).await)
 }
 
+/// The `ImageTags.Primary` a synthesised folder (library / album / artist)
+/// must advertise for jellyfin-web to fetch its image at all.
+///
+/// V82 — a capability field a client GATES a request on is answered from the
+/// same source that would serve the request. `SynthItemDto::folder` hardcoded
+/// `image_tags: None`, so jellyfin-web never called
+/// `/Items/{id}/Images/Primary` for an album or a library and rendered the
+/// flat icon fallback instead. The endpoint worked the whole time: an Elbow
+/// album whose twelve tracks all carry embedded art showed a blank tile, while
+/// the SAME art rendered in the now-playing bar (which requests the TRACK id,
+/// carrying a real tag). The advertisement, not the image, was missing.
+///
+/// Resolution goes through `resolve_synth_image_item`, i.e. the same lookup
+/// that serves the request, so the tag cannot promise an image the endpoint
+/// would 404 on. `None` when the group has no representative — the icon
+/// fallback is then correct rather than a guaranteed 404 per tile.
+///
+/// The tag VALUE is the representative item's id: opaque to the client (it
+/// only round-trips it as `?tag=`), but stable, and it changes if the
+/// representative does, which is what lets a cached tile refresh.
+pub(crate) async fn synth_primary_tag(
+    state: &AppState,
+    id_str: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let item = resolve_synth_image_item(state, id_str).await?;
+    let mut tags = std::collections::BTreeMap::new();
+    tags.insert("Primary".to_string(), item.id.to_string());
+    Some(tags)
+}
+
+/// Stamp `ImageTags.Primary` onto every synth folder in a list that has a
+/// representative image. One warm of the synth map covers the whole page, so
+/// a 279-artist grid costs one scan rather than 279.
+pub(crate) async fn stamp_synth_image_tags(
+    state: &AppState,
+    items: &mut [pharos_jellyfin_api::dto::SynthItemDto],
+) {
+    for it in items.iter_mut() {
+        // EMPTY counts as absent. The album/artist builders set
+        // `Some(Default::default())` — an empty map — which serialises as
+        // `"ImageTags": {}` and reads to jellyfin-web exactly like no image at
+        // all. Testing only for `None` skipped every one of them.
+        if it.image_tags.as_ref().is_none_or(|m| m.is_empty()) {
+            if let Some(tags) = synth_primary_tag(state, &it.id).await {
+                it.image_tags = Some(tags);
+            }
+        }
+    }
+}
+
 /// Resolve a synthesised Series/Season/Artist/Album wire id (a 32-hex hash,
 /// no stored row) to a representative member item whose frame / cover stands
 /// in as the group's poster. Series/Season pick the lowest `(season, episode)`
@@ -722,6 +772,30 @@ fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
         }
         if let Some(a) = it.probe.album.as_deref() {
             consider(album_id_for(a), it.id, it.title.clone());
+        }
+    }
+    // A LIBRARY is a group too, and until now the only one without a
+    // representative image: jellyfin-web renders a CollectionFolder with no
+    // Primary as a flat coloured icon tile, which is why "My Media" looked
+    // nothing like Jellyfin's. Same machinery, one more id per item.
+    //
+    // The key is prefixed by whether the item HAS art, so an item with a real
+    // poster always outranks one whose image would have to be extracted from a
+    // video frame — a library tile is the first thing seen on the home screen
+    // and a black frame there is worse than none. Title breaks ties, so the
+    // choice is stable across restarts rather than wandering per scan.
+    for lib in state.libraries().iter() {
+        let root = std::path::Path::new(&lib.root_path);
+        for it in all {
+            if !it.path.starts_with(root) {
+                continue;
+            }
+            let rank = if it.has_primary_art { '0' } else { '1' };
+            consider(
+                lib.wire_id.clone(),
+                it.id,
+                format!("{rank}{}", it.title.to_lowercase()),
+            );
         }
     }
     let mut cache = state
