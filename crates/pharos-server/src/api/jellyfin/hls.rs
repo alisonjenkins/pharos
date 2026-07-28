@@ -2809,16 +2809,38 @@ async fn fmp4_segment_opts(
 ) -> SegmentOpts {
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
-    let window = pharos_core::SegmentWindow::for_segment(
-        seg,
-        source_frame_rate(item.probe.frame_rate_mille),
-        item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
-    );
     // Fold the live-session cap with any URL-carried `VideoBitrate` ceiling
     // (Lace incident) so a remote Firefox on VP9 is capped too.
     let cap = min_opt(
         extract_session_bitrate_cap(state, req).await,
         qs_video_bitrate_cap(req.query_string()),
+    );
+    let session_burn = session_burn_indices(state, req).await;
+    fmp4_segment_opts_resolved(item, seg, video, subtitle_stream_index, cap, session_burn)
+}
+
+/// The body of [`fmp4_segment_opts`] with its two request-derived inputs —
+/// the bitrate cap and the session's burn set — passed in instead of read off
+/// an `HttpRequest`.
+///
+/// Split out for B139 so the cold-start PREWARM can build a CMAF segment key
+/// through the SAME code the CMAF route uses. That is the V92 requirement, not
+/// a tidiness one: a prewarm that derives its key independently drifts from the
+/// key the client requests, and the failure is silent — both paths simply
+/// produce segments, and the warmed one is never read.
+#[allow(clippy::too_many_arguments)]
+fn fmp4_segment_opts_resolved(
+    item: &pharos_core::MediaItem,
+    seg: u32,
+    video: SegmentVideo,
+    subtitle_stream_index: Option<u32>,
+    cap: Option<u64>,
+    session_burn: Option<std::collections::BTreeSet<u32>>,
+) -> SegmentOpts {
+    let window = pharos_core::SegmentWindow::for_segment(
+        seg,
+        source_frame_rate(item.probe.frame_rate_mille),
+        item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
     );
     // B50 — honour the client's negotiated cap, bounded by source + ceiling.
     let bitrate = effective_video_bitrate(cap, item.probe.bitrate_bps);
@@ -2842,7 +2864,6 @@ async fn fmp4_segment_opts(
     // the resulting encode queue timed the player out. The session records what
     // THIS client actually cannot render (resolved from its SubtitleProfiles at
     // PlaybackInfo); consult that instead of assuming.
-    let session_burn = session_burn_indices(state, req).await;
     let codec = subtitle_stream_index.and_then(|abs| {
         item.probe
             .subtitle_tracks
