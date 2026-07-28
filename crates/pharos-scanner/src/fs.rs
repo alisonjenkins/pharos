@@ -2111,6 +2111,37 @@ mod tests {
             Ok(matches)
         }
 
+        async fn audio_items_needing_art(
+            &self,
+            limit: i64,
+            ttl_cutoff: i64,
+        ) -> DomainResult<Vec<MediaItem>> {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut matches: Vec<MediaItem> = inner
+                .values()
+                .filter(|item| {
+                    let source_eligible = matches!(
+                        item.match_source.as_deref(),
+                        None | Some("search") | Some("none")
+                    );
+                    let ttl_eligible = item
+                        .metadata_refreshed_at
+                        .is_none_or(|refreshed| refreshed < ttl_cutoff);
+                    matches!(item.kind, MediaKind::Audio)
+                        && !item.has_primary_art
+                        && source_eligible
+                        && ttl_eligible
+                })
+                .cloned()
+                .collect();
+            matches.sort_by_key(|item| item.id);
+            matches.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok(matches)
+        }
+
         async fn item_entity_counts(
             &self,
             item_id: MediaId,

@@ -401,6 +401,28 @@ pub trait MetadataProvider: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<MetadataResult>> + Send;
 }
 
+/// Whether an `artwork.source` names bytes pharos holds on disk and can serve
+/// as a file.
+///
+/// The `artwork` table mixes two kinds of locator: a filesystem path (a local
+/// sidecar, or a provider image already downloaded into the image cache) and a
+/// bare remote `url` that nothing has fetched yet. Only the former can answer
+/// an image request, and only the former should flip `has_primary_art` — a
+/// `url` row advertises a tile that would 404 on every render.
+///
+/// This lives in core, and is the single list, because the same predicate is
+/// applied in three places that must never disagree: the sqlite and postgres
+/// `set_artwork` writers (which maintain the denormalised flag) and the image
+/// route that resolves a role to a path. When those were three separate
+/// `matches!` arms, adding MusicBrainz as an artwork source cached covers that
+/// were never advertised and never served — the flag simply stayed false.
+pub fn artwork_source_is_item_servable(source: &str) -> bool {
+    matches!(
+        source.to_ascii_lowercase().as_str(),
+        "local" | "tmdb" | "tvdb" | "musicbrainz"
+    )
+}
+
 /// LIB-C4 — stable 32-hex wire id for an aggregate entity (genre /
 /// artist / album / studio), keyed on a `kind` namespace + `name`. Pure
 /// arithmetic over the UTF-8 bytes — not IO, so it lives in core (V12
@@ -1964,6 +1986,36 @@ impl std::str::FromStr for MediaKind {
 }
 
 #[cfg(test)]
+mod artwork_source_tests {
+    use super::artwork_source_is_item_servable;
+
+    #[test]
+    fn every_provider_that_downloads_bytes_is_servable() {
+        // These four write a file into the image cache and record its path, so
+        // the image route can serve them and `has_primary_art` is true.
+        for source in ["local", "tmdb", "tvdb", "musicbrainz"] {
+            assert!(
+                artwork_source_is_item_servable(source),
+                "{source} downloads bytes and must be servable"
+            );
+        }
+        // Casing comes from whatever wrote the row; the predicate must not
+        // care.
+        assert!(artwork_source_is_item_servable("Local"));
+        assert!(artwork_source_is_item_servable("MusicBrainz"));
+    }
+
+    #[test]
+    fn a_bare_remote_url_is_not_servable() {
+        // A `url` row is a pointer nothing has fetched. Advertising it would
+        // put a tile on screen that 404s on every render.
+        assert!(!artwork_source_is_item_servable("url"));
+        assert!(!artwork_source_is_item_servable(""));
+        assert!(!artwork_source_is_item_servable("fanart"));
+    }
+}
+
+#[cfg(test)]
 mod media_kind_wire_tests {
     use super::MediaKind;
 
@@ -2866,6 +2918,25 @@ pub trait MediaStore: Send + Sync {
     /// refresh, so re-admitting one re-fetches that record without
     /// reconsidering the match.
     fn items_needing_match(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
+
+    /// Audio items still lacking cover art, eligible for an album-art lookup:
+    /// kind `audio`, `has_primary_art` false, `match_source` NULL or in
+    /// (`search`,`none`), not refreshed since `ttl_cutoff`, ascending id,
+    /// capped at `limit`.
+    ///
+    /// Separate from [`items_needing_match`](Self::items_needing_match)
+    /// because the two select disjoint sets for different reasons. That query
+    /// is restricted to movies and episodes and asks "what metadata is stale?";
+    /// this one asks "what has no cover?" — a track whose overview and year are
+    /// perfectly current is still worth a lookup if its tile is blank, and a
+    /// track that already has art is not worth one however old its match is.
+    /// Excluding rows that already have art also means an album resolved once
+    /// never spends a rate-limited MusicBrainz search again.
+    fn audio_items_needing_art(
         &self,
         limit: i64,
         ttl_cutoff: i64,

@@ -1020,10 +1020,7 @@ impl MediaStore for PostgresStore {
         // item-servable, so it clears the flag. Non-Primary roles never touch
         // it.
         if role.eq_ignore_ascii_case("Primary") {
-            let servable = matches!(
-                source.to_ascii_lowercase().as_str(),
-                "local" | "tmdb" | "tvdb"
-            );
+            let servable = pharos_core::artwork_source_is_item_servable(source);
             sqlx::query("UPDATE media_items SET has_primary_art = $1 WHERE id = $2")
                 .bind(servable)
                 .bind(id_i64)
@@ -1096,6 +1093,28 @@ impl MediaStore for PostgresStore {
              WHERE (match_source IS NULL OR match_source IN ('search','none','nfo_id')) \
                AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1) \
                AND kind IN ('movie','episode') \
+             ORDER BY id ASC LIMIT $2"
+        );
+        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+            .bind(ttl_cutoff)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter().map(MediaRow::into_domain).collect()
+    }
+
+    async fn audio_items_needing_art(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<MediaItem>> {
+        let sql = format!(
+            "SELECT {MEDIA_COLUMNS} FROM media_items \
+             WHERE kind = 'audio' \
+               AND has_primary_art = FALSE \
+               AND (match_source IS NULL OR match_source IN ('search','none')) \
+               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1) \
              ORDER BY id ASC LIMIT $2"
         );
         let rows = sqlx::query_as::<_, MediaRow>(&sql)
