@@ -284,6 +284,56 @@ impl TranscodeOptions {
     }
 }
 
+/// Identifies a set of segments that MUST come from one encoder because they
+/// share one init (T105 / spec 003).
+///
+/// A shared-init fMP4 rendition serves every segment under a single `avcC`
+/// carrying seg0's parameter sets, and the media segments carry none of their
+/// own. Two encoders' SPS are not interchangeable — measured on the deployment
+/// GPU, NVENC emits Main profile where libx264 emits High — so a segment
+/// produced by a different encoder than the init is undecodable (issue #114).
+///
+/// The key is DERIVED from the whole `TranscodeOptions`, with only the fields
+/// that legitimately vary WITHIN a rendition neutralised. That direction
+/// matters: a hand-listed key silently goes stale when a new option is added,
+/// and the failure mode is corrupt video rather than a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RenditionKey(u64);
+
+impl RenditionKey {
+    /// Fields neutralised here are the ones that differ between segments of the
+    /// SAME rendition. Everything else — codec, container, bitrate, audio
+    /// track, burn variant, frame rate — distinguishes renditions that cannot
+    /// share an init.
+    pub fn new(input: &std::path::Path, opts: &TranscodeOptions) -> Self {
+        let mut o = opts.clone();
+        o.start_position_ticks = 0;
+        o.duration_ticks = None;
+        o.decode_preroll_seconds = None;
+        if let Some(m) = o.muxed_audio_source.as_mut() {
+            // The muxed-audio PATH is part of the rendition; the offset into it
+            // is per-segment.
+            m.start_seconds = 0.0;
+        }
+        // Canonicalised through serde so a newly added option joins the key
+        // automatically. Falling back to the Debug form keeps this total —
+        // there is no sensible way to fail here, and a key that panicked would
+        // take playback down.
+        let canon = serde_json::to_string(&o).unwrap_or_else(|_| format!("{o:?}"));
+
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        input.hash(&mut h);
+        canon.hash(&mut h);
+        Self(h.finish())
+    }
+
+    /// Short, stable-within-process label for logs and metrics.
+    pub fn short(&self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -356,6 +406,78 @@ mod tests {
         // device-profile parsers don't accidentally upgrade clients
         // that asked for plain mp4.
         assert_eq!(Container::from_name("mp4"), Some(Container::Mp4));
+    }
+
+    fn cmaf_opts() -> TranscodeOptions {
+        TranscodeOptions {
+            container: Container::Fmp4,
+            source_frame_rate: None,
+            video: Some(VideoCodec::H264),
+            audio: None,
+            video_bitrate_bps: Some(3_000_000),
+            audio_bitrate_bps: None,
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            decode_preroll_seconds: None,
+            muxed_audio_source: None,
+        }
+    }
+
+    /// Segments of ONE rendition must share a key: only the per-segment fields
+    /// differ between them, and if those leaked into the key every segment
+    /// would pin its own device and the guarantee would be vacuous.
+    #[test]
+    fn segments_of_one_rendition_share_a_key() {
+        let path = std::path::Path::new("/media/Show/S01E01.mkv");
+        let seg0 = cmaf_opts();
+        let mut seg7 = cmaf_opts();
+        seg7.start_position_ticks = 7 * 6 * 10_000_000;
+        seg7.duration_ticks = Some(6 * 10_000_000);
+        seg7.decode_preroll_seconds = Some(1.5);
+        assert_eq!(
+            RenditionKey::new(path, &seg0),
+            RenditionKey::new(path, &seg7),
+            "start/duration/preroll vary WITHIN a rendition and must not split it"
+        );
+    }
+
+    /// Anything that changes the encode's parameter sets is a different
+    /// rendition and must not be allowed to share an init.
+    #[test]
+    fn an_encode_affecting_field_changes_the_key() {
+        let path = std::path::Path::new("/media/Show/S01E01.mkv");
+        let base = RenditionKey::new(path, &cmaf_opts());
+
+        let mut o = cmaf_opts();
+        o.video_bitrate_bps = Some(6_000_000);
+        assert_ne!(base, RenditionKey::new(path, &o), "bitrate rung");
+
+        let mut o = cmaf_opts();
+        o.container = Container::Mpegts;
+        assert_ne!(base, RenditionKey::new(path, &o), "container");
+
+        let mut o = cmaf_opts();
+        o.audio_source_stream_index = Some(2);
+        assert_ne!(base, RenditionKey::new(path, &o), "audio track");
+
+        let mut o = cmaf_opts();
+        o.burn_subtitle_stream_index = Some(1);
+        assert_ne!(base, RenditionKey::new(path, &o), "burn variant");
+
+        let mut o = cmaf_opts();
+        o.source_frame_rate = pharos_core::FrameRate::from_mille(23_976);
+        assert_ne!(base, RenditionKey::new(path, &o), "frame rate");
+
+        assert_ne!(
+            base,
+            RenditionKey::new(std::path::Path::new("/media/Show/S01E02.mkv"), &cmaf_opts()),
+            "a different source is a different rendition"
+        );
     }
 
     #[test]

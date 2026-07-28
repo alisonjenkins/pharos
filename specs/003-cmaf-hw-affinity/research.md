@@ -171,3 +171,56 @@ carry the identical hazard, but no hevc CMAF rung exists today"). VP9 fMP4 alrea
 exists and is CPU-only for a different reason (no NVENC VP9 encoder), so it is
 unaffected in practice, but the affinity mechanism should key off the container
 contract rather than re-encode the codec list.
+
+---
+
+## R7 — Can the encoders simply be made to agree? (measured 2026-07-28)
+
+**Question.** If NVENC and a software encoder emitted the same SPS, no pinning
+would be needed and free load-balancing could continue. Is the difference
+reconcilable by flags, or by swapping libx264 for a different software encoder?
+
+**Answer: no.** Measured on the deployment GPU, decoding the `avcC` SPS
+field-by-field rather than trusting the original comment.
+
+Defaults differ in profile AND in two internal derivations:
+
+| field | NVENC | libx264 (default) |
+|---|---|---|
+| `profile_idc` | 77 (Main) | 100 (High) |
+| `log2_max_frame_num` | 8 | 4 |
+| `log2_max_poc_lsb` | 8 | 6 |
+| High-profile fields | absent | present |
+
+`-profile:v main` on libx264 aligns `profile_idc`, `constraint_flags`,
+`level_idc` and removes the High-only fields — so most of the gap IS forceable.
+The remaining two are not:
+
+| encoder | log2_max_frame_num | pic_order_cnt_type | log2_max_poc_lsb |
+|---|---|---|---|
+| h264_nvenc (default) | 8 | 0 | 8 |
+| h264_nvenc `-bf 0` | 8 | 2 | — |
+| h264_nvenc `-g 16` | 8 | 0 | 8 |
+| libx264 `-profile main` | 4 | 0 | 6 |
+| libx264 `-g 256` | 4 | 0 | 6 |
+| libx264 `-refs 4 -bf 0` | 4 | 2 | — |
+| libopenh264 | 15 | 2 | — |
+
+NVENC pins 8 regardless of GOP length or B-frames; x264 pins 4 regardless of
+`-g`/`-refs`; openh264 is further away still (15, and poc type 2). No ffmpeg
+flag moves either, and no available software encoder matches.
+
+**Why it cannot be patched around.** `log2_max_frame_num` is the WIDTH of the
+`frame_num` field in every slice header. Changing it in the SPS does not
+re-encode the slices, so an init rewritten to "agree" would make the decoder
+mis-parse every slice that follows. This is a bitstream-layout difference, not
+a metadata one.
+
+**Consequence for the design.** The one-encoder-per-rendition requirement is
+real and cannot be dissolved. Pinning (this spec) stands as the fix. The one
+useful by-product: `-profile:v main` narrows the gap enough that profile is NOT
+the obstacle, so nobody need re-investigate that branch.
+
+**Rejected.** Rewriting `avcC` to match (breaks slice parsing, above); swapping
+libx264 for openh264 (further apart, and a large quality/speed regression);
+hardware-only with no CPU fallback (that is pinning, minus the safety).
