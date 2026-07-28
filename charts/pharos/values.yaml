@@ -53,6 +53,16 @@ tmdb:
     secretName: ""      # e.g. "pharos-tmdb"
     secretKey: "api-key"
 
+# ── MusicBrainz + Cover Art Archive album artwork. Most music files carry no
+#    embedded picture and no cover.jpg, so album/artist tiles render a flat
+#    icon; MusicBrainz fills that gap with no API key. What it does require is
+#    an identifying contact in the User-Agent — a URL or email whose owner can
+#    be reached if this instance misbehaves. Their policy blocks clients that
+#    omit one, so leaving this empty keeps the feature off rather than sending
+#    an anonymous agent. Injected as PHAROS_MUSICBRAINZ_CONTACT.
+musicbrainz:
+  contact: "https://github.com/alisonjenkins/pharos"
+
 # ── pharos config.toml, rendered into a ConfigMap mounted at
 #    /etc/pharos/config.toml. Optional fields are omitted when null/empty.
 config:

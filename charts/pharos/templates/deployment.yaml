@@ -121,6 +121,14 @@ spec:
                   name: {{ .Values.tmdb.apiKey.secretName }}
                   key: {{ .Values.tmdb.apiKey.secretKey | default "api-key" }}
             {{- end }}
+            {{- with .Values.musicbrainz.contact }}
+            # MusicBrainz + Cover Art Archive album artwork. No API key exists;
+            # the gate is a contact address, which their policy requires in the
+            # User-Agent (they block clients that omit one). Absent → the
+            # album-art pass never runs.
+            - name: PHAROS_MUSICBRAINZ_CONTACT
+              value: {{ . | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8096
