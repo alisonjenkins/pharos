@@ -671,3 +671,37 @@ async fn album_and_artist_detail_advertise_the_cover_the_grid_shows() {
         );
     }
 }
+
+#[actix_web::test]
+async fn opening_a_music_genre_resolves_instead_of_400() {
+    // B156 — `/Genres` and `/MusicGenres` hand out genre wire ids as tile ids,
+    // and opening a tile fetches the item before listing its children. That
+    // fetch fell through every synth resolution to the numeric parse and
+    // answered 400 "invalid id", so the genre page dead-ended. Seen live as
+    // repeated `GET /Users/{u}/Items/<genre id> 400` from jellyfin-web.
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+
+    // The client always lists first, so take the id the list actually emits
+    // rather than re-deriving the hash.
+    let genres = get_items!(app, token, "/MusicGenres");
+    let id = genres
+        .iter()
+        .find(|g| g["Name"] == "Nu Metal")
+        .and_then(|g| g["Id"].as_str())
+        .expect("the seeded audio genre must be listed")
+        .to_string();
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/Items/{id}"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200, "a genre tile's own item must resolve");
+    let body: serde_json::Value = serde_json::from_slice(&test::read_body(resp).await).unwrap();
+    assert_eq!(body["Name"], "Nu Metal");
+    assert_eq!(body["Id"].as_str(), Some(id.as_str()));
+    // Nu Metal is carried by the seeded movie + episode too, so it is a
+    // general Genre; a genre held only by audio would type as MusicGenre.
+    assert_eq!(body["Type"], "Genre");
+}

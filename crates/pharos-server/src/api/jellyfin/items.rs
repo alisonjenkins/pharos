@@ -5256,6 +5256,67 @@ fn shuffle_in_place(items: &mut [MediaItem], seed: u64) {
 /// neither. Names are recovered by hashing the store's distinct candidates —
 /// the same pattern `resolve_parent_filter` uses, so any id that resolves as
 /// a `ParentId` also resolves as a single item (and vice versa).
+/// B156 — resolve a genre wire id (`genres.wire_id`, i.e. `genre_id_for(name)`)
+/// to the same folder DTO the `/Genres` + `/MusicGenres` list builders emit.
+/// `None` when the id names no genre row.
+///
+/// The `Type` follows membership rather than the endpoint the client happened
+/// to come from: a genre carried ONLY by audio is a `MusicGenre`, anything else
+/// a `Genre`. Getting this wrong sends jellyfin-web down the wrong detail
+/// renderer (a music genre rendered as a video Genre lists nothing).
+async fn synth_genre(
+    state: &AppState,
+    id_str: &str,
+) -> Result<Option<serde_json::Value>, actix_web::Error> {
+    use pharos_core::GenreStore;
+    let rows = state
+        .stores
+        .genres_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let Some(gc) = rows.iter().find(|gc| gc.genre.wire_id == id_str) else {
+        return Ok(None);
+    };
+    let all = state
+        .list_items_cached()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let want = gc.genre.name.to_lowercase();
+    let (mut audio, mut other) = (0u32, 0u32);
+    for item in all.iter() {
+        let Some(raw) = item.probe.genre.as_deref() else {
+            continue;
+        };
+        if pharos_core::split_genre_field(raw)
+            .into_iter()
+            .any(|n| n.to_lowercase() == want)
+        {
+            if item.kind == MediaKind::Audio {
+                audio += 1;
+            } else {
+                other += 1;
+            }
+        }
+    }
+    let kind = if audio > 0 && other == 0 {
+        "MusicGenre"
+    } else {
+        "Genre"
+    };
+    Ok(Some(
+        serde_json::to_value(SynthItemDto {
+            child_count: Some(gc.item_count),
+            ..SynthItemDto::folder(
+                gc.genre.wire_id.clone(),
+                gc.genre.name.clone(),
+                state.server_id.clone(),
+                kind,
+            )
+        })
+        .unwrap_or(serde_json::Value::Null),
+    ))
+}
+
 async fn synth_album_or_artist(
     state: &AppState,
     id_str: &str,
@@ -5445,6 +5506,13 @@ async fn fetch_item_dto(
         if let Some(view) = synth_album_or_artist(state, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
+        if let Some(view) = synth_genre(state, id_str).await? {
+            return Ok(crate::api::jellyfin::wire::json(&view));
+        }
+        // B156 — a genre wire id. `/Genres` and `/MusicGenres` hand these out
+        // as tile ids, and opening a tile fetches the item before listing its
+        // children; without this the fetch fell through to the numeric parse
+        // and answered 400 "invalid id", which killed the genre page.
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id).await.map_err(|e| match e {
