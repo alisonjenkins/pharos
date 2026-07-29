@@ -84,7 +84,23 @@ async fn deliver_image(
         resp.insert_header((ETAG, t.clone()));
     }
     if head_only {
-        return resp.finish();
+        // B166 — a HEAD must advertise the length the GET would send. actix's
+        // encoder derives `Content-Length` from the body's declared
+        // `BodySize` and DROPS any manually-inserted header, so `.finish()` —
+        // an empty body, `BodySize::Sized(0)` — advertised `Content-Length: 0`
+        // for every image. Same trap as B101 on the video path, where a
+        // zero-length HEAD collapsed Firefox's seekability probe.
+        //
+        // `SizedStream` declares the real length while its stream is never
+        // polled for a HEAD, so the bytes are still not read off disk.
+        let len = tokio::fs::metadata(final_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        return resp.body(actix_web::body::SizedStream::new(
+            len,
+            futures_util::stream::empty::<Result<actix_web::web::Bytes, actix_web::Error>>(),
+        ));
     }
     match tokio::fs::read(final_path).await {
         Ok(bytes) => resp.body(bytes),
@@ -1568,6 +1584,58 @@ mod tests {
             .await
             .expect("a cover that landed after the memo warmed must be picked up");
         assert_eq!(tags.get("Primary").map(String::as_str), Some("2"));
+    }
+
+    #[actix_web::test]
+    async fn a_head_advertises_the_length_the_get_would_send() {
+        // B166 — `.finish()` on the HEAD path declared an empty body, and
+        // actix derives Content-Length from the body size while DROPPING a
+        // manually-inserted header, so every image HEAD said 0. Observed live
+        // as `content-length: 0` next to an ETag whose own prefix encoded
+        // 157,350 bytes. Same trap as B101 on the video path.
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let poster = dir.path().join("poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 77, &dir.path().join("movie.mkv")).await;
+        state
+            .stores
+            .set_artwork(77, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+
+        let app = test::init_service(App::new().app_data(state.clone()).configure(register)).await;
+
+        let get = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/items/77/images/primary")
+                .to_request(),
+        )
+        .await;
+        let get_len = test::read_body(get).await.len();
+        assert_eq!(get_len, PNG_1X1.len(), "GET serves the sidecar");
+
+        let head = test::call_service(
+            &app,
+            test::TestRequest::with_uri("/items/77/images/primary")
+                .method(actix_web::http::Method::HEAD)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(head.status(), 200);
+        // The Content-Length header is stamped by the h1 encoder at wire time,
+        // from the body's declared size — which is precisely the value that
+        // was wrong. Assert the mechanism rather than a header the in-process
+        // test harness never materialises.
+        use actix_web::body::MessageBody;
+        assert_eq!(
+            head.into_body().size(),
+            actix_web::body::BodySize::Sized(get_len as u64),
+            "a HEAD must declare the length the GET would send"
+        );
     }
 
     #[actix_web::test]
