@@ -5284,7 +5284,11 @@ async fn synth_album_or_artist(
         // B78/V38 — typed SynthItemDto.
         let mut it = SynthItemDto {
             child_count: Some(tracks.len() as u32),
-            image_tags: Some(Default::default()),
+            // B157 — the same lookup the GRID uses (`synth_album_dto`), so the
+            // detail header shows the cover the tile already showed. An empty
+            // map here serialises as `"ImageTags": {}`, which reads to every
+            // client as no image at all.
+            image_tags: crate::api::jellyfin::images::synth_primary_tag(state, id_str).await,
             backdrop_image_tags: Some(Vec::new()),
             genres: Some(Vec::new()),
             tags: Some(Vec::new()),
@@ -5318,7 +5322,9 @@ async fn synth_album_or_artist(
         // B78/V38 — typed SynthItemDto.
         return Ok(Some(
             serde_json::to_value(SynthItemDto {
-                image_tags: Some(Default::default()),
+                // B157 — as above: the artist detail header needs the tag the
+                // artist GRID already resolves.
+                image_tags: crate::api::jellyfin::images::synth_primary_tag(state, id_str).await,
                 backdrop_image_tags: Some(Vec::new()),
                 genres: Some(Vec::new()),
                 tags: Some(Vec::new()),
