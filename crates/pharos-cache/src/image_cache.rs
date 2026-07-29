@@ -396,13 +396,31 @@ impl ImageCache {
         let Ok(meta) = tokio::fs::metadata(source).await else {
             return source.to_path_buf();
         };
-        // Only large sidecars are worth scaling. A ~480px JPEG is tens of KB;
-        // a full-res poster/fanart is hundreds of KB to several MB. Below this
-        // threshold the file already reads fast and re-encoding would only add
-        // latency + risk upscaling a small image, so serve it verbatim.
+        // B163 — decide on DIMENSIONS, not file size. This used to serve
+        // anything under 256 KiB verbatim, on the reasoning that a small file
+        // is already cheap to read. But the question a thumbnail request asks
+        // is not "is this file big?", it is "is this image bigger than the box
+        // it goes in?" — and a 1000x1500 poster compresses to about 253 KiB,
+        // slipping under the threshold and being served whole into a 213 px
+        // tile. The client then decoded a 1.5 MP bitmap per tile and the grid
+        // moved an order of magnitude more bytes than it needed.
+        //
+        // Reading the intrinsic width costs a header parse of the first few KB
+        // — no decode — so the correct question is now the cheap one. The byte
+        // threshold survives only as the fallback for a format whose header we
+        // cannot read, where guessing wrong by scaling risks upscaling.
         const SCALE_THRESHOLD_BYTES: u64 = 256 * 1024;
-        if meta.len() < SCALE_THRESHOLD_BYTES {
-            return source.to_path_buf();
+        match intrinsic_width(source).await {
+            // Already at or near the requested size: re-encoding would cost
+            // latency and quality for nothing, and scaling UP is always wrong.
+            // The 20% band stops a 480-px cap re-encoding a 500-px sidecar.
+            Some(w) if w <= width.saturating_add(width / 5) => {
+                return source.to_path_buf();
+            }
+            // Genuinely wider than the target — scale it whatever it weighs.
+            Some(_) => {}
+            None if meta.len() < SCALE_THRESHOLD_BYTES => return source.to_path_buf(),
+            None => {}
         }
         let mtime = meta
             .modified()
@@ -1081,6 +1099,64 @@ impl ImageCache {
 }
 
 #[cfg(test)]
+mod header_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::width_from_header;
+
+    /// Minimal JPEG: SOI, an APP0 segment to be skipped, then SOF0 carrying the
+    /// size. Built by hand so the test states the byte layout it depends on.
+    fn jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8];
+        // APP0, length 6, four bytes of payload — must be SKIPPED, not read as
+        // a frame header. This is the step that made the naive scan wrong.
+        v.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x06, 1, 2, 3, 4]);
+        // SOF0: marker, length, precision, height, width, components.
+        v.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        v.extend_from_slice(&height.to_be_bytes());
+        v.extend_from_slice(&width.to_be_bytes());
+        v.push(3);
+        v
+    }
+
+    #[test]
+    fn jpeg_width_is_read_past_the_app_segments() {
+        assert_eq!(width_from_header(&jpeg(1000, 1500)), Some(1000));
+        assert_eq!(width_from_header(&jpeg(213, 213)), Some(213));
+    }
+
+    #[test]
+    fn a_huffman_table_is_not_mistaken_for_a_frame_header() {
+        // B163 — DHT (0xC4) sits in the 0xC0..=0xCF range but carries no
+        // dimensions. Reading it as a SOF yields a garbage width, which would
+        // make the scale decision arbitrary.
+        let mut v = vec![0xFF, 0xD8];
+        v.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x06, 9, 9, 9, 9]);
+        v.extend_from_slice(&jpeg(640, 480)[2..]);
+        assert_eq!(width_from_header(&v), Some(640));
+    }
+
+    #[test]
+    fn png_width_comes_from_ihdr() {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend_from_slice(&[0, 0, 0, 13]);
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&800u32.to_be_bytes());
+        v.extend_from_slice(&600u32.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert_eq!(width_from_header(&v), Some(800));
+    }
+
+    #[test]
+    fn an_unreadable_header_declines_rather_than_guessing() {
+        // The caller falls back to its byte heuristic on None; returning a
+        // wrong number instead would risk upscaling.
+        assert_eq!(width_from_header(b""), None);
+        assert_eq!(width_from_header(b"not an image at all"), None);
+        assert_eq!(width_from_header(&[0xFF, 0xD8]), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -1384,4 +1460,70 @@ mod tests {
             .await;
         assert!(matches!(res, Err(ImageCacheError::Io(_))));
     }
+}
+
+/// The intrinsic pixel width of an image, read from its header without
+/// decoding it.
+///
+/// B163 — scaling has to be decided on how big the IMAGE is, not how big the
+/// file is, and doing that per request is only acceptable if it is cheap. Every
+/// format here states its dimensions within the first few dozen bytes after the
+/// signature, so one short read answers it. `None` means "not a format we can
+/// read cheaply", and the caller falls back to its byte heuristic rather than
+/// risk upscaling.
+async fn intrinsic_width(source: &Path) -> Option<u32> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(source).await.ok()?;
+    // Enough for a PNG/WebP header and for the SOF marker of essentially every
+    // JPEG (EXIF thumbnails push it back, but not this far).
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = f.read(&mut buf).await.ok()?;
+    buf.truncate(n);
+    width_from_header(&buf)
+}
+
+/// Header-only width parse, split out so it can be tested on byte literals.
+fn width_from_header(b: &[u8]) -> Option<u32> {
+    // PNG: 8-byte signature, then an IHDR chunk whose width is at offset 16.
+    if b.len() >= 24 && b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(u32::from_be_bytes([b[16], b[17], b[18], b[19]]));
+    }
+    // WebP: "RIFF" .... "WEBP", then a VP8/VP8L/VP8X chunk.
+    if b.len() >= 30 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        return match &b[12..16] {
+            b"VP8X" => {
+                Some((u32::from(b[24]) | (u32::from(b[25]) << 8) | (u32::from(b[26]) << 16)) + 1)
+            }
+            b"VP8L" => Some(((u32::from(b[21]) | (u32::from(b[22]) << 8)) & 0x3FFF) + 1),
+            b"VP8 " => Some(u32::from(u16::from_le_bytes([b[26], b[27]]) & 0x3FFF)),
+            _ => None,
+        };
+    }
+    // JPEG: walk the marker chain to a Start-Of-Frame, which carries the size.
+    if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
+        let mut i = 2usize;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = b[i + 1];
+            // SOF0/1/2/3/5/6/7/9/10/11/13/14/15 all carry height+width at the
+            // same offset; DHT/DAC/RST/SOS do not and must not be read as one.
+            let is_sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+            if is_sof {
+                return Some(u32::from(u16::from_be_bytes([b[i + 7], b[i + 8]])));
+            }
+            if matches!(marker, 0xD8 | 0xD9 | 0x01 | 0xD0..=0xD7) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            if len < 2 {
+                return None;
+            }
+            i += 2 + len;
+        }
+    }
+    None
 }
