@@ -1530,6 +1530,47 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn artwork_landing_after_the_memo_warmed_re_picks_the_representative() {
+        // B155 — the synth-image memo pins the representative for the life of
+        // the pod. The backfill runs for hours after boot, so an album whose
+        // tile was first rendered before its cover downloaded kept resolving to
+        // the coverless track it was warmed with — permanently blank until a
+        // restart, which is why covers "arrived" only after a deploy.
+        use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        let track = |id: u64, title: &str| MediaItem {
+            id,
+            path: format!("/m/{id}.flac").into(),
+            title: title.into(),
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                album: Some("Hypnotize".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.stores.put(track(1, "Attack")).await.unwrap();
+        state.stores.put(track(2, "Lonely Day")).await.unwrap();
+
+        let album_id = crate::api::jellyfin::dto::album_id_for("Hypnotize");
+        // Warmed while the album had no art at all: no tag, memo now pinned.
+        assert!(synth_primary_tag(&state, &album_id).await.is_none());
+
+        state
+            .stores
+            .set_artwork(2, "Primary", "musicbrainz", "/cache/hypnotize.jpg")
+            .await
+            .unwrap();
+        state.note_artwork_changed();
+
+        let tags = synth_primary_tag(&state, &album_id)
+            .await
+            .expect("a cover that landed after the memo warmed must be picked up");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("2"));
+    }
+
+    #[actix_web::test]
     async fn local_primary_artwork_is_served_verbatim() {
         use pharos_core::MediaStore;
         let dir = tempfile::tempdir().unwrap();

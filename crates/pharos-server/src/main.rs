@@ -1017,6 +1017,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     musicbrainz,
                     cfg.metadata.clone(),
                     state.is_bg_leader.clone(),
+                    state.artwork_epoch.clone(),
                 );
             }
             (true, None) => {

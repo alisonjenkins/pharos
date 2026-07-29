@@ -151,6 +151,7 @@ pub fn spawn(
     musicbrainz: Option<MusicBrainzClient>,
     cfg: MetadataConfig,
     is_bg_leader: Arc<AtomicBool>,
+    artwork_epoch: Arc<std::sync::atomic::AtomicU64>,
 ) {
     tokio::spawn(async move {
         let idle = Duration::from_secs(cfg.refresh_interval_secs.max(1));
@@ -177,6 +178,14 @@ pub fn spawn(
             {
                 Ok(s) => {
                     tracing::info!(enriched = s.enriched, "T9 metadata backfill: pass complete");
+                    // B155 — a pass that enriched anything may have recorded
+                    // new artwork, which changes which track should represent
+                    // an album/artist tile. Bump the epoch so the synth-image
+                    // memo (built before the cover existed) is dropped instead
+                    // of pinning a coverless representative until restart.
+                    if s.enriched > 0 {
+                        artwork_epoch.fetch_add(1, Ordering::Relaxed);
+                    }
                     s
                 }
                 Err(e) => {
