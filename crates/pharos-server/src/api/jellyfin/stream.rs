@@ -1141,6 +1141,7 @@ mod tests {
             path: "/no/such".into(),
             title: "t".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(60_000), // 60s
                 bitrate_bps,

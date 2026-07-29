@@ -764,3 +764,48 @@ fn a_books_library_reports_the_books_collection_type() {
     // An unknown token still falls back to Mixed rather than to Books.
     assert_eq!(LibraryKind::parse("bookshelf"), LibraryKind::Mixed);
 }
+
+#[test]
+fn book_format_round_trips_and_knows_what_a_client_can_open() {
+    use crate::BookFormat;
+
+    let all = [
+        BookFormat::Epub,
+        BookFormat::Pdf,
+        BookFormat::Comic,
+        BookFormat::Unreadable,
+    ];
+
+    // Store round-trip: whatever `as_str` writes, `parse` must read back, or a
+    // stored book row decodes to the wrong format.
+    for f in all {
+        assert_eq!(
+            BookFormat::parse(f.as_str()),
+            Some(f),
+            "{} did not round-trip",
+            f.as_str()
+        );
+    }
+
+    // Distinct discriminators — a collision would silently merge two formats.
+    let tokens: std::collections::HashSet<_> = all.iter().map(|f| f.as_str()).collect();
+    assert_eq!(tokens.len(), all.len());
+
+    // An unrecognised token must NOT decode to a readable format. A hand-edited
+    // or future-version row becomes None, and the caller decides, rather than
+    // silently becoming an epub.
+    assert_eq!(BookFormat::parse("azw3"), None);
+    assert_eq!(BookFormat::parse(""), None);
+
+    // THE authority on readability (see BookFormat::readable_by_client): exactly
+    // one variant is unreadable. If a fifth format is added and no client can
+    // open it, this assertion is what forces the decision to be explicit.
+    for f in all {
+        assert_eq!(
+            f.readable_by_client(),
+            f != BookFormat::Unreadable,
+            "{} disagreed about client readability",
+            f.as_str()
+        );
+    }
+}

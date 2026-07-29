@@ -69,10 +69,10 @@ otherwise by labelling `Path` and `/Download` as US1-only.
 
 ### Book metadata types
 
-- [ ] T009 Add `BookFormat` (`Epub`, `Pdf`, `Comic`, `Unreadable`) to `crates/pharos-core/src/lib.rs` with `as_str()`/`parse()` for the store discriminator and **`readable_by_client()`** — `!matches!(self, Unreadable)`. This method is the single authority on readability; do **not** add a `READABLE_BY_CLIENT` extension list, which would be a second answer that can drift (D1)
-- [ ] T010 [P] Add test `book_format_round_trips_and_knows_what_a_client_can_open` in `crates/pharos-core/src/lib.rs` tests: `as_str`→`parse` round-trips for all four variants, all four `as_str` values are distinct, and `readable_by_client()` is false for `Unreadable` only
-- [ ] T011 Add `BookMeta` to `crates/pharos-core/src/lib.rs` with the seven fields from [data-model.md](./data-model.md), deriving `Debug, Clone, PartialEq, Default`. Title, release date and description are **not** here — they are ordinary item fields (R6)
-- [ ] T012 Add `pub book: Option<BookMeta>` to `MediaItem` (`crates/pharos-core/src/lib.rs:38`); fix the struct-literal sites the compiler names — **COMMIT**
+- [X] T009 Add `BookFormat` (`Epub`, `Pdf`, `Comic`, `Unreadable`) to `crates/pharos-core/src/lib.rs` with `as_str()`/`parse()` for the store discriminator and **`readable_by_client()`** — `!matches!(self, Unreadable)`. This method is the single authority on readability; do **not** add a `READABLE_BY_CLIENT` extension list, which would be a second answer that can drift (D1)
+- [X] T010 [P] Add test `book_format_round_trips_and_knows_what_a_client_can_open` in `crates/pharos-core/src/lib.rs` tests: `as_str`→`parse` round-trips for all four variants, all four `as_str` values are distinct, and `readable_by_client()` is false for `Unreadable` only
+- [X] T011 Add `BookMeta` to `crates/pharos-core/src/lib.rs` with the seven fields from [data-model.md](./data-model.md), deriving `Debug, Clone, PartialEq, Default`. Title, release date and description are **not** here — they are ordinary item fields (R6)
+- [X] T012 Add `pub book: Option<BookMeta>` to `MediaItem` (`crates/pharos-core/src/lib.rs:38`); fix the struct-literal sites the compiler names — **COMMIT**
 
 ### Step 2 — store
 

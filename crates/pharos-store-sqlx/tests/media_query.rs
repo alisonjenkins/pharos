@@ -55,6 +55,7 @@ fn synth_item(id: u64) -> MediaItem {
         // SortName order differs from id order.
         title: format!("Title {:05}", 99_999 - id),
         kind,
+        book: None,
         probe: MediaProbe {
             duration_ms: Some((id % 7_200) * 1_000 + 1_000),
             artist: (kind == MediaKind::Audio).then(|| format!("Artist {}", id % 5)),

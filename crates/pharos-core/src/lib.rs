@@ -46,6 +46,10 @@ pub struct MediaItem {
     /// omit fields whose value is `None` so clients negotiate against
     /// reality, not a stub.
     pub probe: MediaProbe,
+    /// 004-books — book-specific facts when kind == Book, `None` otherwise.
+    /// A book's `probe` stays `MediaProbe::default()`: it is never handed to
+    /// ffmpeg (FR-001) and offers nothing to play (FR-008).
+    pub book: Option<BookMeta>,
     /// Show-hierarchy metadata when kind == Episode. None for
     /// Movie / Audio. Synthesised Series + Season DTOs derive their
     /// stable ids from `series_name` + `(series_name, season_number)`
@@ -1929,6 +1933,94 @@ impl MediaProbe {
     pub fn is_hdr(&self) -> bool {
         matches!(self.video_range(), "HDR")
     }
+}
+
+/// 004-books — what KIND of book a file is, decided from its extension at scan
+/// time. The store discriminator is [`Self::as_str`].
+///
+/// `Unreadable` is a first-class variant rather than an omission from a list of
+/// readable extensions. `.mobi` and `.azw3` are indexed and downloadable but no
+/// client ships a reader for either, and modelling that as a variant means a DTO
+/// builder cannot forget it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BookFormat {
+    /// epub — read by jellyfin-web's `bookPlayer` (epub.js).
+    #[default]
+    Epub,
+    /// PDF — read by `pdfPlayer` (pdf.js).
+    Pdf,
+    /// cbz / cbr / cbt / cb7 — read by `comicsPlayer` (libarchive.js), which
+    /// unpacks the archive in the browser. pharos only ever opens it to find a
+    /// cover and count pages.
+    Comic,
+    /// Indexed and downloadable, but NO client can open it (`.mobi`, `.azw3`).
+    Unreadable,
+}
+
+impl BookFormat {
+    /// Store discriminator. Distinct values are asserted in a test — a
+    /// collision would silently merge two formats on read-back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BookFormat::Epub => "epub",
+            BookFormat::Pdf => "pdf",
+            BookFormat::Comic => "comic",
+            BookFormat::Unreadable => "unreadable",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. `None` for an unrecognised token so a
+    /// hand-edited row cannot silently become a readable format.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "epub" => Some(BookFormat::Epub),
+            "pdf" => Some(BookFormat::Pdf),
+            "comic" => Some(BookFormat::Comic),
+            "unreadable" => Some(BookFormat::Unreadable),
+            _ => None,
+        }
+    }
+
+    /// THE single authority on whether a client can open this format.
+    ///
+    /// Deliberately not a second extension list. The design draft had both this
+    /// and a `READABLE_BY_CLIENT` set of extensions, which is two answers to one
+    /// question and they drift. "Does pharos walk this file?" is a different
+    /// question, asked before any `BookFormat` exists, and that one IS an
+    /// extension list (`BOOK_EXTENSIONS`).
+    pub fn readable_by_client(self) -> bool {
+        !matches!(self, BookFormat::Unreadable)
+    }
+}
+
+/// 004-books — the book-SPECIFIC facts read from the file at scan time.
+///
+/// Title, release date and description are deliberately NOT here: they are
+/// ordinary [`MediaItem`] / [`ItemMetadata`] fields populated by the metadata
+/// resolver from the same OPF / `ComicInfo.xml` read. Duplicating them would
+/// create a second authority for a field every other kind already has, and the
+/// DTO would then have to decide which one wins.
+///
+/// Separate from [`MediaProbe`] for the same reason: `MediaProbe` is
+/// stream-shaped, and "author" does not belong beside "pix_fmt".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookMeta {
+    pub format: BookFormat,
+    /// Comic archive entry count / PDF page count. `None` for epub, which has
+    /// no stable page count — pagination is a function of the reader's viewport,
+    /// so any number pharos invented would be wrong on every device.
+    pub page_count: Option<u32>,
+    /// epub `dc:creator`, ComicInfo `Writer`.
+    pub author: Option<String>,
+    /// epub `dc:publisher`.
+    pub publisher: Option<String>,
+    /// `calibre:series`, ComicInfo `Series`.
+    pub series_name: Option<String>,
+    /// `calibre:series_index`, ComicInfo `Number`. `None` sorts LAST within a
+    /// series, not as zero — an unnumbered volume is unknown, not first.
+    pub series_index: Option<u32>,
+    /// epub `dc:identifier` when it carries an ISBN.
+    pub isbn: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

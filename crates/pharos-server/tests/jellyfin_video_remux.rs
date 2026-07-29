@@ -157,6 +157,7 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
             path: "/nonexistent.mkv".into(),
             title: "MKV Movie".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(60_000),
                 width: Some(1920),
@@ -255,6 +256,7 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
             path: "/legacy.avi".into(),
             title: "AVI Movie".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(60_000),
                 width: Some(624),

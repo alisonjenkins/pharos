@@ -80,6 +80,7 @@ async fn seed(cache_dir: &std::path::Path) -> (web::Data<AppState>, String) {
             path: fx,
             title: "fx".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(3_000),
                 width: Some(320),

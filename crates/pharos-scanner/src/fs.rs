@@ -1039,6 +1039,10 @@ impl<P: Prober> FsScanner<P> {
                     path,
                     title,
                     kind,
+                    // This is the PROBE path — a media file that went through
+                    // ffmpeg. A book never reaches here (it branches before the
+                    // prober, T036), so it carries no book metadata.
+                    book: None,
                     probe,
                     series,
                     // Let the store-side `now_secs` populate. Passing

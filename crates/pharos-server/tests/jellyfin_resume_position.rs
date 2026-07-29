@@ -39,6 +39,7 @@ async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String
             path: "/fake/path.mkv".into(),
             title: "Resume Test".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(3_600_000), // 1h
                 width: Some(1920),
@@ -222,6 +223,7 @@ async fn playback_info_emits_zero_when_no_user_data_row_exists() {
             path: "/fake/never-played.mkv".into(),
             title: "Never Played".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe::default(),
             series: None,
             created_at: None,
@@ -293,6 +295,7 @@ async fn resume_list_filters_by_media_types() {
                 path: format!("/m/{id}").into(),
                 title: title.into(),
                 kind,
+                book: None,
                 probe: MediaProbe {
                     duration_ms: Some(3_600_000),
                     ..Default::default()

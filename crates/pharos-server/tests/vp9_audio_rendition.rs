@@ -136,6 +136,7 @@ async fn seed_with_duration(
             path: fixture,
             title: "s".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms,
                 width: Some(320),

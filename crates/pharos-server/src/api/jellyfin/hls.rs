@@ -3449,6 +3449,7 @@ mod tests {
                 path: "/nonexistent.mkv".into(),
                 title: "m".into(),
                 kind: MediaKind::Movie,
+                book: None,
                 probe,
                 series: None,
                 created_at: None,
@@ -3902,6 +3903,7 @@ mod tests {
             path: "/x".into(),
             title: "t".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: pharos_core::MediaProbe {
                 duration_ms: Some(60_000),
                 width: Some(1920),

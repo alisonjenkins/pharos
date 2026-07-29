@@ -49,6 +49,7 @@ async fn seed() -> (web::Data<AppState>, String) {
             path: "/nonexistent/clip.webm".into(),
             title: "clip".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(DURATION_MS),
                 frame_rate_mille: Some(24_000),
