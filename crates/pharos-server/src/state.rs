@@ -249,6 +249,17 @@ pub struct AppState {
     /// (`list()`), and a TV-library grid fires one per visible tile. `None`
     /// caches a negative (id matched no group) so misses don't rescan either.
     pub synth_image_ids: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>>,
+    /// B155 — bumped by the metadata backfill whenever a pass records new
+    /// artwork. The synth-image memo above pins BOTH the chosen representative
+    /// and its negatives for the life of the pod, and the representative is now
+    /// chosen by whether it has art (B154) — so an album resolved before its
+    /// cover was downloaded stayed blank until the next restart, however long
+    /// the backfill had since been running. Bumping the epoch drops the memo so
+    /// the next request re-warms against current artwork.
+    pub artwork_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// The `artwork_epoch` the memo was built at. A mismatch means the memo
+    /// predates artwork that has since landed.
+    pub synth_image_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Serialises the one-time synth-image-map warm (see
     /// `resolve_synth_image_item`). A library grid fires many poster requests
     /// at once for distinct synth ids; without this each would run its own
@@ -340,12 +351,27 @@ fn unix_now_secs() -> i64 {
 
 impl AppState {
     /// Look up a memoised synth-id → representative item id, if present.
+    ///
+    /// B155 — drops the whole memo first when artwork has landed since it was
+    /// built, so a newly-covered album stops reporting the coverless
+    /// representative (or the negative) it was warmed with.
     pub fn synth_image_cached(&self, id: &str) -> Option<Option<u64>> {
-        self.synth_image_ids
+        use std::sync::atomic::Ordering;
+        let mut map = self
+            .synth_image_ids
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
-            .copied()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.artwork_epoch.load(Ordering::Relaxed);
+        if self.synth_image_epoch.swap(now, Ordering::Relaxed) != now {
+            map.clear();
+        }
+        map.get(id).copied()
+    }
+
+    /// Record that artwork changed, invalidating the synth-image memo.
+    pub fn note_artwork_changed(&self) {
+        self.artwork_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record a synth-id → representative item id resolution.
@@ -552,6 +578,8 @@ impl AppState {
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
@@ -637,6 +665,8 @@ impl AppState {
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
