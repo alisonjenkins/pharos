@@ -1007,12 +1007,13 @@ where
         .or(item.probe.artist.as_deref());
     let album = item.probe.album.as_deref();
 
-    // Both the search and the cover download are network calls, so they pace
-    // against live playback on the shared gate exactly like every other sweep
-    // (V34).
-    let permit = BgPermit::acquire(bg_io).await;
+    // NOT under a `bg_io` permit. MusicBrainz's own rate gate makes this call
+    // block for over a second of pure waiting, and `bg_io` parks to a single
+    // permit while someone is streaming (V34) — holding that permit through the
+    // wait would let one queued album lookup starve every other background
+    // sweep. The lookup touches no media storage; the permit is taken below,
+    // around the cache write, which does.
     let result = mb.album_art(artist, album).await;
-    drop(permit);
 
     let art = match result {
         Ok(a) => a,
@@ -1044,7 +1045,10 @@ where
     };
 
     let remote = art.remote_art();
-    download_and_cache_art(
+    // The cache write IS local disk I/O, on the volume playback reads through,
+    // so it paces against live playback like every other sweep (V34).
+    let permit = BgPermit::acquire(bg_io).await;
+    let cached = download_and_cache_art(
         cache,
         store,
         item,
@@ -1052,7 +1056,9 @@ where
         &remote,
         art.bytes.clone(),
     )
-    .await?;
+    .await;
+    drop(permit);
+    cached?;
     store
         .set_item_match(
             item.id,
