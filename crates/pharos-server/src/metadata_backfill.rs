@@ -217,7 +217,11 @@ where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
     Mb: AlbumArtResolver,
-    S: MediaStore + GenreStore + PersonStore + SeriesMetadataStore,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + SeriesMetadataStore
+        + pharos_store_sqlx::ServerConfigStore,
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
     if tmdb.is_none() && tvdb.is_none() && musicbrainz.is_none() {
@@ -923,6 +927,47 @@ fn upsert_art(
     }
 }
 
+/// Key under which the album-art matcher version that produced the CURRENT
+/// artwork is recorded.
+const ALBUM_ART_VERSION_KEY: &str = "musicbrainz_album_art_version";
+
+/// Drop every MusicBrainz-sourced cover when the matcher that chose them has
+/// changed, so a corrected matcher can revisit its own mistakes.
+///
+/// B150 — the reason this exists. Owl City's `Fireflies` was given The Attic's
+/// sleeve, and because `audio_items_needing_art` skips anything that already
+/// has art, no later pass would ever have looked at it again. A cached cover is
+/// only as trustworthy as the matcher that picked it, so the matcher's version
+/// is recorded beside the artwork and a bump clears the lot. Mirrors the
+/// `TRICKPLAY_GEN_VERSION` wipe-and-regenerate idiom.
+///
+/// Costs one config read per pass and nothing else once the versions agree.
+async fn invalidate_stale_album_art<S>(store: &S) -> DomainResult<()>
+where
+    S: MediaStore + pharos_store_sqlx::ServerConfigStore,
+{
+    let want = crate::musicbrainz::ALBUM_ART_QUERY_VERSION.to_string();
+    let have = store
+        .load_named_config(ALBUM_ART_VERSION_KEY)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    if have.as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    let cleared = store.clear_provider_artwork("musicbrainz").await?;
+    tracing::info!(
+        cleared_items = cleared,
+        from = have.as_deref().unwrap_or("none"),
+        to = want.as_str(),
+        "musicbrainz album-art: matcher version changed, dropping its covers for a re-match"
+    );
+    store
+        .set_named_config(ALBUM_ART_VERSION_KEY, &want)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    Ok(())
+}
+
 /// One album-art pass: give every coverless audio track the front cover of its
 /// album.
 ///
@@ -949,8 +994,14 @@ async fn enrich_audio_pass<Mb, S>(
 ) -> DomainResult<(usize, bool)>
 where
     Mb: AlbumArtResolver,
-    S: MediaStore,
+    S: MediaStore + pharos_store_sqlx::ServerConfigStore,
 {
+    // A wrong cover is invisible to the eligibility query, which skips anything
+    // that already has art — so a matcher fix cannot reach its own mistakes
+    // unless the pass clears them first.
+    if let Err(e) = invalidate_stale_album_art(store).await {
+        tracing::warn!(error = %e, "album-art invalidation check failed");
+    }
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
     let items = store
         .audio_items_needing_art(
@@ -1813,6 +1864,110 @@ mod tests {
         .unwrap();
         assert_eq!(n, 0);
         assert!(!had_work, "a current-version miss waits for the TTL");
+    }
+
+    // B150 — a WRONG cover is invisible to the eligibility query, which skips
+    // anything that already has art. Without version-gated invalidation, Owl
+    // City's `Fireflies` would keep The Attic's sleeve forever, however much
+    // the matcher improved.
+    #[tokio::test]
+    async fn a_matcher_version_bump_drops_its_own_covers_for_a_re_match() {
+        let s = store().await;
+        put_track(&s, 900_406, "Owl City", "Fireflies").await;
+        // A cover from an older, wrong matcher.
+        s.set_artwork(
+            900_406,
+            "Primary",
+            "musicbrainz",
+            "/cache/primary/audio/wrong.jpg",
+        )
+        .await
+        .unwrap();
+        s.set_item_match(
+            900_406,
+            "musicbrainz",
+            "the-attic-mbid",
+            "search",
+            Some(1.0),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(s.get(900_406).await.unwrap().has_primary_art);
+        // The stored version is deliberately stale.
+        pharos_store_sqlx::ServerConfigStore::set_named_config(&s, ALBUM_ART_VERSION_KEY, "1")
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+
+        let (n, _) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::hit(),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(n, 1, "the track must be re-matched, not skipped");
+        let got = s.get(900_406).await.unwrap();
+        assert_eq!(
+            got.match_external_id.as_deref(),
+            Some("rg-abc-123"),
+            "the wrong match must be replaced"
+        );
+        // And the version is recorded, so the next pass does not clear again.
+        assert_eq!(
+            pharos_store_sqlx::ServerConfigStore::load_named_config(&s, ALBUM_ART_VERSION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(
+                crate::musicbrainz::ALBUM_ART_QUERY_VERSION
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
+    // The converse: once the versions agree, covers are left alone. A pass that
+    // re-cleared every time would re-download the whole library hourly.
+    #[tokio::test]
+    async fn a_current_matcher_version_leaves_existing_covers_alone() {
+        let s = store().await;
+        put_track(&s, 900_407, "Owl City", "Ocean Eyes").await;
+        s.set_artwork(
+            900_407,
+            "Primary",
+            "musicbrainz",
+            "/cache/primary/audio/ok.jpg",
+        )
+        .await
+        .unwrap();
+        pharos_store_sqlx::ServerConfigStore::set_named_config(
+            &s,
+            ALBUM_ART_VERSION_KEY,
+            &crate::musicbrainz::ALBUM_ART_QUERY_VERSION.to_string(),
+        )
+        .await
+        .unwrap();
+        let (_td, cache) = cache();
+
+        let (n, had_work) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::hit(),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+        assert!(!had_work, "nothing to do once the versions agree");
+        assert!(s.get(900_407).await.unwrap().has_primary_art);
     }
 
     // Movies and episodes are the other pass's business; the album-art pass

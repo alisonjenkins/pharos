@@ -1130,6 +1130,27 @@ impl MediaStore for PostgresStore {
         rows.into_iter().map(MediaRow::into_domain).collect()
     }
 
+    async fn clear_provider_artwork(&self, provider: &str) -> DomainResult<u64> {
+        // Reset the items FIRST: once the artwork rows are gone there is no
+        // way to find which items had them.
+        let affected = sqlx::query(
+            "UPDATE media_items SET has_primary_art = FALSE, match_source = NULL, \
+                match_external_id = NULL, metadata_refreshed_at = NULL \
+             WHERE id IN (SELECT item_id FROM artwork WHERE source = $1)",
+        )
+        .bind(provider)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?
+        .rows_affected();
+        sqlx::query("DELETE FROM artwork WHERE source = $1")
+            .bind(provider)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(affected)
+    }
+
     #[tracing::instrument(skip(self), fields(media.id = %item_id))]
     async fn item_entity_counts(&self, item_id: MediaId) -> DomainResult<EntityCounts> {
         let id_i64 = media_id_i64(item_id)?;

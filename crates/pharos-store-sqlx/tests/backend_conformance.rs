@@ -292,6 +292,52 @@ where
         "a track that now has art must leave the eligible set"
     );
 
+    // clear_provider_artwork — the escape hatch for a matcher whose PICKS were
+    // wrong rather than whose data changed. Exercised here because it is two
+    // statements against real tables and its ordering matters: the items must
+    // be reset while the artwork rows still say which items they were.
+    assert!(
+        MediaStore::get(&store, track_id)
+            .await
+            .unwrap()
+            .has_primary_art,
+        "precondition: the track has provider art"
+    );
+    let cleared = MediaStore::clear_provider_artwork(&store, "musicbrainz")
+        .await
+        .unwrap();
+    assert!(cleared >= 1, "the covered track must be reset");
+    let after_clear = MediaStore::get(&store, track_id).await.unwrap();
+    assert!(
+        !after_clear.has_primary_art,
+        "clearing provider art must drop the denormalised flag"
+    );
+    assert_eq!(after_clear.match_source, None, "and re-open the match");
+    assert!(
+        MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000, MISS_MARKER)
+            .await
+            .unwrap()
+            .iter()
+            .any(|i| i.id == track_id),
+        "a cleared track must be eligible again"
+    );
+    // Art from another provider is untouched — this clears one provider's
+    // picks, not the artwork table.
+    MediaStore::set_artwork(&store, track_id, "Backdrop", "tmdb", "/cache/b.jpg")
+        .await
+        .unwrap();
+    MediaStore::clear_provider_artwork(&store, "musicbrainz")
+        .await
+        .unwrap();
+    assert!(
+        MediaStore::artwork_for(&store, track_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, source, _)| source == "tmdb"),
+        "another provider's artwork must survive"
+    );
+
     // A stamped match state also removes it, so an unmatched album is not
     // re-searched on every pass.
     let unmatched_id: MediaId = 4;
