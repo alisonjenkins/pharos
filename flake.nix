@@ -631,6 +631,41 @@
                 default_type application/octet-stream;
                 access_log /dev/stdout;
                 sendfile on;
+
+                # B162 — compress text on the way out. The jellyfin-web bundle
+                # ships a 1 MB stylesheet and comparable JS, and pharos's list
+                # endpoints answer with large JSON; none of it was compressed,
+                # so every page load moved several MB in full over the WAN.
+                #
+                # Deliberately done HERE and not as actix `Compress`
+                # middleware: angie already fronts every pharos response, and
+                # an actix compressor would also sit on the video/segment/image
+                # paths, where switching a response to chunked transfer breaks
+                # the Content-Length and Range handling those paths depend on
+                # (B101 was a size-0 DirectPlay HEAD; B140 a range served
+                # whole). Compressing at the proxy keeps that risk off the
+                # media paths entirely.
+                #
+                # `gzip_types` is an ALLOW-list of text-shaped types for the
+                # same reason: video, images and `application/octet-stream` are
+                # already compressed or must not be touched — the bandwidth
+                # probe (B161) is octet-stream and would be meaningless if
+                # squeezed. text/html is always included by angie implicitly.
+                gzip on;
+                gzip_vary on;
+                gzip_proxied any;
+                gzip_comp_level 5;
+                gzip_min_length 1024;
+                gzip_types
+                  text/plain
+                  text/css
+                  text/javascript
+                  text/xml
+                  application/javascript
+                  application/json
+                  application/manifest+json
+                  application/xml
+                  image/svg+xml;
                 client_body_temp_path /tmp/angie/client_body;
                 proxy_temp_path        /tmp/angie/proxy;
                 fastcgi_temp_path      /tmp/angie/fastcgi;
