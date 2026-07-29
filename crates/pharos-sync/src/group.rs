@@ -2312,6 +2312,30 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     },
                 );
                 state.send_catch_up(member_id);
+            } else {
+                // B168 — the socket came back holding an attachment to THIS
+                // group, but the roster no longer has this member: it was
+                // removed while its socket was down. Two parties disagree, and
+                // only one of them can see it — the client is still rendering
+                // the SyncPlay UI and free-running its player against a group
+                // that has moved on. That disagreement is the desync.
+                //
+                // Say so. `GroupLeft` makes stock jellyfin-web exit SyncPlay
+                // (Manager.processGroupUpdate → disableSyncPlay), which is
+                // honest and recoverable — the alternative, silence, waits for
+                // the user to press something before the truth arrives, and on
+                // 2026-07-29 that took eleven minutes.
+                //
+                // Deliberately NOT broadcast to every group-less socket on
+                // connect: `disableSyncPlay(true)` toasts "SyncPlay disabled",
+                // so an unconditional send would fire on every page load. This
+                // fires only where the server holds contradictory evidence.
+                tracing::info!(
+                    group = %state.id, member = %member_id,
+                    "syncplay: socket returned to a group it is no longer in — telling client GroupLeft"
+                );
+                metrics::counter!("pharos_syncplay_stale_membership_healed_total").increment(1);
+                state.send_one(member_id, ServerMsg::GroupLeft);
             }
         }
         GroupMsg::RemoveMember { member_id } => {
@@ -3342,6 +3366,47 @@ mod tests {
             snapshot_of(&h).await.participants.len(),
             2,
             "the returning member rejoins its own group, not a new one"
+        );
+    }
+
+    /// B168 — a socket that comes back to a group whose roster has dropped it
+    /// must be TOLD. On 2026-07-29 two evicted members reconnected and the
+    /// server said nothing; their clients kept rendering SyncPlay and
+    /// free-running their players, and the first either user heard of it was
+    /// eleven minutes later when one of them pressed pause. Silence on the
+    /// reconnect path is what turns an eviction into a desync.
+    #[tokio::test]
+    async fn a_socket_returning_to_a_group_it_was_removed_from_is_told() {
+        let (h, sinks) = spawn_group();
+        let stayed = MemberId::new();
+        let evicted = MemberId::new();
+        let _rx_stayed = join(&h, &sinks, stayed, "stayed").await;
+        let mut rx_evicted = join(&h, &sinks, evicted, "evicted").await;
+
+        h.tx.send(GroupMsg::RemoveMember { member_id: evicted })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        // Drain everything the removal itself produced.
+        while rx_evicted.try_recv().is_ok() {}
+
+        // The client's socket returns, still attached to this group.
+        h.tx.send(GroupMsg::ResyncMember { member_id: evicted })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let mut told = false;
+        while let Ok(msg) = rx_evicted.try_recv() {
+            if matches!(msg, ServerMsg::GroupLeft) {
+                told = true;
+            }
+        }
+        assert!(
+            told,
+            "a reconnecting client the group no longer knows must be told it \
+             is out — otherwise it keeps playing against a group that has \
+             moved on, which is exactly what 'we got out of sync' looks like"
         );
     }
 
