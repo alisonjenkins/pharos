@@ -358,11 +358,14 @@ async fn build_facet_base(
         ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t.clone()),
         ParentResolution::All | ParentResolution::Empty => {}
     }
-    if let Some(types) = q.include_item_types.as_deref() {
-        let wanted: Vec<pharos_core::MediaKind> =
-            types.split(',').filter_map(MediaKind::from_wire).collect();
-        if !wanted.is_empty() {
-            mq.kinds = wanted;
+    match parse_kind_filter(q.include_item_types.as_deref()) {
+        KindFilter::Unset => {}
+        KindFilter::Kinds(wanted) => mq.kinds = wanted,
+        // "You asked for nothing" — the same shape an empty-but-present `Ids=`
+        // uses, so the query matches nothing instead of everything.
+        KindFilter::MatchesNothing => {
+            mq.filters.ids_present = true;
+            mq.filters.ids.clear();
         }
     }
     if q.is_favorite.is_some() || q.is_played.is_some() {
@@ -3118,16 +3121,99 @@ async fn latest_items(
     Ok(crate::api::jellyfin::wire::json(&dtos))
 }
 
-fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
-    let Some(s) = include else { return items };
-    let wanted: Vec<MediaKind> = s.split(',').filter_map(MediaKind::from_wire).collect();
-    if wanted.is_empty() {
-        return items;
+/// What an `IncludeItemTypes=` parameter asks of the SQL list path.
+///
+/// B153 — the distinction that was missing. `MusicVideo` names a type pharos
+/// stores none of, and the old code read "zero recognised kinds" as "no kind
+/// filter", so a request for music videos returned the ENTIRE library: 51.6 MB
+/// of JSON for a query whose honest answer is an empty list. "I asked for X"
+/// must never widen to "I asked for anything".
+///
+/// Reaching this point already means every synth short-circuit (MusicAlbum,
+/// MusicArtist, Playlist, BoxSet, the show folders) has declined the request,
+/// and the SQL path can only ever return Movie / Episode / Audio rows — so if
+/// none of the named types is one of those, nothing can match, whichever
+/// unknown type it was.
+enum KindFilter {
+    /// No `IncludeItemTypes` at all — every kind is acceptable.
+    Unset,
+    /// At least one named type is a kind pharos stores.
+    Kinds(Vec<MediaKind>),
+    /// Types were named and none of them can appear in this result.
+    MatchesNothing,
+}
+
+/// Types pharos SYNTHESISES rather than stores: they are not a [`MediaKind`],
+/// but a request naming one is still answerable — by a short-circuit, or by
+/// post-processing stored rows (Series/Season tiles are folded out of episode
+/// rows further down this very path). Naming one must NOT be read as "nothing
+/// can match".
+///
+/// Anything outside this list and outside [`MediaKind::from_wire`] is a type
+/// pharos holds none of, so the honest answer is an empty list.
+const SYNTHESISED_ITEM_TYPES: &[&str] = &[
+    "series",
+    "season",
+    "musicalbum",
+    "musicartist",
+    "playlist",
+    "boxset",
+    "folder",
+    "collectionfolder",
+    "userview",
+    "genre",
+    "musicgenre",
+    "studio",
+    "person",
+    "tvchannel",
+    "livetvchannel",
+    "program",
+    "tvprogram",
+    "livetvprogram",
+    "recording",
+];
+
+fn parse_kind_filter(include: Option<&str>) -> KindFilter {
+    let Some(raw) = include.map(str::trim).filter(|s| !s.is_empty()) else {
+        return KindFilter::Unset;
+    };
+    let named: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if named.is_empty() {
+        return KindFilter::Unset;
     }
-    items
-        .into_iter()
-        .filter(|i| wanted.contains(&i.kind))
-        .collect()
+    let wanted: Vec<MediaKind> = named
+        .iter()
+        .filter_map(|t| MediaKind::from_wire(t))
+        .collect();
+    if !wanted.is_empty() {
+        return KindFilter::Kinds(wanted);
+    }
+    // No stored kind named. If any named type is one pharos synthesises, leave
+    // the query unfiltered and let the path that understands it answer.
+    let any_synth = named.iter().any(|t| {
+        let t = t.to_ascii_lowercase();
+        SYNTHESISED_ITEM_TYPES.contains(&t.as_str())
+    });
+    if any_synth {
+        KindFilter::Unset
+    } else {
+        KindFilter::MatchesNothing
+    }
+}
+
+fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
+    match parse_kind_filter(include) {
+        KindFilter::Unset => items,
+        KindFilter::MatchesNothing => Vec::new(),
+        KindFilter::Kinds(wanted) => items
+            .into_iter()
+            .filter(|i| wanted.contains(&i.kind))
+            .collect(),
+    }
 }
 
 async fn user_views(
@@ -4427,13 +4513,13 @@ fn build_media_query(
         mq.parent = Some(pf.clone());
     }
 
-    // IncludeItemTypes → kinds.
-    if let Some(types) = q.include_item_types.as_deref() {
-        let wanted: Vec<pharos_core::MediaKind> =
-            types.split(',').filter_map(MediaKind::from_wire).collect();
-        if !wanted.is_empty() {
-            mq.kinds = wanted;
-        }
+    // IncludeItemTypes → kinds. The MatchesNothing case is applied AFTER the
+    // residual filters are assigned below (`mq.filters = f`), which replaces
+    // the whole struct and would otherwise discard it — the first version of
+    // this fix set the flag here and the request still returned everything.
+    let kind_filter = parse_kind_filter(q.include_item_types.as_deref());
+    if let KindFilter::Kinds(wanted) = &kind_filter {
+        mq.kinds = wanted.clone();
     }
 
     // SearchTerm — case-insensitive substring on title.
@@ -4548,6 +4634,13 @@ fn build_media_query(
             .collect();
     }
     mq.filters = f;
+    // "You asked for nothing" — the same shape an empty-but-present `Ids=`
+    // uses, so a type pharos stores none of matches nothing instead of
+    // everything. Must follow the assignment above.
+    if matches!(kind_filter, KindFilter::MatchesNothing) {
+        mq.filters.ids_present = true;
+        mq.filters.ids.clear();
+    }
 
     // Sort chain — replicate the in-memory stable-sort + conditional reverse.
     let primary = sort_primary(q.sort_by.as_deref());

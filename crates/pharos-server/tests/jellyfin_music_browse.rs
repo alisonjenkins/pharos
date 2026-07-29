@@ -561,3 +561,78 @@ async fn a_music_album_offers_its_artists_as_plain_strings() {
         }
     }
 }
+
+// B153 — jellyfin-web's album page asks for the album's music videos:
+//   /Users/{u}/Items?IncludeItemTypes=MusicVideo&Recursive=true&AlbumIds=…
+// pharos stores no MusicVideos, and "zero recognised kinds" was read as "no
+// kind filter", so the honest answer (an empty list) came back as the ENTIRE
+// library — 51.6 MB of JSON on the real server, on every album page open.
+#[actix_web::test]
+async fn an_unstored_item_type_matches_nothing_rather_than_everything() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    // `/Users/{id}/Items` — the shape jellyfin-web actually sends — shares
+    // `run_items_list` with `/Items`, so exercising the latter covers both.
+    for uri in [
+        "/Items?IncludeItemTypes=MusicVideo&Recursive=true&SortBy=SortName".to_string(),
+        // The "Latest" rail takes a different code path to the same question.
+        "/Items/Latest?IncludeItemTypes=MusicVideo".to_string(),
+        // Several unknown types together are still nothing.
+        "/Items?IncludeItemTypes=MusicVideo,Book,Photo&Recursive=true".to_string(),
+    ] {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(&uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // `/Items/Latest` returns a bare array; the rest return an envelope.
+        let items = v
+            .get("Items")
+            .and_then(|i| i.as_array())
+            .or_else(|| v.as_array())
+            .unwrap_or_else(|| panic!("{uri}: unexpected shape {v}"));
+        assert!(
+            items.is_empty(),
+            "{uri}: asking for a type pharos stores none of must return nothing, got {} items",
+            items.len()
+        );
+    }
+
+    // A type pharos SYNTHESISES is not "nothing" — Series tiles are folded out
+    // of stored episode rows further down the same path, so naming one must
+    // leave the query unfiltered rather than empty. The first version of this
+    // fix was a blanket "unknown type means nothing" and broke exactly that.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?IncludeItemTypes=MusicAlbum&Recursive=true")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        !v["Items"].as_array().unwrap().is_empty(),
+        "a synthesised type must still be answered, not emptied"
+    );
+
+    // ...and a type that IS stored still works, so this did not just switch
+    // the filter off in the other direction.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?IncludeItemTypes=Audio&Recursive=true")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        !v["Items"].as_array().unwrap().is_empty(),
+        "a stored type must still return its items"
+    );
+}
