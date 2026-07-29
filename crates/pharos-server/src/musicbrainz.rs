@@ -75,13 +75,14 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      title-only last resort.
 /// v3 — B144: unquoted final rung, so a tag truncated mid-word can still find
 ///      its release-group. INEFFECTIVE — see v4.
+/// v6 — B148: a coverless release-group falls through to its siblings.
 /// v5 — B147: scoring drops `match_best`'s year penalty, which had made the
 ///      effective bar an exact title match and blocked v2-v4 entirely.
 /// v4 — B145: the unquoted rung wildcards its final token. MusicBrainz's
 ///      search ANDs bare terms, so an unquoted `... Outgu` still required the
 ///      clipped token to match something and returned nothing; `Outgu*` is
 ///      what a truncated tag actually needs.
-pub const ALBUM_ART_QUERY_VERSION: u32 = 5;
+pub const ALBUM_ART_QUERY_VERSION: u32 = 6;
 
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
@@ -89,6 +90,11 @@ pub const ALBUM_ART_QUERY_VERSION: u32 = 5;
 pub fn miss_marker() -> String {
     format!("miss-v{ALBUM_ART_QUERY_VERSION}")
 }
+
+/// How many ranked release-groups to try for a cover before giving up. Each is
+/// a rate-limited request, and past the first few the remaining candidates are
+/// the ones the floor barely admitted.
+const COVER_ATTEMPTS: usize = 3;
 
 /// How long to wait after a 503 when the server names no `Retry-After`.
 const THROTTLE_BACKOFF: Duration = Duration::from_secs(5);
@@ -456,22 +462,29 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs.clamp(1, 60)))
 }
 
-/// The best candidate by TITLE similarity alone, if it clears the floor.
-///
-/// Deliberately not `pharos_core::match_best`. That multiplies similarity by a
-/// year-agreement factor, and an unknown year on either side scores 0.85 — but
-/// this lookup never has a query year to supply, so EVERY candidate was
-/// multiplied by 0.85 and the effective bar became `similarity >= 1.0`, an
-/// exact normalised-title match. B147: that is why the pass only ever matched
-/// albums whose tags were already perfect, and rejected
-/// `Always Outnumbered Never Outgu` against
-/// `Always Outnumbered Never Outgunned` at a true similarity of 0.88 — the
-/// case B144 and B145 were both written to rescue, blocked by a multiplier
-/// neither of them touched.
-fn best_by_title(title: &str, candidates: &[SearchCandidate]) -> Option<(String, f32)> {
-    top_by_title(title, candidates)
+/// One release-group that cleared the confidence floor.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScoredGroup {
+    pub mbid: String,
+    pub year: Option<u32>,
+    pub confidence: f32,
+}
+
+/// Every candidate clearing the floor, best first — see [`MusicBrainzClient::release_groups`]
+/// for why the caller needs the runners-up and not just the winner.
+fn ranked_by_title(title: &str, candidates: &[SearchCandidate]) -> Vec<ScoredGroup> {
+    let mut scored: Vec<ScoredGroup> = candidates
+        .iter()
+        .map(|c| (c, pharos_core::title_similarity(title, &c.title)))
         .filter(|(_, score)| *score >= MIN_ALBUM_CONFIDENCE)
-        .map(|(c, score)| (c.id.clone(), score))
+        .map(|(c, confidence)| ScoredGroup {
+            mbid: c.id.clone(),
+            year: c.year,
+            confidence,
+        })
+        .collect();
+    scored.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    scored
 }
 
 /// The highest-scoring candidate and its title similarity, floor or not — so a
@@ -618,17 +631,30 @@ impl MusicBrainzClient {
 
     /// Resolve the release-group id for `(artist, album)`, consulting the memo
     /// first. `Err` carries why nothing was found.
-    async fn release_group(
+    /// Every release-group that clears the confidence floor, best first.
+    ///
+    /// B148: a list rather than a single winner. MusicBrainz routinely holds
+    /// several release-groups for the same album — `Always Outnumbered Never
+    /// Outgunned`, `Always Outnumbered, Never Outgunned` and
+    /// `Always Outnumbered: Never Outgunned` all score 100 — and the Cover Art
+    /// Archive has art for only some of them. Committing to the top scorer
+    /// meant a coin-flip between a cover and `no_cover_art` for an album whose
+    /// art was right there under a sibling id.
+    async fn release_groups(
         &self,
         artist: Option<&str>,
         album: &str,
-    ) -> Result<(String, Option<u32>, f32), AlbumArtMiss> {
+    ) -> Result<Vec<ScoredGroup>, AlbumArtMiss> {
         let key = album_key(artist, album);
         if let Some(hit) = self.memo.lock().await.get(&key) {
             return match hit {
-                // A memoised hit has already cleared the confidence bar; the
-                // score is not re-reported because the search is not re-run.
-                Ok(mbid) => Ok((mbid.clone(), None, MIN_ALBUM_CONFIDENCE)),
+                // A memoised hit already cleared the floor AND had a cover, so
+                // it is the only candidate worth re-offering.
+                Ok(mbid) => Ok(vec![ScoredGroup {
+                    mbid: mbid.clone(),
+                    year: None,
+                    confidence: MIN_ALBUM_CONFIDENCE,
+                }]),
                 // Replay the REAL reason, not a stand-in for it.
                 Err(miss) => Err(miss.clone()),
             };
@@ -662,33 +688,37 @@ impl MusicBrainzClient {
         // Score against the stripped title: the qualifiers that were removed to
         // find the release-group would otherwise count against its similarity.
         let scored_title = strip_edition_qualifiers(album);
-        let best = best_by_title(&scored_title, &candidates);
+        let ranked = ranked_by_title(&scored_title, &candidates);
 
-        let outcome = match best {
-            Some(m) => m,
-            None => {
-                // Remember the miss — with its REASON — so the album's other
-                // tracks neither re-run a rate-limited search nor report a
-                // cause that was never diagnosed.
-                let miss = match top_by_title(&scored_title, &candidates) {
-                    Some((c, confidence)) => AlbumArtMiss::BelowConfidence {
-                        best: c.title.clone(),
-                        confidence,
-                    },
-                    None => AlbumArtMiss::NoCandidates { query },
-                };
-                self.memo.lock().await.insert(key, Err(miss.clone()));
-                return Err(miss);
-            }
-        };
+        if ranked.is_empty() {
+            // Remember the miss — with its REASON — so the album's other tracks
+            // neither re-run a rate-limited search nor report a cause that was
+            // never diagnosed.
+            let miss = match top_by_title(&scored_title, &candidates) {
+                Some((c, confidence)) => AlbumArtMiss::BelowConfidence {
+                    best: c.title.clone(),
+                    confidence,
+                },
+                None => AlbumArtMiss::NoCandidates { query },
+            };
+            self.memo.lock().await.insert(key, Err(miss.clone()));
+            return Err(miss);
+        }
+        Ok(ranked)
+    }
 
-        let (mbid, confidence) = outcome;
-        let year = candidates
-            .iter()
-            .find(|c| c.id == mbid)
-            .and_then(|c| c.year);
-        self.memo.lock().await.insert(key, Ok(mbid.clone()));
-        Ok((mbid, year, confidence))
+    /// Remember an album's verdict so its other tracks neither re-search nor
+    /// report a cause that was never diagnosed.
+    async fn remember(
+        &self,
+        artist: Option<&str>,
+        album: &str,
+        verdict: Result<String, AlbumArtMiss>,
+    ) {
+        self.memo
+            .lock()
+            .await
+            .insert(album_key(artist, album), verdict);
     }
 
     /// One rate-limited release-group search, retried once on a throttle.
@@ -810,15 +840,39 @@ impl MusicBrainzClient {
             .map(str::trim)
             .filter(|a| !a.is_empty())
             .ok_or(AlbumArtMiss::NoAlbumTag)?;
-        let (mbid, year, confidence) = self.release_group(artist, album).await?;
-        let bytes = self.front_cover(&mbid).await?;
-        Ok(AlbumArt {
-            mbid,
-            title: album.to_string(),
-            confidence,
-            year,
-            bytes,
-        })
+        let ranked = self.release_groups(artist, album).await?;
+
+        // Walk the ranked groups until one actually HAS a cover. Capped: each
+        // attempt is a rate-limited request, and past the first few the
+        // remaining candidates are the ones the floor barely admitted.
+        let mut last_missing: Option<String> = None;
+        for group in ranked.iter().take(COVER_ATTEMPTS) {
+            match self.front_cover(&group.mbid).await {
+                Ok(bytes) => {
+                    self.remember(artist, album, Ok(group.mbid.clone())).await;
+                    return Ok(AlbumArt {
+                        mbid: group.mbid.clone(),
+                        title: album.to_string(),
+                        confidence: group.confidence,
+                        year: group.year,
+                        bytes,
+                    });
+                }
+                Err(AlbumArtMiss::NoCoverArt { mbid }) => {
+                    last_missing = Some(mbid);
+                    continue;
+                }
+                // A transport failure is not this album's verdict — leave the
+                // memo untouched so the next pass retries rather than caching
+                // an outage as a miss.
+                Err(other) => return Err(other),
+            }
+        }
+        let miss = AlbumArtMiss::NoCoverArt {
+            mbid: last_missing.unwrap_or_else(|| "no candidate".into()),
+        };
+        self.remember(artist, album, Err(miss.clone())).await;
+        Err(miss)
     }
 }
 
@@ -1179,10 +1233,16 @@ mod tests {
                 year: Some(2004),
             },
         ];
-        let (id, score) = best_by_title("Always Outnumbered Never Outgu", &candidates)
+        let ranked = ranked_by_title("Always Outnumbered Never Outgu", &candidates);
+        let best = ranked
+            .first()
             .expect("the clipped tag must match its album");
-        assert_eq!(id, "386ca43e", "the closer title must win");
-        assert!(score >= MIN_ALBUM_CONFIDENCE, "scored {score}");
+        assert_eq!(best.mbid, "386ca43e", "the closer title must win");
+        assert!(
+            best.confidence >= MIN_ALBUM_CONFIDENCE,
+            "scored {}",
+            best.confidence
+        );
 
         // The same candidates through `match_best` — what shipped — are
         // rejected, which is the whole bug. If this ever starts passing,
@@ -1199,6 +1259,53 @@ mod tests {
         );
     }
 
+    // B148 — MusicBrainz routinely holds several release-groups for the same
+    // album, and the Cover Art Archive has art for only some of them. These
+    // three all scored 100 for The Prodigy in the live response, and the one
+    // the old code committed to had no cover.
+    #[test]
+    fn every_group_clearing_the_floor_is_offered_best_first() {
+        let candidates = vec![
+            SearchCandidate {
+                id: "50da1a12".into(),
+                title: "Always Outnumbered, Never Outgunned".into(),
+                year: Some(2004),
+            },
+            SearchCandidate {
+                id: "386ca43e".into(),
+                title: "Always Outnumbered Never Outgunned".into(),
+                year: Some(2004),
+            },
+            SearchCandidate {
+                id: "nope".into(),
+                title: "Something Else Entirely".into(),
+                year: None,
+            },
+        ];
+        let ranked = ranked_by_title("Always Outnumbered Never Outgu", &candidates);
+        assert_eq!(ranked.len(), 2, "the unrelated album must not be offered");
+        assert!(
+            ranked[0].confidence >= ranked[1].confidence,
+            "best first: {ranked:?}"
+        );
+        // The two differ only in punctuation, which `title_similarity`
+        // normalises away — so they TIE, and there is no principled winner to
+        // assert. That is precisely why the caller needs both: picking either
+        // one and stopping is the coin-flip B148 removes.
+        assert_eq!(
+            ranked[0].confidence, ranked[1].confidence,
+            "punctuation-only variants must score identically: {ranked:?}"
+        );
+        let offered: std::collections::BTreeSet<&str> =
+            ranked.iter().map(|g| g.mbid.as_str()).collect();
+        assert_eq!(
+            offered,
+            ["386ca43e", "50da1a12"].into_iter().collect(),
+            "both siblings must be offered"
+        );
+        assert!(ranked.iter().all(|g| g.confidence >= MIN_ALBUM_CONFIDENCE));
+    }
+
     #[test]
     fn a_genuinely_different_album_is_still_rejected() {
         // The floor must still do its job — this is what stops a loose
@@ -1208,7 +1315,7 @@ mod tests {
             title: "Piano Classics (disc 1)".into(),
             year: None,
         }];
-        assert!(best_by_title("Trance Classics [Moonshine] Disc 1", &candidates).is_none());
+        assert!(ranked_by_title("Trance Classics [Moonshine] Disc 1", &candidates).is_empty());
         // ...and the rejection still names what it rejected and by how much.
         let (c, score) = top_by_title("Trance Classics [Moonshine] Disc 1", &candidates).unwrap();
         assert_eq!(c.title, "Piano Classics (disc 1)");
