@@ -118,6 +118,9 @@ pub fn image_path(root: &Path, role: ImageRole, kind: MediaKind, id: u64, index:
         MediaKind::Movie => "movie",
         MediaKind::Episode => "episode",
         MediaKind::Audio => "audio",
+        // 004-books — a book's cover is written into this same cache under the
+        // existing Primary role, so it needs a directory like any other kind.
+        MediaKind::Book => "book",
     };
     let file = if index == 0 {
         format!("{id}.jpg")
@@ -1027,6 +1030,16 @@ impl ImageCache {
             _ => "thumbnail=100,scale=480:-1",
         };
         let args: Vec<&str> = match kind {
+            // 004-books — a book is never an ffmpeg input. `extract` pulls a
+            // frame out of a media container; an epub, a comic archive and a PDF
+            // have no frames and ffmpeg cannot read any of them. Book covers are
+            // read from the file by the scanner and written through
+            // `set_artwork`, so reaching here means a caller asked ffmpeg for a
+            // book's poster. NoContent is the truthful answer — the same one a
+            // cover-less audio file gets — and the caller negatively-caches it,
+            // so it does not retry forever. The arm DIVERGES rather than
+            // returning empty args, which would invoke ffmpeg with no input.
+            MediaKind::Book => return Err(ImageCacheError::NoContent),
             MediaKind::Movie | MediaKind::Episode => vec![
                 "-hide_banner",
                 "-loglevel",
