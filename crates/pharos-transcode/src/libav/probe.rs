@@ -339,7 +339,13 @@ fn format_tags(fmt: &ffi::AVFormatContext) -> FormatTags {
         genre: get("genre", &["GENRE", "Genre"]),
         track: get("track", &["TRACK", "Track", "track_number"]),
         disc: get("disc", &["DISC", "Disc", "disc_number", "DISCNUMBER"]),
-        date: get("date", &["DATE", "Date", "year", "YEAR", "creation_time"]),
+        // B169 — `creation_time` is deliberately NOT here. It is the time the
+        // FILE was muxed, not the date the work was released, and reading it
+        // as one dated 139 films in this library by when they were copied:
+        // "300" and "300 - Rise of an Empire" both 2026-07-19, "Avatar"
+        // 2026-07-20, "47 Ronin" 2026-07-21 — a copy campaign rendered as
+        // release dates.
+        date: get("date", &["DATE", "Date", "year", "YEAR"]),
         original_date: get(
             "originaldate",
             &[

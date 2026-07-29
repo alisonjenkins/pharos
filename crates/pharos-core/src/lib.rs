@@ -1775,8 +1775,10 @@ pub struct MediaProbe {
     /// `studio` tag) → the `Studios` array. Defaulted for pre-B90 rows.
     #[serde(default)]
     pub network: Option<String>,
-    /// B90 — the full raw release/air date string (`date`/`originaldate`/
-    /// `creation_time` tag, e.g. `2003-09-22`) BEFORE it is reduced to `year`.
+    /// B90 — the full raw release/air date string (`date`/`originaldate`
+    /// tag, e.g. `2003-09-22`) BEFORE it is reduced to `year`. B169 removed
+    /// the container `creation_time` fallback: that is the MUX time, not a
+    /// release date.
     /// The `embedded` provider parses a full `YYYY-MM-DD` into Jellyfin
     /// `PremiereDate`; a year-only value leaves PremiereDate unset. Defaulted
     /// for pre-B90 rows.
@@ -2103,7 +2105,13 @@ pub struct ScanState {
 // 90_000_000, which silently flattened the HLS segment grid (see
 // `pharos_core::FrameRate`) and stuttered playback. Re-probe so the rows
 // currently holding a container clock record an honest "unknown" instead.
-pub const PROBE_SCHEMA_VERSION: i64 = 5;
+// v6 (B169): the container's `creation_time` no longer feeds `year` /
+// `release_date`. It records when the FILE was muxed, so every film carried
+// the date it was copied into the library rather than the date it came out —
+// 139 of them here, "Avatar" as 2026-07-20, "Apocalypse Now" as 2025-05-06.
+// Re-probe so those rows drop the mux date; the metadata backfill then fills
+// the real year from the provider it had already matched correctly.
+pub const PROBE_SCHEMA_VERSION: i64 = 6;
 
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis

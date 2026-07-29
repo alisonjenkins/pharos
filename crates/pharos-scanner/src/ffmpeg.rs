@@ -317,9 +317,6 @@ struct FfprobeFormatTags {
         alias = "TVNetworkName"
     )]
     network: Option<String>,
-    /// B90 — MP4/Matroska container creation date, a `date` fallback.
-    #[serde(default, alias = "creation_time")]
-    creation_time: Option<String>,
 }
 
 /// Parse the leading unsigned integer of a `track`/`disc` tag ("3", "3/12").
@@ -536,20 +533,16 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
                 .filter(|s| !s.trim().is_empty()),
             network: parsed.format.tags.network.filter(|s| !s.trim().is_empty()),
             // Full raw date for PremiereDate; prefer original release, then the
-            // plain date, then the container creation_time.
+            // plain date. B169 — the container's `creation_time` is NOT a
+            // fallback: it records when the file was muxed, not when the work
+            // was released, and using it dated old films by when they were
+            // copied into the library.
             release_date: parsed
                 .format
                 .tags
                 .original_date
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| parsed.format.tags.date.filter(|s| !s.trim().is_empty()))
-                .or_else(|| {
-                    parsed
-                        .format
-                        .tags
-                        .creation_time
-                        .filter(|s| !s.trim().is_empty())
-                }),
+                .or_else(|| parsed.format.tags.date.filter(|s| !s.trim().is_empty())),
             chapters,
             // P34 — alternate editions enrichment lives in a
             // future scanner pass (sibling-file convention reader
@@ -632,6 +625,53 @@ mod tests {
         "format": {"format_name": "mp3", "duration": "245.123",
                    "size": "9876543", "bit_rate": "320000"}
     }"#;
+
+    /// B169 — a container's `creation_time` is when the FILE was muxed, not
+    /// when the work was released. Reading it as a release date dated 139
+    /// films in the live library by when they were copied in: "300" and "300 -
+    /// Rise of an Empire" both 2026-07-19, "Avatar" 2026-07-20, "Apocalypse
+    /// Now" 2025-05-06. A file with no real date tag must yield NO date, so
+    /// the online provider (which had matched these films correctly all along)
+    /// is free to supply the real one.
+    #[test]
+    fn a_containers_mux_time_is_not_a_release_date() {
+        const MUXED_TODAY: &[u8] = br#"{
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080,
+                 "avg_frame_rate": "24000/1001"}
+            ],
+            "format": {"format_name": "matroska,webm", "duration": "5400.0",
+                       "size": "5243523", "bit_rate": "4000000",
+                       "tags": {"creation_time": "2026-07-29T11:04:12.000000Z"}}
+        }"#;
+        let info = parse_ffprobe_output(MUXED_TODAY).unwrap();
+        assert_eq!(
+            info.probe.release_date, None,
+            "the mux timestamp must not become a release date"
+        );
+        assert_eq!(
+            info.probe.year, None,
+            "nor a production year — that is how Lara Croft (2003) became 2026"
+        );
+    }
+
+    /// The other half: a REAL date tag is still read. Removing the mux-time
+    /// fallback must not cost the files that carry a genuine release date.
+    #[test]
+    fn a_real_date_tag_is_still_read() {
+        const DATED: &[u8] = br#"{
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080,
+                 "avg_frame_rate": "24000/1001"}
+            ],
+            "format": {"format_name": "matroska,webm", "duration": "5400.0",
+                       "size": "5243523", "bit_rate": "4000000",
+                       "tags": {"DATE": "2003-07-21", "creation_time": "2026-07-29T11:04:12.000000Z"}}
+        }"#;
+        let info = parse_ffprobe_output(DATED).unwrap();
+        assert_eq!(info.probe.release_date.as_deref(), Some("2003-07-21"));
+        assert_eq!(info.probe.year, Some(2003));
+    }
 
     #[test]
     fn parse_video_extracts_full_metadata() {
