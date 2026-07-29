@@ -544,6 +544,49 @@ struct MemberRec {
     /// a hydrating replica stamps "now", giving every roster entry a full
     /// [`MEMBER_TTL_MS`] to reconnect after a deploy.
     last_seen: tokio::time::Instant,
+    /// When this replica last knew the member had NO `/socket` here — set by
+    /// `MemberSocketLost` and by hydration (which has never seen the socket),
+    /// cleared on reconnect. Feeds `pharos_syncplay_socket_gone_seconds`.
+    ///
+    /// This is the number every reconnect-grace constant has been guessed at
+    /// twice without ever measuring: how long a real client actually takes to
+    /// come back. B167 measured it at 12–22 MINUTES against a 600 s grace.
+    socket_gone_since: Option<(tokio::time::Instant, SocketGoneCause)>,
+}
+
+/// Why a member currently has no socket — the `cause` label on
+/// `pharos_syncplay_socket_gone_seconds`. Bounded and stable: two variants,
+/// asserted distinct in `socket_gone_causes_are_distinct_and_stable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketGoneCause {
+    /// The socket dropped while this replica held it — a client-side close, a
+    /// network blip, or our own drain closing it on shutdown.
+    SocketLost,
+    /// This replica hydrated the member from a persisted snapshot and has
+    /// never seen its socket. The post-deploy population.
+    Hydrated,
+}
+
+impl SocketGoneCause {
+    fn label(self) -> &'static str {
+        match self {
+            SocketGoneCause::SocketLost => "socket_lost",
+            SocketGoneCause::Hydrated => "hydrated",
+        }
+    }
+}
+
+/// Record how long a member's socket was gone, once it comes back. Called from
+/// every reconnect path (`AddMember` re-add, `ResyncMember`) — the histogram
+/// only answers "how long do reconnects really take" if it is exhaustive.
+fn record_socket_return(rec: &mut MemberRec) {
+    if let Some((since, cause)) = rec.socket_gone_since.take() {
+        metrics::histogram!(
+            "pharos_syncplay_socket_gone_seconds",
+            "cause" => cause.label(),
+        )
+        .record(since.elapsed().as_secs_f64());
+    }
 }
 
 /// One entry in the group's play queue.
@@ -1574,6 +1617,7 @@ impl GroupState {
                         ignore_wait: m.ignore_wait,
                         connected: false,
                         last_seen: now,
+                        socket_gone_since: Some((now, SocketGoneCause::Hydrated)),
                     },
                 )
             })
@@ -1926,21 +1970,39 @@ impl GroupHandle {
                         // full anti-wedge timeout on every play/seek forever and
                         // keeps the participants list honest.
                         let now = tokio::time::Instant::now();
-                        let ghosts: Vec<(MemberId, bool)> = state
+                        let ghosts: Vec<(MemberId, bool, u64, u64)> = state
                             .members
                             .iter()
-                            .filter(|(_, m)| {
+                            .filter_map(|(id, m)| {
                                 // A member with no socket is awaiting a
                                 // reconnect, not haunting the group: it holds no
                                 // gate, so it gets the far longer grace.
                                 let ttl = if m.connected { MEMBER_TTL_MS } else { DISCONNECTED_TTL_MS };
-                                now.saturating_duration_since(m.last_seen).as_millis() as u64 > ttl
+                                let silent_ms =
+                                    now.saturating_duration_since(m.last_seen).as_millis() as u64;
+                                (silent_ms > ttl).then_some((*id, m.connected, silent_ms, ttl))
                             })
-                            .map(|(id, m)| (*id, m.connected))
                             .collect();
                         if !ghosts.is_empty() {
-                            for (id, connected) in ghosts {
-                                tracing::info!(group = %state.id, member = %id, connected, "syncplay: pruning unresponsive member (ghost)");
+                            for (id, connected, silent_ms, ttl_ms) in ghosts {
+                                // Carry the values the verdict was reached ON.
+                                // "pruned as a ghost" alone cost an evening of
+                                // reconstruction (B167): the log named neither
+                                // how long the member had been silent nor which
+                                // grace it was judged against, so there was no
+                                // way to tell a dead client from a live one that
+                                // was merely slower to reconnect than a constant
+                                // somebody guessed.
+                                tracing::info!(
+                                    group = %state.id, member = %id, connected,
+                                    silent_ms, ttl_ms,
+                                    "syncplay: pruning unresponsive member (ghost)"
+                                );
+                                metrics::counter!(
+                                    "pharos_syncplay_member_pruned_total",
+                                    "connected" => if connected { "true" } else { "false" },
+                                )
+                                .increment(1);
                                 remove_member(&mut state, id);
                             }
                             state.persist();
@@ -2110,6 +2172,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 rec.last_seen = tokio::time::Instant::now();
                 // The socket is back — the member is a gate follower again.
                 rec.connected = true;
+                record_socket_return(rec);
                 let summaries = state.member_summaries();
                 let leader = state.leader.unwrap_or(member_id);
                 let _ = reply.send(Joined {
@@ -2138,6 +2201,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     ignore_wait: false,
                     connected: true,
                     last_seen: tokio::time::Instant::now(),
+                    socket_gone_since: None,
                 },
             );
             if was_empty {
@@ -2183,6 +2247,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // The socket is back — the member is a gate follower again.
                 if let Some(rec) = state.members.get_mut(&member_id) {
                     rec.connected = true;
+                    record_socket_return(rec);
                 }
                 // A reconnect (page reload / deploy rollover) hands a FRESH
                 // jellyfin-web Manager whose `groupInfo` is null and whose
@@ -2218,6 +2283,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.connected = false;
                 rec.buffering = false;
+                // Start the clock the reconnect histogram reads. Don't restamp
+                // a member already counted as gone (a duplicate loss event
+                // would reset the measurement and under-report the gap).
+                rec.socket_gone_since
+                    .get_or_insert((tokio::time::Instant::now(), SocketGoneCause::SocketLost));
             } else {
                 return;
             }
@@ -3375,6 +3445,89 @@ mod tests {
         assert!(
             capture2.latest.lock().unwrap().is_none(),
             "orphan group's snapshot must be REMOVED on dissolution"
+        );
+    }
+
+    /// The `cause` label on `pharos_syncplay_socket_gone_seconds`. The two
+    /// causes must never collide: `hydrated` is the post-deploy population
+    /// whose reconnect latency justified B167's rule change, and averaging it
+    /// into ordinary `socket_lost` blips would hide exactly the tail that
+    /// matters.
+    #[test]
+    fn socket_gone_causes_are_distinct_and_stable() {
+        const ALL: [SocketGoneCause; 2] = [SocketGoneCause::SocketLost, SocketGoneCause::Hydrated];
+        assert_eq!(SocketGoneCause::SocketLost.label(), "socket_lost");
+        assert_eq!(SocketGoneCause::Hydrated.label(), "hydrated");
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "socket-gone causes collide: {labels:?}"
+        );
+    }
+
+    /// How long a client actually takes to get its `/socket` back is THE
+    /// number both reconnect graces were guessed at without: 150 s, then
+    /// 600 s, while the real figure on 2026-07-29 was 12–22 minutes. Measure
+    /// it, so the next grace is set from data instead of from optimism.
+    #[tokio::test(start_paused = true)]
+    async fn a_members_reconnect_gap_is_measured() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, sinks, _rx1, _m1) = fresh().await;
+        let (m2, mut _rx2) = add_member(&h, &sinks, "second").await;
+
+        h.tx.send(GroupMsg::MemberSocketLost { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Deliberately UNDER both prune graces: this test's claim is that the
+        // gap is measured at all. Whether a member survives a gap longer than
+        // a grace is the fix's claim, tested separately — a test that advanced
+        // past the graces here would be asserting two things and would race
+        // the prune tick.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        h.tx.send(GroupMsg::ResyncMember { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_syncplay_socket_gone_seconds" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = found.expect(
+            "a member's socket coming back must record how long it was gone — \
+             without it, every reconnect grace is a guess",
+        );
+        assert!(
+            labels.contains(&"cause=socket_lost".to_string()),
+            "the measurement must name why the socket was gone; got {labels:?}"
+        );
+        let DebugValue::Histogram(samples) = value else {
+            panic!("expected a histogram, got {value:?}");
+        };
+        let secs = samples.first().expect("one sample").into_inner();
+        assert!(
+            (secs - 120.0).abs() < 1.0,
+            "must record the real gap (120s), got {secs}"
         );
     }
 
@@ -5617,6 +5770,7 @@ mod tests {
             MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
         let live = MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
         let mk = |last_seen| MemberRec {
+            socket_gone_since: None,
             name: "m".into(),
             offset: ClockOffset::default(),
             buffering: false,
