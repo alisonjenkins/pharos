@@ -1143,6 +1143,41 @@ mod media_segments_tests {
 }
 
 #[cfg(test)]
+mod local_address_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use actix_web::test;
+
+    #[actix_web::test]
+    async fn the_advertised_address_follows_the_clients_scheme() {
+        // B165 — this is the CONTRACT the reverse proxy in front has to feed.
+        // pharos was already reading the header correctly; the angie config
+        // overwrote it with its own plaintext `$scheme`, so an HTTPS-only
+        // deployment advertised `LocalAddress: http://...` and any client that
+        // followed it dropped to plaintext (or was blocked as mixed content).
+        // Pin the server half so a regression here is caught in-tree, since the
+        // proxy half lives in flake.nix and has no test harness.
+        let req = test::TestRequest::default()
+            .insert_header(("X-Forwarded-Proto", "https"))
+            .insert_header(("Host", "media.example.com"))
+            .to_http_request();
+        assert_eq!(
+            derive_local_address(&req),
+            "https://media.example.com",
+            "an https client must be told https"
+        );
+
+        // No proxy in front: fall back to the connection's own scheme rather
+        // than inventing one.
+        let req = test::TestRequest::default()
+            .insert_header(("Host", "media.example.com"))
+            .to_http_request();
+        assert_eq!(derive_local_address(&req), "http://media.example.com");
+    }
+}
+
+#[cfg(test)]
 mod bitrate_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 

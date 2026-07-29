@@ -678,6 +678,21 @@
                   ""      close;
                 }
 
+                # B165 — keep the CLIENT's scheme, don't substitute our own.
+                # TLS terminates at the cluster gateway, which forwards plain
+                # HTTP here and states the original scheme in
+                # X-Forwarded-Proto. Setting that header to `$scheme`
+                # overwrote `https` with this listener's own `http`, so every
+                # absolute URL pharos derives from it came back plaintext —
+                # `/System/Info/Public` advertised
+                # `LocalAddress: http://prototype.aliflix...` on an HTTPS-only
+                # deployment. Honour an inbound value; fall back to $scheme
+                # only when there is nothing in front of us.
+                map $http_x_forwarded_proto $forwarded_proto {
+                  default $http_x_forwarded_proto;
+                  ""      $scheme;
+                }
+
                 server {
                   listen ${toString port};
 
@@ -704,7 +719,7 @@
                     proxy_set_header Host              $host;
                     proxy_set_header X-Real-IP         $remote_addr;
                     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_set_header X-Forwarded-Proto $forwarded_proto;
                   }
 
                   # SPA served under /${prefix}/; its files live at the
@@ -724,7 +739,7 @@
                     proxy_set_header Host              $host;
                     proxy_set_header X-Real-IP         $remote_addr;
                     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_set_header X-Forwarded-Proto $forwarded_proto;
                     proxy_set_header Upgrade           $http_upgrade;
                     proxy_set_header Connection        $connection_upgrade;
                   }
