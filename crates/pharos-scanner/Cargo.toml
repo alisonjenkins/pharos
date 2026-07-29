@@ -14,6 +14,9 @@ futures-util = "0.3"
 # through the persistent libav worker pool instead of forking ffprobe.
 # Enabled via the `libav-probe` feature (the server turns it on).
 pharos-transcode = { path = "../pharos-transcode", optional = true, default-features = false, features = ["backend-lib"] }
+# B169 — which PROVIDER supplied each descriptive field. The scanner runs
+# in-process with the server, so these land on the server's /metrics.
+metrics.workspace = true
 # LIB-A8 — filesystem watcher (optional). Pure-Rust cross-platform fs
 # notification (inotify / kqueue / ReadDirectoryChangesW). Pulled in only
 # behind the `watch` feature so the default build stays lean.
@@ -52,6 +55,7 @@ watch = ["dep:notify", "tokio/sync", "tokio/time"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+metrics-util.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
