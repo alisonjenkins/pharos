@@ -376,10 +376,14 @@ fn hit_outcome(cached_art_roles: usize) -> EnrichOutcome {
 }
 
 fn kind_label(kind: MediaKind) -> &'static str {
+    // Bounded metric label; `MediaKind::as_str` is the same table, but this one
+    // is a DASHBOARD CONTRACT and is kept separate deliberately so a change to
+    // the internal token cannot silently rename a label.
     match kind {
         MediaKind::Movie => "movie",
         MediaKind::Episode => "episode",
         MediaKind::Audio => "audio",
+        MediaKind::Book => "book",
     }
 }
 
@@ -450,8 +454,13 @@ where
             )
         }
         // No provider covers audio here — skip (never marked).
-        MediaKind::Audio => {
-            record_enrich(MediaKind::Audio, EnrichOutcome::Skipped);
+        // 004-books joins audio here: an online book provider is out of scope,
+        // and querying TMDB or TVDB for a book would return a confident wrong
+        // match — the class that produced B150/B152/B159/B160 for album art.
+        // `item.kind` rather than a literal, so the metric label names the kind
+        // that was actually skipped.
+        MediaKind::Audio | MediaKind::Book => {
+            record_enrich(item.kind, EnrichOutcome::Skipped);
             return Ok(false);
         }
     };
@@ -523,8 +532,13 @@ where
                 return Ok(false);
             }
         }
-        MediaKind::Audio => {
-            record_enrich(MediaKind::Audio, EnrichOutcome::Skipped);
+        // 004-books joins audio here: an online book provider is out of scope,
+        // and querying TMDB or TVDB for a book would return a confident wrong
+        // match — the class that produced B150/B152/B159/B160 for album art.
+        // `item.kind` rather than a literal, so the metric label names the kind
+        // that was actually skipped.
+        MediaKind::Audio | MediaKind::Book => {
+            record_enrich(item.kind, EnrichOutcome::Skipped);
             return Ok(false);
         }
     };

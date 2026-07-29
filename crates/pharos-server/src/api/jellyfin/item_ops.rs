@@ -126,6 +126,10 @@ async fn metadata_editor(
         pharos_core::MediaKind::Movie => "Movies",
         pharos_core::MediaKind::Episode => "tvshows",
         pharos_core::MediaKind::Audio => "music",
+        // 004-books — the metadata editor's library-type selector. `books` is
+        // the collection type jellyfin-web already understands, matching
+        // `LibraryKind::Books.collection_type()`.
+        pharos_core::MediaKind::Book => "books",
     };
     Ok(crate::api::jellyfin::wire::json(&MetadataEditorInfoDto {
         content_type,

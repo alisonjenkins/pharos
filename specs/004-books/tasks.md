@@ -62,10 +62,10 @@ otherwise by labelling `Path` and `/Download` as US1-only.
 
 ### Step 1 — core enums
 
-- [ ] T005 Add `Book` to `MediaKind` in `crates/pharos-core/src/lib.rs:1929`, extend `as_str()` → `"book"` and `from_wire()` to accept `"book"` case-insensitively. Fix every exhaustive-match compile error the compiler names, **and apply T004's recorded verdict at each non-exhaustive site in the same commit** — they are part of adding the variant, not a follow-up
-- [ ] T006 [P] Add test `book_is_parsed_from_the_wire_discriminator` in `crates/pharos-core/src/lib.rs` tests: `from_wire("Book")`, `from_wire("book")`, `MediaKind::Book.as_str() == "book"`. *Ordering note: a test naming a variant cannot compile before the variant exists, so T005 precedes T006 by necessity, not by preference. Recorded so the V11 ordering does not read as an oversight*
-- [ ] T007 Add `Books` to `LibraryKind` in `crates/pharos-core/src/lib.rs:1402`, `collection_type()` → `"books"`, `parse()` accepting `books`/`book`
-- [ ] T008 [P] Add test `a_books_library_reports_the_books_collection_type` in `crates/pharos-core/src/lib.rs` tests — **COMMIT** (T005–T008: variants + audited verdicts, no new behaviour)
+- [X] T005 Add `Book` to `MediaKind` in `crates/pharos-core/src/lib.rs:1929`, extend `as_str()` → `"book"` and `from_wire()` to accept `"book"` case-insensitively. Fix every exhaustive-match compile error the compiler names, **and apply T004's recorded verdict at each non-exhaustive site in the same commit** — they are part of adding the variant, not a follow-up
+- [X] T006 [P] Add test `book_is_parsed_from_the_wire_discriminator` in `crates/pharos-core/src/lib.rs` tests: `from_wire("Book")`, `from_wire("book")`, `MediaKind::Book.as_str() == "book"`. *Ordering note: a test naming a variant cannot compile before the variant exists, so T005 precedes T006 by necessity, not by preference. Recorded so the V11 ordering does not read as an oversight*
+- [X] T007 Add `Books` to `LibraryKind` in `crates/pharos-core/src/lib.rs:1402`, `collection_type()` → `"books"`, `parse()` accepting `books`/`book`
+- [X] T008 [P] Add test `a_books_library_reports_the_books_collection_type` in `crates/pharos-core/src/lib.rs` tests — **COMMIT** (T005–T008: variants + audited verdicts, no new behaviour)
 
 ### Book metadata types
 

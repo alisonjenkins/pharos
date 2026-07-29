@@ -1438,6 +1438,26 @@ pub struct VirtualFolderOptionsDto {
     pub enable_realtime_monitor: bool,
 }
 
+/// Does an item of this kind have video frames the image route can extract?
+///
+/// Four separate sites used to spell this as `!matches!(kind, Audio)`, each
+/// with its own comment saying "audio has no video frames". That inverted
+/// form silently answered TRUE for `MediaKind::Book` when the variant was
+/// added (004-books / R10 — `matches!` is invisible to the compiler), which
+/// would have advertised a poster, a backdrop, a thumb and a per-chapter
+/// frame for every epub, all of which the image route can only 404. B149 is
+/// what that looks like in production.
+///
+/// Stated positively and in ONE place: only a film or an episode has frames.
+/// Audio and books get artwork from a file on disk instead, recorded in the
+/// `artwork` table and surfaced as `has_primary_art`.
+fn has_video_frames(kind: pharos_core::MediaKind) -> bool {
+    matches!(
+        kind,
+        pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
+    )
+}
+
 impl BaseItemDto {
     pub fn from_domain(item: &pharos_core::MediaItem, server_id: &str) -> Self {
         Self::from_domain_with_user_data(item, server_id, pharos_core::UserItemData::default())
@@ -1580,16 +1600,31 @@ impl BaseItemDto {
     }
 
     fn build(item: &pharos_core::MediaItem, server_id: &str) -> Self {
-        let kind = match item.kind {
-            pharos_core::MediaKind::Movie => "Movie",
-            pharos_core::MediaKind::Episode => "Episode",
-            pharos_core::MediaKind::Audio => "Audio",
-        };
+        // `base_item_kind()` is documented on `MediaKind` as the single
+        // canonical `BaseItemDto.Type` projection. This site used to re-derive
+        // it with its own match — a second authority for one fact, which is
+        // exactly the drift the audit went looking for. Collapsed rather than
+        // given a fourth arm.
+        let kind = item.kind.base_item_kind();
+        // 004-books / FR-002 — `MediaType` is EXHAUSTIVE deliberately. It was
+        // `Audio => "Audio", _ => "Video"`, which silently made a book a video.
+        // That is the first gate all three jellyfin-web book readers check
+        // (`canPlayMediaType(mediaType) === "book"`), so the wildcard would have
+        // failed the entire feature with no error anywhere. A wildcard here must
+        // never come back: the next `MediaKind` variant should refuse to compile
+        // until it decides what it is to a client.
         let media_type = match item.kind {
             pharos_core::MediaKind::Audio => "Audio",
-            _ => "Video",
+            pharos_core::MediaKind::Book => "Book",
+            pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode => "Video",
         };
-        let is_video = !matches!(item.kind, pharos_core::MediaKind::Audio);
+        // A book is neither audio nor video. `is_video` drives `container_for`
+        // and `build_media_streams`, so a book must answer false to both — it
+        // claims no container and carries no streams (FR-008).
+        let is_video = matches!(
+            item.kind,
+            pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
+        );
         let probe = &item.probe;
         let container = container_for(probe, &item.path, is_video);
         let run_time_ticks = probe.run_time_ticks().unwrap_or(0);
@@ -1697,15 +1732,16 @@ impl BaseItemDto {
                     start_position_ticks: c.start_ms.saturating_mul(10_000),
                     image_date_modified: "0001-01-01T00:00:00.0000000Z",
                     // B88 — advertise a per-chapter image so the client fetches
-                    // the on-demand frame. Audio has no video frames to extract.
-                    image_tag: if matches!(item.kind, pharos_core::MediaKind::Audio) {
-                        None
-                    } else {
+                    // the on-demand frame. Audio and books have no video frames
+                    // to extract, so they advertise none.
+                    image_tag: if has_video_frames(item.kind) {
                         Some(image_tag_for(
                             item.id,
                             item.art_version,
                             &format!("chapter:{idx}"),
                         ))
+                    } else {
+                        None
                     },
                 })
                 .collect(),
@@ -1717,10 +1753,10 @@ impl BaseItemDto {
             // consistent with `image_tags_for` (which already omits Backdrop
             // for Audio) — otherwise jellyfin-web requests a backdrop that can
             // only 404, tripping the strict-console compat spec.
-            backdrop_image_tags: if matches!(item.kind, pharos_core::MediaKind::Audio) {
-                vec![]
-            } else {
+            backdrop_image_tags: if has_video_frames(item.kind) {
                 vec![image_tag_for(item.id, item.art_version, "backdrop")]
+            } else {
+                vec![]
             },
             screenshot_image_tags: vec![],
             date_created: item.created_at.map(format_iso8601),
@@ -1877,14 +1913,14 @@ pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, 
     // Primary tag ONLY when one actually exists — otherwise the client requests
     // a poster the image route can never serve and every grid render 404s.
     // Backdrop/Thumb only make sense for video.
-    let has_primary = !matches!(item.kind, pharos_core::MediaKind::Audio) || item.has_primary_art;
+    let has_primary = has_video_frames(item.kind) || item.has_primary_art;
     if has_primary {
         m.insert(
             "Primary".into(),
             serde_json::Value::String(image_tag_for(item.id, item.art_version, "primary")),
         );
     }
-    if !matches!(item.kind, pharos_core::MediaKind::Audio) {
+    if has_video_frames(item.kind) {
         m.insert(
             "Backdrop".into(),
             serde_json::Value::String(image_tag_for(item.id, item.art_version, "backdrop")),

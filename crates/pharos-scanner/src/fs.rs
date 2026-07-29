@@ -1007,7 +1007,12 @@ impl<P: Prober> FsScanner<P> {
                         .map(|t| t.trim().to_string())
                         .filter(|t| !t.is_empty())
                         .unwrap_or_else(stem),
-                    _ => stem(),
+                    // 004-books — a book already landed here via the wildcard
+                    // and `stem()` is the RIGHT answer for it (FR-007's filename
+                    // fallback), but it was correct by accident. Named
+                    // explicitly, and the wildcard dropped, so the next
+                    // `MediaKind` variant has to decide rather than inherit.
+                    MediaKind::Movie | MediaKind::Episode | MediaKind::Book => stem(),
                 };
                 // Stat the file so MediaProbe.size_bytes is set even when
                 // ffprobe didn't report `format.size` (some containers).

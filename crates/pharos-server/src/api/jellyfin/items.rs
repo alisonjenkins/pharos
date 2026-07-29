@@ -197,6 +197,7 @@ async fn items_counts(
     let mut artists: HashSet<&str> = HashSet::new();
     let mut albums: HashSet<&str> = HashSet::new();
     let mut genres: HashSet<&str> = HashSet::new();
+    let mut books = 0u32;
     for i in all.iter() {
         match i.kind {
             MediaKind::Movie => movies += 1,
@@ -209,6 +210,9 @@ async fn items_counts(
                 }
             }
             MediaKind::Audio => audio += 1,
+            // 004-books — `ItemCountsDto.book_count` already existed and was
+            // hardcoded to 0; now it counts.
+            MediaKind::Book => books += 1,
         }
         if let Some(n) = i.probe.artist.as_deref() {
             artists.insert(n);
@@ -234,7 +238,7 @@ async fn items_counts(
         album_count: albums.len() as u32,
         music_video_count: 0,
         box_set_count: 0,
-        book_count: 0,
+        book_count: books,
         item_count: all.len() as u32,
         // GenreCount isn't in the SDK's ItemCounts model, but clients
         // sometimes read it and a strict client ignores unknown fields.
@@ -6116,9 +6120,15 @@ async fn resume_items(
                 .collect()
         })
         .unwrap_or_default();
+    // 004-books / FR-002 — the SECOND MediaType decision site (the first is in
+    // `dto.rs`, the third in `search.rs`). Was `_ => "video"`, so a book on the
+    // resume shelf reported itself as video and no reader would open it.
+    // EXHAUSTIVE on purpose: a wildcard is how three copies of this decision
+    // stayed out of sight until the R10 audit.
     let media_type_of = |kind: pharos_core::MediaKind| match kind {
         pharos_core::MediaKind::Audio => "audio",
-        _ => "video",
+        pharos_core::MediaKind::Book => "book",
+        pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode => "video",
     };
     let ids = state
         .stores

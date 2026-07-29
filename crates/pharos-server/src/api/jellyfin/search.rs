@@ -451,17 +451,23 @@ fn parse_include_item_types(s: Option<&str>) -> Option<Vec<MediaKind>> {
 }
 
 fn jellyfin_type(k: MediaKind) -> &'static str {
-    match k {
-        MediaKind::Movie => "Movie",
-        MediaKind::Episode => "Episode",
-        MediaKind::Audio => "Audio",
-    }
+    // Third copy of this table found by the 004-books audit (the others were
+    // `dto.rs` and `MediaKind::base_item_kind` itself). Delegated to the
+    // canonical projection so `Type` cannot disagree between search results and
+    // item fetches.
+    k.base_item_kind()
 }
 
 fn media_type(k: MediaKind) -> &'static str {
+    // 004-books / FR-002 — was `Audio => "Audio", _ => "Video"`. Search results
+    // feed the same client player selection as `/Items`, so a book surfaced by
+    // search must report `Book` here too or it opens nothing. EXHAUSTIVE on
+    // purpose: this is the third such site the audit had to find, and a wildcard
+    // is what let it hide.
     match k {
         MediaKind::Audio => "Audio",
-        _ => "Video",
+        MediaKind::Book => "Book",
+        MediaKind::Movie | MediaKind::Episode => "Video",
     }
 }
 

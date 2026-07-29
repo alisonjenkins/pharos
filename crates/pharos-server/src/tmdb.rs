@@ -293,7 +293,13 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
         match kind {
             pharos_core::MediaKind::Movie => self.0.search_movie(title, year).await,
             pharos_core::MediaKind::Episode => self.0.search_tv(title, year).await,
-            pharos_core::MediaKind::Audio => vec![],
+            // 004-books — no online metadata provider for books. TMDB and
+            // TVDB index films and television; a book queried against either
+            // returns a confident-looking wrong match, which is the failure
+            // class that produced B150/B152/B159/B160 for album art. An online
+            // book provider (Google Books / Comic Vine) is explicitly out of
+            // scope for 004-books; book metadata comes from inside the file.
+            pharos_core::MediaKind::Audio | pharos_core::MediaKind::Book => vec![],
         }
     }
 
@@ -310,7 +316,13 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
                 (Some(s), Some(e)) => self.0.episode_detail(id, s, e).await,
                 _ => self.0.tv_detail(id).await,
             },
-            pharos_core::MediaKind::Audio => None,
+            // 004-books — no online metadata provider for books. TMDB and
+            // TVDB index films and television; a book queried against either
+            // returns a confident-looking wrong match, which is the failure
+            // class that produced B150/B152/B159/B160 for album art. An online
+            // book provider (Google Books / Comic Vine) is explicitly out of
+            // scope for 004-books; book metadata comes from inside the file.
+            pharos_core::MediaKind::Audio | pharos_core::MediaKind::Book => None,
         }
     }
 

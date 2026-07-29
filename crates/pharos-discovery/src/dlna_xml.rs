@@ -100,12 +100,21 @@ pub fn browse_response_xml(
 
     let mut didl = String::with_capacity(512);
     didl.push_str(r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">"#);
+    let mut number_returned = 0usize;
     for item in page {
         let id = item.id;
         let title = xml_escape(&item.title);
         let class = match item.kind {
             MediaKind::Movie | MediaKind::Episode => "object.item.videoItem",
             MediaKind::Audio => "object.item.audioItem.musicTrack",
+            // 004-books — a DLNA renderer cannot open an epub, a comic archive
+            // or a PDF, and a book has no stream to hand it (FR-008). Emitting
+            // one would advertise `object.item.videoItem` on a
+            // `/Videos/{id}/stream` URL that produces nothing, so books are
+            // omitted from the DIDL entirely rather than described wrongly.
+            // `number_returned` counts what was actually emitted, not the page
+            // length, so the SOAP reply stays truthful.
+            MediaKind::Book => continue,
         };
         let protocol_info = match item.kind {
             MediaKind::Audio => "http-get:*:audio/mpeg:*",
@@ -118,10 +127,10 @@ pub fn browse_response_xml(
         didl.push_str(&format!(
             r#"<item id="{id}" parentID="0" restricted="1"><dc:title>{title}</dc:title><upnp:class>{class}</upnp:class><res protocolInfo="{protocol_info}">{url}</res></item>"#
         ));
+        number_returned += 1;
     }
     didl.push_str("</DIDL-Lite>");
     let didl_escaped = xml_escape(&didl);
-    let number_returned = page.len();
     let object_id_safe = xml_escape(object_id);
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>

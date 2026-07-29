@@ -695,3 +695,72 @@ fn frame_index_at_round_trips_through_the_frame_grid() {
     assert_eq!(r.frame_index_at(-5.0), 0);
     assert_eq!(r.frame_index_at(f64::NAN), 0);
 }
+
+// ---------------------------------------------------------------------------
+// 004-books — the wire discriminators for the Book kind and the Books library.
+//
+// Ordering note (Constitution III / V11): a test that NAMES an enum variant
+// cannot compile before the variant exists, so these follow their variants by
+// necessity rather than by preference. What they do guard is the wire tokens,
+// which are load-bearing and easy to change by accident — every one of them is
+// read by a client, not by pharos.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn book_is_parsed_from_the_wire_discriminator() {
+    use crate::MediaKind;
+
+    // `from_wire` is the single canonical parser for `IncludeItemTypes` / `Type`
+    // and is case-insensitive because clients disagree on casing.
+    assert_eq!(MediaKind::from_wire("Book"), Some(MediaKind::Book));
+    assert_eq!(MediaKind::from_wire("book"), Some(MediaKind::Book));
+    assert_eq!(MediaKind::from_wire("BOOK"), Some(MediaKind::Book));
+    assert_eq!(MediaKind::from_wire("  Book  "), Some(MediaKind::Book));
+
+    // The internal/store token and the PascalCase wire token are DIFFERENT
+    // fields and both are read: `as_str` is the store discriminator,
+    // `base_item_kind` is `BaseItemDto.Type`, which strict kotlin clients
+    // hard-require on every item.
+    assert_eq!(MediaKind::Book.as_str(), "book");
+    assert_eq!(MediaKind::Book.base_item_kind(), "Book");
+
+    // Round-trip through the store token.
+    assert_eq!(
+        "book".parse::<MediaKind>().ok(),
+        Some(MediaKind::Book),
+        "FromStr must accept what as_str emits, or a stored row cannot be read back"
+    );
+
+    // Every kind's tokens stay distinct — a collision would silently merge two
+    // kinds in the store or on the wire.
+    let kinds = [
+        MediaKind::Movie,
+        MediaKind::Episode,
+        MediaKind::Audio,
+        MediaKind::Book,
+    ];
+    let store: std::collections::HashSet<_> = kinds.iter().map(|k| k.as_str()).collect();
+    let wire: std::collections::HashSet<_> = kinds.iter().map(|k| k.base_item_kind()).collect();
+    assert_eq!(
+        store.len(),
+        kinds.len(),
+        "store discriminators must be distinct"
+    );
+    assert_eq!(wire.len(), kinds.len(), "wire Type tokens must be distinct");
+}
+
+#[test]
+fn a_books_library_reports_the_books_collection_type() {
+    use crate::LibraryKind;
+
+    assert_eq!(LibraryKind::parse("books"), LibraryKind::Books);
+    assert_eq!(LibraryKind::parse("book"), LibraryKind::Books);
+    assert_eq!(LibraryKind::parse("Books"), LibraryKind::Books);
+
+    // The token jellyfin-web matches on. Anything else and it renders a video
+    // grid over items that will never play.
+    assert_eq!(LibraryKind::Books.collection_type(), "books");
+
+    // An unknown token still falls back to Mixed rather than to Books.
+    assert_eq!(LibraryKind::parse("bookshelf"), LibraryKind::Mixed);
+}

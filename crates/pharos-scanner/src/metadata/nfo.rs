@@ -155,6 +155,18 @@ fn nfo_candidates(req: &MetadataRequest<'_>) -> Vec<PathBuf> {
                 out.push(p);
             }
         }
+        // 004-books — no Kodi NFO for a book. Book metadata comes from inside
+        // the file (the epub OPF, `ComicInfo.xml`, the PDF info dictionary) via
+        // the book provider, not from a Kodi sidecar. Returning no candidates is
+        // not a gap: `NfoProvider::fetch` skips files that do not exist anyway,
+        // so a `<basename>.nfo` beside a book would still be read if someone
+        // hand-wrote one — this arm only declines to GUESS at filenames whose
+        // Kodi conventions (`movie.nfo`, `tvshow.nfo`) mean nothing for books.
+        MediaKind::Book => {
+            if let Some(p) = sibling_nfo(req.path) {
+                out.push(p);
+            }
+        }
     }
 
     out

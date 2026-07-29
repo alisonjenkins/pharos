@@ -1403,6 +1403,10 @@ pub enum LibraryKind {
     Movies,
     TvShows,
     Music,
+    /// 004-books / FR-005 — a library of ebooks, comics and PDFs. `books` is a
+    /// `CollectionType` the deployed jellyfin-web bundle already understands, so
+    /// the client renders a book grid rather than a video grid.
+    Books,
     #[default]
     Mixed,
 }
@@ -1416,6 +1420,7 @@ impl LibraryKind {
             LibraryKind::Movies => "movies",
             LibraryKind::TvShows => "tvshows",
             LibraryKind::Music => "music",
+            LibraryKind::Books => "books",
             LibraryKind::Mixed => "mixed",
         }
     }
@@ -1428,6 +1433,7 @@ impl LibraryKind {
             "movies" | "movie" => LibraryKind::Movies,
             "tvshows" | "tvshow" | "tv" | "shows" | "series" => LibraryKind::TvShows,
             "music" | "audio" => LibraryKind::Music,
+            "books" | "book" => LibraryKind::Books,
             _ => LibraryKind::Mixed,
         }
     }
@@ -1931,6 +1937,17 @@ pub enum MediaKind {
     Episode,
     #[default]
     Audio,
+    /// 004-books — an ebook, comic archive or PDF. Carries NO stream facts:
+    /// a book is never probed by ffmpeg (FR-001) and offers nothing to play
+    /// (FR-008), so its `MediaProbe` is always `default()` and its book-specific
+    /// facts live in [`BookMeta`].
+    ///
+    /// Adding this variant did NOT make the compiler enumerate every site that
+    /// must decide about books — only exhaustive `match` sites. 34 `matches!` /
+    /// `==` predicates decide on `MediaKind` and rustc reports none of them; see
+    /// `specs/004-books/kind-decision-audit.md` for the audited list. Adding a
+    /// fifth variant means redoing that audit (V-clause in invariants.md).
+    Book,
 }
 
 impl MediaKind {
@@ -1939,6 +1956,7 @@ impl MediaKind {
             MediaKind::Movie => "movie",
             MediaKind::Episode => "episode",
             MediaKind::Audio => "audio",
+            MediaKind::Book => "book",
         }
     }
 
@@ -1956,6 +1974,7 @@ impl MediaKind {
             "movie" => Some(MediaKind::Movie),
             "episode" => Some(MediaKind::Episode),
             "audio" => Some(MediaKind::Audio),
+            "book" => Some(MediaKind::Book),
             _ => None,
         }
     }
@@ -1971,6 +1990,7 @@ impl MediaKind {
             MediaKind::Movie => "Movie",
             MediaKind::Episode => "Episode",
             MediaKind::Audio => "Audio",
+            MediaKind::Book => "Book",
         }
     }
 }
@@ -1982,6 +2002,7 @@ impl std::str::FromStr for MediaKind {
             "movie" => Ok(MediaKind::Movie),
             "episode" => Ok(MediaKind::Episode),
             "audio" => Ok(MediaKind::Audio),
+            "book" => Ok(MediaKind::Book),
             other => Err(DomainError::Backend(format!("unknown media kind: {other}"))),
         }
     }

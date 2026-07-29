@@ -203,7 +203,14 @@ impl MetadataProvider for FilenameProvider {
         // episodes. Audio identity is artist/album/track-tag driven
         // (a later slice); skip it here so we don't surface a bogus
         // "title" from a track filename.
-        matches!(kind, MediaKind::Movie | MediaKind::Episode)
+        // 004-books / FR-007 — books are admitted so a file whose OPF or
+        // ComicInfo.xml carries no title still gets one from its filename. Without
+        // this a title-less epub lists untitled, and this predicate is a `matches!`
+        // that the compiler never flagged when `Book` was added (R10).
+        matches!(
+            kind,
+            MediaKind::Movie | MediaKind::Episode | MediaKind::Book
+        )
     }
 
     async fn fetch(&self, req: &MetadataRequest<'_>) -> DomainResult<MetadataResult> {
