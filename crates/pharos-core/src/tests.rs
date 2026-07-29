@@ -430,6 +430,12 @@ impl MediaStore for MemStore {
         Ok(matches)
     }
 
+    async fn clear_provider_artwork(&self, _provider: &str) -> DomainResult<u64> {
+        // MemStore is a lightweight test-double with no artwork table; the
+        // invalidation path is exercised against the real sqlx stores.
+        Ok(0)
+    }
+
     async fn item_entity_counts(&self, _item_id: MediaId) -> DomainResult<EntityCounts> {
         // MemStore is a lightweight scanner test-double with no genre/people/
         // studio join tables; the online-enrich fill-if-empty gate is exercised

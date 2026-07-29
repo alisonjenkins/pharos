@@ -316,6 +316,13 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn clear_provider_artwork(&self, provider: &str) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.clear_provider_artwork(provider).await,
+            AnyStore::Postgres(p) => p.clear_provider_artwork(provider).await,
+        }
+    }
+
     async fn audio_items_needing_art(
         &self,
         limit: i64,

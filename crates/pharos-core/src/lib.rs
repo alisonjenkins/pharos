@@ -2949,6 +2949,20 @@ pub trait MediaStore: Send + Sync {
         current_miss_marker: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 
+    /// Delete every artwork row recorded by `provider` and re-admit those items
+    /// for a fresh lookup, returning how many items were affected.
+    ///
+    /// The escape hatch for a provider whose MATCHING changed rather than
+    /// whose data did. A cached cover is keyed on `has_primary_art`, which the
+    /// eligibility query uses to skip items that already have art — so an item
+    /// given the WRONG cover is invisible to every later pass, however much the
+    /// matcher improves. Clearing the provider's rows is what lets a corrected
+    /// matcher revisit its own mistakes.
+    fn clear_provider_artwork(
+        &self,
+        provider: &str,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
     /// Count of linked genres/people/studios for `id` (fill-if-empty gate).
     fn item_entity_counts(
         &self,

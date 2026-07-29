@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pharos_core::{ArtworkRole, SearchCandidate};
+use pharos_core::ArtworkRole;
 use tokio::sync::Mutex;
 
 use crate::online_enrich::RemoteArt;
@@ -75,6 +75,7 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      title-only last resort.
 /// v3 — B144: unquoted final rung, so a tag truncated mid-word can still find
 ///      its release-group. INEFFECTIVE — see v4.
+/// v7 — B150: a candidate's credited artist must be consistent with the tag.
 /// v6 — B148: a coverless release-group falls through to its siblings.
 /// v5 — B147: scoring drops `match_best`'s year penalty, which had made the
 ///      effective bar an exact title match and blocked v2-v4 entirely.
@@ -82,7 +83,7 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      search ANDs bare terms, so an unquoted `... Outgu` still required the
 ///      clipped token to match something and returned nothing; `Outgu*` is
 ///      what a truncated tag actually needs.
-pub const ALBUM_ART_QUERY_VERSION: u32 = 6;
+pub const ALBUM_ART_QUERY_VERSION: u32 = 7;
 
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
@@ -462,6 +463,49 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs.clamp(1, 60)))
 }
 
+/// A release-group returned by search, with the artist credited to it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Candidate {
+    pub id: String,
+    pub title: String,
+    pub year: Option<u32>,
+    /// The credited artist, when MusicBrainz states one.
+    pub artist: Option<String>,
+}
+
+/// Minimum similarity between the file's artist tag and a candidate's credited
+/// artist. Below this the candidate is a DIFFERENT act that happens to share an
+/// album title, and its cover is simply the wrong picture.
+const MIN_ARTIST_CONFIDENCE: f32 = 0.6;
+
+/// Whether a candidate's credited artist is consistent with the file's.
+///
+/// B150 — the check that was missing. `Fireflies` by Owl City and `Fireflies`
+/// by Still Corners, Simon Falconer, Katie Garibaldi and 200-odd others all
+/// score a perfect title match, so with the artist dropped from the query (the
+/// title-only rung) the pick was arbitrary and Owl City's single got The
+/// Attic's sleeve.
+///
+/// Permissive in the two directions that are NOT evidence of a different act:
+/// an unknown artist on either side cannot contradict anything, and a
+/// containment match accepts `Owl City` against `Owl City feat. Shawn
+/// Chrystopher` (and the reverse) without demanding the tag be spelled the
+/// provider's way.
+fn artist_is_consistent(want: Option<&str>, have: Option<&str>) -> bool {
+    let (Some(want), Some(have)) = (want, have) else {
+        return true;
+    };
+    let (want, have) = (want.trim(), have.trim());
+    if want.is_empty() || have.is_empty() || is_compilation_artist(want) {
+        return true;
+    }
+    let (w, h) = (want.to_lowercase(), have.to_lowercase());
+    if w.contains(&h) || h.contains(&w) {
+        return true;
+    }
+    pharos_core::title_similarity(want, have) >= MIN_ARTIST_CONFIDENCE
+}
+
 /// One release-group that cleared the confidence floor.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScoredGroup {
@@ -470,11 +514,17 @@ pub(crate) struct ScoredGroup {
     pub confidence: f32,
 }
 
-/// Every candidate clearing the floor, best first — see [`MusicBrainzClient::release_groups`]
-/// for why the caller needs the runners-up and not just the winner.
-fn ranked_by_title(title: &str, candidates: &[SearchCandidate]) -> Vec<ScoredGroup> {
+/// Every candidate clearing the floor AND crediting a consistent artist, best
+/// first — see [`MusicBrainzClient::release_groups`] for why the caller needs
+/// the runners-up and not just the winner.
+fn ranked_by_title(
+    title: &str,
+    artist: Option<&str>,
+    candidates: &[Candidate],
+) -> Vec<ScoredGroup> {
     let mut scored: Vec<ScoredGroup> = candidates
         .iter()
+        .filter(|c| artist_is_consistent(artist, c.artist.as_deref()))
         .map(|c| (c, pharos_core::title_similarity(title, &c.title)))
         .filter(|(_, score)| *score >= MIN_ALBUM_CONFIDENCE)
         .map(|(c, confidence)| ScoredGroup {
@@ -489,10 +539,7 @@ fn ranked_by_title(title: &str, candidates: &[SearchCandidate]) -> Vec<ScoredGro
 
 /// The highest-scoring candidate and its title similarity, floor or not — so a
 /// rejection can name what it rejected and by how much.
-fn top_by_title<'a>(
-    title: &str,
-    candidates: &'a [SearchCandidate],
-) -> Option<(&'a SearchCandidate, f32)> {
+fn top_by_title<'a>(title: &str, candidates: &'a [Candidate]) -> Option<(&'a Candidate, f32)> {
     candidates
         .iter()
         .map(|c| (c, pharos_core::title_similarity(title, &c.title)))
@@ -522,7 +569,7 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 /// — MusicBrainz has no sandbox and its rate limit makes live tests hostile.
 /// Malformed JSON or a missing `release-groups` array yields an empty `Vec`
 /// rather than panicking: a provider blip must never fail a scan (V6).
-pub(crate) fn parse_release_groups(body: &str) -> Vec<SearchCandidate> {
+pub(crate) fn parse_release_groups(body: &str) -> Vec<Candidate> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return vec![];
     };
@@ -532,7 +579,7 @@ pub(crate) fn parse_release_groups(body: &str) -> Vec<SearchCandidate> {
     groups
         .iter()
         .filter_map(|g| {
-            Some(SearchCandidate {
+            Some(Candidate {
                 id: g.get("id")?.as_str()?.to_string(),
                 title: g.get("title")?.as_str()?.to_string(),
                 year: g
@@ -540,6 +587,20 @@ pub(crate) fn parse_release_groups(body: &str) -> Vec<SearchCandidate> {
                     .and_then(|d| d.as_str())
                     .and_then(|d| d.get(0..4))
                     .and_then(|y| y.parse().ok()),
+                // B150 — the credited artist decides whether a same-titled
+                // release-group is the same ALBUM. Without it, dropping the
+                // artist from the query (the title-only rung) meant every
+                // "Fireflies" ever released scored a perfect 1.0.
+                artist: g
+                    .get("artist-credit")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|a| !a.is_empty()),
             })
         })
         .collect()
@@ -664,7 +725,7 @@ impl MusicBrainzClient {
         // returns NO candidates — a wrong-but-present result is a confidence
         // question, not a query question.
         let attempts = search_attempts(artist, album);
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<Candidate> = Vec::new();
         let mut query = attempts
             .first()
             .cloned()
@@ -688,7 +749,7 @@ impl MusicBrainzClient {
         // Score against the stripped title: the qualifiers that were removed to
         // find the release-group would otherwise count against its similarity.
         let scored_title = strip_edition_qualifiers(album);
-        let ranked = ranked_by_title(&scored_title, &candidates);
+        let ranked = ranked_by_title(&scored_title, artist, &candidates);
 
         if ranked.is_empty() {
             // Remember the miss — with its REASON — so the album's other tracks
@@ -729,10 +790,7 @@ impl MusicBrainzClient {
     /// into up to four. Treating that as a plain failure both wasted the album
     /// and kept the pressure on. Backing off and retrying once is the polite
     /// response and the one their documentation asks for.
-    async fn search_release_groups(
-        &self,
-        query: &str,
-    ) -> Result<Vec<SearchCandidate>, AlbumArtMiss> {
+    async fn search_release_groups(&self, query: &str) -> Result<Vec<Candidate>, AlbumArtMiss> {
         for attempt in 0..=1 {
             self.gate.acquire().await;
             let resp = self
@@ -1222,18 +1280,20 @@ mod tests {
         // Real candidates, verbatim from the live MusicBrainz response for the
         // wildcard query B145 added.
         let candidates = vec![
-            SearchCandidate {
+            Candidate {
                 id: "386ca43e".into(),
                 title: "Always Outnumbered Never Outgunned".into(),
                 year: Some(2004),
+                artist: None,
             },
-            SearchCandidate {
+            Candidate {
                 id: "40b0d65f".into(),
                 title: "Always Outnumbered Always Outgunned".into(),
                 year: Some(2004),
+                artist: None,
             },
         ];
-        let ranked = ranked_by_title("Always Outnumbered Never Outgu", &candidates);
+        let ranked = ranked_by_title("Always Outnumbered Never Outgu", None, &candidates);
         let best = ranked
             .first()
             .expect("the clipped tag must match its album");
@@ -1247,10 +1307,18 @@ mod tests {
         // The same candidates through `match_best` — what shipped — are
         // rejected, which is the whole bug. If this ever starts passing,
         // `year_factor` changed and this indirection can be reconsidered.
+        let as_search: Vec<pharos_core::SearchCandidate> = candidates
+            .iter()
+            .map(|c| pharos_core::SearchCandidate {
+                id: c.id.clone(),
+                title: c.title.clone(),
+                year: c.year,
+            })
+            .collect();
         let via_match_best = pharos_core::match_best(
             "Always Outnumbered Never Outgu",
             None,
-            &candidates,
+            &as_search,
             MIN_ALBUM_CONFIDENCE,
         );
         assert!(
@@ -1266,23 +1334,26 @@ mod tests {
     #[test]
     fn every_group_clearing_the_floor_is_offered_best_first() {
         let candidates = vec![
-            SearchCandidate {
+            Candidate {
                 id: "50da1a12".into(),
                 title: "Always Outnumbered, Never Outgunned".into(),
                 year: Some(2004),
+                artist: None,
             },
-            SearchCandidate {
+            Candidate {
                 id: "386ca43e".into(),
                 title: "Always Outnumbered Never Outgunned".into(),
                 year: Some(2004),
+                artist: None,
             },
-            SearchCandidate {
+            Candidate {
                 id: "nope".into(),
                 title: "Something Else Entirely".into(),
                 year: None,
+                artist: None,
             },
         ];
-        let ranked = ranked_by_title("Always Outnumbered Never Outgu", &candidates);
+        let ranked = ranked_by_title("Always Outnumbered Never Outgu", None, &candidates);
         assert_eq!(ranked.len(), 2, "the unrelated album must not be offered");
         assert!(
             ranked[0].confidence >= ranked[1].confidence,
@@ -1306,16 +1377,108 @@ mod tests {
         assert!(ranked.iter().all(|g| g.confidence >= MIN_ALBUM_CONFIDENCE));
     }
 
+    // B150 — the wrong-cover bug, reported from production: Owl City's single
+    // `Fireflies` was given The Attic's sleeve. `releasegroup:"Fireflies"`
+    // returns 217 release-groups and the top five are ALL exact-title matches
+    // by different acts, so with the artist dropped from the query the pick was
+    // arbitrary. These candidates are verbatim from that live response.
+    #[test]
+    fn a_same_titled_album_by_another_artist_is_rejected() {
+        let candidates = vec![
+            Candidate {
+                id: "8908a5cb".into(),
+                title: "Fireflies".into(),
+                year: None,
+                artist: Some("Simon Falconer".into()),
+            },
+            Candidate {
+                id: "f27bf96a".into(),
+                title: "Fireflies".into(),
+                year: None,
+                artist: Some("Still Corners".into()),
+            },
+            Candidate {
+                id: "c8e85646".into(),
+                title: "Fireflies".into(),
+                year: Some(2009),
+                artist: Some("Owl City".into()),
+            },
+        ];
+        let ranked = ranked_by_title("Fireflies", Some("Owl City"), &candidates);
+        assert_eq!(
+            ranked.len(),
+            1,
+            "only the Owl City release-group may survive: {ranked:?}"
+        );
+        assert_eq!(ranked[0].mbid, "c8e85646");
+
+        // Without the artist check every one of them is a perfect match — the
+        // state that shipped the wrong sleeve.
+        assert_eq!(ranked_by_title("Fireflies", None, &candidates).len(), 3);
+    }
+
+    #[test]
+    fn artist_consistency_is_permissive_where_a_mismatch_is_not_evidence() {
+        // A "feat." credit on either side is the same act.
+        assert!(artist_is_consistent(
+            Some("Owl City"),
+            Some("Owl City feat. Shawn Chrystopher")
+        ));
+        assert!(artist_is_consistent(
+            Some("Owl City Feat. Shawn Chrystopher"),
+            Some("Owl City")
+        ));
+        // Punctuation and case are not evidence of a different act.
+        assert!(artist_is_consistent(Some("owl city"), Some("Owl City")));
+        // An unknown artist on EITHER side cannot contradict anything.
+        assert!(artist_is_consistent(None, Some("Still Corners")));
+        assert!(artist_is_consistent(Some("Owl City"), None));
+        // A compilation placeholder never narrows — MusicBrainz credits the
+        // contributors, so demanding the placeholder match would reject every
+        // real answer.
+        assert!(artist_is_consistent(
+            Some("Various Artists"),
+            Some("Fatboy Slim")
+        ));
+        // ...but two genuinely different acts are rejected.
+        assert!(!artist_is_consistent(Some("Owl City"), Some("The Attic")));
+        assert!(!artist_is_consistent(
+            Some("Owl City"),
+            Some("Simon Falconer")
+        ));
+    }
+
+    #[test]
+    fn parse_reads_the_credited_artist() {
+        let body = r#"{"release-groups":[
+            {"id":"c8e85646","title":"Fireflies",
+             "artist-credit":[{"name":"Owl City"}]},
+            {"id":"x","title":"Split",
+             "artist-credit":[{"name":"A"},{"name":"B"}]},
+            {"id":"y","title":"No Credit"}
+        ]}"#;
+        let got = parse_release_groups(body);
+        assert_eq!(got[0].artist.as_deref(), Some("Owl City"));
+        // A split credit keeps both names, so containment still matches either.
+        assert_eq!(got[1].artist.as_deref(), Some("A, B"));
+        // Absent stays absent rather than becoming an empty string that would
+        // read as "credited to nobody" and fail every comparison.
+        assert_eq!(got[2].artist, None);
+    }
+
     #[test]
     fn a_genuinely_different_album_is_still_rejected() {
         // The floor must still do its job — this is what stops a loose
         // wildcard query putting someone else's cover on your album.
-        let candidates = vec![SearchCandidate {
+        let candidates = vec![Candidate {
             id: "x".into(),
             title: "Piano Classics (disc 1)".into(),
             year: None,
+            artist: None,
         }];
-        assert!(ranked_by_title("Trance Classics [Moonshine] Disc 1", &candidates).is_empty());
+        assert!(
+            ranked_by_title("Trance Classics [Moonshine] Disc 1", None, &candidates).is_empty()
+        );
         // ...and the rejection still names what it rejected and by how much.
         let (c, score) = top_by_title("Trance Classics [Moonshine] Disc 1", &candidates).unwrap();
         assert_eq!(c.title, "Piano Classics (disc 1)");
