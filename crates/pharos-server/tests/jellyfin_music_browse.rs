@@ -636,3 +636,38 @@ async fn an_unstored_item_type_matches_nothing_rather_than_everything() {
         "a stored type must still return its items"
     );
 }
+
+#[actix_web::test]
+async fn album_and_artist_detail_advertise_the_cover_the_grid_shows() {
+    // B157 — the grid (`synth_album_dto`) resolves `ImageTags.Primary` through
+    // `synth_primary_tag`, but the DETAIL fetch built its DTO with an empty
+    // map, which serialises as `"ImageTags": {}` and reads to every client as
+    // no image at all. So an album tile carried its sleeve and the page you
+    // reached by clicking it did not.
+    use pharos_core::MediaStore;
+    let (state, token) = seed().await;
+    state
+        .stores
+        .set_artwork(600, "Primary", "musicbrainz", "/cache/sig-other.jpg")
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(state)).await;
+
+    for id in [
+        album_id_for("Significant Other"),
+        artist_id_for("Limp Bizkit"),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(&format!("/Items/{id}"))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(&test::call_and_read_body(&app, req).await).unwrap();
+        assert_eq!(
+            body["ImageTags"]["Primary"].as_str(),
+            Some("600"),
+            "detail page for {id} must advertise the cover its tile shows, got {}",
+            body["ImageTags"]
+        );
+    }
+}
