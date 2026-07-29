@@ -75,11 +75,13 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      title-only last resort.
 /// v3 — B144: unquoted final rung, so a tag truncated mid-word can still find
 ///      its release-group. INEFFECTIVE — see v4.
+/// v5 — B147: scoring drops `match_best`'s year penalty, which had made the
+///      effective bar an exact title match and blocked v2-v4 entirely.
 /// v4 — B145: the unquoted rung wildcards its final token. MusicBrainz's
 ///      search ANDs bare terms, so an unquoted `... Outgu` still required the
 ///      clipped token to match something and returned nothing; `Outgu*` is
 ///      what a truncated tag actually needs.
-pub const ALBUM_ART_QUERY_VERSION: u32 = 4;
+pub const ALBUM_ART_QUERY_VERSION: u32 = 5;
 
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
@@ -99,9 +101,15 @@ const MIN_WILDCARD_STEM: usize = 4;
 /// How many release-group candidates to consider per search.
 const SEARCH_LIMIT: u32 = 8;
 
-/// `(album artist, album)` → the matched release-group id, or `None` when the
-/// search already came back empty.
-type AlbumMemo = Arc<Mutex<HashMap<(String, String), Option<String>>>>;
+/// `(album artist, album)` → the matched release-group id, or the REASON the
+/// lookup failed.
+///
+/// B147: this used to be `Option<String>`, which collapsed every failure into
+/// "no candidates". An album's first track then logged the true cause and its
+/// other eleven logged a cause that was never diagnosed — so a library whose
+/// misses were nearly all `below_confidence` reported 192 `no_candidates`
+/// against 26, and the ratio pointed at the wrong problem for hours.
+type AlbumMemo = Arc<Mutex<HashMap<(String, String), Result<String, AlbumArtMiss>>>>;
 
 /// The most recently downloaded cover, keyed by release-group id.
 type CoverSlot = Arc<Mutex<Option<(String, Vec<u8>)>>>;
@@ -448,6 +456,36 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs.clamp(1, 60)))
 }
 
+/// The best candidate by TITLE similarity alone, if it clears the floor.
+///
+/// Deliberately not `pharos_core::match_best`. That multiplies similarity by a
+/// year-agreement factor, and an unknown year on either side scores 0.85 — but
+/// this lookup never has a query year to supply, so EVERY candidate was
+/// multiplied by 0.85 and the effective bar became `similarity >= 1.0`, an
+/// exact normalised-title match. B147: that is why the pass only ever matched
+/// albums whose tags were already perfect, and rejected
+/// `Always Outnumbered Never Outgu` against
+/// `Always Outnumbered Never Outgunned` at a true similarity of 0.88 — the
+/// case B144 and B145 were both written to rescue, blocked by a multiplier
+/// neither of them touched.
+fn best_by_title(title: &str, candidates: &[SearchCandidate]) -> Option<(String, f32)> {
+    top_by_title(title, candidates)
+        .filter(|(_, score)| *score >= MIN_ALBUM_CONFIDENCE)
+        .map(|(c, score)| (c.id.clone(), score))
+}
+
+/// The highest-scoring candidate and its title similarity, floor or not — so a
+/// rejection can name what it rejected and by how much.
+fn top_by_title<'a>(
+    title: &str,
+    candidates: &'a [SearchCandidate],
+) -> Option<(&'a SearchCandidate, f32)> {
+    candidates
+        .iter()
+        .map(|c| (c, pharos_core::title_similarity(title, &c.title)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+}
+
 /// Render an error and every cause beneath it.
 ///
 /// `reqwest`'s `Display` stops at "error sending request for url (...)", which
@@ -590,10 +628,9 @@ impl MusicBrainzClient {
             return match hit {
                 // A memoised hit has already cleared the confidence bar; the
                 // score is not re-reported because the search is not re-run.
-                Some(mbid) => Ok((mbid.clone(), None, MIN_ALBUM_CONFIDENCE)),
-                None => Err(AlbumArtMiss::NoCandidates {
-                    query: search_attempts(artist, album).join(" | "),
-                }),
+                Ok(mbid) => Ok((mbid.clone(), None, MIN_ALBUM_CONFIDENCE)),
+                // Replay the REAL reason, not a stand-in for it.
+                Err(miss) => Err(miss.clone()),
             };
         }
 
@@ -625,32 +662,33 @@ impl MusicBrainzClient {
         // Score against the stripped title: the qualifiers that were removed to
         // find the release-group would otherwise count against its similarity.
         let scored_title = strip_edition_qualifiers(album);
-        let best = pharos_core::match_best(&scored_title, None, &candidates, MIN_ALBUM_CONFIDENCE);
+        let best = best_by_title(&scored_title, &candidates);
 
         let outcome = match best {
             Some(m) => m,
             None => {
-                // Remember the miss so the album's other tracks don't each
-                // spend a rate-limited search rediscovering it.
-                self.memo.lock().await.insert(key, None);
-                return Err(match candidates.first() {
-                    Some(c) => AlbumArtMiss::BelowConfidence {
+                // Remember the miss — with its REASON — so the album's other
+                // tracks neither re-run a rate-limited search nor report a
+                // cause that was never diagnosed.
+                let miss = match top_by_title(&scored_title, &candidates) {
+                    Some((c, confidence)) => AlbumArtMiss::BelowConfidence {
                         best: c.title.clone(),
-                        confidence: pharos_core::match_best(&scored_title, None, &candidates, 0.0)
-                            .map(|m| m.confidence)
-                            .unwrap_or(0.0),
+                        confidence,
                     },
                     None => AlbumArtMiss::NoCandidates { query },
-                });
+                };
+                self.memo.lock().await.insert(key, Err(miss.clone()));
+                return Err(miss);
             }
         };
 
+        let (mbid, confidence) = outcome;
         let year = candidates
             .iter()
-            .find(|c| c.id == outcome.id)
+            .find(|c| c.id == mbid)
             .and_then(|c| c.year);
-        self.memo.lock().await.insert(key, Some(outcome.id.clone()));
-        Ok((outcome.id, year, outcome.confidence))
+        self.memo.lock().await.insert(key, Ok(mbid.clone()));
+        Ok((mbid, year, confidence))
     }
 
     /// One rate-limited release-group search, retried once on a throttle.
@@ -1118,6 +1156,63 @@ mod tests {
         // everything.
         assert_eq!(unquoted_query("---").as_deref(), None);
         assert_eq!(unquoted_query("").as_deref(), None);
+    }
+
+    // B147 — the bug that made B144 and B145 both look like failures.
+    // `match_best` multiplies title similarity by a year-agreement factor, and
+    // an unknown year on EITHER side scores 0.85. This lookup never has a query
+    // year, so every candidate was multiplied by 0.85 and the effective bar
+    // became `similarity >= 1.0` — an exact normalised-title match.
+    #[test]
+    fn scoring_does_not_apply_a_year_penalty_this_lookup_can_never_satisfy() {
+        // Real candidates, verbatim from the live MusicBrainz response for the
+        // wildcard query B145 added.
+        let candidates = vec![
+            SearchCandidate {
+                id: "386ca43e".into(),
+                title: "Always Outnumbered Never Outgunned".into(),
+                year: Some(2004),
+            },
+            SearchCandidate {
+                id: "40b0d65f".into(),
+                title: "Always Outnumbered Always Outgunned".into(),
+                year: Some(2004),
+            },
+        ];
+        let (id, score) = best_by_title("Always Outnumbered Never Outgu", &candidates)
+            .expect("the clipped tag must match its album");
+        assert_eq!(id, "386ca43e", "the closer title must win");
+        assert!(score >= MIN_ALBUM_CONFIDENCE, "scored {score}");
+
+        // The same candidates through `match_best` — what shipped — are
+        // rejected, which is the whole bug. If this ever starts passing,
+        // `year_factor` changed and this indirection can be reconsidered.
+        let via_match_best = pharos_core::match_best(
+            "Always Outnumbered Never Outgu",
+            None,
+            &candidates,
+            MIN_ALBUM_CONFIDENCE,
+        );
+        assert!(
+            via_match_best.is_none(),
+            "match_best's year penalty is why this fix exists"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_different_album_is_still_rejected() {
+        // The floor must still do its job — this is what stops a loose
+        // wildcard query putting someone else's cover on your album.
+        let candidates = vec![SearchCandidate {
+            id: "x".into(),
+            title: "Piano Classics (disc 1)".into(),
+            year: None,
+        }];
+        assert!(best_by_title("Trance Classics [Moonshine] Disc 1", &candidates).is_none());
+        // ...and the rejection still names what it rejected and by how much.
+        let (c, score) = top_by_title("Trance Classics [Moonshine] Disc 1", &candidates).unwrap();
+        assert_eq!(c.title, "Piano Classics (disc 1)");
+        assert!(score < MIN_ALBUM_CONFIDENCE, "scored {score}");
     }
 
     #[test]
