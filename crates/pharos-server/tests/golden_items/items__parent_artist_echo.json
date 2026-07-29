@@ -20,7 +20,19 @@
       "Name": "Echo Album",
       "ServerId": "SERVERID",
       "Tags": [],
-      "Type": "MusicAlbum"
+      "Type": "MusicAlbum",
+      "UserData": {
+        "IsFavorite": false,
+        "ItemId": "080477e50c7a1f08080477e50c7a1f08",
+        "Key": "080477e50c7a1f08080477e50c7a1f08",
+        "LastPlayedDate": null,
+        "Likes": null,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false,
+        "PlayedPercentage": 0.0,
+        "Rating": null
+      }
     }
   ],
   "StartIndex": 0,

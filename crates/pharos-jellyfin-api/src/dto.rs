@@ -664,8 +664,20 @@ impl SynthItemDto {
     /// A bare synth folder (`Id`, `Name`, `ServerId`, `Type`, `MediaType`
     /// "Unknown", `IsFolder` true) — the Genre/Studio/Tag shape. Callers add
     /// richer fields on the returned value as needed.
+    /// A synthesised folder item.
+    ///
+    /// `UserData` is ALWAYS populated. B146: the Android TV app's album detail
+    /// screen calls `item.userData.isFavorite()` unconditionally
+    /// (`ItemListFragment.addButtons`), so a synth item that omits the field
+    /// takes the app down with a `NullPointerException` the moment it is
+    /// opened. This is the same crash class as B68, where a library folder
+    /// missing its `UserData` killed the same client — which is exactly why
+    /// setting it belongs HERE, in the one constructor every synth item goes
+    /// through, rather than at each of the dozen call sites where the next one
+    /// would be forgotten.
     pub fn folder(id: String, name: String, server_id: String, kind: &'static str) -> Self {
         Self {
+            user_data: Some(UserItemDataDto::folder(&id, false, 0, false)),
             id,
             name,
             server_id,
@@ -687,7 +699,6 @@ impl SynthItemDto {
             album_artist: None,
             album_artists: None,
             artist_items: None,
-            user_data: None,
         }
     }
 }

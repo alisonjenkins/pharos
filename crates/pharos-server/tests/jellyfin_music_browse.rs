@@ -399,3 +399,51 @@ async fn dashed_music_ids_resolve_in_filters_and_similar() {
         "dashed album Similar must resolve, got {got:?}"
     );
 }
+
+// B146 — the Android TV album detail screen calls `item.userData.isFavorite()`
+// unconditionally (`ItemListFragment.addButtons`), so a synth item that omits
+// `UserData` takes the app down with a NullPointerException the moment it is
+// opened. Proven from a live logcat trace, and the same crash class as B68
+// (a library folder missing its UserData killed the same client).
+//
+// Asserted across every music browse surface, because the field is set in the
+// one constructor they all share — this is what proves that.
+#[actix_web::test]
+async fn every_synth_music_item_carries_user_data() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    for uri in [
+        "/Albums",
+        "/Artists",
+        "/Artists/AlbumArtists",
+        "/MusicGenres",
+        "/Items?IncludeItemTypes=MusicAlbum&Recursive=true",
+    ] {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = v["Items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: no Items"));
+        assert!(!items.is_empty(), "{uri} returned nothing to check");
+        for it in items {
+            let ud = &it["UserData"];
+            assert!(
+                ud.is_object(),
+                "{uri}: {} has no UserData — the native app dereferences it \
+                 unconditionally and crashes: {it}",
+                it["Name"]
+            );
+            // The app also reads these two off it, so a present-but-empty
+            // object would be the same crash one field further in.
+            assert!(ud["IsFavorite"].is_boolean(), "{uri}: {ud}");
+            assert_eq!(ud["ItemId"], it["Id"], "{uri}: UserData must name its item");
+        }
+    }
+}
