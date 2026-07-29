@@ -20,11 +20,15 @@
 //! Scope is deliberately artwork-only. MusicBrainz models an *album* while
 //! pharos stores a row per *track*, so the lookup is keyed on
 //! `(album artist, album)` and memoised — a twelve-track album costs one search
-//! and one cover download, not twelve of each. What it cannot do is artist
-//! photographs: the Cover Art Archive holds release art exclusively, and the
-//! providers that do carry artist images all require a key. Album, album-artist
-//! and track tiles are covered by the album cover; a bare artist tile is not,
-//! and pretending otherwise would just 404 for every render.
+//! and one cover download, not twelve of each.
+//!
+//! One cover lights up four views. A cached Primary flips `has_primary_art`,
+//! and the album, album-artist and artist tiles all synthesise their image
+//! from a representative track, so covering the tracks covers everything above
+//! them. What this does NOT get you is a *photograph of the artist*: the Cover
+//! Art Archive holds release art exclusively, and every provider carrying
+//! artist portraits requires a key. An artist tile shows one of their album
+//! covers — a real image rather than a blank card, but not the artist.
 
 use std::collections::HashMap;
 use std::sync::Arc;
