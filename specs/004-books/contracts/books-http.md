@@ -6,6 +6,10 @@ Authority for every requirement below is the deployed jellyfin-web bundle
 (see [research.md](../research.md) R2), not the Jellyfin OpenAPI document — where
 they disagree, the shipped client wins, because it is the acceptance test.
 
+**Revised 2026-07-29**: the book-item shape now says empty/0 rather than
+absent/null (R9), and `PlaybackInfo` moved out of "explicitly unchanged" into a
+contract of its own (FR-010).
+
 ---
 
 ## NEW `GET /Items/{itemId}/Download`
@@ -54,6 +58,10 @@ gratuitous divergence.
 
 - Emitted **only** when the request's `Fields` contains `Path`. The client asks
   as `Fields=CanDownload,Path`.
+- The parameter and the field name are matched in **every spelling a client
+  dialect may send** — `Fields`/`fields`, `Path`/`path` (V69). A camelCase
+  spelling silently ignored would disable the entire feature for that client,
+  which is a recurring bug class here.
 - Omitted (not null) otherwise, per the existing convention that absent means
   "not requested".
 - Applies to every item kind, not just books — `Fields=Path` is a general
@@ -76,16 +84,40 @@ this one field.
   "MediaType": "Book",       // gates all three players (lowercased compare)
   "Path": "/srv/Books/Dune.epub",   // when Fields=Path
   "CanDownload": true,
-  "RunTimeTicks": null,      // R8 — null even though position is tracked
+  "RunTimeTicks": 0,         // R8/R9 — 0, NOT null; the field is not optional
+  "MediaSources": [],        // R9 — EMPTY, not absent
+  "MediaStreams": [],        // R9 — EMPTY, not absent
   "SeriesName": "Dune",      // from book.series_name
   "IndexNumber": 1,          // from book.series_index
-  "ImageTags": { "Primary": "…" }   // iff a cover was extracted
-  // MediaSources / MediaStreams: ABSENT (R9)
+  "ImageTags": { "Primary": "…" }   // iff a cover was extracted; no Backdrop/Thumb
 }
 ```
 
 `MediaType` and `Type` are both `Book` and both are required: `Type` drives the
 grid's card shape, `MediaType` drives player selection.
+
+**On empty rather than absent**: the goal is that a client has nothing to request
+a stream for, and `[]` achieves that completely. Omitting the arrays would mean
+adding `skip_serializing_if`, and `dto.rs:420` records why that is forbidden —
+array fields are default-empty because jellyfin-web iterates them without null
+guards, and absent ones throw `Symbol.iterator` TypeErrors during view init.
+Likewise `RunTimeTicks` is `u64`, so `null` is not available without changing the
+field for every item kind.
+
+---
+
+## CHANGED `POST|GET /Items/{itemId}/PlaybackInfo` — books yield no source
+
+The route exists for any item id (`items.rs:105-106`, handler at `items.rs:2081`).
+A book must leave it **without having entered codec negotiation**:
+
+```jsonc
+{ "MediaSources": [], "PlaySessionId": "…" }
+```
+
+No device-profile evaluation, no direct-play/transcode decision, no
+`TranscodingUrl`. FR-010 exists because this rule previously lived only in this
+document's "explicitly unchanged" section, which meant nothing enforced it.
 
 ---
 
@@ -106,15 +138,16 @@ A library configured `kind = "books"` appears as:
 - `IncludeItemTypes=Book` selects book items (via the existing
   `MediaKind::from_wire`).
 - `SortBy=SeriesSortName,SortName` groups a series in reading order using
-  `book_series` + `book_series_index`.
+  `book_series` + `book_series_index`. A book with no series index sorts last,
+  not as index zero.
 
 ---
 
 ## Explicitly unchanged
 
-- `/Items/{id}/PlaybackInfo` — a book must never reach codec negotiation (R9). A
-  `PlaybackInfo` request naming a book returns no `MediaSources`.
 - `/Videos/{id}/stream`, HLS, and every transcode path — never valid for a book.
+  Nothing needs to reject a book explicitly, because with `MediaSources: []` no
+  client constructs such a URL.
 - `/Items/{id}/Images/Primary` — the cover is served by the existing image path
   with no book-specific handling, because it is written into the existing cache
   under the existing role.
