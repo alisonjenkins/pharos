@@ -1108,17 +1108,21 @@ impl MediaStore for PostgresStore {
         &self,
         limit: i64,
         ttl_cutoff: i64,
+        current_miss_marker: &str,
     ) -> DomainResult<Vec<MediaItem>> {
         let sql = format!(
             "SELECT {MEDIA_COLUMNS} FROM media_items \
              WHERE kind = 'audio' \
                AND has_primary_art = FALSE \
                AND (match_source IS NULL OR match_source IN ('search','none')) \
-               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1) \
-             ORDER BY id ASC LIMIT $2"
+               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1 \
+                    OR (match_source = 'none' \
+                        AND (match_external_id IS NULL OR match_external_id <> $2))) \
+             ORDER BY id ASC LIMIT $3"
         );
         let rows = sqlx::query_as::<_, MediaRow>(&sql)
             .bind(ttl_cutoff)
+            .bind(current_miss_marker)
             .bind(limit)
             .fetch_all(&self.pool)
             .await

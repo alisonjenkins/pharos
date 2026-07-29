@@ -953,7 +953,11 @@ where
 {
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
     let items = store
-        .audio_items_needing_art(cfg.max_per_pass, ttl_cutoff)
+        .audio_items_needing_art(
+            cfg.max_per_pass,
+            ttl_cutoff,
+            &crate::musicbrainz::miss_marker(),
+        )
         .await?;
     let had_work = !items.is_empty();
     if !had_work {
@@ -1036,8 +1040,18 @@ where
             // no-match. A transport failure is NOT the item's fault — leave it
             // eligible so the next pass retries rather than burning its TTL.
             if !matches!(miss, crate::musicbrainz::AlbumArtMiss::Unavailable { .. }) {
+                // Stamp the query version alongside the miss so a later
+                // improvement to the lookup re-admits this row at once instead
+                // of waiting out the full TTL.
                 store
-                    .set_item_match(item.id, "musicbrainz", "", "none", None, now)
+                    .set_item_match(
+                        item.id,
+                        "musicbrainz",
+                        &crate::musicbrainz::miss_marker(),
+                        "none",
+                        None,
+                        now,
+                    )
                     .await?;
             }
             return Ok(false);
@@ -1648,7 +1662,10 @@ mod tests {
 
         // And it drops out of the eligible set, so the album's other tracks
         // never re-run a rate-limited search for art that already exists.
-        let still_eligible = s.audio_items_needing_art(10, NOW + 1).await.unwrap();
+        let still_eligible = s
+            .audio_items_needing_art(10, NOW + 1, &crate::musicbrainz::miss_marker())
+            .await
+            .unwrap();
         assert!(still_eligible.is_empty());
     }
 
@@ -1678,10 +1695,19 @@ mod tests {
         let got = s.get(900_401).await.unwrap();
         assert!(!got.has_primary_art);
         assert_eq!(got.match_source.as_deref(), Some("none"));
+        // The verdict carries the query version that reached it.
+        assert_eq!(
+            got.match_external_id.as_deref(),
+            Some(crate::musicbrainz::miss_marker().as_str())
+        );
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // `none` + a fresh timestamp means the TTL, not the next pass, decides
         // when to look again.
-        assert!(s.audio_items_needing_art(10, NOW).await.unwrap().is_empty());
+        assert!(s
+            .audio_items_needing_art(10, NOW, &crate::musicbrainz::miss_marker())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // A transport failure is NOT the track's fault. Burning its TTL on a
@@ -1712,10 +1738,81 @@ mod tests {
             "an outage must not stamp a match state"
         );
         assert_eq!(
-            s.audio_items_needing_art(10, NOW).await.unwrap().len(),
+            s.audio_items_needing_art(10, NOW, &crate::musicbrainz::miss_marker())
+                .await
+                .unwrap()
+                .len(),
             1,
             "the track must still be eligible after a provider outage"
         );
+    }
+
+    // A miss is held by the TTL so the album's other tracks don't re-run the
+    // same search — but only while the query that reached it is still current.
+    // Without this, B142's better queries would have done nothing for 30 days
+    // on exactly the 22 albums they fix.
+    #[tokio::test]
+    async fn a_miss_from_an_older_query_version_is_retried_at_once() {
+        let s = store().await;
+        put_track(
+            &s,
+            900_404,
+            "Coldplay",
+            "A Rush Of Blood To The Head (Japan)",
+        )
+        .await;
+        // Stamped by a previous, worse query — same shape the shipped v1 wrote.
+        s.set_item_match(900_404, "musicbrainz", "miss-v1", "none", None, NOW)
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+
+        // Fresh timestamp, so the TTL alone would exclude it.
+        let (n, had_work) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::hit(),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "a stale verdict must be revisited, not waited out");
+        assert!(had_work);
+        assert!(s.get(900_404).await.unwrap().has_primary_art);
+    }
+
+    // The converse: a miss reached by the CURRENT query is left alone, so an
+    // album that genuinely has no artwork is not re-searched every pass.
+    #[tokio::test]
+    async fn a_miss_from_the_current_query_version_is_left_alone() {
+        let s = store().await;
+        put_track(&s, 900_405, "Nobody", "Unreleased Demos").await;
+        s.set_item_match(
+            900_405,
+            "musicbrainz",
+            &crate::musicbrainz::miss_marker(),
+            "none",
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let (_td, cache) = cache();
+
+        let (n, had_work) = enrich_audio_pass(
+            &s,
+            &sem(4),
+            &cache,
+            &FakeAlbumArt::hit(),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+        assert!(!had_work, "a current-version miss waits for the TTL");
     }
 
     // Movies and episodes are the other pass's business; the album-art pass

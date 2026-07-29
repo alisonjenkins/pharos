@@ -2936,10 +2936,17 @@ pub trait MediaStore: Send + Sync {
     /// track that already has art is not worth one however old its match is.
     /// Excluding rows that already have art also means an album resolved once
     /// never spends a rate-limited MusicBrainz search again.
+    /// `current_miss_marker` is the `match_external_id` a miss reached by the
+    /// CURRENT lookup logic carries. A row stamped with anything else is
+    /// re-admitted immediately regardless of `ttl_cutoff`: its verdict came
+    /// from an older, worse query, and holding it for the full TTL would mean
+    /// an improvement to that query does nothing for a month on exactly the
+    /// albums it fixes.
     fn audio_items_needing_art(
         &self,
         limit: i64,
         ttl_cutoff: i64,
+        current_miss_marker: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 
     /// Count of linked genres/people/studios for `id` (fill-if-empty gate).
