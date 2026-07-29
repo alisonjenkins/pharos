@@ -673,11 +673,10 @@ async fn music_similar(
             b.0.cmp(&a.0)
                 .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
         });
-        let items: Vec<serde_json::Value> = scored
-            .iter()
-            .take(q.limit as usize)
-            .map(|(_, a)| synth_album_dto(state, a))
-            .collect();
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        for (_, a) in scored.iter().take(q.limit as usize) {
+            items.push(synth_album_dto(state, a).await);
+        }
         let total = items.len() as u32;
         return Ok(crate::api::jellyfin::wire::query_result(items, total, 0));
     }
@@ -3700,22 +3699,19 @@ fn aggregate_albums(items: &[MediaItem], keep: impl Fn(&MediaItem) -> bool) -> V
 
 /// Wire DTO for one synthesised album (matches the `/Albums` shape, plus
 /// the year + child count the detail rails render).
-fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
+///
+/// B149: the Primary tag comes from `synth_primary_tag`, i.e. the SAME lookup
+/// that serves the image, so a tag is advertised only when there are bytes
+/// behind it. It used to be a hash of the album id, emitted unconditionally —
+/// which told every client to fetch a cover for albums that had none and
+/// produced a burst of `coil3.network.HttpException: HTTP 404` on the Google TV
+/// app for each screen of tiles. Advertising art that cannot be served is the
+/// mirror of B130 (art that could be served but was never advertised), and it
+/// is worse: the client pays for the request and still shows a blank.
+async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     let album_id = album_id_for(&a.name);
-    // Advertise a Primary image tag so clients actually request the cover.
-    // The album image endpoint resolves a synth album id to a child track's
-    // artwork (embedded cover or sidecar folder.jpg); without a tag in
-    // ImageTags jellyfin-web / the native apps never fetch it, so album
-    // cards + the album header rendered blank. The tag value is only a
-    // cache-buster — a stable hash of the album id keeps it deterministic.
-    let primary_tag = {
-        use xxhash_rust::xxh3::xxh3_64;
-        let h = xxh3_64(album_id.as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF;
-        format!("{h:016x}")
-    };
-    let mut image_tags = std::collections::BTreeMap::new();
-    image_tags.insert("Primary".to_string(), primary_tag);
+    let image_tags = crate::api::jellyfin::images::synth_primary_tag(state, &album_id).await;
     // B78/V38 — typed SynthItemDto, serialized to keep the Value return.
     serde_json::to_value(SynthItemDto {
         child_count: Some(a.child_count),
@@ -3727,7 +3723,7 @@ fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
                 id: artist_id_for(artist),
             }]
         }),
-        image_tags: Some(image_tags),
+        image_tags,
         backdrop_image_tags: Some(Vec::new()),
         genres: Some(Vec::new()),
         tags: Some(Vec::new()),
@@ -3815,8 +3811,10 @@ async fn maybe_list_music(
                 .is_some_and(|a| a.eq_ignore_ascii_case(&artist))
         });
         sort_album_aggs(&mut aggs, q.sort_by.as_deref(), descending);
-        let mut items: Vec<serde_json::Value> =
-            aggs.iter().map(|a| synth_album_dto(state, a)).collect();
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        for a in aggs.iter() {
+            items.push(synth_album_dto(state, a).await);
+        }
         // Loose tracks (no album tag) still belong on the artist page.
         let loose: Vec<&MediaItem> = all
             .iter()
@@ -3915,12 +3913,10 @@ async fn maybe_list_music(
     sort_album_aggs(&mut aggs, q.sort_by.as_deref(), descending);
     let total = aggs.len() as u32;
     let start = q.start_index as usize;
-    let page: Vec<serde_json::Value> = aggs
-        .iter()
-        .skip(start)
-        .take(q.take_limit())
-        .map(|a| synth_album_dto(state, a))
-        .collect();
+    let mut page: Vec<serde_json::Value> = Vec::new();
+    for a in aggs.iter().skip(start).take(q.take_limit()) {
+        page.push(synth_album_dto(state, a).await);
+    }
     Ok(Some(crate::api::jellyfin::wire::query_result(
         page,
         total,

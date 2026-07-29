@@ -230,6 +230,21 @@ fn names(items: &[serde_json::Value]) -> Vec<String> {
 #[actix_web::test]
 async fn artist_children_are_albums_plus_loose_tracks() {
     let (state, token) = seed().await;
+    // Give "Significant Other" a real cover so the Primary-tag assertion below
+    // tests the contract rather than the old unconditional stamp. Both its
+    // tracks are covered because the representative is chosen by TITLE, not by
+    // id — art on the wrong one leaves the album looking bare.
+    for id in [600, 601] {
+        pharos_core::MediaStore::set_artwork(
+            &state.stores,
+            id,
+            "Primary",
+            "local",
+            &format!("/cache/primary/audio/{id}.jpg"),
+        )
+        .await
+        .unwrap();
+    }
     let app = test::init_service(build_app(state)).await;
     let artist = artist_id_for("Limp Bizkit");
     // EXACT jellyfin-web artist-detail children query.
@@ -250,14 +265,22 @@ async fn artist_children_are_albums_plus_loose_tracks() {
     assert_eq!(items[0]["ChildCount"], 2);
     assert_eq!(items[0]["ProductionYear"], 1999);
     assert_eq!(items[0]["AlbumArtists"][0]["Name"], "Limp Bizkit");
-    // A synth album MUST advertise a Primary image tag, else clients never
-    // request the cover and album cards render blank (B-music). The image
-    // endpoint resolves the tag to a child track's artwork.
+    // An album whose tracks HAVE a cover must advertise a Primary tag, else
+    // clients never request it and the cards render blank (B130's class). The
+    // image endpoint resolves the tag to that child track's artwork.
     let primary = items[0]["ImageTags"]["Primary"].as_str();
     assert!(
         primary.is_some_and(|t| !t.is_empty()),
-        "synth album must advertise a non-empty Primary ImageTag, got {:?}",
+        "an album with cover art must advertise a Primary ImageTag, got {:?}",
         items[0]["ImageTags"]
+    );
+    // ...and the album whose tracks have none must NOT (B149) — the converse,
+    // asserted here so the two rules are stated side by side rather than in
+    // separate files where one could be relaxed without the other.
+    assert!(
+        items[1]["ImageTags"].get("Primary").is_none(),
+        "an album with no cover must not advertise one: {:?}",
+        items[1]["ImageTags"]
     );
 }
 
@@ -444,6 +467,44 @@ async fn every_synth_music_item_carries_user_data() {
             // object would be the same crash one field further in.
             assert!(ud["IsFavorite"].is_boolean(), "{uri}: {ud}");
             assert_eq!(ud["ItemId"], it["Id"], "{uri}: UserData must name its item");
+        }
+    }
+}
+
+// B149 — an advertised Primary tag is a promise the image route can keep.
+// `synth_album_dto` used to emit one unconditionally, derived from a hash of
+// the album id, so every client fetched a cover for albums that had none and
+// the Google TV app logged a burst of HTTP 404s per screen of tiles. This is
+// the mirror of B130 (art that could be served but was never advertised), and
+// worse: the client pays for the request and still shows a blank.
+#[actix_web::test]
+async fn an_album_with_no_art_advertises_no_primary_tag() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    // The seeded tracks carry no embedded picture and no sidecar, so nothing
+    // in this library can serve an album cover.
+    for uri in [
+        "/Albums",
+        "/Items?IncludeItemTypes=MusicAlbum&Recursive=true",
+    ] {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = v["Items"].as_array().unwrap();
+        assert!(!items.is_empty(), "{uri} returned nothing to check");
+        for it in items {
+            let primary = it["ImageTags"].get("Primary");
+            assert!(
+                primary.is_none(),
+                "{uri}: {} advertises Primary {primary:?} with no bytes behind it",
+                it["Name"]
+            );
         }
     }
 }
