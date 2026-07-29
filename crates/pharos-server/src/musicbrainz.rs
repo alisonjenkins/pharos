@@ -74,8 +74,12 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 /// v2 — B142: edition qualifiers stripped, compilation placeholders dropped,
 ///      title-only last resort.
 /// v3 — B144: unquoted final rung, so a tag truncated mid-word can still find
-///      its release-group.
-pub const ALBUM_ART_QUERY_VERSION: u32 = 3;
+///      its release-group. INEFFECTIVE — see v4.
+/// v4 — B145: the unquoted rung wildcards its final token. MusicBrainz's
+///      search ANDs bare terms, so an unquoted `... Outgu` still required the
+///      clipped token to match something and returned nothing; `Outgu*` is
+///      what a truncated tag actually needs.
+pub const ALBUM_ART_QUERY_VERSION: u32 = 4;
 
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
@@ -83,6 +87,14 @@ pub const ALBUM_ART_QUERY_VERSION: u32 = 3;
 pub fn miss_marker() -> String {
     format!("miss-v{ALBUM_ART_QUERY_VERSION}")
 }
+
+/// How long to wait after a 503 when the server names no `Retry-After`.
+const THROTTLE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Shortest final token that may carry a trailing wildcard. Below this a
+/// wildcard matches most of the database, and every candidate it returns is
+/// noise for the similarity floor to reject.
+const MIN_WILDCARD_STEM: usize = 4;
 
 /// How many release-group candidates to consider per search.
 const SEARCH_LIMIT: u32 = 8;
@@ -107,6 +119,16 @@ struct RateGate(Mutex<Option<tokio::time::Instant>>);
 impl RateGate {
     fn new() -> Self {
         Self(Mutex::new(None))
+    }
+
+    /// Push the next permitted instant out by `extra`, so every waiter behind
+    /// this one backs off too. Called when the server says it is being asked
+    /// too often — otherwise the next queued album walks straight into the same
+    /// 503.
+    async fn delay(&self, extra: Duration) {
+        let mut next = self.0.lock().await;
+        let base = next.unwrap_or_else(tokio::time::Instant::now);
+        *next = Some(base.max(tokio::time::Instant::now()) + extra);
     }
 
     /// Block until this caller's slot is due, then claim the next one.
@@ -374,22 +396,56 @@ pub(crate) fn search_attempts(artist: Option<&str>, album: &str) -> Vec<String> 
     out
 }
 
-/// An unquoted Lucene release-group query — the words, not the phrase.
+/// An unquoted Lucene release-group query — the words, not the phrase, with a
+/// trailing wildcard on the last one.
+///
+/// B145: the wildcard is the whole point, and B144 shipped without it. Bare
+/// terms are ANDed by MusicBrainz's search, so an unquoted
+/// `Always Outnumbered Never Outgu` STILL required the clipped token `Outgu`
+/// to match a real word and still returned nothing — the rung was inert for
+/// the exact case it was written for. `Outgu*` matches `Outgunned`, which is
+/// what a truncated tag needs. The similarity floor then decides, as before.
 ///
 /// `None` when the title has nothing to search on once Lucene's operators are
 /// removed, which would otherwise produce a query matching everything.
 fn unquoted_query(album: &str) -> Option<String> {
     // Drop the characters Lucene reads as syntax rather than escaping them: a
     // bare `-` is NOT, a bare `:` opens a field, and an unbalanced bracket is a
-    // parse error. What is left is the words.
+    // parse error. Apostrophes stay INSIDE a word — splitting on them turned
+    // `Prospekt's March` into the two terms `Prospekt s`, which ANDed against a
+    // stray `s` and matched nothing.
     let words: Vec<&str> = album
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .map(|w| w.trim_matches('\''))
         .filter(|w| !w.is_empty())
         .collect();
-    if words.is_empty() {
-        return None;
+    let (last, head) = words.split_last()?;
+    let mut terms: Vec<String> = head.iter().map(|w| (*w).to_string()).collect();
+    // Only a word long enough to be distinctive gets the wildcard — `a*` or
+    // `II*` would match most of the database and hand the similarity floor a
+    // pile of noise to reject.
+    if last.len() >= MIN_WILDCARD_STEM {
+        terms.push(format!("{last}*"));
+    } else {
+        terms.push((*last).to_string());
     }
-    Some(format!("releasegroup:({})", words.join(" ")))
+    Some(format!("releasegroup:({})", terms.join(" ")))
+}
+
+/// The `Retry-After` delay a throttling response asks for, when it sends one.
+///
+/// Only the delta-seconds form is honoured — the HTTP-date form would need a
+/// clock comparison to be meaningful, and MusicBrainz sends seconds. Absurd
+/// values are clamped so a malformed header cannot park the backfill for a day.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs.clamp(1, 60)))
 }
 
 /// Render an error and every cause beneath it.
@@ -597,35 +653,61 @@ impl MusicBrainzClient {
         Ok((outcome.id, year, outcome.confidence))
     }
 
-    /// One rate-limited release-group search.
+    /// One rate-limited release-group search, retried once on a throttle.
+    ///
+    /// B145: the first passes logged `release-group search returned 503`, which
+    /// is MusicBrainz saying "slow down" — their limiter is a burst budget, not
+    /// a flat one-per-second, and the B142 ladder turned one request per album
+    /// into up to four. Treating that as a plain failure both wasted the album
+    /// and kept the pressure on. Backing off and retrying once is the polite
+    /// response and the one their documentation asks for.
     async fn search_release_groups(
         &self,
         query: &str,
     ) -> Result<Vec<SearchCandidate>, AlbumArtMiss> {
-        self.gate.acquire().await;
-        let resp = self
-            .http
-            .get(format!("{MB_BASE}/release-group"))
-            .query(&[
-                ("query", query),
-                ("fmt", "json"),
-                ("limit", &SEARCH_LIMIT.to_string()),
-            ])
-            .send()
-            .await
-            .map_err(|e| AlbumArtMiss::Unavailable {
-                cause: format!("release-group search: {}", error_chain(&e)),
+        for attempt in 0..=1 {
+            self.gate.acquire().await;
+            let resp = self
+                .http
+                .get(format!("{MB_BASE}/release-group"))
+                .query(&[
+                    ("query", query),
+                    ("fmt", "json"),
+                    ("limit", &SEARCH_LIMIT.to_string()),
+                ])
+                .send()
+                .await
+                .map_err(|e| AlbumArtMiss::Unavailable {
+                    cause: format!("release-group search: {}", error_chain(&e)),
+                })?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt == 0 {
+                let wait = retry_after(resp.headers()).unwrap_or(THROTTLE_BACKOFF);
+                tracing::info!(
+                    query,
+                    backoff_ms = wait.as_millis() as u64,
+                    "musicbrainz: throttled (503), backing off before one retry"
+                );
+                metrics::counter!("pharos_album_art_throttled_total").increment(1);
+                // Push the shared gate out too, so every other album waits with
+                // this one instead of walking straight into the same 503.
+                self.gate.delay(wait).await;
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(AlbumArtMiss::Unavailable {
+                    cause: format!("release-group search returned {}", status.as_u16()),
+                });
+            }
+            let body = resp.text().await.map_err(|e| AlbumArtMiss::Unavailable {
+                cause: format!("reading release-group body: {}", error_chain(&e)),
             })?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(AlbumArtMiss::Unavailable {
-                cause: format!("release-group search returned {}", status.as_u16()),
-            });
+            return Ok(parse_release_groups(&body));
         }
-        let body = resp.text().await.map_err(|e| AlbumArtMiss::Unavailable {
-            cause: format!("reading release-group body: {}", error_chain(&e)),
-        })?;
-        Ok(parse_release_groups(&body))
+        Err(AlbumArtMiss::Unavailable {
+            cause: "release-group search still throttled (503) after one retry".into(),
+        })
     }
 
     /// Download the front cover for a release-group, reusing the single-slot
@@ -940,7 +1022,7 @@ mod tests {
         let attempts = search_attempts(Some("The Prodigy"), "Always Outnumbered Never Outgu");
         let last = attempts.last().expect("at least one attempt");
         assert_eq!(
-            last, "releasegroup:(Always Outnumbered Never Outgu)",
+            last, "releasegroup:(Always Outnumbered Never Outgu*)",
             "the final rung must be unquoted so Lucene scores partial matches"
         );
         // It is genuinely LAST — the exact phrase still gets first refusal.
@@ -956,13 +1038,81 @@ mod tests {
         );
     }
 
+    // B145 — B144's rung was inert for the case it was written for.
+    // MusicBrainz ANDs bare terms, so `... Outgu` still required the clipped
+    // token to match a real word and returned nothing. The wildcard is the
+    // whole point.
+    #[test]
+    fn the_unquoted_rung_wildcards_its_final_token() {
+        assert_eq!(
+            unquoted_query("Always Outnumbered Never Outgu").as_deref(),
+            Some("releasegroup:(Always Outnumbered Never Outgu*)")
+        );
+        // A short final token gets NO wildcard — `II*` would match most of the
+        // database and hand the similarity floor a pile of noise.
+        assert_eq!(
+            unquoted_query("Toxicity II").as_deref(),
+            Some("releasegroup:(Toxicity II)")
+        );
+    }
+
+    // `Prospekt's March` split into the terms `Prospekt` and `s`, which ANDed
+    // against a stray `s` and matched nothing. Seen live.
+    #[test]
+    fn an_apostrophe_stays_inside_its_word() {
+        assert_eq!(
+            unquoted_query("Prospekt's March").as_deref(),
+            Some("releasegroup:(Prospekt's March*)")
+        );
+        // A leading/trailing quote is punctuation, not part of the word.
+        assert_eq!(
+            unquoted_query("'Heroes'").as_deref(),
+            Some("releasegroup:(Heroes*)")
+        );
+    }
+
+    #[test]
+    fn retry_after_is_honoured_and_clamped() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(3)));
+        // A malformed or absurd header must not park the backfill for a day.
+        h.insert(RETRY_AFTER, HeaderValue::from_static("86400"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(60)));
+        h.insert(RETRY_AFTER, HeaderValue::from_static("0"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(1)));
+        // The HTTP-date form is not parsed; fall back to the fixed backoff.
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&h), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    // A 503 must slow down EVERY caller, not just the one that saw it —
+    // otherwise the next queued album walks straight into the same throttle.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttle_delays_every_waiter_not_just_the_one_that_saw_it() {
+        let gate = RateGate::new();
+        gate.acquire().await;
+        gate.delay(Duration::from_secs(5)).await;
+        let before = tokio::time::Instant::now();
+        gate.acquire().await;
+        assert!(
+            tokio::time::Instant::now() - before >= Duration::from_secs(5),
+            "the next caller must inherit the backoff"
+        );
+    }
+
     #[test]
     fn the_unquoted_rung_drops_lucene_operators_rather_than_escaping_them() {
         // A bare `-` is NOT, a bare `:` opens a field, an unbalanced bracket is
         // a parse error. Unquoted, they have to go entirely.
         assert_eq!(
             unquoted_query("Ministry of Sound: Anthems II: 1991-2009").as_deref(),
-            Some("releasegroup:(Ministry of Sound Anthems II 1991 2009)")
+            Some("releasegroup:(Ministry of Sound Anthems II 1991 2009*)")
         );
         // Nothing searchable left -> no rung, rather than a query matching
         // everything.
