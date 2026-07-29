@@ -76,13 +76,13 @@ otherwise by labelling `Path` and `/Download` as US1-only.
 
 ### Step 2 — store
 
-- [ ] T013 [P] Add `crates/pharos-store-sqlx/migrations/sqlite/0052_book_metadata.sql` — seven nullable columns on `media_items` per data-model.md, no backfill
-- [ ] T014 [P] Add the identical `crates/pharos-store-sqlx/migrations/postgres/0052_book_metadata.sql`
-- [ ] T015 Extend `MEDIA_COLUMNS` in `crates/pharos-store-sqlx/src/sqlite.rs:16` with the seven columns, assemble `BookMeta` in `MediaRow::into_domain` when `book_format` is non-null, and update every `INSERT`/`UPSERT` on `media_items` for the new placeholder arity
-- [ ] T016 Do the same in `crates/pharos-store-sqlx/src/postgres.rs:31` — a separate string constant, not shared with sqlite. Postgres uses `$N` placeholders, so arity errors are silent at compile time
-- [ ] T017 Extend `crates/pharos-store-sqlx/src/any.rs` for the book-carrying methods: whichever of `put`, `get`, `list`, `set_artwork` and the query methods changed signature or row shape in T015/T016. Enumerate them from the compile errors rather than guessing — if none changed, say so in the commit message instead of leaving an empty task
-- [ ] T018 Add `crates/pharos-store-sqlx/tests/book_roundtrip.rs`: a `MediaItem` with a populated `BookMeta` survives insert→fetch byte-identically; a non-book item round-trips with `book: None`; a book with `series_index: None` round-trips as `None` and not `0`. Runs against BOTH backends the way `tests/backend_conformance.rs` does
-- [ ] T019 Run `nix develop --command just test-postgres` — mandatory after any `sqlx::query*` edit: placeholder arity and column names are NOT compile-checked, so a broken query passes `just test` and fails `nix flake check` — **COMMIT**
+- [X] T013 [P] Add `crates/pharos-store-sqlx/migrations/sqlite/0053_book_metadata.sql` (0052 became the `kind` CHECK widening — see commit) — seven nullable columns on `media_items` per data-model.md, no backfill
+- [X] T014 [P] Add `crates/pharos-store-sqlx/migrations/postgres/0053_book_metadata.sql` (BIGINT, not INTEGER — sqlx-postgres is a strict decoder)
+- [X] T015 Extend `MEDIA_COLUMNS` in `crates/pharos-store-sqlx/src/sqlite.rs:16` with the seven columns, assemble `BookMeta` in `MediaRow::into_domain` when `book_format` is non-null, and update every `INSERT`/`UPSERT` on `media_items` for the new placeholder arity
+- [X] T016 Do the same in `crates/pharos-store-sqlx/src/postgres.rs:31` — a separate string constant, not shared with sqlite. Postgres uses `$N` placeholders, so arity errors are silent at compile time
+- [X] T017 Extend `crates/pharos-store-sqlx/src/any.rs` for the book-carrying methods: whichever of `put`, `get`, `list`, `set_artwork` and the query methods changed signature or row shape in T015/T016. Enumerate them from the compile errors rather than guessing — if none changed, say so in the commit message instead of leaving an empty task
+- [X] T018 Add `crates/pharos-store-sqlx/tests/book_roundtrip.rs`: a `MediaItem` with a populated `BookMeta` survives insert→fetch byte-identically; a non-book item round-trips with `book: None`; a book with `series_index: None` round-trips as `None` and not `0`. Runs against BOTH backends the way `tests/backend_conformance.rs` does
+- [X] T019 Run `nix develop --command just test-postgres` — mandatory after any `sqlx::query*` edit: placeholder arity and column names are NOT compile-checked, so a broken query passes `just test` and fails `nix flake check` — **COMMIT**
 
 ### Step 3 — `Path` on the DTO (gate 2)
 

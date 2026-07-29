@@ -26,6 +26,7 @@ fn media_item(id: MediaId, title: &str, kind: MediaKind) -> MediaItem {
         path: format!("/media/migrate/{id}.mkv").into(),
         title: title.into(),
         kind,
+        book: None,
         probe: MediaProbe::default(),
         series: None,
         created_at: Some(1_700_000_000 + id as i64),
