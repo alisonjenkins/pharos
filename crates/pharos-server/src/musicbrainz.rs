@@ -86,6 +86,29 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      what a truncated tag actually needs.
 pub const ALBUM_ART_QUERY_VERSION: u32 = 8;
 
+/// Bumped when the matcher could have produced a WRONG cover, so the covers it
+/// already handed out have to be dropped and re-derived.
+///
+/// B160 — this is deliberately separate from [`ALBUM_ART_QUERY_VERSION`].
+/// Re-admitting MISSES is free: the miss marker carries the query version and
+/// the eligibility query re-admits any row stamped by an older one, touching
+/// nothing that already has a cover. Dropping HITS is not free — it deletes
+/// every cached cover and re-downloads them at MusicBrainz's one-request-per-
+/// second, which on this library meant coverage falling from 1243 covered
+/// tracks to 727 and taking about an hour of blank tiles to climb back. Paying
+/// that for B152, a fix that could only ever turn misses into hits, was pure
+/// loss.
+///
+/// Bump THIS one only when a past match may be wrong (B150's artist check is
+/// the example: it was written because Owl City's `Fireflies` had been given
+/// The Attic's sleeve, and those already-written covers had to go). For a
+/// change that can only find MORE albums, bump the query version alone.
+///
+/// v1 — the split itself. Everything up to B159 predates it; the library was
+///      fully re-matched under v8 of the query on 2026-07-29, so there is
+///      nothing outstanding to clear.
+pub const ALBUM_MATCH_VERSION: u32 = 1;
+
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
 /// so nothing can confuse the two.

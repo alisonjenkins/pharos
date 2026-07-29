@@ -939,6 +939,9 @@ fn upsert_art(
 /// Key under which the album-art matcher version that produced the CURRENT
 /// artwork is recorded.
 const ALBUM_ART_VERSION_KEY: &str = "musicbrainz_album_art_version";
+/// B160 — the version whose change DOES drop cached covers. See
+/// [`crate::musicbrainz::ALBUM_MATCH_VERSION`].
+const ALBUM_MATCH_VERSION_KEY: &str = "musicbrainz_album_match_version";
 
 /// Drop every MusicBrainz-sourced cover when the matcher that chose them has
 /// changed, so a corrected matcher can revisit its own mistakes.
@@ -955,25 +958,53 @@ async fn invalidate_stale_album_art<S>(store: &S) -> DomainResult<()>
 where
     S: MediaStore + pharos_store_sqlx::ServerConfigStore,
 {
-    let want = crate::musicbrainz::ALBUM_ART_QUERY_VERSION.to_string();
+    // B160 — clearing is keyed on the MATCH version, not the query version.
+    // Re-admitting misses needs no clear at all: the miss marker carries the
+    // query version and `audio_items_needing_art` re-admits any row stamped by
+    // an older one, leaving covered tracks alone. Clearing is only correct when
+    // past matches may be WRONG, which is a strictly rarer event.
+    let want = crate::musicbrainz::ALBUM_MATCH_VERSION.to_string();
     let have = store
+        .load_named_config(ALBUM_MATCH_VERSION_KEY)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    // An ABSENT record is not a stale one — a fresh install (and the first boot
+    // after this split) has nothing to invalidate. Adopt the version silently;
+    // only a recorded value that DIFFERS justifies dropping covers.
+    let stale = matches!(have.as_deref(), Some(h) if h != want);
+    if stale {
+        let cleared = store.clear_provider_artwork("musicbrainz").await?;
+        tracing::info!(
+            cleared_items = cleared,
+            from = have.as_deref().unwrap_or("none"),
+            to = want.as_str(),
+            "musicbrainz album-art: matcher version changed, dropping its covers for a re-match"
+        );
+    }
+    if have.as_deref() != Some(want.as_str()) {
+        store
+            .set_named_config(ALBUM_MATCH_VERSION_KEY, &want)
+            .await
+            .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    }
+    // Record the query version too. Nothing is cleared for it — it exists so
+    // the miss marker's shape is greppable next to the stored value.
+    let q = crate::musicbrainz::ALBUM_ART_QUERY_VERSION.to_string();
+    let have_q = store
         .load_named_config(ALBUM_ART_VERSION_KEY)
         .await
         .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
-    if have.as_deref() == Some(want.as_str()) {
-        return Ok(());
+    if have_q.as_deref() != Some(q.as_str()) {
+        tracing::info!(
+            from = have_q.as_deref().unwrap_or("none"),
+            to = q.as_str(),
+            "musicbrainz album-art: query version changed, re-admitting older misses"
+        );
+        store
+            .set_named_config(ALBUM_ART_VERSION_KEY, &q)
+            .await
+            .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
     }
-    let cleared = store.clear_provider_artwork("musicbrainz").await?;
-    tracing::info!(
-        cleared_items = cleared,
-        from = have.as_deref().unwrap_or("none"),
-        to = want.as_str(),
-        "musicbrainz album-art: matcher version changed, dropping its covers for a re-match"
-    );
-    store
-        .set_named_config(ALBUM_ART_VERSION_KEY, &want)
-        .await
-        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
     Ok(())
 }
 
@@ -1912,8 +1943,9 @@ mod tests {
         .await
         .unwrap();
         assert!(s.get(900_406).await.unwrap().has_primary_art);
-        // The stored version is deliberately stale.
-        pharos_store_sqlx::ServerConfigStore::set_named_config(&s, ALBUM_ART_VERSION_KEY, "1")
+        // The stored MATCH version is deliberately stale — that is the one
+        // whose change drops covers (B160).
+        pharos_store_sqlx::ServerConfigStore::set_named_config(&s, ALBUM_MATCH_VERSION_KEY, "0")
             .await
             .unwrap();
         let (_td, cache) = cache();
@@ -1938,6 +1970,53 @@ mod tests {
         );
         // And the version is recorded, so the next pass does not clear again.
         assert_eq!(
+            pharos_store_sqlx::ServerConfigStore::load_named_config(&s, ALBUM_MATCH_VERSION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(crate::musicbrainz::ALBUM_MATCH_VERSION.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_bump_re_admits_misses_without_dropping_covers() {
+        // B160 — clearing every cached cover is the expensive path and was
+        // being taken for every ladder improvement. B152 could only ever turn
+        // misses into hits, yet it dropped the library from 1243 covered
+        // tracks to 727 and took about an hour of blank tiles to recover. A
+        // query bump must leave hits alone; the miss marker already re-admits
+        // the rows that need re-asking.
+        let s = store().await;
+        put_track(&s, 900_420, "Owl City", "Ocean Eyes").await;
+        s.set_artwork(
+            900_420,
+            "Primary",
+            "musicbrainz",
+            "/cache/primary/audio/ocean-eyes.jpg",
+        )
+        .await
+        .unwrap();
+        assert!(s.get(900_420).await.unwrap().has_primary_art);
+        // Versions agree on the MATCH, but the QUERY has moved on.
+        for (k, v) in [
+            (
+                ALBUM_MATCH_VERSION_KEY,
+                crate::musicbrainz::ALBUM_MATCH_VERSION.to_string(),
+            ),
+            (ALBUM_ART_VERSION_KEY, "1".to_string()),
+        ] {
+            pharos_store_sqlx::ServerConfigStore::set_named_config(&s, k, &v)
+                .await
+                .unwrap();
+        }
+
+        invalidate_stale_album_art(&s).await.unwrap();
+
+        assert!(
+            s.get(900_420).await.unwrap().has_primary_art,
+            "a query-version bump must not drop a cover that is already correct"
+        );
+        assert_eq!(
             pharos_store_sqlx::ServerConfigStore::load_named_config(&s, ALBUM_ART_VERSION_KEY)
                 .await
                 .unwrap()
@@ -1946,7 +2025,34 @@ mod tests {
                 crate::musicbrainz::ALBUM_ART_QUERY_VERSION
                     .to_string()
                     .as_str()
-            )
+            ),
+            "the query version is still recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_boot_adopts_the_match_version_without_clearing() {
+        // B160 — an ABSENT record is not a stale one. A fresh install, and the
+        // first boot after this split, must adopt the version silently rather
+        // than treat "never recorded" as "changed" and wipe the library.
+        let s = store().await;
+        put_track(&s, 900_421, "Owl City", "Ocean Eyes").await;
+        s.set_artwork(900_421, "Primary", "musicbrainz", "/cache/p.jpg")
+            .await
+            .unwrap();
+
+        invalidate_stale_album_art(&s).await.unwrap();
+
+        assert!(
+            s.get(900_421).await.unwrap().has_primary_art,
+            "nothing was recorded, so there was nothing to invalidate"
+        );
+        assert_eq!(
+            pharos_store_sqlx::ServerConfigStore::load_named_config(&s, ALBUM_MATCH_VERSION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(crate::musicbrainz::ALBUM_MATCH_VERSION.to_string().as_str())
         );
     }
 
