@@ -658,6 +658,16 @@ pub(crate) async fn synth_primary_tag(
     id_str: &str,
 ) -> Option<std::collections::BTreeMap<String, String>> {
     let item = resolve_synth_image_item(state, id_str).await?;
+    // B149 — the same rule real items follow (`dto::image_tags_for`): a video
+    // representative can always serve a Primary (a frame is extracted on
+    // demand), but an AUDIO track's only Primary source is cached artwork, so
+    // advertising one it does not have makes every grid render 404. The synth
+    // path resolved a representative and stamped a tag unconditionally, which
+    // is how a library with no covers still told the Google TV app to fetch one
+    // per tile.
+    if matches!(item.kind, pharos_core::MediaKind::Audio) && !item.has_primary_art {
+        return None;
+    }
     let mut tags = std::collections::BTreeMap::new();
     tags.insert("Primary".to_string(), item.id.to_string());
     Some(tags)

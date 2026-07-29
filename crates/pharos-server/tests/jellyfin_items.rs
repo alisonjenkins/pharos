@@ -2135,8 +2135,6 @@ async fn a_music_album_advertises_the_primary_image_it_can_serve() {
             path: "/m/elbow/01.mp3".into(),
             title: "Starlings".into(),
             kind: MediaKind::Audio,
-            // The art IS present — this is the case that rendered blank.
-            has_primary_art: true,
             probe: pharos_core::MediaProbe {
                 album: Some("The Seldom Seen Kid".into()),
                 artist: Some("Elbow".into()),
@@ -2146,6 +2144,20 @@ async fn a_music_album_advertises_the_primary_image_it_can_serve() {
         })
         .await
         .unwrap();
+    // The art IS present — this is the case that rendered blank. It must be
+    // recorded via `set_artwork`, which is the ONLY writer of the denormalised
+    // `has_primary_art`: setting the field on the `MediaItem` and calling `put`
+    // is silently dropped, so a test that did that was asserting against a
+    // track with no artwork at all.
+    pharos_core::MediaStore::set_artwork(
+        &stores,
+        900,
+        "Primary",
+        "local",
+        "/cache/primary/audio/900.jpg",
+    )
+    .await
+    .unwrap();
     let state = web::Data::new(AppState::new(stores, "test".into()));
     let app = test::init_service(build_app(state)).await;
 
