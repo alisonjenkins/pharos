@@ -2115,6 +2115,7 @@ mod tests {
             &self,
             limit: i64,
             ttl_cutoff: i64,
+            current_miss_marker: &str,
         ) -> DomainResult<Vec<MediaItem>> {
             let inner = self
                 .inner
@@ -2130,10 +2131,14 @@ mod tests {
                     let ttl_eligible = item
                         .metadata_refreshed_at
                         .is_none_or(|refreshed| refreshed < ttl_cutoff);
+                    // A miss stamped by an older query version is re-admitted
+                    // regardless of the TTL — see `audio_items_needing_art`.
+                    let stale_verdict = item.match_source.as_deref() == Some("none")
+                        && item.match_external_id.as_deref() != Some(current_miss_marker);
                     matches!(item.kind, MediaKind::Audio)
                         && !item.has_primary_art
                         && source_eligible
-                        && ttl_eligible
+                        && (ttl_eligible || stale_verdict)
                 })
                 .cloned()
                 .collect();

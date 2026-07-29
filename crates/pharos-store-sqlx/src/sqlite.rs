@@ -1199,17 +1199,21 @@ impl MediaStore for SqliteStore {
         &self,
         limit: i64,
         ttl_cutoff: i64,
+        current_miss_marker: &str,
     ) -> DomainResult<Vec<MediaItem>> {
         let sql = format!(
             "SELECT {MEDIA_COLUMNS} FROM media_items \
              WHERE kind = 'audio' \
                AND has_primary_art = 0 \
                AND (match_source IS NULL OR match_source IN ('search','none')) \
-               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < ?) \
+               AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < ? \
+                    OR (match_source = 'none' \
+                        AND (match_external_id IS NULL OR match_external_id <> ?))) \
              ORDER BY id ASC LIMIT ?"
         );
         let rows = sqlx::query_as::<_, MediaRow>(&sql)
             .bind(ttl_cutoff)
+            .bind(current_miss_marker)
             .bind(limit)
             .fetch_all(&self.pool)
             .await

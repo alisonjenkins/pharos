@@ -57,6 +57,31 @@ const MB_MIN_INTERVAL: Duration = Duration::from_millis(1100);
 /// because it looks deliberate.
 const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 
+/// Bumped whenever the query LADDER changes in a way that could turn a past
+/// miss into a hit.
+///
+/// A miss is stamped so the album's other eleven tracks don't each re-run a
+/// rate-limited search, and the TTL then holds that verdict for 30 days. That
+/// is right for a stable query and wrong the moment the query improves: the
+/// first live pass recorded 22 `no_candidates` and B142 fixed most of them,
+/// but every one of those rows was already stamped and would have waited until
+/// late August to benefit. Stamping the version alongside the miss lets the
+/// eligibility query re-admit exactly the rows whose verdict was reached by an
+/// older, worse query — without disturbing albums that genuinely have no
+/// artwork under the current one.
+///
+/// v1 — initial ladder: exact `(album artist, album)` only.
+/// v2 — B142: edition qualifiers stripped, compilation placeholders dropped,
+///      title-only last resort.
+pub const ALBUM_ART_QUERY_VERSION: u32 = 2;
+
+/// The `match_external_id` written beside a miss, carrying the query version
+/// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
+/// so nothing can confuse the two.
+pub fn miss_marker() -> String {
+    format!("miss-v{ALBUM_ART_QUERY_VERSION}")
+}
+
 /// How many release-group candidates to consider per search.
 const SEARCH_LIMIT: u32 = 8;
 

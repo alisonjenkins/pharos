@@ -320,10 +320,17 @@ impl MediaStore for AnyStore {
         &self,
         limit: i64,
         ttl_cutoff: i64,
+        current_miss_marker: &str,
     ) -> DomainResult<Vec<MediaItem>> {
         match self {
-            AnyStore::Sqlite(s) => s.audio_items_needing_art(limit, ttl_cutoff).await,
-            AnyStore::Postgres(p) => p.audio_items_needing_art(limit, ttl_cutoff).await,
+            AnyStore::Sqlite(s) => {
+                s.audio_items_needing_art(limit, ttl_cutoff, current_miss_marker)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.audio_items_needing_art(limit, ttl_cutoff, current_miss_marker)
+                    .await
+            }
         }
     }
 

@@ -252,7 +252,9 @@ where
     track.probe.album_artist = Some("The Conformance Band".into());
     MediaStore::put(&store, track.clone()).await.unwrap();
 
-    let needing = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000)
+    // The `match_external_id` a miss reached by the current lookup carries.
+    const MISS_MARKER: &str = "miss-v2";
+    let needing = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000, MISS_MARKER)
         .await
         .unwrap();
     assert!(
@@ -282,7 +284,7 @@ where
             .has_primary_art,
         "a downloaded musicbrainz Primary is item-servable"
     );
-    let after_art = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000)
+    let after_art = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000, MISS_MARKER)
         .await
         .unwrap();
     assert!(
@@ -300,6 +302,30 @@ where
         &store,
         unmatched_id,
         "musicbrainz",
+        MISS_MARKER,
+        "none",
+        None,
+        1_900_000_000,
+    )
+    .await
+    .unwrap();
+    let after_stamp = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000, MISS_MARKER)
+        .await
+        .unwrap();
+    assert!(
+        !after_stamp.iter().any(|i| i.id == unmatched_id),
+        "a freshly stamped track waits for the TTL, not the next pass"
+    );
+
+    // ...unless the verdict came from an OLDER query version. Otherwise an
+    // improvement to the lookup does nothing for a month on exactly the albums
+    // it fixes.
+    // An unversioned stamp (what the very first release wrote) counts as
+    // stale too — those are precisely the rows a bump needs to reach.
+    MediaStore::set_item_match(
+        &store,
+        unmatched_id,
+        "musicbrainz",
         "",
         "none",
         None,
@@ -307,12 +333,31 @@ where
     )
     .await
     .unwrap();
-    let after_stamp = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000)
+    assert!(
+        MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000, MISS_MARKER)
+            .await
+            .unwrap()
+            .iter()
+            .any(|i| i.id == unmatched_id),
+        "an unversioned miss must be re-admitted"
+    );
+    MediaStore::set_item_match(
+        &store,
+        unmatched_id,
+        "musicbrainz",
+        "miss-v1",
+        "none",
+        None,
+        1_900_000_000,
+    )
+    .await
+    .unwrap();
+    let after_bump = MediaStore::audio_items_needing_art(&store, 10, 1_800_000_000, MISS_MARKER)
         .await
         .unwrap();
     assert!(
-        !after_stamp.iter().any(|i| i.id == unmatched_id),
-        "a freshly stamped track waits for the TTL, not the next pass"
+        after_bump.iter().any(|i| i.id == unmatched_id),
+        "a miss stamped by an older query version must be re-admitted at once"
     );
 
     // -----------------------------------------------------------------
