@@ -3032,6 +3032,8 @@ dependencies = [
  "criterion",
  "futures-util",
  "libc",
+ "metrics",
+ "metrics-util",
  "notify",
  "pharos-core",
  "pharos-transcode",

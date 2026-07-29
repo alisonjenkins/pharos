@@ -256,3 +256,76 @@ async fn empty_resolver_yields_default() {
     let merged = resolver.resolve(&request(MediaKind::Movie, &probe)).await;
     assert_eq!(merged, MetadataResult::default());
 }
+
+/// B169 — the merge is first-Some-wins across four providers, and until now
+/// nothing recorded WHICH one won. That is why 139 films carrying their
+/// container's mux date as a release date were indistinguishable from 139
+/// films that were simply new: the value was visible, its provenance was not.
+/// One counter answers "where do my years come from" for the whole library.
+#[tokio::test]
+async fn the_provider_that_supplied_the_year_is_recorded() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let probe = MediaProbe::default();
+    // The shape of the bug: a low-priority source holds the RIGHT year, and a
+    // higher-priority one overrides it. Which is exactly what a filename
+    // `(2003)` losing to a container tag looks like.
+    let filenamey = MockProvider::ok(
+        "filename",
+        10,
+        MetadataResult {
+            production_year: Some(2003),
+            ..Default::default()
+        },
+    );
+    let embeddedy = MockProvider::ok(
+        "embedded",
+        30,
+        MetadataResult {
+            production_year: Some(2026),
+            ..Default::default()
+        },
+    );
+    let resolver = MetadataResolver::new()
+        .with_provider(filenamey)
+        .with_provider(embeddedy);
+    let merged = resolver.resolve(&request(MediaKind::Movie, &probe)).await;
+    assert_eq!(
+        merged.production_year,
+        Some(2026),
+        "precondition: higher priority wins"
+    );
+
+    let found = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(ck, _, _, _)| {
+            let k = ck.key();
+            if k.name() != "pharos_metadata_field_source_total" {
+                return None;
+            }
+            let labels: Vec<String> = k
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            labels
+                .contains(&"field=production_year".to_string())
+                .then_some(labels)
+        });
+
+    let Some(labels) = found else {
+        panic!(
+            "the provider that supplied the year must be recorded — without it \
+             a wrong year and a right one look identical"
+        );
+    };
+    assert!(
+        labels.contains(&"provider=embedded".to_string()),
+        "must name the provider that actually won, not one that merely ran; got {labels:?}"
+    );
+}

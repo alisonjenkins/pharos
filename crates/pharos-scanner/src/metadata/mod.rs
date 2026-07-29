@@ -104,7 +104,34 @@ impl MetadataResolver {
                 continue;
             }
             match provider.fetch(req).await {
-                Ok(result) => merge_into(&mut merged, result),
+                Ok(result) => {
+                    // B169 — record WHICH provider first supplied each dated
+                    // field. The merge is first-Some-wins across four sources,
+                    // and nothing anywhere said which one had won: a container
+                    // tag beating a filename year was indistinguishable from a
+                    // curated NFO doing it, so 139 films carrying their mux
+                    // date looked exactly like 139 films that were simply new.
+                    // Bounded: two fields × four provider names.
+                    let had_year = merged.production_year.is_some();
+                    let had_premiere = merged.premiere_date.is_some();
+                    merge_into(&mut merged, result);
+                    if !had_year && merged.production_year.is_some() {
+                        metrics::counter!(
+                            "pharos_metadata_field_source_total",
+                            "field" => "production_year",
+                            "provider" => provider.name(),
+                        )
+                        .increment(1);
+                    }
+                    if !had_premiere && merged.premiere_date.is_some() {
+                        metrics::counter!(
+                            "pharos_metadata_field_source_total",
+                            "field" => "premiere_date",
+                            "provider" => provider.name(),
+                        )
+                        .increment(1);
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         provider = provider.name(),
