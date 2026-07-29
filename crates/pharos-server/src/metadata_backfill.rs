@@ -1055,11 +1055,20 @@ where
     // The album artist is the right key: on a compilation the per-track artist
     // is the performer of that track, which would not match the release-group.
     // Fall back to the track artist when there is no album-artist tag.
-    let artist = item
-        .probe
-        .album_artist
-        .as_deref()
-        .or(item.probe.artist.as_deref());
+    // B152 — a BLANK tag is an absent tag. Owl City's `Fireflies` carries
+    // `album_artist = ""` alongside `artist = "Owl City"`; `Option::or` sees
+    // `Some("")` and keeps it, so the good tag was shadowed by an empty one.
+    // Downstream that empty string reads as "artist unknown", which the B150
+    // consistency check deliberately lets pass — so the track went straight
+    // back to matching any album called Fireflies.
+    let non_blank = |s: &Option<String>| {
+        s.as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+    };
+    let artist = non_blank(&item.probe.album_artist).or_else(|| non_blank(&item.probe.artist));
+    let artist = artist.as_deref();
     let album = item.probe.album.as_deref();
 
     // NOT under a `bg_io` permit. MusicBrainz's own rate gate makes this call
@@ -1968,6 +1977,62 @@ mod tests {
         assert_eq!(n, 0);
         assert!(!had_work, "nothing to do once the versions agree");
         assert!(s.get(900_407).await.unwrap().has_primary_art);
+    }
+
+    // B152 — Owl City's `Fireflies` carries `album_artist = ""` alongside a
+    // perfectly good `artist = "Owl City"`. `Option::or` keeps the `Some("")`,
+    // and an empty artist reads downstream as "unknown", which the B150
+    // consistency check lets pass — so the artist verification that fix added
+    // was silently switched off for exactly the track that motivated it.
+    #[tokio::test]
+    async fn a_blank_album_artist_falls_through_to_the_track_artist() {
+        let s = store().await;
+        let item = MediaItem {
+            id: 900_408,
+            path: "/music/owl city/fireflies.mp3".into(),
+            title: "Fireflies".into(),
+            kind: MediaKind::Audio,
+            probe: pharos_core::MediaProbe {
+                album: Some("Fireflies - Single of the Week".into()),
+                // Exactly the shape found in production: present but empty.
+                album_artist: Some("   ".into()),
+                artist: Some("Owl City".into()),
+                ..Default::default()
+            },
+            ..MediaItem::default()
+        };
+        s.put(item.clone()).await.unwrap();
+        let (_td, cache) = cache();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let spy = SpyAlbumArt(seen.clone());
+
+        enrich_audio_one(&s, &sem(4), &cache, &spy, &item, NOW)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [Some("Owl City".to_string())],
+            "the blank album_artist must not shadow the track artist"
+        );
+    }
+
+    /// Records the artist each lookup was given, so the tag-selection rule can
+    /// be asserted directly rather than inferred from a match.
+    struct SpyAlbumArt(std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+    impl AlbumArtResolver for SpyAlbumArt {
+        async fn album_art(
+            &self,
+            artist: Option<&str>,
+            _album: Option<&str>,
+        ) -> Result<AlbumArt, crate::musicbrainz::AlbumArtMiss> {
+            self.0
+                .lock()
+                .expect("spy lock")
+                .push(artist.map(str::to_string));
+            Err(crate::musicbrainz::AlbumArtMiss::NoAlbumTag)
+        }
     }
 
     // Movies and episodes are the other pass's business; the album-art pass
