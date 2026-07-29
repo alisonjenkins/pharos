@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod auth_extractor;
 pub mod ci_query;
+mod download;
 pub mod fmp4;
 pub mod hls;
 pub mod images;
@@ -49,6 +50,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     admin::register(cfg);
     items::register(cfg);
     item_ops::register(cfg);
+    download::register(cfg);
     playlists::register(cfg);
     live_tv::register(cfg);
     search::register(cfg);
