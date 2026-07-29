@@ -23,7 +23,9 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     series_folder, series_year, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, has_primary_art, \
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
-    original_language, art_version";
+    original_language, art_version, \
+    book_format, book_page_count, book_author, book_publisher, book_series, \
+    book_series_index, book_isbn";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -618,9 +620,12 @@ impl MediaStore for SqliteStore {
                 production_locations_json, trailers_json, \
                 series_folder, series_year, track_number, disc_number, release_year, \
                 synopsis, content_rating, network, release_date, title_fold, \
-                original_language) \
+                original_language, \
+                book_format, book_page_count, book_author, book_publisher, \
+                book_series, book_series_index, book_isbn) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                     ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET path = excluded.path,
                                            title = excluded.title,
                                            title_fold = excluded.title_fold,
@@ -663,6 +668,13 @@ impl MediaStore for SqliteStore {
                                            provider_ids = excluded.provider_ids,
                                            production_locations_json = excluded.production_locations_json,
                                            original_language = excluded.original_language,
+                                           book_format = excluded.book_format,
+                                           book_page_count = excluded.book_page_count,
+                                           book_author = excluded.book_author,
+                                           book_publisher = excluded.book_publisher,
+                                           book_series = excluded.book_series,
+                                           book_series_index = excluded.book_series_index,
+                                           book_isbn = excluded.book_isbn,
                                            trailers_json = excluded.trailers_json,
                                            series_folder = excluded.series_folder,
                                            series_year = excluded.series_year,
@@ -735,6 +747,26 @@ impl MediaStore for SqliteStore {
         // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
         .bind(item.title.to_lowercase())
         .bind(item.metadata.original_language.clone())
+        // 004-books — seven columns, all NULL for a non-book item. `as_ref()`
+        // on the Option<BookMeta> keeps every bind derived from the SAME
+        // Option, so a book can never be half-written.
+        .bind(item.book.as_ref().map(|b| b.format.as_str()))
+        .bind(
+            item.book
+                .as_ref()
+                .and_then(|b| b.page_count)
+                .map(|v| v as i64),
+        )
+        .bind(item.book.as_ref().and_then(|b| b.author.clone()))
+        .bind(item.book.as_ref().and_then(|b| b.publisher.clone()))
+        .bind(item.book.as_ref().and_then(|b| b.series_name.clone()))
+        .bind(
+            item.book
+                .as_ref()
+                .and_then(|b| b.series_index)
+                .map(|v| v as i64),
+        )
+        .bind(item.book.as_ref().and_then(|b| b.isbn.clone()))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -2978,6 +3010,15 @@ struct MediaRow {
     release_date: Option<String>,
     has_primary_art: bool,
     art_version: i64,
+    // 004-books — NULL `book_format` is exactly "this item is not a book", so
+    // the whole `BookMeta` hangs off that one column being present.
+    book_format: Option<String>,
+    book_page_count: Option<i64>,
+    book_author: Option<String>,
+    book_publisher: Option<String>,
+    book_series: Option<String>,
+    book_series_index: Option<i64>,
+    book_isbn: Option<String>,
     match_provider: Option<String>,
     match_external_id: Option<String>,
     match_source: Option<String>,
@@ -3187,9 +3228,24 @@ impl MediaRow {
             path: self.path.into(),
             title: self.title,
             kind,
-            // T015 replaces this with `BookMeta` assembled from the book_*
-            // columns once migration 0052 lands.
-            book: None,
+            // 004-books — assembled only when `book_format` is present. An
+            // unrecognised token yields `None` for the WHOLE BookMeta rather
+            // than silently defaulting to Epub: a row written by a newer version
+            // is better read as "not a book I understand" than as the wrong
+            // format (see BookFormat::parse).
+            book: self
+                .book_format
+                .as_deref()
+                .and_then(pharos_core::BookFormat::parse)
+                .map(|format| pharos_core::BookMeta {
+                    format,
+                    page_count: self.book_page_count.map(|v| v as u32),
+                    author: self.book_author,
+                    publisher: self.book_publisher,
+                    series_name: self.book_series,
+                    series_index: self.book_series_index.map(|v| v as u32),
+                    isbn: self.book_isbn,
+                }),
             probe,
             series,
             created_at,

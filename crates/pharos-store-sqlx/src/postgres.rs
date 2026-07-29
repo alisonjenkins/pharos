@@ -38,7 +38,9 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     series_folder, series_year, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, has_primary_art, \
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
-    original_language, art_version";
+    original_language, art_version, \
+    book_format, book_page_count, book_author, book_publisher, book_series, \
+    book_series_index, book_isbn";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -592,12 +594,15 @@ impl MediaStore for PostgresStore {
                 series_folder, series_year, title_fold, attachments_json, \
                 track_number, disc_number, release_year, \
                 production_locations_json, trailers_json, \
-                synopsis, content_rating, network, release_date, original_language) \
+                synopsis, content_rating, network, release_date, original_language, \
+                book_format, book_page_count, book_author, book_publisher, \
+                book_series, book_series_index, book_isbn) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
                      $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, \
-                     $48, $49, $50, $51, $52, $53, $54)
+                     $48, $49, $50, $51, $52, $53, $54, \
+                     $55, $56, $57, $58, $59, $60, $61)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             title_fold = EXCLUDED.title_fold,
@@ -645,6 +650,13 @@ impl MediaStore for PostgresStore {
                                             release_year = EXCLUDED.release_year,
                                             production_locations_json = EXCLUDED.production_locations_json,
                                             original_language = EXCLUDED.original_language,
+                                            book_format = EXCLUDED.book_format,
+                                            book_page_count = EXCLUDED.book_page_count,
+                                            book_author = EXCLUDED.book_author,
+                                            book_publisher = EXCLUDED.book_publisher,
+                                            book_series = EXCLUDED.book_series,
+                                            book_series_index = EXCLUDED.book_series_index,
+                                            book_isbn = EXCLUDED.book_isbn,
                                             trailers_json = EXCLUDED.trailers_json,
                                             synopsis = EXCLUDED.synopsis,
                                             content_rating = EXCLUDED.content_rating,
@@ -707,6 +719,27 @@ impl MediaStore for PostgresStore {
         .bind(p.network.as_deref())
         .bind(p.release_date.as_deref())
         .bind(item.metadata.original_language.clone())
+        // 004-books — $55..$61, all NULL for a non-book item. Every bind is
+        // derived from the SAME Option<BookMeta>, so a book can never be
+        // half-written. Postgres placeholder arity is not compile-checked, which
+        // is why `just test-postgres` is mandatory after touching this.
+        .bind(item.book.as_ref().map(|b| b.format.as_str()))
+        .bind(
+            item.book
+                .as_ref()
+                .and_then(|b| b.page_count)
+                .map(|v| v as i64),
+        )
+        .bind(item.book.as_ref().and_then(|b| b.author.clone()))
+        .bind(item.book.as_ref().and_then(|b| b.publisher.clone()))
+        .bind(item.book.as_ref().and_then(|b| b.series_name.clone()))
+        .bind(
+            item.book
+                .as_ref()
+                .and_then(|b| b.series_index)
+                .map(|v| v as i64),
+        )
+        .bind(item.book.as_ref().and_then(|b| b.isbn.clone()))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -3152,6 +3185,15 @@ struct MediaRow {
     release_date: Option<String>,
     has_primary_art: bool,
     art_version: i64,
+    // 004-books — NULL `book_format` is exactly "this item is not a book", so
+    // the whole `BookMeta` hangs off that one column being present.
+    book_format: Option<String>,
+    book_page_count: Option<i64>,
+    book_author: Option<String>,
+    book_publisher: Option<String>,
+    book_series: Option<String>,
+    book_series_index: Option<i64>,
+    book_isbn: Option<String>,
     match_provider: Option<String>,
     match_external_id: Option<String>,
     match_source: Option<String>,
@@ -3357,6 +3399,24 @@ impl MediaRow {
             path: self.path.into(),
             title: self.title,
             kind,
+            // 004-books — assembled only when `book_format` is present. An
+            // unrecognised token yields `None` for the WHOLE BookMeta rather
+            // than silently defaulting to Epub: a row written by a newer version
+            // is better read as "not a book I understand" than as the wrong
+            // format (see BookFormat::parse).
+            book: self
+                .book_format
+                .as_deref()
+                .and_then(pharos_core::BookFormat::parse)
+                .map(|format| pharos_core::BookMeta {
+                    format,
+                    page_count: self.book_page_count.map(|v| v as u32),
+                    author: self.book_author,
+                    publisher: self.book_publisher,
+                    series_name: self.book_series,
+                    series_index: self.book_series_index.map(|v| v as u32),
+                    isbn: self.book_isbn,
+                }),
             probe,
             series,
             created_at: self.created_at,
