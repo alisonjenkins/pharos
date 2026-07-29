@@ -236,6 +236,121 @@ pub(crate) fn release_group_query(artist: Option<&str>, album: &str) -> String {
     }
 }
 
+/// The `album_artist` values that name a compilation rather than a performer.
+///
+/// MusicBrainz credits a compilation to its actual contributors, so searching
+/// `artist:"Various Artists"` excludes the very release you are looking for.
+/// Measured on the first live pass: every `Ministry of Sound` compilation
+/// missed for exactly this reason.
+fn is_compilation_artist(artist: &str) -> bool {
+    matches!(
+        artist.trim().to_ascii_lowercase().as_str(),
+        "various artists" | "various" | "va" | "soundtrack" | "original soundtrack"
+    )
+}
+
+/// Strip the edition/format qualifiers tags carry and MusicBrainz does not
+/// index into the release-group title.
+///
+/// A release GROUP is the abstract album; the pressing details — `(Japan)`,
+/// `[Bonus Tracks]`, `(CD EP UK & Europe)`, `(CDr Promo) US` — belong to an
+/// individual release, so a title carrying them matches no release-group at
+/// all. Measured on the first live pass: of 22 `no_candidates` misses, most
+/// were a real album wearing one of these suffixes.
+///
+/// Only TRAILING bracketed groups are removed, and only when something is left
+/// — a title that is entirely bracketed keeps its brackets rather than becoming
+/// the empty string, and an interior bracket (`Sign "O" the Times (Disc 1)` vs
+/// `Where (Are We)? Now`) is untouched.
+pub(crate) fn strip_edition_qualifiers(album: &str) -> String {
+    let mut out = album.trim();
+    loop {
+        let trimmed = out.trim_end();
+        // A trailing bare region/format token, e.g. `... (CDr Promo) US`.
+        let after_word = match trimmed.rsplit_once(char::is_whitespace) {
+            Some((head, last))
+                if last.len() <= 3
+                    && !last.is_empty()
+                    && last.chars().all(|c| c.is_ascii_uppercase())
+                    && head.ends_with([')', ']']) =>
+            {
+                head.trim_end()
+            }
+            _ => trimmed,
+        };
+        let Some(open) = after_word
+            .strip_suffix(')')
+            .map(|_| '(')
+            .or_else(|| after_word.strip_suffix(']').map(|_| '['))
+        else {
+            out = after_word;
+            break;
+        };
+        let Some(idx) = after_word.rfind(open) else {
+            out = after_word;
+            break;
+        };
+        let head = after_word[..idx].trim_end();
+        if head.is_empty() {
+            // The whole title is bracketed — stripping it would leave nothing
+            // to search for, which is worse than searching the odd title.
+            out = after_word;
+            break;
+        }
+        out = head;
+    }
+    out.to_string()
+}
+
+/// The ordered search attempts for one album, most specific first.
+///
+/// Each attempt costs a rate-limited request, so the ladder is only walked
+/// while an attempt returns NO candidates at all — a wrong-but-present result
+/// is a confidence question, not a query question, and re-asking would not
+/// improve it. The vec never contains duplicates: an album with no qualifiers
+/// and a normal artist yields exactly one attempt, which is the common case.
+pub(crate) fn search_attempts(artist: Option<&str>, album: &str) -> Vec<String> {
+    let artist = artist.map(str::trim).filter(|a| !a.is_empty());
+    // A compilation is credited to its contributors on MusicBrainz, so naming
+    // "Various Artists" as the artist excludes the release we want.
+    let effective_artist = artist.filter(|a| !is_compilation_artist(a));
+    let stripped = strip_edition_qualifiers(album);
+
+    let mut out = vec![release_group_query(effective_artist, album)];
+    let mut push = |q: String| {
+        if !out.contains(&q) {
+            out.push(q);
+        }
+    };
+    if stripped != album {
+        push(release_group_query(effective_artist, &stripped));
+    }
+    // Last resort: the title alone. A tag whose artist field is wrong (a
+    // per-track performer on a compilation, a mis-parsed "Artist - Date"
+    // string) still names its album correctly.
+    if effective_artist.is_some() {
+        push(release_group_query(None, &stripped));
+    }
+    out
+}
+
+/// Render an error and every cause beneath it.
+///
+/// `reqwest`'s `Display` stops at "error sending request for url (...)", which
+/// names the request and not the failure — the first live pass logged six of
+/// those and none said whether it was DNS, TLS, a timeout or a refused
+/// connection. Walking `source()` puts the actual cause in the log line.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
+}
+
 /// Parse a MusicBrainz `/release-group` search body into ranked candidates.
 ///
 /// Pure (no I/O) so the JSON shape is unit-tested without touching the network
@@ -363,14 +478,40 @@ impl MusicBrainzClient {
                 // score is not re-reported because the search is not re-run.
                 Some(mbid) => Ok((mbid.clone(), None, MIN_ALBUM_CONFIDENCE)),
                 None => Err(AlbumArtMiss::NoCandidates {
-                    query: release_group_query(artist, album),
+                    query: search_attempts(artist, album).join(" | "),
                 }),
             };
         }
 
-        let query = release_group_query(artist, album);
-        let candidates = self.search_release_groups(&query).await?;
-        let best = pharos_core::match_best(album, None, &candidates, MIN_ALBUM_CONFIDENCE);
+        // Most specific first. The ladder is only walked while an attempt
+        // returns NO candidates — a wrong-but-present result is a confidence
+        // question, not a query question.
+        let attempts = search_attempts(artist, album);
+        let mut candidates = Vec::new();
+        let mut query = attempts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| release_group_query(artist, album));
+        for (n, attempt) in attempts.iter().enumerate() {
+            let found = self.search_release_groups(attempt).await?;
+            if !found.is_empty() {
+                if n > 0 {
+                    tracing::debug!(
+                        album,
+                        attempt = n,
+                        query = attempt.as_str(),
+                        "musicbrainz: a relaxed query found candidates the exact one did not"
+                    );
+                }
+                query = attempt.clone();
+                candidates = found;
+                break;
+            }
+        }
+        // Score against the stripped title: the qualifiers that were removed to
+        // find the release-group would otherwise count against its similarity.
+        let scored_title = strip_edition_qualifiers(album);
+        let best = pharos_core::match_best(&scored_title, None, &candidates, MIN_ALBUM_CONFIDENCE);
 
         let outcome = match best {
             Some(m) => m,
@@ -381,7 +522,7 @@ impl MusicBrainzClient {
                 return Err(match candidates.first() {
                     Some(c) => AlbumArtMiss::BelowConfidence {
                         best: c.title.clone(),
-                        confidence: pharos_core::match_best(album, None, &candidates, 0.0)
+                        confidence: pharos_core::match_best(&scored_title, None, &candidates, 0.0)
                             .map(|m| m.confidence)
                             .unwrap_or(0.0),
                     },
@@ -415,7 +556,7 @@ impl MusicBrainzClient {
             .send()
             .await
             .map_err(|e| AlbumArtMiss::Unavailable {
-                cause: format!("release-group search: {e}"),
+                cause: format!("release-group search: {}", error_chain(&e)),
             })?;
         let status = resp.status();
         if !status.is_success() {
@@ -424,7 +565,7 @@ impl MusicBrainzClient {
             });
         }
         let body = resp.text().await.map_err(|e| AlbumArtMiss::Unavailable {
-            cause: format!("reading release-group body: {e}"),
+            cause: format!("reading release-group body: {}", error_chain(&e)),
         })?;
         Ok(parse_release_groups(&body))
     }
@@ -447,7 +588,7 @@ impl MusicBrainzClient {
             .send()
             .await
             .map_err(|e| AlbumArtMiss::Unavailable {
-                cause: format!("cover art fetch: {e}"),
+                cause: format!("cover art fetch: {}", error_chain(&e)),
             })?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -464,7 +605,7 @@ impl MusicBrainzClient {
             .bytes()
             .await
             .map_err(|e| AlbumArtMiss::Unavailable {
-                cause: format!("reading cover art body: {e}"),
+                cause: format!("reading cover art body: {}", error_chain(&e)),
             })?
             .to_vec();
         if !looks_like_image(&bytes) {
@@ -634,6 +775,136 @@ mod tests {
         }
         .to_string()
         .contains("Greatest Hits"));
+    }
+
+    // Every title here MISSED on the first live pass with `no_candidates`.
+    // A release GROUP is the abstract album; pressing details belong to an
+    // individual release, so a title carrying them matches nothing at all.
+    #[test]
+    fn edition_qualifiers_are_stripped_from_real_failing_titles() {
+        for (raw, want) in [
+            (
+                "A Rush Of Blood To The Head (Japan)",
+                "A Rush Of Blood To The Head",
+            ),
+            ("Invaders Must Die [Bonus Tracks]", "Invaders Must Die"),
+            ("Prospekts March (CD EP UK & Europe)", "Prospekts March"),
+            ("Talk (Remixes) (CDr Promo) US", "Talk"),
+        ] {
+            assert_eq!(strip_edition_qualifiers(raw), want, "stripping {raw:?}");
+        }
+    }
+
+    #[test]
+    fn stripping_never_eats_a_whole_title_or_an_interior_bracket() {
+        // Entirely bracketed: stripping would leave nothing to search for.
+        assert_eq!(strip_edition_qualifiers("(Untitled)"), "(Untitled)");
+        assert_eq!(strip_edition_qualifiers("[]"), "[]");
+        // Interior brackets are part of the name, not a suffix.
+        assert_eq!(
+            strip_edition_qualifiers("Where (Are We)? Now"),
+            "Where (Are We)? Now"
+        );
+        // A plain title is returned unchanged (and costs no extra attempt).
+        assert_eq!(strip_edition_qualifiers("Ocean Eyes"), "Ocean Eyes");
+        assert_eq!(strip_edition_qualifiers("  Ocean Eyes  "), "Ocean Eyes");
+    }
+
+    // MusicBrainz credits a compilation to its contributors, so naming
+    // "Various Artists" as the artist EXCLUDES the release being searched for.
+    // Every Ministry of Sound compilation missed for exactly this reason.
+    #[test]
+    fn a_compilation_is_searched_without_its_placeholder_artist() {
+        let attempts = search_attempts(
+            Some("Various Artists"),
+            "Ministry of Sound: Anthems II: 1991-2009",
+        );
+        assert!(
+            attempts.iter().all(|q| !q.contains("Various Artists")),
+            "a placeholder artist must never narrow the search: {attempts:?}"
+        );
+        assert!(attempts[0].contains("Ministry of Sound"));
+
+        for placeholder in ["various artists", "VA", "Soundtrack", "Original Soundtrack"] {
+            assert!(
+                is_compilation_artist(placeholder),
+                "{placeholder} names a compilation, not a performer"
+            );
+        }
+        assert!(!is_compilation_artist("Various Cruelties")); // a real band
+        assert!(!is_compilation_artist("Owl City"));
+    }
+
+    // The ladder is walked only while an attempt finds NOTHING, so a clean tag
+    // that matches costs exactly one rate-limited request. The later rungs are
+    // paid for only by albums that would otherwise have stayed blank.
+    #[test]
+    fn the_exact_query_is_always_tried_first() {
+        let attempts = search_attempts(Some("Owl City"), "Ocean Eyes");
+        assert_eq!(
+            attempts[0], "releasegroup:\"Ocean Eyes\" AND artist:\"Owl City\"",
+            "the most specific query must come first"
+        );
+        // A clean title adds no stripped-title rung — only the drop-the-artist
+        // last resort, reached solely when the exact query found nothing.
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert!(!attempts[1].contains("artist:"));
+    }
+
+    #[test]
+    fn a_qualified_title_falls_back_to_the_stripped_one_then_to_no_artist() {
+        let attempts = search_attempts(Some("Coldplay"), "A Rush Of Blood To The Head (Japan)");
+        assert_eq!(attempts.len(), 3, "{attempts:?}");
+        // Most specific first — the exact tag still gets its chance.
+        assert!(attempts[0].contains(r"\(Japan\)"));
+        assert!(
+            attempts[1].contains("A Rush Of Blood To The Head") && !attempts[1].contains("Japan")
+        );
+        assert!(attempts[1].contains("Coldplay"));
+        // Last resort drops the artist: a mis-parsed artist tag still names its
+        // album correctly.
+        assert!(!attempts[2].contains("artist:"));
+        // No duplicates — a repeated query would just burn the rate limit.
+        let uniq: std::collections::BTreeSet<_> = attempts.iter().collect();
+        assert_eq!(uniq.len(), attempts.len());
+    }
+
+    // reqwest's Display stops at "error sending request for url (...)", which
+    // names the request and not the failure. Six live misses said exactly that
+    // and none said whether it was DNS, TLS, a timeout or a refusal.
+    #[test]
+    fn error_chain_reports_the_cause_not_just_the_request() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "dns error: no record found")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "error sending request for url (https://musicbrainz.org/)"
+                )
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let rendered = error_chain(&Outer(Inner));
+        assert!(rendered.contains("error sending request"));
+        assert!(
+            rendered.contains("dns error: no record found"),
+            "the underlying cause must survive: {rendered}"
+        );
     }
 
     #[test]
