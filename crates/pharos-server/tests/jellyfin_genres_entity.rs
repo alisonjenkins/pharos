@@ -89,6 +89,72 @@ async fn get_json(state: web::Data<AppState>, token: &str, uri: &str) -> serde_j
     serde_json::from_slice(&body).unwrap()
 }
 
+/// A library holding both film and music, so `/MusicGenres` can be shown to
+/// return the music genres and only those.
+async fn seed_mixed() -> (web::Data<AppState>, String) {
+    let (state, token) = seed().await;
+    let rows: &[(u64, &str, &str, MediaKind)] = &[
+        (10, "Track One", "Shoegaze, Action", MediaKind::Audio),
+        (11, "Track Two", "Shoegaze", MediaKind::Audio),
+        (12, "An Episode", "Sci-Fi", MediaKind::Episode),
+    ];
+    for (id, title, genre, kind) in rows {
+        state
+            .stores
+            .put(MediaItem {
+                id: *id,
+                path: format!("/m/{id}.flac").into(),
+                title: (*title).into(),
+                kind: *kind,
+                probe: MediaProbe {
+                    genre: Some((*genre).to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    (state, token)
+}
+
+// jellyfin-web's music library calls `getMusicGenres` -> `GET /MusicGenres`
+// and does not `.catch` the result. With the route absent the 404 rejected a
+// promise nothing was waiting on, and the Genres tab spun forever.
+#[actix_web::test]
+async fn music_genres_route_exists_and_lists_only_genres_carried_by_audio() {
+    let (state, token) = seed_mixed().await;
+    let v = get_json(state, &token, "/MusicGenres").await;
+    let items = v["Items"].as_array().unwrap();
+    let names: Vec<&str> = items.iter().map(|i| i["Name"].as_str().unwrap()).collect();
+
+    // "Shoegaze" is audio-only; "Action" is on both a film and a track, so it
+    // is a music genre too. "Sci-Fi" appears only on video and must not show.
+    assert!(names.contains(&"Shoegaze"), "got {names:?}");
+    assert!(names.contains(&"Action"), "got {names:?}");
+    assert!(
+        !names.contains(&"Sci-Fi"),
+        "a video-only genre must not appear under music: {names:?}"
+    );
+
+    // Counts are over audio only: Action is on one track (and one film).
+    let action = items
+        .iter()
+        .find(|i| i["Name"] == "Action")
+        .expect("Action present");
+    assert_eq!(
+        action["ChildCount"].as_u64(),
+        Some(1),
+        "the count must be audio items, not every item with the genre"
+    );
+
+    // The Type the client switches on, and an Id byte-identical to the one
+    // /Genres hands out — the /Items?ParentId pivot must keep resolving.
+    assert_eq!(action["Type"], "MusicGenre");
+    assert_eq!(action["Id"].as_str(), Some(genre_id_for("Action").as_str()));
+    assert_eq!(v["TotalRecordCount"].as_u64(), Some(names.len() as u64));
+}
+
 #[actix_web::test]
 async fn genres_list_backfills_rows_with_wire_id_and_counts() {
     let (state, token) = seed().await;

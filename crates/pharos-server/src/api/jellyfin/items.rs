@@ -126,6 +126,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // its entity rows with an item count via the indexed *_with_counts
     // store query (genres/item_genres, studios/item_studios).
     cfg.route("/genres", web::get().to(list_genres))
+        .route("/musicgenres", web::get().to(list_music_genres))
         .route("/studios", web::get().to(list_studios))
         // /Artists + /Albums power jellyfin-web's music navigation.
         .route("/artists", web::get().to(list_artists))
@@ -861,6 +862,76 @@ async fn list_genres(
                 state.server_id.clone(),
                 "Genre",
             )
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
+}
+
+/// `GET /MusicGenres` — the genres carried by AUDIO items only, typed
+/// `MusicGenre`.
+///
+/// jellyfin-web's music library reaches for this endpoint by name
+/// (`ApiClient.getMusicGenres` → `GET /MusicGenres`), and its call has no
+/// `.catch`: with the route absent the 404 rejected a promise nothing was
+/// waiting on and the Genres tab spun forever. Serving `/Genres` here instead
+/// would list every film and television genre alongside the music ones, which
+/// is not what the tab means.
+///
+/// Ids come from [`genres_with_counts`] rather than being re-derived, so a
+/// music genre's `Id` is byte-identical to the one `/Genres` hands out and the
+/// `/Items?ParentId=<genre id>` pivot resolves unchanged. Only the membership
+/// and the counts are recomputed over audio.
+///
+/// [`genres_with_counts`]: pharos_core::GenreStore::genres_with_counts
+async fn list_music_genres(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::GenreStore;
+    use std::collections::HashMap;
+    state
+        .stores
+        .backfill_genres()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let rows = state
+        .stores
+        .genres_with_counts()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = state
+        .list_items_cached()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+
+    // Count each genre over audio items only. `probe.genre` is the raw tag
+    // string and may pack several genres, so it is split on the same
+    // `|`/`,` convention the entity backfill uses — otherwise "Rock, Indie"
+    // would be its own single genre and match nothing.
+    let mut audio_counts: HashMap<String, u32> = HashMap::new();
+    for item in all.iter().filter(|i| i.kind == MediaKind::Audio) {
+        let Some(raw) = item.probe.genre.as_deref() else {
+            continue;
+        };
+        for name in pharos_core::split_genre_field(raw) {
+            *audio_counts.entry(name.to_lowercase()).or_default() += 1;
+        }
+    }
+
+    let items: Vec<SynthItemDto> = rows
+        .iter()
+        .filter_map(|gc| {
+            let count = *audio_counts.get(&gc.genre.name.to_lowercase())?;
+            Some(SynthItemDto {
+                child_count: Some(count),
+                ..SynthItemDto::folder(
+                    gc.genre.wire_id.clone(),
+                    gc.genre.name.clone(),
+                    state.server_id.clone(),
+                    "MusicGenre",
+                )
+            })
         })
         .collect();
     let total = items.len() as u32;
