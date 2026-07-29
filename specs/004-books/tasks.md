@@ -86,11 +86,11 @@ otherwise by labelling `Path` and `/Download` as US1-only.
 
 ### Step 3 — `Path` on the DTO (gate 2)
 
-- [ ] T020 [P] Add test `path_is_absent_unless_the_client_asks_for_it` in `crates/pharos-server/tests/items_query_golden.rs`: `GET /Items?IncludeItemTypes=Book` has no `Path` key; `&Fields=CanDownload,Path` yields the real filesystem path; **and `&fields=path` yields it too** (V69 — a camelCase spelling silently ignored would disable the whole feature for that client, a recurring bug class here)
-- [ ] T021 Add `Path: Option<String>` to `BaseItemDto` in `crates/pharos-jellyfin-api/src/dto.rs` with `skip_serializing_if = "Option::is_none"` — omitted, not null, per the existing "absent means not requested" convention
-- [ ] T022 Populate `Path` in `build_items_page_with_fields` (`crates/pharos-server/src/api/jellyfin/items.rs:4816`) gated on `fields_requests(fields, "Path")` — the existing helper at `items.rs:4874` that keeps `People`/`Studios`/`Tags` off the default payload. Applies to every item kind
-- [ ] T023 Apply the same gating to the single-item fetch in `crates/pharos-server/src/api/jellyfin/items.rs` so `GET /Items/{id}?Fields=Path` agrees with the list response
-- [ ] T024 Make `fields_requests` (`crates/pharos-server/src/api/jellyfin/items.rs:4874`) match the field name case-insensitively, and confirm the `fields` query parameter itself binds case-insensitively — **COMMIT**
+- [X] T020 [P] Add test `path_is_absent_unless_the_client_asks_for_it` in `crates/pharos-server/tests/items_query_golden.rs`: `GET /Items?IncludeItemTypes=Book` has no `Path` key; `&Fields=CanDownload,Path` yields the real filesystem path; **and `&fields=path` yields it too** (V69 — a camelCase spelling silently ignored would disable the whole feature for that client, a recurring bug class here)
+- [X] T021 Add `Path: Option<String>` to `BaseItemDto` in `crates/pharos-jellyfin-api/src/dto.rs` with `skip_serializing_if = "Option::is_none"` — omitted, not null, per the existing "absent means not requested" convention
+- [X] T022 Populate `Path` in `build_items_page_with_fields` (`crates/pharos-server/src/api/jellyfin/items.rs:4816`) gated on `fields_requests(fields, "Path")` — the existing helper at `items.rs:4874` that keeps `People`/`Studios`/`Tags` off the default payload. Applies to every item kind
+- [X] T023 Apply the same gating to the single-item fetch in `crates/pharos-server/src/api/jellyfin/items.rs` so `GET /Items/{id}?Fields=Path` agrees with the list response
+- [X] T024 Make `fields_requests` (`crates/pharos-server/src/api/jellyfin/items.rs:4874`) match the field name case-insensitively, and confirm the `fields` query parameter itself binds case-insensitively — **COMMIT**
 
 ### Step 4 — `GET /Items/{id}/Download` (gate 3)
 

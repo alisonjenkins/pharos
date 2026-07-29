@@ -429,6 +429,25 @@ pub struct BaseItemDto {
     pub tags: Vec<String>,
     pub studios: Vec<NameGuidPairDto>,
     pub people: Vec<PersonDto>,
+    /// 004-books / FR-003 — the item's filesystem path, emitted ONLY when the
+    /// request's `Fields` asks for it (`with_path`). Omitted, not null, per the
+    /// convention that an absent field means "not requested".
+    ///
+    /// This is REQUIRED, not cosmetic. All three jellyfin-web book readers gate
+    /// on `canPlayItem`, which tests `item.Path` against an extension —
+    /// `bookPlayer` on `.endsWith("epub")`, `pdfPlayer` on a lowercased `pdf`,
+    /// `comicsPlayer` on `.cbr/.cbt/.cbz/.cb7`. With `Path` absent all three
+    /// return false and the client declines to open the item with no error, no
+    /// toast and no network request at all.
+    ///
+    /// V9 says media paths never reach an UNAUTHENTICATED client. Item fetches
+    /// are authenticated, and this is additionally `Fields`-gated, so the field
+    /// appears only when a logged-in client explicitly asks. A synthetic path
+    /// shaped to satisfy the extension test was rejected: the field means a
+    /// filesystem path, the metadata editor displays it, and the lie would
+    /// resurface as a different bug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub production_locations: Vec<String>,
     pub provider_ids: serde_json::Map<String, serde_json::Value>,
     pub remote_trailers: Vec<serde_json::Value>,
@@ -1589,6 +1608,13 @@ impl BaseItemDto {
         self
     }
 
+    /// FR-003 — attach the item's filesystem path. Call ONLY when the request's
+    /// `Fields` contains `Path`; see the field's docs for why it is gated.
+    pub fn with_path(mut self, path: &std::path::Path) -> Self {
+        self.path = Some(path.to_string_lossy().into_owned());
+        self
+    }
+
     pub fn from_domain_with_user_data(
         item: &pharos_core::MediaItem,
         server_id: &str,
@@ -1642,6 +1668,9 @@ impl BaseItemDto {
             kind,
             media_type,
             is_folder: false,
+            // Fields-gated: attached by `with_path` only when the request asks
+            // for it (FR-003). Absent by default keeps V9 exposure minimal.
+            path: None,
             user_data: UserItemDataDto {
                 item_id: wire_item_id(item.id),
                 ..Default::default()

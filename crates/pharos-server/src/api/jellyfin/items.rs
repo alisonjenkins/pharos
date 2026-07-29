@@ -4829,6 +4829,11 @@ pub(crate) async fn build_items_page_with_fields(
     let want_people = fields_requests(fields, "People");
     let want_studios = fields_requests(fields, "Studios");
     let want_tags = fields_requests(fields, "Tags");
+    // FR-003 — `Path` is what all three jellyfin-web book readers gate on. The
+    // client asks as `Fields=CanDownload,Path`. `fields_requests` compares
+    // case-insensitively and `CiQuery` binds the parameter KEY case-insensitively,
+    // so `fields=path` works as well as `Fields=Path` (V69).
+    let want_path = fields_requests(fields, "Path");
     let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
@@ -4860,6 +4865,9 @@ pub(crate) async fn build_items_page_with_fields(
             if let Ok(t) = state.stores.tags_for_item(item.id).await {
                 dto = dto.with_tags(&t);
             }
+        }
+        if want_path {
+            dto = dto.with_path(&item.path);
         }
         items.push(dto);
     }
@@ -5406,32 +5414,45 @@ async fn synth_album_or_artist(
     Ok(None)
 }
 
+/// `Fields` on the single-item fetch. Only `Path` is consulted today — the
+/// detail path already attaches People / Studios / Tags unconditionally, but
+/// `Path` stays gated so a filesystem path is never in a payload that did not
+/// ask for one (FR-003, V9).
+#[derive(serde::Deserialize, Default)]
+struct ItemDetailQuery {
+    #[serde(default)]
+    fields: Option<String>,
+}
+
 async fn get_item(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
+    q: CiQuery<ItemDetailQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
-    fetch_item_dto(&state, &id_str, user.0.id).await
+    fetch_item_dto(&state, &id_str, user.0.id, q.0.fields.as_deref()).await
 }
 
 async fn get_user_item(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<(String, String)>,
+    q: CiQuery<ItemDetailQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let (user_path, item_id) = path.into_inner();
     let bearer_id = user.0.id.0.simple().to_string();
     if user_path != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
-    fetch_item_dto(&state, &item_id, user.0.id).await
+    fetch_item_dto(&state, &item_id, user.0.id, q.0.fields.as_deref()).await
 }
 
 async fn fetch_item_dto(
     state: &AppState,
     id_str: &str,
     user_id: UserId,
+    fields: Option<&str>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // B85 — accept the dashed synth id the kotlin SDK sends: every synth /
     // entity resolution below compares against the dashless stored form, so a
@@ -5582,18 +5603,22 @@ async fn fetch_item_dto(
             }
         }
     };
-    Ok(crate::api::jellyfin::wire::json(
-        &BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
-            .with_trickplay(
-                &item.probe,
-                &state.generated_trickplay_widths(item.id),
-                state.trickplay_interval_ms,
-            )
-            .with_local_artwork_tags(id, item.art_version, &local_art_roles)
-            .with_people(&people)
-            .with_studios(&studios)
-            .with_tags(&tags),
-    ))
+    let mut dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
+        .with_trickplay(
+            &item.probe,
+            &state.generated_trickplay_widths(item.id),
+            state.trickplay_interval_ms,
+        )
+        .with_local_artwork_tags(id, item.art_version, &local_art_roles)
+        .with_people(&people)
+        .with_studios(&studios)
+        .with_tags(&tags);
+    // FR-003 — gated, unlike the joins above, so the detail payload agrees with
+    // the list payload: `Fields=Path` present on both, absent on both.
+    if fields_requests(fields, "Path") {
+        dto = dto.with_path(&item.path);
+    }
+    Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
 /// If `id_str` matches the library id of any configured root, return
