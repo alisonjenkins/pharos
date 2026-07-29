@@ -556,6 +556,19 @@ pub struct SynthItemDto {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub album_artist: Option<String>,
+    /// `Artists` — plain STRINGS, and the reason this field exists separately
+    /// from [`Self::album_artists`].
+    ///
+    /// B151: jellyfin-androidtv builds a MusicAlbum card's title as
+    /// `artists?.joinToString() ?: albumArtists?.joinToString() ?: albumArtist`
+    /// followed by the name. `albumArtists` is a `List<NameGuidPair>`, so
+    /// `joinToString` calls Kotlin's data-class `toString()` on each element —
+    /// with `Artists` absent the album grid rendered
+    /// `NameGuidPair(name=Owl City, id=…) - Ocean Eyes` as the album name.
+    /// Emitting the string list makes the first branch win, which is the shape
+    /// the client is actually written for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artists: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub album_artists: Option<Vec<NameGuidPairDto>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -697,6 +710,7 @@ impl SynthItemDto {
             genres: None,
             tags: None,
             album_artist: None,
+            artists: None,
             album_artists: None,
             artist_items: None,
         }
