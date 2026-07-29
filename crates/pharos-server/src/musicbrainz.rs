@@ -238,8 +238,19 @@ impl AlbumArt {
 }
 
 /// The Cover Art Archive front-cover URL for a release-group id.
+/// B158 — ask for the 500px thumbnail, not the original.
+///
+/// `/front` redirects to the archive.org ORIGINAL: a full-resolution sleeve
+/// scan, routinely several MB and sometimes tens. Every one of those was being
+/// pulled across a home connection to render a 280px tile, under a single
+/// 20-second whole-request budget — so the body read timed out and the album
+/// was left blank with `provider unavailable: reading cover art body:
+/// operation timed out`. The Cover Art Archive publishes derived thumbnails at
+/// `-250`, `-500` and `-1200`; 500px comfortably covers the largest surface
+/// that renders a cover (the detail header) and is one to two orders of
+/// magnitude smaller.
 fn front_cover_url(mbid: &str) -> String {
-    format!("{CAA_BASE}/release-group/{mbid}/front")
+    format!("{CAA_BASE}/release-group/{mbid}/front-500")
 }
 
 /// Cache key for an album lookup: the album artist (lowercased, empty when
@@ -677,7 +688,11 @@ impl MusicBrainzClient {
         );
         let http = reqwest::Client::builder()
             .user_agent(ua)
-            .timeout(Duration::from_secs(20))
+            // Split the budget: a dead host should fail fast, but a live
+            // transfer needs room. One 20s WHOLE-request timeout meant a slow
+            // cover download and an unreachable server were the same event.
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(45))
             .build()
             // `ClientBuilder::build` only fails on TLS backend init, which
             // would already have failed for TMDB; fall back rather than panic
@@ -1525,7 +1540,22 @@ mod tests {
     fn front_cover_url_targets_the_release_group_front() {
         assert_eq!(
             front_cover_url("abc-123"),
-            "https://coverartarchive.org/release-group/abc-123/front"
+            "https://coverartarchive.org/release-group/abc-123/front-500"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn front_cover_url_asks_for_a_derived_thumbnail_not_the_original() {
+        // B158 — bare `/front` redirects to the archive.org ORIGINAL: a
+        // full-resolution sleeve scan, routinely several MB. Pulling those to
+        // render a 280px tile timed the body read out under the request budget
+        // and left albums blank ("reading cover art body: operation timed
+        // out"). Assert the size suffix explicitly: dropping it reintroduces
+        // the timeouts silently, since the URL still resolves.
+        let url = front_cover_url("abc-123");
+        assert!(
+            url.ends_with("/front-500"),
+            "must request the 500px derivative, got {url}"
         );
     }
 
