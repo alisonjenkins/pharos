@@ -29,6 +29,7 @@ fn item(id: u64, title: &str, overview: Option<&str>, kind: MediaKind) -> MediaI
         path: format!("/m/{id}.mkv").into(),
         title: title.to_string(),
         kind,
+        book: None,
         probe: MediaProbe::default(),
         series: None,
         created_at: Some(1_700_000_000 + id as i64),

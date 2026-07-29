@@ -63,6 +63,7 @@ async fn seed(
             path: path.clone(),
             title: "fake".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(duration_ms),
                 bitrate_bps: Some(bitrate_bps),

@@ -170,6 +170,7 @@ fn arb_item() -> impl Strategy<Value = MediaItem> {
             path: format!("/m/{path}.bin").into(),
             title,
             kind,
+            book: None,
             probe,
             series,
             // `created_at = None` so the store backfills — compared

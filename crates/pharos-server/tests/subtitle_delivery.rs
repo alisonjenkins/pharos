@@ -152,6 +152,7 @@ async fn seed(fixture: &Path) -> web::Data<AppState> {
             path: fixture.to_path_buf(),
             title: "m".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(3_000),
                 subtitle_tracks: vec![

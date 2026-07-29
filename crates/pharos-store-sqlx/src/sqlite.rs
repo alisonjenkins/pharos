@@ -3187,6 +3187,9 @@ impl MediaRow {
             path: self.path.into(),
             title: self.title,
             kind,
+            // T015 replaces this with `BookMeta` assembled from the book_*
+            // columns once migration 0052 lands.
+            book: None,
             probe,
             series,
             created_at,

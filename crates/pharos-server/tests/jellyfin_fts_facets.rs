@@ -41,6 +41,7 @@ async fn seed() -> (web::Data<AppState>, String) {
                 path: format!("/m/{id}.mkv").into(),
                 title: title.into(),
                 kind,
+                book: None,
                 probe: MediaProbe::default(),
                 series: None,
                 created_at: Some(1_700_000_000 + id as i64),

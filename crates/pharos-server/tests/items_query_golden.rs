@@ -198,6 +198,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
                 path: r.path.into(),
                 title: r.title.into(),
                 kind: r.kind,
+                book: None,
                 probe: r.probe.clone(),
                 series: r.series.clone(),
                 created_at: r.created_at,

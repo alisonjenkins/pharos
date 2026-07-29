@@ -388,6 +388,7 @@ mod tests {
             path: path.into(),
             title: "t".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 container: container.map(String::from),
                 video_codec: video_codec.map(String::from),

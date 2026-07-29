@@ -100,6 +100,7 @@ async fn seed(fixture: PathBuf, cache_dir: &Path) -> (web::Data<AppState>, Strin
             path: fixture,
             title: "clip".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(15_000),
                 width: Some(320),

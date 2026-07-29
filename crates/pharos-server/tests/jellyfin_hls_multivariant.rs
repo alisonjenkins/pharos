@@ -74,6 +74,7 @@ async fn seed_with_fixture(
             path: fixture_path,
             title: "fixture".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(3_000),
                 width: Some(320),

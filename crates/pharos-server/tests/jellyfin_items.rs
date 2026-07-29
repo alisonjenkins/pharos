@@ -479,6 +479,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
             path: "/m/probed.webm".into(),
             title: "Probed".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe,
             series: None,
             created_at: None,

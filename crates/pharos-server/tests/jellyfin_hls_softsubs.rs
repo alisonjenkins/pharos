@@ -36,6 +36,7 @@ async fn seed_with_subs(tracks: Vec<SubtitleTrack>) -> (web::Data<AppState>, Str
             path: "/nonexistent.mkv".into(),
             title: "m".into(),
             kind: MediaKind::Movie,
+            book: None,
             probe: MediaProbe {
                 duration_ms: Some(60_000),
                 width: Some(1920),
