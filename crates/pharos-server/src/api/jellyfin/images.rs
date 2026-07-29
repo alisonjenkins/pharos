@@ -781,11 +781,22 @@ fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
                 );
             }
         }
+        // B154 — an artist/album tile can only ever show a track's CACHED
+        // cover (`synth_primary_tag` refuses to advertise a Primary for an
+        // audio row without one), so the representative must be a track that
+        // HAS art whenever the group contains one. Ranking by title alone
+        // picked the alphabetically-first track, which is rarely the one the
+        // MusicBrainz backfill matched: 24 albums held a cover on some track
+        // and still rendered as blank tiles. Same `has_primary_art`-first key
+        // the library tiles below already use; title still breaks ties, so the
+        // choice stays stable across restarts.
+        let art_rank = if it.has_primary_art { '0' } else { '1' };
+        let track_key = format!("{art_rank}{}", it.title.to_lowercase());
         if let Some(a) = it.probe.artist.as_deref() {
-            consider(artist_id_for(a), it.id, it.title.clone());
+            consider(artist_id_for(a), it.id, track_key.clone());
         }
         if let Some(a) = it.probe.album.as_deref() {
-            consider(album_id_for(a), it.id, it.title.clone());
+            consider(album_id_for(a), it.id, track_key);
         }
     }
     // A LIBRARY is a group too, and until now the only one without a
@@ -1472,6 +1483,50 @@ mod tests {
             ..Default::default()
         };
         state.stores.put(item).await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn album_representative_prefers_the_track_that_has_a_cover() {
+        // B154 — the MusicBrainz backfill records the cover against ONE track
+        // of an album, and which one is unrelated to track title. Picking the
+        // alphabetically-first track as the album's representative therefore
+        // landed on a coverless row most of the time, and `synth_primary_tag`
+        // (correctly, per B149) refuses to advertise a Primary for an audio
+        // row with no art — so the album tile stayed blank while the album
+        // demonstrably had a cover. Live count when this was written: 24 of
+        // 105 albums with art rendered blank for exactly this reason.
+        use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        let track = |id: u64, title: &str| MediaItem {
+            id,
+            path: format!("/m/{id}.flac").into(),
+            title: title.into(),
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                album: Some("Toxicity".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // "Aerials" sorts first; the cover lives on "Toxicity".
+        state.stores.put(track(1, "Aerials")).await.unwrap();
+        state.stores.put(track(2, "Toxicity")).await.unwrap();
+        state
+            .stores
+            .set_artwork(2, "Primary", "musicbrainz", "/cache/toxicity.jpg")
+            .await
+            .unwrap();
+
+        let album_id = crate::api::jellyfin::dto::album_id_for("Toxicity");
+        let tags = synth_primary_tag(&state, &album_id)
+            .await
+            .expect("an album with a cover on any track must advertise Primary");
+        assert_eq!(
+            tags.get("Primary").map(String::as_str),
+            Some("2"),
+            "the representative must be the track that actually has the cover"
+        );
     }
 
     #[actix_web::test]
