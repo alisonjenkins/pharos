@@ -94,10 +94,10 @@ otherwise by labelling `Path` and `/Download` as US1-only.
 
 ### Step 4 — `GET /Items/{id}/Download` (gate 3)
 
-- [ ] T025 [P] Add `crates/pharos-server/tests/item_download.rs`: `?api_key=<token>` with **no** `Authorization` header returns 200 and the exact bytes; `HEAD` returns `Content-Length` equal to the file size (**not 0**); `Range: bytes=0-99` returns 206 with `Content-Range` and 100 bytes; unknown id 404; no token 401
-- [ ] T026 Add `crates/pharos-server/src/api/jellyfin/download.rs` per [contracts/books-http.md](./contracts/books-http.md): resolve id → stored path (no client-supplied path, so V9 has nothing to traverse), `Range` support, `Content-Disposition: attachment; filename="<basename>"`, `Accept-Ranges: bytes`, and the extension→`Content-Type` map. Not restricted to books — real Jellyfin serves any item
-- [ ] T027 Return a **sized** body so actix's h1 encoder derives a truthful `Content-Length` on `HEAD` (V113/B166: the encoder takes the header from the body's `BodySize` and discards a hand-set one, so `.finish()` yields `Sized(0)`) — the identical mistake B166 fixed one endpoint over
-- [ ] T028 Register `download::register(cfg)` in `crates/pharos-server/src/api/jellyfin/mod.rs:43` — **COMMIT**
+- [X] T025 [P] Add `crates/pharos-server/tests/item_download.rs`: `?api_key=<token>` with **no** `Authorization` header returns 200 and the exact bytes; `HEAD` returns `Content-Length` equal to the file size (**not 0**); `Range: bytes=0-99` returns 206 with `Content-Range` and 100 bytes; unknown id 404; no token 401
+- [X] T026 Add `crates/pharos-server/src/api/jellyfin/download.rs` per [contracts/books-http.md](./contracts/books-http.md): resolve id → stored path (no client-supplied path, so V9 has nothing to traverse), `Range` support, `Content-Disposition: attachment; filename="<basename>"`, `Accept-Ranges: bytes`, and the extension→`Content-Type` map. Not restricted to books — real Jellyfin serves any item
+- [X] T027 Return a **sized** body so actix's h1 encoder derives a truthful `Content-Length` on `HEAD` (V113/B166: the encoder takes the header from the body's `BodySize` and discards a hand-set one, so `.finish()` yields `Sized(0)`) — the identical mistake B166 fixed one endpoint over
+- [X] T028 Register `download::register(cfg)` in `crates/pharos-server/src/api/jellyfin/mod.rs:43` — **COMMIT**
 
 ### Step 5 — the classification signal, before the branch it measures (R12)
 
