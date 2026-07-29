@@ -6138,12 +6138,31 @@ async fn resume_items(
         }
     }
     let ids = ids_kept;
+    // B164 — honour `Limit`/`StartIndex`. This endpoint returned EVERY
+    // resumable item however few the client asked for: jellyfin-web's home row
+    // requests `Limit=12` and was served 86 items, 400 KB of JSON to render
+    // twelve tiles. `TotalRecordCount` stays the unpaged total, which is what
+    // Jellyfin means by it and what a client would page against.
+    let int_param = |name: &str| -> Option<usize> {
+        req.query_string()
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.parse::<usize>().ok())
+    };
+    let total = items.len() as u32;
+    let start = int_param("StartIndex").unwrap_or(0).min(items.len());
+    let end = int_param("Limit")
+        .map_or(items.len(), |n| start.saturating_add(n))
+        .min(items.len());
+    let page_ids: Vec<pharos_core::MediaId> = ids[start..end].to_vec();
+    let items: Vec<MediaItem> = items[start..end].to_vec();
+    let ids = page_ids;
     let user_data = state
         .stores
         .user_data_bulk(user.0.id, &ids)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let total = items.len() as u32;
     let dtos: Vec<BaseItemDto> = items
         .iter()
         .enumerate()
@@ -6159,7 +6178,7 @@ async fn resume_items(
     Ok(crate::api::jellyfin::wire::json(&ItemsResultDto {
         items: dtos,
         total_record_count: total,
-        start_index: 0,
+        start_index: start as u32,
     }))
 }
 

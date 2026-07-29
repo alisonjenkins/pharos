@@ -560,3 +560,95 @@ async fn userviews_items_carry_kotlin_complete_userdata() {
         }
     }
 }
+
+// B164 — the Resume row must honour `Limit`. It returned EVERY resumable item
+// however few the client asked for: jellyfin-web's home row requests
+// `Limit=12` and was served 86 items — 400 KB of JSON to render twelve tiles.
+#[actix_web::test]
+async fn resume_row_honours_the_limit_the_client_asked_for() {
+    use pharos_core::{
+        MediaItem, MediaKind, MediaStore, SecretString, TokenStore, UserDataStore, UserId,
+        UserItemData, UserPolicy, UserRecord, UserStore,
+    };
+    // Own user + token: `seed()` does not hand back the id, and this test needs
+    // to write user data directly to make items resumable.
+    let (state, _) = seed().await;
+    let auth = pharos_server::auth::BuiltinAuth::new(state.stores.clone());
+    let uid = UserId::new();
+    state
+        .stores
+        .create(UserRecord {
+            id: uid,
+            name: "resume-tester".into(),
+            password_hash: auth.hash_password(&SecretString::new("pw")).unwrap(),
+            policy: UserPolicy {
+                admin: true,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let token = state.stores.issue(uid, "test").await.unwrap();
+    let token = token.0.expose().to_string();
+    for id in 0..30u64 {
+        state
+            .stores
+            .put(MediaItem {
+                id: 5000 + id,
+                path: format!("/m/{id}.mkv").into(),
+                title: format!("Film {id:02}"),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Partially watched → resumable.
+        state
+            .stores
+            .set_user_data(
+                uid,
+                5000 + id,
+                UserItemData {
+                    last_played_position_ticks: 10_000_000,
+                    played: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let upath = uid.0.simple().to_string();
+    let app = test::init_service(build_app(state)).await;
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!(
+                "/Users/{upath}/Items/Resume?Limit=12&MediaTypes=Video"
+            ))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = v["Items"].as_array().expect("Items array");
+    assert_eq!(items.len(), 12, "a Limit of 12 must return 12 items");
+    // The unpaged total is what a client pages against, so it stays truthful.
+    assert_eq!(
+        v["TotalRecordCount"].as_u64(),
+        Some(30),
+        "TotalRecordCount is the unpaged total"
+    );
+
+    // No Limit still returns everything, so existing callers are unaffected.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/Users/{upath}/Items/Resume?MediaTypes=Video"))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Items"].as_array().map(Vec::len), Some(30));
+}
