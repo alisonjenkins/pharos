@@ -80,13 +80,46 @@ fn default_bitrate_size() -> usize {
     500_000
 }
 
+/// Fill `n` bytes with high-entropy noise.
+///
+/// B161 — the payload of a THROUGHPUT test must not compress. A xorshift64*
+/// stream is incompressible in practice and costs a few ns per 8 bytes, so
+/// there is no reason to send anything cheaper. Seeded by a constant: the
+/// bytes are meaningless, only their incompressibility matters, and a fixed
+/// seed keeps the handler deterministic for tests.
+fn incompressible(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    while out.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let take = (n - out.len()).min(8);
+        out.extend_from_slice(&x.to_le_bytes()[..take]);
+    }
+    out
+}
+
 async fn bitrate_test(q: CiQuery<BitrateTestQuery>) -> impl Responder {
-    // Real Jellyfin streams `Size` bytes for the client to measure
-    // throughput. Phase-1 stub: return the exact byte count of zeros.
+    // Real Jellyfin streams `Size` bytes for the client to measure throughput,
+    // and jellyfin-web divides the byte COUNT it asked for by the wall time to
+    // get a bandwidth figure it then picks a bitrate from.
+    //
+    // B161 — this used to send `vec![0u8; n]`. Zeros are perfectly
+    // compressible: the instant anything on the path gzips (which is exactly
+    // what B162 turns on for the static bundle), 3 MB of zeros goes out as a
+    // few KB, the client concludes the link is roughly a thousand times faster
+    // than it is, and picks a bitrate that cannot be sustained — arriving at
+    // B81's rebuffering from the opposite direction. Two independent guards, so
+    // neither one silently becoming untrue re-opens it:
+    //   1. the body is incompressible noise, so compressing it gains nothing;
+    //   2. `Content-Encoding: identity` tells every compressing layer (actix
+    //      middleware, angie, any future CDN) to leave it alone.
     let n = q.size.min(50 * 1024 * 1024); // cap at 50 MB so abuse can't DoS
     HttpResponse::Ok()
         .content_type("application/octet-stream")
-        .body(vec![0u8; n])
+        .insert_header((actix_web::http::header::CONTENT_ENCODING, "identity"))
+        .body(incompressible(n))
 }
 
 async fn system_configuration() -> impl Responder {
@@ -1106,5 +1139,80 @@ mod media_segments_tests {
         let got = folder_storage(None, "/var/lib/pharos/cache")
             .expect("advertised fallback resolves to an existing ancestor");
         assert_eq!(got.path, "/var/lib/pharos/cache");
+    }
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use actix_web::{test, App};
+
+    #[::core::prelude::v1::test]
+    fn the_bitrate_payload_does_not_compress() {
+        // B161 — the ONE property this body must have. It used to be
+        // `vec![0u8; n]`, which gzips to nothing, so any compressing layer
+        // would have made the client measure a link ~1000x faster than it is
+        // and pick an unsustainable bitrate. Asserted structurally rather than
+        // by running a compressor, so the test needs no new dependency: zeros
+        // (and any cheap filler) collapse to a handful of distinct byte values
+        // and long runs, and noise does neither.
+        let bytes = incompressible(3_000_000);
+        assert_eq!(bytes.len(), 3_000_000, "must return exactly what was asked");
+
+        let distinct = bytes
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct > 250,
+            "payload must span the byte range, got {distinct} distinct values"
+        );
+
+        let longest_run = bytes
+            .windows(2)
+            .fold((1usize, 1usize), |(best, cur), w| {
+                let cur = if w[0] == w[1] { cur + 1 } else { 1 };
+                (best.max(cur), cur)
+            })
+            .0;
+        assert!(
+            longest_run < 16,
+            "payload must not contain long runs, got a run of {longest_run}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_short_bitrate_payload_is_still_exact() {
+        // The client divides the count it ASKED for by the elapsed time, so a
+        // body that is off by even one byte skews the measurement.
+        for n in [0usize, 1, 7, 8, 9, 4095] {
+            assert_eq!(incompressible(n).len(), n);
+        }
+    }
+
+    #[actix_web::test]
+    async fn the_bitrate_response_refuses_to_be_encoded() {
+        // Belt and braces alongside the incompressible body: an explicit
+        // identity encoding tells actix's compressor, angie and any future CDN
+        // to leave this response alone.
+        let app = test::init_service(
+            App::new().route("/playback/bitratetest", web::get().to(bitrate_test)),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/playback/bitratetest?size=1024")
+            .insert_header(("accept-encoding", "gzip, br"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get(actix_web::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("identity"),
+        );
+        assert_eq!(test::read_body(resp).await.len(), 1024);
     }
 }
