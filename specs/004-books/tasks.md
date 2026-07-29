@@ -40,9 +40,9 @@ compiling and revertable alone (CLAUDE.md). The boundaries follow plan.md
 
 **Purpose**: three pure-Rust readers, and nothing else
 
-- [ ] T001 Add `zip`, `sevenz-rust` and `lopdf` to `[workspace.dependencies]` in `Cargo.toml` and as `*.workspace = true` in `crates/pharos-scanner/Cargo.toml`. Do **not** add an XML crate — `quick-xml` is already a `pharos-scanner` dependency (`crates/pharos-scanner/Cargo.toml:29`) and handles `container.xml`, the OPF and `ComicInfo.xml`
-- [ ] T002 Run `nix develop --command just hakari-regen` and commit the regenerated `crates/workspace-hack/Cargo.toml` **together with** `Cargo.lock` (a stale hack crate fails CI's `just hakari-check`; an uncommitted `Cargo.lock` breaks the Nix `buildRustPackage` build) — **COMMIT**
-- [ ] T003 Confirm no C dependency crept in: `nix develop --command cargo tree -p pharos-scanner -e no-dev | grep -iE '\-sys$'` names nothing new. This is load-bearing — it is the same constraint that rules out a PDF rasteriser (R11) and a rar reader (R7)
+- [X] T001 Add `zip`, `sevenz-rust` and `lopdf` to `[workspace.dependencies]` in `Cargo.toml` and as `*.workspace = true` in `crates/pharos-scanner/Cargo.toml`. Do **not** add an XML crate — `quick-xml` is already a `pharos-scanner` dependency (`crates/pharos-scanner/Cargo.toml:29`) and handles `container.xml`, the OPF and `ComicInfo.xml`
+- [X] T002 Run `nix develop --command just hakari-regen` and commit the regenerated `crates/workspace-hack/Cargo.toml` **together with** `Cargo.lock` (a stale hack crate fails CI's `just hakari-check`; an uncommitted `Cargo.lock` breaks the Nix `buildRustPackage` build) — **COMMIT**
+- [X] T003 Confirm no C dependency crept in: `nix develop --command cargo tree -p pharos-scanner -e no-dev | grep -iE '\-sys$'` names nothing new. This is load-bearing — it is the same constraint that rules out a PDF rasteriser (R11) and a rar reader (R7)
 
 **Checkpoint**: `cargo build --workspace --locked` succeeds, new deps unused.
 

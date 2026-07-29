@@ -19,6 +19,7 @@ actix-router = { version = "0.5", default-features = false, features = ["http", 
 actix-rt = { version = "2" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
+byteorder = { version = "1" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
@@ -38,9 +39,11 @@ hashbrown = { version = "0.14", default-features = false, features = ["ahash", "
 indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
+md-5 = { version = "0.10" }
 memchr = { version = "2" }
 metrics-util = { version = "0.17" }
 mio = { version = "1", features = ["net", "os-ext"] }
+nom = { version = "7" }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -54,6 +57,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = { version = "0.10" }
+simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 socket2-3b31131e45eafb45 = { package = "socket2", version = "0.6", default-features = false, features = ["all"] }
@@ -62,6 +66,7 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "migra
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -74,6 +79,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
+byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
@@ -90,8 +96,10 @@ getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-f
 indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
+md-5 = { version = "0.10" }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
+nom = { version = "7" }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
