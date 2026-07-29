@@ -170,6 +170,16 @@ pub enum AlbumArtMiss {
     NoCandidates { query: String },
     /// Candidates came back but none reached [`MIN_ALBUM_CONFIDENCE`].
     BelowConfidence { best: String, confidence: f32 },
+    /// B159 — candidates matched the TITLE well enough but every one of them
+    /// credits a different artist, so the release-group belongs to somebody
+    /// else. Distinct from `BelowConfidence`: the title is not the problem, and
+    /// reporting it as one produced log lines that contradicted themselves
+    /// ("scored 0.95, below 0.85").
+    ArtistMismatch {
+        best: String,
+        want: String,
+        have: String,
+    },
     /// A release-group matched but the Cover Art Archive has no front cover
     /// for it — common for bootlegs and small labels.
     NoCoverArt { mbid: String },
@@ -185,6 +195,7 @@ impl AlbumArtMiss {
             Self::NoAlbumTag => "no_album_tag",
             Self::NoCandidates { .. } => "no_candidates",
             Self::BelowConfidence { .. } => "below_confidence",
+            Self::ArtistMismatch { .. } => "artist_mismatch",
             Self::NoCoverArt { .. } => "no_cover_art",
             Self::Unavailable { .. } => "unavailable",
         }
@@ -201,6 +212,10 @@ impl std::fmt::Display for AlbumArtMiss {
             Self::BelowConfidence { best, confidence } => write!(
                 f,
                 "best release-group `{best}` scored {confidence:.2}, below {MIN_ALBUM_CONFIDENCE:.2}"
+            ),
+            Self::ArtistMismatch { best, want, have } => write!(
+                f,
+                "release-group `{best}` matches the title but is credited to `{have}`, not `{want}`"
             ),
             Self::NoCoverArt { mbid } => {
                 write!(f, "cover art archive has no front cover for {mbid}")
@@ -558,6 +573,38 @@ fn top_by_title<'a>(title: &str, candidates: &'a [Candidate]) -> Option<(&'a Can
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
+/// Name the disqualifier that actually fired when nothing survived ranking.
+///
+/// B159 — [`ranked_by_title`] rejects on TWO independent grounds (the credited
+/// artist is inconsistent, or the title is below the floor) and the caller used
+/// to report both as a confidence shortfall, quoting [`top_by_title`]'s score,
+/// which ignores the artist filter. The result contradicted itself in
+/// production: "best release-group `Experience` scored 0.95, below 0.85". A
+/// reason that names the wrong cause is worse than a bare one, because it sends
+/// the reader to tune a threshold that was never consulted.
+fn classify_miss(
+    scored_title: &str,
+    artist: Option<&str>,
+    candidates: &[Candidate],
+    query: String,
+) -> AlbumArtMiss {
+    match top_by_title(scored_title, candidates) {
+        // Cleared the title floor, so the artist check is what rejected it.
+        Some((c, confidence)) if confidence >= MIN_ALBUM_CONFIDENCE => {
+            AlbumArtMiss::ArtistMismatch {
+                best: c.title.clone(),
+                want: artist.unwrap_or("<none>").to_string(),
+                have: c.artist.clone().unwrap_or_else(|| "<none>".into()),
+            }
+        }
+        Some((c, confidence)) => AlbumArtMiss::BelowConfidence {
+            best: c.title.clone(),
+            confidence,
+        },
+        None => AlbumArtMiss::NoCandidates { query },
+    }
+}
+
 /// Render an error and every cause beneath it.
 ///
 /// `reqwest`'s `Display` stops at "error sending request for url (...)", which
@@ -771,13 +818,7 @@ impl MusicBrainzClient {
             // Remember the miss — with its REASON — so the album's other tracks
             // neither re-run a rate-limited search nor report a cause that was
             // never diagnosed.
-            let miss = match top_by_title(&scored_title, &candidates) {
-                Some((c, confidence)) => AlbumArtMiss::BelowConfidence {
-                    best: c.title.clone(),
-                    confidence,
-                },
-                None => AlbumArtMiss::NoCandidates { query },
-            };
+            let miss = classify_miss(&scored_title, artist, &candidates, query);
             self.memo.lock().await.insert(key, Err(miss.clone()));
             return Err(miss);
         }
@@ -1034,6 +1075,64 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_artist_is_reported_as_such_not_as_a_low_score() {
+        // B159 — `ranked_by_title` rejects on two independent grounds, and the
+        // miss arm used to report both as a confidence shortfall while quoting
+        // `top_by_title`'s score, which ignores the artist filter. Live result:
+        // "best release-group `Experience` scored 0.95, below 0.85" — a reason
+        // that contradicts itself and sends the reader to tune a floor that was
+        // never consulted.
+        let candidates = vec![Candidate {
+            id: "mbid-1".into(),
+            title: "Experience".into(),
+            year: Some(1992),
+            artist: Some("Somebody Else".into()),
+        }];
+        // Title alone clears the floor...
+        let (top, score) = top_by_title("Experience", &candidates).unwrap();
+        assert_eq!(top.title, "Experience");
+        assert!(
+            score >= MIN_ALBUM_CONFIDENCE,
+            "title similarity {score} must clear the floor for this test to mean anything"
+        );
+        // ...so nothing survives, and the ONLY honest reason is the artist.
+        assert!(ranked_by_title("Experience", Some("The Prodigy"), &candidates).is_empty());
+
+        // Route it the way the caller does — the point is WHICH reason is
+        // chosen, not how it prints.
+        let miss = classify_miss("Experience", Some("The Prodigy"), &candidates, "q".into());
+        assert_eq!(miss.label(), "artist_mismatch");
+        let text = miss.to_string();
+        for needle in ["Experience", "The Prodigy", "Somebody Else"] {
+            assert!(text.contains(needle), "reason must name {needle}: {text}");
+        }
+        assert!(
+            !text.contains("below"),
+            "an artist rejection must not be dressed up as a score: {text}"
+        );
+
+        // A genuinely poor title still reports as a confidence shortfall.
+        let far = vec![Candidate {
+            id: "mbid-2".into(),
+            title: "Something Entirely Different".into(),
+            year: None,
+            artist: Some("The Prodigy".into()),
+        }];
+        assert_eq!(
+            classify_miss("Experience", Some("The Prodigy"), &far, "q".into()).label(),
+            "below_confidence"
+        );
+        // No candidates at all still names the query.
+        assert_eq!(
+            classify_miss("Experience", Some("The Prodigy"), &[], "the-query".into()).to_string(),
+            AlbumArtMiss::NoCandidates {
+                query: "the-query".into()
+            }
+            .to_string()
+        );
+    }
+
+    #[test]
     fn album_key_folds_tag_casing() {
         assert_eq!(
             album_key(Some("Owl City"), "Ocean Eyes"),
@@ -1051,6 +1150,11 @@ mod tests {
             AlbumArtMiss::BelowConfidence {
                 best: "b".into(),
                 confidence: 0.1,
+            },
+            AlbumArtMiss::ArtistMismatch {
+                best: "b".into(),
+                want: "w".into(),
+                have: "h".into(),
             },
             AlbumArtMiss::NoCoverArt { mbid: "m".into() },
             AlbumArtMiss::Unavailable { cause: "c".into() },
