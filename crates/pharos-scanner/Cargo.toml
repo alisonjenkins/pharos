@@ -27,6 +27,11 @@ notify = { version = "8", optional = true }
 # tags, which the streaming event reader handles cleanly without a rigid
 # derive.
 quick-xml = { workspace = true }
+# 004-books — book containers. `quick-xml` above is reused for the epub OPF,
+# `META-INF/container.xml` and `ComicInfo.xml`; no new XML crate is needed.
+zip = { workspace = true }
+sevenz-rust = { workspace = true }
+lopdf = { workspace = true }
 # Episode-number extraction: a faithful port of Emby.Naming's ordered
 # expression list (SxxEyy, 1x02, EP12, absolute anime numbering, …).
 regex = "1"

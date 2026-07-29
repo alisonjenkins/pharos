@@ -50,6 +50,24 @@ dioxus = { version = "0.7", default-features = false, features = ["macro", "html
 dioxus-web = { version = "0.7", default-features = false }
 gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 quick-xml = "0.41"
+# 004-books — book containers. All three are PURE RUST with no `-sys` crate,
+# which is load-bearing: single-binary deploy with no runtime dependency
+# beyond ffmpeg is what rules out a PDF rasteriser (R11) and a rar reader
+# (R7). An epub IS a zip, so `zip` covers epub and cbz both.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sevenz-rust = { version = "0.6", default-features = false }
+# PDF page tree + info dictionary only. `lopdf` parses; it does NOT render,
+# and nothing in this workspace can — see R11.
+#
+# `nom_parser`, NOT `pom_parser`: lopdf 0.34.0's pom variant does not compile
+# (its own reader.rs calls `parser::indirect_object` with 5 args while the pom
+# `indirect_object` takes 4 — upstream bug in that feature combination).
+# `nom_parser` is lopdf's default and the maintained path.
+#
+# Deliberately NOT enabling `embed_image`, which pulls the `image` crate.
+# R11 rests on there being no raster decoder in this workspace; a cover is
+# extracted only when it is ALREADY a JPEG, so nothing needs to decode one.
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
