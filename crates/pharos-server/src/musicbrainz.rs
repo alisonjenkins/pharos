@@ -73,7 +73,9 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 /// v1 — initial ladder: exact `(album artist, album)` only.
 /// v2 — B142: edition qualifiers stripped, compilation placeholders dropped,
 ///      title-only last resort.
-pub const ALBUM_ART_QUERY_VERSION: u32 = 2;
+/// v3 — B144: unquoted final rung, so a tag truncated mid-word can still find
+///      its release-group.
+pub const ALBUM_ART_QUERY_VERSION: u32 = 3;
 
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
@@ -356,7 +358,38 @@ pub(crate) fn search_attempts(artist: Option<&str>, album: &str) -> Vec<String> 
     if effective_artist.is_some() {
         push(release_group_query(None, &stripped));
     }
+    // Final rung: the same words UNQUOTED. Every rung above is a quoted phrase,
+    // which Lucene matches exactly — so a tag truncated mid-word finds nothing
+    // at all, however close it is. `Always Outnumbered Never Outgu` (a real tag
+    // in this library, clipped by whatever wrote it) misses every quoted query
+    // and would score 0.88 against `Always Outnumbered, Never Outgunned` if the
+    // search ever returned it. Unquoted, Lucene scores partial matches and does.
+    //
+    // This rung is only safe because acceptance is still gated on
+    // `MIN_ALBUM_CONFIDENCE` — a loose query returns loose candidates, and the
+    // similarity floor is what stops one becoming a wrong cover.
+    if let Some(q) = unquoted_query(&stripped) {
+        push(q);
+    }
     out
+}
+
+/// An unquoted Lucene release-group query — the words, not the phrase.
+///
+/// `None` when the title has nothing to search on once Lucene's operators are
+/// removed, which would otherwise produce a query matching everything.
+fn unquoted_query(album: &str) -> Option<String> {
+    // Drop the characters Lucene reads as syntax rather than escaping them: a
+    // bare `-` is NOT, a bare `:` opens a field, and an unbalanced bracket is a
+    // parse error. What is left is the words.
+    let words: Vec<&str> = album
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(format!("releasegroup:({})", words.join(" ")))
 }
 
 /// Render an error and every cause beneath it.
@@ -871,15 +904,17 @@ mod tests {
             "the most specific query must come first"
         );
         // A clean title adds no stripped-title rung — only the drop-the-artist
-        // last resort, reached solely when the exact query found nothing.
-        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        // and unquoted last resorts, reached solely when earlier rungs found
+        // nothing.
+        assert_eq!(attempts.len(), 3, "{attempts:?}");
         assert!(!attempts[1].contains("artist:"));
+        assert!(attempts[2].starts_with("releasegroup:("));
     }
 
     #[test]
     fn a_qualified_title_falls_back_to_the_stripped_one_then_to_no_artist() {
         let attempts = search_attempts(Some("Coldplay"), "A Rush Of Blood To The Head (Japan)");
-        assert_eq!(attempts.len(), 3, "{attempts:?}");
+        assert_eq!(attempts.len(), 4, "{attempts:?}");
         // Most specific first — the exact tag still gets its chance.
         assert!(attempts[0].contains(r"\(Japan\)"));
         assert!(
@@ -897,6 +932,44 @@ mod tests {
     // reqwest's Display stops at "error sending request for url (...)", which
     // names the request and not the failure. Six live misses said exactly that
     // and none said whether it was DNS, TLS, a timeout or a refusal.
+    // Every quoted rung is an exact Lucene phrase, so a tag clipped mid-word
+    // finds nothing however close it is. `Always Outnumbered Never Outgu` is a
+    // real tag in this library.
+    #[test]
+    fn a_truncated_tag_gets_an_unquoted_rung() {
+        let attempts = search_attempts(Some("The Prodigy"), "Always Outnumbered Never Outgu");
+        let last = attempts.last().expect("at least one attempt");
+        assert_eq!(
+            last, "releasegroup:(Always Outnumbered Never Outgu)",
+            "the final rung must be unquoted so Lucene scores partial matches"
+        );
+        // It is genuinely LAST — the exact phrase still gets first refusal.
+        assert!(attempts[0].contains('"'));
+
+        // And the truncated tag would clear the confidence floor once the
+        // search returns the real album, which is the whole point of the rung.
+        let real = "Always Outnumbered, Never Outgunned";
+        let score = pharos_core::title_similarity("Always Outnumbered Never Outgu", real);
+        assert!(
+            score >= MIN_ALBUM_CONFIDENCE,
+            "clipped tag scored {score} against {real}, below the {MIN_ALBUM_CONFIDENCE} floor"
+        );
+    }
+
+    #[test]
+    fn the_unquoted_rung_drops_lucene_operators_rather_than_escaping_them() {
+        // A bare `-` is NOT, a bare `:` opens a field, an unbalanced bracket is
+        // a parse error. Unquoted, they have to go entirely.
+        assert_eq!(
+            unquoted_query("Ministry of Sound: Anthems II: 1991-2009").as_deref(),
+            Some("releasegroup:(Ministry of Sound Anthems II 1991 2009)")
+        );
+        // Nothing searchable left -> no rung, rather than a query matching
+        // everything.
+        assert_eq!(unquoted_query("---").as_deref(), None);
+        assert_eq!(unquoted_query("").as_deref(), None);
+    }
+
     #[test]
     fn error_chain_reports_the_cause_not_just_the_request() {
         #[derive(Debug)]
