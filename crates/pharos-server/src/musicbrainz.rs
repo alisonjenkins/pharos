@@ -75,6 +75,7 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      title-only last resort.
 /// v3 — B144: unquoted final rung, so a tag truncated mid-word can still find
 ///      its release-group. INEFFECTIVE — see v4.
+/// v8 — B152: a blank artist tag no longer shadows a good one.
 /// v7 — B150: a candidate's credited artist must be consistent with the tag.
 /// v6 — B148: a coverless release-group falls through to its siblings.
 /// v5 — B147: scoring drops `match_best`'s year penalty, which had made the
@@ -83,7 +84,7 @@ const MIN_ALBUM_CONFIDENCE: f32 = 0.85;
 ///      search ANDs bare terms, so an unquoted `... Outgu` still required the
 ///      clipped token to match something and returned nothing; `Outgu*` is
 ///      what a truncated tag actually needs.
-pub const ALBUM_ART_QUERY_VERSION: u32 = 7;
+pub const ALBUM_ART_QUERY_VERSION: u32 = 8;
 
 /// The `match_external_id` written beside a miss, carrying the query version
 /// that reached it. Distinguishable from a hit (a release-group MBID) by shape,
