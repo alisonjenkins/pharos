@@ -1053,6 +1053,9 @@ async fn list_albums(
                 genres: Some(Vec::new()),
                 tags: Some(Vec::new()),
                 album_artist: artist.clone(),
+                // `Artists` (strings) as well as `AlbumArtists` (NameGuidPair):
+                // see SynthItemDto::artists for why the client needs both.
+                artists: artist.as_ref().map(|a| vec![a.clone()]),
                 album_artists: artist.as_ref().map(|a| {
                     vec![NameGuidPairDto {
                         name: a.clone(),
@@ -3717,6 +3720,12 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
         child_count: Some(a.child_count),
         production_year: a.year.map(|y| y as i32),
         album_artist: a.album_artist.clone(),
+        // `Artists` (strings) as well as `AlbumArtists` (NameGuidPair):
+        // see SynthItemDto::artists for why the client needs both.
+        artists: a
+            .album_artist
+            .as_deref()
+            .map(|artist| vec![artist.to_string()]),
         album_artists: a.album_artist.as_deref().map(|artist| {
             vec![NameGuidPairDto {
                 name: artist.to_string(),
@@ -5194,6 +5203,9 @@ async fn synth_album_or_artist(
             )
         };
         if let Some(a) = artist {
+            // `Artists` (strings) as well as `AlbumArtists` (NameGuidPair) —
+            // see SynthItemDto::artists for why the client needs both.
+            it.artists = Some(vec![a.clone()]);
             it.album_artists = Some(vec![NameGuidPairDto {
                 name: a.clone(),
                 id: artist_id_for(&a),

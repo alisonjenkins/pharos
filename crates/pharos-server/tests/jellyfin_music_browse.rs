@@ -508,3 +508,56 @@ async fn an_album_with_no_art_advertises_no_primary_tag() {
         }
     }
 }
+
+// B151 — jellyfin-androidtv builds a MusicAlbum card's title as
+// `artists?.joinToString() ?: albumArtists?.joinToString() ?: albumArtist`
+// plus the name. `albumArtists` is a List<NameGuidPair>, so joinToString calls
+// Kotlin's data-class toString on each element: with `Artists` absent the album
+// grid showed `NameGuidPair(name=Owl City, id=…) - Ocean Eyes` where the album
+// name belongs. Every surface that offers AlbumArtists must also offer Artists.
+#[actix_web::test]
+async fn a_music_album_offers_its_artists_as_plain_strings() {
+    let (state, token) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let artist = artist_id_for("Limp Bizkit");
+    for uri in [
+        "/Albums".to_string(),
+        "/Items?IncludeItemTypes=MusicAlbum&Recursive=true".to_string(),
+        format!("/Items?ParentId={artist}"),
+    ] {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri(&uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let albums: Vec<_> = v["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["Type"] == "MusicAlbum")
+            .collect();
+        assert!(!albums.is_empty(), "{uri} returned no albums to check");
+        for it in albums {
+            if it.get("AlbumArtists").is_none() {
+                continue; // an album with no artist tag offers neither
+            }
+            let artists = it.get("Artists").unwrap_or_else(|| {
+                panic!("{uri}: {} offers AlbumArtists but no Artists — the card title becomes a struct dump: {it}", it["Name"])
+            });
+            let list = artists.as_array().expect("Artists must be an array");
+            assert!(
+                list.iter().all(|a| a.is_string()),
+                "{uri}: Artists must be plain strings, got {artists}"
+            );
+            assert_eq!(
+                list.first().and_then(|a| a.as_str()),
+                it["AlbumArtists"][0]["Name"].as_str(),
+                "{uri}: Artists and AlbumArtists must name the same act"
+            );
+        }
+    }
+}
