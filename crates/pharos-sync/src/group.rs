@@ -83,19 +83,29 @@ pub const UNPAUSE_GATE_TIMEOUT_MS: u64 = 5_000;
 /// gate to the anti-wedge timeout forever.
 pub const MEMBER_TTL_MS: u64 = 150_000;
 
-/// How long a member with NO SOCKET may take to reconnect before the group
-/// gives up on it.
+/// B167 — how long a group with NO connected member and no sign of life of any
+/// kind may sit before it is dissolved WHOLE.
 ///
-/// This is deliberately far longer than [`MEMBER_TTL_MS`], because the two
-/// describe opposite situations. A member that is silent WITH a live socket is
-/// a dead client holding a place in every readiness gate, and must go promptly.
-/// A member whose socket is gone already holds nothing — `follower_ids` filters
-/// on `connected` — so the only thing pruning it early achieves is destroying
-/// the membership its client is in the middle of reconnecting to.
+/// There is deliberately no per-member equivalent. A member whose socket is
+/// gone holds nothing: `follower_ids` filters on `connected`, so it blocks no
+/// readiness gate and freezes no group. Evicting it individually therefore buys
+/// only a tidier participants list, and costs a viewer their watch party — and
+/// the server cannot tell "closed the tab" from "reconnecting" at all, because
+/// the only evidence is silence, which both produce.
 ///
-/// Sized for a WAN client's exponential socket backoff after a deploy: the
-/// eviction this fixes missed the old 150 s window by 12 seconds.
-pub const DISCONNECTED_TTL_MS: u64 = 600_000;
+/// Every attempt to separate them with a duration has failed, in the same
+/// direction, twice: 150 s evicted a member 12 s before its client reconnected,
+/// so it became 600 s; then a deploy on 2026-07-29 closed every socket in a
+/// party and the clients took 12, 22 and 22 minutes to come back, so 600 s
+/// evicted the two people who were quietly watching while sparing the one
+/// pressing buttons. A third number would fail the same way — there is no
+/// reconnect delay a browser cannot exceed.
+///
+/// So the decision moved off the member and onto the GROUP, where the evidence
+/// is unambiguous: if not one member has a socket and nobody has made a sound,
+/// there is no watch party left to protect. It survives whole or it dies whole;
+/// it is never quietly thinned. Sized far beyond any observed blackout.
+pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 
 /// How often the actor sweeps for TTL-expired members.
 const MEMBER_PRUNE_TICK_MS: u64 = 30_000;
@@ -1597,8 +1607,9 @@ impl GroupState {
         // Stamp every restored member "seen now", but NOT connected: a
         // hydrated member is one whose socket this replica has never seen. It
         // therefore holds no readiness gate until its `/socket` registers (and
-        // `ResyncMember` marks it connected), and it is pruned on the long
-        // DISCONNECTED_TTL_MS reconnect grace rather than the ghost TTL.
+        // `ResyncMember` marks it connected), and (B167) it is never pruned
+        // individually at all — only GROUP_ABANDONED_MS can reap it, with the
+        // rest of a group nobody came back to.
         // Claiming `connected: true` here asserted a socket that does not
         // exist — which both made gates wait on absent members and put every
         // restored member on the short TTL, evicting one 12 s before its client
@@ -1962,49 +1973,82 @@ impl GroupHandle {
                         state.persist();
                     }
                     _ = prune_tick.tick() => {
-                        // T83 — ghost prune: members silent past MEMBER_TTL_MS
-                        // (no KeepAlive-driven ping, no clock report, no command)
-                        // are gone-for-good roster entries — typically hydrated
-                        // after a deploy from a device that never reconnected.
-                        // Removing them keeps readiness gates from waiting the
-                        // full anti-wedge timeout on every play/seek forever and
-                        // keeps the participants list honest.
                         let now = tokio::time::Instant::now();
-                        let ghosts: Vec<(MemberId, bool, u64, u64)> = state
+                        let silent_ms = |m: &MemberRec| {
+                            now.saturating_duration_since(m.last_seen).as_millis() as u64
+                        };
+
+                        // T83 — ghost prune, now scoped to the ONLY member that
+                        // costs the group anything by staying: one we still
+                        // believe holds a socket, gone silent past
+                        // MEMBER_TTL_MS. `follower_ids` counts it, so every
+                        // readiness gate waits on an ack from a dead TCP peer
+                        // until the anti-wedge timeout. It has to go.
+                        //
+                        // B167 — a DISCONNECTED member is NOT pruned here, at
+                        // any age. See GROUP_ABANDONED_MS: it holds nothing, so
+                        // eviction buys only a tidier roster, and two graces in
+                        // a row proved that no duration separates "gone" from
+                        // "slow to reconnect". Its seat is kept until it comes
+                        // back or the whole group is abandoned.
+                        let ghosts: Vec<(MemberId, u64)> = state
                             .members
                             .iter()
-                            .filter_map(|(id, m)| {
-                                // A member with no socket is awaiting a
-                                // reconnect, not haunting the group: it holds no
-                                // gate, so it gets the far longer grace.
-                                let ttl = if m.connected { MEMBER_TTL_MS } else { DISCONNECTED_TTL_MS };
-                                let silent_ms =
-                                    now.saturating_duration_since(m.last_seen).as_millis() as u64;
-                                (silent_ms > ttl).then_some((*id, m.connected, silent_ms, ttl))
-                            })
+                            .filter(|(_, m)| m.connected && silent_ms(m) > MEMBER_TTL_MS)
+                            .map(|(id, m)| (*id, silent_ms(m)))
                             .collect();
-                        if !ghosts.is_empty() {
-                            for (id, connected, silent_ms, ttl_ms) in ghosts {
-                                // Carry the values the verdict was reached ON.
-                                // "pruned as a ghost" alone cost an evening of
-                                // reconstruction (B167): the log named neither
-                                // how long the member had been silent nor which
-                                // grace it was judged against, so there was no
-                                // way to tell a dead client from a live one that
-                                // was merely slower to reconnect than a constant
-                                // somebody guessed.
-                                tracing::info!(
-                                    group = %state.id, member = %id, connected,
-                                    silent_ms, ttl_ms,
-                                    "syncplay: pruning unresponsive member (ghost)"
-                                );
-                                metrics::counter!(
-                                    "pharos_syncplay_member_pruned_total",
-                                    "connected" => if connected { "true" } else { "false" },
-                                )
+                        let pruned_any = !ghosts.is_empty();
+                        for (id, silent) in ghosts {
+                            // Carry the values the verdict was reached ON.
+                            // "pruned as a ghost" alone cost an evening of
+                            // reconstruction (B167): the log named neither how
+                            // long the member had been silent nor which grace it
+                            // was judged against.
+                            tracing::info!(
+                                group = %state.id, member = %id, connected = true,
+                                silent_ms = silent, ttl_ms = MEMBER_TTL_MS,
+                                "syncplay: pruning unresponsive member (dead socket)"
+                            );
+                            metrics::counter!(
+                                "pharos_syncplay_member_pruned_total",
+                                "connected" => "true",
+                            )
+                            .increment(1);
+                            remove_member(&mut state, id);
+                        }
+
+                        // The retained population, as a number rather than as
+                        // an absence of log lines: members holding a seat while
+                        // their client reconnects. If this sits high forever,
+                        // reconnects are broken — which is exactly what nobody
+                        // could see on 2026-07-29.
+                        let awaiting = state.members.values().filter(|m| !m.connected).count();
+                        metrics::gauge!("pharos_syncplay_members_awaiting_reconnect")
+                            .set(awaiting as f64);
+
+                        // B167 / B29 — abandonment is decided for the group as a
+                        // whole: nobody holds a socket AND nothing has been heard
+                        // from anyone (HTTP commands count) for GROUP_ABANDONED_MS.
+                        // This is what still reaps orphaned snapshots after a
+                        // restart nobody returns from, without ever thinning a
+                        // group that still has someone in it.
+                        let quiet_ms = state.members.values().map(silent_ms).min().unwrap_or(0);
+                        let abandoned = !state.members.is_empty()
+                            && state.members.values().all(|m| !m.connected)
+                            && quiet_ms > GROUP_ABANDONED_MS;
+                        if abandoned {
+                            tracing::info!(
+                                group = %state.id,
+                                members = state.members.len(),
+                                quiet_ms,
+                                threshold_ms = GROUP_ABANDONED_MS,
+                                "syncplay: dissolving abandoned group (no sockets, no activity)"
+                            );
+                            metrics::counter!("pharos_syncplay_group_dissolved_total")
                                 .increment(1);
-                                remove_member(&mut state, id);
-                            }
+                            state.members.clear();
+                        }
+                        if pruned_any || abandoned {
                             state.persist();
                         }
                     }
@@ -3248,11 +3292,17 @@ mod tests {
         );
     }
 
-    /// The reconnect grace is a grace, not an amnesty: a socket that never comes
-    /// back still leaves the roster, or a group accumulates dead members
-    /// forever.
+    /// B167 — THE regression test for the 2026-07-29 eviction. A deploy closed
+    /// every socket in a watch party; two members' browsers took 22 minutes to
+    /// reconnect, and the 600 s grace removed them mid-film while the third —
+    /// who happened to keep pressing buttons, refreshing its `last_seen` — was
+    /// spared. Quietly watching must not be what gets you evicted.
+    ///
+    /// This test previously asserted the OPPOSITE (a disconnected member is
+    /// pruned once the grace lapses). That contract is what broke the party:
+    /// it treats silence as death, and a reconnecting client is silent.
     #[tokio::test(start_paused = true)]
-    async fn a_disconnected_member_that_never_returns_is_still_pruned() {
+    async fn a_disconnected_member_keeps_its_seat_while_the_group_is_alive() {
         let (h, sinks) = spawn_group();
         let stayed = MemberId::new();
         let gone = MemberId::new();
@@ -3261,7 +3311,10 @@ mod tests {
         h.tx.send(GroupMsg::MemberSocketLost { member_id: gone })
             .await
             .unwrap();
-        let ticks = (DISCONNECTED_TTL_MS / MEMBER_PRUNE_TICK_MS) + 2;
+
+        // An hour — six times the old grace, and well past the 22 minutes a
+        // real browser took.
+        let ticks = (3_600_000 / MEMBER_PRUNE_TICK_MS) + 2;
         for _ in 0..ticks {
             tokio::time::advance(Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
             h.tx.send(GroupMsg::MemberPing { member_id: stayed })
@@ -3269,10 +3322,71 @@ mod tests {
                 .unwrap();
             let _ = snapshot_of(&h).await;
         }
+
+        let mut participants = snapshot_of(&h).await.participants;
+        participants.sort();
         assert_eq!(
-            snapshot_of(&h).await.participants,
-            vec!["stayed".to_string()],
-            "a socket that never returns is eventually pruned"
+            participants,
+            vec!["gone".to_string(), "stayed".to_string()],
+            "a member whose socket is gone holds no gate and blocks nothing — \
+             evicting it only destroys the membership its client is trying to \
+             reconnect to"
+        );
+
+        // And the seat is still there to come back to.
+        h.tx.send(GroupMsg::ResyncMember { member_id: gone })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert_eq!(
+            snapshot_of(&h).await.participants.len(),
+            2,
+            "the returning member rejoins its own group, not a new one"
+        );
+    }
+
+    /// The other half of B167: retention is not amnesty. A group where NOBODY
+    /// holds a socket and nothing has been heard from anyone is over, and is
+    /// dissolved WHOLE — never thinned member by member.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_nobody_returns_to_is_dissolved_whole() {
+        let (h, sinks) = spawn_group();
+        let a = MemberId::new();
+        let b = MemberId::new();
+        let _rx_a = join(&h, &sinks, a, "a").await;
+        let _rx_b = join(&h, &sinks, b, "b").await;
+        for id in [a, b] {
+            h.tx.send(GroupMsg::MemberSocketLost { member_id: id })
+                .await
+                .unwrap();
+        }
+        let _ = snapshot_of(&h).await;
+
+        // Halfway to the threshold the party is still intact — dissolution is
+        // not just "eventually", it is bounded below too.
+        for _ in 0..((GROUP_ABANDONED_MS / 2) / MEMBER_PRUNE_TICK_MS) {
+            tokio::time::advance(Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
+            let _ = snapshot_of(&h).await;
+        }
+        assert_eq!(
+            snapshot_of(&h).await.participants.len(),
+            2,
+            "a group must not dissolve before the abandonment threshold"
+        );
+
+        for _ in 0..((GROUP_ABANDONED_MS / 2) / MEMBER_PRUNE_TICK_MS) + 2 {
+            tokio::time::advance(Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..200 {
+            if h.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            h.tx.is_closed(),
+            "an abandoned group must dissolve, or orphans haunt the join picker"
         );
     }
 
@@ -3394,10 +3508,11 @@ mod tests {
 
     /// B29 — a hydrated group whose members NEVER reconnect must dissolve by
     /// itself: hydration stamps the roster "seen now" but NOT connected, the
-    /// prune reaps everyone after the DISCONNECTED_TTL_MS reconnect grace, and
-    /// the emptied actor terminates AND deletes its persisted snapshot. This is
-    /// what keeps orphaned snapshots (pod restarted, everyone gone) from
-    /// haunting the join picker for 48h.
+    /// group is declared abandoned after GROUP_ABANDONED_MS (B167 moved this
+    /// verdict from the member to the group), and the emptied actor terminates
+    /// AND deletes its persisted snapshot. This is what keeps orphaned
+    /// snapshots (pod restarted, everyone gone) from haunting the join picker
+    /// for 48h.
     #[tokio::test(start_paused = true)]
     async fn hydrated_group_with_no_show_members_dissolves_and_removes_snapshot() {
         // Produce a REAL snapshot: an actor with one member persists its state.
@@ -3429,9 +3544,9 @@ mod tests {
             Some(&json),
         );
 
-        // Reconnect grace (600s) + prune tick (30s) → the no-show roster is
+        // Abandonment threshold + prune tick (30s) → the no-show roster is
         // reaped and the actor dissolves. Advance well past it.
-        for _ in 0..((DISCONNECTED_TTL_MS / MEMBER_PRUNE_TICK_MS) + 2) {
+        for _ in 0..((GROUP_ABANDONED_MS / MEMBER_PRUNE_TICK_MS) + 2) {
             tokio::time::advance(Duration::from_secs(30)).await;
             tokio::task::yield_now().await;
         }
