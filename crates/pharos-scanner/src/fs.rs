@@ -18,7 +18,16 @@ use crate::metadata::{
 };
 
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
+    // Media — handed to the prober.
     "mkv", "mp4", "mov", "avi", "webm", "m4v", "flac", "mp3", "opus", "m4a", "ogg", "wav",
+    // 004-books — books, which must be WALKED but never probed. `probe_one`
+    // branches on `book::is_book_path` before touching the prober: an epub is
+    // not a media container, ffprobe/libav fails on it, and V6 makes a probe
+    // miss write nothing — so a book handed to ffmpeg is an item that never
+    // exists. Kept in one list because "does pharos walk this file" is a single
+    // question; "can a client read it" is a different one, answered by
+    // `BookFormat::readable_by_client`.
+    "epub", "pdf", "cbz", "cbr", "cbt", "cb7", "mobi", "azw3",
 ];
 
 /// SIMD-accelerated stable ID for a path. xxh3_64 hashes UTF-8 bytes,
@@ -984,8 +993,60 @@ impl<P: Prober> FsScanner<P> {
         self.resolver.resolve(&req).await
     }
 
+    /// 004-books — build a `MediaItem` for a book path, or `None` when the path
+    /// is not a book.
+    ///
+    /// No ffmpeg, no probe, no async: reading a book is a filesystem + parse
+    /// operation. The `MediaProbe` stays `default()`, which `MediaItem.probe`
+    /// already documents as the "a row can exist without probe data" case, so no
+    /// struct gymnastics are needed.
+    ///
+    /// The title is the filename stem. A book's real title comes from its OPF or
+    /// `ComicInfo.xml` via the metadata resolver, which runs later and overrides
+    /// this; the stem guarantees FR-007's "no book is ever listed untitled" even
+    /// when the file carries no metadata at all.
+    fn book_item(&self, path: &Path) -> Option<MediaItem> {
+        let book = crate::book::read_book_meta(path)?;
+        let title = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        // Stat for size only. Everything else on `MediaProbe` describes streams
+        // a book does not have.
+        let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
+        Some(MediaItem {
+            id: stable_id(path),
+            path: path.to_path_buf(),
+            title,
+            kind: MediaKind::Book,
+            book: Some(book),
+            probe: pharos_core::MediaProbe {
+                size_bytes,
+                ..Default::default()
+            },
+            series: None,
+            created_at: None,
+            metadata: Default::default(),
+            has_primary_art: false,
+            art_version: 0,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
+        })
+    }
+
     #[tracing::instrument(skip(self), fields(media.path = %path.display()))]
     async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
+        // 004-books / FR-001 — classify BEFORE the prober is reached. This is
+        // not an optimisation: `self.prober.probe` fails on an epub, the `Err`
+        // arm below writes nothing (V6), and the item would never exist. The
+        // ordering IS the feature.
+        if let Some(item) = self.book_item(&path) {
+            return Some(item);
+        }
         match self.prober.probe(&path).await {
             Ok(info) => {
                 // Audio: the embedded track title (ID3/Vorbis TITLE) is the
@@ -2887,6 +2948,94 @@ mod tests {
         let kinds: HashSet<MediaKind> = items.iter().map(|i| i.kind).collect();
         assert!(kinds.contains(&MediaKind::Movie));
         assert!(kinds.contains(&MediaKind::Audio));
+    }
+
+    /// SC-002 — a book path must never reach the prober. This is the assertion
+    /// the whole scan design turns on: `probe_one` returns `None` when the
+    /// prober fails (V6), so an epub handed to ffmpeg is an item that never
+    /// exists. The count, not the import, is what proves the ordering.
+    ///
+    /// Verified red by moving the `book_item` branch below the
+    /// `self.prober.probe(&path)` call: the count goes to 5 — every file
+    /// probed, books included — against the 1 asserted here. In production
+    /// that probe does not merely waste a fork: it FAILS on an epub, and the
+    /// `Err` arm writes nothing, so the book silently never appears.
+    #[tokio::test]
+    async fn a_book_path_never_reaches_the_prober() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Dune.epub").await;
+        touch(td.path(), "Watchmen.cbz").await;
+        touch(td.path(), "Manual.pdf").await;
+        touch(td.path(), "Sideloaded.azw3").await;
+        // One real media file, so the test also proves the branch did not
+        // swallow the probe path wholesale.
+        touch(td.path(), "movie.mkv").await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prober = FakeProber {
+            calls: calls.clone(),
+            ..Default::default()
+        };
+        let items = FsScanner::new(prober).scan(td.path()).await.unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly the ONE media file may be probed; every book must bypass ffmpeg entirely"
+        );
+        assert_eq!(items.len(), 5, "all four books plus the movie must import");
+
+        let books: Vec<_> = items.iter().filter(|i| i.kind == MediaKind::Book).collect();
+        assert_eq!(books.len(), 4, "four book files, four Book items");
+        for b in &books {
+            assert!(
+                b.book.is_some(),
+                "{} imported as Book but carries no BookMeta",
+                b.title
+            );
+            assert_eq!(
+                b.probe.duration_ms, None,
+                "a book has no duration; MediaProbe must stay default apart from size"
+            );
+        }
+
+        // Formats are classified, not guessed uniformly.
+        let by_title = |t: &str| {
+            items
+                .iter()
+                .find(|i| i.title == t)
+                .and_then(|i| i.book.as_ref())
+                .map(|b| b.format)
+        };
+        assert_eq!(by_title("Dune"), Some(pharos_core::BookFormat::Epub));
+        assert_eq!(by_title("Watchmen"), Some(pharos_core::BookFormat::Comic));
+        assert_eq!(by_title("Manual"), Some(pharos_core::BookFormat::Pdf));
+        assert_eq!(
+            by_title("Sideloaded"),
+            Some(pharos_core::BookFormat::Unreadable),
+            ".azw3 is indexed but not readable — recorded as such, not as an epub"
+        );
+
+        // The movie still went through the prober unchanged.
+        assert_eq!(
+            items.iter().filter(|i| i.kind == MediaKind::Movie).count(),
+            1
+        );
+    }
+
+    /// FR-007 — a book with no metadata inside it still gets a title, from the
+    /// filename stem. Nothing may list untitled.
+    #[tokio::test]
+    async fn a_book_with_no_internal_metadata_is_titled_from_its_filename() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "The Left Hand of Darkness.epub").await;
+        let items = FsScanner::new(FakeProber::default())
+            .scan(td.path())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "The Left Hand of Darkness");
+        assert_eq!(items[0].kind, MediaKind::Book);
     }
 
     #[tokio::test]
