@@ -69,6 +69,30 @@ async fn seed() -> (web::Data<AppState>, String) {
         .await
         .unwrap();
 
+    // A movie too: `Path` is Fields-gated for every kind EXCEPT books, so the
+    // gate itself can only be tested on a non-book item.
+    stores
+        .put(MediaItem {
+            id: 43,
+            path: "/media/Movies/Alien.mkv".into(),
+            title: "Alien".into(),
+            kind: MediaKind::Movie,
+            book: None,
+            probe: MediaProbe::default(),
+            series: None,
+            created_at: Some(1_700_000_000),
+            metadata: Default::default(),
+            has_primary_art: false,
+            art_version: 0,
+            match_provider: None,
+            match_external_id: None,
+            match_source: None,
+            match_confidence: None,
+            metadata_refreshed_at: None,
+        })
+        .await
+        .unwrap();
+
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     (state, token.0.expose().to_string())
 }
@@ -116,32 +140,58 @@ macro_rules! get_json {
     }};
 }
 
+/// A BOOK always carries `Path`, with or without `Fields`.
+///
+/// Proven necessary in a browser, not argued: jellyfin-web's details page
+/// fetches `/Users/{uid}/Items/{id}` with NO `Fields` and hands that object to
+/// `playbackManager`, whose readers all test `item.Path`. Gated, `Path` was
+/// absent exactly there, and clicking Play did nothing — no iframe, no
+/// `/Download` request, no error. If this is ever relaxed back to a gate, books
+/// stop opening and nothing else fails.
 #[actix_web::test]
-async fn path_is_absent_unless_the_client_asks_for_it() {
+async fn a_book_always_carries_its_path() {
     let (state, token) = seed().await;
     let app = test::init_service(app(state)).await;
 
-    // Default payload: no Path. V9 — least exposure, and a client that did not
-    // ask has no business receiving a filesystem path.
+    // No Fields at all — the request the details page actually makes.
     let body = get_json!(app, "/Items?IncludeItemTypes=Book", &token);
     let item = &body["Items"][0];
     assert_eq!(item["Name"], "Dune", "seed item not returned");
-    assert!(
-        item.get("Path").is_none(),
-        "Path must be OMITTED (not null) when Fields does not ask: {item}"
+    assert_eq!(
+        item["Path"], BOOK_PATH,
+        "a book must carry Path even unasked, or every reader declines silently"
     );
 
-    // Asked for: present, and equal to the real stored path — not a synthesised
-    // one shaped to pass the reader's extension test.
+    // The single-item fetch — the exact route that was broken.
+    let detail = get_json!(app, "/Items/42", &token);
+    assert_eq!(detail["Path"], BOOK_PATH);
+
+    // Asking explicitly still yields the REAL stored path, not a synthesised one
+    // shaped to satisfy the reader's extension test.
     let body = get_json!(
         app,
         "/Items?IncludeItemTypes=Book&Fields=CanDownload,Path",
         &token
     );
-    assert_eq!(
-        body["Items"][0]["Path"], BOOK_PATH,
-        "Fields=Path must emit the real filesystem path"
+    assert_eq!(body["Items"][0]["Path"], BOOK_PATH);
+}
+
+/// Every OTHER kind keeps the gate, so no existing payload grew.
+#[actix_web::test]
+async fn path_is_absent_for_a_non_book_unless_the_client_asks_for_it() {
+    let (state, token) = seed().await;
+    let app = test::init_service(app(state)).await;
+
+    let body = get_json!(app, "/Items?IncludeItemTypes=Movie", &token);
+    let item = &body["Items"][0];
+    assert_eq!(item["Name"], "Alien", "seed item not returned");
+    assert!(
+        item.get("Path").is_none(),
+        "a movie must not leak its path unasked — least exposure is unchanged: {item}"
     );
+
+    let body = get_json!(app, "/Items?IncludeItemTypes=Movie&Fields=Path", &token);
+    assert_eq!(body["Items"][0]["Path"], "/media/Movies/Alien.mkv");
 }
 
 #[actix_web::test]
@@ -153,17 +203,19 @@ async fn the_path_field_is_recognised_in_every_spelling_a_client_may_send() {
     // compares the field NAME case-insensitively, so every combination must
     // work. A client whose spelling was ignored would see books that open
     // nothing, with no error to diagnose.
+    // A MOVIE, because books ignore the gate entirely — asserting spellings
+    // against a book would pass no matter what `fields_requests` did.
     for uri in [
-        "/Items?IncludeItemTypes=Book&Fields=Path",
-        "/Items?IncludeItemTypes=Book&fields=path",
-        "/Items?IncludeItemTypes=Book&FIELDS=PATH",
-        "/Items?IncludeItemTypes=Book&fields=canDownload,path",
+        "/Items?IncludeItemTypes=Movie&Fields=Path",
+        "/Items?IncludeItemTypes=Movie&fields=path",
+        "/Items?IncludeItemTypes=Movie&FIELDS=PATH",
+        "/Items?IncludeItemTypes=Movie&fields=canDownload,path",
         // Whitespace around the comma-separated token, as some clients emit.
-        "/Items?IncludeItemTypes=Book&Fields=CanDownload,%20Path",
+        "/Items?IncludeItemTypes=Movie&Fields=CanDownload,%20Path",
     ] {
         let body = get_json!(app, uri, &token);
         assert_eq!(
-            body["Items"][0]["Path"], BOOK_PATH,
+            body["Items"][0]["Path"], "/media/Movies/Alien.mkv",
             "Path missing for spelling: {uri}"
         );
     }
@@ -174,18 +226,21 @@ async fn the_detail_payload_agrees_with_the_list_payload_about_path() {
     let (state, token) = seed().await;
     let app = test::init_service(app(state)).await;
 
-    // The single-item fetch reads its own `Fields`, so the two paths could
-    // disagree — a book that shows Path in a grid row but not on its detail
-    // page, or the reverse. Both directions asserted.
-    let detail = get_json!(app, "/Items/42", &token);
+    // The single-item fetch reads its own `Fields`, so the two routes could
+    // disagree — an item showing Path in a grid row but not on its detail page,
+    // or the reverse. That divergence is exactly what broke the reader, so both
+    // routes are asserted for both kinds.
+    let detail = get_json!(app, "/Items/43", &token);
     assert!(
         detail.get("Path").is_none(),
-        "detail payload must omit Path when not asked: {detail}"
+        "a movie's detail payload must omit Path when not asked: {detail}"
     );
+    let detail = get_json!(app, "/Items/43?Fields=Path", &token);
+    assert_eq!(detail["Path"], "/media/Movies/Alien.mkv");
 
-    let detail = get_json!(app, "/Items/42?Fields=Path", &token);
+    let detail = get_json!(app, "/Items/42", &token);
     assert_eq!(
         detail["Path"], BOOK_PATH,
-        "detail payload must emit Path when asked"
+        "a book's detail payload carries Path unasked — this is the route that was broken"
     );
 }
