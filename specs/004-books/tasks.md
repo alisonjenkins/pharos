@@ -212,9 +212,9 @@ concern and nothing else.
 
 **Independent test**: read a few pages, navigate away, reopen, land in the same place.
 
-- [ ] T075 [P] [US5] Add test `a_books_read_position_round_trips_through_userdata` in `crates/pharos-server/tests/` asserting a progress report for a book persists and returns as `UserData.PlaybackPositionTicks`, and that `RunTimeTicks` stays 0 alongside it
-- [ ] T076 [US5] Accept progress reports for book items on the existing playback-reporting path (`crates/pharos-server/src/api/jellyfin/sessions.rs` / `user_data.rs`) — a book must not be rejected for having no media source
-- [ ] T077 [US5] Verify by hand per quickstart §10: reopen a part-read book, confirm a non-zero `PlaybackPositionTicks`, **and look at the player UI**. `RunTimeTicks` is 0, so confirm the client renders **no** progress bar rather than a broken, full or NaN one — different outcomes, only one acceptable. Observe it; do not assume it, and do not "fix" it by inventing a runtime (R8) — **COMMIT**
+- [X] T075 [P] [US5] Add test `a_books_read_position_round_trips_through_userdata` in `crates/pharos-server/tests/` asserting a progress report for a book persists and returns as `UserData.PlaybackPositionTicks`, and that `RunTimeTicks` stays 0 alongside it
+- [X] T076 [US5] Accept progress reports for book items on the existing playback-reporting path (`crates/pharos-server/src/api/jellyfin/sessions.rs` / `user_data.rs`) — a book must not be rejected for having no media source
+- [X] T077 [US5] Verify by hand per quickstart §10: reopen a part-read book, confirm a non-zero `PlaybackPositionTicks`, **and look at the player UI**. `RunTimeTicks` is 0, so confirm the client renders **no** progress bar rather than a broken, full or NaN one — different outcomes, only one acceptable. Observe it; do not assume it, and do not "fix" it by inventing a runtime (R8) — **COMMIT**
 
 ---
 
