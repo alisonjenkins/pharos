@@ -1651,10 +1651,25 @@ impl BaseItemDto {
             item.kind,
             pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
         );
+        let is_book = matches!(item.kind, pharos_core::MediaKind::Book);
         let probe = &item.probe;
         let container = container_for(probe, &item.path, is_video);
-        let run_time_ticks = probe.run_time_ticks().unwrap_or(0);
+        // 0 for a book. A book has no time axis, so no meaningful progress bar
+        // can be computed from position/runtime — that absence is by design
+        // (R8) and must NOT later be "fixed" by inventing a runtime.
+        let run_time_ticks = if is_book {
+            0
+        } else {
+            probe.run_time_ticks().unwrap_or(0)
+        };
 
+        // 004-books / FR-008 + SC-004 — a book offers NOTHING to play. Not
+        // "absent", not "null": EMPTY. `dto.rs`'s array-field comment records
+        // why (jellyfin-web iterates these without null guards, so omitting one
+        // throws `Symbol.iterator` during view init — T30), and `run_time_ticks`
+        // is a plain `u64`, so `null` is not available without changing the
+        // field for every kind. The goal is that no client has anything to
+        // request a stream FOR, and an empty array achieves that completely.
         let media_streams = build_media_streams(probe, is_video);
         let default_audio_stream_index: Option<u32> = media_streams
             .iter()
@@ -1679,35 +1694,40 @@ impl BaseItemDto {
             location_type: "FileSystem",
             can_play: true,
             play_access: "Full",
-            media_sources: vec![MediaSourceLiteDto {
-                id: wire_item_id(item.id),
-                container,
-                kind: "Default",
-                is_remote: false,
-                supports_direct_play: true,
-                supports_direct_stream: true,
-                supports_transcoding: true,
-                read_at_native_framerate: false,
-                ignore_dts: false,
-                ignore_index: false,
-                gen_pts_input: false,
-                is_infinite_stream: false,
-                has_segments: false,
-                requires_opening: false,
-                requires_closing: false,
-                requires_looping: false,
-                supports_probing: true,
-                transcoding_sub_protocol: "http",
-                run_time_ticks: probe.run_time_ticks(),
-                protocol: "File",
-                media_streams,
-                bitrate: probe.bitrate_bps,
-                size: probe.size_bytes,
-                name: item.title.clone(),
-                default_audio_stream_index,
-                video_type: "VideoFile",
-                e_tag: "0".into(),
-            }],
+            media_sources: if is_book {
+                // Empty, so nothing can construct /Videos/{id}/stream for an epub.
+                Vec::new()
+            } else {
+                vec![MediaSourceLiteDto {
+                    id: wire_item_id(item.id),
+                    container,
+                    kind: "Default",
+                    is_remote: false,
+                    supports_direct_play: true,
+                    supports_direct_stream: true,
+                    supports_transcoding: true,
+                    read_at_native_framerate: false,
+                    ignore_dts: false,
+                    ignore_index: false,
+                    gen_pts_input: false,
+                    is_infinite_stream: false,
+                    has_segments: false,
+                    requires_opening: false,
+                    requires_closing: false,
+                    requires_looping: false,
+                    supports_probing: true,
+                    transcoding_sub_protocol: "http",
+                    run_time_ticks: probe.run_time_ticks(),
+                    protocol: "File",
+                    media_streams,
+                    bitrate: probe.bitrate_bps,
+                    size: probe.size_bytes,
+                    name: item.title.clone(),
+                    default_audio_stream_index,
+                    video_type: "VideoFile",
+                    e_tag: "0".into(),
+                }]
+            },
             artists: item.probe.artist.iter().cloned().collect(),
             artist_items: item
                 .probe

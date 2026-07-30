@@ -2105,6 +2105,34 @@ async fn playback_info(
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
+    // 004-books / FR-010 — a book leaves here WITHOUT entering codec
+    // negotiation. Returned before the trickplay nudge, the subtitle warm and
+    // the device-profile evaluation below, because none of them mean anything
+    // for an epub and the subtitle warm would cold-demux a file ffmpeg cannot
+    // read at all.
+    //
+    // MediaSources is EMPTY rather than absent (R9): jellyfin-web iterates these
+    // arrays without null guards. With nothing in it there is no source id, so
+    // no client can construct /Videos/{id}/stream or a TranscodingUrl for a
+    // book — which is the actual goal. PlaySessionId is still issued because the
+    // client uses it for progress reporting, and a book DOES report read
+    // position (FR-009).
+    if matches!(item.kind, MediaKind::Book) {
+        let resume_ticks = match state.stores.get_user_data(user.0.id, id).await {
+            Ok(ud) if !ud.played => ud.last_played_position_ticks,
+            _ => 0,
+        };
+        tracing::debug!(
+            media.id = id,
+            path = %item.path.display(),
+            "playbackinfo: book, no playable source offered"
+        );
+        return Ok(crate::api::jellyfin::wire::json(&PlaybackInfoResponseDto {
+            media_sources: Vec::new(),
+            play_session_id: uuid::Uuid::new_v4().simple().to_string(),
+            start_position_ticks: resume_ticks,
+        }));
+    }
     // Bump this show to the front of the background trickplay pre-generator —
     // it (and the rest of its series) is about to be watched, so its scrub
     // previews should be built first. Best-effort; a full queue never blocks.
