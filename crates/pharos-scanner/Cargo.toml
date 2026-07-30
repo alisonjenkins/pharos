@@ -31,6 +31,7 @@ quick-xml = { workspace = true }
 # `META-INF/container.xml` and `ComicInfo.xml`; no new XML crate is needed.
 zip = { workspace = true }
 sevenz-rust = { workspace = true }
+tar = { workspace = true }
 lopdf = { workspace = true }
 # Episode-number extraction: a faithful port of Emby.Naming's ordered
 # expression list (SxxEyy, 1x02, EP12, absolute anime numbering, …).
@@ -61,6 +62,12 @@ watch = ["dep:notify", "tokio/sync", "tokio/time"]
 [dev-dependencies]
 criterion = { workspace = true }
 metrics-util.workspace = true
+# The comic tests BUILD a `.cb7` rather than checking a binary blob into the
+# repo, so the fixture's contents are visible in the test that reads them (same
+# choice as the epub fixtures). `compress` is `lzma-rust/encoder` — still pure
+# Rust — and it is a dev-dependency only, so the shipped binary keeps the
+# decoder alone.
+sevenz-rust = { workspace = true, features = ["compress"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

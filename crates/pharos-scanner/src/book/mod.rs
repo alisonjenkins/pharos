@@ -21,6 +21,7 @@
 //! enumerated cause and never a free-form message — the offending VALUE goes in
 //! the log line beside the counter, where cardinality does not matter.
 
+pub mod comic;
 pub mod epub;
 
 use std::path::Path;
@@ -132,7 +133,7 @@ pub(crate) fn record_classify(
 /// the surrounding literal run, and `resolve_char_ref` answers only for the
 /// NUMERIC form (`&#38;`) — a named entity comes back `Ok(None)`. Handling only
 /// the numeric case silently deletes the `&` from every summary and title that
-/// contains one. Unknown named entities
+/// contains one, which is what the comic tests caught. Unknown named entities
 /// are dropped rather than fatal (V6 tolerance). Same handling as the Kodi NFO
 /// reader, shared here so the two book parsers cannot drift from it.
 pub(crate) fn push_entity(r: &quick_xml::events::BytesRef<'_>, out: &mut String) {
@@ -212,10 +213,14 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
         // image encoding). A caller-side record here would flatten all of those
         // into one uninformative label.
         BookFormat::Epub => Some(epub::read_epub_or_empty(path)),
-        // Comic (US2) and Pdf (US4) readers land with their stories. Until then
-        // they report themselves honestly as parsed-but-cover-less rather than
-        // claiming a cover that does not exist.
-        BookFormat::Comic | BookFormat::Pdf => {
+        // A `.cbr` reaches here too and comes back cover-less by design, with
+        // `rar_unsupported` on the counter (R7) — not routed away, because that
+        // would make the design limit invisible.
+        BookFormat::Comic => Some(comic::read_comic_or_empty(path)),
+        // The Pdf reader lands with US4. Until then it reports itself honestly
+        // as parsed-but-cover-less rather than claiming a cover that does not
+        // exist.
+        BookFormat::Pdf => {
             record_classify(
                 format,
                 ClassifyVerdict::CoverAbsent,
