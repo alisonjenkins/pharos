@@ -211,8 +211,8 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let mut lock = stdout.lock();
     writeln!(
         lock,
-        "seeded: user='playwright' password='playwright-test-pw' (admin), 8 items \
-         (incl. 3-episode series + multitrack), fixture={}",
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 9 items \
+         (incl. 3-episode series + multitrack + epub), fixture={}",
         paths.movie.display()
     )?;
     Ok(())
@@ -229,6 +229,10 @@ struct SeedPaths {
     audio: std::path::PathBuf,
     series_eps: [std::path::PathBuf; 3],
     multitrack: std::path::PathBuf,
+    /// 004-books — a real, minimal epub so `books.spec.ts` can drive
+    /// jellyfin-web's `bookPlayer` (epub.js) against unmodified client code.
+    /// Built by hand rather than by ffmpeg, which cannot produce one.
+    epub: std::path::PathBuf,
 }
 
 /// Register the seed media rows (pure DB — no ffmpeg). Ids 1–4 keep their
@@ -289,6 +293,27 @@ async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), A
         ..Default::default()
     };
     let _ = stores.put(multitrack).await;
+
+    // 004-books — a real epub (id 9) so books.spec.ts can drive jellyfin-web's
+    // bookPlayer. The BookMeta mirrors what the scanner's epub reader extracts
+    // from this exact fixture, so the seeded row and a scanned row agree.
+    let book = MediaItem {
+        id: 9,
+        path: paths.epub.clone(),
+        title: "Playwright Book".into(),
+        kind: MediaKind::Book,
+        book: Some(pharos_core::BookMeta {
+            format: pharos_core::BookFormat::Epub,
+            author: Some("Ada Lovelace".into()),
+            publisher: Some("Pharos Press".into()),
+            series_name: Some("Pharos Fixtures".into()),
+            series_index: Some(1),
+            isbn: Some("9780000000001".into()),
+            page_count: None,
+        }),
+        ..Default::default()
+    };
+    let _ = stores.put(book).await;
     Ok(())
 }
 
@@ -297,6 +322,109 @@ async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), A
 /// h264). Id 8 is a fresh encode with two Opus tracks (440 Hz / 880 Hz) and
 /// two WebVTT subtitle tracks, muxed into Matroska so pharos probes 2 audio +
 /// 2 subs.
+/// 004-books — write a minimal but genuinely valid epub, so the Playwright spec
+/// drives real epub.js rather than a stub.
+///
+/// Hand-built with `zip` because ffmpeg cannot produce one. Everything epub.js
+/// needs is here and nothing else: the uncompressed `mimetype` first entry,
+/// `META-INF/container.xml`, an OPF with metadata + manifest + spine, and TWO
+/// XHTML chapters — two, because a single-page book cannot demonstrate a page
+/// TURN, which is what SC-001 actually asks for.
+#[cfg(debug_assertions)]
+async fn write_seed_epub(path: &std::path::Path) -> Result<(), AppError> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let path = path.to_path_buf();
+    // Blocking zip writing on a blocking thread: this runs once at seed time.
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        let f = std::fs::File::create(&path)?;
+        let mut zw = zip::ZipWriter::new(f);
+
+        // The epub spec requires `mimetype` first and STORED (uncompressed).
+        // Readers that sniff the container check exactly this.
+        zw.start_file(
+            "mimetype",
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+        )
+        .map_err(std::io::Error::other)?;
+        zw.write_all(b"application/epub+zip")?;
+
+        let entries: [(&str, &str); 5] = [
+            (
+                "META-INF/container.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+            ),
+            (
+                "OEBPS/content.opf",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Playwright Book</dc:title>
+    <dc:creator opf:role="aut">Ada Lovelace</dc:creator>
+    <dc:publisher>Pharos Press</dc:publisher>
+    <dc:language>en</dc:language>
+    <dc:date>1843-01-01</dc:date>
+    <dc:description>A seeded fixture for the books E2E spec.</dc:description>
+    <dc:identifier id="uid">9780000000001</dc:identifier>
+    <meta name="calibre:series" content="Pharos Fixtures"/>
+    <meta name="calibre:series_index" content="1"/>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>"#,
+            ),
+            (
+                "OEBPS/toc.ncx",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head><meta name="dtb:uid" content="9780000000001"/></head>
+  <docTitle><text>Playwright Book</text></docTitle>
+  <navMap>
+    <navPoint id="np1" playOrder="1"><navLabel><text>Chapter One</text></navLabel><content src="ch1.xhtml"/></navPoint>
+    <navPoint id="np2" playOrder="2"><navLabel><text>Chapter Two</text></navLabel><content src="ch2.xhtml"/></navPoint>
+  </navMap>
+</ncx>"#,
+            ),
+            (
+                "OEBPS/ch1.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter One</title></head>
+<body><h1>Chapter One</h1><p id="ch1-marker">PHAROS_CHAPTER_ONE</p></body></html>"#,
+            ),
+            (
+                "OEBPS/ch2.xhtml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter Two</title></head>
+<body><h1>Chapter Two</h1><p id="ch2-marker">PHAROS_CHAPTER_TWO</p></body></html>"#,
+            ),
+        ];
+        for (name, body) in entries {
+            zw.start_file(name, SimpleFileOptions::default())
+                .map_err(std::io::Error::other)?;
+            zw.write_all(body.as_bytes())?;
+        }
+        zw.finish().map_err(std::io::Error::other)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?
+    .map_err(AppError::Io)?;
+    Ok(())
+}
+
 #[cfg(debug_assertions)]
 async fn generate_seed_fixtures(
     fixture_dir: &std::path::Path,
@@ -425,6 +553,9 @@ async fn generate_seed_fixtures(
     ])
     .await?;
 
+    let epub = target_dir.join("Playwright Book.epub");
+    write_seed_epub(&epub).await?;
+
     Ok(SeedPaths {
         movie: singles[0].clone(),
         movie2: singles[1].clone(),
@@ -432,6 +563,7 @@ async fn generate_seed_fixtures(
         audio: singles[3].clone(),
         series_eps: [singles[4].clone(), singles[5].clone(), singles[6].clone()],
         multitrack,
+        epub,
     })
 }
 
@@ -1392,6 +1524,7 @@ mod seed_tests {
                 p("show/show-s01e02.webm"),
                 p("show/show-s01e03.webm"),
             ],
+            epub: p("Playwright Book.epub"),
             multitrack: p("multitrack.mkv"),
         };
         register_seed_items(&stores, &paths).await.unwrap();
