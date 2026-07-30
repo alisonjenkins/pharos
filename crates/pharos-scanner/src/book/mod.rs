@@ -23,6 +23,7 @@
 
 pub mod comic;
 pub mod epub;
+pub mod pdf;
 
 use std::path::Path;
 
@@ -217,20 +218,7 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
         // `rar_unsupported` on the counter (R7) — not routed away, because that
         // would make the design limit invisible.
         BookFormat::Comic => Some(comic::read_comic_or_empty(path)),
-        // The Pdf reader lands with US4. Until then it reports itself honestly
-        // as parsed-but-cover-less rather than claiming a cover that does not
-        // exist.
-        BookFormat::Pdf => {
-            record_classify(
-                format,
-                ClassifyVerdict::CoverAbsent,
-                ClassifyReason::NoCoverEntry,
-            );
-            Some(BookMeta {
-                format,
-                ..Default::default()
-            })
-        }
+        BookFormat::Pdf => Some(pdf::read_pdf_or_empty(path)),
         // Handled above.
         BookFormat::Unreadable => Some(BookMeta {
             format,
@@ -312,16 +300,46 @@ pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
                 None
             }
         },
-        // The PDF extractor lands with US4 (T073). Until then a PDF honestly
-        // reports itself cover-less rather than claiming one.
-        BookFormat::Pdf => {
-            record_classify(
-                format,
-                ClassifyVerdict::CoverAbsent,
-                ClassifyReason::NoCoverEntry,
-            );
-            None
-        }
+        // Pass-through only: page one's embedded image when it is already a
+        // JPEG. No rasterisation, permanently (R11) — so "an image pharos
+        // cannot extract" and "no image at all" get DIFFERENT reasons, because
+        // they have different fixes and only one of them is a design limit.
+        BookFormat::Pdf => match pdf::read_pdf_cover(path) {
+            Ok(pdf::PdfCover::Jpeg(bytes)) => {
+                record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
+                Some(bytes)
+            }
+            Ok(pdf::PdfCover::UnsupportedEncoding(filter)) => {
+                record_classify(
+                    format,
+                    ClassifyVerdict::CoverAbsent,
+                    ClassifyReason::UnsupportedImageEncoding,
+                );
+                tracing::debug!(
+                    path = %path.display(),
+                    filter = %filter,
+                    "pdf: page-one image is not pass-through encodable; no cover by design (R11)"
+                );
+                None
+            }
+            Ok(pdf::PdfCover::NoImage) => {
+                record_classify(
+                    format,
+                    ClassifyVerdict::CoverAbsent,
+                    ClassifyReason::NoCoverEntry,
+                );
+                None
+            }
+            Err(err) => {
+                record_classify(
+                    format,
+                    ClassifyVerdict::Unparseable,
+                    ClassifyReason::MalformedContainer,
+                );
+                tracing::warn!(path = %path.display(), error = %err, "pdf cover unreadable");
+                None
+            }
+        },
         // Already recorded as `format_unreadable` by `read_book_meta`; a second
         // verdict for the same file would double-count the rate SC-003 reads.
         BookFormat::Unreadable => None,

@@ -223,8 +223,8 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let mut lock = stdout.lock();
     writeln!(
         lock,
-        "seeded: user='playwright' password='playwright-test-pw' (admin), 10 items \
-         (incl. 3-episode series + multitrack + epub + cbz), fixture={}",
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 11 items \
+         (incl. 3-episode series + multitrack + epub + cbz + pdf), fixture={}",
         paths.movie.display()
     )?;
     Ok(())
@@ -251,6 +251,10 @@ struct SeedPaths {
     /// turn — a slide index alone would advance even if both images failed to
     /// decode.
     cbz: std::path::PathBuf,
+    /// 004-books — a real `.pdf` so `books.spec.ts` can drive jellyfin-web's
+    /// `pdfPlayer` (pdf.js), the THIRD reader behind the same `Book` gate and
+    /// the only one that rasterises into a canvas.
+    pdf: std::path::PathBuf,
 }
 
 /// Register the seed media rows (pure DB — no ffmpeg). Ids 1–4 keep their
@@ -353,6 +357,91 @@ async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), A
         ..Default::default()
     };
     let _ = stores.put(comic).await;
+
+    // 004-books — a real pdf (id 11) so books.spec.ts can drive pdfPlayer.
+    let pdf = MediaItem {
+        id: 11,
+        path: paths.pdf.clone(),
+        title: "Playwright Manual".into(),
+        kind: MediaKind::Book,
+        book: Some(pharos_core::BookMeta {
+            format: pharos_core::BookFormat::Pdf,
+            author: Some("Alan Turing".into()),
+            publisher: None,
+            series_name: None,
+            series_index: None,
+            isbn: None,
+            page_count: Some(1),
+        }),
+        ..Default::default()
+    };
+    let _ = stores.put(pdf).await;
+    Ok(())
+}
+
+/// 004-books — write a genuinely valid single-page `.pdf`, so the Playwright
+/// spec drives real pdf.js rather than a stub.
+///
+/// Hand-assembled rather than built with a PDF crate: `pharos-server` has no
+/// direct `lopdf` dependency and a seed fixture is not worth adding one for.
+/// The file is small enough to be read here in full, which is the point — a
+/// fixture whose contents are visible is a fixture you can reason about when
+/// the reader that consumes it misbehaves.
+///
+/// It draws real TEXT, because a blank page renders to a blank canvas and a
+/// blank canvas is indistinguishable from a failed render.
+#[cfg(debug_assertions)]
+async fn write_seed_pdf(path: &std::path::Path) -> Result<(), AppError> {
+    let contents = b"BT /F1 24 Tf 20 100 Td (PHAROS PDF PAGE ONE) Tj ET\n";
+    let objects: [Vec<u8>; 6] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R \
+           /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        format!(
+            "<< /Length {} >>\nstream\n{}endstream",
+            contents.len(),
+            String::from_utf8_lossy(contents)
+        )
+        .into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Title (Playwright Manual) /Author (Alan Turing) \
+           /Subject (A seeded fixture for the books E2E spec.) \
+           /CreationDate (D:19360101000000Z) >>"
+            .to_vec(),
+    ];
+
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    // Byte offsets of each object, which is the entire reason this is written
+    // by hand rather than by string concatenation: an xref table whose offsets
+    // are wrong yields a file that opens in some readers and not others.
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+
+    let startxref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    // The free-list head, then one 20-byte entry per object. The trailing space
+    // matters: every entry is exactly 20 bytes including its EOL.
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            startxref
+        )
+        .as_bytes(),
+    );
+
+    tokio::fs::write(path, out).await.map_err(AppError::Io)?;
     Ok(())
 }
 
@@ -675,6 +764,9 @@ async fn generate_seed_fixtures(
     let cbz = target_dir.join("Playwright Comic.cbz");
     write_seed_cbz(&cbz, fixture_dir).await?;
 
+    let pdf = target_dir.join("Playwright Manual.pdf");
+    write_seed_pdf(&pdf).await?;
+
     Ok(SeedPaths {
         movie: singles[0].clone(),
         movie2: singles[1].clone(),
@@ -684,6 +776,7 @@ async fn generate_seed_fixtures(
         multitrack,
         epub,
         cbz,
+        pdf,
     })
 }
 
@@ -1656,6 +1749,7 @@ mod seed_tests {
             ],
             epub: p("Playwright Book.epub"),
             cbz: p("Playwright Comic.cbz"),
+            pdf: p("Playwright Manual.pdf"),
             multitrack: p("multitrack.mkv"),
         };
         register_seed_items(&stores, &paths).await.unwrap();
@@ -1681,6 +1775,7 @@ mod seed_tests {
         for (id, ext, fmt, pages) in [
             (9u64, "epub", pharos_core::BookFormat::Epub, None),
             (10, "cbz", pharos_core::BookFormat::Comic, Some(2)),
+            (11, "pdf", pharos_core::BookFormat::Pdf, Some(1)),
         ] {
             let item = stores.get(id).await.unwrap();
             assert_eq!(item.kind, MediaKind::Book, "id {id}");
@@ -1693,5 +1788,34 @@ mod seed_tests {
             assert_eq!(bm.format, fmt, "id {id}");
             assert_eq!(bm.page_count, pages, "id {id}");
         }
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod seed_pdf_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// The seeded PDF is hand-assembled, xref offsets and all, so it is worth
+    /// proving it actually parses rather than discovering in a browser that a
+    /// ten-byte drift made it unopenable. Parsed by the same reader the scanner
+    /// uses, which is also what will read it during a real scan.
+    #[tokio::test]
+    async fn the_seeded_pdf_is_a_valid_single_page_pdf() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("Playwright Manual.pdf");
+        write_seed_pdf(&p).await.unwrap();
+
+        let meta = pharos_scanner::book::pdf::read_pdf(&p)
+            .expect("a hand-built PDF with a wrong xref offset fails exactly here");
+        assert_eq!(meta.page_count, Some(1));
+        assert_eq!(meta.title.as_deref(), Some("Playwright Manual"));
+        assert_eq!(meta.author.as_deref(), Some("Alan Turing"));
+
+        // pdf.js reads the same header; a file not starting with %PDF- is
+        // rejected before anything else happens.
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"), "must carry a PDF header");
+        assert!(bytes.ends_with(b"%%EOF\n"), "must carry a trailer");
     }
 }
