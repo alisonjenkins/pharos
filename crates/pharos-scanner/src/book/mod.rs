@@ -23,6 +23,7 @@
 
 pub mod comic;
 pub mod epub;
+pub mod kindle;
 pub mod pdf;
 
 use std::path::Path;
@@ -258,6 +259,14 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
     let format = format_for_path(path)?;
 
     if format == BookFormat::Unreadable {
+        // 005-kindle-conversion — "unreadable" is now a verdict this branch
+        // REACHES rather than assumes. A `.mobi`/`.azw`/`.azw3` that carries no
+        // DRM converts to an epub the client can open, so the format it is
+        // readable AS is epub, and that is what gets stored. Only DRM and
+        // genuine corruption still land on `Unreadable`.
+        if let Some(meta) = try_kindle_meta(path) {
+            return Some(meta);
+        }
         record_classify(
             format,
             ClassifyVerdict::Unreadable,
@@ -305,6 +314,83 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
         format,
         ..Default::default()
     }))
+}
+
+/// 005-kindle-conversion — try to read a Kindle file as a convertible book.
+///
+/// `Some` means the file converts, so it is stored as the format it is
+/// readable AS: [`BookFormat::Epub`]. `None` means it stays unreadable, and
+/// the caller records that verdict — DRM and corruption both land there,
+/// distinguished on the convert counter rather than by pretending one is the
+/// other.
+///
+/// The conversion is not performed here and its bytes are not kept: this call
+/// wants the metadata and the cover, which are the parts a scan persists.
+/// Delivery converts on demand and caches, so a scan does not pay to
+/// materialise an EPUB nobody has asked for.
+fn try_kindle_meta(path: &Path) -> Option<BookMeta> {
+    if !kindle::is_kindle_path(path) {
+        return None;
+    }
+    let ext = kindle::source_ext(path);
+    // A panic inside the converter is one skipped book, not a dead scan
+    // (V119). `guard_parser` records it on the classify counter; the convert
+    // counter records it too, so "attempted" and "accounted for" reconcile.
+    let Some(parsed) = guard_parser(path, BookFormat::Unreadable, "kindle metadata", || {
+        kindle::read_kindle(path)
+    }) else {
+        kindle::record_convert(
+            kindle::ConvertStage::Scan,
+            ext,
+            kindle::ConvertOutcome::Failed,
+            kindle::ConvertReason::ParserPanic,
+        );
+        return None;
+    };
+
+    match parsed {
+        Ok(meta) => {
+            kindle::record_convert(
+                kindle::ConvertStage::Scan,
+                ext,
+                kindle::ConvertOutcome::Converted,
+                kindle::ConvertReason::Ok,
+            );
+            tracing::debug!(
+                path = %path.display(),
+                source = ext,
+                title = meta.title.as_deref().unwrap_or("<none>"),
+                "kindle: converts to epub; storing as a readable book"
+            );
+            // `to_book_meta` stamps `BookFormat::Epub` — the honest answer to
+            // "what can a client read this as", and the fact the delivery path
+            // reads back to know this item needs converting.
+            Some(meta.to_book_meta())
+        }
+        Err(err) => {
+            let (outcome, reason) = err.outcome();
+            kindle::record_convert(kindle::ConvertStage::Scan, ext, outcome, reason);
+            // DRM is not a defect and must not be logged as one: it is a
+            // permanent property of the file, and 58 of the deployed library's
+            // books have it. A warning per book per scan would be noise that
+            // buries the real failures beside it.
+            if outcome == kindle::ConvertOutcome::DrmProtected {
+                tracing::debug!(
+                    path = %path.display(),
+                    source = ext,
+                    "kindle: DRM-protected; stays unreadable by design"
+                );
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    source = ext,
+                    error = %err,
+                    "kindle: conversion failed; stays unreadable"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Read a book's cover image bytes, and RECORD what happened.
@@ -422,6 +508,66 @@ pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
                         ClassifyReason::MalformedContainer,
                     );
                     tracing::warn!(path = %path.display(), error = %err, "pdf cover unreadable");
+                    None
+                }
+            }
+        }
+        // 005-kindle-conversion — a Kindle file gets a real attempt here.
+        // Every one of the 17 convertible files in the deployed library
+        // declares a cover, and before conversion they could only get one from
+        // a `cover.jpg` sidecar (31%).
+        //
+        // The verdict is recorded against `Epub`, matching what
+        // `read_book_meta` stored: SC-003 is a rate over readable books, and
+        // filing a converted book's cover under a format no client can read
+        // would put it outside the population the rate measures.
+        BookFormat::Unreadable if kindle::is_kindle_path(path) => {
+            match guard_parser(path, format, "kindle cover", || {
+                kindle::read_kindle_cover(path)
+            })? {
+                Ok(Some(bytes)) => {
+                    record_classify(
+                        BookFormat::Epub,
+                        ClassifyVerdict::CoverFound,
+                        ClassifyReason::Ok,
+                    );
+                    Some(bytes)
+                }
+                Ok(None) => {
+                    record_classify(
+                        BookFormat::Epub,
+                        ClassifyVerdict::CoverAbsent,
+                        ClassifyReason::NoCoverEntry,
+                    );
+                    None
+                }
+                // DRM and corruption both land here, and they are NOT the same
+                // fact — one is permanent and expected, the other is a file
+                // worth looking at. `read_book_meta` already recorded this
+                // file's convert outcome, so nothing is counted twice; only
+                // the cover verdict is added.
+                Err(err) => {
+                    let drm = matches!(err, kindle::KindleError::Drm(_));
+                    record_classify(
+                        format,
+                        if drm {
+                            ClassifyVerdict::Unreadable
+                        } else {
+                            ClassifyVerdict::Unparseable
+                        },
+                        if drm {
+                            ClassifyReason::FormatUnreadable
+                        } else {
+                            ClassifyReason::MalformedContainer
+                        },
+                    );
+                    if !drm {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "kindle cover unreadable"
+                        );
+                    }
                     None
                 }
             }
