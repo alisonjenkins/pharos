@@ -21,6 +21,8 @@
 //! enumerated cause and never a free-form message — the offending VALUE goes in
 //! the log line beside the counter, where cardinality does not matter.
 
+pub mod epub;
+
 use std::path::Path;
 
 use pharos_core::{BookFormat, BookMeta};
@@ -179,18 +181,32 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
         });
     }
 
-    // Per-format readers land in the story that needs them (epub → US1,
-    // comic → US2, pdf → US4). Until then every readable format reports itself
-    // honestly as parsed-but-cover-less rather than claiming a cover.
-    record_classify(
-        format,
-        ClassifyVerdict::CoverAbsent,
-        ClassifyReason::NoCoverEntry,
-    );
-    Some(BookMeta {
-        format,
-        ..Default::default()
-    })
+    match format {
+        // Each reader records its own classify verdict, because only it knows
+        // WHY (a missing cover entry, a malformed container, an unsupported
+        // image encoding). A caller-side record here would flatten all of those
+        // into one uninformative label.
+        BookFormat::Epub => Some(epub::read_epub_or_empty(path)),
+        // Comic (US2) and Pdf (US4) readers land with their stories. Until then
+        // they report themselves honestly as parsed-but-cover-less rather than
+        // claiming a cover that does not exist.
+        BookFormat::Comic | BookFormat::Pdf => {
+            record_classify(
+                format,
+                ClassifyVerdict::CoverAbsent,
+                ClassifyReason::NoCoverEntry,
+            );
+            Some(BookMeta {
+                format,
+                ..Default::default()
+            })
+        }
+        // Handled above.
+        BookFormat::Unreadable => Some(BookMeta {
+            format,
+            ..Default::default()
+        }),
+    }
 }
 
 #[cfg(test)]
