@@ -220,12 +220,12 @@ concern and nothing else.
 
 ## Phase 8: Polish & Cross-Cutting Concerns
 
-- [ ] T078 Append the `Path`-exposure clause to `specs/001-pharos-baseline/invariants.md` at the next free V-number: `Path` is emitted only to an authenticated client AND only when `Fields` requests it, in any spelling; a synthetic path shaped to pass a client-side extension test is forbidden. Never renumber — append
-- [ ] T079 Append a second invariant at the next free V-number, generalising T004: **adding a `MediaKind` or `LibraryKind` variant requires auditing the non-exhaustive decision sites, because the compiler does not enumerate them.** This feature found 44 such sites, one of which decided `MediaType`. Cite `specs/004-books/kind-decision-audit.md` as the worked example
-- [ ] T080 [P] Append to `specs/001-pharos-baseline/bugs.md` at the next free B-numbers the two silent-failure classes this feature designed around: a missing `Path` making an item unopenable with no error, and a `HEAD` `Content-Length: 0` from an unsized actix body (cross-referencing B166/V113)
-- [ ] T081 [P] Confirm `PROBE_SCHEMA_VERSION` in `crates/pharos-core/src/lib.rs` does **not** need a bump — book rows are new and no existing media item's probe output changes. Record the conclusion in the commit message rather than bumping reflexively; a bump re-probes ~13k items
-- [ ] T082 Run `nix develop --command just test` and `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`. Pre-commit only runs rustfmt, and a clippy failure silently blocks the image publish
-- [ ] T083 Run `nix develop --command just test-postgres` once more after the final `sqlx::query*` edit
+- [X] T078 Append the `Path`-exposure clause to `specs/001-pharos-baseline/invariants.md` at the next free V-number: `Path` is emitted only to an authenticated client AND only when `Fields` requests it, in any spelling; a synthetic path shaped to pass a client-side extension test is forbidden. Never renumber — append
+- [X] T079 Append a second invariant at the next free V-number, generalising T004: **adding a `MediaKind` or `LibraryKind` variant requires auditing the non-exhaustive decision sites, because the compiler does not enumerate them.** This feature found 44 such sites, one of which decided `MediaType`. Cite `specs/004-books/kind-decision-audit.md` as the worked example
+- [X] T080 [P] Append to `specs/001-pharos-baseline/bugs.md` at the next free B-numbers the two silent-failure classes this feature designed around: a missing `Path` making an item unopenable with no error, and a `HEAD` `Content-Length: 0` from an unsized actix body (cross-referencing B166/V113)
+- [X] T081 [P] Confirm `PROBE_SCHEMA_VERSION` in `crates/pharos-core/src/lib.rs` does **not** need a bump — book rows are new and no existing media item's probe output changes. Record the conclusion in the commit message rather than bumping reflexively; a bump re-probes ~13k items
+- [X] T082 Run `nix develop --command just test` and `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`. Pre-commit only runs rustfmt, and a clippy failure silently blocks the image publish
+- [X] T083 Run `nix develop --command just test-postgres` once more after the final `sqlx::query*` edit
 - [ ] T084 Deploy and verify by query, not by deploy event: `sum by (verdict) (pharos_book_classify_total)` and `sum by (format) (pharos_book_classify_total)` answer SC-003 and SC-005, and quickstart §3/§5's `Path`/`MediaSources`/`PlaybackInfo` assertions hold against the live server. `/metrics` is on the **main HTTP port**, not 9090 — **COMMIT**
 
 ---
