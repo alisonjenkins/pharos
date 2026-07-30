@@ -90,9 +90,22 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                 date: m.date.as_deref().and_then(pdf_date_to_iso),
             })
         }
-        // mobi/azw3 carry nothing pharos can read. Returns nothing rather than
-        // erroring — the filename provider still supplies a title (FR-007).
-        pharos_core::BookFormat::Unreadable => None,
+        // 005-kindle-conversion — mobi/azw/azw3 DO carry readable metadata:
+        // the EXTH records hold title, author, publisher and date, and reading
+        // them is what turns a filename-derived title like
+        // `The Pragmatic Programmer_ From Journeyman to Master` into a real
+        // one. DRM-protected and malformed files still fall through to `None`,
+        // so the filename provider supplies a title (FR-007) exactly as before.
+        pharos_core::BookFormat::Unreadable => {
+            let m = crate::book::kindle::read_kindle(path).ok()?;
+            Some(BookDescriptive {
+                title: m.title,
+                author: m.author,
+                publisher: m.publisher,
+                description: m.description,
+                date: m.date,
+            })
+        }
     }
 }
 
