@@ -784,11 +784,82 @@
             };
           };
 
+        # B175 — jellyfin-web's book reader, with the 100 ms-per-chapter
+        # sleep taken out of it.
+        #
+        # `bookPlayer` renders the book, hides it behind `opacity: 0`, and
+        # keeps the spinner up until `book.locations.generate(1024)` resolves.
+        # epub.js 0.3.93 (the version jellyfin-web 10.11.8 pins, and still the
+        # newest release) ends `Locations.process` with
+        #
+        #     this.processingTimeout = setTimeout(() => completed.resolve(…), this.pause)
+        #
+        # and `this.pause = pause || 100`, which nothing in jellyfin-web
+        # overrides. So opening a book costs a flat **100 ms per linear spine
+        # section of pure idle wait**, measured at 101.1 ms/section across six
+        # real library books and invariant to file size and to
+        # `--disable-background-timer-throttling`. Deployed, that is 1.3 s for
+        # a 12-section book and 34.6 s for a 342-section one, on top of a
+        # ~100 ms render and an 8–380 ms download. Nothing server-side can
+        # reach it; V124.
+        #
+        # Rewriting the constant to 0 keeps the `setTimeout` — so each section
+        # still yields to the event loop and the tab stays responsive — while
+        # deleting the sleep.
+        #
+        # The rewrite MUST fail the build rather than miss: the identifier is
+        # minifier-chosen, so a nixpkgs bump can rename it, and a patch that
+        # silently no-ops would leave the slowness in place while every test
+        # here still passed. Hence the exact-one-match assertions and the
+        # post-conditions below.
+        jellyfinWebBundle =
+          pkgs.runCommand "jellyfin-web-${pkgs.jellyfin-web.version}-epubjs-unpaused"
+            { nativeBuildInputs = [ pkgs.gnugrep pkgs.gnused ]; }
+            ''
+              cp -r --no-preserve=mode,ownership \
+                ${pkgs.jellyfin-web}/share/jellyfin-web "$out"
+
+              pat='this\.pause=[A-Za-z_$][A-Za-z0-9_$]*\|\|100'
+
+              hits=$(grep -rlE "$pat" "$out" || true)
+              n=$(printf '%s' "$hits" | grep -c . || true)
+              if [ "$n" -ne 1 ]; then
+                echo "epub.js pause patch matched $n files, expected exactly 1." >&2
+                echo "jellyfin-web ${pkgs.jellyfin-web.version} minified it differently;" >&2
+                echo "re-derive the pattern from Locations.process before bumping." >&2
+                exit 1
+              fi
+
+              occ=$(grep -oE "$pat" "$hits" | grep -c . || true)
+              if [ "$occ" -ne 1 ]; then
+                echo "epub.js pause patch matched $occ sites in $hits, expected 1." >&2
+                exit 1
+              fi
+
+              # The identifier is captured and re-emitted rather than kept via
+              # `\1` + `0`, because `\10` is an ambiguous backreference.
+              sed -i -E \
+                "s/this\.pause=([A-Za-z_$][A-Za-z0-9_$]*)\|\|100/this.pause=\1||0/" \
+                "$hits"
+
+              # Post-conditions, both directions: the old constant is gone AND
+              # the new one is present. Asserting only the first would pass on
+              # a sed that deleted the assignment outright.
+              if grep -qE "$pat" "$hits"; then
+                echo "epub.js pause patch left the 100 ms constant behind." >&2
+                exit 1
+              fi
+              if ! grep -qE 'this\.pause=[A-Za-z_$][A-Za-z0-9_$]*\|\|0[^0-9]' "$hits"; then
+                echo "epub.js pause patch did not produce a zero pause." >&2
+                exit 1
+              fi
+            '';
+
         jellyfinWebImage = mkAngieUi {
           pname = "pharos-jellyfin-web";
           port = 8097;
           prefix = "web";
-          bundle = "${pkgs.jellyfin-web}/share/jellyfin-web";
+          bundle = jellyfinWebBundle;
         };
         pharosUiImage = mkAngieUi {
           pname = "pharos-ui";
@@ -960,7 +1031,10 @@
             + "-isystem ${pkgs.glibc.dev}/include";
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
-            export JELLYFIN_WEB_DIR=${pkgs.jellyfin-web}/share/jellyfin-web
+            # The SAME bundle the image ships (B175 epub.js patch included),
+            # so the compat suite exercises what production serves rather than
+            # stock upstream.
+            export JELLYFIN_WEB_DIR=${jellyfinWebBundle}
             # Pin Playwright's browsers to the nix store path so the compat
             # suite needs no `npx playwright install` and behaves the same
             # on every machine. The version matches package.json's
