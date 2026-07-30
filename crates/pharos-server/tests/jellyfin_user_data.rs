@@ -294,6 +294,62 @@ async fn mark_played_broadcasts_user_data_changed_on_bus() {
     }
 }
 
+/// B176 — marking an item unwatched must also forget where the viewer was.
+///
+/// The two live in the same `UserData` and answer the same question, so a
+/// `Played=false` sitting next to a 50 s resume point is the item claiming
+/// both. jellyfin-web draws the resume bar off the position, not the flag, so
+/// the symptom is an "unwatched" card that still starts part-way in and still
+/// appears under Continue Watching.
+#[actix_web::test]
+async fn unmark_played_clears_the_resume_position() {
+    let (state, token, uid) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+
+    // Drive a real resume point through the route a client uses, rather than
+    // writing UserItemData directly — the position has to survive the same
+    // path it does in production for the clear to mean anything.
+    let progress = test::TestRequest::post()
+        .uri("/Sessions/Playing/Progress")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .set_json(serde_json::json!({
+            "ItemId": "300",
+            "PlaySessionId": "sess-unmark",
+            "PositionTicks": 50_000_000u64,
+            "IsPaused": false
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, progress).await.status(), 204);
+
+    let unmark = test::TestRequest::delete()
+        .uri(&format!("/Users/{}/PlayedItems/300", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    assert!(test::call_service(&app, unmark).await.status().is_success());
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{}/Items/300", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["UserData"]["Played"], false);
+    assert_eq!(
+        v["UserData"]["PlaybackPositionTicks"], 0,
+        "an item marked unwatched must not keep a resume point"
+    );
+
+    // And it must leave Continue Watching, which is the surface the stale
+    // position was actually visible on.
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/{}/Items/Resume", uid.0.simple()))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 0);
+}
+
 #[actix_web::test]
 async fn unmark_played_broadcasts_played_false() {
     use pharos_server::state::SocketBroadcast;
