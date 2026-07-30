@@ -54,11 +54,19 @@ fn fully_populated() -> BookMeta {
     }
 }
 
+/// Id base for this test's rows.
+///
+/// The postgres arm runs against a SHARED database that other test binaries
+/// write to concurrently, so low ids collide: `backend_conformance` also writes
+/// id 1, and whichever landed last decided whether this file's id-1 row was a
+/// book or a movie. The failure looked like a store bug and was a test one.
+const BASE: MediaId = 7_000;
+
 async fn run<S: MediaStore>(store: S) {
     // 1. Every field survives, byte-identically.
-    let full = book(1, "Watchmen #3", Some(fully_populated()));
+    let full = book(BASE + 1, "Watchmen #3", Some(fully_populated()));
     store.put(full).await.unwrap();
-    let got = store.get(MediaId::from(1u64)).await.unwrap();
+    let got = store.get(BASE + 1).await.unwrap();
     assert_eq!(
         got.book.as_ref(),
         Some(&fully_populated()),
@@ -75,9 +83,9 @@ async fn run<S: MediaStore>(store: S) {
     //    columns were bound from anything other than the one Option, a movie
     //    would come back carrying a default BookMeta (format Epub!) instead of
     //    None.
-    let movie = book(2, "Alien", None);
+    let movie = book(BASE + 2, "Alien", None);
     store.put(movie).await.unwrap();
-    let got = store.get(MediaId::from(2u64)).await.unwrap();
+    let got = store.get(BASE + 2).await.unwrap();
     assert_eq!(got.book, None, "a non-book item must carry no BookMeta");
     assert_eq!(got.kind, MediaKind::Movie);
 
@@ -85,7 +93,7 @@ async fn run<S: MediaStore>(store: S) {
     //    through an INTEGER column is exactly where a `unwrap_or(0)` would hide,
     //    and 0 would sort it FIRST in a series rather than last.
     let sparse = book(
-        3,
+        BASE + 3,
         "An unnumbered volume",
         Some(BookMeta {
             format: BookFormat::Epub,
@@ -98,7 +106,7 @@ async fn run<S: MediaStore>(store: S) {
         }),
     );
     store.put(sparse).await.unwrap();
-    let got = store.get(MediaId::from(3u64)).await.unwrap().book.unwrap();
+    let got = store.get(BASE + 3).await.unwrap().book.unwrap();
     assert_eq!(
         got.series_index, None,
         "an unnumbered volume must stay None"
@@ -112,11 +120,11 @@ async fn run<S: MediaStore>(store: S) {
     let mut corrected = fully_populated();
     corrected.author = Some("Alan Moore & Dave Gibbons".into());
     store
-        .put(book(1, "Watchmen #3", Some(corrected.clone())))
+        .put(book(BASE + 1, "Watchmen #3", Some(corrected.clone())))
         .await
         .unwrap();
     assert_eq!(
-        store.get(MediaId::from(1u64)).await.unwrap().book,
+        store.get(BASE + 1).await.unwrap().book,
         Some(corrected),
         "the upsert must update book_* columns, not just insert them"
     );
@@ -132,7 +140,7 @@ async fn run<S: MediaStore>(store: S) {
     .into_iter()
     .enumerate()
     {
-        let id = MediaId::from(100u64 + i as u64);
+        let id = BASE + 100 + i as MediaId;
         store
             .put(book(
                 id,
@@ -156,7 +164,7 @@ async fn run<S: MediaStore>(store: S) {
     //    query selects MEDIA_COLUMNS separately, so a column missing from that
     //    string would show up here and nowhere else.
     let all = store.list().await.unwrap();
-    let listed = all.iter().find(|i| i.id == MediaId::from(1u64)).unwrap();
+    let listed = all.iter().find(|i| i.id == BASE + 1).unwrap();
     assert!(
         listed.book.is_some(),
         "MEDIA_COLUMNS must carry book_* for the list path, not just for get"
