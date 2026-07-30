@@ -24,9 +24,11 @@ bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 crossbeam-utils = { version = "0.8" }
+derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest = { version = "0.10", features = ["mac", "std"] }
 dioxus-core = { version = "0.7", default-features = false, features = ["serialize"] }
 either = { version = "1", features = ["serde", "use_std"] }
+fastrand = { version = "2" }
 foldhash = { version = "0.1" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -56,6 +58,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sevenz-rust = { version = "0.6", default-features = false, features = ["compress"] }
+sha1_smol = { version = "1", default-features = false, features = ["std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
@@ -65,6 +68,7 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "migra
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
+stable_deref_trait = { version = "1" }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
@@ -82,8 +86,10 @@ byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
+derive_more-impl = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1", features = ["serde", "use_std"] }
+fastrand = { version = "2" }
 foldhash = { version = "0.1" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -115,6 +121,7 @@ sqlx-macros = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webp
 sqlx-macros-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
+stable_deref_trait = { version = "1" }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
@@ -126,6 +133,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
@@ -139,6 +147,7 @@ libc = { version = "0.2" }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
@@ -152,6 +161,7 @@ libc = { version = "0.2" }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
@@ -165,6 +175,7 @@ libc = { version = "0.2" }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }

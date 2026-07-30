@@ -83,6 +83,23 @@ tar = { version = "0.4", default-features = false }
 # R11 rests on there being no raster decoder in this workspace; a cover is
 # extracted only when it is ALREADY a JPEG, so nothing needs to decode one.
 lopdf = { version = "0.44", default-features = false }
+# 005-kindle-conversion — MOBI/KF8 (`.mobi`/`.azw`/`.azw3`) → EPUB.
+#
+# Pure Rust, ZERO `unsafe`, and it carries the two pieces that make this
+# format hard: a HUFF/CDIC Huffman decoder (7 of the deployed library's 17
+# DRM-free Kindle files use it, PalmDOC LZ77 covers the rest) and the KF8
+# skeleton/fragment index rebuild that splits one decompressed flow back
+# into per-chapter XHTML. Hand-writing those is ~2000 lines against a
+# format with no specification.
+#
+# `default-features = false` drops the `cli` feature (clap, serde_json,
+# ion-rs, and the `image` crate). `image` matters: R11 rests on there being
+# no raster decoder in this workspace, exactly as for lopdf above.
+#
+# GPL-3.0-or-later — combined with pharos's AGPL-3.0-or-later under GPLv3
+# §13, which exists for precisely this pairing. See the scoped exception in
+# deny.toml; it is NOT a workspace-wide allow.
+boko = { version = "0.5", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

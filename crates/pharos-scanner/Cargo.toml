@@ -33,6 +33,11 @@ zip = { workspace = true }
 sevenz-rust = { workspace = true }
 tar = { workspace = true }
 lopdf = { workspace = true }
+# 005-kindle-conversion — `.mobi`/`.azw`/`.azw3` → EPUB, so the three readers
+# jellyfin-web actually ships can open a Kindle file. See the workspace
+# manifest for why this crate rather than a hand-written decoder, and
+# deny.toml for the GPL/AGPL licence pairing.
+boko = { workspace = true }
 # Episode-number extraction: a faithful port of Emby.Naming's ordered
 # expression list (SxxEyy, 1x02, EP12, absolute anime numbering, …).
 regex = "1"

@@ -27,6 +27,37 @@ ignore = [
     # input). No safe upgrade exists (bincode 2.x is a different API).
     # Re-evaluate if we migrate the framing to postcard.
     "RUSTSEC-2025-0141",
+    # RUSTSEC-2026-0194 (quadratic duplicate-attribute check) and
+    # RUSTSEC-2026-0195 (unbounded namespace-declaration allocation in
+    # `NsReader`), both in `quick-xml` < 0.41.
+    #
+    # pharos is already on 0.41 (workspace manifest). These hit ONLY the copy
+    # `boko` 0.5.0 pins at `0.39`, and `cargo update` cannot lift it: for a 0.x
+    # crate, 0.39 → 0.41 is a breaking range, so the fix needs an upstream
+    # release. Ignored on REACHABILITY, and the two differ:
+    #
+    # * 0195 needs `NsReader` / `NamespaceResolver`, of which boko contains
+    #   zero uses — every parse goes through `Reader::from_str`. (Checked by
+    #   name: the `read_resolved`-shaped hits in that crate are
+    #   `resolve_element_role`, a KFX schema helper with no XML involvement.)
+    #
+    # * 0194 is the one that WOULD apply to a plain `Reader`: boko iterates
+    #   `.attributes()` in 12 places and never calls `.with_checks(false)`.
+    #   It is unreachable from pharos for a different reason — only three
+    #   files in boko touch `quick_xml` at all, and the two that PARSE
+    #   (`src/epub/parser.rs`, `src/import/epub.rs`) are the EPUB *importer*.
+    #   pharos calls boko exclusively on `.mobi`/`.azw`/`.azw3`, whose format
+    #   is chosen from the extension, so the epub importer is never entered;
+    #   the Kindle path's only quick-xml use is `escape::unescape` in
+    #   `src/mobi/parser.rs`, a pure string function with no reader and no
+    #   attributes. pharos parses real epubs with its OWN reader on 0.41.
+    #
+    # Worth more care than a routine transitive ignore, because the input IS
+    # user-supplied ebook files. Re-check both if pharos ever hands boko an
+    # `.epub`, or if boko starts resolving namespaces. Drop the entry when
+    # boko moves to quick-xml 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -74,6 +105,21 @@ allow = ["WTFPL"]
 [[licenses.exceptions]]
 name = "ffmpeg-sys-the-third"
 allow = ["WTFPL"]
+
+[[licenses.exceptions]]
+# 005-kindle-conversion — the MOBI/KF8 → EPUB converter is GPL-3.0-or-later.
+#
+# pharos is AGPL-3.0-or-later, and GPLv3 §13 ("Use with the GNU Affero
+# General Public License") explicitly permits combining GPLv3 code with an
+# AGPLv3 work, the combination being governed by the AGPL. So this is a
+# compatible pairing rather than a tolerated one, and it costs nothing: the
+# project is already copyleft.
+#
+# Scoped to this one crate, not a global `GPL-3.0-or-later` allow, so the
+# next GPL dependency stays a deliberate decision — the same reasoning as
+# the WTFPL entries above.
+name = "boko"
+allow = ["GPL-3.0-or-later"]
 
 [bans]
 multiple-versions = "warn"
