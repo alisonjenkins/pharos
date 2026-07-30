@@ -40,7 +40,6 @@ indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 lzma-rust = { version = "0.1", default-features = false, features = ["encoder"] }
-md-5 = { version = "0.10" }
 memchr = { version = "2" }
 metrics-util = { version = "0.17" }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -96,7 +95,6 @@ getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-f
 indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
-md-5 = { version = "0.10" }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
