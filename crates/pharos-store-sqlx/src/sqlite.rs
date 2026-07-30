@@ -2907,9 +2907,19 @@ impl LibraryStore for SqliteStore {
         // Path-boundary-safe: for each library, stamp every media_items row
         // strictly under its root (root + '/'). root_like_pattern escapes
         // wildcards + appends "/%", so /media/movies never claims
-        // /media/movies-4k. Longest-root-wins is not needed (roots don't
-        // nest in practice); a later root simply overwrites if it does.
-        let libs = self.libraries().await?;
+        // /media/movies-4k.
+        //
+        // SHORTEST ROOT FIRST, so the most specific library wins (B174). Roots
+        // DO nest: a whole-share `mixed` root beside typed libraries for its
+        // subfolders is the obvious way to configure this, and it is what the
+        // deployment does. `libraries()` orders by NAME, and under that order
+        // "media" sorted last and overwrote every typed library it contained —
+        // 14,229 items in one mixed library while Movies, Music and TV Shows
+        // sat at zero, with no error anywhere. Ordering by root LENGTH makes
+        // the containing root apply first and the nested one overwrite it,
+        // which is the only assignment that can be correct when roots nest.
+        let mut libs = self.libraries().await?;
+        libs.sort_by_key(|l| l.root_path.len());
         let mut total: i64 = 0;
         for lib in &libs {
             let like = crate::root_like_pattern(&lib.root_path);
