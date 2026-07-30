@@ -141,7 +141,7 @@ concern and nothing else.
 - [X] T047 [US1] Implement `crates/pharos-scanner/src/book/epub.rs` using the existing `quick-xml`: open the zip, read `META-INF/container.xml` → OPF path → parse the OPF `<metadata>` Dublin Core block. No `unwrap`/`expect` (V17); every error carries the offending value — the zip path and the entry name — never a bare class
 - [X] T048 [US1] Wire `epub` into the `read_book_meta` dispatch in `crates/pharos-scanner/src/book/mod.rs`
 - [X] T049 [US1] Walk [quickstart.md](./quickstart.md) §1–§6 against a real books library: items imported with zero ffmpeg invocations, `CollectionType: "books"`, `Path` gated and spelled both ways, `MediaSources: []` from `PlaybackInfo`, and a truthful `Content-Length` on the `/Download` HEAD
-- [ ] T050 [US1] Open the epub in unmodified jellyfin-web via `nix develop --command just compat-playwright-full` and **turn a page** (quickstart §9). If the card opens nothing and the network tab shows no `/Download` request, it is gate 1 or 2 (`MediaType`/`Path`) — check T038 first — **COMMIT**
+- [X] T050 [US1] Open the epub in unmodified jellyfin-web via `compat-playwright/tests/books.spec.ts` (real Chromium, nix-pinned) and **turn a page**. Automated, not manual — 4 assertions: both canPlay gates on the UNFIELDED fetch, valid-epub bytes, reader mounts + page turn, and `/Download?api_key=` actually requested during the open
 
 **Checkpoint**: US1 is independently deliverable and is the MVP.
 
