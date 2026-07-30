@@ -573,11 +573,15 @@ async fn items_similar(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.generated_trickplay_widths(item.id),
-                state.trickplay_interval_ms,
-            )
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+                .with_converted_book(
+                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+                )
+                .with_trickplay(
+                    &item.probe,
+                    &state.generated_trickplay_widths(item.id),
+                    state.trickplay_interval_ms,
+                )
         })
         .collect();
     fill_parent_ids(&state, &mut dtos, &picks);
@@ -1602,11 +1606,15 @@ async fn shows_next_up(
         .iter()
         .map(|(idx, item)| {
             let ud = user_data.get(*idx).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.generated_trickplay_widths(item.id),
-                state.trickplay_interval_ms,
-            )
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+                .with_converted_book(
+                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+                )
+                .with_trickplay(
+                    &item.probe,
+                    &state.generated_trickplay_widths(item.id),
+                    state.trickplay_interval_ms,
+                )
         })
         .collect();
     let total = dtos.len() as u32;
@@ -1747,11 +1755,15 @@ async fn shows_episodes(
         .iter()
         .map(|(idx, item)| {
             let ud = user_data.get(*idx).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.generated_trickplay_widths(item.id),
-                state.trickplay_interval_ms,
-            )
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+                .with_converted_book(
+                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+                )
+                .with_trickplay(
+                    &item.probe,
+                    &state.generated_trickplay_widths(item.id),
+                    state.trickplay_interval_ms,
+                )
         })
         .collect();
     let _ = q.user_id.as_deref();
@@ -3142,11 +3154,15 @@ async fn latest_items(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.generated_trickplay_widths(item.id),
-                state.trickplay_interval_ms,
-            )
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+                .with_converted_book(
+                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+                )
+                .with_trickplay(
+                    &item.probe,
+                    &state.generated_trickplay_widths(item.id),
+                    state.trickplay_interval_ms,
+                )
         })
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
@@ -3964,11 +3980,13 @@ async fn maybe_list_music(
             for (n, t) in loose.iter().enumerate() {
                 let d = ud.get(n).copied().unwrap_or_default();
                 items.push(
-                    serde_json::to_value(BaseItemDto::from_domain_with_user_data(
-                        t,
-                        &state.server_id,
-                        d,
-                    ))
+                    serde_json::to_value(
+                        BaseItemDto::from_domain_with_user_data(t, &state.server_id, d)
+                            .with_converted_book(
+                                crate::book_convert::converted_book_path(state.books.as_ref(), t)
+                                    .as_deref(),
+                            ),
+                    )
                     .unwrap_or_default(),
                 );
             }
@@ -4899,6 +4917,9 @@ pub(crate) async fn build_items_page_with_fields(
     for (i, item) in page.iter().enumerate() {
         let ud = user_data.get(i).copied().unwrap_or_default();
         let mut dto = BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            .with_converted_book(
+                crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+            )
             .with_trickplay(
                 &item.probe,
                 &state.generated_trickplay_widths(item.id),
@@ -4922,7 +4943,15 @@ pub(crate) async fn build_items_page_with_fields(
             }
         }
         if want_path {
-            dto = dto.with_path(&item.path);
+            // A converted Kindle book keeps advertising its EPUB here.
+            // `Fields=Path` asks for the item's path, and for this item that
+            // IS the converted file — re-stamping the `.azw3` would undo the
+            // reader gate two lines after setting it.
+            dto = dto.with_path(
+                crate::book_convert::converted_book_path(state.books.as_ref(), item)
+                    .as_deref()
+                    .unwrap_or(&item.path),
+            );
         }
         items.push(dto);
     }
@@ -5659,6 +5688,12 @@ async fn fetch_item_dto(
         }
     };
     let mut dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
+        // THE load-bearing site for books: jellyfin-web's details page fetches
+        // this route with NO `Fields`, hands the result to `playbackManager`,
+        // and every reader's `canPlayItem` tests `item.Path` (B170/V117).
+        .with_converted_book(
+            crate::book_convert::converted_book_path(state.books.as_ref(), &item).as_deref(),
+        )
         .with_trickplay(
             &item.probe,
             &state.generated_trickplay_widths(item.id),
@@ -5671,7 +5706,13 @@ async fn fetch_item_dto(
     // FR-003 — gated, unlike the joins above, so the detail payload agrees with
     // the list payload: `Fields=Path` present on both, absent on both.
     if fields_requests(fields, "Path") {
-        dto = dto.with_path(&item.path);
+        // Converted-aware for the same reason as the list path above: this
+        // would otherwise overwrite the EPUB path set on construction.
+        dto = dto.with_path(
+            crate::book_convert::converted_book_path(state.books.as_ref(), &item)
+                .as_deref()
+                .unwrap_or(&item.path),
+        );
     }
     Ok(crate::api::jellyfin::wire::json(&dto))
 }
@@ -6258,11 +6299,15 @@ async fn resume_items(
         .enumerate()
         .map(|(i, item)| {
             let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.generated_trickplay_widths(item.id),
-                state.trickplay_interval_ms,
-            )
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+                .with_converted_book(
+                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+                )
+                .with_trickplay(
+                    &item.probe,
+                    &state.generated_trickplay_widths(item.id),
+                    state.trickplay_interval_ms,
+                )
         })
         .collect();
     Ok(crate::api::jellyfin::wire::json(&ItemsResultDto {

@@ -156,6 +156,10 @@ pub struct AppState {
     pub hw_encode_session_budget: usize,
     pub trickplay: Option<TrickplayCache>,
     pub subtitles: Option<SubtitleCache>,
+    /// 005-kindle-conversion — converted-EPUB store for Kindle books. `None`
+    /// disables conversion delivery entirely: the item still lists and still
+    /// downloads, as its original `.azw3`, which is the 004-books behaviour.
+    pub books: Option<crate::book_convert::ConvertedBookCache>,
     /// Trickplay layout knobs surfaced to handlers + DTO emitter so
     /// the wire shape matches what was actually generated.
     pub trickplay_widths: Vec<u32>,
@@ -556,6 +560,7 @@ impl AppState {
             hw_encode_session_budget: 0,
             trickplay: None,
             subtitles: None,
+            books: None,
             trickplay_widths: Vec::new(),
             trickplay_interval_ms: 10_000,
             trickplay_priority: None,
@@ -643,6 +648,7 @@ impl AppState {
             hw_encode_session_budget: 0,
             trickplay: None,
             subtitles: None,
+            books: None,
             trickplay_widths: Vec::new(),
             trickplay_interval_ms: 10_000,
             trickplay_priority: None,
@@ -797,6 +803,11 @@ impl AppState {
 
     pub fn with_subtitle_cache(mut self, cache: SubtitleCache) -> Self {
         self.subtitles = Some(cache);
+        self
+    }
+
+    pub fn with_book_cache(mut self, cache: crate::book_convert::ConvertedBookCache) -> Self {
+        self.books = Some(cache);
         self
     }
 

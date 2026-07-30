@@ -312,6 +312,18 @@ pub struct ServerConfig {
     /// either is set; otherwise the cache stays memory-only.
     #[serde(default)]
     pub subtitle_cache_dir: Option<PathBuf>,
+    /// 005-kindle-conversion — directory to persist converted Kindle books
+    /// (`.mobi`/`.azw`/`.azw3` → EPUB) under. When unset, pharos derives a
+    /// `books` sibling of `transcode_cache_dir` / `image_cache_dir` if either
+    /// is set; with none of the three set, conversion delivery is OFF and a
+    /// Kindle book downloads as its original file.
+    ///
+    /// Converted books are small (the deployed library's 17 total ~80 MiB) and
+    /// regenerate on demand, so this needs no byte cap of its own — unlike
+    /// trickplay, an evicted entry costs one 60 ms rebuild rather than a
+    /// whole-file decode.
+    #[serde(default)]
+    pub book_cache_dir: Option<PathBuf>,
     /// Live-TV M3U playlist path (T47). When set, /LiveTv/Channels
     /// + /LiveTv/Programs serve channels + EPG from this backend.
     #[serde(default)]
