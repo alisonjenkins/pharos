@@ -69,14 +69,22 @@ fn content_type_for(path: &std::path::Path) -> &'static str {
 /// next to the cost of getting the quoting subtly wrong. Non-ASCII names are
 /// left as-is: actix rejects invalid header bytes, and the fallback below keeps
 /// the response valid if that happens.
-fn disposition_for(path: &std::path::Path) -> String {
-    let name: String = path
-        .file_name()
+///
+/// 005-kindle-conversion — `served` is what is actually going over the wire,
+/// which for a converted book is a cache file named after the item id. The
+/// NAME comes from the source (the reader saving it wants "The Prince", not
+/// "42") while the EXTENSION comes from what is being sent, so the saved file
+/// is not an `.azw` full of EPUB bytes that no desktop reader will open.
+fn disposition_for(source: &std::path::Path, served: &std::path::Path) -> String {
+    let stem = source
+        .file_stem()
         .and_then(|n| n.to_str())
-        .unwrap_or("download")
-        .chars()
-        .filter(|c| *c != '"' && *c != '\\')
-        .collect();
+        .unwrap_or("download");
+    let name = match served.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem.to_string(),
+    };
+    let name: String = name.chars().filter(|c| *c != '"' && *c != '\\').collect();
     format!("attachment; filename=\"{name}\"")
 }
 
@@ -99,13 +107,42 @@ async fn download(
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
 
-    let file = NamedFile::open_async(&item.path).await.map_err(|e| {
+    // 005-kindle-conversion — a Kindle book was stored as `Epub` because it
+    // converts, so this route must hand over the EPUB and not the `.azw3` the
+    // item still points at. Converting here rather than at scan keeps the
+    // read-only media share untouched and makes the cache self-healing.
+    //
+    // A failure falls back to the ORIGINAL file rather than erroring: the
+    // 004-books behaviour (an unopenable but downloadable book) is strictly
+    // better than a 500, and the cause is already on the counter and in the
+    // log by the time this returns.
+    let serve_path = match (&state.books, &item.book) {
+        (Some(cache), Some(book))
+            if pharos_scanner::book::kindle::is_converted_kindle(&item.path, book.format) =>
+        {
+            match cache.get_or_convert(id, &item.path).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        media.id = id,
+                        path = %item.path.display(),
+                        error = %e,
+                        "download: kindle conversion unavailable; serving the original file"
+                    );
+                    item.path.clone()
+                }
+            }
+        }
+        _ => item.path.clone(),
+    };
+
+    let file = NamedFile::open_async(&serve_path).await.map_err(|e| {
         // Carry the offending path AND the underlying io error — "not found"
         // alone cannot distinguish a deleted file from a dead NFS mount, which
         // is exactly the distinction the mergerfs outage turned on.
         tracing::warn!(
             media.id = id,
-            path = %item.path.display(),
+            path = %serve_path.display(),
             error = %e,
             "download: source unreadable"
         );
@@ -117,10 +154,14 @@ async fn download(
         .use_last_modified(true)
         .into_response(&req);
 
-    let ct = content_type_for(&item.path);
+    // Both derived from what is actually being SENT, not from the item's
+    // stored path: a converted book must arrive as `application/epub+zip`,
+    // because a browser handed `application/vnd.amazon.ebook` on a same-origin
+    // fetch may offer a download dialog instead of letting the reader have it.
+    let ct = content_type_for(&serve_path);
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(ct));
-    if let Ok(v) = header::HeaderValue::from_str(&disposition_for(&item.path)) {
+    if let Ok(v) = header::HeaderValue::from_str(&disposition_for(&item.path, &serve_path)) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok::<HttpResponse, actix_web::Error>(resp)

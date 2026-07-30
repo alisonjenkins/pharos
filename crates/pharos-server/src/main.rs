@@ -1266,6 +1266,21 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         let sub_cache = sub_cache.with_pool(libav_pool.clone());
         state = state.with_subtitle_cache(sub_cache);
     }
+    // 005-kindle-conversion — converted-EPUB store. Same "explicit dir, else a
+    // sibling of an existing cache dir" rule the subtitle cache uses above; if
+    // no cache dir is configured at all this stays `None` and Kindle books
+    // download as their original file (the 004-books behaviour).
+    let book_dir = cfg.server.book_cache_dir.clone().or_else(|| {
+        cfg.server
+            .transcode_cache_dir
+            .as_ref()
+            .or(cfg.server.image_cache_dir.as_ref())
+            .and_then(|d| d.parent().map(|p| p.join("books")))
+    });
+    if let Some(dir) = book_dir {
+        tracing::info!(dir = %dir.display(), "converted-book cache enabled");
+        state = state.with_book_cache(pharos_server::book_convert::ConvertedBookCache::new(dir));
+    }
     if !cfg.server.trickplay_widths.is_empty() {
         if let Some(cache_dir) = cfg.server.trickplay_cache_dir.clone() {
             let trickplay_cache =

@@ -1623,6 +1623,29 @@ impl BaseItemDto {
         self
     }
 
+    /// 005-kindle-conversion — point `Path` at the EPUB a converted Kindle book
+    /// is actually delivered as.
+    ///
+    /// `bookPlayer`'s gate is `item.Path?.endsWith("epub")`, so a `.azw3` here
+    /// means the reader declines and the book is unopenable — the B170 shape
+    /// that made `Path` unconditional for books in the first place.
+    ///
+    /// The value passed is the REAL cache file the download route serves, not
+    /// the source path with its extension rewritten. That distinction is the
+    /// whole point: a synthesised `…/The Prince.epub` names a file that does
+    /// not exist, and pharos does not misreport a path to satisfy a
+    /// client-side compare (the same reason a `.EPUB` is left alone even
+    /// though the compare is case-sensitive).
+    ///
+    /// `None` — conversion disabled, or this item is not a converted book —
+    /// leaves whatever `build` set, so nothing else changes shape.
+    pub fn with_converted_book(mut self, converted: Option<&std::path::Path>) -> Self {
+        if let Some(p) = converted {
+            self.path = Some(p.to_string_lossy().into_owned());
+        }
+        self
+    }
+
     pub fn from_domain_with_user_data(
         item: &pharos_core::MediaItem,
         server_id: &str,

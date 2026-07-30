@@ -401,11 +401,15 @@ async fn build_suggestions(
         .iter()
         .map(|(idx, item)| {
             let ud = user_data.get(*idx).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud).with_trickplay(
-                &item.probe,
-                &state.trickplay_widths,
-                state.trickplay_interval_ms,
-            )
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+                .with_converted_book(
+                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+                )
+                .with_trickplay(
+                    &item.probe,
+                    &state.trickplay_widths,
+                    state.trickplay_interval_ms,
+                )
         })
         .collect();
     let total = dtos.len() as u32;
