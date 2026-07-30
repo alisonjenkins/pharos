@@ -35,11 +35,13 @@ async fn seed(admin: bool) -> (web::Data<AppState>, String, UserId) {
         .await
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
-    // Two movies under /media/movies, one episode under /media/tv.
+    // Two movies under /media/movies, one episode under /media/tv, one book
+    // under /media/books.
     for (id, path, kind) in [
         (1u64, "/media/movies/Warcraft.mkv", MediaKind::Movie),
         (2, "/media/movies/Dune.mkv", MediaKind::Movie),
         (3, "/media/tv/Show/S01E01.mkv", MediaKind::Episode),
+        (4, "/media/books/Dune.epub", MediaKind::Book),
     ] {
         stores
             .put(MediaItem {
@@ -127,6 +129,88 @@ async fn add_virtual_folder_creates_typed_library_and_groups_items() {
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["TotalRecordCount"], 2, "expected 2 movies, got {v}");
+}
+
+/// 004-books (T058) — FR-005. A books library must reach the client as
+/// `CollectionType: "books"`, on BOTH surfaces the client reads.
+///
+/// The risk is specific and silent. `wire_collection_type` nulls "mixed"
+/// because Jellyfin's kotlin enum has no such member and the string crashes a
+/// strict decode (B68). If that filter were an ALLOWLIST rather than a
+/// passthrough, "books" would arrive as `null`, the library would render as a
+/// generic mixed folder of video cards, and nothing would error — the books
+/// would still be there, just presented as the wrong kind of thing.
+#[actix_web::test]
+async fn a_books_library_presents_as_a_books_collection() {
+    let (state, token, uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/Library/VirtualFolders?name=Books&collectionType=books&refreshLibrary=false")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .insert_header(("content-type", "application/json"))
+        .set_payload(r#"{"LibraryOptions":{"PathInfos":[{"Path":"/media/books"}]}}"#)
+        .to_request();
+    assert!(test::call_service(&app, req).await.status().is_success());
+
+    // Surface 1 — the dashboard's own list.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Library/VirtualFolders")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let books = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "Books")
+        .expect("Books library missing from VirtualFolders");
+    assert_eq!(
+        books["CollectionType"], "books",
+        "a null or absent CollectionType renders the library as a generic \
+         mixed folder of video cards, silently: {books}"
+    );
+    let wire_id = books["ItemId"].as_str().unwrap().to_string();
+
+    // Surface 2 — /UserViews, which is what the client's own navigation reads
+    // and the only one that decides how the grid renders.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/UserViews")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let view = v["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "Books")
+        .expect("Books view missing from /UserViews");
+    assert_eq!(view["CollectionType"], "books", "{view}");
+
+    // And the library actually holds the book, so "books" is not just a label
+    // on an empty folder.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!(
+                "/Users/{}/Items?ParentId={wire_id}",
+                uid.0.simple()
+            ))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1, "expected the one book, got {v}");
+    assert_eq!(v["Items"][0]["Type"], "Book");
 }
 
 #[actix_web::test]

@@ -153,13 +153,13 @@ concern and nothing else.
 
 **Independent test**: seed one `.cbz` of known page count, open, page forward.
 
-- [ ] T051 [P] [US2] Add a `.cbz` fixture generated in-test — a zip of two tiny numbered JPEGs — under `crates/pharos-scanner/tests/fixtures/`
-- [ ] T052 [P] [US2] Add test `a_comics_page_count_and_comicinfo_are_read` in `crates/pharos-scanner/src/book/comic.rs` tests: `page_count` equals the image-entry count; `ComicInfo.xml` `Series`/`Number`/`Writer` map to `series_name`/`series_index`/`author`
-- [ ] T053 [P] [US2] Add test `a_comic_without_comicinfo_still_reports_a_page_count` asserting the archive-only path yields `page_count: Some(n)` with other fields `None`
-- [ ] T054 [US2] Implement `crates/pharos-scanner/src/book/comic.rs`: enumerate entries (zip via `zip`, cb7 via `sevenz-rust`), count image entries in name order, parse `ComicInfo.xml` with `quick-xml` when present. One archive open per file
-- [ ] T055 [US2] Wire `cbz`/`cbt`/`cb7` into the `read_book_meta` dispatch in `crates/pharos-scanner/src/book/mod.rs`
-- [ ] T056 [US2] Classify `.cbr` as `BookFormat::Comic` — it lists, downloads and reads, because libarchive.js unpacks rar client-side — and extract no cover, recording `rar_unsupported` on the counter. **Settled, not deferred** (R7): `unrar` wraps a C library, the same objection that rules out a PDF rasteriser, so `.cbr` is permanently cover-less-but-readable. Counted so the number is visible rather than mysterious
-- [ ] T057 [US2] Open the `.cbz` in jellyfin-web and page forward (quickstart §9 step 3) — **COMMIT**
+- [X] T051 [P] [US2] Add a `.cbz` fixture generated in-test — a zip of two tiny numbered JPEGs — under `crates/pharos-scanner/tests/fixtures/`
+- [X] T052 [P] [US2] Add test `a_comics_page_count_and_comicinfo_are_read` in `crates/pharos-scanner/src/book/comic.rs` tests: `page_count` equals the image-entry count; `ComicInfo.xml` `Series`/`Number`/`Writer` map to `series_name`/`series_index`/`author`
+- [X] T053 [P] [US2] Add test `a_comic_without_comicinfo_still_reports_a_page_count` asserting the archive-only path yields `page_count: Some(n)` with other fields `None`
+- [X] T054 [US2] Implement `crates/pharos-scanner/src/book/comic.rs`: enumerate entries (zip via `zip`, cb7 via `sevenz-rust`), count image entries in name order, parse `ComicInfo.xml` with `quick-xml` when present. One archive open per file
+- [X] T055 [US2] Wire `cbz`/`cbt`/`cb7` into the `read_book_meta` dispatch in `crates/pharos-scanner/src/book/mod.rs`
+- [X] T056 [US2] Classify `.cbr` as `BookFormat::Comic` — it lists, downloads and reads, because libarchive.js unpacks rar client-side — and extract no cover, recording `rar_unsupported` on the counter. **Settled, not deferred** (R7): `unrar` wraps a C library, the same objection that rules out a PDF rasteriser, so `.cbr` is permanently cover-less-but-readable. Counted so the number is visible rather than mysterious
+- [X] T057 [US2] Open the `.cbz` in jellyfin-web and page forward (quickstart §9 step 3) — **COMMIT**
 
 ---
 
