@@ -1,4 +1,5 @@
 //! LIB-D1 — merge-behaviour unit tests for [`MetadataResolver`].
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
 use pharos_core::{
@@ -327,5 +328,150 @@ async fn the_provider_that_supplied_the_year_is_recorded() {
     assert!(
         labels.contains(&"provider=embedded".to_string()),
         "must name the provider that actually won, not one that merely ran; got {labels:?}"
+    );
+}
+
+/// 004-books (T065) — the book provider is an ordinary participant in the
+/// priority-ordered merge, not a special case bolted onto the side.
+///
+/// Three things this pins, each of which fails silently otherwise:
+///
+/// * A curated `.nfo` still wins. If the book provider outranked it, editing a
+///   book's title in Kodi would appear to work and be overwritten on the next
+///   scan.
+/// * A title-less book falls through to the FILENAME provider, so no book is
+///   ever listed untitled (FR-007). This is the reason `supports` was widened
+///   to admit books — a `matches!` the compiler never flagged (R10).
+/// * `dc:date` and `dc:description` land on the ITEM (production_year /
+///   overview), not on `BookMeta` (R6). Two homes for one fact is two answers
+///   that can disagree.
+#[tokio::test]
+async fn book_metadata_flows_through_the_existing_resolver() {
+    use crate::metadata::book::BookMetadataProvider;
+    use crate::metadata::filename::FilenameProvider;
+    use metrics_util::debugging::DebuggingRecorder;
+    use std::io::Write;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let td = tempfile::tempdir().unwrap();
+    let titled = td.path().join("Dune.epub");
+    let untitled = td.path().join("Some Untitled Book.epub");
+    let write = |path: &Path, opf: &str| {
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("META-INF/container.xml", opts).unwrap();
+        zw.write_all(
+            br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        zw.start_file("OEBPS/content.opf", opts).unwrap();
+        zw.write_all(opf.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    };
+    write(
+        &titled,
+        r#"<package><metadata>
+             <dc:title>Dune</dc:title>
+             <dc:description>A desert planet.</dc:description>
+             <dc:date>1965-08-01</dc:date>
+           </metadata><manifest/></package>"#,
+    );
+    write(
+        &untitled,
+        r#"<package><metadata><dc:creator>Anon</dc:creator></metadata><manifest/></package>"#,
+    );
+
+    let probe = MediaProbe::default();
+    // An NFO-shaped high-priority source, standing in for a curated edit.
+    let nfoish = MockProvider {
+        name: "nfo",
+        priority: 100,
+        supports: MediaKind::Book,
+        result: MetadataResult {
+            title: Some("Dune (curated)".into()),
+            ..Default::default()
+        },
+        fail: false,
+    };
+    let resolver = MetadataResolver::new()
+        .with_provider(nfoish)
+        .with_provider(BookMetadataProvider::new())
+        .with_provider(FilenameProvider::new());
+
+    let merged = resolver
+        .resolve(&MetadataRequest {
+            path: &titled,
+            kind: MediaKind::Book,
+            probe: &probe,
+            series: None,
+        })
+        .await;
+    assert_eq!(
+        merged.title.as_deref(),
+        Some("Dune (curated)"),
+        "a curated source must still outrank the book file, or a user's edit is \
+         silently reverted on the next scan"
+    );
+    assert_eq!(
+        merged.overview.as_deref(),
+        Some("A desert planet."),
+        "dc:description belongs on the ITEM's overview, not on BookMeta (R6)"
+    );
+    assert_eq!(
+        merged.production_year,
+        Some(1965),
+        "dc:date belongs on the ITEM's year, not on BookMeta (R6)"
+    );
+
+    // FR-007 — the filename supplies what the file did not. Resolved WITHOUT
+    // the curated mock, which answers for every path and would otherwise mask
+    // the fallback this is testing.
+    let plain = MetadataResolver::new()
+        .with_provider(BookMetadataProvider::new())
+        .with_provider(FilenameProvider::new());
+    let merged = plain
+        .resolve(&MetadataRequest {
+            path: &untitled,
+            kind: MediaKind::Book,
+            probe: &probe,
+            series: None,
+        })
+        .await;
+    assert_eq!(
+        merged.title.as_deref(),
+        Some("Some Untitled Book"),
+        "a book whose OPF names no title takes one from its filename; without \
+         the widened `supports` gate it would list untitled"
+    );
+
+    // B169's counter, reused — no new metric. It must name the BOOK provider as
+    // the source of the year, not merely record that a year arrived.
+    let labels = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(ck, _, _, _)| {
+            let k = ck.key();
+            if k.name() != "pharos_metadata_field_source_total" {
+                return None;
+            }
+            let labels: Vec<String> = k
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            labels
+                .contains(&"field=production_year".to_string())
+                .then_some(labels)
+        });
+    let Some(labels) = labels else {
+        panic!("the provider that supplied a book's year must be recorded")
+    };
+    assert!(
+        labels.contains(&"provider=book".to_string()),
+        "must name the provider that actually won; got {labels:?}"
     );
 }

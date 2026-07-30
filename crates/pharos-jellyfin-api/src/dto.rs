@@ -1847,7 +1847,17 @@ impl BaseItemDto {
                 .or_else(|| item.probe.album.as_deref().map(album_id_for)),
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
-            series_name: item.series.as_ref().map(|s| s.series_name.clone()),
+            // 004-books (T068) — a book's series is its shelf: "Dune Chronicles"
+            // from an epub's `calibre:series`, "Batman" from a comic's
+            // `<Series>`. `SeriesName` is the field jellyfin-web already groups
+            // and labels by, so a book reuses it rather than inventing one the
+            // client would ignore. `item.series` is never set for a Book (the
+            // scanner leaves it `None`), so the two can never contend.
+            series_name: item
+                .series
+                .as_ref()
+                .map(|s| s.series_name.clone())
+                .or_else(|| item.book.as_ref().and_then(|b| b.series_name.clone())),
             series_id: item
                 .series
                 .as_ref()
@@ -1867,11 +1877,14 @@ impl BaseItemDto {
                 .as_ref()
                 .and_then(|s| s.season_number)
                 .or(item.probe.disc_number),
+            // …and books: the volume number within that series, so book 2 of a
+            // trilogy sorts and displays as book 2.
             index_number: item
                 .series
                 .as_ref()
                 .and_then(|s| s.episode_number)
-                .or(item.probe.track_number),
+                .or(item.probe.track_number)
+                .or_else(|| item.book.as_ref().and_then(|b| b.series_index)),
             // P13 — VideoRange is HDR-only when the probe says so.
             // Audio items + SDR videos skip the field entirely.
             video_range: if is_video && item.probe.is_hdr() {

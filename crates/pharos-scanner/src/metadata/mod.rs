@@ -26,6 +26,7 @@
 //! [`priority`]: pharos_core::MetadataProvider::priority
 //! [`fetch`]: pharos_core::MetadataProvider::fetch
 
+pub mod book;
 pub mod embedded;
 pub mod filename;
 pub mod nfo;

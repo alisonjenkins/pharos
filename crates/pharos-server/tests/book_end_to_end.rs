@@ -191,10 +191,19 @@ async fn a_real_epub_survives_scan_to_wire() {
         "SC-004 — nothing to transcode"
     );
     assert_eq!(item["RunTimeTicks"], 0);
-    // SeriesName / IndexNumber projection is US3's (T068). The BookMeta assertions
-    // above already prove the scan READ the series out of the OPF; putting it on
-    // the wire is a separate step, and asserting it here would fail for the right
-    // reason at the wrong time.
+    // T068 — the series the scan read out of the OPF reaches the client on the
+    // fields it already groups by. Held back until US3 landed the projection;
+    // asserted now, on the same end-to-end path, so the read and the wire
+    // cannot drift apart.
+    assert_eq!(
+        item["SeriesName"], "Dune Chronicles",
+        "a book's series is its shelf, and SeriesName is the field jellyfin-web \
+         groups by: {item}"
+    );
+    assert_eq!(
+        item["IndexNumber"], 1,
+        "the volume number within the series: {item}"
+    );
 
     // ---- quickstart §5: PlaybackInfo offers no source.
     let id = item["Id"].as_str().unwrap().to_string();

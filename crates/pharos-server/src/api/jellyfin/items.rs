@@ -4469,6 +4469,9 @@ enum SortPrimary {
     /// Album track order: disc then track then name. jellyfin-web's album
     /// detail sends `SortBy=ParentIndexNumber,IndexNumber,SortName`.
     TrackOrder,
+    /// 004-books — a books library's reading order: series, then volume. The
+    /// token `SeriesSortName` is what jellyfin-web sends for a shelf view.
+    BookSeriesOrder,
     Name,
 }
 
@@ -4490,6 +4493,10 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         "AlbumArtist" => SortPrimary::AlbumArtist,
         "Album" => SortPrimary::Album,
         "ParentIndexNumber" | "IndexNumber" => SortPrimary::TrackOrder,
+        // 004-books — a shelf view. `SeriesSortName` already means "group by
+        // series" in Jellyfin; for a books library the series is the shelf and
+        // the index is the volume.
+        "SeriesSortName" => SortPrimary::BookSeriesOrder,
         _ => SortPrimary::Name,
     }
 }
@@ -4765,6 +4772,26 @@ fn build_media_query(
             } else {
                 vec![
                     (SortKey::Album, SortDir::Asc),
+                    (SortKey::Name, SortDir::Asc),
+                ]
+            }
+        }
+        SortPrimary::BookSeriesOrder => {
+            // Series, then volume, then title. An unnumbered volume sorts last
+            // within its series — the store's column expression coalesces NULL
+            // to a sentinel so both backends agree on that, rather than SQLite
+            // putting it first and Postgres last.
+            if descending {
+                vec![
+                    (SortKey::BookSeries, SortDir::Desc),
+                    (SortKey::BookSeriesIndex, SortDir::Desc),
+                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            } else {
+                vec![
+                    (SortKey::BookSeries, SortDir::Asc),
+                    (SortKey::BookSeriesIndex, SortDir::Asc),
                     (SortKey::Name, SortDir::Asc),
                 ]
             }

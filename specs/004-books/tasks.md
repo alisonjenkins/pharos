@@ -171,16 +171,16 @@ concern and nothing else.
 
 ### The library view
 
-- [ ] T058 [P] [US3] Add test `a_books_library_presents_as_a_books_collection` in `crates/pharos-server/tests/jellyfin_add_library.rs` asserting `GET /UserViews` returns `CollectionType: "books"` for a `kind = "books"` library
-- [ ] T059 [US3] Confirm the library-view builder in `crates/pharos-server/src/api/jellyfin/` emits `LibraryKind::Books.collection_type()` rather than a hardcoded set; extend it if the mapping is exhaustive-matched elsewhere
+- [X] T058 [P] [US3] Add test `a_books_library_presents_as_a_books_collection` in `crates/pharos-server/tests/jellyfin_add_library.rs` asserting `GET /UserViews` returns `CollectionType: "books"` for a `kind = "books"` library
+- [X] T059 [US3] Confirm the library-view builder in `crates/pharos-server/src/api/jellyfin/` emits `LibraryKind::Books.collection_type()` rather than a hardcoded set; extend it if the mapping is exhaustive-matched elsewhere
 
 ### Covers
 
-- [ ] T060 [P] [US3] Add test `an_epub_cover_is_registered_as_primary_art` in `crates/pharos-scanner/src/book/mod.rs` tests asserting cover bytes go through the store's `set_artwork` and that `has_primary_art` becomes true. **Disarm-verify** by swapping to `put` and watching the flag assertion go red — `put` does not maintain the denormalisation (B155)
-- [ ] T061 [US3] Extract the epub cover in `crates/pharos-scanner/src/book/epub.rs`: OPF `<meta name="cover">` → manifest href, else the first image in the spine; record `no_cover_entry` when neither exists
-- [ ] T062 [US3] Extract the comic cover in `crates/pharos-scanner/src/book/comic.rs`: first image entry in name order
-- [ ] T063 [US3] Write extracted covers through `set_artwork(…, ImageRole::Primary)` from the scan path in `crates/pharos-scanner/src/fs.rs`, so the existing image cache and `has_primary_art` apply unchanged
-- [ ] T064 [P] [US3] Add an end-to-end test in `crates/pharos-server/tests/` that a scanned cover-less book advertises no `ImageTags.Primary` and that `GET /Items/{id}/Images/Primary` is consistent with the tag — no advertised-then-404 pair (B149). Complements T037, which asserts the DTO shape; this asserts the scan-to-wire path
+- [X] T060 [P] [US3] Add test `an_epub_cover_is_registered_as_primary_art` in `crates/pharos-scanner/src/book/mod.rs` tests asserting cover bytes go through the store's `set_artwork` and that `has_primary_art` becomes true. **Disarm-verify** by swapping to `put` and watching the flag assertion go red — `put` does not maintain the denormalisation (B155)
+- [X] T061 [US3] Extract the epub cover in `crates/pharos-scanner/src/book/epub.rs`: OPF `<meta name="cover">` → manifest href, else the first image in the spine; record `no_cover_entry` when neither exists
+- [X] T062 [US3] Extract the comic cover in `crates/pharos-scanner/src/book/comic.rs`: first image entry in name order
+- [X] T063 [US3] Write extracted covers through `set_artwork(…, ImageRole::Primary)` from the scan path in `crates/pharos-scanner/src/fs.rs`, so the existing image cache and `has_primary_art` apply unchanged
+- [X] T064 [P] [US3] Add an end-to-end test in `crates/pharos-server/tests/` that a scanned cover-less book advertises no `ImageTags.Primary` and that `GET /Items/{id}/Images/Primary` is consistent with the tag — no advertised-then-404 pair (B149). Complements T037, which asserts the DTO shape; this asserts the scan-to-wire path
 
 ### Authors, series and the rest of the metadata
 

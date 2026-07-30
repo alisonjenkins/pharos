@@ -2518,6 +2518,16 @@ pub enum SortKey {
     /// is type-overloaded in Jellyfin (season for episodes, disc for tracks);
     /// the API picks the column by the query's kind/parent (B87).
     SeasonNumber,
+    /// 004-books — `SeriesSortName` for a book: the shelf it belongs to
+    /// (`book_series`). Distinct from [`SortKey::Name`] so a series of books
+    /// groups together whatever the individual titles are — "Dune Messiah"
+    /// alphabetises nowhere near "Children of Dune".
+    BookSeries,
+    /// 004-books — the volume number within that series (`book_series_index`).
+    /// An UNNUMBERED volume sorts LAST rather than as zero: unknown is not
+    /// first, and a companion volume with no number belongs after book 6, not
+    /// before book 1.
+    BookSeriesIndex,
     /// Stable id order — the implicit final tiebreak on every sort, and the
     /// key for "no explicit sort" callers.
     Id,
