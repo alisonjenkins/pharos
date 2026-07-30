@@ -13,4 +13,18 @@ ignore = [
     # team consider 1.3.3 complete and there's no safe upgrade. Matches
     # the rationale in deny.toml.
     "RUSTSEC-2025-0141",
+    # RUSTSEC-2026-0194 / -0195 — quadratic duplicate-attribute check and
+    # unbounded `NsReader` namespace allocation in quick-xml < 0.41. Both
+    # come from the 0.39 that `boko` pins; pharos's own quick-xml is 0.41,
+    # and 0.39 -> 0.41 is a breaking range for a 0.x crate, so this needs an
+    # upstream release rather than a `cargo update`.
+    #
+    # Ignored on reachability, and the two are unreachable for DIFFERENT
+    # reasons — -0195 needs `NsReader`, which boko never constructs, while
+    # -0194 applies to the plain `Reader` boko does use but lives in its EPUB
+    # *importer*, which pharos never enters because it hands boko only
+    # `.mobi`/`.azw`/`.azw3`. The full argument, including what would
+    # invalidate it, is in deny.toml; V123 says it has to be written down.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
