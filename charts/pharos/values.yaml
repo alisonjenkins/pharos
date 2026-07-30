@@ -143,7 +143,11 @@ config:
     # Plain roots (each becomes a "mixed" library named after its basename).
     roots:
       - "/var/lib/pharos/media"
-    # Typed libraries (LIB-C1). Each: {path, name?, kind: movies|tvshows|music|mixed}.
+    # Typed libraries (LIB-C1). Each: {path, name?, kind: movies|tvshows|music|books|mixed}.
+    #
+    # 004-books — `books` makes jellyfin-web render a book grid and offer its
+    # readers (epub.js / libarchive.js / pdf.js). A books folder left under a
+    # `mixed` root still lists and still opens, but presents as a video library.
     libraries: []
   database:
     # SQLite on the db PVC by default. Set a postgres:// URL to use Postgres
