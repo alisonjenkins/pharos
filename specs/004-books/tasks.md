@@ -135,11 +135,11 @@ concern and nothing else.
 
 **Independent test**: seed one `.epub`, open it in jellyfin-web, turn a page.
 
-- [ ] T044 [P] [US1] Add an epub fixture under `crates/pharos-scanner/tests/fixtures/` — generate it in-test as a zip holding `META-INF/container.xml` plus an OPF, which keeps a binary blob out of the repo
-- [ ] T045 [P] [US1] Add test `an_epubs_opf_metadata_is_read` in `crates/pharos-scanner/src/book/epub.rs` tests: `dc:creator`→author, `dc:publisher`, `calibre:series`/`calibre:series_index`, `dc:identifier`→isbn, and `page_count` stays `None` (epub has no stable page count — deliberate)
-- [ ] T046 [P] [US1] Add test `a_malformed_epub_still_imports_the_item` asserting a zip with no `container.xml` yields `BookMeta { format: Epub, .. }` with empty fields rather than `None`, that the item still imports (V6), and that the counter records `malformed_container`
-- [ ] T047 [US1] Implement `crates/pharos-scanner/src/book/epub.rs` using the existing `quick-xml`: open the zip, read `META-INF/container.xml` → OPF path → parse the OPF `<metadata>` Dublin Core block. No `unwrap`/`expect` (V17); every error carries the offending value — the zip path and the entry name — never a bare class
-- [ ] T048 [US1] Wire `epub` into the `read_book_meta` dispatch in `crates/pharos-scanner/src/book/mod.rs`
+- [X] T044 [P] [US1] Add an epub fixture under `crates/pharos-scanner/tests/fixtures/` — generate it in-test as a zip holding `META-INF/container.xml` plus an OPF, which keeps a binary blob out of the repo
+- [X] T045 [P] [US1] Add test `an_epubs_opf_metadata_is_read` in `crates/pharos-scanner/src/book/epub.rs` tests: `dc:creator`→author, `dc:publisher`, `calibre:series`/`calibre:series_index`, `dc:identifier`→isbn, and `page_count` stays `None` (epub has no stable page count — deliberate)
+- [X] T046 [P] [US1] Add test `a_malformed_epub_still_imports_the_item` asserting a zip with no `container.xml` yields `BookMeta { format: Epub, .. }` with empty fields rather than `None`, that the item still imports (V6), and that the counter records `malformed_container`
+- [X] T047 [US1] Implement `crates/pharos-scanner/src/book/epub.rs` using the existing `quick-xml`: open the zip, read `META-INF/container.xml` → OPF path → parse the OPF `<metadata>` Dublin Core block. No `unwrap`/`expect` (V17); every error carries the offending value — the zip path and the entry name — never a bare class
+- [X] T048 [US1] Wire `epub` into the `read_book_meta` dispatch in `crates/pharos-scanner/src/book/mod.rs`
 - [ ] T049 [US1] Walk [quickstart.md](./quickstart.md) §1–§6 against a real books library: items imported with zero ffmpeg invocations, `CollectionType: "books"`, `Path` gated and spelled both ways, `MediaSources: []` from `PlaybackInfo`, and a truthful `Content-Length` on the `/Download` HEAD
 - [ ] T050 [US1] Open the epub in unmodified jellyfin-web via `nix develop --command just compat-playwright-full` and **turn a page** (quickstart §9). If the card opens nothing and the network tab shows no `/Download` request, it is gate 1 or 2 (`MediaType`/`Path`) — check T038 first — **COMMIT**
 
