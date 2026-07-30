@@ -27,6 +27,11 @@ futures-util = "0.3"
 httpdate = "1"
 libc = "0.2"
 tempfile = "3"
+# 004-books — writing the Playwright epub fixture (`write_seed_epub`) and the
+# end-to-end test's in-test epub. Already in the graph via pharos-scanner, so no
+# new crate is compiled; the seeder itself is #[cfg(debug_assertions)] and so is
+# absent from release builds.
+zip = { workspace = true }
 mime_guess = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 anyhow.workspace = true
@@ -78,9 +83,6 @@ postgres = ["pharos-store-sqlx/postgres"]
 
 [dev-dependencies]
 actix-test = "0.1"
-# 004-books — build a real epub fixture in-test for the end-to-end scan→serve
-# walk, so the repo carries no binary blob.
-zip = { workspace = true }
 awc = "3"
 pharos-jellyfin-test-client = { path = "../pharos-jellyfin-test-client" }
 proptest = "1"

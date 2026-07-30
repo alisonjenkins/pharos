@@ -1691,9 +1691,21 @@ impl BaseItemDto {
             kind,
             media_type,
             is_folder: false,
-            // Fields-gated: attached by `with_path` only when the request asks
-            // for it (FR-003). Absent by default keeps V9 exposure minimal.
-            path: None,
+            // FR-003 — a BOOK carries its Path unconditionally; every other kind
+            // stays `Fields`-gated (`with_path`).
+            //
+            // This asymmetry is not a preference, it is forced by the client and
+            // was proven in a browser: jellyfin-web's details page fetches
+            // `/Users/{uid}/Items/{id}` with NO `Fields` at all, hands that item
+            // to `playbackManager`, and every reader's `canPlayItem` tests
+            // `item.Path`. Gated, `Path` is absent there, so clicking Play does
+            // nothing — no iframe, no request, no error. Books were unopenable.
+            //
+            // V9 governs UNAUTHENTICATED clients and item fetches are
+            // authenticated, so this does not breach it; the gate was a
+            // least-exposure nicety, and for books it cost the whole feature.
+            // Non-book kinds keep the gate, so no existing payload grows.
+            path: is_book.then(|| item.path.to_string_lossy().into_owned()),
             user_data: UserItemDataDto {
                 item_id: wire_item_id(item.id),
                 ..Default::default()
