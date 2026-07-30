@@ -2226,6 +2226,29 @@ pub struct ScanState {
 // the real year from the provider it had already matched correctly.
 pub const PROBE_SCHEMA_VERSION: i64 = 6;
 
+/// 005-kindle-conversion — bump when the BOOK extraction changes in a way that
+/// makes already-indexed book rows stale.
+///
+/// Books never reach the prober (a book path is never probed — V12/FR-001), so
+/// their freshness has nothing to do with [`PROBE_SCHEMA_VERSION`] and gating
+/// it there conflates two independent pipelines. The practical cost of that
+/// conflation is asymmetric and was measured: making 142 books re-read by
+/// bumping the probe version would re-probe ~14,000 video files through ffmpeg
+/// over NFS, hours of work to refresh rows that no change touched. Leaving it
+/// alone instead leaves the books permanently skipped by `(mtime, size)` — the
+/// shape that shipped Kindle conversion to a library where nothing changed,
+/// because all 75 Kindle rows already carried the current probe version.
+///
+/// The scan compares a row against whichever version governs the pipeline that
+/// PRODUCED it, so the two move independently. Both are stored in the same
+/// `probe_schema_version` column: it records the version of the extraction
+/// that made the row, and for a book that extraction is the book parser.
+///
+/// v1: initial. Kindle files (`.mobi`/`.azw`/`.azw3`) are read for metadata and
+/// covers and converted to EPUB where DRM-free, so rows previously stored as
+/// `unreadable` with no cover must be re-read.
+pub const BOOK_SCHEMA_VERSION: i64 = 1;
+
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis
 /// window). Every episode is then re-decoded from its source, so this is the

@@ -930,18 +930,28 @@ impl MediaStore for SqliteStore {
         let size_i64 =
             i64::try_from(size).map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
         let now = now_unix_secs();
-        // Stamp the current probe schema version: this row was (re-)probed or
-        // confirmed-current at `PROBE_SCHEMA_VERSION`. On a plain skip the value
-        // was already current (that's why it was skipped), so this is a no-op;
-        // after a re-probe it advances the row to the new version.
+        // Stamp the schema version of the pipeline that produced this row.
+        // Books never reach the prober, so a book row is governed by
+        // `BOOK_SCHEMA_VERSION` and everything else by `PROBE_SCHEMA_VERSION`
+        // (005-kindle-conversion). Chosen in SQL because `mark_seen` is given
+        // an id and not a path — the row's own `kind` is the authority, and
+        // deriving it here keeps the write in step with the scanner's skip
+        // check by construction rather than by two callers agreeing.
+        //
+        // Getting this wrong in the other direction is the trap: stamping the
+        // probe version onto a book would leave it mismatched on every scan
+        // and re-read forever.
         sqlx::query(
             "UPDATE media_items SET file_mtime = ?, file_size_seen = ?, \
-             last_scanned = ?, last_seen_scan_id = ?, probe_schema_version = ? WHERE id = ?",
+             last_scanned = ?, last_seen_scan_id = ?, \
+             probe_schema_version = CASE WHEN kind = 'book' THEN ? ELSE ? END \
+             WHERE id = ?",
         )
         .bind(mtime)
         .bind(size_i64)
         .bind(now)
         .bind(scan_id)
+        .bind(pharos_core::BOOK_SCHEMA_VERSION)
         .bind(pharos_core::PROBE_SCHEMA_VERSION)
         .bind(id_i64)
         .execute(&self.pool)
@@ -972,12 +982,15 @@ impl MediaStore for SqliteStore {
                 .map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
             sqlx::query(
                 "UPDATE media_items SET file_mtime = ?, file_size_seen = ?, \
-                 last_scanned = ?, last_seen_scan_id = ?, probe_schema_version = ? WHERE id = ?",
+                 last_scanned = ?, last_seen_scan_id = ?, \
+                 probe_schema_version = CASE WHEN kind = 'book' THEN ? ELSE ? END \
+                 WHERE id = ?",
             )
             .bind(mtime)
             .bind(size_i64)
             .bind(now)
             .bind(scan_id)
+            .bind(pharos_core::BOOK_SCHEMA_VERSION)
             .bind(pharos_core::PROBE_SCHEMA_VERSION)
             .bind(id_i64)
             .execute(&mut *tx)

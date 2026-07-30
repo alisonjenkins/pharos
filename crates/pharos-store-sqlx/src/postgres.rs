@@ -891,15 +891,20 @@ impl MediaStore for PostgresStore {
         let size_i64 =
             i64::try_from(size).map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
         let now = now_unix_secs();
-        // Stamp the current probe schema version (see the sqlite mark_seen).
+        // Stamp the schema version of the pipeline that produced this row —
+        // book parser for books, prober for everything else (see the sqlite
+        // mark_seen for why it is chosen in SQL).
         sqlx::query(
             "UPDATE media_items SET file_mtime = $1, file_size_seen = $2, \
-             last_scanned = $3, last_seen_scan_id = $4, probe_schema_version = $5 WHERE id = $6",
+             last_scanned = $3, last_seen_scan_id = $4, \
+             probe_schema_version = CASE WHEN kind = 'book' THEN $5 ELSE $6 END \
+             WHERE id = $7",
         )
         .bind(mtime)
         .bind(size_i64)
         .bind(now)
         .bind(scan_id)
+        .bind(pharos_core::BOOK_SCHEMA_VERSION)
         .bind(pharos_core::PROBE_SCHEMA_VERSION)
         .bind(id_i64)
         .execute(&self.pool)
