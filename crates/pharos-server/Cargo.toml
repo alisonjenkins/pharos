@@ -78,6 +78,9 @@ postgres = ["pharos-store-sqlx/postgres"]
 
 [dev-dependencies]
 actix-test = "0.1"
+# 004-books — build a real epub fixture in-test for the end-to-end scan→serve
+# walk, so the repo carries no binary blob.
+zip = { workspace = true }
 awc = "3"
 pharos-jellyfin-test-client = { path = "../pharos-jellyfin-test-client" }
 proptest = "1"
