@@ -125,6 +125,31 @@ pub(crate) fn record_classify(
     .increment(1);
 }
 
+/// Re-insert the character an XML entity or char-ref stands for, so an
+/// element's text reassembles intact.
+///
+/// quick-xml 0.41 delivers `&amp;` as its own `GeneralRef` event that SPLITS
+/// the surrounding literal run, and `resolve_char_ref` answers only for the
+/// NUMERIC form (`&#38;`) — a named entity comes back `Ok(None)`. Handling only
+/// the numeric case silently deletes the `&` from every summary and title that
+/// contains one. Unknown named entities
+/// are dropped rather than fatal (V6 tolerance). Same handling as the Kodi NFO
+/// reader, shared here so the two book parsers cannot drift from it.
+pub(crate) fn push_entity(r: &quick_xml::events::BytesRef<'_>, out: &mut String) {
+    if let Ok(Some(c)) = r.resolve_char_ref() {
+        out.push(c);
+    } else if let Ok(name) = r.decode() {
+        match name.as_ref() {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ => {}
+        }
+    }
+}
+
 /// Book extensions pharos WALKS. Distinct from
 /// [`BookFormat::readable_by_client`], which answers whether a client can open
 /// one — indexing a file and being able to read it are different facts, and
