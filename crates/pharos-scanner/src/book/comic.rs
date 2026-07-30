@@ -196,22 +196,134 @@ pub fn read_comic(path: &Path) -> Result<ComicMetadata, ComicError> {
     Ok(meta)
 }
 
+/// Read the cover image's BYTES — the first page in reading order.
+///
+/// A second open of the archive, for the same reason the epub reader takes one:
+/// metadata is read on every scan pass, the cover only for a book the scan is
+/// actually writing. `Ok(None)` means the archive held no images at all, which
+/// is a normal outcome and not an error.
+pub fn read_comic_cover(path: &Path) -> Result<Option<Vec<u8>>, ComicError> {
+    let Some(entry) = read_comic(path)?.cover_entry else {
+        return Ok(None);
+    };
+    let container = ComicContainer::for_path(path)
+        .ok_or_else(|| ComicError::NotAComic(path.to_string_lossy().into_owned()))?;
+    let bytes = match container {
+        // Unreachable: `read_comic` above already returned `RarUnsupported`.
+        ComicContainer::Rar => return Err(ComicError::RarUnsupported(entry)),
+        ComicContainer::Zip => {
+            let file = std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| ComicError::Unreadable {
+                container: "zip".into(),
+                detail: e.to_string(),
+            })?;
+            let idx = (0..zip.len())
+                .find(|i| {
+                    zip.by_index_raw(*i)
+                        .map(|e| e.name() == entry)
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| ComicError::Unreadable {
+                    container: "zip".into(),
+                    detail: format!("cover entry {entry:?} vanished between passes"),
+                })?;
+            let mut e = zip.by_index(idx).map_err(|e| ComicError::Unreadable {
+                container: "zip".into(),
+                detail: e.to_string(),
+            })?;
+            let mut out = Vec::new();
+            e.read_to_end(&mut out)
+                .map_err(|e| ComicError::Unreadable {
+                    container: "zip".into(),
+                    detail: e.to_string(),
+                })?;
+            out
+        }
+        ComicContainer::Tar => {
+            let file = std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
+            let mut archive = tar::Archive::new(file);
+            let entries = archive.entries().map_err(|e| ComicError::Unreadable {
+                container: "tar".into(),
+                detail: e.to_string(),
+            })?;
+            let mut found = None;
+            for e in entries {
+                let mut e = e.map_err(|e| ComicError::Unreadable {
+                    container: "tar".into(),
+                    detail: e.to_string(),
+                })?;
+                let is_cover = e
+                    .path()
+                    .map(|p| p.to_string_lossy() == entry)
+                    .unwrap_or(false);
+                if is_cover {
+                    let mut out = Vec::new();
+                    e.read_to_end(&mut out)
+                        .map_err(|e| ComicError::Unreadable {
+                            container: "tar".into(),
+                            detail: e.to_string(),
+                        })?;
+                    found = Some(out);
+                    break;
+                }
+            }
+            found.ok_or_else(|| ComicError::Unreadable {
+                container: "tar".into(),
+                detail: format!("cover entry {entry:?} vanished between passes"),
+            })?
+        }
+        ComicContainer::SevenZ => {
+            let mut file =
+                std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
+            let len = file
+                .metadata()
+                .map_err(|e| ComicError::Open(e.to_string()))?
+                .len();
+            let archive = sevenz_rust::Archive::read(&mut file, len, &[]).map_err(|e| {
+                ComicError::Unreadable {
+                    container: "7z".into(),
+                    detail: e.to_string(),
+                }
+            })?;
+            let mut reader = sevenz_rust::SevenZReader::from_archive(
+                archive,
+                file,
+                sevenz_rust::Password::empty(),
+            );
+            let mut found = None;
+            reader
+                .for_each_entries(|e, rd| {
+                    if found.is_none() && e.name == entry {
+                        let mut out = Vec::new();
+                        if rd.read_to_end(&mut out).is_ok() {
+                            found = Some(out);
+                        }
+                    }
+                    Ok(true)
+                })
+                .map_err(|e| ComicError::Unreadable {
+                    container: "7z".into(),
+                    detail: e.to_string(),
+                })?;
+            found.ok_or_else(|| ComicError::Unreadable {
+                container: "7z".into(),
+                detail: format!("cover entry {entry:?} vanished between passes"),
+            })?
+        }
+    };
+    Ok(Some(bytes))
+}
+
 /// The scan path's decision: a parse failure yields a page-count-less
 /// `BookMeta` rather than dropping the item (V6), and records WHY.
+///
+/// Records only the PARSE outcome — except for `.cbr`, whose verdict IS a cover
+/// verdict and can be settled here because it is settled for every rar there
+/// will ever be. Everything else's cover verdict belongs to the extractor,
+/// which is the only step that knows whether bytes came out.
 pub fn read_comic_or_empty(path: &Path) -> BookMeta {
     match read_comic(path) {
-        Ok(meta) => {
-            // Same convention as the epub reader: this step establishes that a
-            // cover ENTRY exists; the extractor (T062) records the final
-            // verdict once it has the bytes.
-            let (verdict, reason) = if meta.cover_entry.is_some() {
-                (ClassifyVerdict::CoverFound, ClassifyReason::Ok)
-            } else {
-                (ClassifyVerdict::CoverAbsent, ClassifyReason::NoCoverEntry)
-            };
-            record_classify(BookFormat::Comic, verdict, reason);
-            meta.to_book_meta()
-        }
+        Ok(meta) => meta.to_book_meta(),
         Err(err) => {
             let (verdict, reason) = match &err {
                 // NOT `Unparseable`: a `.cbr` parses fine in the client. The
