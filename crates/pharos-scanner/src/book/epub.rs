@@ -17,7 +17,7 @@ use std::path::Path;
 use pharos_core::{BookFormat, BookMeta};
 use quick_xml::events::Event;
 
-use super::{record_classify, ClassifyReason, ClassifyVerdict};
+use super::{push_entity, record_classify, ClassifyReason, ClassifyVerdict};
 
 /// Everything an epub's OPF told us.
 ///
@@ -226,7 +226,10 @@ fn rootfile_href(xml: &str) -> Option<String> {
 /// cover.
 fn parse_opf(xml: &str) -> Result<EpubMetadata, String> {
     let mut reader = quick_xml::Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // NOT `trim_text(true)` — see the note in `comic::parse_comic_info`. An
+    // entity splits the literal run, so per-run trimming eats the spaces around
+    // it and a description containing `&amp;` comes back with words fused.
+    reader.config_mut().trim_text(false);
 
     let mut out = EpubMetadata::default();
     // `<meta name="cover" content="ID">` names a MANIFEST item id; the href
@@ -277,11 +280,7 @@ fn parse_opf(xml: &str) -> Result<EpubMetadata, String> {
             }
             // quick-xml 0.41 delivers entities separately, so `&amp;` in a
             // title reassembles here rather than truncating it.
-            Ok(Event::GeneralRef(r)) if current.is_some() => {
-                if let Ok(Some(c)) = r.resolve_char_ref() {
-                    text.push(c);
-                }
-            }
+            Ok(Event::GeneralRef(r)) if current.is_some() => push_entity(&r, &mut text),
             Ok(Event::End(_)) => {
                 if let Some(field) = current.take() {
                     let trimmed = text.trim().to_string();
@@ -621,6 +620,34 @@ mod tests {
         assert_eq!(
             meta.cover_href, None,
             "no image in the manifest means no cover — never a chapter file"
+        );
+    }
+
+    /// An entity SPLITS the literal run quick-xml delivers, so both halves of
+    /// this have to survive: the `&` itself (a named entity, which
+    /// `resolve_char_ref` alone answers `None` for) and the spaces around it
+    /// (which per-run trimming eats). Caught by the comic reader's tests; the
+    /// same defect was here, unasserted.
+    #[test]
+    fn entities_survive_intact_inside_an_element() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("Ampersand.epub");
+        let opf = r#"<package><metadata>
+            <dc:title>Sense &amp; Sensibility</dc:title>
+            <dc:description>Elinor &amp; Marianne &#8212; two sisters.</dc:description>
+          </metadata><manifest/></package>"#;
+        write_epub(&p, Some(CONTAINER), Some(("OEBPS/content.opf", opf)));
+
+        let meta = read_epub(&p).unwrap();
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("Sense & Sensibility"),
+            "a named entity must resolve, and the spaces either side must stay"
+        );
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Elinor & Marianne — two sisters."),
+            "named and numeric entities must both survive in one run"
         );
     }
 
