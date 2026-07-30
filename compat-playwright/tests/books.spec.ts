@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import * as fs from "fs";
 
 // 004-books (T050) — SC-001, against unmodified jellyfin-web in real Chromium.
 //
@@ -502,5 +503,38 @@ test.describe("books: unmodified jellyfin-web opens an epub", () => {
       verdicts!.withoutPath,
       "without Path every reader declines — silently, which is why Path is asserted server-side too",
     ).toBe(false);
+  });
+  // B175 / V124 — the reader's 100 ms-per-chapter sleep must be patched OUT of
+  // the bundle we serve.
+  //
+  // epub.js 0.3.93 ends `Locations.process` with `setTimeout(resolve,
+  // this.pause)` and defaults `this.pause` to 100, and `bookPlayer` keeps the
+  // book hidden behind `opacity: 0` until `locations.generate(1024)` resolves.
+  // That is a flat 100 ms of idle wait per linear spine section before a reader
+  // sees anything: 3.1 s for a 30-section book, 35.1 s for a 342-section one.
+  // `jellyfinWebBundle` in flake.nix rewrites the constant to 0 (measured
+  // 4.6-5.6x faster to open).
+  //
+  // The nix build already fails if the rewrite misses. This asserts the
+  // DIFFERENT half: that the bundle actually being served is the patched one,
+  // which a `bundle = pkgs.jellyfin-web` regression would break silently while
+  // the derivation still built fine.
+  test("the served epub.js has no per-chapter sleep", async () => {
+    const dir = process.env.JELLYFIN_WEB_DIR;
+    test.skip(!dir, "JELLYFIN_WEB_DIR unset — enter the nix devShell");
+
+    const chunk = fs
+      .readdirSync(dir!)
+      .find((f) => /^node_modules\.epubjs\..*\.chunk\.js$/.test(f));
+    expect(chunk, "the bundle must ship an epub.js chunk").toBeTruthy();
+
+    const src = fs.readFileSync(`${dir}/${chunk}`, "utf8");
+    // The identifier is minifier-chosen, so match its shape, not its name.
+    const assign = src.match(/this\.pause=[A-Za-z_$][A-Za-z0-9_$]*\|\|(\d+)/);
+    expect(assign, "epub.js Locations must still assign a default pause").toBeTruthy();
+    expect(
+      assign![1],
+      "a non-zero default pause is 100 ms of dead wait per chapter on every book open",
+    ).toBe("0");
   });
 });
