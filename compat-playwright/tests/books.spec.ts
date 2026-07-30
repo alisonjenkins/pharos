@@ -356,6 +356,112 @@ test.describe("books: unmodified jellyfin-web opens an epub", () => {
       .toBeGreaterThan(0);
   });
 
+  // T077 — the read position survives, and the UI puts the book where a book
+  // goes.
+  //
+  // Two different outcomes hide behind "a book has no runtime": the client can
+  // present it as a book (right) or try to draw it as a part-watched video
+  // (wrong — a full or NaN-width bar reads as corrupted state rather than as an
+  // absent duration). Only one is acceptable and they are indistinguishable
+  // from the server, so this is observed in the DOM.
+  //
+  // jellyfin-web has a "Continue Reading" row distinct from "Continue
+  // Watching", and which one an item lands in is decided by what PHAROS says it
+  // is. The movie is the counterweight: without it, a page that rendered no
+  // resume rows at all would report "the book is not in Continue Watching" and
+  // pass while proving nothing.
+  test("a part-read book resumes into Continue Reading, not Continue Watching", async ({
+    page,
+  }) => {
+    test.setTimeout(150_000);
+
+    await connectToServer(page);
+    await login(page, SEED_USER, SEED_PASS);
+
+    // Report a position for the book AND for a movie, through the client's own
+    // API so the request shape is the one a reader actually sends.
+    const MOVIE_WIRE_ID = "00000000000000000000000000000001";
+    await page.evaluate(
+      async ([bookId, movieId]) => {
+        const api = (window as any).ApiClient;
+        const report = (id: string, ticks: number) =>
+          api.ajax({
+            type: "POST",
+            url: api.getUrl("Sessions/Playing/Progress"),
+            data: JSON.stringify({
+              ItemId: id,
+              PlaySessionId: `spec-${id}`,
+              PositionTicks: ticks,
+              IsPaused: true,
+            }),
+            contentType: "application/json",
+          });
+        await report(bookId, 1_234_000);
+        // ~2.5s into the ~5s fixture clip: unambiguously part-watched.
+        await report(movieId, 25_000_000);
+      },
+      [BOOK_WIRE_ID, MOVIE_WIRE_ID],
+    );
+
+    // The position came back — this is what the reader reads on reopen.
+    const item = await page.evaluate(async (id) => {
+      const api = (window as any).ApiClient;
+      return await api.getItem(api.getCurrentUserId(), id);
+    }, BOOK_WIRE_ID);
+    expect(item.UserData.PlaybackPositionTicks).toBe(1_234_000);
+    expect(item.RunTimeTicks, "a book still has no time axis").toBe(0);
+    expect(
+      item.UserData.PlayedPercentage,
+      "must be a number: a null percentage is what a NaN serialises to, and a " +
+        "client draws that as a full or broken bar",
+    ).toBe(0);
+
+    // Now LOOK at it.
+    await page.reload({ waitUntil: "networkidle" });
+    const sections = async () =>
+      await page.evaluate(() => {
+        const out: Record<string, { ids: string[]; widths: string[] }> = {};
+        for (const h of Array.from(document.querySelectorAll("h2"))) {
+          const sec = h.closest(".verticalSection") ?? h.parentElement;
+          out[(h.textContent ?? "").trim()] = {
+            ids: Array.from(
+              new Set(
+                Array.from(sec?.querySelectorAll<HTMLElement>("[data-id]") ?? []).map(
+                  (e) => e.dataset.id ?? "",
+                ),
+              ),
+            ),
+            widths: Array.from(
+              sec?.querySelectorAll<HTMLElement>("[class*=itemProgressBarForeground]") ?? [],
+            ).map((e) => e.style.width),
+          };
+        }
+        return out;
+      });
+
+    await expect
+      .poll(async () => (await sections())["Continue Watching"]?.ids ?? [], { timeout: 30_000 })
+      .toContain(MOVIE_WIRE_ID);
+
+    const rows = await sections();
+    expect(
+      rows["Continue Reading"]?.ids ?? [],
+      "a part-read book belongs in Continue Reading — which it only reaches if " +
+        "pharos reported it as a Book with a resume position",
+    ).toContain(BOOK_WIRE_ID);
+    expect(
+      rows["Continue Watching"]?.ids ?? [],
+      "and NOT in Continue Watching, where it would be presented as a video",
+    ).not.toContain(BOOK_WIRE_ID);
+
+    // Whatever bars the row does draw, none of the book's may be NaN-width or
+    // claim the book is fully read.
+    for (const w of rows["Continue Reading"]?.widths ?? []) {
+      expect(w, `a book's progress width must not be NaN, got ${w}`).not.toContain("NaN");
+      expect(parseFloat(w) || 0, `a book must not render as fully read, got ${w}`).toBeLessThan(1);
+    }
+  });
+
   // The negative case that the whole design turns on. Recorded as a test so the
   // failure MODE is documented executably: if a future change drops `Path`, this
   // is what the symptom looks like — no request, no error, nothing.
