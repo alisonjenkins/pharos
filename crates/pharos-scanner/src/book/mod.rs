@@ -44,7 +44,7 @@ pub(crate) enum ClassifyVerdict {
     /// Metadata was read; no cover came out of the file.
     CoverAbsent,
     /// The file is a recognised book extension no client can open
-    /// (`.mobi`, `.azw3`). Indexed and downloadable, never presented as
+    /// (`.mobi`, `.azw`, `.azw3`). Indexed and downloadable, never presented as
     /// readable.
     Unreadable,
     /// The extension is a book format but the file could not be opened or
@@ -85,7 +85,7 @@ pub(crate) enum ClassifyReason {
     /// cannot extract its cover: `unrar` wraps a C library, the same objection
     /// that rules out a PDF rasteriser (R7). Permanent and by design.
     RarUnsupported,
-    /// `.mobi` / `.azw3` — no client ships a reader.
+    /// `.mobi` / `.azw` / `.azw3` — no client ships a reader.
     FormatUnreadable,
     /// The archive or document is malformed, truncated, or not the format its
     /// extension claims.
@@ -156,7 +156,9 @@ pub(crate) fn push_entity(r: &quick_xml::events::BytesRef<'_>, out: &mut String)
 /// [`BookFormat::readable_by_client`], which answers whether a client can open
 /// one — indexing a file and being able to read it are different facts, and
 /// conflating them is what would put an open button on a `.mobi`.
-pub const BOOK_EXTENSIONS: &[&str] = &["epub", "pdf", "cbz", "cbr", "cbt", "cb7", "mobi", "azw3"];
+pub const BOOK_EXTENSIONS: &[&str] = &[
+    "epub", "pdf", "cbz", "cbr", "cbt", "cb7", "mobi", "azw", "azw3",
+];
 
 /// The [`BookFormat`] for a path's extension, or `None` if it is not a book at
 /// all. Case-insensitive: a `.EPUB` is still an epub to pharos, even though
@@ -173,7 +175,11 @@ pub fn format_for_path(path: &Path) -> Option<BookFormat> {
         "epub" => Some(BookFormat::Epub),
         "pdf" => Some(BookFormat::Pdf),
         "cbz" | "cbr" | "cbt" | "cb7" => Some(BookFormat::Comic),
-        "mobi" | "azw3" => Some(BookFormat::Unreadable),
+        // `.azw` is the older Kindle format, alongside `.azw3` and `.mobi`.
+        // Present in the deployed library (30 files) and omitted from the
+        // first draft of this list, which would have left them unindexed —
+        // not listed, not downloadable, absent rather than merely unreadable.
+        "mobi" | "azw" | "azw3" => Some(BookFormat::Unreadable),
         _ => None,
     }
 }
@@ -411,7 +417,7 @@ mod tests {
     /// `BookFormat::readable_by_client` is the only authority on the second.
     #[test]
     fn walking_a_book_is_not_the_same_question_as_reading_it() {
-        for ext in ["mobi", "azw3"] {
+        for ext in ["mobi", "azw", "azw3"] {
             let p = std::path::PathBuf::from(format!("/books/x.{ext}"));
             let f = format_for_path(&p).expect("indexed");
             assert!(BOOK_EXTENSIONS.contains(&ext), "{ext} must be walked");

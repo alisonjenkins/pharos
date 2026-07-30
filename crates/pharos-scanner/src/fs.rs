@@ -27,7 +27,7 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     // exists. Kept in one list because "does pharos walk this file" is a single
     // question; "can a client read it" is a different one, answered by
     // `BookFormat::readable_by_client`.
-    "epub", "pdf", "cbz", "cbr", "cbt", "cb7", "mobi", "azw3",
+    "epub", "pdf", "cbz", "cbr", "cbt", "cb7", "mobi", "azw", "azw3",
 ];
 
 /// SIMD-accelerated stable ID for a path. xxh3_64 hashes UTF-8 bytes,
