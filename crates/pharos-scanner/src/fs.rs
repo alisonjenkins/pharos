@@ -30,6 +30,31 @@ pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "epub", "pdf", "cbz", "cbr", "cbt", "cb7", "mobi", "azw", "azw3",
 ];
 
+/// Which schema version governs whether an already-indexed `path` is stale.
+///
+/// 005-kindle-conversion — the incremental scan skips a file whose
+/// `(mtime, size)` are unchanged AND whose stored version still matches. A
+/// book's row is produced by the book parser and never by the prober, so
+/// comparing it against `PROBE_SCHEMA_VERSION` ties two unrelated pipelines
+/// together in both directions, and both are bad:
+///
+/// * bumping the probe version to refresh 142 books re-probes ~14,000 video
+///   files through ffmpeg over NFS;
+/// * NOT bumping it leaves every book permanently skipped, which is how Kindle
+///   conversion shipped to a library where nothing changed — all 75 Kindle
+///   rows already carried the current probe version, so the scan skipped them
+///   and the feature was inert on exactly the files it was written for.
+///
+/// The store's `mark_seen` picks the same version from the row's `kind`, so
+/// the value written and the value compared cannot drift.
+pub fn expected_schema_version(path: &Path) -> i64 {
+    if crate::book::is_book_path(path) {
+        pharos_core::BOOK_SCHEMA_VERSION
+    } else {
+        pharos_core::PROBE_SCHEMA_VERSION
+    }
+}
+
 /// SIMD-accelerated stable ID for a path. xxh3_64 hashes UTF-8 bytes,
 /// then masks to 63 bits so the value always survives the
 /// `u64 -> i64` conversion the sqlite store does on insert. (Half of
@@ -570,7 +595,7 @@ impl<P: Prober> FsScanner<P> {
                     if !self.force
                         && state.file_mtime == mtime
                         && state.file_size == size
-                        && state.probe_schema_version == pharos_core::PROBE_SCHEMA_VERSION
+                        && state.probe_schema_version == expected_schema_version(&primary)
                     {
                         seen_batch.push((id, mtime, size));
                         seen += 1;
@@ -2078,14 +2103,20 @@ mod tests {
         ) -> DomainResult<()> {
             // Mirror the store: mark_seen is an UPDATE — only stamp rows
             // that already exist (the scanner put()s before marking).
-            if !self
+            //
+            // The row's own kind picks the schema version, exactly as the
+            // real store's `CASE WHEN kind = 'book'` does — a fake that
+            // stamped the probe version onto a book would hide the
+            // re-read-forever bug the real one is written to avoid.
+            let kind = self
                 .inner
                 .lock()
                 .map_err(|e| DomainError::Backend(e.to_string()))?
-                .contains_key(&id)
-            {
+                .get(&id)
+                .map(|it| it.kind);
+            let Some(kind) = kind else {
                 return Ok(());
-            }
+            };
             self.states
                 .lock()
                 .map_err(|e| DomainError::Backend(e.to_string()))?
@@ -2096,8 +2127,14 @@ mod tests {
                         file_mtime: mtime,
                         file_size: size,
                         last_seen_scan_id: scan_id,
-                        // Mirror the store: mark_seen stamps the current version.
-                        probe_schema_version: pharos_core::PROBE_SCHEMA_VERSION,
+                        // Mirror the store: mark_seen stamps the version of
+                        // the pipeline that produced the row, which for a book
+                        // is the book parser (005-kindle-conversion).
+                        probe_schema_version: if kind == pharos_core::MediaKind::Book {
+                            pharos_core::BOOK_SCHEMA_VERSION
+                        } else {
+                            pharos_core::PROBE_SCHEMA_VERSION
+                        },
                     },
                 );
             Ok(())
@@ -3596,6 +3633,60 @@ mod tests {
             1,
             "row at current version skips when unchanged"
         );
+    }
+
+    /// 005-kindle-conversion — a book's freshness is governed by the BOOK
+    /// schema version, not the probe one.
+    ///
+    /// Both directions matter and the second is the one that shipped broken:
+    /// a book row carrying the current PROBE version must still be re-read
+    /// (that is exactly the state the deployed library was in — 75 Kindle rows
+    /// at probe v6, skipped forever, feature inert), and once re-read at the
+    /// book version it must SETTLE rather than re-read on every scan.
+    #[tokio::test]
+    async fn a_books_staleness_is_governed_by_the_book_schema_version() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "book.epub", b"not really an epub").await;
+        let prober = FakeProber::default();
+        let store = MemStore::default();
+        let s = FsScanner::new(prober.clone());
+
+        assert_eq!(s.scan_into(td.path(), &store).await.unwrap().added.len(), 1);
+        let id = stable_id(&td.path().join("book.epub"));
+
+        // A book is stamped with the BOOK version, never the probe version —
+        // otherwise the two pipelines are welded together again.
+        assert_eq!(
+            store.states.lock().unwrap()[&id].probe_schema_version,
+            pharos_core::BOOK_SCHEMA_VERSION,
+        );
+
+        // Settles: unchanged on disk and at the current book version → skipped.
+        assert_eq!(
+            s.scan_into(td.path(), &store).await.unwrap().skipped,
+            1,
+            "a book at the current book version must skip, not re-read forever"
+        );
+
+        // The deployed library's exact state: a book row left carrying the
+        // PROBE version. It must NOT be skipped.
+        store
+            .states
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .probe_schema_version = pharos_core::PROBE_SCHEMA_VERSION;
+        assert_eq!(
+            s.scan_into(td.path(), &store).await.unwrap().skipped,
+            0,
+            "a book stamped with the probe version is stale and must be re-read \
+             — skipping it is how Kindle conversion shipped to a library where \
+             nothing changed"
+        );
+
+        // A book is still never handed to the prober (V12/FR-001).
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
