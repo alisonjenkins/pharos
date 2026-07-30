@@ -76,10 +76,49 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                 date: m.date,
             })
         }
-        // A PDF's info dictionary lands with US4 (T073); mobi/azw3 carry
-        // nothing pharos can read. Both return nothing rather than erroring —
-        // the filename provider still supplies a title (FR-007).
-        pharos_core::BookFormat::Pdf | pharos_core::BookFormat::Unreadable => None,
+        pharos_core::BookFormat::Pdf => {
+            let m = crate::book::pdf::read_pdf(path).ok()?;
+            Some(BookDescriptive {
+                title: m.title,
+                author: m.author,
+                // `/Producer` is usually the SOFTWARE that made the file
+                // ("Adobe Acrobat", "LaTeX"), not an imprint. Surfacing that as
+                // a studio would fill the library's studio facet with PDF
+                // toolchains, so it is read and deliberately not published.
+                publisher: None,
+                description: m.description,
+                date: m.date.as_deref().and_then(pdf_date_to_iso),
+            })
+        }
+        // mobi/azw3 carry nothing pharos can read. Returns nothing rather than
+        // erroring — the filename provider still supplies a title (FR-007).
+        pharos_core::BookFormat::Unreadable => None,
+    }
+}
+
+/// A PDF `/CreationDate` (`D:19790101000000Z`) as a plain ISO date.
+///
+/// The rest of this module reads dates the way epub and ComicInfo write them —
+/// `1979`, `1979-01-01`. A PDF date left verbatim would parse as neither, so a
+/// scanned book would silently lose its year to a format difference.
+fn pdf_date_to_iso(raw: &str) -> Option<String> {
+    let digits: String = raw
+        .trim()
+        .trim_start_matches("D:")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    match digits.len() {
+        // A bare year stays a bare year — no invented month or day.
+        4..=5 => Some(digits[..4].to_string()),
+        6..=7 => Some(format!("{}-{}", &digits[..4], &digits[4..6])),
+        n if n >= 8 => Some(format!(
+            "{}-{}-{}",
+            &digits[..4],
+            &digits[4..6],
+            &digits[6..8]
+        )),
+        _ => None,
     }
 }
 
@@ -335,6 +374,24 @@ mod tests {
                 "{kind:?} would be read as an archive on every file in the library"
             );
         }
+    }
+
+    #[test]
+    fn a_pdf_creation_date_normalises_to_the_shape_every_other_reader_uses() {
+        assert_eq!(
+            pdf_date_to_iso("D:19790101000000Z").as_deref(),
+            Some("1979-01-01")
+        );
+        assert_eq!(pdf_date_to_iso("D:197901").as_deref(), Some("1979-01"));
+        assert_eq!(
+            pdf_date_to_iso("D:1979").as_deref(),
+            Some("1979"),
+            "a bare year stays bare — no invented month or day"
+        );
+        // Without the "D:" prefix, which producers omit often enough to matter.
+        assert_eq!(pdf_date_to_iso("19790101").as_deref(), Some("1979-01-01"));
+        assert_eq!(pdf_date_to_iso("").as_deref(), None);
+        assert_eq!(pdf_date_to_iso("D:bogus").as_deref(), None);
     }
 
     #[test]

@@ -184,12 +184,12 @@ concern and nothing else.
 
 ### Authors, series and the rest of the metadata
 
-- [ ] T065 [P] [US3] Add test `book_metadata_flows_through_the_existing_resolver` in `crates/pharos-scanner/src/metadata/tests.rs`: the book provider participates in the priority-ordered merge; `dc:date`→release date and `dc:description`→overview land on the **item** and not in `BookMeta` (R6); a file whose metadata has no title falls back to the filename; and `pharos_metadata_field_source_total{field,provider}` records which provider supplied the year (B169's counter, reused — add no new metric)
-- [ ] T066 [US3] Add `crates/pharos-scanner/src/metadata/book.rs` implementing `MetadataProvider` over the book file, registered in `crates/pharos-scanner/src/metadata/mod.rs` at **embedded priority (30)** on the existing ladder (nfo 100 > sidecar 50 > embedded 30 > filename 10). Supplies title, author, publisher, series, release date and description
-- [ ] T067 [US3] Admit books to the filename provider: `crates/pharos-scanner/src/metadata/filename.rs:206` gates on `matches!(kind, Movie | Episode)`, so a book currently gets no filename-derived title and FR-007 requires that no book is listed untitled. One of T004's audit sites
-- [ ] T068 [US3] Project `SeriesName` from `book.series_name` and `IndexNumber` from `book.series_index` in `crates/pharos-jellyfin-api/src/dto.rs`
-- [ ] T069 [P] [US3] Add test `books_sort_into_reading_order_within_a_series` in `crates/pharos-server/tests/items_query_golden.rs`: `SortBy=SeriesSortName,SortName` orders three books of one series by `book_series_index`, and a fourth with **no** index sorts last rather than as zero
-- [ ] T070 [US3] Support that sort in `crates/pharos-store-sqlx/src/sqlite.rs` and `postgres.rs` using `book_series`/`book_series_index`; re-run `nix develop --command just test-postgres` — **COMMIT**
+- [X] T065 [P] [US3] Add test `book_metadata_flows_through_the_existing_resolver` in `crates/pharos-scanner/src/metadata/tests.rs`: the book provider participates in the priority-ordered merge; `dc:date`→release date and `dc:description`→overview land on the **item** and not in `BookMeta` (R6); a file whose metadata has no title falls back to the filename; and `pharos_metadata_field_source_total{field,provider}` records which provider supplied the year (B169's counter, reused — add no new metric)
+- [X] T066 [US3] Add `crates/pharos-scanner/src/metadata/book.rs` implementing `MetadataProvider` over the book file, registered in `crates/pharos-scanner/src/metadata/mod.rs` at **embedded priority (30)** on the existing ladder (nfo 100 > sidecar 50 > embedded 30 > filename 10). Supplies title, author, publisher, series, release date and description
+- [X] T067 [US3] Admit books to the filename provider: `crates/pharos-scanner/src/metadata/filename.rs:206` gates on `matches!(kind, Movie | Episode)`, so a book currently gets no filename-derived title and FR-007 requires that no book is listed untitled. One of T004's audit sites
+- [X] T068 [US3] Project `SeriesName` from `book.series_name` and `IndexNumber` from `book.series_index` in `crates/pharos-jellyfin-api/src/dto.rs`
+- [X] T069 [P] [US3] Add test `books_sort_into_reading_order_within_a_series` in `crates/pharos-server/tests/items_query_golden.rs`: `SortBy=SeriesSortName,SortName` orders three books of one series by `book_series_index`, and a fourth with **no** index sorts last rather than as zero
+- [X] T070 [US3] Support that sort in `crates/pharos-store-sqlx/src/sqlite.rs` and `postgres.rs` using `book_series`/`book_series_index`; re-run `nix develop --command just test-postgres` — **COMMIT**
 
 ---
 

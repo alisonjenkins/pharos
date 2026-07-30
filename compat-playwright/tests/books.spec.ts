@@ -33,6 +33,9 @@ const BOOK_WIRE_ID = "00000000000000000000000000000009";
 /// unpacker (libarchive.js) behind the same `MediaType: "Book"` gate.
 /// HEX, not decimal — wire ids are `{id:032x}`, so internal id 10 is `…000a`.
 const COMIC_WIRE_ID = "0000000000000000000000000000000a";
+/// The seeded `.pdf` (id 11 → `…000b`). Read by `pdfPlayer`, the third reader
+/// behind the same `Book` gate and the only one that rasterises into a canvas.
+const PDF_WIRE_ID = "0000000000000000000000000000000b";
 
 async function connectToServer(page: Page) {
   await page.goto("/", { waitUntil: "networkidle" });
@@ -288,6 +291,69 @@ test.describe("books: unmodified jellyfin-web opens an epub", () => {
       turned = (await activeIndex()) === 1;
     }
     expect(turned, "8 page turns never reached page two").toBe(true);
+  });
+
+  // T074 — the THIRD reader. `pdfPlayer` is pdf.js, and unlike the other two
+  // it RASTERISES: it renders page one into a `<canvas>`. So the assertion is
+  // that the canvas has non-zero pixels drawn into it, not merely that a
+  // canvas element appeared — an empty canvas is what a failed render leaves
+  // behind, and it looks identical to a successful one in the DOM.
+  test("pdfPlayer opens the pdf and renders page one", async ({ page }) => {
+    test.setTimeout(150_000);
+
+    await connectToServer(page);
+    await login(page, SEED_USER, SEED_PASS);
+    const sid = await serverId(page);
+
+    const item = await page.evaluate(async (id) => {
+      const api = (window as any).ApiClient;
+      return await api.getItem(api.getCurrentUserId(), id);
+    }, PDF_WIRE_ID);
+    expect(item.Type).toBe("Book");
+    expect(String(item.MediaType).toLowerCase()).toBe("book");
+    expect(item.Path, "no Path means every reader declines silently").toBeTruthy();
+    // pdfPlayer lowercases before comparing, unlike bookPlayer — asserted as
+    // pdfPlayer actually spells it rather than as the other reader does.
+    expect(String(item.Path).toLowerCase().endsWith("pdf")).toBe(true);
+
+    await page.goto(`/#/details?id=${PDF_WIRE_ID}&serverId=${sid}`);
+    const playBtn = page.locator("button.btnPlay").first();
+    await playBtn.waitFor({ timeout: 20_000 });
+    await playBtn.click({ force: true });
+
+    await page.locator("#pdfPlayer").waitFor({ timeout: 60_000 });
+    const canvas = page.locator("#pdfPlayer canvas#canvas");
+    await canvas.waitFor({ timeout: 60_000 });
+
+    // pdf.js sizes the canvas from the page's MediaBox before it draws, so a
+    // non-zero size proves the DOCUMENT parsed — the xref table in the
+    // hand-assembled fixture is right.
+    const size = await canvas.evaluate((c: HTMLCanvasElement) => [c.width, c.height]);
+    expect(size[0], "a zero-width canvas means the PDF never parsed").toBeGreaterThan(0);
+    expect(size[1]).toBeGreaterThan(0);
+
+    // And something was actually PAINTED. The fixture draws text, because a
+    // blank page renders to a blank canvas and a blank canvas is
+    // indistinguishable from a render that silently failed.
+    await expect
+      .poll(
+        async () =>
+          await canvas.evaluate((c: HTMLCanvasElement) => {
+            const ctx = c.getContext("2d");
+            if (!ctx) return -1;
+            const { data } = ctx.getImageData(0, 0, c.width, c.height);
+            // Count pixels that are neither transparent nor pure white.
+            let painted = 0;
+            for (let i = 0; i < data.length; i += 4) {
+              if (data[i + 3] !== 0 && !(data[i] === 255 && data[i + 1] === 255 && data[i + 2] === 255)) {
+                painted++;
+              }
+            }
+            return painted;
+          }),
+        { timeout: 60_000 },
+      )
+      .toBeGreaterThan(0);
   });
 
   // The negative case that the whole design turns on. Recorded as a test so the
