@@ -39,6 +39,7 @@ hashbrown = { version = "0.14", default-features = false, features = ["ahash", "
 indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
+lzma-rust = { version = "0.1", default-features = false, features = ["encoder"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
 metrics-util = { version = "0.17" }
@@ -56,7 +57,7 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.10" }
+sevenz-rust = { version = "0.6", default-features = false, features = ["compress"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
@@ -111,7 +112,6 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.10" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
