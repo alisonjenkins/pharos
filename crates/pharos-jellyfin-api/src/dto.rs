@@ -1629,7 +1629,17 @@ impl BaseItemDto {
         user_data: pharos_core::UserItemData,
     ) -> Self {
         let mut dto = Self::build(item, server_id);
-        dto.user_data = UserItemDataDto::from_domain(item.id, user_data);
+        // WITH the runtime, not `from_domain`'s hardcoded zero. B36 fixed this
+        // for the session + user-data routes and left the ITEM routes reporting
+        // `PlayedPercentage: 0` for every part-watched film — so a card's resume
+        // bar drew empty on the one payload the grid actually renders from.
+        // `run_time_ticks` was computed by `build` immediately above; the value
+        // was always right here, it just was not passed.
+        //
+        // A book's runtime is 0, so this yields 0.0 rather than a NaN — which
+        // serde writes as `null` and a client draws as a full or broken bar.
+        dto.user_data =
+            UserItemDataDto::from_domain_with_runtime(item.id, user_data, dto.run_time_ticks);
         dto
     }
 
