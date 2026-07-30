@@ -226,7 +226,7 @@ concern and nothing else.
 - [X] T081 [P] Confirm `PROBE_SCHEMA_VERSION` in `crates/pharos-core/src/lib.rs` does **not** need a bump — book rows are new and no existing media item's probe output changes. Record the conclusion in the commit message rather than bumping reflexively; a bump re-probes ~13k items
 - [X] T082 Run `nix develop --command just test` and `nix develop --command cargo clippy --workspace --all-targets -- -D warnings`. Pre-commit only runs rustfmt, and a clippy failure silently blocks the image publish
 - [X] T083 Run `nix develop --command just test-postgres` once more after the final `sqlx::query*` edit
-- [ ] T084 Deploy and verify by query, not by deploy event: `sum by (verdict) (pharos_book_classify_total)` and `sum by (format) (pharos_book_classify_total)` answer SC-003 and SC-005, and quickstart §3/§5's `Path`/`MediaSources`/`PlaybackInfo` assertions hold against the live server. `/metrics` is on the **main HTTP port**, not 9090 — **COMMIT**
+- [X] T084 Deploy and verify by query, not by deploy event: `sum by (verdict) (pharos_book_classify_total)` and `sum by (format) (pharos_book_classify_total)` answer SC-003 and SC-005, and quickstart §3/§5's `Path`/`MediaSources`/`PlaybackInfo` assertions hold against the live server. `/metrics` is on the **main HTTP port**, not 9090 — **COMMIT**
 
 ---
 
