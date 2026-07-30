@@ -2758,7 +2758,12 @@ impl LibraryStore for PostgresStore {
 
     #[tracing::instrument(skip(self))]
     async fn backfill_library_ids(&self) -> DomainResult<u64> {
-        let libs = self.libraries().await?;
+        // SHORTEST ROOT FIRST, so the most specific library wins — see the
+        // sqlite impl for why (B174): `libraries()` orders by NAME, and a
+        // whole-share "media" root sorted last and overwrote every typed
+        // library nested inside it.
+        let mut libs = self.libraries().await?;
+        libs.sort_by_key(|l| l.root_path.len());
         for lib in &libs {
             let like = crate::root_like_pattern(&lib.root_path);
             sqlx::query("UPDATE media_items SET library_id = $1 WHERE path LIKE $2 ESCAPE '\\'")

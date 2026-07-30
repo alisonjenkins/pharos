@@ -1541,3 +1541,71 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     let keys: Vec<&str> = need2.iter().map(|c| c.series_key.as_str()).collect();
     assert_eq!(keys, vec!["/tv/Buffy (1997)"]);
 }
+
+/// B174 — when roots NEST, the most specific library wins.
+///
+/// The old code ordered by `libraries()`'s `ORDER BY name` and let a later root
+/// overwrite an earlier one, on the stated assumption that "roots don't nest in
+/// practice". They do: a whole-share `mixed` root beside typed libraries for
+/// its subfolders is the obvious way to configure this, and it is what the
+/// deployment does. Under that ordering the containing root sorted LAST and
+/// swallowed everything — 14,229 items in one mixed library while Movies, Music
+/// and TV Shows sat at zero, with no error anywhere.
+///
+/// The names here are chosen to reproduce that exact ordering: "media" sorts
+/// AFTER "Books"/"Movies", so a name-ordered pass gives the containing root the
+/// last word. A test whose names happened to sort the other way would pass
+/// against the bug.
+#[tokio::test]
+async fn a_nested_library_beats_the_root_that_contains_it() {
+    use pharos_core::{LibraryKind, LibraryStore};
+    let s = fresh().await;
+    let all_wire = "cccc2222cccc2222cccc2222cccc2222";
+    let books_wire = "dddd3333dddd3333dddd3333dddd3333";
+    let movies_wire = "eeee4444eeee4444eeee4444eeee4444";
+
+    // The whole share, named so it sorts LAST — this is the trap.
+    s.upsert_library("media", "/media", LibraryKind::Mixed, all_wire)
+        .await
+        .unwrap();
+    s.upsert_library("Books", "/media/Ebooks", LibraryKind::Books, books_wire)
+        .await
+        .unwrap();
+    s.upsert_library("Movies", "/media/Movies", LibraryKind::Movies, movies_wire)
+        .await
+        .unwrap();
+
+    s.put(item(1, "/media/Ebooks/Dune.epub", "Dune", MediaKind::Book))
+        .await
+        .unwrap();
+    s.put(item(
+        2,
+        "/media/Movies/Alien.mkv",
+        "Alien",
+        MediaKind::Movie,
+    ))
+    .await
+    .unwrap();
+    // Directly under the mixed root and in no typed library — it must still be
+    // claimed by the root, or the fix would trade one silent gap for another.
+    s.put(item(3, "/media/Loose.mkv", "Loose", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    let assigned = s.backfill_library_ids().await.unwrap();
+    assert_eq!(assigned, 3, "every item lands in exactly one library");
+
+    assert_eq!(
+        s.item_ids_for_library(books_wire).await.unwrap(),
+        vec![1],
+        "the book belongs to the Books library, not to the mixed root that \
+         happens to contain it — this is what decides whether the client \
+         renders a book grid or a video grid"
+    );
+    assert_eq!(s.item_ids_for_library(movies_wire).await.unwrap(), vec![2]);
+    assert_eq!(
+        s.item_ids_for_library(all_wire).await.unwrap(),
+        vec![3],
+        "the mixed root keeps only what no more specific library claimed"
+    );
+}
