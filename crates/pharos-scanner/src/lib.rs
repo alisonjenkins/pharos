@@ -2,6 +2,7 @@
 //! for `FfmpegProber` (V12). Walk runs inside `spawn_blocking` so it never
 //! parks the async runtime (V5).
 
+pub mod book;
 pub mod detect;
 pub mod ffmpeg;
 pub mod fingerprint;

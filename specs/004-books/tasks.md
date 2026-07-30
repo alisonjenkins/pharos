@@ -101,9 +101,9 @@ otherwise by labelling `Path` and `/Download` as US1-only.
 
 ### Step 5 — the classification signal, before the branch it measures (R12)
 
-- [ ] T029 [P] Add test `classify_labels_are_distinct_and_stable` in `crates/pharos-scanner/src/book/mod.rs` tests asserting every `BookClassifyVerdict`/`BookClassifyReason` `label()` is distinct and matches the exact strings [quickstart.md](./quickstart.md) §8 queries. Metric labels are a dashboard contract — a renamed label breaks alerts silently
-- [ ] T030 Add `BookClassifyVerdict` and `BookClassifyReason` enums with `label()` methods to `crates/pharos-scanner/src/book/mod.rs`. Reasons are bounded: `no_cover_entry`, `unsupported_image_encoding`, `rar_unsupported`, `malformed_container`, `format_unreadable`. The offending *value* goes in the log line beside the counter, never into a label
-- [ ] T031 Emit `pharos_book_classify_total{format,verdict,reason}` from the classification path in `crates/pharos-scanner/src/book/mod.rs`. Ships **before** T036's branch exists, per Constitution III — the signal must be readable before the thing it measures lands. This counter is what makes SC-003 (cover rate) and SC-005 (what each file was classified as) answerable by query — **COMMIT**
+- [X] T029 [P] Add test `classify_labels_are_distinct_and_stable` in `crates/pharos-scanner/src/book/mod.rs` tests asserting every `BookClassifyVerdict`/`BookClassifyReason` `label()` is distinct and matches the exact strings [quickstart.md](./quickstart.md) §8 queries. Metric labels are a dashboard contract — a renamed label breaks alerts silently
+- [X] T030 Add `BookClassifyVerdict` and `BookClassifyReason` enums with `label()` methods to `crates/pharos-scanner/src/book/mod.rs`. Reasons are bounded: `no_cover_entry`, `unsupported_image_encoding`, `rar_unsupported`, `malformed_container`, `format_unreadable`. The offending *value* goes in the log line beside the counter, never into a label
+- [X] T031 Emit `pharos_book_classify_total{format,verdict,reason}` from the classification path in `crates/pharos-scanner/src/book/mod.rs`. Ships **before** T036's branch exists, per Constitution III — the signal must be readable before the thing it measures lands. This counter is what makes SC-003 (cover rate) and SC-005 (what each file was classified as) answerable by query — **COMMIT**
 
 ### Step 6 — extension classification and the probe bypass
 
