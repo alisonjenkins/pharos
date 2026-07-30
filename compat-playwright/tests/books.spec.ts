@@ -203,6 +203,22 @@ test.describe("books: unmodified jellyfin-web opens an epub", () => {
     await connectToServer(page);
     await login(page, SEED_USER, SEED_PASS);
     const sid = await serverId(page);
+
+    // The page-turn spec above leaves a READ POSITION on this same seeded
+    // book, and `bookPlayer` resumes to it — so without this the reader opens
+    // on chapter two and the `#ch1-marker` wait below times out. The failure
+    // depends on how far the previous spec got before teardown, which is why
+    // it surfaced as an intermittent 60 s timeout rather than an obvious
+    // ordering bug. Clearing it makes this spec's precondition explicit rather
+    // than inherited; B176 makes the DELETE actually reset the position.
+    await page.evaluate(async (id) => {
+      const api = (window as any).ApiClient;
+      await api.ajax({
+        type: "DELETE",
+        url: api.getUrl(`Users/${api.getCurrentUserId()}/PlayedItems/${id}`),
+      });
+    }, BOOK_WIRE_ID);
+
     await page.goto(`/#/details?id=${BOOK_WIRE_ID}&serverId=${sid}`);
     const playBtn = page.locator("button.btnPlay").first();
     await playBtn.waitFor({ timeout: 20_000 });
