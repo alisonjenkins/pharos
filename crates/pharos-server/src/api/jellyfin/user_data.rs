@@ -62,6 +62,12 @@ fn op_mark_played(d: &mut UserItemData) {
 }
 fn op_unmark_played(d: &mut UserItemData) {
     d.played = false;
+    // B176 — and forget where they were. Jellyfin's `MarkUnplayed` clears the
+    // resume position along with the flag, and leaving it set produces an item
+    // that says "unwatched" and then starts 40 minutes in: the flag and the
+    // position are two halves of one answer to "have I seen this", so a mutation
+    // that moves one and not the other leaves the pair contradicting itself.
+    d.last_played_position_ticks = 0;
 }
 fn op_mark_favorite(d: &mut UserItemData) {
     d.is_favorite = true;
