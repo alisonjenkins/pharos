@@ -200,6 +200,58 @@ where
     assert!(total >= 1);
     assert!(page.iter().any(|i| i.id == item_id));
 
+    // 004-books (T070) — reading order, asserted on BOTH backends because that
+    // is the whole reason the column expression is what it is. SQLite sorts
+    // NULLs FIRST in ASC and Postgres sorts them LAST, so a bare
+    // `book_series_index` would put the unnumbered volume ahead of book one on
+    // one engine and behind it on the other: the same query, two orders,
+    // neither of them wrong-looking. The store coalesces NULL to a sentinel so
+    // "unknown is not first" holds everywhere (migration 0053).
+    for (id, title, index) in [
+        (9001 as MediaId, "Second", Some(2u32)),
+        (9002, "Unnumbered", None),
+        (9003, "First", Some(1)),
+    ] {
+        let mut book = media_item(id, title);
+        book.kind = MediaKind::Book;
+        book.path = format!("/media/conformance/books/{title}.epub").into();
+        book.book = Some(pharos_core::BookMeta {
+            format: pharos_core::BookFormat::Epub,
+            series_name: Some("Conformance Chronicles".into()),
+            series_index: index,
+            ..Default::default()
+        });
+        MediaStore::put(&store, book).await.unwrap();
+    }
+    let reading_order = MediaQuery {
+        kinds: vec![MediaKind::Book],
+        sort: vec![
+            (pharos_core::SortKey::BookSeries, pharos_core::SortDir::Asc),
+            (
+                pharos_core::SortKey::BookSeriesIndex,
+                pharos_core::SortDir::Asc,
+            ),
+            (pharos_core::SortKey::Name, pharos_core::SortDir::Asc),
+        ],
+        ..Default::default()
+    };
+    let (books, _) = MediaStore::query(&store, &reading_order).await.unwrap();
+    // Filtered to THIS series: the postgres backend runs against a shared
+    // database that other tests have already written books into, so asserting
+    // the whole list would fail on leftovers rather than on ordering.
+    let titles: Vec<&str> = books
+        .iter()
+        .filter(|i| {
+            i.book.as_ref().and_then(|b| b.series_name.as_deref()) == Some("Conformance Chronicles")
+        })
+        .map(|i| i.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        ["First", "Second", "Unnumbered"],
+        "an unnumbered volume sorts LAST within its series on every backend"
+    );
+
     let search_q = pharos_core::SearchQuery {
         term: "Conformance".into(),
         kinds: Vec::new(),

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::metadata::{
-    embedded::EmbeddedTagProvider, filename::FilenameProvider, nfo::NfoProvider,
-    sidecar::SidecarArtworkProvider, MetadataResolver,
+    book::BookMetadataProvider, embedded::EmbeddedTagProvider, filename::FilenameProvider,
+    nfo::NfoProvider, sidecar::SidecarArtworkProvider, MetadataResolver,
 };
 
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
@@ -228,6 +228,10 @@ fn default_resolver() -> MetadataResolver {
         .with_provider(NfoProvider::new())
         .with_provider(SidecarArtworkProvider::new())
         .with_provider(EmbeddedTagProvider::new())
+        // 004-books — the epub OPF / ComicInfo.xml reader, at the same rung as
+        // embedded container tags: a curated .nfo still wins any scalar, and a
+        // filename still supplies a title the file itself did not carry.
+        .with_provider(BookMetadataProvider::new())
         .with_provider(FilenameProvider::new())
 }
 

@@ -556,3 +556,114 @@ async fn items_query_byte_identical_to_golden() {
         failures.join("\n\n")
     );
 }
+
+/// 004-books (T069) — reading order.
+///
+/// A books library is browsed by shelf, not alphabetically: "Dune Messiah"
+/// alphabetises nowhere near "Children of Dune", so a series sorted by title
+/// reads in an order no one wants. `SortBy=SeriesSortName,SortName` groups by
+/// series and orders by volume.
+///
+/// The unnumbered volume is the point of the fourth book. NULL sorts FIRST in
+/// SQLite's ASC and LAST in Postgres's, so a bare `book_series_index` column
+/// would put a companion volume ahead of book one on the deployment's sqlite
+/// and behind it on postgres — the same query, two orders. The store coalesces
+/// NULL to a sentinel so both agree, and "unknown is not first" is the rule
+/// migration 0053 states.
+///
+/// Its own store rather than the shared corpus above, so the golden files stay
+/// untouched: this asserts an ORDER, and a golden capture would pin the whole
+/// payload for a question about four rows.
+#[actix_web::test]
+async fn books_sort_into_reading_order_within_a_series() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "test").await.unwrap();
+    let token = token.0.expose().to_string();
+
+    // Deliberately inserted out of order, and TITLED so that alphabetical order
+    // (Children < Dune < Dune Messiah < Sands) differs from reading order — if
+    // the sort silently fell back to SortName the assertion below would still
+    // see a plausible-looking list.
+    for (id, title, series, index) in [
+        (1u64, "Dune Messiah", Some("Dune Chronicles"), Some(2u32)),
+        (2, "Sands of Arrakis", Some("Dune Chronicles"), None),
+        (3, "Children of Dune", Some("Dune Chronicles"), Some(3)),
+        (4, "Dune", Some("Dune Chronicles"), Some(1)),
+        // A different shelf, so "group by series" is shown to do something.
+        (5, "Neuromancer", Some("Sprawl"), Some(1)),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: format!("/media/Books/{title}.epub").into(),
+                title: title.into(),
+                kind: MediaKind::Book,
+                book: Some(pharos_core::BookMeta {
+                    format: pharos_core::BookFormat::Epub,
+                    series_name: series.map(str::to_string),
+                    series_index: index,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Book&SortBy=SeriesSortName,SortName")
+        .insert_header((
+            "X-Emby-Authorization",
+            format!(
+                "MediaBrowser Client=\"t\", Device=\"d\", DeviceId=\"i\", Version=\"1\", Token=\"{token}\""
+            ),
+        ))
+        .to_request();
+    let body: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let order: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        order,
+        [
+            "Dune",
+            "Dune Messiah",
+            "Children of Dune",
+            "Sands of Arrakis",
+            "Neuromancer",
+        ],
+        "reading order: volumes 1-3 in sequence, the UNNUMBERED volume last \
+         within its series (not first, which is where SQLite puts a NULL), then \
+         the next shelf"
+    );
+
+    // And the projection the client groups by is actually present.
+    let first = &body["Items"][0];
+    assert_eq!(first["SeriesName"], "Dune Chronicles");
+    assert_eq!(first["IndexNumber"], 1);
+    assert!(
+        body["Items"][3]["IndexNumber"].is_null(),
+        "an unnumbered volume must report no index rather than 0 — 0 is a \
+         volume number and this is the absence of one: {}",
+        body["Items"][3]
+    );
+}

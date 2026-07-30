@@ -54,6 +54,15 @@ fn sort_key_column(key: SortKey) -> &'static str {
         SortKey::AlbumArtist => "LOWER(album_artist)",
         SortKey::IndexNumber => "episode_number",
         SortKey::SeasonNumber => "season_number",
+        SortKey::BookSeries => "LOWER(book_series)",
+        // COALESCE rather than a bare column, deliberately. SQLite sorts NULLs
+        // FIRST in ASC and Postgres sorts them LAST, so an unnumbered volume
+        // would lead the series on one backend and trail it on the other — the
+        // divergence the episode sort tolerates but this one must not, because
+        // "unknown is not first" is the stated rule (migration 0053). The
+        // sentinel is `i32::MAX`; a real volume numbered two billion would tie
+        // with it, and would have other problems.
+        SortKey::BookSeriesIndex => "COALESCE(book_series_index, 2147483647)",
         SortKey::Id => "id",
     }
 }
