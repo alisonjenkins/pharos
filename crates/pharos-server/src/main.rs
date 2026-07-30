@@ -211,8 +211,8 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let mut lock = stdout.lock();
     writeln!(
         lock,
-        "seeded: user='playwright' password='playwright-test-pw' (admin), 9 items \
-         (incl. 3-episode series + multitrack + epub), fixture={}",
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 10 items \
+         (incl. 3-episode series + multitrack + epub + cbz), fixture={}",
         paths.movie.display()
     )?;
     Ok(())
@@ -233,6 +233,12 @@ struct SeedPaths {
     /// jellyfin-web's `bookPlayer` (epub.js) against unmodified client code.
     /// Built by hand rather than by ffmpeg, which cannot produce one.
     epub: std::path::PathBuf,
+    /// 004-books — a real `.cbz` so `books.spec.ts` can drive jellyfin-web's
+    /// `comicsPlayer` (libarchive.js + Swiper). Its two pages have DIFFERENT
+    /// dimensions, which is how the spec tells one from the other after a page
+    /// turn — a slide index alone would advance even if both images failed to
+    /// decode.
+    cbz: std::path::PathBuf,
 }
 
 /// Register the seed media rows (pure DB — no ffmpeg). Ids 1–4 keep their
@@ -314,6 +320,27 @@ async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), A
         ..Default::default()
     };
     let _ = stores.put(book).await;
+
+    // 004-books — a real cbz (id 10) so books.spec.ts can drive comicsPlayer.
+    // `page_count: Some(2)` is what the scanner's comic reader counts out of
+    // this exact archive, so the seeded row and a scanned row agree.
+    let comic = MediaItem {
+        id: 10,
+        path: paths.cbz.clone(),
+        title: "Playwright Comic".into(),
+        kind: MediaKind::Book,
+        book: Some(pharos_core::BookMeta {
+            format: pharos_core::BookFormat::Comic,
+            author: Some("Grace Hopper".into()),
+            publisher: Some("Pharos Press".into()),
+            series_name: Some("Pharos Comics".into()),
+            series_index: Some(1),
+            isbn: None,
+            page_count: Some(2),
+        }),
+        ..Default::default()
+    };
+    let _ = stores.put(comic).await;
     Ok(())
 }
 
@@ -415,6 +442,83 @@ async fn write_seed_epub(path: &std::path::Path) -> Result<(), AppError> {
             zw.start_file(name, SimpleFileOptions::default())
                 .map_err(std::io::Error::other)?;
             zw.write_all(body.as_bytes())?;
+        }
+        zw.finish().map_err(std::io::Error::other)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?
+    .map_err(AppError::Io)?;
+    Ok(())
+}
+
+/// 004-books — write a genuinely valid `.cbz`, so the Playwright spec drives
+/// real libarchive.js rather than a stub.
+///
+/// A cbz is just a zip of images in name order. The two pages are REAL PNGs
+/// produced by ffmpeg — a hand-rolled byte blob would satisfy pharos's
+/// extension check and then fail to decode in the browser, which is exactly the
+/// silent shape this fixture exists to rule out.
+///
+/// They are deliberately different SIZES (64×64 and 128×32). The spec reads
+/// `naturalWidth` to tell page one from page two, because a Swiper index
+/// advances whether or not the image behind it decoded — asserting the index
+/// alone would pass on two broken images.
+#[cfg(debug_assertions)]
+async fn write_seed_cbz(
+    path: &std::path::Path,
+    work_dir: &std::path::Path,
+) -> Result<(), AppError> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let page1 = work_dir.join("page01.png");
+    let page2 = work_dir.join("page02.png");
+    for (out, size, colour) in [(&page1, "64x64", "red"), (&page2, "128x32", "blue")] {
+        run_ffmpeg(&[
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c={colour}:s={size}:d=1"),
+            "-frames:v",
+            "1",
+            out.to_string_lossy().as_ref(),
+        ])
+        .await?;
+    }
+
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        let f = std::fs::File::create(&path)?;
+        let mut zw = zip::ZipWriter::new(f);
+
+        // Tagged, so the scanner's ComicInfo path is exercised by the same
+        // fixture the browser reads. `PageCount` is deliberately absent: the
+        // archive is the authority on that.
+        zw.start_file("ComicInfo.xml", SimpleFileOptions::default())
+            .map_err(std::io::Error::other)?;
+        zw.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<ComicInfo>
+  <Title>Playwright Comic</Title>
+  <Series>Pharos Comics</Series>
+  <Number>1</Number>
+  <Writer>Grace Hopper</Writer>
+  <Publisher>Pharos Press</Publisher>
+  <Summary>A seeded fixture for the books E2E spec.</Summary>
+  <Year>1843</Year>
+</ComicInfo>"#,
+        )?;
+
+        for (name, src) in [("page01.png", &page1), ("page02.png", &page2)] {
+            let bytes = std::fs::read(src)?;
+            zw.start_file(name, SimpleFileOptions::default())
+                .map_err(std::io::Error::other)?;
+            zw.write_all(&bytes)?;
         }
         zw.finish().map_err(std::io::Error::other)?;
         Ok(())
@@ -556,6 +660,9 @@ async fn generate_seed_fixtures(
     let epub = target_dir.join("Playwright Book.epub");
     write_seed_epub(&epub).await?;
 
+    let cbz = target_dir.join("Playwright Comic.cbz");
+    write_seed_cbz(&cbz, fixture_dir).await?;
+
     Ok(SeedPaths {
         movie: singles[0].clone(),
         movie2: singles[1].clone(),
@@ -564,6 +671,7 @@ async fn generate_seed_fixtures(
         series_eps: [singles[4].clone(), singles[5].clone(), singles[6].clone()],
         multitrack,
         epub,
+        cbz,
     })
 }
 
@@ -1525,6 +1633,7 @@ mod seed_tests {
                 p("show/show-s01e03.webm"),
             ],
             epub: p("Playwright Book.epub"),
+            cbz: p("Playwright Comic.cbz"),
             multitrack: p("multitrack.mkv"),
         };
         register_seed_items(&stores, &paths).await.unwrap();
@@ -1542,5 +1651,25 @@ mod seed_tests {
         }
         // The multitrack clip is registered as a Movie.
         assert_eq!(stores.get(8).await.unwrap().kind, MediaKind::Movie);
+
+        // 004-books — both reader fixtures. The PATHS are what decide which
+        // reader jellyfin-web offers (`canPlayItem` tests the extension and
+        // nothing else), so a seed that registered the right kind against the
+        // wrong path would open no reader at all and say nothing about it.
+        for (id, ext, fmt, pages) in [
+            (9u64, "epub", pharos_core::BookFormat::Epub, None),
+            (10, "cbz", pharos_core::BookFormat::Comic, Some(2)),
+        ] {
+            let item = stores.get(id).await.unwrap();
+            assert_eq!(item.kind, MediaKind::Book, "id {id}");
+            assert!(
+                item.path.to_string_lossy().ends_with(ext),
+                "id {id} must end in .{ext} or every reader declines silently, got {}",
+                item.path.display()
+            );
+            let bm = item.book.expect("a Book row must carry BookMeta");
+            assert_eq!(bm.format, fmt, "id {id}");
+            assert_eq!(bm.page_count, pages, "id {id}");
+        }
     }
 }

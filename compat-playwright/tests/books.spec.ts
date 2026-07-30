@@ -28,6 +28,11 @@ const SEED_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
 const BOOK_ID = "9";
 /// The 32-hex wire id jellyfin-web addresses items by; `9` is the internal id.
 const BOOK_WIRE_ID = "00000000000000000000000000000009";
+/// The seeded `.cbz` (id 10) — two PNG pages of DIFFERENT sizes plus a
+/// ComicInfo.xml. Read by `comicsPlayer`, a different reader with a different
+/// unpacker (libarchive.js) behind the same `MediaType: "Book"` gate.
+/// HEX, not decimal — wire ids are `{id:032x}`, so internal id 10 is `…000a`.
+const COMIC_WIRE_ID = "0000000000000000000000000000000a";
 
 async function connectToServer(page: Page) {
   await page.goto("/", { waitUntil: "networkidle" });
@@ -203,6 +208,86 @@ test.describe("books: unmodified jellyfin-web opens an epub", () => {
     expect(downloads.length, "the reader must have fetched the epub").toBeGreaterThan(0);
     // Query auth, no Authorization header — the shape getItemDownloadUrl builds.
     expect(downloads[0]).toContain("api_key=");
+  });
+
+  // T057 — the SECOND reader. `comicsPlayer` sits behind the same
+  // `MediaType: "Book"` gate as `bookPlayer` but tests a different extension
+  // set (`.cbr`/`.cbt`/`.cbz`/`.cb7`, case-sensitive) and unpacks with
+  // libarchive.js instead of epub.js. Nothing about the epub passing implies
+  // this one does: playbackManager picks between the two readers purely on
+  // `canPlayItem`, i.e. purely on `Path`.
+  test("comicsPlayer opens the cbz and turns a page", async ({ page }) => {
+    test.setTimeout(150_000);
+
+    await connectToServer(page);
+    await login(page, SEED_USER, SEED_PASS);
+    const sid = await serverId(page);
+
+    // Gate check first, so a failure below localises: wrong MediaType/Path is a
+    // different bug from libarchive failing to unpack.
+    const item = await page.evaluate(async (id) => {
+      const api = (window as any).ApiClient;
+      return await api.getItem(api.getCurrentUserId(), id);
+    }, COMIC_WIRE_ID);
+    expect(item.Type).toBe("Book");
+    expect(String(item.MediaType).toLowerCase()).toBe("book");
+    expect(item.Path, "no Path means every reader declines silently").toBeTruthy();
+    expect(
+      item.Path.endsWith(".cbz"),
+      `comicsPlayer's compare is case-sensitive and includes the dot, got ${item.Path}`,
+    ).toBe(true);
+
+    await page.goto(`/#/details?id=${COMIC_WIRE_ID}&serverId=${sid}`);
+    const playBtn = page.locator("button.btnPlay").first();
+    await playBtn.waitFor({ timeout: 20_000 });
+    await playBtn.click({ force: true });
+
+    // comicsPlayer builds `#comicsPlayer` and fills a Swiper with one
+    // `.swiper-slide` per image, each holding an `img.swiper-slide-img` whose
+    // src is a blob URL of the unpacked page.
+    const reader = page.locator("#comicsPlayer");
+    await reader.waitFor({ timeout: 60_000 });
+    const slides = page.locator("#comicsPlayer .swiper-slide");
+    await expect(slides).toHaveCount(2, { timeout: 60_000 });
+
+    // The images must actually DECODE. A slide exists whether or not its blob
+    // is a real image, so an index-only assertion would pass on two broken
+    // pages — which is precisely the silent-failure shape this spec exists for.
+    const dims = async () =>
+      await page.evaluate(() =>
+        Array.from(
+          document.querySelectorAll<HTMLImageElement>("#comicsPlayer img.swiper-slide-img"),
+        ).map((i) => [i.naturalWidth, i.naturalHeight]),
+      );
+    await expect
+      .poll(async () => (await dims()).filter(([w]) => w > 0).length, { timeout: 60_000 })
+      .toBe(2);
+    expect(
+      await dims(),
+      "the fixture's pages are 64x64 and 128x32; equal sizes here would mean the " +
+        "two slides are showing the same image",
+    ).toEqual([
+      [64, 64],
+      [128, 32],
+    ]);
+
+    // TURN THE PAGE. Swiper's own `activeIndex` is the reader's notion of which
+    // page is showing, so it is read rather than inferred from the DOM.
+    const activeIndex = async () =>
+      await page.evaluate(() => {
+        const el = document.querySelector(".slideshowSwiperContainer") as any;
+        return el?.swiper?.activeIndex ?? -1;
+      });
+    expect(await activeIndex()).toBe(0);
+
+    await reader.click({ position: { x: 5, y: 5 }, force: true });
+    let turned = false;
+    for (let i = 0; i < 8 && !turned; i++) {
+      await page.keyboard.press("ArrowRight");
+      await page.waitForTimeout(600);
+      turned = (await activeIndex()) === 1;
+    }
+    expect(turned, "8 page turns never reached page two").toBe(true);
   });
 
   // The negative case that the whole design turns on. Recorded as a test so the
