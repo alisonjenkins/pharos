@@ -416,6 +416,14 @@ pub struct BaseItemDto {
     pub run_time_ticks: u64,
     pub location_type: &'static str,
     pub can_play: bool,
+    /// 004-books / FR-004 — may a client fetch this item's file bytes?
+    ///
+    /// Always true: `/Items/{id}/Download` serves ANY item (matching real
+    /// Jellyfin, which advertises `CanDownload` generally), so claiming
+    /// otherwise would be a lie the download button exposes. The client asks for
+    /// this field by name — `Fields=CanDownload,Path` — which is how the gap was
+    /// found: nothing emitted it, so every client saw the field as absent.
+    pub can_download: bool,
     pub media_sources: Vec<MediaSourceLiteDto>,
     pub play_access: &'static str,
     // Array-typed fields jellyfin-web iterates over without null
@@ -1693,6 +1701,7 @@ impl BaseItemDto {
             run_time_ticks,
             location_type: "FileSystem",
             can_play: true,
+            can_download: true,
             play_access: "Full",
             media_sources: if is_book {
                 // Empty, so nothing can construct /Videos/{id}/stream for an epub.

@@ -3206,6 +3206,7 @@ dependencies = [
  "uuid",
  "workspace-hack",
  "xxhash-rust",
+ "zip",
 ]
 
 [[package]]
