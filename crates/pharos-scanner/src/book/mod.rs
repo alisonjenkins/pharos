@@ -239,6 +239,95 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
     }
 }
 
+/// Read a book's cover image bytes, and RECORD what happened.
+///
+/// This is the only step that can tell a cover from the promise of one, so it
+/// is where the cover verdict is recorded. A manifest entry is not a cover: an
+/// OPF can name an image the archive does not contain, and reporting
+/// `cover_found` on the strength of the name would advertise a `Primary` tag
+/// that 404s on every grid render — the B149 shape the counter exists to make
+/// visible.
+///
+/// Returns `None` for every no-cover outcome, having said WHY on the counter
+/// first. The caller writes nothing, and `has_primary_art` stays false, so the
+/// item advertises no `Primary` tag.
+pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
+    let format = format_for_path(path)?;
+    match format {
+        BookFormat::Epub => match epub::read_epub_cover(path) {
+            Ok(Some(bytes)) => {
+                record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
+                Some(bytes)
+            }
+            Ok(None) => {
+                record_classify(
+                    format,
+                    ClassifyVerdict::CoverAbsent,
+                    ClassifyReason::NoCoverEntry,
+                );
+                None
+            }
+            Err(err) => {
+                record_classify(
+                    format,
+                    ClassifyVerdict::Unparseable,
+                    ClassifyReason::MalformedContainer,
+                );
+                tracing::warn!(path = %path.display(), error = %err, "epub cover unreadable");
+                None
+            }
+        },
+        BookFormat::Comic => match comic::read_comic_cover(path) {
+            Ok(Some(bytes)) => {
+                record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
+                Some(bytes)
+            }
+            Ok(None) => {
+                record_classify(
+                    format,
+                    ClassifyVerdict::CoverAbsent,
+                    ClassifyReason::NoCoverEntry,
+                );
+                None
+            }
+            Err(err) => {
+                let (verdict, reason) = match &err {
+                    comic::ComicError::RarUnsupported(_) => {
+                        (ClassifyVerdict::CoverAbsent, ClassifyReason::RarUnsupported)
+                    }
+                    comic::ComicError::Open(_) => {
+                        (ClassifyVerdict::Unparseable, ClassifyReason::Unopenable)
+                    }
+                    _ => (
+                        ClassifyVerdict::Unparseable,
+                        ClassifyReason::MalformedContainer,
+                    ),
+                };
+                record_classify(format, verdict, reason);
+                if matches!(err, comic::ComicError::RarUnsupported(_)) {
+                    tracing::debug!(path = %path.display(), reason = %err, "comic: no cover by design");
+                } else {
+                    tracing::warn!(path = %path.display(), error = %err, "comic cover unreadable");
+                }
+                None
+            }
+        },
+        // The PDF extractor lands with US4 (T073). Until then a PDF honestly
+        // reports itself cover-less rather than claiming one.
+        BookFormat::Pdf => {
+            record_classify(
+                format,
+                ClassifyVerdict::CoverAbsent,
+                ClassifyReason::NoCoverEntry,
+            );
+            None
+        }
+        // Already recorded as `format_unreadable` by `read_book_meta`; a second
+        // verdict for the same file would double-count the rate SC-003 reads.
+        BookFormat::Unreadable => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

@@ -131,28 +131,60 @@ pub fn read_epub(path: &Path) -> Result<EpubMetadata, EpubError> {
     Ok(meta)
 }
 
+/// Read the cover image's BYTES out of an epub.
+///
+/// A second open of the archive, deliberately: metadata is read for every book
+/// on every scan pass, and the cover only for a book the scan is actually
+/// writing. Both are O(1) in file size — a zip's central directory is read
+/// without inflating anything but the entries actually named — so SC-002 holds
+/// either way.
+///
+/// Returns `Ok(None)` when the OPF declared no cover at all, which is a normal
+/// outcome and not an error.
+pub fn read_epub_cover(path: &Path) -> Result<Option<Vec<u8>>, EpubError> {
+    let Some(href) = read_epub(path)?.cover_href else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).map_err(|e| EpubError::Open(e.to_string()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| EpubError::NotAZip(e.to_string()))?;
+    let idx = (0..zip.len())
+        .find(|i| {
+            zip.by_index_raw(*i)
+                .map(|e| e.name().eq_ignore_ascii_case(&href))
+                .unwrap_or(false)
+        })
+        // A manifest that names an entry the archive does not contain. Rare,
+        // and worth naming the href rather than reporting "no cover" — the two
+        // have different fixes.
+        .ok_or_else(|| EpubError::MissingOpf {
+            href: href.clone(),
+            detail: "declared as the cover but absent from the archive".into(),
+        })?;
+    let mut entry = zip.by_index(idx).map_err(|e| EpubError::MissingOpf {
+        href: href.clone(),
+        detail: e.to_string(),
+    })?;
+    let mut bytes = Vec::new();
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|e| EpubError::MissingOpf {
+            href,
+            detail: e.to_string(),
+        })?;
+    Ok(Some(bytes))
+}
+
 /// The scan path's decision: a parse failure yields empty metadata rather than
 /// dropping the item (V6), and records WHY on the classify counter.
+///
+/// Records only the PARSE outcome. The cover verdict belongs to the extractor
+/// (`super::read_book_cover`), which is the only step that knows whether bytes
+/// actually came out — recording `cover_found` here on the strength of a
+/// manifest entry would report a cover for a book whose grid tile 404s, which
+/// is the B149 shape the counter exists to make visible.
 pub fn read_epub_or_empty(path: &Path) -> BookMeta {
     match read_epub(path) {
-        Ok(meta) => {
-            let verdict = if meta.cover_href.is_some() {
-                // The href exists; the BYTES are pulled by the cover extractor
-                // (T061), which records the final verdict. Reported as
-                // cover-absent here would undercount, so this stays honest by
-                // reporting what THIS step established.
-                ClassifyVerdict::CoverFound
-            } else {
-                ClassifyVerdict::CoverAbsent
-            };
-            let reason = if meta.cover_href.is_some() {
-                ClassifyReason::Ok
-            } else {
-                ClassifyReason::NoCoverEntry
-            };
-            record_classify(BookFormat::Epub, verdict, reason);
-            meta.to_book_meta()
-        }
+        Ok(meta) => meta.to_book_meta(),
         Err(err) => {
             let (verdict, reason) = match &err {
                 EpubError::Open(_) => (ClassifyVerdict::Unparseable, ClassifyReason::Unopenable),
