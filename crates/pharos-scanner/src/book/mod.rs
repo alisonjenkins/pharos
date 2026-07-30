@@ -92,6 +92,16 @@ pub(crate) enum ClassifyReason {
     MalformedContainer,
     /// The file could not be opened at all (permissions, a dead mount).
     Unopenable,
+    /// A parser PANICKED on this file.
+    ///
+    /// Distinct from `MalformedContainer`, which is a parser reporting a bad
+    /// file: this is a parser failing to report anything. Every book format
+    /// here is parsed by a third-party crate over input a user dropped in a
+    /// folder, and none of them can promise never to panic — lopdf alone holds
+    /// 173 `unwrap()`s. A panic that escapes kills the whole scan RUN, so one
+    /// hostile file would stop every later file being indexed. Caught, it is
+    /// one skipped book with a name in the log.
+    ParserPanic,
 }
 
 impl ClassifyReason {
@@ -104,6 +114,55 @@ impl ClassifyReason {
             ClassifyReason::FormatUnreadable => "format_unreadable",
             ClassifyReason::MalformedContainer => "malformed_container",
             ClassifyReason::Unopenable => "unopenable",
+            ClassifyReason::ParserPanic => "parser_panic",
+        }
+    }
+}
+
+/// Run a book parser so that a PANIC inside it becomes a skipped file rather
+/// than a dead scan.
+///
+/// V6 says a file that cannot be read is logged and skipped and the scan
+/// continues. Every parser reached from here is a third-party crate handling
+/// input a user dropped in a media folder, and none of them can promise never
+/// to panic. Without this, one file that trips an `unwrap` deep in a decoder
+/// aborts the scan TASK, and every file after it goes unindexed — a large
+/// invisible failure caused by a small visible one.
+///
+/// This catches panics, which is the risk that remains after choosing parsers
+/// with no `unsafe` and bounded recursion. It does NOT catch an abort or a
+/// stack overflow; nothing in-process can, which is why the depth bound in the
+/// parser itself (RUSTSEC-2026-0187, B173) mattered rather than being papered
+/// over here.
+pub(crate) fn guard_parser<T>(
+    path: &Path,
+    format: BookFormat,
+    what: &'static str,
+    f: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> Option<T> {
+    match std::panic::catch_unwind(f) {
+        Ok(v) => Some(v),
+        Err(payload) => {
+            // The panic message, when it is one of the two payload shapes a
+            // panic actually carries. "expose the cause": a bare "it panicked"
+            // sends the reader back to the file with nothing to go on.
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            record_classify(
+                format,
+                ClassifyVerdict::Unparseable,
+                ClassifyReason::ParserPanic,
+            );
+            tracing::error!(
+                path = %path.display(),
+                stage = what,
+                panic = %detail,
+                "book parser PANICKED; skipping this file so the scan continues (V6)"
+            );
+            None
         }
     }
 }
@@ -214,23 +273,38 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
         });
     }
 
-    match format {
+    // Every arm runs behind `guard_parser`: a panic in a third-party parser
+    // becomes this ONE file skipped, not the rest of the library unindexed.
+    let parsed = match format {
         // Each reader records its own classify verdict, because only it knows
         // WHY (a missing cover entry, a malformed container, an unsupported
         // image encoding). A caller-side record here would flatten all of those
         // into one uninformative label.
-        BookFormat::Epub => Some(epub::read_epub_or_empty(path)),
+        BookFormat::Epub => guard_parser(path, format, "epub metadata", || {
+            epub::read_epub_or_empty(path)
+        }),
         // A `.cbr` reaches here too and comes back cover-less by design, with
         // `rar_unsupported` on the counter (R7) — not routed away, because that
         // would make the design limit invisible.
-        BookFormat::Comic => Some(comic::read_comic_or_empty(path)),
-        BookFormat::Pdf => Some(pdf::read_pdf_or_empty(path)),
+        BookFormat::Comic => guard_parser(path, format, "comic metadata", || {
+            comic::read_comic_or_empty(path)
+        }),
+        BookFormat::Pdf => guard_parser(path, format, "pdf metadata", || {
+            pdf::read_pdf_or_empty(path)
+        }),
         // Handled above.
         BookFormat::Unreadable => Some(BookMeta {
             format,
             ..Default::default()
         }),
-    }
+    };
+    // A panicked parse still IMPORTS the book, carrying its format — V6 again.
+    // Returning `None` here would drop the item, which is the outcome the
+    // guard exists to prevent.
+    Some(parsed.unwrap_or(BookMeta {
+        format,
+        ..Default::default()
+    }))
 }
 
 /// Read a book's cover image bytes, and RECORD what happened.
@@ -248,30 +322,34 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
 pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
     let format = format_for_path(path)?;
     match format {
-        BookFormat::Epub => match epub::read_epub_cover(path) {
-            Ok(Some(bytes)) => {
-                record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
-                Some(bytes)
+        BookFormat::Epub => {
+            match guard_parser(path, format, "epub cover", || epub::read_epub_cover(path))? {
+                Ok(Some(bytes)) => {
+                    record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
+                    Some(bytes)
+                }
+                Ok(None) => {
+                    record_classify(
+                        format,
+                        ClassifyVerdict::CoverAbsent,
+                        ClassifyReason::NoCoverEntry,
+                    );
+                    None
+                }
+                Err(err) => {
+                    record_classify(
+                        format,
+                        ClassifyVerdict::Unparseable,
+                        ClassifyReason::MalformedContainer,
+                    );
+                    tracing::warn!(path = %path.display(), error = %err, "epub cover unreadable");
+                    None
+                }
             }
-            Ok(None) => {
-                record_classify(
-                    format,
-                    ClassifyVerdict::CoverAbsent,
-                    ClassifyReason::NoCoverEntry,
-                );
-                None
-            }
-            Err(err) => {
-                record_classify(
-                    format,
-                    ClassifyVerdict::Unparseable,
-                    ClassifyReason::MalformedContainer,
-                );
-                tracing::warn!(path = %path.display(), error = %err, "epub cover unreadable");
-                None
-            }
-        },
-        BookFormat::Comic => match comic::read_comic_cover(path) {
+        }
+        BookFormat::Comic => match guard_parser(path, format, "comic cover", || {
+            comic::read_comic_cover(path)
+        })? {
             Ok(Some(bytes)) => {
                 record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
                 Some(bytes)
@@ -310,42 +388,44 @@ pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
         // JPEG. No rasterisation, permanently (R11) — so "an image pharos
         // cannot extract" and "no image at all" get DIFFERENT reasons, because
         // they have different fixes and only one of them is a design limit.
-        BookFormat::Pdf => match pdf::read_pdf_cover(path) {
-            Ok(pdf::PdfCover::Jpeg(bytes)) => {
-                record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
-                Some(bytes)
+        BookFormat::Pdf => {
+            match guard_parser(path, format, "pdf cover", || pdf::read_pdf_cover(path))? {
+                Ok(pdf::PdfCover::Jpeg(bytes)) => {
+                    record_classify(format, ClassifyVerdict::CoverFound, ClassifyReason::Ok);
+                    Some(bytes)
+                }
+                Ok(pdf::PdfCover::UnsupportedEncoding(filter)) => {
+                    record_classify(
+                        format,
+                        ClassifyVerdict::CoverAbsent,
+                        ClassifyReason::UnsupportedImageEncoding,
+                    );
+                    tracing::debug!(
+                        path = %path.display(),
+                        filter = %filter,
+                        "pdf: page-one image is not pass-through encodable; no cover by design (R11)"
+                    );
+                    None
+                }
+                Ok(pdf::PdfCover::NoImage) => {
+                    record_classify(
+                        format,
+                        ClassifyVerdict::CoverAbsent,
+                        ClassifyReason::NoCoverEntry,
+                    );
+                    None
+                }
+                Err(err) => {
+                    record_classify(
+                        format,
+                        ClassifyVerdict::Unparseable,
+                        ClassifyReason::MalformedContainer,
+                    );
+                    tracing::warn!(path = %path.display(), error = %err, "pdf cover unreadable");
+                    None
+                }
             }
-            Ok(pdf::PdfCover::UnsupportedEncoding(filter)) => {
-                record_classify(
-                    format,
-                    ClassifyVerdict::CoverAbsent,
-                    ClassifyReason::UnsupportedImageEncoding,
-                );
-                tracing::debug!(
-                    path = %path.display(),
-                    filter = %filter,
-                    "pdf: page-one image is not pass-through encodable; no cover by design (R11)"
-                );
-                None
-            }
-            Ok(pdf::PdfCover::NoImage) => {
-                record_classify(
-                    format,
-                    ClassifyVerdict::CoverAbsent,
-                    ClassifyReason::NoCoverEntry,
-                );
-                None
-            }
-            Err(err) => {
-                record_classify(
-                    format,
-                    ClassifyVerdict::Unparseable,
-                    ClassifyReason::MalformedContainer,
-                );
-                tracing::warn!(path = %path.display(), error = %err, "pdf cover unreadable");
-                None
-            }
-        },
+        }
         // Already recorded as `format_unreadable` by `read_book_meta`; a second
         // verdict for the same file would double-count the rate SC-003 reads.
         BookFormat::Unreadable => None,
@@ -360,6 +440,11 @@ mod tests {
     /// Metric labels are a dashboard contract: a renamed one breaks an alert
     /// silently. These exact strings appear in the quickstart's PromQL, so they
     /// are pinned here rather than left to whatever the enum happens to emit.
+    /// NOTE (V118 applies to this test too): the arrays below are enumerated by
+    /// HAND, and Rust cannot check them for completeness without a derive. The
+    /// compiler does force `label()` to gain an arm for a new variant, so a new
+    /// variant cannot be label-less — but it CAN be absent from here and go
+    /// unasserted. Adding a variant means adding it in both places.
     #[test]
     fn classify_labels_are_distinct_and_stable() {
         let verdicts = [
@@ -376,6 +461,7 @@ mod tests {
             ClassifyReason::FormatUnreadable,
             ClassifyReason::MalformedContainer,
             ClassifyReason::Unopenable,
+            ClassifyReason::ParserPanic,
         ];
 
         let v: std::collections::HashSet<_> = verdicts.iter().map(|v| v.label()).collect();
@@ -387,6 +473,7 @@ mod tests {
         assert_eq!(ClassifyVerdict::CoverFound.label(), "cover_found");
         assert_eq!(ClassifyVerdict::CoverAbsent.label(), "cover_absent");
         assert_eq!(ClassifyReason::RarUnsupported.label(), "rar_unsupported");
+        assert_eq!(ClassifyReason::ParserPanic.label(), "parser_panic");
         assert_eq!(
             ClassifyReason::UnsupportedImageEncoding.label(),
             "unsupported_image_encoding"
@@ -395,7 +482,83 @@ mod tests {
         // Bounded cardinality: 4 formats × 4 verdicts × 7 reasons is the
         // absolute ceiling, and the reachable set is far smaller. No label
         // carries a path, a filename or an error message.
-        assert!(v.len() * r.len() <= 28);
+        assert!(v.len() * r.len() <= 32);
+    }
+
+    /// B173 follow-up — a panicking parser must cost ONE file, not the scan.
+    ///
+    /// The risk is asymmetric: a panic that escapes `read_book_meta` kills the
+    /// scan task, so every file after the bad one goes unindexed. That is a
+    /// large invisible failure caused by a small visible one, and it is exactly
+    /// what V6 exists to prevent.
+    ///
+    /// `guard_parser` is exercised directly with a panicking closure, because a
+    /// test that waits for a real parser to panic is a test that passes for the
+    /// wrong reason the day the parser is fixed.
+    #[test]
+    fn a_panicking_parser_skips_one_file_and_records_why() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Silence the panic hook so the test output stays readable; the panic
+        // is the point, not the backtrace.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out: Option<u32> = guard_parser(
+            std::path::Path::new("/books/Hostile.pdf"),
+            BookFormat::Pdf,
+            "pdf metadata",
+            || panic!("called `Option::unwrap()` on a `None` value"),
+        );
+        std::panic::set_hook(prev);
+
+        assert_eq!(out, None, "the guard must swallow the panic, not resume it");
+
+        let labels = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(k, _, _, _)| {
+                let key = k.key();
+                (key.name() == "pharos_book_classify_total").then(|| {
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+            });
+        let Some(labels) = labels else {
+            panic!(
+                "a panicking parser must be VISIBLE — silently skipping a file is the \
+                    failure shape this whole counter exists to prevent"
+            )
+        };
+        assert_eq!(labels.get("format").map(String::as_str), Some("pdf"));
+        assert_eq!(
+            labels.get("verdict").map(String::as_str),
+            Some("unparseable")
+        );
+        assert_eq!(
+            labels.get("reason").map(String::as_str),
+            Some("parser_panic"),
+            "a panic is NOT malformed_container: one is the parser reporting a bad \
+             file, the other is the parser failing to report at all"
+        );
+    }
+
+    /// …and the item still IMPORTS. Dropping it would trade a dead scan for a
+    /// vanished book, which V6 forbids just as firmly.
+    #[test]
+    fn a_book_whose_parser_panics_still_imports() {
+        let td = tempfile::tempdir().unwrap();
+        // Not a PDF at all; the real reader rejects it cleanly rather than
+        // panicking, which is the honest state of the world — what is asserted
+        // is the CONTRACT that a failed parse still yields a row.
+        let p = td.path().join("Hostile.pdf");
+        std::fs::write(&p, b"%PDF-1.4\ngarbage").unwrap();
+        let meta = read_book_meta(&p).expect("a book must still import");
+        assert_eq!(meta.format, BookFormat::Pdf);
     }
 
     #[test]
