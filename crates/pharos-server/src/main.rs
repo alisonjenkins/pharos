@@ -124,6 +124,18 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_force(force);
+    // 004-books — the CLI scan writes book covers too. Without this a
+    // `pharos scan` would index books with no tiles and the next server-side
+    // pass would skip them as unchanged, so the library stays cover-less until
+    // someone thinks to run `--force`.
+    let scanner = match cfg.server.image_cache_dir.clone() {
+        Some(dir) => scanner.with_cover_sink(std::sync::Arc::new(
+            pharos_server::book_cover::ImageCacheCoverSink::new(
+                pharos_cache::image_cache::ImageCache::new(dir),
+            ),
+        )),
+        None => scanner,
+    };
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -1358,23 +1370,33 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         // probe reads through the same shared I/O gate the server shrinks
         // during live playback, so it paces itself down while streaming.
         let io_gate = app_state.bg_io.clone();
+        // 004-books — a book's cover lives inside the file, so the scan writes
+        // it into the image cache and records THAT path as Primary artwork.
+        // `None` when no image cache is configured: books then index without
+        // covers, exactly as every other item does under the same config.
+        let cover_sink: Option<std::sync::Arc<dyn pharos_scanner::fs::CoverSink>> =
+            app_state.images.clone().map(|cache| {
+                std::sync::Arc::new(pharos_server::book_cover::ImageCacheCoverSink::new(cache))
+                    as std::sync::Arc<dyn pharos_scanner::fs::CoverSink>
+            });
         // P48 — same prober selection as the CLI scan + admin refresh paths.
         // The closure builds a fresh owned scanner per root (each spawned task
         // owns its own — the prober isn't required to be Clone).
         let make_scanner = move || {
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
-            {
+            let s =
                 pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
                     .with_rate_limit_ms(rate_limit_ms)
                     .with_probe_concurrency_opt(probe_concurrency)
-                    .with_io_gate(io_gate.clone())
-            }
+                    .with_io_gate(io_gate.clone());
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
-            {
-                pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
-                    .with_rate_limit_ms(rate_limit_ms)
-                    .with_probe_concurrency_opt(probe_concurrency)
-                    .with_io_gate(io_gate.clone())
+            let s = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+                .with_rate_limit_ms(rate_limit_ms)
+                .with_probe_concurrency_opt(probe_concurrency)
+                .with_io_gate(io_gate.clone());
+            match cover_sink.clone() {
+                Some(sink) => s.with_cover_sink(sink),
+                None => s,
             }
         };
         spawn_for_roots(app_state.clone(), &scan_roots, watch_cfg, make_scanner)

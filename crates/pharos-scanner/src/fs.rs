@@ -173,6 +173,37 @@ pub struct FsScanner<P: Prober> {
     /// seen only a subset of what's on disk, so sweeping would prune every
     /// not-yet-visited file). `None` (CLI/tests) = never cancels.
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 004-books (T063) — where a book's extracted cover BYTES are written.
+    ///
+    /// A cover lives INSIDE the book file, so unlike every other artwork source
+    /// there is no path on the media filesystem to record. The bytes have to
+    /// land somewhere first, and the only writable place is the server's image
+    /// cache — which this crate deliberately does not depend on (V12: the
+    /// scanner's domain logic stays testable without one). So the destination
+    /// arrives as a sink the server implements over `ImageCache::upload`.
+    ///
+    /// `None` (CLI scans, tests) means covers are still READ — the classify
+    /// counter must report the same rate wherever the scan runs — and then
+    /// dropped, so no `Primary` row is written and no tag is advertised.
+    cover_sink: Option<Arc<dyn CoverSink>>,
+}
+
+/// 004-books (T063) — destination for a book cover's bytes.
+///
+/// Implemented by the server over the existing on-disk image cache, so a book's
+/// cover is stored, scaled, ETagged and served by exactly the same machinery as
+/// a sidecar poster or a downloaded provider image. Boxed future rather than
+/// AFIT because this is used as a trait object.
+pub trait CoverSink: Send + Sync {
+    /// Persist `bytes` as this item's Primary artwork and return the absolute
+    /// path they were written to, which the caller records via `set_artwork`.
+    fn store_cover<'a>(
+        &'a self,
+        item_id: MediaId,
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<std::path::PathBuf>> + Send + 'a>,
+    >;
 }
 
 impl<P: Prober> std::fmt::Debug for FsScanner<P> {
@@ -215,6 +246,7 @@ impl<P: Prober> FsScanner<P> {
             io_gate: None,
             progress: None,
             cancel: None,
+            cover_sink: None,
         }
     }
 
@@ -229,6 +261,7 @@ impl<P: Prober> FsScanner<P> {
             io_gate: None,
             progress: None,
             cancel: None,
+            cover_sink: None,
         }
     }
 
@@ -272,6 +305,14 @@ impl<P: Prober> FsScanner<P> {
         self
     }
 
+    /// 004-books (T063) — where extracted book covers are written. The server
+    /// wires this to the image cache; without it covers are read (so the
+    /// classify counter stays truthful) and discarded.
+    pub fn with_cover_sink(mut self, sink: Arc<dyn CoverSink>) -> Self {
+        self.cover_sink = Some(sink);
+        self
+    }
+
     /// LIB-D7 — override the metadata resolver. Production callers use the
     /// default local provider set (NFO ▸ sidecar ▸ filename); this is a test
     /// seam to inject a fixed/empty resolver, mirroring
@@ -279,6 +320,65 @@ impl<P: Prober> FsScanner<P> {
     pub fn with_resolver(mut self, resolver: MetadataResolver) -> Self {
         self.resolver = Arc::new(resolver);
         self
+    }
+
+    /// 004-books (T063) — extract this item's cover and record it as Primary
+    /// artwork.
+    ///
+    /// Called after `put`, because `set_artwork` writes a row keyed on an item
+    /// that must already exist. Deliberately goes through `set_artwork` and NOT
+    /// `put`: `put` does not maintain the denormalised `has_primary_art`
+    /// (B155), so a cover written the other way would be on disk, servable, and
+    /// never advertised — present but invisible.
+    ///
+    /// Best-effort throughout (V6): a cover that cannot be read or written
+    /// leaves the book indexed and cover-less, which is a supported state.
+    /// Takes the id/kind/path rather than the item because `put` consumes the
+    /// item and this must run after it.
+    async fn store_book_cover<S: MediaStore>(
+        &self,
+        store: &S,
+        id: MediaId,
+        kind: MediaKind,
+        path: &Path,
+    ) {
+        if kind != MediaKind::Book {
+            return;
+        }
+        // Read on every book, sink or no sink. The extractor is what records
+        // the cover verdict, and SC-003's rate must mean the same thing whether
+        // the scan ran in the server or from the CLI. Blocking archive IO goes
+        // off the reactor (V5).
+        let owned = path.to_path_buf();
+        let Ok(Some(bytes)) =
+            tokio::task::spawn_blocking(move || crate::book::read_book_cover(&owned)).await
+        else {
+            return;
+        };
+        let Some(sink) = self.cover_sink.as_ref() else {
+            return;
+        };
+        match sink.store_cover(id, bytes).await {
+            Ok(stored) => {
+                if let Err(e) = store
+                    .set_artwork(id, "Primary", "local", &stored.to_string_lossy())
+                    .await
+                {
+                    tracing::warn!(
+                        media.id = id,
+                        media.path = %path.display(),
+                        error = %e,
+                        "book cover written but not recorded; it will not be advertised"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                media.id = id,
+                media.path = %path.display(),
+                error = %e,
+                "book cover extracted but could not be cached"
+            ),
+        }
     }
 
     /// LIB-A8 — snapshot of the recognised-extension set, for a watcher that
@@ -655,7 +755,14 @@ impl<P: Prober> FsScanner<P> {
                 collections,
                 tags,
             } = merge_metadata_into_item(&mut item, meta);
+            // Captured before `put` consumes the item; the cover write below
+            // needs them and must run AFTER the row exists.
+            let (item_kind, item_path) = (item.kind, item.path.clone());
             store.put(item).await?;
+            // 004-books — a book's cover lives inside the file, so it has no
+            // sidecar path to record and is extracted + cached here instead.
+            self.store_book_cover(store, item_id, item_kind, &item_path)
+                .await;
             // LIB-C4 — populate the item_genres join. UNION of the probe's
             // (possibly comma/pipe-separated) `genre` column with the NFO
             // `<genre>` tags resolved above; `link_item_genres` is idempotent
@@ -897,7 +1004,12 @@ impl<P: Prober> FsScanner<P> {
             collections,
             tags,
         } = merge_metadata_into_item(&mut item, meta);
+        let item_kind = item.kind;
         store.put(item).await?;
+        // 004-books — the watched create/modify path extracts + caches a book
+        // cover the same way a full scan does, or a book added by the watcher
+        // would be the only one without a tile.
+        self.store_book_cover(store, item_id, item_kind, path).await;
         // LIB-C4 — keep the item_genres join in step (probe ∪ NFO genres).
         store.link_item_genres(item_id, &genres).await?;
         // LIB-C2 — keep the item_people join in step (watched create/modify
