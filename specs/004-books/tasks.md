@@ -199,10 +199,10 @@ concern and nothing else.
 
 **Independent test**: seed one `.pdf`, open it, page one renders.
 
-- [ ] T071 [P] [US4] Add test `a_pdfs_info_dictionary_and_page_count_are_read` in `crates/pharos-scanner/src/book/pdf.rs` tests asserting `page_count`, plus title and author from the document info dictionary when present
-- [ ] T072 [P] [US4] Add test `a_pdf_cover_comes_out_only_when_page_one_is_already_a_jpeg`: a PDF whose page one is a `DCTDecode` XObject yields cover bytes that are a valid JPEG; a text-first PDF yields **no** cover and records `unsupported_image_encoding`. This is the narrowing R11 settled — asserted so it cannot be quietly widened later
-- [ ] T073 [US4] Implement `crates/pharos-scanner/src/book/pdf.rs` with `lopdf`: info dictionary, page count, and page one's embedded image when it is `DCTDecode` (the stream bytes **are** a JPEG, so they go straight to the image cache with no decode step). **No rasterisation** — `lopdf` cannot, and there is no pure-Rust image decoder in the tree; adding either a rasteriser or a decoder breaks single-binary deploy (R11)
-- [ ] T074 [US4] Wire `pdf` into the `read_book_meta` dispatch and open the `.pdf` in jellyfin-web, confirming page one renders (quickstart §9 step 4) — **COMMIT**
+- [X] T071 [P] [US4] Add test `a_pdfs_info_dictionary_and_page_count_are_read` in `crates/pharos-scanner/src/book/pdf.rs` tests asserting `page_count`, plus title and author from the document info dictionary when present
+- [X] T072 [P] [US4] Add test `a_pdf_cover_comes_out_only_when_page_one_is_already_a_jpeg`: a PDF whose page one is a `DCTDecode` XObject yields cover bytes that are a valid JPEG; a text-first PDF yields **no** cover and records `unsupported_image_encoding`. This is the narrowing R11 settled — asserted so it cannot be quietly widened later
+- [X] T073 [US4] Implement `crates/pharos-scanner/src/book/pdf.rs` with `lopdf`: info dictionary, page count, and page one's embedded image when it is `DCTDecode` (the stream bytes **are** a JPEG, so they go straight to the image cache with no decode step). **No rasterisation** — `lopdf` cannot, and there is no pure-Rust image decoder in the tree; adding either a rasteriser or a decoder breaks single-binary deploy (R11)
+- [X] T074 [US4] Wire `pdf` into the `read_book_meta` dispatch and open the `.pdf` in jellyfin-web, confirming page one renders (quickstart §9 step 4) — **COMMIT**
 
 ---
 
