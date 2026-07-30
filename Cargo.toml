@@ -63,15 +63,19 @@ tar = { version = "0.4", default-features = false }
 # PDF page tree + info dictionary only. `lopdf` parses; it does NOT render,
 # and nothing in this workspace can — see R11.
 #
-# `nom_parser`, NOT `pom_parser`: lopdf 0.34.0's pom variant does not compile
-# (its own reader.rs calls `parser::indirect_object` with 5 args while the pom
-# `indirect_object` takes 4 — upstream bug in that feature combination).
-# `nom_parser` is lopdf's default and the maintained path.
+# 0.42, NOT 0.34: RUSTSEC-2026-0187 is a stack overflow in 0.34 on deeply
+# nested PDF objects, reachable from pharos because the scanner parses whatever
+# a user drops in a media folder. A stack overflow ABORTS — it is not a
+# `Result` any caller can handle — so V6's "a bad file never takes the scan
+# down" cannot hold against it. `a_deeply_nested_pdf_does_not_take_the_process_
+# down` asserts it; pinned back to 0.34 that test dies with SIGABRT.
+# 0.42 also drops the parser feature flags, so the `nom_parser`/`pom_parser`
+# choice 0.34 forced (its pom variant did not compile) no longer exists.
 #
 # Deliberately NOT enabling `embed_image`, which pulls the `image` crate.
 # R11 rests on there being no raster decoder in this workspace; a cover is
 # extracted only when it is ALREADY a JPEG, so nothing needs to decode one.
-lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
+lopdf = { version = "0.42", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

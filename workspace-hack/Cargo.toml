@@ -44,7 +44,6 @@ md-5 = { version = "0.10" }
 memchr = { version = "2" }
 metrics-util = { version = "0.17" }
 mio = { version = "1", features = ["net", "os-ext"] }
-nom = { version = "7" }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -67,7 +66,7 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "migra
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
-time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -100,7 +99,6 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
-nom = { version = "7" }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -120,6 +118,7 @@ sqlx-macros-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log"] }

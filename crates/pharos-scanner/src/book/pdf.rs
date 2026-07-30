@@ -559,6 +559,67 @@ mod tests {
         }
     }
 
+    /// RUSTSEC-2026-0187 — lopdf 0.34 stack-overflowed on deeply nested PDF
+    /// objects. A stack overflow ABORTS: it is not a `Result` anyone can
+    /// handle, so V6's "a bad file never takes the scan down" cannot hold
+    /// against it, and the input here is whatever a user drops in a media
+    /// folder.
+    ///
+    /// nextest runs each test in its own process, so a regression shows up as a
+    /// CRASHED test rather than a failed assertion — which is the honest signal
+    /// for this class. The assertion body only has to reach the end.
+    #[test]
+    fn a_deeply_nested_pdf_does_not_take_the_process_down() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("Nested.pdf");
+
+        // 50k nested arrays — well past any legitimate document, and past the
+        // depth that overflowed a default 8 MiB stack in the vulnerable version.
+        let depth = 50_000;
+        let mut nested = Vec::with_capacity(depth * 2 + 2);
+        nested.extend(std::iter::repeat_n(b'[', depth));
+        nested.push(b'0');
+        nested.extend(std::iter::repeat_n(b']', depth));
+
+        let objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Annots 4 0 R >>".to_vec(),
+            nested,
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let startxref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                objects.len() + 1,
+                startxref
+            )
+            .as_bytes(),
+        );
+        std::fs::write(&p, out).unwrap();
+
+        // Either answer is acceptable — parsed, or rejected with a reason. What
+        // is NOT acceptable is never returning at all.
+        let _ = read_pdf(&p);
+        let _ = read_pdf_cover(&p);
+        // And the scan path keeps the item either way (V6).
+        assert_eq!(read_pdf_or_empty(&p).format, BookFormat::Pdf);
+    }
+
     #[test]
     fn a_malformed_pdf_still_imports_the_item() {
         let td = tempfile::tempdir().unwrap();
