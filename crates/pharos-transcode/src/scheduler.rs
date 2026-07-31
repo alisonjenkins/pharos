@@ -1410,6 +1410,30 @@ enum BackgroundAdmission {
 /// a pinned CMAF rendition resolves to exactly one device, so narrow pools are
 /// not hypothetical. Refusing outright resolves the caller just as promptly as
 /// the clamp did and keeps the reserve.
+/// What a `BackgroundAdmission::Never` shed should actually reply with.
+///
+/// `background_admission` only ever sees `candidates` — it cannot tell a pool
+/// that structurally cannot hold the reserve (genuine load management) apart
+/// from a job whose candidate set narrowed to just that pool because a PRIOR
+/// attempt on this same job hit a transient worker failure (`JobFinished`'s
+/// transient-retry arm sets `ctx.last_error` and excludes the failed device
+/// before re-placing). Replying `Busy` — "deliberate load management" — to
+/// the second case collapses a real cause into a bare class, which this
+/// project's error discipline forbids: a diagnostic must carry the offending
+/// value, never a class alone.
+///
+/// Genuine load shedding (no prior failure on this job) still reports `Busy`:
+/// `SchedError::Busy` is a variant callers act on, and it is deliberately
+/// logged at DEBUG rather than ERROR so it does not drown real failures
+/// beside it (V58) — reporting every shed as a `Failed` here would erase that
+/// distinction for the common case this arm exists to serve.
+fn background_never_error(ctx: &JobCtx) -> SchedError {
+    match ctx.last_error.clone() {
+        Some(err) => SchedError::Failed(err),
+        None => SchedError::Busy,
+    }
+}
+
 fn background_admission(state: &SchedState, candidates: &[DeviceId]) -> BackgroundAdmission {
     let capacity: usize = candidates
         .iter()
@@ -1820,13 +1844,17 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 return;
             }
             BackgroundAdmission::Never => {
+                let err = background_never_error(&ctx);
                 tracing::debug!(
                     %job_id,
                     candidates = ?candidates,
                     headroom = state.cfg.background_headroom,
-                    "speculative transcode shed: this pool cannot hold the reserve and a job at once"
+                    last_error = ?ctx.last_error,
+                    load_shed = matches!(err, SchedError::Busy),
+                    "speculative transcode admitted to neither wait nor dispatch: \
+                     reserve cannot fit in this candidate pool"
                 );
-                let _ = ctx.reply.send(Err(SchedError::Busy));
+                let _ = ctx.reply.send(Err(err));
                 return;
             }
         }
@@ -2032,9 +2060,22 @@ fn try_place_no_queue(
             // A cooldown can narrow a queued job's candidate set until the
             // reserve no longer fits in it. Re-queueing then parks it forever
             // on a condition only a device coming back can meet; shed it,
-            // exactly as arrival would have.
+            // exactly as arrival would have — same cause/class distinction as
+            // `place` (`background_never_error`): a job that queued after a
+            // transient failure narrowed it to nothing must report THAT, not
+            // a load-shed classification that discards it.
             BackgroundAdmission::Never => {
-                let _ = ctx.reply.send(Err(SchedError::Busy));
+                let err = background_never_error(&ctx);
+                tracing::debug!(
+                    %job_id,
+                    candidates = ?candidates,
+                    headroom = state.cfg.background_headroom,
+                    last_error = ?ctx.last_error,
+                    load_shed = matches!(err, SchedError::Busy),
+                    "queued speculative transcode admitted to neither wait nor dispatch: \
+                     reserve cannot fit in this candidate pool"
+                );
+                let _ = ctx.reply.send(Err(err));
                 return;
             }
         }
@@ -4964,6 +5005,60 @@ mod tests {
             "the permit the reserve exists to hold open must still be free"
         );
         assert_eq!(snap.pending, 0, "and nothing must be left in the queue");
+    }
+
+    /// `BackgroundAdmission::Never` used to reply `SchedError::Busy` —
+    /// "deliberate load management" — unconditionally, even when the reason
+    /// the candidate pool could no longer hold the reserve was that a PRIOR
+    /// attempt on this exact job hit a transient worker failure and excluded
+    /// the device that carried the pool's spare capacity. That collapses a
+    /// real cause into a bare class, which this project's error discipline
+    /// forbids: a diagnostic must carry the offending value, never a class
+    /// alone. A caller reading `Busy` here has no way to learn a device
+    /// actually failed.
+    ///
+    /// The shape: one hw permit + one CPU permit, `background_headroom` 1
+    /// (the default, so CPU alone can never hold it). The hw device is
+    /// tried first (`eligible_for_h264_lists_hw_first_then_cpu`) and fails
+    /// transiently, which excludes it and retries — leaving CPU alone as the
+    /// candidate pool, capacity 1, exactly the reserve, so
+    /// `background_admission` returns `Never` on the retry. The reply must
+    /// be `Failed(DeviceBusy)`, the real cause, not `Busy`.
+    #[tokio::test]
+    async fn a_background_job_shed_after_its_own_transient_failure_reports_the_real_cause() {
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+            if spec.device == gpu {
+                WorkerRunResult::Failed(WorkerError::DeviceBusy)
+            } else {
+                WorkerRunResult::Done { out_bytes: 1 }
+            }
+        });
+        // One hw permit (fails first attempt), one CPU permit — CPU alone
+        // exactly meets `background_headroom` (1), so once hw is excluded
+        // the pool can never hold the reserve.
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[(gpu, 1)], 1),
+            spawner,
+            SchedConfig::default(),
+        );
+
+        let got = s
+            .submit(
+                PathBuf::from("/m/prefetch"),
+                h264(),
+                file_sink(),
+                JobClass::Background,
+                JobHint::default(),
+            )
+            .await;
+        match got {
+            Err(SchedError::Failed(WorkerError::DeviceBusy)) => {}
+            other => panic!(
+                "a job shed after its own transient failure must report that \
+                 failure as the cause, not a bare load-shed `Busy`; got {other:?}"
+            ),
+        }
     }
 
     /// `pending_cap` is client backpressure, and speculative work now shares it.
