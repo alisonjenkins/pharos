@@ -2750,6 +2750,18 @@ fn try_place_no_queue(
             .last_error
             .clone()
             .unwrap_or(WorkerError::Other("no device left".into()));
+        // Same line, same fields, as the arrival path's identical exit. This
+        // one was silent, and it is the path the deployment's dominant fMP4
+        // producer takes: a queued job whose last candidate device fell away
+        // failed the client with nothing in the record naming WHICH devices it
+        // had already burned. Symmetry is the rule (ODD), and the asymmetry
+        // here was between two copies of the same decision.
+        tracing::warn!(
+            %job_id,
+            excluded = ?ctx.excluded,
+            error = %err,
+            "queued transcode job has no device left to try"
+        );
         let _ = ctx.reply.send(Err(SchedError::Failed(err)));
         return;
     }
