@@ -296,6 +296,22 @@ pub struct SchedConfig {
     /// free across the devices that could take it, so a burst of prefetch can
     /// never occupy the last slot a client request would have used.
     pub background_headroom: usize,
+    /// How many speculative jobs may run on a device that is ALSO running a
+    /// client's segment.
+    ///
+    /// `background_headroom` reserves a permit, which is what a client needs
+    /// to start; it does nothing about what the client needs to finish, since
+    /// an encoder shared N ways runs each of its jobs several times slower.
+    /// Measured on the deployment: one segment costs 1 860 ms alone and
+    /// 6 358 ms when the six prefetches its own request launched are admitted
+    /// beside it.
+    ///
+    /// Not zero. Shedding ALL prefetch while a client job runs would starve
+    /// the pipeline that makes the next segment a 30 ms cache hit — prefetch
+    /// is shed, never queued, so what is refused here is not retried later,
+    /// and every segment would become a cold miss. One keeps the buffer
+    /// filling while leaving the client's segment most of the device.
+    pub background_alongside_client: usize,
 }
 
 impl Default for SchedConfig {
@@ -306,6 +322,7 @@ impl Default for SchedConfig {
             cooldown: Duration::from_secs(2),
             max_retries: 3,
             background_headroom: 1,
+            background_alongside_client: 1,
         }
     }
 }
@@ -811,6 +828,22 @@ fn retry_or_fail(
     place(state, job_id, ctx, self_tx);
 }
 
+/// Would admitting a speculative job to `dev` put it beside a client's segment
+/// past the allowance? Speculative work is wanted — it is what turns the next
+/// segment into a cache hit — but not at the cost of the segment somebody is
+/// currently staring at a spinner for.
+fn crowds_a_client(state: &SchedState, dev: DeviceId, cfg: &SchedConfig) -> bool {
+    let mut interactive = 0usize;
+    let mut background = 0usize;
+    for c in state.inflight.values().filter(|c| c.device == Some(dev)) {
+        match c.class {
+            JobClass::Interactive => interactive += 1,
+            JobClass::Background => background += 1,
+        }
+    }
+    interactive > 0 && background >= cfg.background_alongside_client
+}
+
 /// Segment jobs already running on `dev`. This is what sets encode time on a
 /// shared encoder — a device at capacity finishes each of its jobs several
 /// times slower than the same device running one — and nothing recorded it, so
@@ -1075,6 +1108,14 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         let Some(slot) = state.devices.slot(dev) else {
             continue;
         };
+        // A free permit is not the same thing as free throughput. Skip a
+        // device already carrying a client's segment plus its speculative
+        // allowance, and let this job try the next device — or be shed below.
+        // This is what `background_headroom` intends but cannot deliver on its
+        // own: reserving a permit gets a client STARTED, not finished.
+        if ctx.class == JobClass::Background && crowds_a_client(state, dev, &state.cfg) {
+            continue;
+        }
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
             let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
@@ -2336,5 +2377,109 @@ mod tests {
             "a job dispatched onto a device already running one job has one peer"
         );
         assert!(first.await.unwrap().is_ok());
+    }
+    /// The fix. Speculative work must not pile onto the device that is
+    /// encoding the segment a client is blocked on.
+    ///
+    /// `background_headroom` reserves a PERMIT, which is what a client needs to
+    /// start; it does not reserve the encoder's throughput, which is what the
+    /// client needs to finish. On the deployment one client segment request
+    /// launches itself plus six prefetches, all admitted to the one GPU at
+    /// once, and the client's own segment slows from 1 860 ms to 6 358 ms.
+    ///
+    /// The invariant is about the CLIENT'S device, not about refusing
+    /// speculative work everywhere: a prefetch that lands on an otherwise idle
+    /// second device costs the client nothing, so the assertion counts what
+    /// joined the client rather than what was admitted at all.
+    #[tokio::test]
+    async fn speculative_work_does_not_crowd_the_segment_a_client_is_waiting_for() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+
+        // A client is waiting on this one; it takes the GPU.
+        let client = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/client"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // The prefetch burst that same request would launch. The GPU has three
+        // free permits, so before the fix every one of these was admitted onto
+        // it beside the client.
+        let mut handles = Vec::new();
+        for n in 0..4 {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/pre{n}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            }));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        let joined_the_client = results
+            .iter()
+            .filter(|r| matches!(r, Ok(d) if d.device == gpu))
+            .count();
+        assert_eq!(
+            joined_the_client,
+            SchedConfig::default().background_alongside_client,
+            "speculative jobs on the client's device: {results:?}"
+        );
+        assert!(
+            results.iter().any(|r| r == &Err(SchedError::Busy)),
+            "the cap must actually shed, not merely reorder: {results:?}"
+        );
+        assert!(client.await.unwrap().is_ok());
+    }
+
+    /// ...and the cap is about CROWDING A CLIENT, not about throttling prefetch
+    /// in general: with no client segment on the device, speculative work is
+    /// free to use it, which is how the buffer gets built between requests.
+    #[tokio::test]
+    async fn speculative_work_may_fill_an_idle_device() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(300), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let mut running = Vec::new();
+        for n in 0..3 {
+            let s2 = s.clone();
+            running.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/pre{n}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            }));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        for h in running {
+            assert!(
+                h.await.unwrap().is_ok(),
+                "an idle device is exactly where prefetch belongs"
+            );
+        }
     }
 }
