@@ -1160,8 +1160,9 @@ impl HlsSegmentCache {
             // So: fall through and drive it. This is NOT promotion — nobody's
             // class is changed and the shed job is not resubmitted; the
             // requester simply declines to adopt a decision made about somebody
-            // else's job. A DRIVING requester keeps its own shed (B108/V58):
-            // shedding work you submitted yourself is the intended behaviour.
+            // else's job (V127: share a RESULT, never a POLICY DECISION). A
+            // DRIVING requester keeps its own shed (B108/V58): shedding work you
+            // submitted yourself is the intended behaviour.
             let inherited_shed = !driving
                 && matches!(&outcome, Err(e) if matches!(**e, HlsCacheError::SchedulerBusy));
             if !(inherited_shed && attempt == 1) {
