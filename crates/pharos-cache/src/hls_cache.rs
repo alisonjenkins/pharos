@@ -837,6 +837,17 @@ struct InFlightSegment {
     /// receiver only — holding the sender here would keep a dead driver's slot
     /// open and hang every waiter on it.
     job: tokio::sync::watch::Receiver<Option<pharos_transcode::protocol::JobId>>,
+    /// Set the moment a client joins a speculative driver.
+    ///
+    /// Promotion re-ranks the JOB, and a retry is a different job: the second
+    /// `-progress`-completeness attempt re-submits under a new id, and joiners
+    /// that already promoted the first one will not promote again. Without this
+    /// the client silently drops back to the speculative tier for that segment,
+    /// with nothing recorded to say so. The driver reads it to choose the class
+    /// it re-submits as, which is why the flag lives beside the registration
+    /// rather than inside the promotion task: the fact that a client is waiting
+    /// outlives the individual job it was waiting on.
+    promoted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Rebuild an owned error for a waiter out of the one the driver produced.
@@ -1315,10 +1326,15 @@ impl HlsSegmentCache {
         bool, // driving
     ) {
         let job_slot = pharos_transcode::scheduler::JobSlot::new();
+        let promoted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (rx, tx, joined) = match self.inflight.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
                 let e = e.get();
-                (e.rx.clone(), None, Some((e.driver_class, e.job.clone())))
+                (
+                    e.rx.clone(),
+                    None,
+                    Some((e.driver_class, e.job.clone(), e.promoted.clone())),
+                )
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 let (tx, rx) = tokio::sync::watch::channel(None);
@@ -1326,16 +1342,22 @@ impl HlsSegmentCache {
                     rx: rx.clone(),
                     driver_class: class,
                     job: job_slot.subscribe(),
+                    promoted: promoted.clone(),
                 });
                 (rx, Some(tx), None)
             }
         };
-        if let Some((driver_class, job)) = joined {
+        if let Some((driver_class, job, promoted)) = joined {
             // A client has arrived behind somebody else's guess. Sharing the
             // RESULT is right and is the point; inheriting the DRIVER'S TIER is
             // not, and would leave this client ranked behind every other
             // client's work — including work submitted after it started waiting.
             if class == JobClass::Interactive && driver_class == JobClass::Background {
+                // Recorded synchronously, before the promotion is even sent:
+                // this says a client is waiting on these BYTES, which stays true
+                // across however many jobs the driver needs to produce them.
+                // The message re-ranks one job; the flag re-ranks the retry.
+                promoted.store(true, std::sync::atomic::Ordering::Release);
                 self.promote_driver(job);
             }
             return (rx, false);
@@ -1380,6 +1402,7 @@ impl HlsSegmentCache {
                         class,
                         hint,
                         job_slot,
+                        promoted,
                     )
                     .await
                     .map(Arc::new)
@@ -1442,6 +1465,10 @@ impl HlsSegmentCache {
         // Owned here, so its sender dies with this task and no waiter outlives
         // it.
         job_slot: pharos_transcode::scheduler::JobSlot,
+        // Set by `register_or_join` when a client coalesces onto this encode.
+        // Read on the retry, whose submission is a NEW job that no joiner will
+        // promote a second time.
+        promoted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let path = self.segment_path_keyed(key);
         if let Some(parent) = path.parent() {
@@ -1494,8 +1521,24 @@ impl HlsSegmentCache {
                 attempt_opts.decode_preroll_seconds =
                     Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
             }
+            // Whoever this encode is FOR right now, which is not necessarily
+            // who started it. Promotion re-ranks a job, and the retry is a
+            // different job under a different id — joiners that already
+            // promoted the first attempt do not promote again — so re-submitting
+            // as `class` would silently hand the client back the speculative
+            // tier it was rescued from, uncounted. Read fresh each attempt: a
+            // client can arrive during attempt 0.
+            //
+            // The outcome metrics below stay labelled with the original `class`:
+            // they describe this driver, and the joiner already counted its own
+            // request on the coalesced-hit path.
+            let submit_class = if promoted.load(std::sync::atomic::Ordering::Acquire) {
+                JobClass::Interactive
+            } else {
+                class
+            };
             timing = match self
-                .write_segment(source, &attempt_opts, &tmp, class, hint, &job_slot)
+                .write_segment(source, &attempt_opts, &tmp, submit_class, hint, &job_slot)
                 .instrument(tracing::info_span!("write_segment"))
                 .await
             {
@@ -3447,6 +3490,7 @@ mod tests {
                 rx,
                 driver_class: JobClass::Interactive,
                 job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
+                promoted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         tx
@@ -3699,6 +3743,160 @@ mod tests {
         assert_eq!(after.inflight, 1, "promotion must not duplicate the encode");
         let _ = driver.await;
         let _ = joiner.await;
+    }
+
+    /// A scheduler whose worker writes a real segment file plus the
+    /// `-progress` sidecar the completeness check reads — and reports the FIRST
+    /// job short of video frames, so the driver retries under a new job id.
+    ///
+    /// `holds_each_job` cannot express this: it writes nothing, so
+    /// `read_progress` finds no sidecar, `short_of_frames` returns `None`, and
+    /// the retry path is unreachable.
+    fn retries_the_first_encode(
+        attempts: Arc<std::sync::atomic::AtomicU64>,
+    ) -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        struct Retrying(Arc<std::sync::atomic::AtomicU64>);
+        impl WorkerSpawner for Retrying {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let attempts = self.0.clone();
+                Box::pin(
+                    async move { Ok(Box::new(RetryWorker { id, attempts }) as Box<dyn Worker>) },
+                )
+            }
+        }
+        struct RetryWorker {
+            id: WorkerId,
+            attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl Worker for RetryWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let attempts = self.attempts.clone();
+                Box::pin(async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // The second attempt is the one under observation, so it
+                    // has to still be running when the snapshot is taken.
+                    let hold = if n == 0 {
+                        std::time::Duration::from_millis(250)
+                    } else {
+                        std::time::Duration::from_millis(600)
+                    };
+                    tokio::time::sleep(hold).await;
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
+                    // `frame=0` on the first attempt is "no video frames at
+                    // all" — ffmpeg exiting 0 having produced nothing, the
+                    // case the retry exists for.
+                    let frames = if n == 0 { 0 } else { 150 };
+                    let _ = tokio::fs::write(
+                        pharos_transcode::progress_sidecar_path(path),
+                        format!("frame={frames}\nout_time_us=600000000\n"),
+                    )
+                    .await;
+                    WorkerRunResult::Done { out_bytes: 256 }
+                })
+            }
+        }
+
+        TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Retrying(attempts)),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        )
+    }
+
+    /// The promotion has to survive the retry, because the retry is a different
+    /// JOB.
+    ///
+    /// A segment that comes back short of video frames is re-submitted under a
+    /// new id with a deeper decode preroll. Promotion re-ranks one job, and a
+    /// joiner that already promoted the first attempt does not promote again —
+    /// so re-submitting as the driver's original class hands the client straight
+    /// back to the speculative tier it was rescued from, silently and
+    /// uncounted. The measured coalescing rate on the deployment makes that a
+    /// routine path, not a corner: 11 of 26 interactive cache hits arrived by
+    /// joining an in-flight speculative encode.
+    ///
+    /// Asserted through the scheduler's own snapshot DURING the second attempt,
+    /// so it proves the class the retry was submitted at rather than that a
+    /// flag was set.
+    #[tokio::test]
+    async fn a_retried_encode_keeps_the_tier_a_client_promoted_it_to() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = retries_the_first_encode(attempts.clone());
+        let cache = Arc::new(cache.with_scheduler(sched.clone()));
+        // Video, so `frame=0` is a shortfall rather than a legitimate
+        // audio-only segment.
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+
+        let driver = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(11, 4, Path::new("/no/source"), &o, JobClass::Background)
+                    .await
+            })
+        };
+        // A client joins the first attempt and promotes it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let joiner = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(11, 4, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+
+        // The first attempt comes back short at ~250 ms and the driver
+        // re-submits; this lands inside the second attempt.
+        tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "precondition: the completeness check must have forced a retry"
+        );
+        let during = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            during
+                .devices
+                .iter()
+                .map(|d| d.inflight_background)
+                .sum::<usize>(),
+            0,
+            "the retry must not drop the client back to the speculative tier"
+        );
+        assert_eq!(
+            during
+                .devices
+                .iter()
+                .map(|d| d.inflight_interactive)
+                .sum::<usize>(),
+            1,
+            "...it is still the client's own work"
+        );
+
+        let bytes = driver.await.unwrap().expect("the retry must succeed");
+        assert_eq!(bytes.len(), 256);
+        let joined = joiner
+            .await
+            .unwrap()
+            .expect("the joiner gets the bytes too");
+        assert_eq!(joined.len(), 256);
     }
 
     /// The simplest thing the scheduler will place on the CPU: no video
@@ -3962,6 +4160,7 @@ mod tests {
                         rx: second_rx,
                         driver_class: JobClass::Interactive,
                         job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
+                        promoted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
                 );
                 let _ = first.send(Some(Err(Arc::new(HlsCacheError::SchedulerBusy))));
