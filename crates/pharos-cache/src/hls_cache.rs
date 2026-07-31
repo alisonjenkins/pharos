@@ -944,82 +944,12 @@ impl HlsSegmentCache {
         }
 
         // Coalesce onto an encode already in progress for this exact key, or
-        // become the one that starts it. The registration is made under the
-        // DashMap's shard lock, which is released before the driver is spawned,
-        // and the driver is DETACHED — so nothing is held across the encode and
-        // nothing about it depends on this request surviving.
-        let (mut rx, driving) = {
-            let (rx, tx) = match self.inflight.entry(key) {
-                dashmap::mapref::entry::Entry::Occupied(e) => (e.get().rx.clone(), None),
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    let (tx, rx) = tokio::sync::watch::channel(None);
-                    e.insert(InFlightSegment { rx: rx.clone() });
-                    (rx, Some(tx))
-                }
-            };
-            match tx {
-                None => (rx, false),
-                Some(tx) => {
-                    let driver = self.clone();
-                    let driver_source = source.to_path_buf();
-                    let driver_opts = opts.clone();
-                    // Carry this request's span into the detached task. Without
-                    // it the encode's own lines and its `write_segment` span
-                    // land unparented, and the miss line loses the request it
-                    // belongs to — the trace would end where the work begins.
-                    let span = tracing::Span::current();
-                    tokio::spawn(
-                        async move {
-                            // Registered until the driver ENDS, panic included.
-                            let _guard = InFlightGuard {
-                                map: driver.inflight.clone(),
-                                key,
-                            };
-                            let out = driver
-                                .produce_segment(
-                                    &driver_source,
-                                    &driver_opts,
-                                    key,
-                                    media_id,
-                                    seg_index,
-                                    class,
-                                )
-                                .await
-                                .map(Arc::new)
-                                .map_err(Arc::new);
-                            // Publish BEFORE the guard removes the entry, so a
-                            // requester that cloned the receiver a moment ago
-                            // always sees a value.
-                            let _ = tx.send(Some(out));
-                        }
-                        .instrument(span),
-                    );
-                    (rx, true)
-                }
-            }
-        };
-
-        // Wait for the ANSWER, not for exclusion. Two iterations at most: the
-        // value is either already published or arrives with the next change.
+        // become the one that starts it, then wait for the ANSWER rather than
+        // for exclusion.
         let coalesced_started = std::time::Instant::now();
-        let outcome = loop {
-            let published = rx.borrow_and_update().clone();
-            if let Some(v) = published {
-                break v;
-            }
-            if rx.changed().await.is_err() {
-                // Every sender is gone and nothing was published: the driver
-                // panicked, or the runtime is shutting down. Say so and let the
-                // caller retry — the registration is already gone with it, so
-                // the next request re-drives — rather than waiting forever on a
-                // channel nobody can send to.
-                break Err(Arc::new(HlsCacheError::Transcode(
-                    "segment encode driver stopped without publishing a result \
-                     (the task panicked or the runtime is shutting down)"
-                        .to_string(),
-                )));
-            }
-        };
+        let (mut rx, driving) =
+            self.register_or_join(key, source, opts, media_id, seg_index, class);
+        let outcome = Self::await_segment(&mut rx).await;
 
         let bytes = outcome.map_err(|e| shared_copy(&e))?;
         if !driving {
@@ -1040,6 +970,112 @@ impl HlsSegmentCache {
             );
         }
         Ok(bytes.as_ref().clone())
+    }
+
+    /// Register as the driver of this key's encode, or join the one already in
+    /// progress. Returns the receiver the outcome will be published on, and
+    /// whether THIS call is the one driving it.
+    ///
+    /// The registration is made under the DashMap's shard lock, which is
+    /// released before the driver is spawned, and the driver is DETACHED — so
+    /// nothing is held across the encode and nothing about it depends on the
+    /// requester surviving.
+    #[allow(clippy::too_many_arguments)]
+    fn register_or_join(
+        &self,
+        key: SegmentIdentity,
+        source: &Path,
+        opts: &SegmentOpts,
+        media_id: u64,
+        seg_index: u32,
+        class: JobClass,
+    ) -> (
+        tokio::sync::watch::Receiver<Option<SharedSegment>>,
+        bool, // driving
+    ) {
+        let (rx, tx) = match self.inflight.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(e) => (e.get().rx.clone(), None),
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                e.insert(InFlightSegment { rx: rx.clone() });
+                (rx, Some(tx))
+            }
+        };
+        let Some(tx) = tx else {
+            return (rx, false);
+        };
+        let driver = self.clone();
+        let driver_source = source.to_path_buf();
+        let driver_opts = opts.clone();
+        // Built HERE, outside the spawned block, and MOVED into it. Built
+        // inside, a task dropped before its FIRST poll — which is what runtime
+        // shutdown does to a freshly spawned task — would never construct the
+        // guard while its captured `tx` dropped anyway, leaving a registration
+        // whose channel is closed. Every later request for that key would then
+        // find the registration, await a channel nobody can publish to, and get
+        // the dead-driver error forever: precisely the state the guard exists to
+        // prevent. Owned by the future, it drops with the future whether or not
+        // the future is ever polled.
+        let guard = InFlightGuard {
+            map: self.inflight.clone(),
+            key,
+        };
+        // Carry this request's span into the detached task. Without it the
+        // encode's own lines and its `write_segment` span land unparented, and
+        // the miss line loses the request it belongs to — the trace would end
+        // where the work begins.
+        let span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                // Named so the block CAPTURES it: registered until the driver
+                // ends, panic included.
+                let _guard = guard;
+                let out = driver
+                    .produce_segment(
+                        &driver_source,
+                        &driver_opts,
+                        key,
+                        media_id,
+                        seg_index,
+                        class,
+                    )
+                    .await
+                    .map(Arc::new)
+                    .map_err(Arc::new);
+                // Publish BEFORE the guard removes the entry, so a requester
+                // that cloned the receiver a moment ago always sees a value.
+                let _ = tx.send(Some(out));
+            }
+            .instrument(span),
+        );
+        (rx, true)
+    }
+
+    /// Wait for the driver to publish this segment's outcome.
+    ///
+    /// Two iterations at most: the value is either already published or arrives
+    /// with the next change, and the only value ever sent is `Some(_)`.
+    async fn await_segment(
+        rx: &mut tokio::sync::watch::Receiver<Option<SharedSegment>>,
+    ) -> SharedSegment {
+        loop {
+            let published = rx.borrow_and_update().clone();
+            if let Some(v) = published {
+                return v;
+            }
+            if rx.changed().await.is_err() {
+                // Every sender is gone and nothing was published: the driver
+                // panicked, or the runtime is shutting down. Say so and let the
+                // caller retry — the registration is already gone with it, so
+                // the next request re-drives — rather than waiting forever on a
+                // channel nobody can send to.
+                return Err(Arc::new(HlsCacheError::Transcode(
+                    "segment encode driver stopped without publishing a result \
+                     (the task panicked or the runtime is shutting down)"
+                        .to_string(),
+                )));
+            }
+        }
     }
 
     /// Produce one segment: transcode to a temp file, validate, publish into
@@ -3037,6 +3073,58 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one coalesced hit, got {value:?}"
+        );
+    }
+
+    /// A driver task dropped before its FIRST poll must still deregister.
+    ///
+    /// Runtime shutdown does exactly this, and a guard constructed INSIDE the
+    /// spawned block is never constructed on that path — while the block's
+    /// captured sender drops anyway. The registration then outlives the only
+    /// channel that could ever publish to it, and every later request for that
+    /// key coalesces onto it and gets the dead-driver error forever: a permanent
+    /// per-segment outage produced by an orderly shutdown.
+    ///
+    /// Deterministic, not raced: on a current-thread runtime the spawned task
+    /// cannot run until the spawning future yields, and this one never yields.
+    #[test]
+    fn a_driver_dropped_before_its_first_poll_leaves_no_registration() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(3, 0, None, None, &opts);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_rx, driving) = cache.register_or_join(
+                key,
+                Path::new("/no/source"),
+                &opts,
+                3,
+                0,
+                JobClass::Interactive,
+            );
+            assert!(driving, "nothing was in flight, so this call must drive");
+            assert!(
+                cache.inflight.contains_key(&key),
+                "the driver never registered"
+            );
+        });
+        // Shutdown drops the queued task without ever polling it.
+        drop(rt);
+
+        assert_eq!(
+            encode_count(&encodes),
+            0,
+            "the driver ran; this test is no longer about an unpolled task"
+        );
+        assert!(
+            !cache.inflight.contains_key(&key),
+            "a never-polled driver left its registration behind — every later request \
+             for this segment would now wait on a channel nobody can publish to"
         );
     }
 
