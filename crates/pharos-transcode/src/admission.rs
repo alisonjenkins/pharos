@@ -40,7 +40,10 @@ pub struct AdmissionConfig {
     pub decrease_factor: f64,
     /// Never starve prefetch to zero: shed-not-queue means what is refused is
     /// not retried later, so an allowance of 0 would make every segment a cold
-    /// miss. This is the value `SchedConfig::background_alongside_client` ships.
+    /// miss. This is the number the hand-calibrated
+    /// `background_alongside_client` used to be, and it is now the ONLY place
+    /// that number lives — the `SchedConfig` field that once restated it as a
+    /// `usize` is gone.
     pub floor: f64,
 }
 
