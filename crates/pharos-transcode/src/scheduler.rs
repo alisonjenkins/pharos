@@ -1001,6 +1001,23 @@ fn record_queue_outcome(ctx: &JobCtx, outcome: QueueOutcome) -> bool {
 /// queue serving deep guesses while near ones wait?") is a distribution, not a
 /// breakdown. Jobs with no playhead contribute nothing: `i64::MAX` is "no
 /// answer", and recording it would drag every percentile to the ceiling.
+///
+/// NEGATIVE distances contribute nothing either, and the reason is the same
+/// one. Before the backward guess was ranked as imminent, a passed job could
+/// never be dispatched at all, so this filter had nothing to exclude; now a
+/// SyncPlay seek prewarm at −400 reaches an encoder routinely. It is not a
+/// measurement of prefetch DEPTH: its magnitude is a property of how far the
+/// group seeked, chosen by a viewer pressing a button, and it says nothing
+/// about whether the prefetch ladder is tuned too far ahead. Left in, every
+/// such sample lands in the bottom bucket of a positively-bounded histogram and
+/// drags the low quantiles toward zero, which reads as "prefetch is being
+/// served shallow-first" — the healthy verdict — exactly when a group is
+/// seeking. The alternative, documenting their presence instead of excluding
+/// them, leaves a number no query can separate: there is no label to filter on
+/// (see above) and adding one keyed on sign would put a per-viewer behaviour
+/// into a series that exists to describe the ladder. `queue_outcome_total`
+/// already counts that the work happened; this histogram answers a narrower
+/// question and keeps to it.
 fn record_dispatch(state: &SchedState, ctx: &JobCtx) {
     // The histogram shares the counter's denominator by ASKING for it rather
     // than re-testing `retries == 0` beside it: one rule, one place, and a
@@ -1011,7 +1028,7 @@ fn record_dispatch(state: &SchedState, ctx: &JobCtx) {
     }
     if ctx.class == JobClass::Background {
         let distance = lookahead_distance(state, ctx);
-        if distance != i64::MAX {
+        if distance != i64::MAX && !has_been_passed(distance) {
             metrics::histogram!("pharos_transcode_queue_distance").record(distance as f64);
         }
     }
@@ -7520,6 +7537,76 @@ mod tests {
             [4.0],
             "one sample per dispatched speculative job, carrying the distance \
              it was dispatched at"
+        );
+    }
+
+    /// The histogram asks one question — "is the prefetch ladder tuned too far
+    /// ahead?" — and a deliberate backward guess is not an answer to it.
+    ///
+    /// Until a passed job could be dispatched at all, this could not arise. Now
+    /// a SyncPlay seek prewarm at −400 reaches an encoder routinely, and its
+    /// magnitude is a property of how far a viewer seeked rather than of the
+    /// ladder. Recorded, every one of them lands in the bottom bucket of a
+    /// positively-bounded histogram and drags the low quantiles toward zero —
+    /// which reads as the HEALTHY verdict ("served shallow-first") precisely
+    /// while a group is seeking. There is no label to separate them by either:
+    /// the series deliberately has none.
+    ///
+    /// Both a forward and a backward guess, so the filter cannot pass by
+    /// recording nothing at all.
+    #[test]
+    fn the_queue_distance_histogram_takes_no_sample_from_a_backward_guess() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(5), |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+                let stream = StreamKey::of("rewinder");
+
+                let submit = |tag: &'static str, class: JobClass, seg: u32| {
+                    let s2 = s.clone();
+                    async move {
+                        s2.submit(
+                            PathBuf::from(format!("/m/{tag}")),
+                            cmaf(),
+                            file_sink(),
+                            class,
+                            JobHint {
+                                stream,
+                                segment: Some(seg),
+                                seeds_playhead: PlayheadSeed::Observes,
+                            },
+                        )
+                        .await
+                        .expect(tag)
+                    }
+                };
+
+                // The member is at 500...
+                submit("head", JobClass::Interactive, 500).await;
+                // ...its ordinary prefetch is five ahead...
+                submit("forward", JobClass::Background, 505).await;
+                // ...and the group has just seeked it back to 100.
+                submit("prewarm", JobClass::Background, 100).await;
+            })
+        });
+
+        let m = Metrics::capture(&snapshotter);
+        assert_eq!(
+            m.histogram("pharos_transcode_queue_distance"),
+            [5.0],
+            "only forward speculation measures the prefetch ladder; a backward \
+             guess measures the seek that caused it"
         );
     }
 
