@@ -3473,6 +3473,82 @@ mod tests {
         );
     }
 
+    /// Correctness requirement 2 END TO END, not as a `watch` property: a driver
+    /// that dies WITHOUT publishing must fail its waiters with the named error
+    /// rather than park them on a channel nobody can send to.
+    ///
+    /// The driver runs on a runtime the test then kills — which is what runtime
+    /// shutdown does in production, and the only way a driver dies silently
+    /// without reaching into production code for a test-only hook. The registry
+    /// is an `Arc<DashMap>` shared by every clone of the cache, so the waiter on
+    /// the second runtime coalesces onto the doomed driver exactly as a real
+    /// request does.
+    #[test]
+    fn a_requester_is_told_when_its_driver_dies_without_publishing() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_secs(5));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(7, 1, None, None, &opts);
+
+        let driver_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let waiter_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        {
+            let c = cache.clone();
+            let o = opts.clone();
+            driver_rt.spawn(async move {
+                let _ = c
+                    .segment_bytes(7, 1, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await;
+            });
+        }
+        // Wait for the encode to be registered rather than guessing at it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cache.inflight.contains_key(&key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the driver never registered its encode"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let waiter = {
+            let c = cache.clone();
+            let o = opts.clone();
+            waiter_rt.spawn(async move {
+                c.segment_bytes(7, 1, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+        // Long enough for the waiter to coalesce and park on the channel.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The driver's runtime goes away mid-encode: the detached task is
+        // dropped, its sender with it, and nothing was ever published.
+        driver_rt.shutdown_timeout(std::time::Duration::ZERO);
+
+        let got = waiter_rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await
+        });
+        let err = got
+            .expect("the requester hung on a channel nobody can publish to")
+            .unwrap()
+            .expect_err("a driver that died without publishing must fail its waiters");
+        assert!(
+            matches!(&err, HlsCacheError::Transcode(m)
+                if m.contains("driver stopped without publishing")),
+            "the waiter must be told WHY it was woken: {err:?}"
+        );
+    }
+
     /// Write an ffmpeg `-progress` sidecar for `out`. Shaped like the real
     /// thing: repeated blocks, only the last of which is final.
     async fn write_progress(out: &Path, frames: u64, out_time_secs: f64) {
