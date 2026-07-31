@@ -831,10 +831,16 @@ struct InFlightSegment {
 
 /// Rebuild an owned error for a waiter out of the one the driver produced.
 ///
-/// The variant is preserved because callers act on it (`SchedulerBusy` is
-/// shedding, not breakage) and `failure_reason` labels metrics from it. The
-/// `Io` arm keeps the kind and the full message; only the OS error's raw code
-/// object is left behind, which nothing here reads.
+/// The variant is preserved because the code that reads it ACTS on it, and a
+/// `String` would have destroyed that: `SchedulerBusy` is shedding rather than
+/// breakage, so the coalescing fall-through in `segment_bytes_keyed` declines to
+/// adopt it and `shared_failure_outcome` counts it apart from a failure. Note
+/// what is NOT true of this function's output — `failure_reason` does not label
+/// metrics from it. It runs on the ORIGINAL error, inside `produce_segment` for
+/// the encode's own outcome and inside `record_coalesced_failure` on the shared
+/// `Arc<HlsCacheError>`; nothing calls it on a rebuilt copy. The `Io` arm keeps
+/// the kind and the full message; only the OS error's raw code object is left
+/// behind, which nothing here reads.
 fn shared_copy(err: &HlsCacheError) -> HlsCacheError {
     match err {
         HlsCacheError::Io(e) => HlsCacheError::Io(std::io::Error::new(e.kind(), e.to_string())),
@@ -3360,6 +3366,21 @@ mod tests {
         drop(tx);
     }
 
+    /// Abandon the seeded encode exactly as a DYING driver leaves it: the
+    /// registration goes and the sender drops with nothing ever published.
+    ///
+    /// That state is not a synthetic one —
+    /// `a_driver_dropped_before_its_first_poll_leaves_no_registration` proves a
+    /// real runtime shutdown produces precisely it, guard first, sender with it.
+    fn abandon_seeded_driver(
+        cache: &HlsSegmentCache,
+        key: SegmentIdentity,
+        tx: tokio::sync::watch::Sender<Option<SharedSegment>>,
+    ) {
+        cache.inflight.remove(&key);
+        drop(tx);
+    }
+
     /// Block until `n` receivers hold the seeded channel — i.e. until a
     /// requester has ACTUALLY coalesced onto it.
     ///
@@ -3484,23 +3505,47 @@ mod tests {
         )
     }
 
-    /// A DRIVING requester keeps its own shed. Shedding work you submitted
-    /// yourself is the intended behaviour (B108/V58), and the fall-through above
-    /// must not quietly become a retry loop that defeats it: the re-drive is
-    /// "do not adopt somebody else's decision", not "ask again until admitted".
-    #[tokio::test]
-    async fn a_driving_requester_keeps_its_own_shed() {
+    /// A DRIVING requester keeps its own shed, and SUBMITS ONCE. Shedding work
+    /// you submitted yourself is the intended behaviour (B108/V58), and the
+    /// fall-through above must not quietly become a retry loop that defeats it:
+    /// the re-drive is "do not adopt somebody else's decision", not "ask again
+    /// until admitted".
+    ///
+    /// The submission count is what makes this a guard rail rather than a
+    /// description. Delete `!driving` from the fall-through predicate and the
+    /// driving requester falls through, re-registers, submits a SECOND time, is
+    /// shed again — and still returns `SchedulerBusy` with zero encodes and no
+    /// leaked registration, so an end-state-only test passes through the
+    /// regression it exists to catch. The shed counter cannot: each submission
+    /// records one, so a second submission is `Counter(2)`.
+    #[test]
+    fn a_driving_requester_keeps_its_own_shed() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
         let dir = TempDir::new().unwrap();
         let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
-        let cache = cache.with_scheduler(always_sheds_background());
         let opts = slow_opts();
 
-        // Nothing is in flight, so this request drives its own encode — and its
-        // own encode is shed.
-        let err = cache
-            .segment_bytes(5, 1, Path::new("/no/source"), &opts, JobClass::Background)
-            .await
-            .expect_err("a speculative job the scheduler declined must report the shed");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (cache, err) = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                // The scheduler is built inside the runtime it will live on.
+                let cache = cache.with_scheduler(always_sheds_background());
+                // Nothing is in flight, so this request drives its own encode —
+                // and its own encode is shed.
+                let err = cache
+                    .segment_bytes(5, 1, Path::new("/no/source"), &opts, JobClass::Background)
+                    .await
+                    .expect_err("a speculative job the scheduler declined must report the shed");
+                (cache, err)
+            })
+        });
         assert!(
             matches!(err, HlsCacheError::SchedulerBusy),
             "a driving requester must surface its own shed unchanged: {err:?}"
@@ -3515,6 +3560,18 @@ mod tests {
                 .inflight
                 .contains_key(&SegmentIdentity::new(5, 1, None, None, &opts)),
             "the shed left its registration behind"
+        );
+
+        let (_, value) = produced_series(&snapshotter, "shed")
+            .expect("a shed submission must be counted: pharos_segment_produced_total{shed}");
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "the driving requester submitted more than once — the fall-through has become \
+             a retry loop, which is exactly what B108/V58 forbids: {value:?}"
+        );
+        assert!(
+            produced_series(&snapshotter, "coalesced_shed").is_none(),
+            "a requester's own shed must not be booked as an inherited one"
         );
     }
 
@@ -3882,78 +3939,61 @@ mod tests {
     }
 
     /// Correctness requirement 2 END TO END, not as a `watch` property: a driver
-    /// that dies WITHOUT publishing must fail its waiters with the named error
-    /// rather than park them on a channel nobody can send to.
+    /// that dies WITHOUT publishing must fail its WAITERS — the requesters that
+    /// merely joined it — with the named error rather than park them on a
+    /// channel nobody can send to.
     ///
-    /// The driver runs on a runtime the test then kills — which is what runtime
-    /// shutdown does in production, and the only way a driver dies silently
-    /// without reaching into production code for a test-only hook. The registry
-    /// is an `Arc<DashMap>` shared by every clone of the cache, so the waiter on
-    /// the second runtime coalesces onto the doomed driver exactly as a real
-    /// request does.
-    #[test]
-    fn a_requester_is_told_when_its_driver_dies_without_publishing() {
+    /// The abandonment is the seeded one, and the reason is that the waiter's
+    /// join is only observable on the seeded channel: it advances the sender's
+    /// receiver count. The version of this test that killed a real runtime had
+    /// to GUESS the join with a 300 ms sleep, and on a loaded box the guess
+    /// fails in the most misleading way available — the driver's guard has
+    /// already deregistered, so the waiter drives its OWN encode, races the
+    /// test's own timeout and reports "the requester hung on a channel nobody
+    /// can publish to" about a requester that was busy encoding. Nothing is
+    /// given up: `abandon_seeded_driver` leaves exactly the state a killed
+    /// runtime leaves, and that a killed runtime leaves it is proved next door
+    /// by `a_driver_dropped_before_its_first_poll_leaves_no_registration` and by
+    /// `a_requester_whose_driver_dies_before_producing_counts_itself`, which
+    /// shuts a real runtime down under a real driver.
+    #[tokio::test]
+    async fn a_requester_is_told_when_its_driver_dies_without_publishing() {
         let dir = TempDir::new().unwrap();
-        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_secs(5));
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
         let opts = slow_opts();
         let key = SegmentIdentity::new(7, 1, None, None, &opts);
 
-        let driver_rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let waiter_rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-
-        {
-            let c = cache.clone();
-            let o = opts.clone();
-            driver_rt.spawn(async move {
-                let _ = c
-                    .segment_bytes(7, 1, Path::new("/no/source"), &o, JobClass::Interactive)
-                    .await;
-            });
-        }
-        // Wait for the encode to be registered rather than guessing at it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !cache.inflight.contains_key(&key) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the driver never registered its encode"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
+        let tx = seed_inflight(&cache, key);
         let waiter = {
             let c = cache.clone();
             let o = opts.clone();
-            waiter_rt.spawn(async move {
+            tokio::spawn(async move {
                 c.segment_bytes(7, 1, Path::new("/no/source"), &o, JobClass::Interactive)
                     .await
             })
         };
-        // Long enough for the waiter to coalesce and park on the channel.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // The join itself, not an interval in which it probably happened.
+        await_coalescers(&tx, 2).await;
 
-        // The driver's runtime goes away mid-encode: the detached task is
-        // dropped, its sender with it, and nothing was ever published.
-        driver_rt.shutdown_timeout(std::time::Duration::ZERO);
+        // The driver goes away mid-encode: registration gone, sender dropped,
+        // nothing ever published.
+        abandon_seeded_driver(&cache, key, tx);
 
-        let got = waiter_rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await
-        });
-        let err = got
-            .expect("the requester hung on a channel nobody can publish to")
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter hung on a channel nobody can publish to")
             .unwrap()
             .expect_err("a driver that died without publishing must fail its waiters");
         assert!(
             matches!(&err, HlsCacheError::Transcode(m)
                 if m.contains("driver stopped without publishing")),
             "the waiter must be told WHY it was woken: {err:?}"
+        );
+        assert_eq!(
+            encode_count(&encodes),
+            0,
+            "the waiter drove its own encode instead of joining the doomed one, so this \
+             is no longer a test about a dead driver"
         );
     }
 
