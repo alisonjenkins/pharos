@@ -671,6 +671,31 @@ fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
     seg as i64 - *head as i64
 }
 
+/// Has the viewer gone past the segment a [`lookahead_distance`] describes?
+///
+/// The ONE definition of "already passed", shared by the ranking band in
+/// `next_to_dispatch`, the drop in `try_place_no_queue` and the victim choice
+/// in `queue_or_refuse`. Three places that must agree: a queue that ranks a job
+/// last for a reason it then declines to drop it for, or evicts a job it would
+/// have been happy to dispatch, is a queue with two opinions about the same
+/// number.
+///
+/// STRICTLY negative, and the boundary is the whole content of this function.
+/// `lookahead_distance` measures against the last segment the client ASKED FOR,
+/// not the last it finished — a playhead advances when an interactive
+/// submission arrives — so distance 0 is the segment being fetched right now:
+/// wanted, in progress, and not yet produced. It is also the segment
+/// `next_to_dispatch` ranks FIRST among speculation, so treating it as passed
+/// would have the queue destroy the very job it had just called the most urgent
+/// thing in it. Only `seg < head` says the client has moved on.
+///
+/// `i64::MAX` (no playhead, or a job that is not a numbered segment) is not
+/// passed either, and must never be: nothing is KNOWN to need it, which is not
+/// the same as knowing nothing does.
+fn has_been_passed(distance: i64) -> bool {
+    distance < 0
+}
+
 impl TranscodeScheduler {
     pub fn spawn(
         devices: DeviceTable,
@@ -1505,6 +1530,15 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
 /// known to be wanted, but `-1` is the likelier of the two to be asked for again
 /// than `-30`.
 ///
+/// The passed band still earns its place now that examining such a job DROPS it
+/// (`try_place_no_queue`) rather than encoding it. It decides which of the two
+/// happens first — every live job is dispatched before any passed one is looked
+/// at, so the drop can never cost a permit's worth of latency to work somebody
+/// is about to want — and the same key, read at its maximum instead of its
+/// minimum, is what picks the victim when a full queue has to evict
+/// (`queue_or_refuse`). Eviction runs on ARRIVAL, between drains, so it sees
+/// passed jobs that no drain has yet had the chance to drop.
+///
 /// O(n) over `pending_cap` (256) rather than a heap: every key moves whenever
 /// any client advances, so a heap would be re-keyed far more often than popped.
 fn next_to_dispatch(state: &SchedState) -> Option<usize> {
@@ -1519,7 +1553,7 @@ fn next_to_dispatch(state: &SchedState) -> Option<usize> {
                 // `abs` cannot overflow: both operands are `u32`-derived, so `d`
                 // is bounded well inside `i64`, and `i64::MAX` (no playhead)
                 // maps to itself.
-                (1i64, d < 0, d.abs())
+                (1i64, has_been_passed(d), d.abs())
             }
         })
         .map(|(idx, _)| idx)
@@ -2003,6 +2037,12 @@ fn drain_pending(state: &mut SchedState, self_tx: &mpsc::Sender<SchedMsg>) {
 /// Like `place` but never re-queues internally — a job that can't get a
 /// permit is pushed into `requeue` (preserving order) instead, so
 /// `drain_pending` doesn't recurse or reorder.
+///
+/// It is also where speculation stops being worth doing: a `Background` job the
+/// viewer has played past is dropped here rather than dispatched, because this
+/// is the freshest the playhead ever is. Every exit from this function resolves
+/// the caller's reply or returns the job to `requeue`; none of them leaves a
+/// `submit().await` hanging.
 fn try_place_no_queue(
     state: &mut SchedState,
     job_id: JobId,
@@ -2014,6 +2054,41 @@ fn try_place_no_queue(
     // we dispatch the seek-target instead of resurrecting dead prefetch work.
     if ctx.reply.is_closed() {
         return;
+    }
+    // ...and drop speculation the viewer has gone PAST, which is a different
+    // thing entirely: the caller is still there, still waiting, and the bytes
+    // it asked for will never be fetched. Encoding one spends a permit — and,
+    // on a saturated pool, a client's place in the queue — on nothing.
+    //
+    // Judged HERE, at dispatch, rather than by a reaper task, because the
+    // playhead moves under a queued job continuously and this is the point
+    // where the answer is freshest: every job this ever drops was submitted
+    // while it was still ahead of the client. Nothing else catches it —
+    // `reply.is_closed()` fires only when a seek or a track swap CANCELLED the
+    // prefetch, and a client simply advancing past it does neither.
+    //
+    // Reported as `Busy`, not as a failure: nothing broke, the work stopped
+    // being wanted. Same reasoning as `background_never_error`'s load-shed arm
+    // — and the DEBUG line carries the distance and the playhead rather than a
+    // bare class, so "why did this segment never appear" is answerable.
+    if ctx.class == JobClass::Background {
+        let distance = lookahead_distance(state, &ctx);
+        if has_been_passed(distance) {
+            tracing::debug!(
+                %job_id,
+                stream = ctx.stream.0,
+                segment = ctx.segment,
+                playhead = state.playheads.get(&ctx.stream).map(|(h, _)| *h),
+                distance,
+                waited_ms = Instant::now()
+                    .saturating_duration_since(ctx.enqueued)
+                    .as_millis() as u64,
+                input = %ctx.input.display(),
+                "speculative transcode dropped: the viewer has played past it"
+            );
+            let _ = ctx.reply.send(Err(SchedError::Busy));
+            return;
+        }
     }
     let now = Instant::now();
     let full_eligible = state.devices.eligible_for(&ctx.opts, now);
@@ -5174,8 +5249,17 @@ mod tests {
     /// expected order either. `distance.max(0)` cannot produce it either: it
     /// would tie the stale job with distance 0 and hand it the tiebreak on
     /// arrival.
+    ///
+    /// Ranking passed work last was the first half of the answer and is no
+    /// longer the whole of it: a job the viewer has gone past is now DROPPED
+    /// when it is examined, because a permit spent on it buys nothing at any
+    /// position in the order. The ordering still decides which of the two
+    /// things happens first — live speculation is dispatched nearest-first
+    /// before any passed job is looked at — and it is what picks the victim
+    /// when a full queue has to evict (`queue_or_refuse`), so both halves are
+    /// asserted here.
     #[tokio::test]
-    async fn work_the_viewer_has_already_passed_is_the_last_speculation_dispatched() {
+    async fn work_the_viewer_has_already_passed_is_dropped_rather_than_dispatched_last() {
         let order = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = order.clone();
         let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(120), move |_, spec| {
@@ -5245,8 +5329,18 @@ mod tests {
         );
 
         blocker.await.unwrap().expect("the client's own segment");
+        let mut results = Vec::new();
         for h in handles {
-            h.await.unwrap().expect("queued speculative work");
+            results.push(h.await.unwrap());
+        }
+        // Submitted first, so this is `results[0]`.
+        assert!(
+            matches!(results[0], Err(SchedError::Busy)),
+            "a segment the viewer has gone past must be dropped, and its \
+             caller told so rather than left waiting: {results:?}"
+        );
+        for (tag, r) in ["next", "far"].iter().zip(&results[1..]) {
+            assert!(r.is_ok(), "{tag} must still complete: {r:?}");
         }
         let got: Vec<String> = order
             .lock()
@@ -5257,9 +5351,198 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            ["next", "far", "stale"],
-            "a segment the viewer already went past must not outrank the one \
-             they need next: {got:?}"
+            ["next", "far"],
+            "a segment the viewer already went past must neither outrank the \
+             one they need next nor be encoded at all: {got:?}"
+        );
+    }
+
+    /// The other half of the same fact, and the one that says the distance is
+    /// judged at DISPATCH rather than frozen at submit: every job here was
+    /// still AHEAD of the playhead when it was submitted, and one of them stops
+    /// being so while it waits.
+    ///
+    /// A client seeking forward is the ordinary way this happens. It does not
+    /// abort the prefetch tasks it just orphaned — `reply.is_closed()` fires
+    /// only when a seek CANCELS the request, and the prefetch for the segments
+    /// between the old playhead and the new one is simply left behind, still
+    /// queued, still wanted by nobody.
+    ///
+    /// The positive control matters as much as the drop: `live`, submitted at
+    /// the same moment and one segment ahead of where the client landed, must
+    /// still be encoded. "Background work stopped running" would pass a test
+    /// that only checked the stale job.
+    #[tokio::test]
+    async fn a_prefetch_the_viewer_outruns_while_it_waits_is_dropped_at_dispatch() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                // Holds the one permit while everything else piles up behind
+                // it, so the whole queue is in place before anything drains.
+                "blocker" => Duration::from_millis(300),
+                _ => Duration::from_millis(60),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        // One permit, so the queue drains one job at a time and the recorded
+        // order IS the dispatch order. `background_headroom: 0` for the reason
+        // given in the ranking test: a pool that cannot hold the reserve and a
+        // job at once sheds speculation instead of queueing it, and there would
+        // be no queue to examine.
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let stream = StreamKey::of("viewer");
+
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            })
+        };
+
+        // The client is at 100 and its own request holds the permit.
+        let blocker = submit("blocker", JobClass::Interactive, 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Prefetch for the next segment — one AHEAD of the playhead, so this is
+        // perfectly good work at the moment it is queued.
+        let stale = submit("stale", JobClass::Background, 101);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // ...and then the viewer seeks to 140. Segment 101 will never be asked
+        // for; 141 is now the next one.
+        let seek = submit("seek", JobClass::Interactive, 140);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let live = submit("live", JobClass::Background, 141);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            (queued.pending_background, queued.pending_interactive),
+            (2, 1),
+            "precondition: all three must be waiting behind the blocker, or \
+             nothing is examined at dispatch"
+        );
+
+        blocker.await.unwrap().expect("the client's first segment");
+        seek.await.unwrap().expect("the client's seek target");
+        live.await
+            .unwrap()
+            .expect("speculation still ahead of the playhead must survive");
+        let refused = stale.await.unwrap();
+        assert!(
+            matches!(refused, Err(SchedError::Busy)),
+            "a prefetch the viewer outran must be dropped: {refused:?}"
+        );
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "seek", "live"],
+            "the segment the client left behind must never reach an encoder: \
+             {got:?}"
+        );
+    }
+
+    /// Where the line is, and it is not `<= 0`.
+    ///
+    /// `lookahead_distance` measures against the last segment the client ASKED
+    /// FOR, not the last it finished — so distance 0 is the segment being
+    /// fetched right now: wanted, and not yet produced. It is also the segment
+    /// `next_to_dispatch` ranks FIRST among speculation, so dropping it would
+    /// have the queue destroy the very job it had just called the most urgent
+    /// thing in it.
+    ///
+    /// Both sides are asserted in one place because each disarms a different
+    /// mistake: widening the test to `<= 0` kills `standing`, and removing the
+    /// drop entirely encodes `passed`.
+    #[tokio::test]
+    async fn the_segment_the_viewer_is_standing_on_is_not_treated_as_passed() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(300),
+                _ => Duration::from_millis(60),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let stream = StreamKey::of("viewer");
+
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            })
+        };
+
+        // The client asked for 100, so 100 is what it is waiting for.
+        let blocker = submit("blocker", JobClass::Interactive, 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let standing = submit("standing", JobClass::Background, 100);
+        let passed = submit("passed", JobClass::Background, 99);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            queued.pending_background, 2,
+            "precondition: both must be waiting, or neither boundary is tested"
+        );
+
+        blocker.await.unwrap().expect("the client's own segment");
+        standing
+            .await
+            .unwrap()
+            .expect("the segment the viewer is standing on is still wanted");
+        let refused = passed.await.unwrap();
+        assert!(
+            matches!(refused, Err(SchedError::Busy)),
+            "the segment BEHIND the playhead must be dropped: {refused:?}"
+        );
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "standing"],
+            "distance 0 is the segment being fetched, not one that has been \
+             played past: {got:?}"
         );
     }
 
