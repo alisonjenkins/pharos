@@ -865,11 +865,17 @@ fn is_stale(state: &SchedState, ctx: &JobCtx) -> bool {
 /// defect `pharos_transcode_pin_total{outcome="followed"}` shipped with:
 /// two arms of one counter with different denominators, whose ratio is
 /// meaningless and whose absolute values look fine.
-fn record_queue_outcome(ctx: &JobCtx, outcome: QueueOutcome) {
+///
+/// Returns whether it counted, so that this is the ONLY place the rule is
+/// stated. Anything else recorded per terminal outcome — the queue-distance
+/// histogram is the one today — asks here rather than re-deriving `retries ==
+/// 0` beside it, which is two copies of one decision waiting to disagree.
+fn record_queue_outcome(ctx: &JobCtx, outcome: QueueOutcome) -> bool {
     if ctx.retries > 0 {
-        return;
+        return false;
     }
     outcome.record(ctx.class);
+    true
 }
 
 /// The dispatch arm, plus the distance the job was dispatched AT.
@@ -886,8 +892,14 @@ fn record_queue_outcome(ctx: &JobCtx, outcome: QueueOutcome) {
 /// breakdown. Jobs with no playhead contribute nothing: `i64::MAX` is "no
 /// answer", and recording it would drag every percentile to the ceiling.
 fn record_dispatch(state: &SchedState, ctx: &JobCtx) {
-    record_queue_outcome(ctx, QueueOutcome::Dispatched);
-    if ctx.class == JobClass::Background && ctx.retries == 0 {
+    // The histogram shares the counter's denominator by ASKING for it rather
+    // than re-testing `retries == 0` beside it: one rule, one place, and a
+    // retry that stopped counting in one of them cannot silently keep counting
+    // in the other.
+    if !record_queue_outcome(ctx, QueueOutcome::Dispatched) {
+        return;
+    }
+    if ctx.class == JobClass::Background {
         let distance = lookahead_distance(state, ctx);
         if distance != i64::MAX {
             metrics::histogram!("pharos_transcode_queue_distance").record(distance as f64);
