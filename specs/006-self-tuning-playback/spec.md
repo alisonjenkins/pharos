@@ -55,8 +55,9 @@ background slots to win.
 ## Scope
 
 **In**: the playback path only — how much speculative transcode work may run
-beside a client's segment (phase 1), and which speculative work wins when there
-is not room for all of it (phase 2).
+beside a client's segment (phase 1), how in-flight work is shared rather than
+locked (phase 2a), and which speculative work wins when there is not room for
+all of it (phase 2b).
 
 **Out, deliberately**:
 
@@ -180,41 +181,136 @@ One addition to what B177 shipped: `peer_jobs` counts *all* peers. The
 controller needs the **background** peer count specifically, recorded at
 dispatch alongside it.
 
-## Phase 2 — urgency-gated admission
+## Phase 2a — shared-result single-flight
 
-Land after phase 1 is live, for the same reason prefetch depth is out of scope:
-the allowance is an input to the urgency gate, and shipping both at once makes a
-regression unattributable.
+Land after phase 1 is live. **Prerequisite for 2b**: it is the change that makes
+a background queue safe rather than a repeat of B108.
+
+### The lock that has to go first
+
+`fetch_locks: HashMap<SegmentIdentity, Arc<Mutex<()>>>` is held for the **entire
+multi-second transcode**. It is not guarding a data race — it is single-flight
+dedup implemented as mutual exclusion. Holding exclusion across seconds of work
+is precisely what makes a queued speculative job poisonous: a client asking for
+the same segment blocks in `segment_fetch_lock_wait` for the whole queue wait,
+which is the 90 s shape B108 removed the queue to escape.
+
+Replace it with a **shared-result registry**: `DashMap<SegmentIdentity, _>`
+holding a `watch` receiver (or equivalent shared future) per in-flight segment.
+
+- The first requester inserts the entry and spawns a **detached driver** for the
+  encode.
+- Later requesters clone the receiver and await the **value**, not a lock.
+- Nobody holds exclusion across work, so a queued job cannot block anyone.
+- **Cancellation-safe**, which the current design is not: today, if the lock
+  holder is cancelled mid-transcode the guard drops, the next waiter re-checks
+  the filesystem, and the segment may be encoded twice. A detached driver
+  outlives its original requester.
+- Promotion (2b) falls out for free — the entry already carries the job id.
+- The `post_lock` filesystem re-check disappears; the shared result *is* the
+  answer.
+
+### On "lock-free"
+
+The queue itself is **already lock-free in the way that matters**: `SchedState`
+is owned by a single task fed by an mpsc channel — an actor, no mutex. Priority
+selection (2b) does not introduce one. Replacing it with a CAS-based concurrent
+priority queue would add real complexity to remove contention that does not
+exist, because only one task ever touches it. Deliberately not done.
+
+`dashmap` uses sharded internal locks, so 2a is **not literally lock-free**
+either. The win is "stop holding exclusion across long work" — nanoseconds of
+map contention in place of seconds of held exclusion — not the elimination of
+mutexes as such.
+
+### Dashboard contract
+
+`pharos_segment_cache_total{hit_path="post_lock"}` is a **dashboard contract**
+and `post_lock` ceases to exist as a concept. The label needs a deliberate
+migration to its successor (a request that coalesced onto an in-flight encode),
+not a silent rename: V-class rule, a renamed label breaks alerts silently.
+
+## Phase 2b — urgency-ordered background queue
+
+Background work currently never queues; it is **shed and never retried**. With
+two viewers the loser of the race has its prefetch dropped, so it takes a cold
+interactive miss on every segment while the winner builds a deep buffer. Queuing
+it means served late instead of never — which is the whole justification for
+re-entering territory that has already caused one outage.
+
+### The insight that makes a queue safe
+
+**A client waiting on a speculative job's result is proof the speculation was
+correct.** It is not speculation any more; it is demand. So do not make the
+client wait behind it, and do not cancel and redo the work — **promote it**.
+
+A client arriving on an in-flight entry (2a) reads the job id and calls
+`scheduler.promote(job_id)`. The scheduler reclassifies that queued job
+Background → Interactive and it jumps the tier. The client's wait collapses from
+"queue + encode" to "encode", with no duplicated work.
+
+### Structure
+
+Keep `pending`; allow background in; **select at dispatch instead of popping the
+front**:
+
+1. **Tier**: every Interactive before any Background. Absolute.
+2. **Within Interactive**: FIFO — all equally urgent, someone is blocked on each.
+3. **Within Background**: ascending lookahead distance, **recomputed at dispatch**
+   against the session's current playhead.
+
+Point 3 is what makes it smart rather than merely ordered. Distance is a
+property of *now*, not of the job: one queued 30 s ago at distance 6 may now be
+distance 1 — the most urgent thing in the queue — or already passed. Freezing
+urgency at submit time gets this exactly backwards. An O(n) scan with
+`n ≤ pending_cap` (256) is cheaper than maintaining a heap whose keys all move
+anyway.
 
 `prefetch_target_segments` already loops `for ahead in 1..=ahead_count`, so the
-lookahead distance exists at the submission site and is currently discarded.
-Carry it, and grade admission by it:
+distance exists at the submission site and is currently discarded.
 
-```
-admit a background job at lookahead d  iff  free_background_slots ≥ d
-```
+### Cancellation
 
-where `free_background_slots` is the learned allowance minus background
-in flight when a client job is on the device, and the device capacity minus
-background in flight when it is idle.
+Evaluated at dispatch, so no reaper task is needed:
 
-Distance-1 work needs one free slot and so gets in almost always; distance-6
-work needs six and runs only when the device is genuinely quiet. Under
-contention **every session's next segment beats any session's sixth**, which is
-the desired ordering, without reintroducing the queue B108 removed.
+| condition | action |
+|---|---|
+| `reply.is_closed()` (session swap/stop via `PrefetchRegistry`) | drop — **already implemented** |
+| background job whose distance ≤ 0 (playhead passed it) | drop as stale |
+| queue full | evict the **least urgent background**, not the newest arrival |
+| nothing evictable | shed, as today |
 
-Deep prefetch still runs in the gaps between client requests, which is when
-buffer-building should happen.
+Eviction direction matters: FIFO overflow drops the newest, which is the most
+urgent. Evicting the least urgent is the opposite, and correct.
 
-Two honest limits:
+### What the scheduler must learn
 
-- **This approximates deadline ordering; it is not strict.** Within a single
-  submission burst, admission among jobs that clear the gate is still
-  submit-order. Strict ordering needs a queue, and the queue is what produced
-  the 90 s waits B108 fixed.
-- **It does not guarantee per-session fairness.** If A clears the gate on four
-  jobs before B submits anything, A still gets more. A per-session background
-  cap would close that; hold it until the metric shows it is needed.
+It currently has no idea where a session's playhead is. Background jobs carry
+`(session, segment)`; an Interactive submit updates
+`session → last_requested_segment`; distance is `segment − last_requested`. The
+map is bounded and LRU'd at 256, mirroring `MAX_TRACKED_SESSIONS` in
+`PrefetchRegistry`.
+
+### Consequences
+
+- **`class` becomes mutable mid-flight.** A promoted job must report
+  `class="interactive"` on `encode_seconds` — it ended up being demand, and
+  labelling it background would understate interactive latency in exactly the
+  case that matters.
+- **Per-session fairness is still not guaranteed.** If A queues four jobs before
+  B submits anything, A's still sort ahead at equal distance. A per-session
+  background cap would close it; hold until the metric shows it is needed.
+
+### The test this ships or dies on
+
+A test reproducing B108's shape directly: a client requests a segment that is
+already queued as background behind a saturated device, and the client's wait
+must be bounded by **one encode**, not by the queue. If that cannot be made to
+pass, the queue does not ship. The fallback is the design this replaced:
+urgency-gated admission with no queue — `admit a background job at lookahead d
+iff free_background_slots ≥ d`, so distance-1 work needs one free slot and
+distance-6 needs six. That approximates the ordering without ever queuing, at
+the cost of still dropping the loser's work rather than deferring it.
 
 ## Restart behaviour
 
@@ -254,9 +350,22 @@ Named before the code, per the ODD rule.
   `ignored`. The `ignored` arm is load-bearing: a frozen allowance with
   all-ignored observations means *no signal*, which is a completely different
   problem from a device that genuinely cannot go faster.
-- Phase 2: `pharos_transcode_prefetch_admit_total{verdict,lookahead_bucket}` —
-  `admitted` / `shed`, bucketed by distance, so "shallow prefetch is winning" is
-  a query rather than an assumption.
+- Phase 2a: `pharos_segment_cache_total{hit_path}` gains the successor to
+  `post_lock` — a request that coalesced onto an in-flight encode. Migrated
+  deliberately, not renamed silently.
+- Phase 2b: `pharos_transcode_queue_outcome_total{class,outcome}` —
+  `dispatched` / `stale` / `evicted` / `shed`. The `stale` and `evicted` arms
+  are the ones that say the queue is doing its job rather than merely
+  accumulating; a queue that never evicts and never drops stale work is a queue
+  that has quietly become the FIFO B108 deleted.
+- Phase 2b: `pharos_transcode_promotion_total` — background jobs promoted to
+  interactive because a client arrived on them. This is the safety valve made
+  visible: promotions happening means speculation is being validated by demand;
+  promotions at zero while clients wait means the promotion path is not wired
+  up.
+- Phase 2b: `pharos_transcode_queue_distance` — histogram of the lookahead
+  distance of dispatched background jobs. Shallow-beats-deep becomes a query
+  rather than an assumption.
 - Log only when the **integer** allowance changes, carrying observed, deadline
   and background peers. Not per observation — that would be noise at segment
   rate.
@@ -288,8 +397,25 @@ Scheduler-level:
   `speculative_work_does_not_crowd_the_segment_a_client_is_waiting_for` test
   must pass unchanged**; that is the regression guard
 - a fast scripted device lets progressively more background through
-- phase 2: under contention, a distance-1 job is admitted where a distance-6 job
-  from the same burst is shed
+
+Phase 2a:
+
+- a second requester for an in-flight segment awaits the RESULT and never
+  acquires exclusion — asserted by timing, not by inspection
+- cancelling the first requester does not abort the encode, and the second
+  requester still gets bytes (impossible today)
+
+Phase 2b — **the test this ships or dies on**:
+
+- a client requests a segment already queued as background behind a saturated
+  device; its wait is bounded by one encode, not by the queue. This reproduces
+  B108's shape directly. If it cannot be made to pass, the queue does not ship.
+- a background job whose playhead has passed it is dropped at dispatch rather
+  than encoded
+- at queue capacity, the LEAST urgent background job is evicted and the newly
+  arrived urgent one is kept
+- with two sessions queued, every session's distance-1 job dispatches before any
+  session's distance-6 job
 
 Every signal disarm-verified: the metric assertion must go red with the
 instrumentation removed.
