@@ -1541,9 +1541,16 @@ impl HlsSegmentCache {
             // tier it was rescued from, uncounted. Read fresh each attempt: a
             // client can arrive during attempt 0.
             //
-            // The outcome metrics below stay labelled with the original `class`:
-            // they describe this driver, and the joiner already counted its own
-            // request on the coalesced-hit path.
+            // Two label vocabularies below, and the split is deliberate. The
+            // PRODUCTION outcomes (`pharos_segment_produced_total`,
+            // `pharos_segment_cache_total`) stay labelled with the original
+            // `class`: they count production attempts and requests, they
+            // describe this driver, and the joiner already counted its own
+            // request on the coalesced-hit path. The LATENCY histograms are
+            // labelled `waiting_class` — who was actually waiting — because
+            // they answer a different question, and a client-blocking encode
+            // filed under `class="background"` is invisible to the interactive
+            // p95 that phase 1's own validation reads.
             let submit_class = if promoted.load(std::sync::atomic::Ordering::Acquire) {
                 JobClass::Interactive
             } else {
@@ -1684,15 +1691,34 @@ impl HlsSegmentCache {
         // queue-wait far above the encode p95 is the scheduler starving client
         // requests, not a slow encoder — the two need opposite fixes and were
         // indistinguishable from any metric before this.
+        //
+        // Labelled by WHO WAS WAITING, which for a promoted encode is not who
+        // submitted it. A speculative driver that a client coalesced onto is a
+        // client-blocking encode, and filing it under `class="background"`
+        // understates interactive latency in exactly the case that matters:
+        // Gate A measured 42% of interactive cache hits arriving coalesced, so
+        // a large share of the slow client-visible encodes would sit outside
+        // the interactive p95 that phase 1's validation condition ("a rising
+        // allowance beside a rising p95 means the control law is wrong") is
+        // read from. The scheduler's own `observe_margin` already treats a
+        // promoted job as interactive; these two are meant to be read together
+        // and must not disagree about the same job.
+        let waiting_class = if class == JobClass::Interactive
+            || promoted.load(std::sync::atomic::Ordering::Acquire)
+        {
+            JobClass::Interactive
+        } else {
+            class
+        };
         if let Some(t) = timing.as_ref() {
             metrics::histogram!(
                 "pharos_transcode_queue_wait_seconds",
-                "class" => class.label(),
+                "class" => waiting_class.label(),
             )
             .record(t.queue_wait_ms as f64 / 1000.0);
             metrics::histogram!(
                 "pharos_transcode_encode_seconds",
-                "class" => class.label(),
+                "class" => waiting_class.label(),
                 "device" => t.device.to_string(),
             )
             .record(t.encode_ms as f64 / 1000.0);
@@ -1706,7 +1732,7 @@ impl HlsSegmentCache {
             // two divide.
             metrics::histogram!(
                 "pharos_transcode_peer_jobs",
-                "class" => class.label(),
+                "class" => waiting_class.label(),
                 "device" => t.device.to_string(),
             )
             .record(t.peer_jobs as f64);
@@ -3825,6 +3851,141 @@ mod tests {
             Arc::new(Retrying(attempts)),
             pharos_transcode::scheduler::SchedConfig::default(),
         )
+    }
+
+    /// A scheduler whose worker writes a REAL segment (plus a complete
+    /// `-progress` sidecar) after `hold`.
+    ///
+    /// `holds_each_job` cannot be used for anything downstream of production:
+    /// it writes no file, so `produce_segment` rejects the result at the
+    /// minimum-size gate and returns before the timing histograms — which sit
+    /// after the rename — are ever reached.
+    fn writes_each_segment(
+        hold: std::time::Duration,
+    ) -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        struct Writing(std::time::Duration);
+        impl WorkerSpawner for Writing {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let hold = self.0;
+                Box::pin(async move { Ok(Box::new(WriteWorker { id, hold }) as Box<dyn Worker>) })
+            }
+        }
+        struct WriteWorker {
+            id: WorkerId,
+            hold: std::time::Duration,
+        }
+        impl Worker for WriteWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let hold = self.hold;
+                Box::pin(async move {
+                    tokio::time::sleep(hold).await;
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
+                    let _ = tokio::fs::write(
+                        pharos_transcode::progress_sidecar_path(path),
+                        "frame=150\nout_time_us=600000000\n",
+                    )
+                    .await;
+                    WorkerRunResult::Done { out_bytes: 256 }
+                })
+            }
+        }
+
+        TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Writing(hold)),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        )
+    }
+
+    /// An encode a client ended up blocked on is timed as INTERACTIVE, however
+    /// it started.
+    ///
+    /// `pharos_transcode_encode_seconds{class}` is half of phase 1's own
+    /// validation condition — "a rising allowance beside a rising p95 means the
+    /// control law is wrong" — and that p95 cannot see a slow client-visible
+    /// encode filed under `class="background"`. It is not a rare filing either:
+    /// 42% of interactive cache hits on the deployment arrive coalesced onto an
+    /// encode somebody else started. The scheduler's `observe_margin` already
+    /// treats a promoted job as interactive, so labelling from the driver's
+    /// registration class also left the two signals an operator reads together
+    /// disagreeing about the same job.
+    #[test]
+    fn a_client_blocking_encode_is_timed_as_interactive_however_it_started() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let dir = TempDir::new().unwrap();
+        let (base, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let opts = slow_opts();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                // Built inside the runtime: the scheduler actor is a spawned
+                // task.
+                let sched = writes_each_segment(std::time::Duration::from_millis(400));
+                let cache = Arc::new(base.with_scheduler(sched));
+                // A guess starts the encode...
+                let driver = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(31, 5, Path::new("/no/source"), &o, JobClass::Background)
+                            .await
+                    })
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                // ...and a client turns out to be waiting on it.
+                let joiner = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(31, 5, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                driver.await.unwrap().expect("the encode itself succeeded");
+                joiner.await.unwrap().expect("the joiner got the bytes");
+            })
+        });
+
+        let classes: Vec<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_transcode_encode_seconds")
+            .flat_map(|(ck, _, _, _)| {
+                ck.key()
+                    .labels()
+                    .filter(|l| l.key() == "class")
+                    .map(|l| l.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            classes,
+            vec!["interactive".to_string()],
+            "an encode a client is blocked on must be timed as interactive, \
+             whoever submitted it — otherwise the interactive p95 phase 1 is \
+             validated against cannot see it"
+        );
     }
 
     /// The promotion has to survive the retry, because the retry is a different
