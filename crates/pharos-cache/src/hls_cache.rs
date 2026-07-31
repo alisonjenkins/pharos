@@ -170,6 +170,12 @@ enum SegmentOutcome {
     /// system choosing a client request over a guess — but it must still be
     /// countable, or shedding looks like silence.
     Shed,
+    /// This request ran NO encode of its own: it coalesced onto one already in
+    /// flight for the same key, and that encode failed. Kept apart from
+    /// `Failed` because they are different denominators — `Failed` counts
+    /// production attempts, this counts requests taken down BY one — and the
+    /// ratio between them is the blast radius of a single bad encode.
+    CoalescedFailed,
 }
 
 impl SegmentOutcome {
@@ -184,6 +190,7 @@ impl SegmentOutcome {
             Self::Empty => "empty",
             Self::Failed => "failed",
             Self::Shed => "shed",
+            Self::CoalescedFailed => "coalesced_failed",
         }
     }
 }
@@ -234,6 +241,50 @@ fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str, class: 
         "class" => class.label(),
     )
     .increment(1);
+}
+
+/// Count one request that failed because the encode it COALESCED ONTO failed.
+///
+/// The success half of the coalescing path records a hit per waiter; the failure
+/// half recorded nothing, so ONE failed encode returned to N waiters incremented
+/// `pharos_segment_produced_total` exactly once. That counter is what a
+/// segment-failure alert reads, so it undercounted client-visible failures by
+/// the coalescing factor, and nothing anywhere said how many requests a single
+/// failed encode took down — the rich-on-one-path, silent-on-the-other shape, at
+/// the one place where a single fault reaches an unknown number of clients.
+///
+/// Deliberately a distinct `outcome` on the SAME counter rather than another
+/// `failed` or a parallel metric: `failed` counts production attempts and this
+/// counts requests taken down by one, so summing them gives the client-visible
+/// total while their ratio gives the blast radius. `reason` is `failure_reason`
+/// of the inherited error, so the two share one vocabulary and no new label —
+/// and no new cardinality — is introduced.
+///
+/// The line beside it carries the same identity fields as the hit line, at
+/// `warn`: the error is real, but it is somebody else's error, so it must not be
+/// mistaken for a second failing encode in the log.
+fn record_coalesced_failure(
+    media_id: u64,
+    seg_index: u32,
+    opts: &SegmentOpts,
+    class: JobClass,
+    err: &HlsCacheError,
+) {
+    let reason = failure_reason(err);
+    record_segment_failure(SegmentOutcome::CoalescedFailed, reason, class);
+    tracing::warn!(
+        media.id = media_id,
+        seg = seg_index,
+        class = class.label(),
+        reason,
+        error = %err,
+        codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
+        burn = opts.burn_subtitle_stream_index.is_some(),
+        burn_idx = opts.burn_subtitle_stream_index,
+        audio_idx = opts.audio_source_stream_index,
+        seek_secs = opts.window.start_seconds(),
+        "hls segment request failed with the encode it coalesced onto"
+    );
 }
 
 /// Which of the two hit paths served a cached segment. Bounded label (two
@@ -1006,7 +1057,17 @@ impl HlsSegmentCache {
             }
         };
 
-        let bytes = outcome.map_err(|e| shared_copy(&e))?;
+        let bytes = match outcome {
+            Ok(b) => b,
+            Err(e) => {
+                if !driving {
+                    // Symmetry: the success half of this path records a hit per
+                    // waiter, so the failure half records a failure per waiter.
+                    record_coalesced_failure(media_id, seg_index, opts, class, &e);
+                }
+                return Err(shared_copy(&e));
+            }
+        };
         if !driving {
             // Served by somebody else's encode. This is a hit — it costs a wait
             // but no work — and it is the successor to the old `post_lock` path.
@@ -3270,6 +3331,96 @@ mod tests {
         );
     }
 
+    /// V91 symmetry, failure half. One failed encode is returned to N waiters
+    /// while `pharos_segment_produced_total` increments ONCE, so the counter a
+    /// segment-failure alert reads undercounts client-visible failures by the
+    /// coalescing factor and nothing says how many requests one bad encode took
+    /// down. `outcome="coalesced_failed"` is that missing count.
+    #[test]
+    fn a_request_failed_by_the_encode_it_joined_is_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(11, 5, None, None, &opts);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let tx = seed_inflight(&cache, key);
+                let waiter = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(11, 5, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                finish_seeded_driver(
+                    &cache,
+                    key,
+                    tx,
+                    Err(Arc::new(HlsCacheError::Transcode("ffmpeg exploded".into()))),
+                );
+                let err = waiter
+                    .await
+                    .unwrap()
+                    .expect_err("the joined encode failed, so this request must fail");
+                assert!(
+                    matches!(&err, HlsCacheError::Transcode(m) if m.contains("ffmpeg exploded")),
+                    "the driver's error must reach the waiter intact: {err:?}"
+                );
+            })
+        });
+
+        let failure = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_segment_produced_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                if !labels.contains(&"outcome=coalesced_failed".to_string()) {
+                    return None;
+                }
+                Some((labels, v))
+            });
+
+        let (labels, value) = failure.expect(
+            "a request failed by the encode it coalesced onto must emit \
+             pharos_segment_produced_total{outcome=coalesced_failed} — without it one \
+             failed encode counts once no matter how many clients it took down",
+        );
+        for want in [
+            "outcome=coalesced_failed",
+            "reason=transcode",
+            "class=interactive",
+        ] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing label {want}; got {labels:?}"
+            );
+        }
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one coalesced failure, got {value:?}"
+        );
+    }
+
     /// A driver task dropped before its FIRST poll must still deregister.
     ///
     /// Runtime shutdown does exactly this, and a guard constructed INSIDE the
@@ -3539,6 +3690,7 @@ mod tests {
             SegmentOutcome::Empty,
             SegmentOutcome::Failed,
             SegmentOutcome::Shed,
+            SegmentOutcome::CoalescedFailed,
         ];
         for o in all {
             match o {
@@ -3546,11 +3698,15 @@ mod tests {
                 | SegmentOutcome::Short
                 | SegmentOutcome::Empty
                 | SegmentOutcome::Failed
-                | SegmentOutcome::Shed => {}
+                | SegmentOutcome::Shed
+                | SegmentOutcome::CoalescedFailed => {}
             }
         }
         let labels: Vec<&str> = all.iter().map(|o| o.label()).collect();
-        assert_eq!(labels, vec!["ok", "short", "empty", "failed", "shed"]);
+        assert_eq!(
+            labels,
+            vec!["ok", "short", "empty", "failed", "shed", "coalesced_failed"]
+        );
         let mut uniq = labels.clone();
         uniq.sort_unstable();
         uniq.dedup();
