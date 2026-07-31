@@ -997,6 +997,10 @@ async fn build_transcode_scheduler(
     detected: &[pharos_transcode::HwAccel],
     hw_session_cap: usize,
     probe_caps: bool,
+    // 006 phase 2b's kill switch, straight from `[server]`. False returns
+    // speculative work to shed-not-queue without touching the interactive
+    // queue — see `SchedConfig::queue_background`.
+    queue_background: bool,
 ) -> Option<(
     pharos_transcode::scheduler::TranscodeScheduler,
     Vec<(pharos_transcode::HwAccel, pharos_transcode::VideoCodec)>,
@@ -1098,7 +1102,10 @@ async fn build_transcode_scheduler(
         TranscodeScheduler::spawn(
             table,
             std::sync::Arc::new(ProcSpawner::new()),
-            SchedConfig::default(),
+            SchedConfig {
+                queue_background,
+                ..SchedConfig::default()
+            },
         ),
         hw_codecs,
         hw_session_budget,
@@ -1197,6 +1204,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 &detected,
                 cfg.server.transcode_hw_session_cap,
                 cfg.server.transcode_probe_caps,
+                cfg.server.transcode_queue_background,
             )
             .await
             {

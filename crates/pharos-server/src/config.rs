@@ -295,6 +295,22 @@ pub struct ServerConfig {
     /// instead of guessing. Default true.
     #[serde(default = "default_true")]
     pub transcode_probe_caps: bool,
+    /// May speculative transcode work WAIT for a device permit (006 phase 2b)?
+    ///
+    /// True — the default — lets a refused prefetch enter the scheduler's queue
+    /// and be reconsidered, by how close it is to the viewer, on every freed
+    /// permit (V58): served late beats never, which is what stops the loser of
+    /// a two-viewer race taking a cold miss on every segment. False restores
+    /// the rule that preceded it: refused speculation is shed at the door.
+    ///
+    /// It is here because that reversal was made against an invariant written
+    /// after a production outage (B108). If deep queues of speculation turn out
+    /// to hurt a real deployment, this is the way back — a config flip, not a
+    /// rollback. It touches speculation ONLY: client requests still queue, the
+    /// learned admission controller still runs, and the segment cache's
+    /// shared-result single-flight is unaffected.
+    #[serde(default = "default_true")]
+    pub transcode_queue_background: bool,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.
