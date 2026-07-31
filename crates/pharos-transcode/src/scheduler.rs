@@ -973,6 +973,32 @@ const MAX_TRACKED_STREAMS: usize = 256;
 /// the map can be written in request order rather than in completion order; that
 /// is a strictly larger change ([`JobHint`] gains a field at every construction
 /// site) and it is not what T109 is about.
+///
+/// That gap has two further consequences on this stream while the rewind
+/// holds. Both are benign; neither is a reason to close the gap early.
+///
+/// First, a WIDER staleness-immunity grant than a miss-driven reading ever
+/// gave: with the reading stuck at the pre-rewind position, every later
+/// `Background` submission on the stream reads as
+/// `submitted_behind_a_known_playhead` and is therefore immune to
+/// `reap_stale` and never chosen by eviction (magnitude 0 is never the
+/// `max_by_key` winner). Not a clog — those jobs are exactly what the viewer
+/// wants next, so they dispatch first and leave immediately — but it is a
+/// broader immunity grant than the old reading produced, for as long as the
+/// stale-high reading stands.
+///
+/// Second, one case is genuinely WORSE than before, not merely differently
+/// ranked: the forward prefetch queued just ahead of where the rewind lands
+/// (segments 141-146, say) now ranks by `abs` against the stale-high reading
+/// at magnitude 1-6, instead of the ~21-26 a lagging, miss-driven reading
+/// used to give it. Ranking closer to the front of the queue means the
+/// scheduler dispatches that work — segments the viewer just abandoned by
+/// rewinding — SOONER than it did before this reading existed. It is a
+/// sub-second misallocation of one permit, self-healing the moment the
+/// viewer's genuine position outruns the cached region and a real miss
+/// corrects the reading, but it IS a worse outcome in this one shape, not a
+/// no-op: "no consumer changes verdict" describes a ranking claim, and the
+/// ranking is exactly what changes here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlayheadMotion {
     /// A client's own request: the reading follows it, forwards or backwards.
