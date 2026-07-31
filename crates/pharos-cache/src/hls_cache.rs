@@ -4003,6 +4003,23 @@ mod tests {
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
+                // The file appearing is not the last thing the driver does. It
+                // renames, reads the bytes back and only THEN records the
+                // outcome, so leaving the runtime the instant the path exists
+                // races the counter this test goes on to assert — and the local
+                // recorder is torn down with the closure, so the increment
+                // lands nowhere. Wait for the observable actually being
+                // asserted, not for a proxy that precedes it.
+                while produced_series(&snapshotter, "ok").is_none() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the segment was published but no production attempt was \
+                         ever counted: pharos_segment_produced_total must partition \
+                         attempts (V128), so a published segment with no arm is a \
+                         hole in the partition"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
             })
         });
 
