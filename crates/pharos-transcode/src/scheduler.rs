@@ -628,6 +628,23 @@ pub struct SchedConfig {
     /// allowance starves it just as completely — it merely starves it in the
     /// queue rather than at the door.
     pub admission: AdmissionConfig,
+    /// Master switch for 006 phase 2b: may speculative work WAIT for a permit?
+    ///
+    /// `true` — the shipped behaviour — lets a `Background` job that cannot be
+    /// dispatched enter `pending` and be reconsidered, by urgency, on every
+    /// freed permit (V58). `false` restores the rule that preceded it: refused
+    /// speculation is SHED (`SchedError::Busy`) at the door and never queued.
+    ///
+    /// It exists because phase 2b deliberately reverses an invariant that was
+    /// written in response to a production outage (B108), on a server people
+    /// actually watch. `pending_cap = 0` is not the same lever and must not be
+    /// used as one: it sheds INTERACTIVE jobs too, so a client segment comes
+    /// back as a 500 rather than as a cold miss. This turns the queue off for
+    /// speculation ALONE — the interactive queue, the admission controller
+    /// (V125/V126) and the shared-result registry are untouched — so a
+    /// regression found in production costs a config flip, not a revert of
+    /// thirty-odd commits.
+    pub queue_background: bool,
 }
 
 impl Default for SchedConfig {
@@ -639,6 +656,7 @@ impl Default for SchedConfig {
             max_retries: 3,
             background_headroom: 1,
             admission: AdmissionConfig::default(),
+            queue_background: true,
         }
     }
 }
@@ -1848,6 +1866,29 @@ fn background_admission(state: &SchedState, candidates: &[DeviceId]) -> Backgrou
 /// `pending_cap` is still a hard stop on the queue's SIZE — it never grows past
 /// it. What changes when it is reached is WHICH job goes: see below.
 fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
+    // Phase 2b's kill switch. With `queue_background` off, speculative work
+    // returns to the rule that preceded it — shed at the door, never parked —
+    // while the Interactive queue below carries on unchanged. This is the ONE
+    // place a `Background` job can enter `pending`, on either the arrival or
+    // the retry path, so refusing here is sufficient: with the switch off
+    // `pending` holds no speculative job, and the drain's requeue arms are
+    // therefore unreachable rather than merely unused.
+    //
+    // Deliberately not expressed as `pending_cap = 0`, which looks like the
+    // same lever and is not: that sheds INTERACTIVE jobs too, so a segment a
+    // browser is waiting for comes back as a 500 instead of as a cold miss.
+    if !state.cfg.queue_background && ctx.class == JobClass::Background {
+        tracing::debug!(
+            %job_id,
+            stream = ctx.stream.0,
+            segment = ctx.segment,
+            pending = state.pending.len(),
+            "speculative transcode shed: background queueing is disabled"
+        );
+        record_queue_outcome(&ctx, QueueOutcome::Shed);
+        let _ = ctx.reply.send(Err(SchedError::Busy));
+        return;
+    }
     if state.pending.len() < state.cfg.pending_cap {
         state.pending.push_back((job_id, ctx));
         return;
@@ -7214,6 +7255,89 @@ mod tests {
             1,
             "exactly one unknown job must have made way, not both and not \
              neither: {outcomes:?}"
+        );
+    }
+
+    /// The kill switch for phase 2b, exercised in its OFF state.
+    ///
+    /// Letting speculative work wait for a permit reverses a rule that was
+    /// written in response to a production outage (B108). The reversal is
+    /// argued and guarded, but it runs on a server people watch, so there has
+    /// to be a way back that is not a revert of thirty-odd commits.
+    ///
+    /// Both halves are asserted, and the second is the one that makes this a
+    /// switch rather than a bigger hammer: with it off, speculation is shed at
+    /// the door exactly as it was before phase 2b, AND a client's request still
+    /// queues and is still served. `pending_cap = 0` — the only lever that
+    /// existed before this — fails that second half: it sheds Interactive jobs
+    /// too, so a video segment comes back as a 500 rather than as a cold miss.
+    #[tokio::test]
+    async fn background_queueing_can_be_turned_off_without_shedding_clients() {
+        let spawner = Arc::new(VariableSpawner(Arc::new(
+            |spec: &JobSpec| match job_name(spec).as_str() {
+                "blocker" => Duration::from_millis(300),
+                _ => Duration::from_millis(20),
+            },
+        )));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                // Generous, so nothing here is refused for want of queue SIZE:
+                // whatever is shed is shed by the switch alone.
+                pending_cap: 64,
+                background_headroom: 0,
+                queue_background: false,
+                ..SchedConfig::default()
+            },
+        );
+        let stream = StreamKey::of("viewer");
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
+                    },
+                )
+                .await
+            })
+        };
+
+        // The one permit is taken for the whole test by a client's segment.
+        let blocker = submit("blocker", JobClass::Interactive, 100);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // A guess arriving at a busy pool, and a client's own next segment
+        // arriving right behind it.
+        let guess = submit("guess", JobClass::Background, 101);
+        let client = submit("client", JobClass::Interactive, 102);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // The guess is already resolved — shed, not parked — while the client
+        // is still waiting its turn in the queue the switch left alone.
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            (queued.pending_background, queued.pending_interactive),
+            (0, 1),
+            "with background queueing off, `pending` must hold the client's \
+             segment and no speculation at all"
+        );
+
+        let guess = guess.await.unwrap();
+        assert!(
+            matches!(guess, Err(SchedError::Busy)),
+            "the switch must return speculation to shed-not-queue: {guess:?}"
+        );
+        blocker.await.unwrap().expect("the client's first segment");
+        client.await.unwrap().expect(
+            "turning the speculative queue off must not shed clients — that is \
+             the difference between this switch and pending_cap = 0",
         );
     }
 
