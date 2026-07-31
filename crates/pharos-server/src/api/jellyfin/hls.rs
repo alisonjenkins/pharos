@@ -2663,9 +2663,17 @@ fn spawn_one_prefetch(
     o.burn_subtitle_stream_index = wanted_burn;
     // actix arbiter spawn: the future awaits I/O + the scheduler channel
     // (the encode runs in the transcode worker pool, not here), so it
-    // yields the worker immediately and never blocks request handling. The
-    // handle is returned so the caller can register it for session-scoped
-    // cancellation (episode swap / stop) — see PrefetchRegistry.
+    // yields the worker immediately and never blocks request handling.
+    //
+    // The handle is returned so the caller can register it for session-scoped
+    // cancellation (episode swap / stop) — see PrefetchRegistry. Aborting it
+    // drops this task's `segment_bytes_keyed` future, and so the only receiver
+    // it holds on the segment's shared-result registration; the segment cache
+    // stops the ENCODE when the last such receiver goes
+    // (`await_last_requester_gone`), which is what closes the scheduler job's
+    // `oneshot` and gets it collected as `QueueOutcome::Abandoned` (V58). The
+    // encode survives an abort while any OTHER requester is still waiting on
+    // the same segment, which is the point of the shared result.
     actix_web::rt::spawn(async move {
         // Gate for THIS segment's window (sparse tracks flip burn on/off
         // between segments; the cache key follows the burn index).

@@ -12,12 +12,22 @@
 //! slots (and, on a single-GPU box, delaying the NEW episode's first segments).
 //!
 //! This registry gives prefetch a cancellation handle scoped to the
-//! `PlaySessionId`. Aborting a task drops its `segment_bytes_keyed().await`
-//! (the fill is caller-driven under a per-key lock), which drops the scheduler
-//! `submit()` future — so a queued job is skipped via the existing mechanism and
-//! a running one finishes quickly. Cancellation fires on a media switch
-//! (`register` with a new media for the same session) and on session stop
-//! (`cancel`, from `DELETE /Videos/ActiveEncodings`).
+//! `PlaySessionId`. Cancellation fires on a media switch (`register` with a new
+//! media for the same session) and on session stop (`cancel`, from `DELETE
+//! /Videos/ActiveEncodings`).
+//!
+//! What an abort reaches, and how, changed in 006 phase 2a and had to be put
+//! back. The fill was once caller-driven under a per-key lock, so dropping
+//! `segment_bytes_keyed().await` dropped the scheduler `submit()` with it. Once
+//! the encode moved to a DETACHED driver, the abort dropped only the WAITER —
+//! the `oneshot` lived on inside the driver, `reply.is_closed()` was false for
+//! every abandoned prefetch, and this file's entire purpose quietly stopped
+//! working. The segment cache now stops an encode when the last REQUESTER's
+//! receiver drops (`hls_cache::await_last_requester_gone`), which is what an
+//! abort here produces, so the chain is whole again: abort -> waiter dropped ->
+//! last receiver gone -> `produce_segment` future dropped -> `submit()` dropped
+//! -> `QueueOutcome::Abandoned`. An encode any OTHER session is still waiting on
+//! is untouched, which is the shared result working as intended.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
