@@ -70,23 +70,40 @@ impl JobClass {
 ///
 /// Spec 003 pins such a rendition to ONE device because its segments all decode
 /// under a single init (V80); `pharos_transcode_pin_total{outcome}` is how that
-/// guarantee is observed rather than merely asserted. The three variants are
-/// exhaustive over the shared-init path, so they sum to the number of
-/// shared-init jobs placed — a bucket that stops adding up means a branch is
-/// resolving devices without saying so.
+/// guarantee is observed rather than merely asserted.
+///
+/// `Followed` and `Unresolved` are recorded exactly once per job, at the point
+/// it is actually DISPATCHED (`record_placement`'s call site) — not every time
+/// `candidates_for` examines it. A queued pinned job is re-examined on every
+/// drain pass while it waits, so recording at examination time counted
+/// attempts, not jobs: the denominator inflated without bound under
+/// saturation, which is exactly when this counter is read. `Invalidated` is
+/// recorded immediately inside `candidates_for` instead, because it IS the
+/// terminal decision there — the job fails right then rather than being
+/// placed at all, so there is no later dispatch point to defer to. A
+/// shared-init job that is still queued, or that reaches a terminal failure
+/// for a reason unrelated to the pin (load shed, retries exhausted on an
+/// excluded device), records nothing here by design: this counter answers
+/// "how did the pin resolve for jobs that reached a decision", not "what
+/// happened to every shared-init job ever submitted" — those other outcomes
+/// are covered by `SchedError::Busy`/`Failed` and `ctx.last_error`.
 ///
 /// `Invalidated` is the one to alert on: it means a rendition's device went
 /// unavailable mid-stream and the request was FAILED rather than spilled onto
 /// a second encoder, which is a visible stall for the viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinOutcome {
-    /// The rendition resolved to an eligible device and was placed on it.
+    /// The rendition resolved to an eligible device and the job was placed on
+    /// it. Recorded once, at actual dispatch — see the enum docs.
     Followed,
     /// The resolved device was not eligible (cooldown / excluded), so the
     /// request failed rather than mixing encoders under one init (#114).
+    /// Recorded immediately: this IS the terminal outcome, there is no later
+    /// dispatch to defer to.
     Invalidated,
-    /// No device could be resolved for the rendition at all; placement falls
-    /// through to the normal load-balanced path.
+    /// No device could be resolved for the rendition at all, so placement fell
+    /// through to the normal load-balanced path and the job was placed there.
+    /// Recorded once, at actual dispatch — see the enum docs.
     Unresolved,
 }
 
@@ -1669,12 +1686,21 @@ fn record_placement(
 /// speculative, so once speculative work could queue at all, the drain path
 /// became the DOMINANT producer of fMP4 segments — every one of them able to
 /// spill. The pin therefore lives here, where neither path can forget it.
+///
+/// This runs on EVERY examination of a job, including a queued job
+/// re-examined on each drain pass — so it does not itself record `Followed` /
+/// `Unresolved` (see [`PinOutcome`]'s docs). It returns the outcome the pin
+/// resolved to instead, and the caller records it only if this examination
+/// ends in an actual dispatch. `Invalidated` is the exception: it IS terminal
+/// here (the job fails and never reaches a dispatch point), so it is recorded
+/// immediately, same as before.
 fn candidates_for(
     state: &SchedState,
     job_id: JobId,
     ctx: &JobCtx,
     full_eligible: &[DeviceId],
-) -> Result<SmallVec<[DeviceId; 5]>, SchedError> {
+) -> Result<(SmallVec<[DeviceId; 5]>, Option<PinOutcome>), SchedError> {
+    let mut pin_outcome = None;
     let pinned = if crate::device::shared_init_fmp4(&ctx.opts) {
         let key = crate::options::RenditionKey::new(&ctx.input, &ctx.opts);
         match state.devices.rendition_device(&ctx.opts, key.value()) {
@@ -1691,7 +1717,7 @@ fn candidates_for(
                         "rendition device {d} unavailable; refusing to mix encoders under one init"
                     ))));
                 }
-                PinOutcome::Followed.record();
+                pin_outcome = Some(PinOutcome::Followed);
                 Some(d)
             }
             None => {
@@ -1699,7 +1725,7 @@ fn candidates_for(
                 // total: `followed + invalidated` was always short by however
                 // many shared-init jobs resolved to no device, and there was no
                 // way to tell that from the metric.
-                PinOutcome::Unresolved.record();
+                pin_outcome = Some(PinOutcome::Unresolved);
                 None
             }
         }
@@ -1707,7 +1733,7 @@ fn candidates_for(
         None
     };
     // A pinned rendition has exactly one candidate and never widens.
-    Ok(match pinned {
+    let candidates = match pinned {
         Some(d) => full_eligible
             .iter()
             .copied()
@@ -1718,7 +1744,8 @@ fn candidates_for(
             .copied()
             .filter(|d| !ctx.excluded.contains(d))
             .collect(),
-    })
+    };
+    Ok((candidates, pin_outcome))
 }
 
 /// Try to dispatch `ctx` to its best eligible device; queue if all
@@ -1740,8 +1767,10 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         return;
     }
     // Candidate devices = eligible minus already-tried, with the shared-init
-    // fMP4 pin applied. See `candidates_for`.
-    let candidates = match candidates_for(state, job_id, &ctx, &full_eligible) {
+    // fMP4 pin applied. See `candidates_for`. `pin_outcome` is only recorded
+    // if THIS examination ends in an actual dispatch below — see
+    // `PinOutcome`'s docs.
+    let (candidates, pin_outcome) = match candidates_for(state, job_id, &ctx, &full_eligible) {
         Ok(c) => c,
         Err(e) => {
             let _ = ctx.reply.send(Err(e));
@@ -1816,6 +1845,14 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             continue;
         }
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
+            // This examination is ending in an actual dispatch — the one
+            // point `Followed`/`Unresolved` are recorded (see `PinOutcome`'s
+            // docs). A job that only queues here never reaches this line, so
+            // a queued pinned job re-examined on later drains is not
+            // double-counted.
+            if let Some(outcome) = pin_outcome {
+                outcome.record();
+            }
             let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
@@ -1958,7 +1995,10 @@ fn try_place_no_queue(
     // into cooldown while the job waited) fails the request here exactly as it
     // does on arrival, rather than falling back to the queue: a stall the
     // client recovers from beats a segment no client can decode.
-    let candidates = match candidates_for(state, job_id, &ctx, &full_eligible) {
+    // `pin_outcome` is only recorded if THIS examination ends in an actual
+    // dispatch below — a queued pinned job re-examined on every drain must
+    // not record `Followed` once per examination (see `PinOutcome`'s docs).
+    let (candidates, pin_outcome) = match candidates_for(state, job_id, &ctx, &full_eligible) {
         Ok(c) => c,
         Err(e) => {
             let _ = ctx.reply.send(Err(e));
@@ -2011,6 +2051,11 @@ fn try_place_no_queue(
             continue;
         }
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
+            // Same rule as `place`: only an examination that actually
+            // dispatches records the pin outcome.
+            if let Some(outcome) = pin_outcome {
+                outcome.record();
+            }
             let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
@@ -2996,6 +3041,151 @@ mod tests {
             ALL.len(),
             "pin outcome labels collide: {labels:?} — a folded bucket reports a \
              broken pin as a healthy one"
+        );
+    }
+
+    /// `candidates_for` runs on every examination of a queued job, including
+    /// every drain pass while it waits for its pinned device — but
+    /// `pharos_transcode_pin_total{outcome="followed"}` must count JOBS
+    /// placed, not examinations. Before the fix, `Followed` was recorded
+    /// inside `candidates_for` itself, so a pinned job queued behind its busy
+    /// device inflated the counter once per drain it survived — unboundedly
+    /// under saturation, exactly when the counter is read to verify the pin.
+    ///
+    /// The shape: pin the job to a single-permit GPU, hold that GPU busy for
+    /// the whole test, and drive several SEPARATE drains (one per completed
+    /// CPU job) while the pinned job sits in `pending` and is re-examined on
+    /// each one. Only when the GPU finally frees does the job actually
+    /// dispatch. `followed` must read exactly 1, not one per drain.
+    #[test]
+    fn a_pinned_job_examined_across_several_drains_records_followed_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+                // One GPU permit (what the CMAF job is pinned to), three CPU
+                // permits (unrelated jobs whose completions drive drains).
+                let spawner =
+                    Arc::new(VariableSpawner(Arc::new(
+                        |spec: &JobSpec| match job_name(spec).as_str() {
+                            "hold-gpu" => Duration::from_millis(220),
+                            _ => Duration::from_millis(15),
+                        },
+                    )));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[(gpu, 1)], 3),
+                    spawner,
+                    SchedConfig::default(),
+                );
+
+                // Holds the GPU (and with it the pin's only candidate) for
+                // the whole test.
+                let hold = {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from("/m/hold-gpu"),
+                            h264(),
+                            file_sink(),
+                            JobClass::Interactive,
+                            JobHint::default(),
+                        )
+                        .await
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                // Queues behind the busy pinned device — this submission is
+                // one examination (via `place`) on its own.
+                let probe = {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from("/m/probe"),
+                            cmaf(),
+                            file_sink(),
+                            JobClass::Interactive,
+                            JobHint::default(),
+                        )
+                        .await
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let snap = s.snapshot().await.expect("snapshot");
+                assert_eq!(
+                    snap.pending, 1,
+                    "precondition: the pinned job must be queued behind its \
+                     busy device, not placed or failed"
+                );
+
+                // Each of these lands on a free CPU permit while the GPU is
+                // still held by `hold-gpu`, and each completion drives its
+                // own `drain_pending` — which re-examines the still-queued
+                // pinned job (calls `candidates_for` again) without being
+                // able to place it (its only candidate, the GPU, has no free
+                // permit). Three sequential completions here means at least
+                // three more examinations beyond the initial submission.
+                for tag in ["cpu-1", "cpu-2", "cpu-3"] {
+                    let s2 = s.clone();
+                    s2.submit(
+                        PathBuf::from(format!("/m/{tag}")),
+                        h264(),
+                        file_sink(),
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await
+                    .expect("cpu job");
+                }
+
+                hold.await.unwrap().expect("gpu blocker");
+                let done = probe
+                    .await
+                    .unwrap()
+                    .expect("the pinned job must eventually dispatch");
+                assert_eq!(
+                    done.device, gpu,
+                    "must still land on the pinned device, not spill"
+                );
+            })
+        });
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_pin_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                if labels.contains(&"outcome=followed".to_string()) {
+                    Some(v)
+                } else {
+                    None
+                }
+            });
+        let value = found.expect(
+            "pharos_transcode_pin_total{outcome=\"followed\"} must be recorded \
+             for the one pinned job that dispatched",
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "a pinned job re-examined across several drains must record \
+             `followed` exactly ONCE, at actual dispatch — not once per \
+             examination; got {value:?}"
         );
     }
 
