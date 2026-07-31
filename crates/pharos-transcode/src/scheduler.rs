@@ -637,8 +637,16 @@ fn note_playhead(state: &mut SchedState, stream: StreamKey, segment: u32) {
 /// distance 6 may now be distance 1 — the most urgent thing in the queue — or
 /// already passed, and a frozen value gets both cases backwards.
 ///
-/// `i64` so "already passed" is representable. Jobs with no stream or no segment
-/// sort last: nothing is known to be about to need them.
+/// `i64` so "already passed" is REPRESENTABLE — and representable is all it is.
+/// A negative distance is not a small distance, it is a segment the viewer went
+/// past while the job sat in the queue, so ordering by this value alone gets the
+/// second case backwards too: `-5` would sort ahead of `1`, the segment they
+/// actually need next. Ranking is `next_to_dispatch`'s job and it sorts passed
+/// work behind everything; nothing else may compare these values raw.
+///
+/// Jobs with no stream or no segment return `i64::MAX`: nothing is known to be
+/// about to need them, so they sort behind all useful work — but still ahead of
+/// work that is known to be useless.
 fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
     let (Some(seg), Some((head, _))) = (ctx.segment, state.playheads.get(&ctx.stream)) else {
         return i64::MAX;
@@ -1413,6 +1421,27 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
 /// queue — or already passed. Freezing urgency at submit time ranks both cases
 /// exactly backwards, so the distance is never cached on the job.
 ///
+/// Work the viewer has ALREADY PASSED sorts behind work they have not, which is
+/// why the key carries `distance < 0` before the magnitude rather than the
+/// signed distance. Ascending signed order puts `-5` — a segment abandoned while
+/// the job waited — ahead of `1`, the segment the client needs next, so stale
+/// speculation would systematically preempt exactly the work this ordering
+/// exists to serve, wasting a permit AND delaying the useful job. Under
+/// saturation, the only condition where the queue is non-trivial at all,
+/// playheads outrun the queue routinely, so this is the common case and not an
+/// edge. `reply.is_closed()` does not cover it: only a seek or a track swap
+/// aborts a prefetch task, and a playhead advancing past a segment does neither.
+///
+/// Clamping to zero (`distance.max(0)`) would NOT do: it collapses every passed
+/// job onto the same key as distance 0, the segment the viewer is standing on,
+/// and `min_by_key` breaks that tie by arrival — so the stale job, which arrived
+/// first by construction, would still win. Only ordering passed work as its own
+/// band gets it behind ALL live work.
+///
+/// Within the passed band, nearest-to-the-playhead first (`abs`): none of it is
+/// known to be wanted, but `-1` is the likelier of the two to be asked for again
+/// than `-30`.
+///
 /// O(n) over `pending_cap` (256) rather than a heap: every key moves whenever
 /// any client advances, so a heap would be re-keyed far more often than popped.
 fn next_to_dispatch(state: &SchedState) -> Option<usize> {
@@ -1421,8 +1450,14 @@ fn next_to_dispatch(state: &SchedState) -> Option<usize> {
         .iter()
         .enumerate()
         .min_by_key(|(idx, (_, ctx))| match ctx.class {
-            JobClass::Interactive => (0i64, *idx as i64),
-            JobClass::Background => (1i64, lookahead_distance(state, ctx)),
+            JobClass::Interactive => (0i64, false, *idx as i64),
+            JobClass::Background => {
+                let d = lookahead_distance(state, ctx);
+                // `abs` cannot overflow: both operands are `u32`-derived, so `d`
+                // is bounded well inside `i64`, and `i64::MAX` (no playhead)
+                // maps to itself.
+                (1i64, d < 0, d.abs())
+            }
         })
         .map(|(idx, _)| idx)
 }
@@ -4605,6 +4640,103 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             "both viewers' next-needed segment must run before either viewer's \
              distant one, whatever order they were submitted in: {got:?}"
+        );
+    }
+
+    /// A viewer outruns their own prefetch, which under saturation is the
+    /// normal case rather than an edge — the queue only gets deep when encodes
+    /// are slower than playback, and that is exactly when a playhead passes
+    /// segments still sitting in it.
+    ///
+    /// `lookahead_distance` is signed so "already passed" is representable, and
+    /// ascending order on the raw value then ranks the most useless job in the
+    /// queue as the most urgent one: distance `-5` ahead of distance `1`, the
+    /// segment the client needs next. That spends a permit on bytes nobody will
+    /// fetch and delays the ones somebody will. Nothing else catches it —
+    /// `reply.is_closed()` only fires when a seek or a track swap aborted the
+    /// prefetch, and a playhead simply advancing does neither.
+    ///
+    /// Submission order is stale-first on purpose, so FIFO cannot produce the
+    /// expected order either. `distance.max(0)` cannot produce it either: it
+    /// would tie the stale job with distance 0 and hand it the tiebreak on
+    /// arrival.
+    #[tokio::test]
+    async fn work_the_viewer_has_already_passed_is_the_last_speculation_dispatched() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(120), move |_, spec| {
+            seen.lock().unwrap().push(job_name(spec));
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig::default(),
+        );
+        let stream = StreamKey::of("viewer");
+
+        // The client's own request occupies the one permit and puts the
+        // playhead at 100 — the only way a playhead is ever set.
+        let blocker = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/block"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint {
+                        stream,
+                        segment: Some(100),
+                    },
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // `stale` was queued for a segment the viewer has since gone past;
+        // `next` and `far` are one and ten ahead. Submitted stale-first.
+        let mut handles = Vec::new();
+        for (tag, seg) in [("stale", 95u32), ("next", 101), ("far", 110)] {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snap = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.pending_background, 3,
+            "precondition: all three must be waiting, or there is no order to rank"
+        );
+
+        blocker.await.unwrap().expect("the client's own segment");
+        for h in handles {
+            h.await.unwrap().expect("queued speculative work");
+        }
+        let got: Vec<String> = order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| *n != "block")
+            .cloned()
+            .collect();
+        assert_eq!(
+            got,
+            ["next", "far", "stale"],
+            "a segment the viewer already went past must not outrank the one \
+             they need next: {got:?}"
         );
     }
 
