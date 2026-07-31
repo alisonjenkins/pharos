@@ -1794,30 +1794,39 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
         })
         .map(|(idx, (_, c))| (idx, urgency_key(state, c, idx)))
         .max_by_key(|(_, key)| *key);
-    match victim {
-        Some((idx, worst)) if worst > mine => {
+    // The admission is inside the `Some` arm of the REMOVE, not after it. `idx`
+    // came from an enumeration of this same queue a few lines up and nothing
+    // has touched it since, so `None` is unreachable — but pushing regardless
+    // of what `remove` returned leaves "`pending` never exceeds `pending_cap`"
+    // resting on that argument rather than on the code, and the argument is the
+    // kind that survives a refactor by one line while the invariant does not.
+    // Structured so a job only ever takes a slot that was actually freed.
+    match victim.and_then(|(idx, worst)| {
+        (worst > mine)
             // `VecDeque::remove` preserves the order of everything else, so
             // Interactive arrival order — which `next_to_dispatch` breaks ties
             // on — survives an eviction from the middle of the queue.
-            if let Some((victim_id, victim_ctx)) = state.pending.remove(idx) {
-                tracing::debug!(
-                    job_id = %victim_id,
-                    class = %victim_ctx.class,
-                    stream = victim_ctx.stream.0,
-                    segment = victim_ctx.segment,
-                    distance = lookahead_distance(state, &victim_ctx),
-                    replaced_by = %job_id,
-                    replaced_by_class = %ctx.class,
-                    pending = state.pending.len(),
-                    input = %victim_ctx.input.display(),
-                    "speculative transcode evicted: a more urgent job arrived at a full queue"
-                );
-                record_queue_outcome(&victim_ctx, QueueOutcome::Evicted);
-                let _ = victim_ctx.reply.send(Err(SchedError::Busy));
-            }
+            .then(|| state.pending.remove(idx))
+            .flatten()
+    }) {
+        Some((victim_id, victim_ctx)) => {
+            tracing::debug!(
+                job_id = %victim_id,
+                class = %victim_ctx.class,
+                stream = victim_ctx.stream.0,
+                segment = victim_ctx.segment,
+                distance = lookahead_distance(state, &victim_ctx),
+                replaced_by = %job_id,
+                replaced_by_class = %ctx.class,
+                pending = state.pending.len(),
+                input = %victim_ctx.input.display(),
+                "speculative transcode evicted: a more urgent job arrived at a full queue"
+            );
+            record_queue_outcome(&victim_ctx, QueueOutcome::Evicted);
+            let _ = victim_ctx.reply.send(Err(SchedError::Busy));
             state.pending.push_back((job_id, ctx));
         }
-        _ => {
+        None => {
             tracing::debug!(
                 %job_id,
                 class = %ctx.class,
