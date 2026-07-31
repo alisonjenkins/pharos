@@ -1,8 +1,71 @@
 # 006-self-tuning-playback — measure the hardware instead of guessing it
 
-**Status**: designed 2026-07-31
+**Status**: designed 2026-07-31; **phase 1 shipped and validated in production
+2026-07-31**; phases 2a and 2b implemented, pending deploy.
 **Depends on**: B177/V125 (`background_alongside_client`, `peer_jobs`
 instrumentation), B108/V58 (`background_headroom`, defer-and-rank)
+
+## What shipped, and where it diverged from this design
+
+Phase 1 landed as PR #188 and was **measured on the deployment under real
+playback**, which is the only evidence that counts here:
+
+| signal | observed |
+|---|---|
+| `pharos_transcode_background_allowance{device="Nvenc:0"}` | **2** (floor is 1) |
+| `pharos_transcode_margin_total{verdict="met"}` | 1; no `missed`, no `ignored` |
+| interactive `encode_seconds` | 1.292 s against a 3.0 s deadline |
+| background | 22 encodes, mean 2.17 s |
+
+Both halves of the gate hold: the allowance climbed off the floor **while**
+interactive encode stayed well inside its deadline. The control law works on this
+hardware.
+
+Four divergences from the design above, each forced by something implementation
+found that the design did not know:
+
+1. **Promotion had to land BEFORE the queue, not after.** This document names
+   promotion as the insight that makes a queue safe; the implementation plan
+   sequenced it afterwards anyway. Without it, `register_or_join` coalesces an
+   interactive request onto a queued *Background* driver whose class is fixed at
+   registration, so the client waits at background tier behind every interactive
+   job including later arrivals, with no timeout. A different mechanism from
+   B108's lock, the same harm.
+2. **The allowance gauge is seeded at boot**, not on first observation. Scraping
+   the live pod found both controller series absent because the `metrics` crate
+   registers lazily and nothing had been played since the pod started — making
+   "not deployed", "deployed but idle" and "deployed but wedged" indistinguishable
+   from a dashboard. `margin_total` is deliberately NOT seeded: a counter starting
+   at zero would lie about traffic, while its absence correctly means no
+   observation was ever made.
+3. **Six queue outcomes, not four.** `dispatched` / `stale` / `evicted` / `shed`
+   did not account for every exit; `abandoned` and `failed` were added so the arms
+   partition jobs rather than approximately covering them. Counted once per job
+   (`retries == 0`) so every arm shares one denominator.
+4. **The shed/failure split needed a second value.** `coalesced_failed` initially
+   counted an inherited `SchedulerBusy` as an encode failure, which under a
+   prefetch storm would have made an alert fire on admission control working
+   correctly. `coalesced_shed` keeps the two sums disjoint.
+
+Three defects this work found in already-shipped behaviour, all of which would
+have been silent:
+
+- An interactive request coalescing onto a background driver inherited its
+  load-shed and reached the viewer as a **500 on a video segment** (B134 class,
+  now V127).
+- `try_place_no_queue` applied no shared-init fMP4 rendition pin, so a CMAF
+  rendition pinned to NVENC that queued could be handed the CPU on drain —
+  undecodable video served with a 200 (#114 / V80). Pre-existing, but this work
+  routed the deployment's dominant fMP4 producer through that path.
+- `place()` stamped peer counts at dispatch and the queue-drain path did not, so
+  the instrumentation was blind on the only path that runs when a device is
+  saturated (B178).
+
+New invariants: **V126** (a tunable that must know the hardware is a defect),
+**V127** (an outcome computed for one job's parameters must not be adopted as
+another job's answer), **V128** (counter arms must share a denominator).
+**V58**, **V80**, **V91** and **V125** were rewritten rather than left
+contradicting the code.
 
 ## The problem, measured
 
