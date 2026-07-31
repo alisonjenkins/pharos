@@ -1556,8 +1556,25 @@ impl HlsSegmentCache {
             } else {
                 class
             };
+            // A submission raised to Interactive by somebody else's arrival is
+            // made on THAT requester's behalf, and must not speak for this
+            // driver's stream — see `JobHint::on_behalf_of_a_joiner`. When the
+            // class did not move, this driver IS the requester and the hint is
+            // its own.
+            let submit_hint = if submit_class == class {
+                hint
+            } else {
+                hint.on_behalf_of_a_joiner()
+            };
             timing = match self
-                .write_segment(source, &attempt_opts, &tmp, submit_class, hint, &job_slot)
+                .write_segment(
+                    source,
+                    &attempt_opts,
+                    &tmp,
+                    submit_class,
+                    submit_hint,
+                    &job_slot,
+                )
                 .instrument(tracing::info_span!("write_segment"))
                 .await
             {
@@ -3785,32 +3802,44 @@ mod tests {
     }
 
     /// A scheduler whose worker writes a real segment file plus the
-    /// `-progress` sidecar the completeness check reads — and reports the FIRST
-    /// job short of video frames, so the driver retries under a new job id.
+    /// `-progress` sidecar the completeness check reads — and reports the
+    /// `short_at`-th job it sees short of video frames, so the driver retries
+    /// that one under a new job id.
     ///
     /// `holds_each_job` cannot express this: it writes nothing, so
     /// `read_progress` finds no sidecar, `short_of_frames` returns `None`, and
     /// the retry path is unreachable.
-    fn retries_the_first_encode(
+    ///
+    /// WHICH job comes back short is a parameter because a test may need to
+    /// establish some scheduler state — a stream's playhead, say — with a job
+    /// that simply succeeds before the one under observation arrives.
+    fn retries_the_nth_encode(
         attempts: Arc<std::sync::atomic::AtomicU64>,
+        short_at: u64,
     ) -> pharos_transcode::scheduler::TranscodeScheduler {
         use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerId};
         use pharos_transcode::scheduler::{
             RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
         };
 
-        struct Retrying(Arc<std::sync::atomic::AtomicU64>);
+        struct Retrying(Arc<std::sync::atomic::AtomicU64>, u64);
         impl WorkerSpawner for Retrying {
             fn spawn(&self, id: WorkerId) -> SpawnFuture {
                 let attempts = self.0.clone();
-                Box::pin(
-                    async move { Ok(Box::new(RetryWorker { id, attempts }) as Box<dyn Worker>) },
-                )
+                let short_at = self.1;
+                Box::pin(async move {
+                    Ok(Box::new(RetryWorker {
+                        id,
+                        attempts,
+                        short_at,
+                    }) as Box<dyn Worker>)
+                })
             }
         }
         struct RetryWorker {
             id: WorkerId,
             attempts: Arc<std::sync::atomic::AtomicU64>,
+            short_at: u64,
         }
         impl Worker for RetryWorker {
             fn id(&self) -> WorkerId {
@@ -3818,11 +3847,14 @@ mod tests {
             }
             fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
                 let attempts = self.attempts.clone();
+                let short_at = self.short_at;
                 Box::pin(async move {
                     let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    // The second attempt is the one under observation, so it
-                    // has to still be running when the snapshot is taken.
-                    let hold = if n == 0 {
+                    let short = n == short_at;
+                    // The attempt AFTER the short one is the one under
+                    // observation, so it has to still be running when the
+                    // snapshot is taken; the short one gets out of the way.
+                    let hold = if short {
                         std::time::Duration::from_millis(250)
                     } else {
                         std::time::Duration::from_millis(600)
@@ -3832,10 +3864,9 @@ mod tests {
                         return WorkerRunResult::Died;
                     };
                     let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
-                    // `frame=0` on the first attempt is "no video frames at
-                    // all" — ffmpeg exiting 0 having produced nothing, the
-                    // case the retry exists for.
-                    let frames = if n == 0 { 0 } else { 150 };
+                    // `frame=0` is "no video frames at all" — ffmpeg exiting 0
+                    // having produced nothing, the case the retry exists for.
+                    let frames = if short { 0 } else { 150 };
                     let _ = tokio::fs::write(
                         pharos_transcode::progress_sidecar_path(path),
                         format!("frame={frames}\nout_time_us=600000000\n"),
@@ -3848,7 +3879,7 @@ mod tests {
 
         TranscodeScheduler::spawn(
             pharos_transcode::device::DeviceTable::from_probe(&[], 4),
-            Arc::new(Retrying(attempts)),
+            Arc::new(Retrying(attempts, short_at)),
             pharos_transcode::scheduler::SchedConfig::default(),
         )
     }
@@ -4008,7 +4039,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let sched = retries_the_first_encode(attempts.clone());
+        let sched = retries_the_nth_encode(attempts.clone(), 0);
         let cache = Arc::new(cache.with_scheduler(sched.clone()));
         // Video, so `frame=0` is a shortfall rather than a legitimate
         // audio-only segment.
@@ -4071,6 +4102,120 @@ mod tests {
             .unwrap()
             .expect("the joiner gets the bytes too");
         assert_eq!(joined.len(), 256);
+    }
+
+    /// ...and the promoted re-submission must not drag the DRIVER'S viewer's
+    /// playhead forward with it.
+    ///
+    /// The retry is Interactive because somebody JOINED, and `note_playhead`
+    /// moves a stream's playhead on every interactive submission — but the
+    /// joiner is on a stream the segment cache cannot name, while the stream
+    /// the hint does name belongs to the speculative driver. Its viewer never
+    /// asked for this segment.
+    ///
+    /// The harm is concrete: viewer A standing at segment 100 prefetches 106,
+    /// anybody joins that guess, the retry declares A to be at 106 — and A's
+    /// own queued prefetch for 101–105 is instantly stale, reaped as such, so A
+    /// takes five cold misses before its next request drags the playhead back.
+    /// `promote_job` refuses to move the playhead for exactly this reason; the
+    /// re-submission is the same act arriving by another route.
+    #[tokio::test]
+    async fn a_promoted_retry_does_not_move_the_drivers_playhead() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Job 0 succeeds — it is only here to put a reading on the viewer's
+        // stream. Job 1, the speculative driver, is the one that comes back
+        // short and retries.
+        let sched = retries_the_nth_encode(attempts.clone(), 1);
+        let cache = Arc::new(cache.with_scheduler(sched.clone()));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let viewer = StreamKey::of("viewer-a");
+
+        // Viewer A asks for its own segment 100: an interactive submission, so
+        // the scheduler now knows where A stands.
+        cache
+            .segment_bytes_keyed(
+                50,
+                100,
+                None,
+                None,
+                Path::new("/no/source"),
+                &opts,
+                JobClass::Interactive,
+                viewer,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("the viewer's own segment");
+        let before = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            before.playheads.get(&viewer).copied(),
+            Some(100),
+            "precondition: the viewer's position must be known"
+        );
+
+        // A's prefetch runs six segments ahead of that...
+        let driver = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes_keyed(
+                    50,
+                    106,
+                    None,
+                    None,
+                    Path::new("/no/source"),
+                    &o,
+                    JobClass::Background,
+                    viewer,
+                    PlayheadSeed::Observes,
+                )
+                .await
+            })
+        };
+        // ...and somebody else turns out to want that segment now, promoting it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let joiner = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes_keyed(
+                    50,
+                    106,
+                    None,
+                    None,
+                    Path::new("/no/source"),
+                    &o,
+                    JobClass::Interactive,
+                    StreamKey::of("viewer-b"),
+                    PlayheadSeed::Observes,
+                )
+                .await
+            })
+        };
+        driver.await.unwrap().expect("the retry must succeed");
+        joiner
+            .await
+            .unwrap()
+            .expect("the joiner gets the bytes too");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "precondition: the priming job, the short attempt and its retry"
+        );
+
+        let after = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            after.playheads.get(&viewer).copied(),
+            Some(100),
+            "a submission made on a JOINER's behalf must not declare the \
+             driver's viewer to have reached the segment being guessed at — \
+             everything that viewer has queued between the two becomes stale"
+        );
     }
 
     /// The simplest thing the scheduler will place on the CPU: no video

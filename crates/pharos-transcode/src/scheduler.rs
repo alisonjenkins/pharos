@@ -415,6 +415,43 @@ pub struct JobHint {
     pub seeds_playhead: PlayheadSeed,
 }
 
+impl JobHint {
+    /// The same job, submitted on a JOINER's behalf rather than on the original
+    /// requester's — so it speaks for no stream at all.
+    ///
+    /// A speculative driver that acquires a client re-submits at the client's
+    /// tier, because a retry is a NEW job and a joiner promotes only once
+    /// (`InFlightSegment::promoted`). That submission is `Interactive`, and
+    /// `note_playhead` moves a stream's playhead on every interactive
+    /// submission — but the client that made it interactive is on a stream the
+    /// segment cache cannot name, while the stream this hint DOES name belongs
+    /// to the speculative driver, whose own viewer never asked for this
+    /// segment.
+    ///
+    /// Left alone, viewer A prefetching segment 106 while standing at 100 has
+    /// its OWN playhead jumped to 106 the moment anybody joins that guess: A's
+    /// queued prefetch for 101–105 is instantly stale, is reaped as such, and A
+    /// takes five cold misses before its next request drags the playhead back.
+    /// [`promote_job`] refuses to move the playhead for precisely this reason
+    /// ("a joiner is waiting on that segment, not standing on it"); a promoted
+    /// RE-submission is the same act reaching the actor by another route, and
+    /// has to obey the same rule.
+    ///
+    /// Dropping the stream is the whole answer rather than half of one. A
+    /// numbered segment with no stream ranks `i64::MAX`, which is read only
+    /// within the Background tier — and this job is Interactive: ranked FIFO
+    /// among clients, never a staleness candidate, never an eviction victim. The
+    /// shared-init device pin (V80) keys on `(input, opts)`, not on the stream,
+    /// so a pinned CMAF rendition still lands where its siblings did.
+    pub fn on_behalf_of_a_joiner(self) -> Self {
+        Self {
+            stream: StreamKey::NONE,
+            seeds_playhead: PlayheadSeed::Observes,
+            ..self
+        }
+    }
+}
+
 /// A live transcode output as a stream of muxed byte chunks. Boxed so the
 /// type stays platform-agnostic (the concrete unix worker stream lives in
 /// `worker::proc`). The stream owns the worker process + its device
