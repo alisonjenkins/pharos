@@ -943,13 +943,20 @@ impl AppState {
 
     /// T87 — every recorded (play-session, options) pair currently pointing
     /// at `media_id`.
-    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<SegmentOpts> {
+    ///
+    /// Returns the play-session id alongside the options rather than dropping
+    /// it. The caller warms segments for a specific member of a SyncPlay group,
+    /// and the scheduler ranks speculative work by how far ahead of a stream's
+    /// playhead it sits — work submitted with no stream sorts last forever, so
+    /// discarding the key here would put the segments a whole group is about to
+    /// need at the back of the queue.
+    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<(String, SegmentOpts)> {
         self.segment_opts_hints
             .lock()
             .map(|m| {
-                m.values()
-                    .filter(|(mid, _)| *mid == media_id)
-                    .map(|(_, o)| o.clone())
+                m.iter()
+                    .filter(|(_, (mid, _))| *mid == media_id)
+                    .map(|(psid, (_, o))| (psid.clone(), o.clone()))
                     .collect()
             })
             .unwrap_or_default()
