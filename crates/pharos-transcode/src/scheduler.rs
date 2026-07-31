@@ -1858,9 +1858,11 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
     // Evict the least urgent instead, by the same key that ranks dispatch
     // (`next_to_dispatch`) read at its maximum rather than its minimum. Same
     // key, so the queue cannot evict a job it would have been happy to
-    // dispatch, and so passed work — which eviction, running on ARRIVAL between
+    // dispatch, and so OUTRUN work — which eviction, running on ARRIVAL between
     // drains, sees before any drain has had the chance to drop it — is the
-    // first thing to go.
+    // first thing to go. Work aimed behind the playhead on PURPOSE is the last:
+    // same key, magnitude 0, which is the point of `urgency_key` reading its
+    // two ends rather than each site having its own opinion.
     //
     // Three rules make this a load-management decision rather than a lottery.
     // Only `Background` is a candidate: somebody is blocked on every
@@ -1973,11 +1975,35 @@ fn urgency_key(state: &SchedState, ctx: &JobCtx, arrival: usize) -> (i64, bool, 
             // The band is STALENESS, not sign: a job aimed behind the playhead
             // on purpose (the SyncPlay seek prewarm) is live work and must not
             // be ranked, or evicted, as a leftover. See `is_stale`.
+            let stale = is_stale(state, ctx);
+            // ...and keeping it out of the stale BAND is not enough on its own,
+            // because the magnitude decides everything within a band. A
+            // deliberate backward guess at −400 has magnitude 400 under `abs`
+            // — larger than every forward guess in the queue — so the seek
+            // target sorted behind all of them for dispatch (i.e. was encoded
+            // after the member had already arrived at it, defeating the feature
+            // without dropping anything) and was the preferred EVICTION victim
+            // for the next arrival with any smaller magnitude.
+            //
+            // A deliberate backward guess is a statement that the viewer is
+            // about to be there, which is IMMINENT, so it takes magnitude 0:
+            // dispatched first, evicted last. That is what the reasoning above
+            // always claimed and what the code now does.
+            //
+            // Only a passed job that survived `is_stale` can be here — outrun
+            // work is in the `true` band and swept before selection — so this
+            // arm is exactly "aimed behind the viewer on purpose". `i64::MAX`
+            // (no playhead) is not passed and keeps its ceiling, so genuinely
+            // unrankable work still sorts last.
             //
             // `abs` cannot overflow: both operands are `u32`-derived, so `d`
-            // is bounded well inside `i64`, and `i64::MAX` (no playhead)
-            // maps to itself.
-            (1, is_stale(state, ctx), d.abs())
+            // is bounded well inside `i64`, and `i64::MAX` maps to itself.
+            let magnitude = if has_been_passed(d) && !stale {
+                0
+            } else {
+                d.abs()
+            };
+            (1, stale, magnitude)
         }
     }
 }
@@ -2015,6 +2041,12 @@ fn urgency_key(state: &SchedState, ctx: &JobCtx, arrival: usize) -> (i64, bool, 
 /// Within the passed band, nearest-to-the-playhead first (`abs`): none of it is
 /// known to be wanted, but `-1` is the likelier of the two to be asked for again
 /// than `-30`.
+///
+/// A DELIBERATE backward guess is not in that band and is not ranked by its
+/// magnitude either: it takes magnitude 0, ahead of every forward guess. Its
+/// distance is large precisely because the seek is long, and reading that as
+/// "far away" dispatched the segment the group is about to land on after every
+/// speculative segment queued for anybody still playing.
 ///
 /// THIS function can no longer reach that band, and the honest statement of
 /// that belongs here rather than in a comment describing a live path. Stale
@@ -6469,6 +6501,183 @@ mod tests {
         assert!(
             got.contains(&"prewarm".to_string()),
             "the backward seek target must still reach an encoder: {got:?}"
+        );
+    }
+
+    /// Surviving the sweep is not the same as being ranked as live work.
+    ///
+    /// A deliberate backward guess at −400 has magnitude 400 under `abs`, which
+    /// is larger than every forward guess in the queue — so the seek target was
+    /// dispatched LAST among speculation, i.e. after the member had already
+    /// arrived at it. Nothing is dropped and no counter moves; the feature is
+    /// simply defeated. Magnitude 0 says what it means: the viewer is about to
+    /// be there, so it goes first.
+    ///
+    /// Two background jobs on the rewinder's own stream, because one cannot
+    /// show an ordering.
+    #[tokio::test]
+    async fn a_backward_prewarm_is_dispatched_before_the_forward_guesses_beside_it() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(400),
+                _ => Duration::from_millis(40),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let rewinder = StreamKey::of("rewinder");
+
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream: rewinder,
+                        segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
+                    },
+                )
+                .await
+            })
+        };
+
+        // The member is at 500 and its own request holds the only permit.
+        let blocker = submit("blocker", JobClass::Interactive, 500);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Its ordinary prefetch: the next segment it would play if the group
+        // had not just seeked. Distance +5.
+        let forward = submit("forward", JobClass::Background, 505);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The group seeks back to 100. Distance −400 — deliberately, and the
+        // segment the member will ask for first.
+        let prewarm = submit("prewarm", JobClass::Background, 100);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            queued.pending_background, 2,
+            "precondition: both guesses must be waiting behind the blocker, or \
+             nothing is ranked at all"
+        );
+
+        blocker.await.unwrap().expect("the member's own segment");
+        prewarm.await.unwrap().expect("the seek target");
+        forward.await.unwrap().expect("the ordinary guess");
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "prewarm", "forward"],
+            "the segment the group is about to land on must be encoded before \
+             a guess about a future the group has just cancelled: {got:?}"
+        );
+    }
+
+    /// ...and at a full queue it must be the LAST thing given up, not the
+    /// first.
+    ///
+    /// `queue_or_refuse` reads the same key at its maximum, and a deliberate
+    /// backward guess is not excluded from candidacy — its distance is −400,
+    /// not `i64::MAX`. Under `abs` it was therefore the preferred victim for
+    /// the next arrival with any smaller magnitude, and left as `evicted`.
+    /// Magnitude 0 makes it the least evictable speculative job present, which
+    /// is what "the viewer is about to be there" means at the other end of the
+    /// order.
+    #[tokio::test]
+    async fn a_full_queue_gives_up_a_forward_guess_before_a_backward_prewarm() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(500),
+                _ => Duration::from_millis(40),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        // One permit, room for two queued jobs.
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                pending_cap: 2,
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let rewinder = StreamKey::of("rewinder");
+
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream: rewinder,
+                        segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
+                    },
+                )
+                .await
+            })
+        };
+
+        // The member is at 500 and holds the only permit.
+        let blocker = submit("blocker", JobClass::Interactive, 500);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // The seek prewarm and one ordinary forward guess fill the queue.
+        let prewarm = submit("prewarm", JobClass::Background, 100);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let forward = submit("forward", JobClass::Background, 505);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A third guess arrives at a full queue, nearer than `forward` (+1) but
+        // still a guess about a future the group has cancelled. It may take
+        // `forward`'s slot; it may not take the seek target's.
+        let nearer = submit("nearer", JobClass::Background, 501);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            queued.pending_background, 2,
+            "precondition: the queue must be at its cap, never above it"
+        );
+
+        blocker.await.unwrap().expect("the member's own segment");
+        let evicted = forward.await.unwrap();
+        assert!(
+            matches!(evicted, Err(SchedError::Busy)),
+            "the forward guess must be the one given up: {evicted:?}"
+        );
+        prewarm
+            .await
+            .unwrap()
+            .expect("the segment the group is about to land on must survive a full queue");
+        nearer.await.unwrap().expect("the arrival that beat it");
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "prewarm", "nearer"],
+            "a full queue must keep the seek target: {got:?}"
         );
     }
 
