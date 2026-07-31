@@ -116,6 +116,112 @@ impl std::fmt::Display for JobClass {
     }
 }
 
+/// What happened to one [`TranscodeScheduler::promote`] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionOutcome {
+    /// The job was waiting for a permit and is now ranked as a client's.
+    Queued,
+    /// The job was already encoding; its class changed so it stops counting
+    /// against the speculative allowance on its device.
+    Inflight,
+    /// The job was already Interactive — a second requester arriving behind the
+    /// first, or a client joining a client.
+    AlreadyClient,
+    /// No such job: it finished (the joiner will get the published bytes
+    /// anyway) or the id names a submission the actor has already resolved.
+    Unknown,
+    /// A requester wanted to promote a driver that had not reached the
+    /// scheduler yet, and gave up waiting for it to. Distinct from `Unknown`
+    /// because it means the promotion never had a target, not that it missed
+    /// one — a non-zero rate here is the window in which a client can still
+    /// inherit a speculative tier.
+    Unassigned,
+}
+
+impl PromotionOutcome {
+    /// Stable metric-label string, same contract as [`PinOutcome::label`]:
+    /// these are the `outcome` label on `pharos_transcode_promotion_total`, so
+    /// a rename breaks dashboards silently and a collision would hide the case
+    /// that matters. Pinned by a test.
+    pub fn label(self) -> &'static str {
+        match self {
+            PromotionOutcome::Queued => "queued",
+            PromotionOutcome::Inflight => "inflight",
+            PromotionOutcome::AlreadyClient => "already_client",
+            PromotionOutcome::Unknown => "unknown",
+            PromotionOutcome::Unassigned => "unassigned",
+        }
+    }
+
+    /// Record this outcome. One call per promotion request, including the ones
+    /// that changed nothing: a promotion path that only counts its successes
+    /// cannot distinguish "no client ever joined speculative work" from "every
+    /// client that did arrived too late to name it".
+    pub fn record(self) {
+        metrics::counter!("pharos_transcode_promotion_total", "outcome" => self.label())
+            .increment(1);
+    }
+}
+
+/// Where the scheduler publishes the id it assigns to a submission.
+///
+/// A caller cannot otherwise name a job before it finishes, and naming it is
+/// the whole point: an interactive request that coalesces onto a speculative
+/// encode already in progress must be able to say "this one is a client's now".
+///
+/// A `watch` channel rather than a `OnceLock` for two reasons. A joiner can
+/// arrive before the driver has reached the scheduler at all — resolving audio
+/// alone can take a while — so it needs to WAIT for the id rather than miss it;
+/// and a job that is retried submits again under a new id, so the slot must
+/// carry the current one, not the first.
+///
+/// The sender lives with the submitting task. When that task ends without ever
+/// submitting, every waiter wakes with an error instead of hanging.
+#[derive(Clone, Debug)]
+pub struct JobSlot {
+    tx: Arc<tokio::sync::watch::Sender<Option<JobId>>>,
+}
+
+impl Default for JobSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JobSlot {
+    pub fn new() -> Self {
+        Self {
+            tx: Arc::new(tokio::sync::watch::channel(None).0),
+        }
+    }
+
+    /// Watch this slot. Held by anyone who wants to promote the job; keeps no
+    /// sender alive, so it cannot keep a dead driver's slot open.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<JobId>> {
+        self.tx.subscribe()
+    }
+
+    fn assign(&self, id: JobId) {
+        let _ = self.tx.send(Some(id));
+    }
+}
+
+/// Block until this slot names a job, or until nobody can ever name it.
+///
+/// Free function rather than a method: the waiter must hold only a receiver
+/// (see [`JobSlot`]), and a method would require holding the slot itself and
+/// with it the sender that is supposed to die.
+pub async fn await_job_id(rx: &mut tokio::sync::watch::Receiver<Option<JobId>>) -> Option<JobId> {
+    loop {
+        if let Some(id) = *rx.borrow_and_update() {
+            return Some(id);
+        }
+        if rx.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
 /// Identifies one client's playback stream, so the scheduler can tell "the
 /// segment this viewer needs next" from "a segment some other viewer wanted
 /// first". Opaque hash of the play-session id — bounded cardinality, no PII, and
@@ -400,8 +506,13 @@ enum SchedMsg {
         sink: SinkRequest,
         class: JobClass,
         hint: JobHint,
+        /// Filled with the id the actor assigns, the moment it assigns it, for
+        /// callers that need to name this job while it is still running.
+        assigned: Option<JobSlot>,
         reply: oneshot::Sender<Result<JobDone, SchedError>>,
     },
+    /// Somebody a client is blocked on turned out to be speculative work.
+    Promote { job_id: JobId },
     SubmitLive {
         input: PathBuf,
         opts: TranscodeOptions,
@@ -600,6 +711,26 @@ impl TranscodeScheduler {
         class: JobClass,
         hint: JobHint,
     ) -> Result<JobDone, SchedError> {
+        self.submit_tracked(input, opts, sink, class, hint, None)
+            .await
+    }
+
+    /// [`Self::submit`], additionally publishing the assigned [`JobId`] into
+    /// `assigned` as soon as the actor allocates it.
+    ///
+    /// For callers that may need to change their mind about a running job — in
+    /// practice the segment cache, whose speculative encodes acquire a client
+    /// when somebody coalesces onto them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_tracked(
+        &self,
+        input: PathBuf,
+        opts: TranscodeOptions,
+        sink: SinkRequest,
+        class: JobClass,
+        hint: JobHint,
+        assigned: Option<JobSlot>,
+    ) -> Result<JobDone, SchedError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(SchedMsg::Submit {
@@ -608,12 +739,29 @@ impl TranscodeScheduler {
                 sink,
                 class,
                 hint,
+                assigned,
                 reply,
             })
             .await
             .map_err(|_| SchedError::Io("scheduler stopped".into()))?;
         rx.await
             .map_err(|_| SchedError::Io("scheduler dropped reply".into()))?
+    }
+
+    /// Re-rank a job somebody is now blocked on as a client's own.
+    ///
+    /// A client waiting on a speculative job's result is proof the speculation
+    /// was correct — and proof that it is no longer speculative. Leaving it at
+    /// its old class would make that client wait behind every other client's
+    /// work, including work submitted after it started waiting, which is the
+    /// B108 shape wearing different clothes.
+    ///
+    /// Fire-and-forget by design: nothing the caller does depends on the
+    /// answer, and a promotion that arrives after the job has finished is
+    /// harmless (counted `unknown`). Silent only if the actor is gone, at which
+    /// point the caller's own request is about to fail anyway.
+    pub async fn promote(&self, job_id: JobId) {
+        let _ = self.tx.send(SchedMsg::Promote { job_id }).await;
     }
 
     /// Submit a live transcode and get a byte stream of the muxed output.
@@ -685,6 +833,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             sink,
             class,
             hint,
+            assigned,
             reply,
         } => {
             if matches!(sink, SinkRequest::LiveStream) {
@@ -703,6 +852,12 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             }
             let job_id = JobId(state.next_job);
             state.next_job += 1;
+            // Published BEFORE placement, so a requester that coalesces onto
+            // this job can name it even while it is still queued — which is
+            // exactly the case promotion exists for.
+            if let Some(slot) = assigned {
+                slot.assign(job_id);
+            }
             let ctx = JobCtx {
                 input,
                 opts,
@@ -723,6 +878,9 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 span: tracing::Span::none(),
             };
             place(state, job_id, ctx, self_tx);
+        }
+        SchedMsg::Promote { job_id } => {
+            promote_job(state, job_id, self_tx);
         }
         SchedMsg::SubmitLive { input, opts, reply } => {
             // Live path: acquire a permit best-first, then spawn a
@@ -987,6 +1145,60 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 playheads: state.playheads.iter().map(|(k, (s, _))| (*k, *s)).collect(),
             });
         }
+    }
+}
+
+/// Reclassify a job somebody turned out to be blocked on.
+///
+/// Looks in `pending` first and `inflight` second, because those are the two
+/// places a job can be and they want the change for different reasons: a queued
+/// job is re-ranked (a client's work outranks every guess), while an inflight
+/// one stops counting against its device's speculative allowance, so the next
+/// admission decision does not treat a client's segment as crowding.
+///
+/// Deliberately does NOT move the stream's playhead. Promotion says a client is
+/// waiting on this segment, not that it has reached it — the requester joined
+/// work already in progress, and letting that advance the playhead would make
+/// the lookahead distance measure itself, which `note_playhead` refuses for the
+/// same reason.
+fn promote_job(state: &mut SchedState, job_id: JobId, self_tx: &mpsc::Sender<SchedMsg>) {
+    let found = state
+        .pending
+        .iter_mut()
+        .find(|(id, _)| *id == job_id)
+        .map(|(_, ctx)| (ctx, PromotionOutcome::Queued))
+        .or_else(|| {
+            state
+                .inflight
+                .get_mut(&job_id)
+                .map(|ctx| (ctx, PromotionOutcome::Inflight))
+        });
+    let Some((ctx, outcome)) = found else {
+        PromotionOutcome::Unknown.record();
+        return;
+    };
+    if ctx.class == JobClass::Interactive {
+        PromotionOutcome::AlreadyClient.record();
+        return;
+    }
+    ctx.class = JobClass::Interactive;
+    let waited_ms = Instant::now()
+        .saturating_duration_since(ctx.enqueued)
+        .as_millis() as u64;
+    let input = ctx.input.clone();
+    outcome.record();
+    tracing::info!(
+        %job_id,
+        outcome = outcome.label(),
+        waited_ms,
+        input = %input.display(),
+        "speculative transcode promoted: a client is waiting on it"
+    );
+    // A promoted job may now outrank whatever the queue would otherwise have
+    // chosen, and a permit may be free right now (nothing has finished since
+    // it was queued). Re-drain rather than wait for the next completion.
+    if outcome == PromotionOutcome::Queued {
+        drain_pending(state, self_tx);
     }
 }
 
@@ -2441,6 +2653,169 @@ mod tests {
             ALL.len(),
             "pin outcome labels collide: {labels:?} — a folded bucket reports a \
              broken pin as a healthy one"
+        );
+    }
+
+    #[test]
+    fn promotion_outcome_labels_are_distinct_and_stable() {
+        const ALL: [PromotionOutcome; 5] = [
+            PromotionOutcome::Queued,
+            PromotionOutcome::Inflight,
+            PromotionOutcome::AlreadyClient,
+            PromotionOutcome::Unknown,
+            PromotionOutcome::Unassigned,
+        ];
+        assert_eq!(PromotionOutcome::Queued.label(), "queued");
+        assert_eq!(PromotionOutcome::Inflight.label(), "inflight");
+        assert_eq!(PromotionOutcome::AlreadyClient.label(), "already_client");
+        assert_eq!(PromotionOutcome::Unknown.label(), "unknown");
+        assert_eq!(PromotionOutcome::Unassigned.label(), "unassigned");
+
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "promotion outcome labels collide: {labels:?} — folding `unassigned` \
+             into `unknown` would hide the window where a client can still \
+             inherit a speculative tier"
+        );
+    }
+
+    /// The mechanism that makes speculative work safe to defer: a client
+    /// waiting on a speculative job's result is proof the speculation was
+    /// correct, so the job stops being speculative.
+    ///
+    /// Asserted through the SNAPSHOT rather than through the promotion counter,
+    /// because the counter only proves a message was delivered. What matters is
+    /// the effect: the job no longer counts against its device's speculative
+    /// allowance, which is what `crowds_a_client` reads on every later
+    /// admission decision.
+    #[tokio::test]
+    async fn a_promoted_job_stops_counting_as_speculation() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(2), spawner, SchedConfig::default());
+        let slot = JobSlot::new();
+        let mut watch_id = slot.subscribe();
+
+        let job = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit_tracked(
+                    PathBuf::from("/m/prefetch"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                    JobHint {
+                        stream: StreamKey::of("viewer"),
+                        segment: Some(7),
+                    },
+                    Some(slot),
+                )
+                .await
+            })
+        };
+        let job_id = await_job_id(&mut watch_id)
+            .await
+            .expect("the scheduler must name a submission it accepted");
+
+        let before = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            before
+                .devices
+                .iter()
+                .map(|d| d.inflight_background)
+                .sum::<usize>(),
+            1,
+            "precondition: it is running as speculation"
+        );
+
+        s.promote(job_id).await;
+        let after = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            after
+                .devices
+                .iter()
+                .map(|d| d.inflight_background)
+                .sum::<usize>(),
+            0,
+            "a promoted job must stop counting against the speculative allowance"
+        );
+        assert_eq!(
+            after
+                .devices
+                .iter()
+                .map(|d| d.inflight_interactive)
+                .sum::<usize>(),
+            1,
+            "...and must count as the client's work it now is"
+        );
+        // Promotion says a client is WAITING on this segment, not that it has
+        // reached it. Moving the playhead here would let work already in flight
+        // advance the distance its own urgency is judged against.
+        assert!(
+            after.playheads.is_empty(),
+            "promotion must not move a playhead: {:?}",
+            after.playheads
+        );
+        assert!(job.await.unwrap().is_ok());
+    }
+
+    /// Every promotion request is counted, including the ones that change
+    /// nothing. A promotion path that books only its successes cannot tell "no
+    /// client ever joined speculative work" from "every client that did arrived
+    /// after the job had already finished" — opposite problems.
+    #[test]
+    fn a_promotion_with_no_target_is_counted_not_silently_dropped() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(one_gpu(2), spawner, SchedConfig::default());
+                // Nothing was ever submitted, so this id names no job at all.
+                s.promote(JobId(4242)).await;
+                // Round-trip through the actor so the promotion is processed.
+                let _ = s.snapshot().await;
+            })
+        });
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_promotion_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+        let (labels, value) = found.expect(
+            "a promotion that found no job must still be counted: \
+             pharos_transcode_promotion_total{outcome=\"unknown\"}",
+        );
+        assert!(
+            labels.contains(&"outcome=unknown".to_string()),
+            "expected outcome=unknown; got {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "exactly one promotion was requested; got {value:?}"
         );
     }
 

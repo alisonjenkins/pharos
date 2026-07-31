@@ -827,6 +827,16 @@ impl SegmentWait {
 struct InFlightSegment {
     /// Resolves to `Some(outcome)` exactly once, when the driver publishes.
     rx: tokio::sync::watch::Receiver<Option<SharedSegment>>,
+    /// Who the driver submitted as. A joiner that is blocked on these bytes
+    /// while the driver is speculative has to say so — the outcome is shared,
+    /// but the driver's PRIORITY was decided about the driver (V127), and a
+    /// client silently adopting a prefetch's tier is the whole hazard.
+    driver_class: JobClass,
+    /// Names the driver's scheduler job once it has one, so a joiner can ask
+    /// for it to be promoted. Empty until the driver actually submits, and a
+    /// receiver only — holding the sender here would keep a dead driver's slot
+    /// open and hang every waiter on it.
+    job: tokio::sync::watch::Receiver<Option<pharos_transcode::protocol::JobId>>,
 }
 
 /// Rebuild an owned error for a waiter out of the one the driver produced.
@@ -1253,6 +1263,35 @@ impl HlsSegmentCache {
         Ok(bytes.as_ref().clone())
     }
 
+    /// Ask the scheduler to re-rank the driver of a segment a client is now
+    /// waiting on.
+    ///
+    /// Detached, because the requester's next move is to wait for the bytes and
+    /// nothing it does depends on the promotion landing. It waits for the
+    /// driver to be ASSIGNED an id rather than reading one and giving up: a
+    /// joiner routinely arrives while the driver is still resolving audio, and
+    /// giving up there would leave exactly the client this exists for waiting at
+    /// a speculative tier. The wait ends by itself if the driver never submits
+    /// — the slot's sender dies with it.
+    fn promote_driver(
+        &self,
+        mut job: tokio::sync::watch::Receiver<Option<pharos_transcode::protocol::JobId>>,
+    ) {
+        let Some(sched) = self.scheduler.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match pharos_transcode::scheduler::await_job_id(&mut job).await {
+                Some(id) => sched.promote(id).await,
+                // Counted here rather than in the scheduler: the scheduler
+                // never hears about this one, and a promotion with no target is
+                // precisely the window in which a client can still inherit a
+                // speculative tier.
+                None => pharos_transcode::scheduler::PromotionOutcome::Unassigned.record(),
+            }
+        });
+    }
+
     /// Register as the driver of this key's encode, or join the one already in
     /// progress. Returns the receiver the outcome will be published on, and
     /// whether THIS call is the one driving it.
@@ -1275,14 +1314,33 @@ impl HlsSegmentCache {
         tokio::sync::watch::Receiver<Option<SharedSegment>>,
         bool, // driving
     ) {
-        let (rx, tx) = match self.inflight.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(e) => (e.get().rx.clone(), None),
+        let job_slot = pharos_transcode::scheduler::JobSlot::new();
+        let (rx, tx, joined) = match self.inflight.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                let e = e.get();
+                (e.rx.clone(), None, Some((e.driver_class, e.job.clone())))
+            }
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 let (tx, rx) = tokio::sync::watch::channel(None);
-                e.insert(InFlightSegment { rx: rx.clone() });
-                (rx, Some(tx))
+                e.insert(InFlightSegment {
+                    rx: rx.clone(),
+                    driver_class: class,
+                    job: job_slot.subscribe(),
+                });
+                (rx, Some(tx), None)
             }
         };
+        if let Some((driver_class, job)) = joined {
+            // A client has arrived behind somebody else's guess. Sharing the
+            // RESULT is right and is the point; inheriting the DRIVER'S TIER is
+            // not, and would leave this client ranked behind every other
+            // client's work — including work submitted after it started waiting.
+            if class == JobClass::Interactive && driver_class == JobClass::Background {
+                self.promote_driver(job);
+            }
+            return (rx, false);
+        }
+        // Only the Vacant arm reaches here, and it always produced a sender.
         let Some(tx) = tx else {
             return (rx, false);
         };
@@ -1321,6 +1379,7 @@ impl HlsSegmentCache {
                         seg_index,
                         class,
                         hint,
+                        job_slot,
                     )
                     .await
                     .map(Arc::new)
@@ -1378,6 +1437,11 @@ impl HlsSegmentCache {
         seg_index: u32,
         class: JobClass,
         hint: JobHint,
+        // `job_slot` is published to as soon as the scheduler names this
+        // encode's job, so a requester coalescing onto it can have it promoted.
+        // Owned here, so its sender dies with this task and no waiter outlives
+        // it.
+        job_slot: pharos_transcode::scheduler::JobSlot,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let path = self.segment_path_keyed(key);
         if let Some(parent) = path.parent() {
@@ -1431,7 +1495,7 @@ impl HlsSegmentCache {
                     Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
             }
             timing = match self
-                .write_segment(source, &attempt_opts, &tmp, class, hint)
+                .write_segment(source, &attempt_opts, &tmp, class, hint, &job_slot)
                 .instrument(tracing::info_span!("write_segment"))
                 .await
             {
@@ -1718,6 +1782,7 @@ impl HlsSegmentCache {
     /// Transcode one segment to `out`. Returns the scheduler's timing split
     /// (queue-wait vs encode + device) when the scheduler path ran, so the
     /// caller can attribute a slow segment; `None` on the inline fallback.
+    #[allow(clippy::too_many_arguments)]
     async fn write_segment(
         &self,
         source: &Path,
@@ -1725,6 +1790,7 @@ impl HlsSegmentCache {
         out: &Path,
         class: JobClass,
         hint: JobHint,
+        job_slot: &pharos_transcode::scheduler::JobSlot,
     ) -> Result<Option<pharos_transcode::scheduler::JobDone>, HlsCacheError> {
         let _ = source.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
         // Scheduler path: the worker writes the segment file itself,
@@ -1732,7 +1798,7 @@ impl HlsSegmentCache {
         if let Some(sched) = &self.scheduler {
             use pharos_transcode::scheduler::SinkRequest;
             let done = sched
-                .submit(
+                .submit_tracked(
                     source.to_path_buf(),
                     opts.clone(),
                     SinkRequest::FileDirect {
@@ -1740,6 +1806,10 @@ impl HlsSegmentCache {
                     },
                     class,
                     hint,
+                    // Re-published on the retry attempt too: a retried encode is
+                    // a NEW job, and promoting the one it replaced would leave
+                    // the client waiting on the tier it was rescued from.
+                    Some(job_slot.clone()),
                 )
                 .await
                 .map_err(|e| match e {
@@ -3371,7 +3441,14 @@ mod tests {
         key: SegmentIdentity,
     ) -> tokio::sync::watch::Sender<Option<SharedSegment>> {
         let (tx, rx) = tokio::sync::watch::channel(None);
-        cache.inflight.insert(key, InFlightSegment { rx });
+        cache.inflight.insert(
+            key,
+            InFlightSegment {
+                rx,
+                driver_class: JobClass::Interactive,
+                job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
+            },
+        );
         tx
     }
 
@@ -3527,6 +3604,124 @@ mod tests {
                 ..SchedConfig::default()
             },
         )
+    }
+
+    /// A scheduler whose one worker holds its permit for `hold`, so a job can
+    /// be observed mid-flight.
+    fn holds_each_job(
+        hold: std::time::Duration,
+    ) -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::protocol::{JobSpec, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SchedConfig, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult,
+            WorkerSpawner,
+        };
+
+        struct Slow(std::time::Duration);
+        impl WorkerSpawner for Slow {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let hold = self.0;
+                Box::pin(async move { Ok(Box::new(SlowWorker { id, hold }) as Box<dyn Worker>) })
+            }
+        }
+        struct SlowWorker {
+            id: WorkerId,
+            hold: std::time::Duration,
+        }
+        impl Worker for SlowWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, _job: JobSpec) -> RunFuture<'a> {
+                let hold = self.hold;
+                Box::pin(async move {
+                    tokio::time::sleep(hold).await;
+                    WorkerRunResult::Done { out_bytes: 1 }
+                })
+            }
+        }
+
+        TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Slow(hold)),
+            SchedConfig::default(),
+        )
+    }
+
+    /// The wiring that makes deferring speculative work safe (V58).
+    ///
+    /// Coalescing shares the RESULT of an encode, which is always right. It must
+    /// not share the DRIVER'S PRIORITY, which was decided about the driver
+    /// (V127): a client that joins a prefetch and silently adopts its tier waits
+    /// behind every other client's work, including work submitted after it
+    /// started waiting. That is B108's harm arriving by a different route.
+    ///
+    /// Asserted through the scheduler's own snapshot, so it proves the job's
+    /// class actually changed rather than that a message was sent.
+    #[tokio::test]
+    async fn an_interactive_requester_joining_a_prefetch_promotes_it() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let sched = holds_each_job(std::time::Duration::from_millis(600));
+        let cache = Arc::new(cache.with_scheduler(sched.clone()));
+        let opts = slow_opts();
+
+        // Speculative warm-up starts the encode.
+        let driver = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(9, 3, Path::new("/no/source"), &o, JobClass::Background)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let before = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            before
+                .devices
+                .iter()
+                .map(|d| d.inflight_background)
+                .sum::<usize>(),
+            1,
+            "precondition: the prefetch is running as speculation"
+        );
+
+        // ...and then a client asks for the same segment and coalesces onto it.
+        let joiner = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(9, 3, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        let after = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            after
+                .devices
+                .iter()
+                .map(|d| d.inflight_background)
+                .sum::<usize>(),
+            0,
+            "the client's arrival must have re-ranked the encode it is waiting on"
+        );
+        assert_eq!(
+            after
+                .devices
+                .iter()
+                .map(|d| d.inflight_interactive)
+                .sum::<usize>(),
+            1,
+            "...as a client's own work"
+        );
+        // Exactly one encode: promotion re-ranks the job, it does not start a
+        // second one.
+        assert_eq!(after.inflight, 1, "promotion must not duplicate the encode");
+        let _ = driver.await;
+        let _ = joiner.await;
     }
 
     /// A DRIVING requester keeps its own shed, and SUBMITS ONCE. Shedding work
@@ -3722,9 +3917,14 @@ mod tests {
                 // becoming one. Ordered this way deliberately: seeding after the
                 // publish would race the woken requester.
                 let (second, second_rx) = tokio::sync::watch::channel(None);
-                cache
-                    .inflight
-                    .insert(key, InFlightSegment { rx: second_rx });
+                cache.inflight.insert(
+                    key,
+                    InFlightSegment {
+                        rx: second_rx,
+                        driver_class: JobClass::Interactive,
+                        job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
+                    },
+                );
                 let _ = first.send(Some(Err(Arc::new(HlsCacheError::SchedulerBusy))));
                 drop(first);
 
