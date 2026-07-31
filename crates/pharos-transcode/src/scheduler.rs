@@ -154,8 +154,13 @@ pub enum QueueOutcome {
     /// belongs to `pharos_segment_produced_total` and the job's span; a retry
     /// re-dispatches the SAME job and is deliberately not counted again.
     Dispatched,
-    /// Speculative work the viewer played past while it waited. Dropped at
-    /// dispatch rather than encoded — see `has_been_passed`.
+    /// Speculative work the viewer OUTRAN while it waited. Swept out of the
+    /// queue on every drain rather than encoded — see [`is_stale`] for what
+    /// distinguishes it from a guess aimed behind the playhead on purpose, and
+    /// `reap_stale` for why the sweep is unconditional (a job that leaves by
+    /// eviction is counted `evicted`, so dropping only what selection happened
+    /// to examine biased this arm downward under exactly the load an operator
+    /// reads it at).
     Stale,
     /// Displaced from a full queue by a more urgent arrival.
     Evicted,
@@ -1821,14 +1826,18 @@ fn urgency_key(state: &SchedState, ctx: &JobCtx, arrival: usize) -> (i64, bool, 
 /// known to be wanted, but `-1` is the likelier of the two to be asked for again
 /// than `-30`.
 ///
-/// The passed band still earns its place now that examining such a job DROPS it
-/// (`try_place_no_queue`) rather than encoding it. It decides which of the two
-/// happens first — every live job is dispatched before any passed one is looked
-/// at, so the drop can never cost a permit's worth of latency to work somebody
-/// is about to want — and the same key, read at its maximum instead of its
-/// minimum, is what picks the victim when a full queue has to evict
-/// (`queue_or_refuse`). Eviction runs on ARRIVAL, between drains, so it sees
-/// passed jobs that no drain has yet had the chance to drop.
+/// THIS function can no longer reach that band, and the honest statement of
+/// that belongs here rather than in a comment describing a live path. Stale
+/// work is swept unconditionally at the top of `drain_pending` (`reap_stale`),
+/// and no job can become stale during a drain — only `note_playhead`, on an
+/// interactive `Submit`, moves a playhead, and the actor processes no messages
+/// mid-drain. So by the time selection runs, `pending` holds no stale job.
+///
+/// The band is not dead: it is read at its MAXIMUM by `queue_or_refuse`, which
+/// runs on ARRIVAL, between drains — and an interactive arrival's own
+/// `note_playhead` is what turns incumbents stale, a few lines before that
+/// arrival picks a victim. That is the ordering the band exists for now: the
+/// work a viewer has just outrun is the first thing a full queue gives up.
 ///
 /// O(n) over `pending_cap` (256) rather than a heap: every key moves whenever
 /// any client advances, so a heap would be re-keyed far more often than popped.
@@ -2288,6 +2297,79 @@ fn reap_abandoned(state: &mut SchedState) {
     }
 }
 
+/// Drop queued speculation the viewer has OUTRUN, wherever it sits in the
+/// order.
+///
+/// Judged at examination first, in `try_place_no_queue`, which was wrong for
+/// the same reason `reap_abandoned` is a sweep. `next_to_dispatch` sorts
+/// outrun work last by design, so a job in that band is examined only once it
+/// becomes the minimum — and under sustained load every freed permit goes to a
+/// live job and `drain_pending` exits with the passed band untouched. Stale
+/// jobs were therefore never examined, never dropped, and went on occupying
+/// `pending_cap`, which V58 calls client backpressure in the very paragraph
+/// that makes `reap_abandoned` unconditional. The eviction backstop only fires
+/// AT `pending_cap`, i.e. after the accumulation V58 forbids has already
+/// happened.
+///
+/// The signal consequence is the one that decides it. A stale job that
+/// eventually leaves by eviction is counted `evicted`, not `stale` — so the
+/// query the arm exists for ("`stale` dominating `dispatched` says prefetch
+/// depth is tuned too far ahead") was biased downward precisely under
+/// saturation, the only load at which anyone reads it. A metric arm that
+/// under-reports in its own diagnostic regime is not a contract.
+///
+/// Running it unconditionally makes the passed band unreachable from
+/// `next_to_dispatch` — see that function, which now says so rather than
+/// describing a path nothing takes. The band is still read, by
+/// `queue_or_refuse`: eviction runs on ARRIVAL, and an interactive arrival's
+/// own `note_playhead` is what turns incumbents stale a few lines before the
+/// victim is chosen.
+///
+/// Cheap for the same reason `reap_abandoned` is: O(n) over `pending_cap` on
+/// an event that already happens at segment rate, and it recomputes the
+/// distance rather than trusting a cached one, so a playhead that moved while
+/// the queue sat still is seen the first time a permit frees.
+fn reap_stale(state: &mut SchedState) {
+    // Taken out so `is_stale` can borrow the rest of the state. Nothing it
+    // reads lives in `pending`.
+    let pending = std::mem::take(&mut state.pending);
+    let before = pending.len();
+    let mut kept: VecDeque<(JobId, JobCtx)> = VecDeque::with_capacity(before);
+    for (job_id, ctx) in pending {
+        if !is_stale(state, &ctx) {
+            kept.push_back((job_id, ctx));
+            continue;
+        }
+        tracing::debug!(
+            %job_id,
+            stream = ctx.stream.0,
+            segment = ctx.segment,
+            playhead = state.playheads.get(&ctx.stream).map(|(h, _)| *h),
+            distance = lookahead_distance(state, &ctx),
+            waited_ms = Instant::now()
+                .saturating_duration_since(ctx.enqueued)
+                .as_millis() as u64,
+            input = %ctx.input.display(),
+            "speculative transcode dropped: the viewer has played past it"
+        );
+        record_queue_outcome(&ctx, QueueOutcome::Stale);
+        // Resolved, not merely dropped: an evicted or dropped job whose
+        // `oneshot` is discarded leaves its caller's `submit().await` resolving
+        // through a `RecvError` with nothing to say. Reported as `Busy`, not as
+        // a failure — nothing broke, the work stopped being wanted.
+        let _ = ctx.reply.send(Err(SchedError::Busy));
+    }
+    state.pending = kept;
+    let dropped = before - state.pending.len();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            pending = state.pending.len(),
+            "dropped queued speculative transcodes their viewers had outrun"
+        );
+    }
+}
+
 /// On a freed permit, dispatch queued work in urgency order until nothing else
 /// fits.
 ///
@@ -2315,6 +2397,7 @@ fn reap_abandoned(state: &mut SchedState) {
 /// least, one drain at a time.
 fn drain_pending(state: &mut SchedState, self_tx: &mpsc::Sender<SchedMsg>) {
     reap_abandoned(state);
+    reap_stale(state);
     let mut passed_over: VecDeque<(JobId, JobCtx)> = VecDeque::new();
     while any_permit_free(state) {
         let Some(idx) = next_to_dispatch(state) else {
@@ -2333,11 +2416,8 @@ fn drain_pending(state: &mut SchedState, self_tx: &mpsc::Sender<SchedMsg>) {
 /// permit is pushed into `requeue` (preserving order) instead, so
 /// `drain_pending` doesn't recurse or reorder.
 ///
-/// It is also where speculation stops being worth doing: a `Background` job the
-/// viewer has played past is dropped here rather than dispatched, because this
-/// is the freshest the playhead ever is. Every exit from this function resolves
-/// the caller's reply or returns the job to `requeue`; none of them leaves a
-/// `submit().await` hanging.
+/// Every exit from this function resolves the caller's reply or returns the job
+/// to `requeue`; none of them leaves a `submit().await` hanging.
 fn try_place_no_queue(
     state: &mut SchedState,
     job_id: JobId,
@@ -2351,47 +2431,14 @@ fn try_place_no_queue(
         record_queue_outcome(&ctx, QueueOutcome::Abandoned);
         return;
     }
-    // ...and drop speculation the viewer OUTRAN, which is a different thing
-    // entirely: the caller is still there, still waiting, and the bytes it
-    // asked for will never be fetched. Encoding one spends a permit — and, on a
-    // saturated pool, a client's place in the queue — on nothing.
-    //
-    // Outran, not merely behind: `is_stale` requires the playhead to have moved
-    // AFTER this job was submitted. A job aimed behind the playhead on purpose
-    // — the SyncPlay seek prewarm, whose whole job is to warm a backward seek
-    // target before the member asks for it — is live work and survives here.
-    //
-    // Judged HERE, at dispatch, rather than by a reaper task, because the
-    // playhead moves under a queued job continuously and this is the point
-    // where the answer is freshest: every job this ever drops was submitted
-    // while it was still ahead of the client. Nothing else catches it —
-    // `reply.is_closed()` fires only when a seek or a track swap CANCELLED the
-    // prefetch, and a client simply advancing past it does neither.
-    //
-    // Reported as `Busy`, not as a failure: nothing broke, the work stopped
-    // being wanted. Same reasoning as `background_never_error`'s load-shed arm
-    // — and the DEBUG line carries the distance and the playhead rather than a
-    // bare class, so "why did this segment never appear" is answerable.
-    if ctx.class == JobClass::Background {
-        let distance = lookahead_distance(state, &ctx);
-        if is_stale(state, &ctx) {
-            tracing::debug!(
-                %job_id,
-                stream = ctx.stream.0,
-                segment = ctx.segment,
-                playhead = state.playheads.get(&ctx.stream).map(|(h, _)| *h),
-                distance,
-                waited_ms = Instant::now()
-                    .saturating_duration_since(ctx.enqueued)
-                    .as_millis() as u64,
-                input = %ctx.input.display(),
-                "speculative transcode dropped: the viewer has played past it"
-            );
-            record_queue_outcome(&ctx, QueueOutcome::Stale);
-            let _ = ctx.reply.send(Err(SchedError::Busy));
-            return;
-        }
-    }
+    // No staleness check here, and the asymmetry with the line above is the
+    // point. Abandonment is driven from OUTSIDE the actor: a caller can drop
+    // its `submit().await` at any instant, including halfway through a drain,
+    // so it has to be re-checked on every examination. Staleness is driven from
+    // INSIDE it — only `note_playhead`, on an interactive `Submit`, moves a
+    // playhead — and the actor processes no messages mid-drain, so no job can
+    // become stale between `reap_stale` and here. Checking it again would be a
+    // condition that can no longer change.
     let now = Instant::now();
     let full_eligible = state.devices.eligible_for(&ctx.opts, now);
     // The SAME candidate set the arrival path computes, pin included. A job
@@ -5536,6 +5583,139 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|e| panic!("{tag} was refused: {e:?}"));
         }
+    }
+
+    /// The same fact for staleness, which had the same placement bug and a
+    /// worse consequence.
+    ///
+    /// Dropping stale work only where a SELECTED job reaches it is dropping it
+    /// nowhere under load: `next_to_dispatch` sorts outrun work last by design,
+    /// so it is examined only once it becomes the minimum, and under saturation
+    /// every freed permit goes to a live job and the drain exits with the band
+    /// untouched. The jobs then sat in `pending` — the cap V58 calls client
+    /// backpressure — until the pool went quiet.
+    ///
+    /// The signal half is what makes it block rather than merely disappoint. A
+    /// stale job that eventually leaves by eviction is counted `evicted`, so
+    /// `stale` — the arm whose whole purpose is to say "prefetch depth is tuned
+    /// too far ahead" — under-reported precisely under saturation, the only
+    /// load at which anyone reads it. Both halves are asserted: the queue is
+    /// empty of it, and the counter says so, both DURING the run rather than
+    /// after the pool drains, because after the pool drains the old behaviour
+    /// gets the same numbers eventually.
+    #[test]
+    fn stale_speculation_leaves_the_queue_under_load_and_is_counted_where_it_is_read() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let spawner = Arc::new(VariableSpawner(Arc::new(|spec: &JobSpec| {
+                    match job_name(spec).as_str() {
+                        // Outlive the whole observation, so the pool is full
+                        // again the moment the drain has placed `waiter` and
+                        // nothing further in the queue is ever selected.
+                        "hold-long" | "waiter" => Duration::from_millis(900),
+                        // Frees one permit — and with it a drain — while the
+                        // other is still held.
+                        "hold-short" => Duration::from_millis(150),
+                        _ => Duration::from_millis(20),
+                    }
+                })));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[], 2),
+                    spawner,
+                    SchedConfig {
+                        pending_cap: 4,
+                        ..SchedConfig::default()
+                    },
+                );
+                let stream = StreamKey::of("viewer");
+                let submit = |tag: String, class: JobClass, seg: u32| {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from(format!("/m/{tag}")),
+                            h264(),
+                            file_sink(),
+                            class,
+                            JobHint {
+                                stream,
+                                segment: Some(seg),
+                            },
+                        )
+                        .await
+                    })
+                };
+
+                // Both permits taken by the client, playhead at 100.
+                let long = submit("hold-long".into(), JobClass::Interactive, 100);
+                let short = submit("hold-short".into(), JobClass::Interactive, 100);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+
+                // Three prefetches queue, all AHEAD of the playhead and all
+                // good work at this moment.
+                let prefetch: Vec<_> = (0..3)
+                    .map(|i| submit(format!("prefetch-{i}"), JobClass::Background, 101 + i))
+                    .collect();
+                // ...and then the viewer jumps, leaving all three behind. This
+                // request is also the one job somebody IS waiting for.
+                let waiter = submit("waiter".into(), JobClass::Interactive, 200);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+
+                let before = s.snapshot().await.expect("snapshot");
+                assert_eq!(
+                    (before.pending_background, before.pending_interactive),
+                    (3, 1),
+                    "precondition: the queue must be full, three of it speculative"
+                );
+
+                // `hold-short` finishes, the drain places `waiter` in the freed
+                // permit, and the pool is full again — so under the old
+                // placement none of the three is ever examined.
+                tokio::time::sleep(Duration::from_millis(220)).await;
+                let after = s.snapshot().await.expect("snapshot");
+                assert_eq!(
+                    after.pending_background, 0,
+                    "speculation the viewer outran must not still be occupying \
+                     the cap a client needs"
+                );
+                let m = Metrics::capture(&snapshotter);
+                assert_eq!(
+                    m.counter(
+                        "pharos_transcode_queue_outcome_total",
+                        &["class=background", "outcome=stale"],
+                    ),
+                    3,
+                    "...and it must be counted as `stale` while the pool is \
+                     still saturated, which is when the arm is read"
+                );
+
+                for (i, h) in prefetch.into_iter().enumerate() {
+                    let r = h.await.unwrap();
+                    assert!(
+                        matches!(r, Err(SchedError::Busy)),
+                        "prefetch-{i} must be told its bytes are no longer \
+                         wanted rather than left waiting: {r:?}"
+                    );
+                }
+                for (tag, h) in [
+                    ("hold-short", short),
+                    ("waiter", waiter),
+                    ("hold-long", long),
+                ] {
+                    h.await
+                        .unwrap()
+                        .unwrap_or_else(|e| panic!("{tag} was refused: {e:?}"));
+                }
+            })
+        });
     }
 
     /// A viewer outruns their own prefetch, which under saturation is the
