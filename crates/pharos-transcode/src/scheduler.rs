@@ -22,6 +22,7 @@
 //!   error, or — if the whole actor dies — a dropped oneshot → clean
 //!   `RecvError`). No path leaves a caller hung.
 
+use crate::admission::{AdmissionConfig, AdmissionController, Observation};
 use crate::device::DeviceTable;
 use crate::options::TranscodeOptions;
 use crate::protocol::{DeviceId, JobId, JobSpec, OutputSink, WorkerError, WorkerId};
@@ -276,6 +277,11 @@ pub struct SchedSnapshot {
     /// permit held for the lifetime of a progressive transcode was previously
     /// invisible: `in_use` was occupied with nothing to attribute it to.
     pub live_streams: usize,
+    /// The learned speculative allowance per device, unrounded. This IS the
+    /// tuner: a value that never leaves the floor under playback means the loop
+    /// is not working, which is indistinguishable from a correctly cautious loop
+    /// unless the value itself is visible.
+    pub background_allowance: Vec<(DeviceId, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +324,11 @@ pub struct SchedConfig {
     /// and every segment would become a cold miss. One keeps the buffer
     /// filling while leaving the client's segment most of the device.
     pub background_alongside_client: usize,
+    /// How the per-device speculative allowance is learned. `floor` here is the
+    /// value `background_alongside_client` used to be, and a cold controller
+    /// sits exactly on it — so a fresh process behaves precisely like the
+    /// constant this replaces.
+    pub admission: AdmissionConfig,
 }
 
 impl Default for SchedConfig {
@@ -329,6 +340,7 @@ impl Default for SchedConfig {
             max_retries: 3,
             background_headroom: 1,
             background_alongside_client: 1,
+            admission: AdmissionConfig::default(),
         }
     }
 }
@@ -413,6 +425,10 @@ struct SchedState {
     inflight: HashMap<JobId, JobCtx>,
     pending: VecDeque<(JobId, JobCtx)>,
     cfg: SchedConfig,
+    /// Learned, per device, from every finished interactive segment. In memory:
+    /// relearned each boot, which costs one viewer the head start and never
+    /// misleads the admission rule after a hardware change.
+    admission: AdmissionController,
     /// Live streams currently holding a permit. Shared with each
     /// [`PermitStream`], which decrements on drop — the only bookkeeping the
     /// live path has, since it reports no `JobFinished`.
@@ -429,6 +445,7 @@ impl TranscodeScheduler {
     ) -> TranscodeScheduler {
         let (tx, mut rx) = mpsc::channel::<SchedMsg>(cfg.inbox_depth);
         let self_tx = tx.clone();
+        let admission = AdmissionController::new(cfg.admission.clone());
         let mut state = SchedState {
             devices,
             spawner,
@@ -436,6 +453,7 @@ impl TranscodeScheduler {
             inflight: HashMap::new(),
             pending: VecDeque::new(),
             cfg,
+            admission,
             next_job: 0,
             live: Arc::new(AtomicUsize::new(0)),
             next_worker: 0,
@@ -717,6 +735,13 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                             "transcode job done"
                         );
                     });
+                    // Fold this segment into what the device has learned. Only
+                    // interactive jobs carry a deadline anybody is waiting on:
+                    // a speculative encode being slow is not a symptom, it is
+                    // the system working as designed.
+                    if ctx.class == JobClass::Interactive {
+                        observe_margin(state, device, &ctx, encode_ms);
+                    }
                     let _ = ctx.reply.send(Ok(JobDone {
                         device,
                         out_bytes,
@@ -815,6 +840,12 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     .max(),
                 inflight: state.inflight.len(),
                 live_streams: state.live.load(Ordering::Relaxed),
+                background_allowance: state
+                    .devices
+                    .slots()
+                    .iter()
+                    .map(|s| (s.id, state.admission.raw_allowance(s.id, s.capacity)))
+                    .collect(),
             });
         }
     }
@@ -879,6 +910,56 @@ fn background_peers_on(state: &SchedState, dev: DeviceId) -> usize {
         .values()
         .filter(|c| c.device == Some(dev) && c.class == JobClass::Background)
         .count()
+}
+
+/// Record what one finished client segment said about its device, and report it.
+///
+/// Symmetry rule: the verdict counter is incremented on EVERY interactive
+/// completion, including the ones that teach nothing. A frozen allowance with
+/// all-`ignored` observations means no signal reached the loop — a completely
+/// different problem from a device that genuinely cannot go faster, and
+/// indistinguishable from it if the ignored arm is silent.
+fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode_ms: u64) {
+    let capacity = state.devices.slot(device).map(|s| s.capacity).unwrap_or(1);
+    let obs = Observation {
+        // Live/progressive jobs have no duration and so no deadline.
+        segment_seconds: ctx.opts.duration_ticks.map(|t| t as f64 / 10_000_000.0),
+        encode_seconds: encode_ms as f64 / 1000.0,
+        background_peers: ctx.background_peers,
+        // A retried job's encode time is the duration of a bounce.
+        usable: ctx.retries == 0,
+    };
+    let before = state.admission.allowance(device, capacity);
+    let verdict = state.admission.observe(device, capacity, obs);
+    let after = state.admission.allowance(device, capacity);
+    let raw = state.admission.raw_allowance(device, capacity);
+
+    metrics::counter!(
+        "pharos_transcode_margin_total",
+        "device" => device.to_string(),
+        "verdict" => verdict.label(),
+    )
+    .increment(1);
+    metrics::gauge!(
+        "pharos_transcode_background_allowance",
+        "device" => device.to_string(),
+    )
+    .set(raw);
+
+    // Only when the INTEGER allowance moves. Logging every observation would
+    // emit at segment rate and drown the line that matters.
+    if before != after {
+        tracing::info!(
+            %device,
+            verdict = verdict.label(),
+            encode_secs = obs.encode_seconds,
+            deadline_secs = obs.segment_seconds.map(|s| s * 0.5),
+            background_peers = obs.background_peers,
+            allowance_from = before,
+            allowance_to = after,
+            "speculative allowance changed"
+        );
+    }
 }
 
 /// Permits currently free across the devices that could take a given job.
@@ -1526,6 +1607,18 @@ mod tests {
     fn cmaf() -> TranscodeOptions {
         let mut o = h264();
         o.container = Container::Fmp4;
+        o
+    }
+
+    /// `cmaf()` carries no `duration_ticks` (neither does `h264()`, which it is
+    /// built from) — an observation without one is deliberately `Ignored` and
+    /// teaches the admission controller nothing. Every test that expects the
+    /// controller to learn from a finished segment must go through this helper
+    /// instead of a bare `cmaf()`, or the assertion proves nothing. 6 s
+    /// segments, matching the value used throughout `admission.rs`'s own tests.
+    fn cmaf_with_duration() -> TranscodeOptions {
+        let mut o = cmaf();
+        o.duration_ticks = Some(6 * 10_000_000);
         o
     }
 
@@ -2634,5 +2727,194 @@ mod tests {
                 "an idle device is exactly where prefetch belongs"
             );
         }
+    }
+
+    /// ODD — the tuner ships as a MEASUREMENT first. The controller must learn
+    /// from finished jobs before anything consults it, so the deploy that turns
+    /// it on can be judged against a gauge rather than a hope.
+    ///
+    /// Strengthened per controller review: asserting the allowance is still
+    /// 1.0 after one job is satisfied by a controller that is never fed at all
+    /// — precisely the wiring bug this test exists to catch. So this puts a
+    /// speculative job on the GPU FIRST (admission still uses the shipped
+    /// constant, `background_alongside_client == 1`, so exactly one may share
+    /// the device with an interactive one), then submits the interactive job
+    /// the controller actually learns from. It sees one background peer
+    /// already running, meets its deadline comfortably, and
+    /// `background_peers (1) >= current allowance.floor() (1)` makes the
+    /// success EXERCISED — the only kind that raises the allowance. If
+    /// `observe` were never called the raw allowance could not move off 1.0.
+    ///
+    /// The second half proves the OTHER direction: even with the learned
+    /// value sitting at 2.0, admission itself is unchanged — a fresh client
+    /// held open while a burst of speculative jobs targets its device still
+    /// sees only the CONSTANT `background_alongside_client` (1) join it. A
+    /// controller that fed the learned value into `crowds_a_client` instead of
+    /// the constant would let a second job through here and fail this.
+    #[tokio::test]
+    async fn a_finished_segment_teaches_the_controller_without_changing_admission() {
+        // 6 s segments (via `cmaf_with_duration`), 100 ms encode: comfortably
+        // inside the 3 s deadline. `ScriptedSpawner` applies one script to
+        // every worker it spawns, so every job below shares this delay.
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(100), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+
+        // A speculative job claims the GPU first...
+        let bg = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/pre"),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // ...so the interactive job dispatched next sees exactly one
+        // background peer already running beside it: the allowance the
+        // shipped constant permits, and the exact shape an exercised success
+        // needs.
+        let done = s
+            .submit(
+                PathBuf::from("/m/a"),
+                cmaf_with_duration(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.background_peers, 1);
+        assert!(bg.await.unwrap().is_ok());
+
+        let snap = s.snapshot().await.unwrap();
+        // One entry per device the table actually holds (GPU + the always-
+        // present CPU fallback) — proof the gauge is populated from the real
+        // device list, not a single hardcoded value.
+        assert_eq!(snap.background_allowance.len(), snap.devices.len());
+        let learned = snap
+            .background_allowance
+            .iter()
+            .find(|(d, _)| *d == gpu)
+            .map(|(_, v)| *v);
+        assert_eq!(
+            learned,
+            Some(2.0),
+            "an exercised success (background_peers 1 >= floor 1) must raise \
+             the allowance by increase_step -- {snap:?} proves the observation \
+             never reached the controller if this is still 1.0"
+        );
+
+        // Admission itself must be UNCHANGED: even though the learned
+        // allowance is now 2.0, a fresh client held open while a burst of
+        // speculative jobs targets its device must still see only the
+        // CONSTANT `background_alongside_client` (1) join it.
+        let client2 = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/b"),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut handles = Vec::new();
+        for n in 0..3 {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/pre2{n}")),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            }));
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        let joined_the_client = results
+            .iter()
+            .filter(|r| matches!(r, Ok(d) if d.device == gpu))
+            .count();
+        assert_eq!(
+            joined_the_client,
+            SchedConfig::default().background_alongside_client,
+            "admission must still read the shipped CONSTANT, not the learned \
+             2.0 allowance: {results:?}"
+        );
+        assert!(client2.await.unwrap().is_ok());
+    }
+
+    /// The verdict counter is the signal that says whether the loop is hearing
+    /// anything at all. A frozen allowance means nothing without it: "the device
+    /// cannot go faster" and "no observation ever arrived" look identical.
+    #[test]
+    fn a_finished_segment_records_a_margin_verdict() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(100), |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+                s.submit(
+                    PathBuf::from("/m/a"),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+                .unwrap();
+            })
+        });
+
+        let verdict = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_margin_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = verdict.expect(
+            "a finished client segment must emit pharos_transcode_margin_total — \
+             it is the signal that says the loop heard anything",
+        );
+        assert!(
+            labels.contains(&"verdict=met".to_string()),
+            "expected a met verdict; got {labels:?}"
+        );
+        assert!(matches!(value, DebugValue::Counter(1)), "got {value:?}");
     }
 }

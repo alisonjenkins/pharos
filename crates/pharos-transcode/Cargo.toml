@@ -56,6 +56,7 @@ path = "src/bin/transcode_tool.rs"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 futures-util = "0.3"
+metrics-util.workspace = true
 # The placement record is part of the scheduler's contract, so a test
 # subscribes and asserts the event actually carries its fields.
 tracing-subscriber.workspace = true
