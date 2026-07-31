@@ -2,7 +2,7 @@
 
 **Status**: designed 2026-07-31
 **Depends on**: B177/V125 (`background_alongside_client`, `peer_jobs`
-instrumentation), B108/V58 (`background_headroom`, shed-not-queue)
+instrumentation), B108/V58 (`background_headroom`, defer-and-rank)
 
 ## The problem, measured
 
