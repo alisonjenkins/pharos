@@ -451,6 +451,26 @@ impl TranscodeScheduler {
         let (tx, mut rx) = mpsc::channel::<SchedMsg>(cfg.inbox_depth);
         let self_tx = tx.clone();
         let admission = AdmissionController::new(cfg.admission.clone());
+        // Seed `pharos_transcode_background_allowance` for every device NOW,
+        // before the actor task even exists, rather than waiting for the first
+        // finished interactive segment to emit it (which `observe_margin` does
+        // and may be minutes away, or never, if nothing has been played since
+        // boot). The `metrics` crate registers a series lazily on first
+        // emission, so until one of the two ran, "not deployed", "deployed but
+        // idle", and "deployed and wedged at the floor" were all the same
+        // absent series. Seeding this gauge (never the `margin_total` counter,
+        // which must stay absent until a real observation happens) makes the
+        // first of those three distinguishable from the other two; the other
+        // two are already distinguished by whether `margin_total` itself has
+        // any samples. Done synchronously here, before `tokio::spawn`, rather
+        // than from inside the actor task: this line runs on the caller's
+        // thread, which is where a test's `metrics::with_local_recorder`
+        // installs its recorder — inside the spawned task it would depend on
+        // that task happening to be polled on the same thread before anyone
+        // reads the metric back.
+        for slot in devices.slots() {
+            emit_allowance_gauge(&admission, slot.id, slot.capacity);
+        }
         let mut state = SchedState {
             devices,
             spawner,
@@ -935,6 +955,23 @@ fn background_peers_on(state: &SchedState, dev: DeviceId) -> usize {
         .count()
 }
 
+/// Publish the raw (unrounded) speculative allowance for one device.
+///
+/// The single choke point for `pharos_transcode_background_allowance`: the
+/// boot-time seed in [`TranscodeScheduler::spawn`] and the per-observation
+/// emission in [`observe_margin`] both call this instead of each holding
+/// their own copy of the metric name + label key, so the two can never
+/// drift into reporting under different series. Always the *raw* value
+/// (never the floored `allowance()`): the fraction is the only evidence a
+/// multiplicative decrease ever happened.
+fn emit_allowance_gauge(admission: &AdmissionController, device: DeviceId, capacity: usize) {
+    metrics::gauge!(
+        "pharos_transcode_background_allowance",
+        "device" => device.to_string(),
+    )
+    .set(admission.raw_allowance(device, capacity));
+}
+
 /// Record what one finished client segment said about its device, and report it.
 ///
 /// Symmetry rule: the verdict counter is incremented on EVERY interactive
@@ -959,7 +996,6 @@ fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode
     let before = state.admission.allowance(device, capacity);
     let verdict = state.admission.observe(device, capacity, obs);
     let after = state.admission.allowance(device, capacity);
-    let raw = state.admission.raw_allowance(device, capacity);
 
     metrics::counter!(
         "pharos_transcode_margin_total",
@@ -967,11 +1003,7 @@ fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode
         "verdict" => verdict.label(),
     )
     .increment(1);
-    metrics::gauge!(
-        "pharos_transcode_background_allowance",
-        "device" => device.to_string(),
-    )
-    .set(raw);
+    emit_allowance_gauge(&state.admission, device, capacity);
 
     // Only when the INTEGER allowance moves. Logging every observation would
     // emit at segment rate and drown the line that matters.
@@ -3239,6 +3271,68 @@ mod tests {
              (this alone would ALSO be true of a controller that was never \
              wired up, which is why the metric assertion above is the one \
              that matters)"
+        );
+    }
+
+    /// The metrics crate registers a series lazily on first emission, and
+    /// `pharos_transcode_background_allowance` used to be emitted ONLY from
+    /// `observe_margin`, which runs when an interactive segment finishes. A
+    /// freshly booted pod that nobody has streamed from therefore reported
+    /// the series as entirely absent — indistinguishable from a build that
+    /// predates the controller. Assert the gauge exists, for every device,
+    /// the moment the scheduler is spawned, with no `submit` call anywhere in
+    /// this test.
+    #[test]
+    fn the_allowance_gauge_exists_from_boot_before_any_job_is_submitted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                // Spawning alone must publish the gauge — no `submit` here.
+                let _s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+            })
+        });
+
+        let gauge = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_background_allowance" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = gauge.expect(
+            "pharos_transcode_background_allowance must exist the moment the \
+             scheduler is spawned — otherwise its absence cannot distinguish \
+             'not deployed' from 'deployed but idle' or 'deployed and wedged \
+             at the floor'",
+        );
+        let want_label = format!("device={}", DeviceId::hw(HwAccel::Nvenc, 0));
+        assert!(
+            labels.contains(&want_label),
+            "expected the Nvenc device labeled; got {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Gauge(v) if v == 1.0),
+            "a cold, never-observed device must read the floor (1.0); got {value:?}"
         );
     }
 }
