@@ -8,9 +8,11 @@
 //! Design:
 //! - One file per `(media_id, segment_index)` under
 //!   `{root}/{media_id}/{seg}.ts`.
-//! - Per-key `tokio::sync::Mutex<()>` deduplicates concurrent fetches:
-//!   the first request transcodes + writes the file, others wait on
-//!   the lock then read from disk.
+//! - A per-key SHARED RESULT deduplicates concurrent fetches: the first
+//!   request registers the segment as in flight and drives the encode on a
+//!   detached task, later requests await the value it publishes. Nobody
+//!   holds exclusion across the encode, so a slow segment cannot make a
+//!   later requester for the same key wait on a lock (B108).
 //! - LRU tracking via `(access_counter, key) → bytes`; eviction is
 //!   triggered after each insert and runs lazily until total bytes is
 //!   under the configured cap.
@@ -18,6 +20,7 @@
 //!   cache; the writer renames `.tmp → .ts` atomically and removes the
 //!   tmp file on failure.
 
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -235,22 +238,29 @@ fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str, class: 
 
 /// Which of the two hit paths served a cached segment. Bounded label (two
 /// values), because the difference is diagnostic: `fast` means the file was
-/// already there on the first look, `post_lock` means this request queued
-/// behind a concurrent mint of the SAME key and got the bytes the winner
-/// produced. A stream that is mostly `post_lock` is one where prefetch and the
-/// client keep colliding on the same segment — which reads as a healthy hit
-/// rate while every one of those requests paid the full single-flight wait.
+/// already there on the first look, `coalesced` means this request arrived while
+/// the SAME key was already being produced and was handed the result.
+///
+/// A stream that is mostly `coalesced` is one where prefetch and the client keep
+/// colliding on the same segment — which reads as a healthy hit rate while every
+/// one of those requests paid the full single-flight wait.
+///
+/// **Renamed from `post_lock` in 006 phase 2a.** There is no lock any more: a
+/// coalescing requester awaits a value, it does not queue for exclusion. The old
+/// label is a dashboard contract, so this is a deliberate migration, not a
+/// silent rename — any panel or alert selecting `hit_path="post_lock"` must be
+/// repointed at `coalesced` in the same change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CacheHitPath {
     Fast,
-    PostLock,
+    Coalesced,
 }
 
 impl CacheHitPath {
     fn label(self) -> &'static str {
         match self {
             CacheHitPath::Fast => "fast",
-            CacheHitPath::PostLock => "post_lock",
+            CacheHitPath::Coalesced => "coalesced",
         }
     }
 }
@@ -557,9 +567,6 @@ impl SegmentIdentity {
 
 #[derive(Debug, Default)]
 struct CacheState {
-    /// Per-key locks. Held while a fetch is in flight so concurrent
-    /// requests for the same segment don't race.
-    fetch_locks: HashMap<SegmentIdentity, Arc<Mutex<()>>>,
     /// Per-directory locks deduplicating continuous-audio HLS sessions (the
     /// A/V-sync fix): the first request spawns the one ffmpeg producing the
     /// audio rendition; concurrent requests see it already running.
@@ -608,6 +615,79 @@ pub struct HlsSegmentCache {
     /// or builds without a worker binary).
     scheduler: Option<pharos_transcode::scheduler::TranscodeScheduler>,
     state: Arc<Mutex<CacheState>>,
+    /// Segments currently being produced, keyed by identity. The value carries
+    /// a `watch` receiver holding the eventual outcome.
+    ///
+    /// This is single-flight WITHOUT mutual exclusion: nobody holds anything
+    /// across the encode, so a slow segment cannot make a later requester for
+    /// the same key wait on a lock — it waits on the answer, and gets it the
+    /// instant the encode does. The predecessor, a per-key `Mutex` held for the
+    /// whole multi-second transcode, is what made a queued speculative job
+    /// poisonous: the client's own later request for that segment inherited the
+    /// entire wait (B108).
+    inflight: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
+}
+
+/// The eventual outcome of one in-flight segment encode, as every waiter sees
+/// it.
+///
+/// Both sides are behind an `Arc` because the value is shared: the bytes so one
+/// encode is not copied per waiter until it is returned, and the error because
+/// [`HlsCacheError`] is not `Clone` (`std::io::Error` is not). It is deliberately
+/// NOT a `String`: collapsing the error would lose the VARIANT, and
+/// `SchedulerBusy` — deliberate load-shedding — would come back to callers as a
+/// generic transcode failure. See [`shared_copy`].
+type SharedSegment = Result<Arc<Vec<u8>>, Arc<HlsCacheError>>;
+
+/// A segment somebody is already producing.
+#[derive(Clone)]
+struct InFlightSegment {
+    /// Resolves to `Some(outcome)` exactly once, when the driver publishes.
+    rx: tokio::sync::watch::Receiver<Option<SharedSegment>>,
+}
+
+/// Rebuild an owned error for a waiter out of the one the driver produced.
+///
+/// The variant is preserved because callers act on it (`SchedulerBusy` is
+/// shedding, not breakage) and `failure_reason` labels metrics from it. The
+/// `Io` arm keeps the kind and the full message; only the OS error's raw code
+/// object is left behind, which nothing here reads.
+fn shared_copy(err: &HlsCacheError) -> HlsCacheError {
+    match err {
+        HlsCacheError::Io(e) => HlsCacheError::Io(std::io::Error::new(e.kind(), e.to_string())),
+        HlsCacheError::Transcode(m) => HlsCacheError::Transcode(m.clone()),
+        HlsCacheError::NonUtf8Path => HlsCacheError::NonUtf8Path,
+        HlsCacheError::SchedulerBusy => HlsCacheError::SchedulerBusy,
+        HlsCacheError::AudioNotReady {
+            name,
+            reason,
+            waited_ms,
+            last_progress,
+        } => HlsCacheError::AudioNotReady {
+            name: name.clone(),
+            reason: *reason,
+            waited_ms: *waited_ms,
+            last_progress: *last_progress,
+        },
+    }
+}
+
+/// Drops the in-flight registration however the driver ends.
+///
+/// A `Drop` impl rather than a line at the end of the driver because the entry
+/// must go on EVERY exit — including a panic. An entry left behind after its
+/// sender is gone would make that key permanently unrequestable: every later
+/// request would find the registration, await a channel nobody can publish to,
+/// and get the dead-driver error forever.
+struct InFlightGuard {
+    map: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
+    key: SegmentIdentity,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
 }
 
 impl std::fmt::Debug for HlsSegmentCache {
@@ -716,6 +796,7 @@ impl HlsSegmentCache {
             transcoder: FfmpegTranscoder::new(),
             scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
+            inflight: Arc::new(DashMap::new()),
         }
     }
 
@@ -862,56 +943,124 @@ impl HlsSegmentCache {
             }
         }
 
-        let lock = {
-            let mut state = self.state.lock().await;
-            state
-                .fetch_locks
-                .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        // Time the single-flight wait separately from the transcode. A high
-        // lock_wait_ms means a concurrent request for the SAME key (variant +
-        // burn + audio tuple) is already transcoding this segment and we are
-        // queued behind it — invisible in transcode_ms, and a real contributor
-        // to the client-visible segment latency ramp under prefetch / ABR.
-        let lock_wait_ms = {
-            let waited = std::time::Instant::now();
-            let g = lock
-                .lock()
-                .instrument(tracing::info_span!("segment_fetch_lock_wait"))
-                .await;
-            (g, waited.elapsed().as_millis() as u64)
-        };
-        let (_guard, lock_wait_ms) = lock_wait_ms;
-
-        // Re-check: another task may have populated while we waited. This is a
-        // cache hit too — it previously returned bytes without touching a
-        // counter or a log line, so every segment served this way was invisible
-        // in both the hit rate AND the miss rate.
-        let relock_started = std::time::Instant::now();
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            self.touch(key).await;
-            match tokio::fs::read(&path).await {
-                Ok(b) => {
-                    record_cache_hit(
-                        media_id,
-                        seg_index,
-                        b.len(),
-                        opts,
-                        class,
-                        CacheHitPath::PostLock,
-                        relock_started.elapsed().as_millis() as u64,
-                        cached_age_secs(&meta),
+        // Coalesce onto an encode already in progress for this exact key, or
+        // become the one that starts it. The registration is made under the
+        // DashMap's shard lock, which is released before the driver is spawned,
+        // and the driver is DETACHED — so nothing is held across the encode and
+        // nothing about it depends on this request surviving.
+        let (mut rx, driving) = {
+            let (rx, tx) = match self.inflight.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(e) => (e.get().rx.clone(), None),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    e.insert(InFlightSegment { rx: rx.clone() });
+                    (rx, Some(tx))
+                }
+            };
+            match tx {
+                None => (rx, false),
+                Some(tx) => {
+                    let driver = self.clone();
+                    let driver_source = source.to_path_buf();
+                    let driver_opts = opts.clone();
+                    // Carry this request's span into the detached task. Without
+                    // it the encode's own lines and its `write_segment` span
+                    // land unparented, and the miss line loses the request it
+                    // belongs to — the trace would end where the work begins.
+                    let span = tracing::Span::current();
+                    tokio::spawn(
+                        async move {
+                            // Registered until the driver ENDS, panic included.
+                            let _guard = InFlightGuard {
+                                map: driver.inflight.clone(),
+                                key,
+                            };
+                            let out = driver
+                                .produce_segment(
+                                    &driver_source,
+                                    &driver_opts,
+                                    key,
+                                    media_id,
+                                    seg_index,
+                                    class,
+                                )
+                                .await
+                                .map(Arc::new)
+                                .map_err(Arc::new);
+                            // Publish BEFORE the guard removes the entry, so a
+                            // requester that cloned the receiver a moment ago
+                            // always sees a value.
+                            let _ = tx.send(Some(out));
+                        }
+                        .instrument(span),
                     );
-                    return Ok(b);
+                    (rx, true)
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
-                }
-                Err(e) => return Err(e.into()),
             }
-        }
+        };
 
+        // Wait for the ANSWER, not for exclusion. Two iterations at most: the
+        // value is either already published or arrives with the next change.
+        let coalesced_started = std::time::Instant::now();
+        let outcome = loop {
+            let published = rx.borrow_and_update().clone();
+            if let Some(v) = published {
+                break v;
+            }
+            if rx.changed().await.is_err() {
+                // Every sender is gone and nothing was published: the driver
+                // panicked, or the runtime is shutting down. Say so and let the
+                // caller retry — the registration is already gone with it, so
+                // the next request re-drives — rather than waiting forever on a
+                // channel nobody can send to.
+                break Err(Arc::new(HlsCacheError::Transcode(
+                    "segment encode driver stopped without publishing a result \
+                     (the task panicked or the runtime is shutting down)"
+                        .to_string(),
+                )));
+            }
+        };
+
+        let bytes = outcome.map_err(|e| shared_copy(&e))?;
+        if !driving {
+            // Served by somebody else's encode. This is a hit — it costs a wait
+            // but no work — and it is the successor to the old `post_lock` path.
+            // Same fields as the fast hit; `age_secs` is None because these
+            // bytes never came off a file whose mtime could be asked.
+            self.touch(key).await;
+            record_cache_hit(
+                media_id,
+                seg_index,
+                bytes.len(),
+                opts,
+                class,
+                CacheHitPath::Coalesced,
+                coalesced_started.elapsed().as_millis() as u64,
+                None,
+            );
+        }
+        Ok(bytes.as_ref().clone())
+    }
+
+    /// Produce one segment: transcode to a temp file, validate, publish into
+    /// the keyed cache path, record.
+    ///
+    /// Runs in a DETACHED task, so it outlives the requester that started it —
+    /// a client that seeks away mid-encode no longer throws away work that the
+    /// next requester will immediately ask for again. Under the per-key `Mutex`
+    /// it replaced, that cancellation dropped the guard, and the next waiter
+    /// re-checked the filesystem, found nothing, and encoded the same segment a
+    /// second time.
+    async fn produce_segment(
+        &self,
+        source: &Path,
+        opts: &SegmentOpts,
+        key: SegmentIdentity,
+        media_id: u64,
+        seg_index: u32,
+        class: JobClass,
+    ) -> Result<Vec<u8>, HlsCacheError> {
+        let path = self.segment_path_keyed(key);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -1150,7 +1299,11 @@ impl HlsSegmentCache {
             media.id = media_id,
             seg = seg_index,
             transcode_ms = transcode_ms as u64,
-            lock_wait_ms,
+            // No `lock_wait_ms`: there is no lock to wait on. The wait a
+            // requester can now suffer is the coalesce wait, and it is reported
+            // where it is actually paid — `read_ms` on the
+            // `hit_path="coalesced"` line, which the old field never covered
+            // (the lock WINNER always logged ~0 and the waiters logged nothing).
             queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
             encode_ms = timing.as_ref().map(|t| t.encode_ms),
             peer_jobs = timing.as_ref().map(|t| t.peer_jobs),
@@ -1218,10 +1371,6 @@ impl HlsSegmentCache {
         }
         self.record(key, bytes.len() as u64).await;
         self.maybe_evict().await;
-        // Release the per-key fetch lock so future calls don't keep it
-        // forever — leave the file in the LRU.
-        let mut state = self.state.lock().await;
-        state.fetch_locks.remove(&key);
         Ok(bytes)
     }
 
@@ -2628,6 +2777,266 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one hit, got {value:?}"
+        );
+    }
+
+    /// Bytes the stub encoder emits. Comfortably above `MIN_SEGMENT_BYTES`
+    /// (64), so the produced "segment" is not rejected as truncated.
+    const SLOW_SEGMENT_BYTES: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A cache whose encoder is a shell script that takes `delay` to produce a
+    /// segment, and appends one byte to a counter file every time it RUNS.
+    ///
+    /// Returns the cache and the counter path: `encode_count` reads it, so the
+    /// assertion "this segment was encoded once" is made against real process
+    /// starts rather than against anything the cache reports about itself.
+    ///
+    /// The cache root is a SUBDIRECTORY of `dir`: `HlsSegmentCache::new`
+    /// reconciles the generation marker by wiping everything else in its root,
+    /// which would delete the stub and the counter.
+    fn slow_test_cache(dir: &TempDir, delay: std::time::Duration) -> (HlsSegmentCache, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.path().join("slow-ffmpeg");
+        let encodes = dir.path().join("encodes");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf 'e' >> '{}'\nsleep {}\nprintf '%s' '{}'\n",
+                encodes.display(),
+                delay.as_secs_f64(),
+                SLOW_SEGMENT_BYTES,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = HlsSegmentCache::new(dir.path().join("cache"), 1 << 30).with_ffmpeg(&bin);
+        (cache, encodes)
+    }
+
+    /// How many times the stub encoder actually ran.
+    fn encode_count(encodes: &Path) -> u64 {
+        std::fs::metadata(encodes).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Options the stub can satisfy: no video judgement, no continuous-audio
+    /// slice to resolve (`Separate` never calls the resolver).
+    fn slow_opts() -> SegmentOpts {
+        SegmentOpts {
+            container: SegmentContainer::Mpegts,
+            video: None,
+            audio: AudioDelivery::Separate,
+            video_bitrate_bps: None,
+            window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+        }
+    }
+
+    /// The lock this replaces was held for the ENTIRE multi-second transcode.
+    /// It was not guarding a data race — it was single-flight dedup implemented
+    /// as mutual exclusion, and holding exclusion across seconds of work is what
+    /// makes a queued speculative job poisonous (B108). A second requester must
+    /// await the RESULT, and get it at the moment the first one does.
+    #[tokio::test]
+    async fn a_second_requester_awaits_the_result_rather_than_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(400));
+        let opts = slow_opts();
+
+        let started = std::time::Instant::now();
+        let a = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(1, 0, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+        // Arrive well after the first requester has begun the encode.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let b = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(1, 0, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+
+        let a = a.await.unwrap().unwrap();
+        let b = b.await.unwrap().unwrap();
+        assert_eq!(a, b, "both requesters get the same bytes");
+        assert_eq!(a, SLOW_SEGMENT_BYTES.as_bytes(), "the stub's payload");
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "the second requester started a second encode"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(700),
+            "the second requester serialised behind a second encode: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Cancellation safety, which the Mutex design cannot express: today, if the
+    /// lock holder is dropped mid-transcode the guard releases, the next waiter
+    /// re-checks the filesystem, finds nothing, and encodes the SAME segment
+    /// again. A detached driver outlives the requester that started it.
+    #[tokio::test]
+    async fn cancelling_the_first_requester_does_not_abort_the_encode() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(400));
+        let opts = slow_opts();
+
+        let a = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(1, 0, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let b = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(1, 0, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+        // Give the second requester the chance to attach to the in-flight
+        // encode before the first one goes away, which is the shape the live
+        // path has: a client seeks away while another request is already
+        // waiting on the same segment.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The client seeked away / disconnected.
+        a.abort();
+
+        let bytes = b.await.unwrap().unwrap();
+        assert!(!bytes.is_empty(), "the surviving requester got nothing");
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "the segment was encoded twice after a cancellation"
+        );
+    }
+
+    /// The two `watch` properties the wait loop rests on, asserted rather than
+    /// assumed — both are silent, concurrency-only failures if they do not hold.
+    ///
+    /// 1. A sender dropped WITHOUT publishing must wake its waiters with an
+    ///    error. Otherwise a driver that panics parks every requester for that
+    ///    segment forever, and the hang appears only under load.
+    /// 2. A value published BEFORE the sender drops must still be delivered.
+    ///    That is what makes the driver's publish-then-deregister order safe: a
+    ///    requester that cloned the receiver a moment earlier still sees the
+    ///    result, rather than losing the wakeup to the sender's disappearance.
+    #[tokio::test]
+    async fn a_dropped_driver_wakes_its_waiters_and_a_published_result_survives_it() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None::<u32>);
+        drop(tx);
+        assert!(
+            rx.changed().await.is_err(),
+            "a sender that died without publishing must wake its waiter"
+        );
+
+        let (tx, rx) = tokio::sync::watch::channel(None::<u32>);
+        // Cloned while the encode is still in flight, as a coalescing
+        // requester does.
+        let mut waiter = rx.clone();
+        tx.send(Some(7)).unwrap();
+        drop(tx);
+        assert!(
+            waiter.changed().await.is_ok(),
+            "a result published before the sender dropped must still be delivered"
+        );
+        assert_eq!(waiter.borrow_and_update().clone(), Some(7));
+    }
+
+    /// V91 symmetry for the path that replaces `post_lock`: a request that
+    /// coalesced onto somebody else's in-flight encode is a HIT — it paid a wait
+    /// but no work — and must be as countable as the fast one. The old post-lock
+    /// re-check recorded nothing at all, which is the hole B134 was.
+    #[test]
+    fn a_coalesced_hit_is_counted_and_labelled() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(400));
+        let opts = slow_opts();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // `with_local_recorder` installs the recorder for a CLOSURE on this
+        // thread, so the runtime has to be current-thread: the detached driver
+        // and both requesters then record into the same snapshot.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let a = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(9, 3, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let b = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(9, 3, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                a.await.unwrap().unwrap();
+                b.await.unwrap().unwrap();
+            })
+        });
+
+        let hit = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_segment_cache_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                if !labels.contains(&"hit_path=coalesced".to_string()) {
+                    return None;
+                }
+                Some((labels, v))
+            });
+
+        let (labels, value) = hit.expect(
+            "a request served by somebody else's in-flight encode must emit \
+             pharos_segment_cache_total{hit_path=coalesced} — it is the signal",
+        );
+        for want in ["result=hit", "hit_path=coalesced", "class=interactive"] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing label {want}; got {labels:?}"
+            );
+        }
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one coalesced hit, got {value:?}"
         );
     }
 
