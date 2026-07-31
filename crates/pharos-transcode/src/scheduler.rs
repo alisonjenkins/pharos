@@ -197,6 +197,28 @@ impl QueueOutcome {
         }
     }
 
+    /// Record this outcome under the job's class AS IT IS NOW.
+    ///
+    /// `class` is not fixed for a job's lifetime: [`TranscodeScheduler::promote`]
+    /// changes it in place when a client turns out to be blocked on somebody
+    /// else's guess, and the outcome is recorded at the exit, afterwards. So
+    /// `sum(pharos_transcode_queue_outcome_total{class="background"})` is
+    /// background SUBMISSIONS MINUS PROMOTIONS, not background submissions, and
+    /// the difference is `pharos_transcode_promotion_total{outcome=~"queued|
+    /// inflight"}` — read the two together or the speculative denominator is
+    /// short by every guess a viewer actually joined.
+    ///
+    /// `pharos_transcode_queue_distance` inherits the same skew and has no
+    /// label to expose it: a promoted job is `Interactive` by the time
+    /// `record_dispatch` runs, so it contributes no sample, and the histogram
+    /// therefore describes the guesses NOBODY joined. That is the right shape
+    /// for "is prefetch depth tuned too far ahead" — a joined guess was, by
+    /// definition, not too far ahead — but it is a survivorship-filtered
+    /// distribution and reading it as "how deep speculation runs" overstates
+    /// the depth.
+    ///
+    /// Both are stable, bounded label sets either way: two classes, six
+    /// outcomes.
     fn record(self, class: JobClass) {
         metrics::counter!(
             "pharos_transcode_queue_outcome_total",
@@ -2173,6 +2195,15 @@ fn candidates_for(
 
 /// Try to dispatch `ctx` to its best eligible device; queue if all
 /// permits are busy; fail if no device can ever take it.
+///
+/// It does NOT check staleness, and cannot need to. `is_stale` is "the playhead
+/// moved AFTER this job was submitted", and a job's arrival IS its submission:
+/// `playhead_tick_at_submit` is read one statement earlier, from the same actor
+/// turn, so nothing can have moved in between. A `Background` job that arrives
+/// behind its stream's playhead is therefore never stale by construction — it
+/// is a deliberate backward guess, which is exactly the SyncPlay seek prewarm,
+/// and dropping it here would delete the feature on the one path where a free
+/// permit would otherwise have served it immediately.
 fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc::Sender<SchedMsg>) {
     // Caller gone (client seeked/disconnected → dropped the `submit().await`
     // and its oneshot receiver): don't spend a worker on a segment nobody is
