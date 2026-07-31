@@ -1734,13 +1734,30 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
     // drains, sees before any drain has had the chance to drop it — is the
     // first thing to go.
     //
-    // Two rules make this a load-management decision rather than a lottery.
+    // Three rules make this a load-management decision rather than a lottery.
     // Only `Background` is a candidate: somebody is blocked on every
     // Interactive job in the queue, and freeing a slot by abandoning a client
     // mid-request is a 500 on a segment somebody is watching. And the newcomer
     // must actually BEAT the victim: an arriving guess deeper than everything
     // queued is refused rather than admitted at the cost of work nearer the
     // viewer, so a burst of far-out prefetch cannot churn the queue.
+    //
+    // The third is candidacy rather than rank, because rank cannot express it.
+    // A job of UNKNOWN urgency (`i64::MAX` — no stream, or not a numbered
+    // segment) sorts last for dispatch, which is right: `has_been_passed`'s own
+    // reasoning is that nothing is KNOWN to need it, which is not the same as
+    // knowing nothing does, and deferring it costs only latency. Reading the
+    // same key at its maximum turns that into "destroy it first", and no single
+    // total order can say both. So it is filtered OUT of candidacy instead: a
+    // speculative arrival may not buy its slot by destroying work whose urgency
+    // it cannot compare itself against.
+    //
+    // A CLIENT'S arrival still may. Otherwise a queue full of unknowable
+    // speculation — whole-file work, the transcode tool, anything on
+    // `StreamKey::NONE` — would become unevictable and start shedding
+    // interactive requests, which is the exact failure `pending_cap` exists to
+    // prevent. Between an unrankable guess and a segment somebody is watching,
+    // the guess goes.
     //
     // Today the second rule already implies the first — an Interactive
     // incumbent's key is (0, .., its arrival index) and an arrival's is
@@ -1754,11 +1771,15 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
     // evicted job whose `oneshot` is merely dropped leaves its caller's
     // `submit().await` resolving through a `RecvError` with nothing to say.
     let mine = urgency_key(state, &ctx, state.pending.len());
+    let arrival_is_a_client = ctx.class == JobClass::Interactive;
     let victim = state
         .pending
         .iter()
         .enumerate()
-        .filter(|(_, (_, c))| c.class == JobClass::Background)
+        .filter(|(_, (_, c))| {
+            c.class == JobClass::Background
+                && (arrival_is_a_client || lookahead_distance(state, c) != i64::MAX)
+        })
         .map(|(idx, (_, c))| (idx, urgency_key(state, c, idx)))
         .max_by_key(|(_, key)| *key);
     match victim {
@@ -6473,6 +6494,196 @@ mod tests {
             ["blocker", "prewarm", "closer"],
             "the queue must keep the work nearest each viewer, including the \
              viewer who has not fetched anything yet: {got:?}"
+        );
+    }
+
+    /// Unknown is not the same as useless, and eviction is the one place that
+    /// distinction cannot be expressed as a rank.
+    ///
+    /// A job with no stream or no segment has distance `i64::MAX`. Sorting it
+    /// last for DISPATCH is right — nothing is known to need it, and deferral
+    /// costs only latency. Reading the same key at its maximum makes it the
+    /// first thing destroyed, and no single total order says both. It is
+    /// therefore filtered out of candidacy: a speculative arrival may not buy
+    /// its slot by destroying work it cannot rank itself against.
+    #[tokio::test]
+    async fn a_guess_may_not_displace_work_whose_urgency_is_unknown() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(400),
+                _ => Duration::from_millis(40),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                pending_cap: 2,
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let stream = StreamKey::of("viewer");
+
+        let submit = |tag: &'static str, class: JobClass, hint: JobHint| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    hint,
+                )
+                .await
+            })
+        };
+        let on = |seg: u32| JobHint {
+            stream,
+            segment: Some(seg),
+        };
+
+        // The client is at 100 and holds the only permit.
+        let blocker = submit("blocker", JobClass::Interactive, on(100));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Whole-file work with no viewer behind it at all: `JobHint::default()`
+        // is `StreamKey::NONE` and no segment, so nothing can be said about
+        // when — or whether — it is needed.
+        let unknown = submit("unknown", JobClass::Background, JobHint::default());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let near = submit("near", JobClass::Background, on(101));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A guess ten segments out arrives at the full queue. It beats nothing
+        // it is allowed to compare itself against.
+        let deep = submit("deep", JobClass::Background, on(110));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            queued.pending_background, 2,
+            "precondition: the queue must be at its cap, never above it"
+        );
+
+        blocker.await.unwrap().expect("the client's own segment");
+        let deep = deep.await.unwrap();
+        assert!(
+            matches!(deep, Err(SchedError::Busy)),
+            "a guess must be refused rather than admitted by destroying work \
+             it cannot rank itself against: {deep:?}"
+        );
+        near.await.unwrap().expect("the nearer incumbent");
+        unknown
+            .await
+            .unwrap()
+            .expect("work of unknown urgency must not be evicted for a guess");
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "near", "unknown"],
+            "unknown still sorts LAST for dispatch — it just is not destroyed \
+             first: {got:?}"
+        );
+    }
+
+    /// ...and the carve-out that keeps that from becoming a worse bug. If
+    /// unknown work were simply unevictable, a queue full of it would start
+    /// shedding CLIENTS, which is the exact failure `pending_cap` exists to
+    /// prevent. Between an unrankable guess and a segment somebody is watching,
+    /// the guess goes.
+    #[tokio::test]
+    async fn a_client_may_still_displace_work_whose_urgency_is_unknown() {
+        let spawner = Arc::new(VariableSpawner(Arc::new(
+            |spec: &JobSpec| match job_name(spec).as_str() {
+                "blocker" => Duration::from_millis(400),
+                _ => Duration::from_millis(40),
+            },
+        )));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                pending_cap: 2,
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let submit = |tag: String, class: JobClass, hint: JobHint| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    hint,
+                )
+                .await
+            })
+        };
+
+        let stream = StreamKey::of("viewer");
+        let blocker = submit(
+            "blocker".into(),
+            JobClass::Interactive,
+            JobHint {
+                stream,
+                segment: Some(100),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // A queue with nothing rankable in it.
+        let unknowns: Vec<_> = (0..2)
+            .map(|i| {
+                submit(
+                    format!("unknown-{i}"),
+                    JobClass::Background,
+                    JobHint::default(),
+                )
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // ...and a client's own segment arriving at it.
+        let client = submit(
+            "client".into(),
+            JobClass::Interactive,
+            JobHint {
+                stream,
+                segment: Some(101),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            (queued.pending_background, queued.pending_interactive),
+            (1, 1),
+            "precondition: the client must have taken a speculative job's place"
+        );
+
+        blocker.await.unwrap().expect("the client's own segment");
+        client
+            .await
+            .unwrap()
+            .expect("a client must never be shed behind unrankable speculation");
+        let outcomes: Vec<_> = futures_util::future::join_all(unknowns)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| matches!(r, Err(SchedError::Busy)))
+                .count(),
+            1,
+            "exactly one unknown job must have made way, not both and not \
+             neither: {outcomes:?}"
         );
     }
 
