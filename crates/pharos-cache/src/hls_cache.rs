@@ -170,12 +170,28 @@ enum SegmentOutcome {
     /// system choosing a client request over a guess — but it must still be
     /// countable, or shedding looks like silence.
     Shed,
-    /// This request ran NO encode of its own: it coalesced onto one already in
-    /// flight for the same key, and that encode failed. Kept apart from
+    /// This request ran NO encode of its own and got no segment: either it
+    /// coalesced onto an in-flight encode for the same key which then failed,
+    /// or the driver it was waiting on went away before `produce_segment` ever
+    /// ran (a panic, or runtime shutdown) — a case nothing counted, because the
+    /// encode that would have counted itself never started. Kept apart from
     /// `Failed` because they are different denominators — `Failed` counts
     /// production attempts, this counts requests taken down BY one — and the
     /// ratio between them is the blast radius of a single bad encode.
     CoalescedFailed,
+    /// This request ran no encode of its own and inherited a `SchedulerBusy`
+    /// from the job it joined: deliberate load-shedding, decided about somebody
+    /// else's submission, reaching a client.
+    ///
+    /// NOT `CoalescedFailed`, and the distinction is the whole reason this
+    /// value exists. Under a prefetch storm — the B108 condition — Background
+    /// waiters are shed en masse, so folding these into the failure bucket
+    /// would make `failed + coalesced_failed` (the sum V91 tells an operator to
+    /// alert on) dominated by `reason="scheduler_busy"`, i.e. alerting on the
+    /// admission control working as designed. A shed is a decision; a failure
+    /// is a fault. `shed + coalesced_shed` is the shedding total, disjoint from
+    /// the failure total.
+    CoalescedShed,
 }
 
 impl SegmentOutcome {
@@ -191,6 +207,7 @@ impl SegmentOutcome {
             Self::Failed => "failed",
             Self::Shed => "shed",
             Self::CoalescedFailed => "coalesced_failed",
+            Self::CoalescedShed => "coalesced_shed",
         }
     }
 }
@@ -260,6 +277,15 @@ fn record_segment_failure(outcome: SegmentOutcome, reason: &'static str, class: 
 /// of the inherited error, so the two share one vocabulary and no new label —
 /// and no new cardinality — is introduced.
 ///
+/// Two situations reach here, and they share this outcome because they share the
+/// property that makes the count necessary — no encode of this request's own ran,
+/// so nothing else counted it: a published failure from a driver this request
+/// joined, and a driver that vanished before `produce_segment` started at all
+/// (panic or runtime shutdown), which is uncounted even for the requester that
+/// spawned it. What does NOT reach here is an inherited `SchedulerBusy`; see
+/// [`record_coalesced_shed`], because a load-shed decision is not a fault and
+/// must stay out of the failure sum V91 tells operators to alert on.
+///
 /// The line beside it carries the same identity fields as the hit line, at
 /// `warn`: the error is real, but it is somebody else's error, so it must not be
 /// mistaken for a second failing encode in the log.
@@ -285,6 +311,77 @@ fn record_coalesced_failure(
         seek_secs = opts.window.start_seconds(),
         "hls segment request failed with the encode it coalesced onto"
     );
+}
+
+/// Count one request that inherited a LOAD-SHED decision made about another
+/// job's submission.
+///
+/// This is client-visible — the request returns `SchedulerBusy` and the browser
+/// sees a 500 on a video segment — so it must be counted; the mistake it exists
+/// to undo is counting it as an encode FAILURE. `failure_reason(SchedulerBusy)`
+/// is `"scheduler_busy"`, so before this outcome existed every one of these
+/// landed as `{outcome="coalesced_failed", reason="scheduler_busy"}`. Under a
+/// prefetch storm — precisely the B108 condition, where Background jobs are shed
+/// by design — that reason dominates the bucket, and an operator following V91's
+/// own arithmetic (`failed + coalesced_failed`) alerts on deliberate
+/// load-shedding as breakage: the same shed/failure conflation the coalescing
+/// fall-through exists to keep off the RESPONSE path, reappearing one signal
+/// layer down.
+///
+/// Same counter, same `outcome` label key, one more bounded value, `reason`
+/// still from the `failure_reason` vocabulary: no new label key and no new
+/// cardinality. `warn`, not `debug` as the driving requester's own shed is
+/// logged, because a shed a client asked for is a declined guess while this one
+/// is a declined guess a client is BLOCKED ON.
+fn record_coalesced_shed(media_id: u64, seg_index: u32, opts: &SegmentOpts, class: JobClass) {
+    record_segment_failure(SegmentOutcome::CoalescedShed, "scheduler_busy", class);
+    tracing::warn!(
+        media.id = media_id,
+        seg = seg_index,
+        class = class.label(),
+        reason = "scheduler_busy",
+        codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
+        burn = opts.burn_subtitle_stream_index.is_some(),
+        burn_idx = opts.burn_subtitle_stream_index,
+        audio_idx = opts.audio_source_stream_index,
+        seek_secs = opts.window.start_seconds(),
+        "hls segment request shed by the admission decision made about the encode it coalesced onto"
+    );
+}
+
+/// Which counter, if any, a failed wait on the shared registry belongs to.
+///
+/// One decision in one place, because V91 tells an operator to SUM these and
+/// every wrong merge here becomes a wrong number in front of somebody on call.
+/// `None` means "already counted" — not "ignore".
+///
+/// - **The driver went away** before `produce_segment` ever ran (panic, runtime
+///   shutdown). The encode that would have counted itself never started, so this
+///   request is counted NOWHERE else — and that is equally true of the requester
+///   that SPAWNED the driver, which is why this arm is decided before `driving`.
+///   Reuses `coalesced_failed` rather than inventing a third value: the property
+///   that makes the count necessary is "no encode of this request's own ran",
+///   which is exactly what that outcome counts.
+/// - **This request drove the encode** and the driver published. `produce_segment`
+///   already recorded `failed` or `shed` for it; counting again double-counts one
+///   production attempt.
+/// - **Somebody else's published outcome.** A failure is `coalesced_failed`; a
+///   `SchedulerBusy` is `coalesced_shed`, because deliberate load-shedding is a
+///   decision and not a fault, and folding it into the failure bucket makes the
+///   V91 sum alert on admission control doing its job under a prefetch storm.
+fn shared_failure_outcome(
+    err: &HlsCacheError,
+    driving: bool,
+    driver_gone: bool,
+) -> Option<SegmentOutcome> {
+    match (driving, driver_gone) {
+        (_, true) => Some(SegmentOutcome::CoalescedFailed),
+        (true, false) => None,
+        (false, false) => match err {
+            HlsCacheError::SchedulerBusy => Some(SegmentOutcome::CoalescedShed),
+            _ => Some(SegmentOutcome::CoalescedFailed),
+        },
+    }
 }
 
 /// Which of the two hit paths served a cached segment. Bounded label (two
@@ -690,6 +787,41 @@ pub struct HlsSegmentCache {
 /// generic transcode failure. See [`shared_copy`].
 type SharedSegment = Result<Arc<Vec<u8>>, Arc<HlsCacheError>>;
 
+/// How one wait on the shared registry ended.
+///
+/// The two arms are not interchangeable FOR ACCOUNTING, which is the only reason
+/// this is not just a [`SharedSegment`]. A published error was already counted by
+/// the encode that produced it (`produce_segment` records `failed` / `shed`
+/// before it returns), so a driving requester must not count it again. A driver
+/// that went away never reached `produce_segment` at all, so nothing counted it
+/// and the requester is the only party left that can — driving or not.
+enum SegmentWait {
+    /// The driver published an outcome, success or failure.
+    Published(SharedSegment),
+    /// Every sender is gone and nothing was published: the driver panicked, or
+    /// the runtime is shutting down.
+    DriverGone,
+}
+
+impl SegmentWait {
+    /// The error a caller sees when its driver went away. Names the two causes,
+    /// because "no result" with no reason is the shape that costs an hour.
+    fn driver_gone_error() -> Arc<HlsCacheError> {
+        Arc::new(HlsCacheError::Transcode(
+            "segment encode driver stopped without publishing a result \
+             (the task panicked or the runtime is shutting down)"
+                .to_string(),
+        ))
+    }
+
+    fn into_outcome(self) -> SharedSegment {
+        match self {
+            Self::Published(v) => v,
+            Self::DriverGone => Err(Self::driver_gone_error()),
+        }
+    }
+}
+
 /// A segment somebody is already producing.
 #[derive(Clone)]
 struct InFlightSegment {
@@ -1005,11 +1137,13 @@ impl HlsSegmentCache {
         // published outcome or the second attempt's outcome, whatever it is.
         let coalesced_started = std::time::Instant::now();
         let mut attempt = 0u8;
-        let (outcome, driving) = loop {
+        let (outcome, driving, driver_gone) = loop {
             attempt += 1;
             let (mut rx, driving) =
                 self.register_or_join(key, source, opts, media_id, seg_index, class);
-            let outcome = Self::await_segment(&mut rx).await;
+            let wait = Self::await_segment(&mut rx).await;
+            let driver_gone = matches!(wait, SegmentWait::DriverGone);
+            let outcome = wait.into_outcome();
             // A request that did not drive this encode must not be failed by
             // its driver's LOAD-SHED decision. `SchedulerBusy` says "the
             // scheduler kept its permits for work a client is blocked on" — the
@@ -1031,7 +1165,7 @@ impl HlsSegmentCache {
             let inherited_shed = !driving
                 && matches!(&outcome, Err(e) if matches!(**e, HlsCacheError::SchedulerBusy));
             if !(inherited_shed && attempt == 1) {
-                break (outcome, driving);
+                break (outcome, driving, driver_gone);
             }
             tracing::debug!(
                 media.id = media_id,
@@ -1060,10 +1194,17 @@ impl HlsSegmentCache {
         let bytes = match outcome {
             Ok(b) => b,
             Err(e) => {
-                if !driving {
-                    // Symmetry: the success half of this path records a hit per
-                    // waiter, so the failure half records a failure per waiter.
-                    record_coalesced_failure(media_id, seg_index, opts, class, &e);
+                // Symmetry: the success half of this path records a hit per
+                // waiter, so the failure half records one per waiter too — but
+                // it must record the RIGHT thing, because V91 tells an operator
+                // to SUM these. Which counter, and whether any, is
+                // `shared_failure_outcome`'s single decision.
+                match shared_failure_outcome(&e, driving, driver_gone) {
+                    None => {}
+                    Some(SegmentOutcome::CoalescedShed) => {
+                        record_coalesced_shed(media_id, seg_index, opts, class);
+                    }
+                    Some(_) => record_coalesced_failure(media_id, seg_index, opts, class, &e),
                 }
                 return Err(shared_copy(&e));
             }
@@ -1173,23 +1314,21 @@ impl HlsSegmentCache {
     /// with the next change, and the only value ever sent is `Some(_)`.
     async fn await_segment(
         rx: &mut tokio::sync::watch::Receiver<Option<SharedSegment>>,
-    ) -> SharedSegment {
+    ) -> SegmentWait {
         loop {
             let published = rx.borrow_and_update().clone();
             if let Some(v) = published {
-                return v;
+                return SegmentWait::Published(v);
             }
             if rx.changed().await.is_err() {
                 // Every sender is gone and nothing was published: the driver
                 // panicked, or the runtime is shutting down. Say so and let the
                 // caller retry — the registration is already gone with it, so
                 // the next request re-drives — rather than waiting forever on a
-                // channel nobody can send to.
-                return Err(Arc::new(HlsCacheError::Transcode(
-                    "segment encode driver stopped without publishing a result \
-                     (the task panicked or the runtime is shutting down)"
-                        .to_string(),
-                )));
+                // channel nobody can send to. Reported as its own arm rather
+                // than as an error so the caller can tell it apart from a
+                // failure the encode already counted.
+                return SegmentWait::DriverGone;
             }
         }
     }
@@ -3220,6 +3359,53 @@ mod tests {
         drop(tx);
     }
 
+    /// Block until `n` receivers hold the seeded channel — i.e. until a
+    /// requester has ACTUALLY coalesced onto it.
+    ///
+    /// An observable, not a wall-clock premise. A sleep that is long enough on
+    /// an idle box and too short on a loaded one lets the requester miss the
+    /// registration and drive its own encode, after which the test fails
+    /// describing something that never happened. Deadlined, so a requester that
+    /// never arrives fails here — naming that — instead of downstream.
+    async fn await_coalescers(tx: &tokio::sync::watch::Sender<Option<SharedSegment>>, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tx.receiver_count() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no requester coalesced onto the seeded encode ({} of {n} receivers)",
+                tx.receiver_count()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The `pharos_segment_produced_total` series carrying `outcome=<want>`,
+    /// as `(labels, value)`.
+    fn produced_series(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        want: &str,
+    ) -> Option<(Vec<String>, metrics_util::debugging::DebugValue)> {
+        let want = format!("outcome={want}");
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_segment_produced_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                if !labels.contains(&want) {
+                    return None;
+                }
+                Some((labels, v))
+            })
+    }
+
     /// `SchedulerBusy` is LOAD-SHEDDING, not breakage — the scheduler keeping
     /// its permits for work a client is blocked on. It is the right answer for
     /// the speculative prefetch that asked for it and the wrong one for a client
@@ -3381,26 +3567,7 @@ mod tests {
             })
         });
 
-        let failure = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(ck, _, _, v)| {
-                let k = ck.key();
-                if k.name() != "pharos_segment_produced_total" {
-                    return None;
-                }
-                let labels: Vec<String> = k
-                    .labels()
-                    .map(|l| format!("{}={}", l.key(), l.value()))
-                    .collect();
-                if !labels.contains(&"outcome=coalesced_failed".to_string()) {
-                    return None;
-                }
-                Some((labels, v))
-            });
-
-        let (labels, value) = failure.expect(
+        let (labels, value) = produced_series(&snapshotter, "coalesced_failed").expect(
             "a request failed by the encode it coalesced onto must emit \
              pharos_segment_produced_total{outcome=coalesced_failed} — without it one \
              failed encode counts once no matter how many clients it took down",
@@ -3418,6 +3585,246 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one coalesced failure, got {value:?}"
+        );
+    }
+
+    /// A client-visible LOAD-SHED is not an encode FAILURE, and the counter must
+    /// not say it is.
+    ///
+    /// V91 tells an operator that `failed + coalesced_failed` is the
+    /// client-visible failure total and that their ratio is the blast radius of
+    /// one bad encode. `failure_reason(SchedulerBusy)` is `"scheduler_busy"`, so
+    /// an inherited shed booked as `coalesced_failed` puts deliberate
+    /// load-shedding inside that sum — and under a prefetch storm, the B108
+    /// condition where Background work is shed BY DESIGN, it comes to dominate
+    /// it. Following V91's own arithmetic then pages somebody for admission
+    /// control working: the same shed/failure conflation the coalescing
+    /// fall-through exists to keep off the response path, one signal layer down.
+    ///
+    /// Reaching a NON-driving shed takes two in-flight encodes, because the
+    /// fall-through spends attempt 1 declining the first: this requester joins
+    /// one shed encode, declines it, and finds a second already registered, so
+    /// its second attempt is a join rather than a drive. `encode_count` proves
+    /// that — a requester that drove its own would have run the stub.
+    #[test]
+    fn an_inherited_shed_is_counted_as_a_shed_not_a_failure() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(12, 6, None, None, &opts);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let first = seed_inflight(&cache, key);
+                let waiter = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(12, 6, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                await_coalescers(&first, 2).await;
+
+                // A SECOND encode registers before the first publishes, so the
+                // fall-through re-registers onto a live driver instead of
+                // becoming one. Ordered this way deliberately: seeding after the
+                // publish would race the woken requester.
+                let (second, second_rx) = tokio::sync::watch::channel(None);
+                cache
+                    .inflight
+                    .insert(key, InFlightSegment { rx: second_rx });
+                let _ = first.send(Some(Err(Arc::new(HlsCacheError::SchedulerBusy))));
+                drop(first);
+
+                await_coalescers(&second, 2).await;
+                finish_seeded_driver(
+                    &cache,
+                    key,
+                    second,
+                    Err(Arc::new(HlsCacheError::SchedulerBusy)),
+                );
+
+                let err = waiter
+                    .await
+                    .unwrap()
+                    .expect_err("both encodes it joined were shed, so this request must fail");
+                assert!(
+                    matches!(err, HlsCacheError::SchedulerBusy),
+                    "the shed must reach the caller as a shed: {err:?}"
+                );
+            })
+        });
+        assert_eq!(
+            encode_count(&encodes),
+            0,
+            "the requester drove its own encode, so this is no longer an INHERITED shed"
+        );
+
+        let (labels, value) = produced_series(&snapshotter, "coalesced_shed").expect(
+            "a request shed by another job's admission decision must emit \
+             pharos_segment_produced_total{outcome=coalesced_shed} — booking it as \
+             coalesced_failed puts deliberate load-shedding inside the failure sum V91 \
+             tells operators to alert on",
+        );
+        for want in [
+            "outcome=coalesced_shed",
+            "reason=scheduler_busy",
+            "class=interactive",
+        ] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing label {want}; got {labels:?}"
+            );
+        }
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one inherited shed, got {value:?}"
+        );
+        assert!(
+            produced_series(&snapshotter, "coalesced_failed").is_none(),
+            "a shed was counted as an encode failure; `failed + coalesced_failed` is the \
+             sum V91 calls the client-visible failure total, and load-shedding is not a \
+             failure of anything"
+        );
+    }
+
+    /// A requester whose OWN driver dies before it produces anything is counted
+    /// nowhere unless the requester counts it.
+    ///
+    /// `produce_segment` never ran, so no `failed` was recorded, and the
+    /// coalesced counter used to be gated on `!driving` — so the one request
+    /// this takes down disappeared from every counter. Shutdown-only, but it is
+    /// the rich-on-one-arm asymmetry V91 exists to forbid, and the arm it is
+    /// missing from is the failure arm.
+    ///
+    /// The driver is put on its OWN runtime — entered for the duration of the
+    /// request, which is all `tokio::spawn` consults — and that runtime is then
+    /// shut down from a second thread while the requester survives on the first.
+    /// That is the production shape (the task is dropped, its sender with it,
+    /// nothing published) and needs no hook in production code.
+    #[test]
+    fn a_requester_whose_driver_dies_before_producing_counts_itself() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_secs(5));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(13, 7, None, None, &opts);
+
+        let driver_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let driver_handle = driver_rt.handle().clone();
+        let requester_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Kills the driver's runtime as soon as the encode is registered —
+        // waiting on the observable rather than on a guessed interval.
+        let killer = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !cache.inflight.contains_key(&key) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the driver never registered its encode"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                driver_rt.shutdown_timeout(std::time::Duration::ZERO);
+            })
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let err = metrics::with_local_recorder(&recorder, || {
+            requester_rt.block_on(async {
+                // Everything this request spawns lands on the doomed runtime;
+                // the request itself is driven by this thread and outlives it.
+                let _entered = driver_handle.enter();
+                cache
+                    .segment_bytes(13, 7, Path::new("/no/source"), &opts, JobClass::Interactive)
+                    .await
+            })
+        })
+        .expect_err("a driver that died without producing must fail the request that spawned it");
+        killer.join().unwrap();
+
+        assert!(
+            matches!(&err, HlsCacheError::Transcode(m)
+                if m.contains("driver stopped without publishing")),
+            "the requester must be told WHY it was woken: {err:?}"
+        );
+
+        let (labels, value) = produced_series(&snapshotter, "coalesced_failed").expect(
+            "a request whose driver died before producing anything must still be counted — \
+             `produce_segment` never ran, so nothing else counted it, and gating the \
+             coalesced counter on !driving dropped it from every series",
+        );
+        for want in [
+            "outcome=coalesced_failed",
+            "reason=transcode",
+            "class=interactive",
+        ] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing label {want}; got {labels:?}"
+            );
+        }
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one uncounted-driver failure, got {value:?}"
+        );
+    }
+
+    /// The whole accounting rule, stated once. Each arm is a different reason a
+    /// request can end without bytes, and merging any two of them is a wrong
+    /// number in a dashboard rather than a compile error.
+    #[test]
+    fn a_failed_shared_wait_is_counted_exactly_once() {
+        let boom = HlsCacheError::Transcode("ffmpeg exploded".into());
+        let shed = HlsCacheError::SchedulerBusy;
+        let gone = shared_copy(&SegmentWait::DriverGone.into_outcome().unwrap_err());
+
+        // Published to the requester that produced it: `produce_segment` already
+        // recorded `failed` / `shed`, so a second count is a double count.
+        assert_eq!(shared_failure_outcome(&boom, true, false), None);
+        assert_eq!(shared_failure_outcome(&shed, true, false), None);
+
+        // The driver went away before `produce_segment` ran: counted nowhere
+        // else, whether or not this request is the one that spawned it.
+        assert_eq!(
+            shared_failure_outcome(&gone, true, true),
+            Some(SegmentOutcome::CoalescedFailed)
+        );
+        assert_eq!(
+            shared_failure_outcome(&gone, false, true),
+            Some(SegmentOutcome::CoalescedFailed)
+        );
+
+        // Somebody else's outcome: a fault counts as a failure, a load-shed
+        // decision counts as a shed and stays out of the failure sum.
+        assert_eq!(
+            shared_failure_outcome(&boom, false, false),
+            Some(SegmentOutcome::CoalescedFailed)
+        );
+        assert_eq!(
+            shared_failure_outcome(&shed, false, false),
+            Some(SegmentOutcome::CoalescedShed)
         );
     }
 
@@ -3767,6 +4174,7 @@ mod tests {
             SegmentOutcome::Failed,
             SegmentOutcome::Shed,
             SegmentOutcome::CoalescedFailed,
+            SegmentOutcome::CoalescedShed,
         ];
         for o in all {
             match o {
@@ -3775,13 +4183,22 @@ mod tests {
                 | SegmentOutcome::Empty
                 | SegmentOutcome::Failed
                 | SegmentOutcome::Shed
-                | SegmentOutcome::CoalescedFailed => {}
+                | SegmentOutcome::CoalescedFailed
+                | SegmentOutcome::CoalescedShed => {}
             }
         }
         let labels: Vec<&str> = all.iter().map(|o| o.label()).collect();
         assert_eq!(
             labels,
-            vec!["ok", "short", "empty", "failed", "shed", "coalesced_failed"]
+            vec![
+                "ok",
+                "short",
+                "empty",
+                "failed",
+                "shed",
+                "coalesced_failed",
+                "coalesced_shed"
+            ]
         );
         let mut uniq = labels.clone();
         uniq.sort_unstable();
