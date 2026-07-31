@@ -1586,6 +1586,84 @@ fn record_placement(
     span
 }
 
+/// The devices a job may actually be placed on: eligible, minus already-tried,
+/// with the shared-init fMP4 pin applied.
+///
+/// Spec 003 — a shared-init fMP4 rendition must come from ONE encoder, so it
+/// does not get a choice of devices. The device is a pure function of the
+/// rendition (see `DeviceTable::rendition_device`), which keeps the answer
+/// stable across a restart; an in-memory pin would not, and a rendition
+/// re-pinned mid-playback serves segments that no longer match the client's
+/// init (issue #114 — undecodable video, served with a 200).
+///
+/// Cooldown deliberately does NOT re-route it. Spilling to a second encoder is
+/// exactly the failure this prevents, so an unavailable device FAILS the request
+/// instead (`Err` here): the client restarts the stream and re-fetches an init
+/// that matches whatever produces it next. A visible stall that recovers beats
+/// silent corruption.
+///
+/// Shared by BOTH dispatch paths, and that is the point rather than tidiness.
+/// `device_supports` deliberately keeps hardware eligible for H264+fMP4 — the
+/// one-encoder guarantee is enforced by this pin, not by excluding the GPU — so
+/// a path that skips the pin sees a wide `full_eligible` and will happily hand a
+/// pinned rendition to a second encoder. Which is what the drain path did: an
+/// fMP4 job whose pinned device was busy fell through to the queue, and drained
+/// onto whatever had a free permit. Browser H264 is all CMAF and its prefetch is
+/// speculative, so once speculative work could queue at all, the drain path
+/// became the DOMINANT producer of fMP4 segments — every one of them able to
+/// spill. The pin therefore lives here, where neither path can forget it.
+fn candidates_for(
+    state: &SchedState,
+    job_id: JobId,
+    ctx: &JobCtx,
+    full_eligible: &[DeviceId],
+) -> Result<SmallVec<[DeviceId; 5]>, SchedError> {
+    let pinned = if crate::device::shared_init_fmp4(&ctx.opts) {
+        let key = crate::options::RenditionKey::new(&ctx.input, &ctx.opts);
+        match state.devices.rendition_device(&ctx.opts, key.value()) {
+            Some(d) => {
+                if !full_eligible.contains(&d) {
+                    PinOutcome::Invalidated.record();
+                    tracing::warn!(
+                        %job_id,
+                        rendition = %key.short(),
+                        device = %d,
+                        "rendition device unavailable (cooldown); failing rather than spilling to another encoder"
+                    );
+                    return Err(SchedError::Failed(WorkerError::Other(format!(
+                        "rendition device {d} unavailable; refusing to mix encoders under one init"
+                    ))));
+                }
+                PinOutcome::Followed.record();
+                Some(d)
+            }
+            None => {
+                // Previously silent. Without it the counter cannot be read as a
+                // total: `followed + invalidated` was always short by however
+                // many shared-init jobs resolved to no device, and there was no
+                // way to tell that from the metric.
+                PinOutcome::Unresolved.record();
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // A pinned rendition has exactly one candidate and never widens.
+    Ok(match pinned {
+        Some(d) => full_eligible
+            .iter()
+            .copied()
+            .filter(|c| *c == d && !ctx.excluded.contains(c))
+            .collect(),
+        None => full_eligible
+            .iter()
+            .copied()
+            .filter(|d| !ctx.excluded.contains(d))
+            .collect(),
+    })
+}
+
 /// Try to dispatch `ctx` to its best eligible device; queue if all
 /// permits are busy; fail if no device can ever take it.
 fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc::Sender<SchedMsg>) {
@@ -1604,66 +1682,14 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         let _ = ctx.reply.send(Err(SchedError::Unsupported));
         return;
     }
-    // Spec 003 — a shared-init fMP4 rendition must come from ONE encoder, so it
-    // does not get a choice of devices. The device is a pure function of the
-    // rendition (see `DeviceTable::rendition_device`), which keeps the answer
-    // stable across a restart; an in-memory pin would not, and a rendition
-    // re-pinned mid-playback serves segments that no longer match the client's
-    // init (issue #114 — undecodable video, served with a 200).
-    //
-    // Cooldown deliberately does NOT re-route it. Spilling to a second encoder
-    // is exactly the failure this prevents, so an unavailable device FAILS the
-    // request instead: the client restarts the stream and re-fetches an init
-    // that matches whatever produces it next. A visible stall that recovers
-    // beats silent corruption.
-    let pinned = if crate::device::shared_init_fmp4(&ctx.opts) {
-        let key = crate::options::RenditionKey::new(&ctx.input, &ctx.opts);
-        match state.devices.rendition_device(&ctx.opts, key.value()) {
-            Some(d) => {
-                if !full_eligible.contains(&d) {
-                    PinOutcome::Invalidated.record();
-                    tracing::warn!(
-                        %job_id,
-                        rendition = %key.short(),
-                        device = %d,
-                        "rendition device unavailable (cooldown); failing rather than spilling to another encoder"
-                    );
-                    let _ = ctx
-                        .reply
-                        .send(Err(SchedError::Failed(WorkerError::Other(format!(
-                        "rendition device {d} unavailable; refusing to mix encoders under one init"
-                    )))));
-                    return;
-                }
-                PinOutcome::Followed.record();
-                Some(d)
-            }
-            None => {
-                // Previously silent. Without it the counter cannot be read as a
-                // total: `followed + invalidated` was always short by however
-                // many shared-init jobs resolved to no device, and there was no
-                // way to tell that from the metric.
-                PinOutcome::Unresolved.record();
-                None
-            }
+    // Candidate devices = eligible minus already-tried, with the shared-init
+    // fMP4 pin applied. See `candidates_for`.
+    let candidates = match candidates_for(state, job_id, &ctx, &full_eligible) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ctx.reply.send(Err(e));
+            return;
         }
-    } else {
-        None
-    };
-
-    // Candidate devices = eligible minus already-tried. A pinned rendition has
-    // exactly one candidate and never widens.
-    let candidates: SmallVec<[DeviceId; 5]> = match pinned {
-        Some(d) => full_eligible
-            .iter()
-            .copied()
-            .filter(|c| *c == d && !ctx.excluded.contains(c))
-            .collect(),
-        None => full_eligible
-            .iter()
-            .copied()
-            .filter(|d| !ctx.excluded.contains(d))
-            .collect(),
     };
     if candidates.is_empty() {
         // Every supporting device has been tried + failed transiently.
@@ -1819,11 +1845,19 @@ fn try_place_no_queue(
     }
     let now = Instant::now();
     let full_eligible = state.devices.eligible_for(&ctx.opts, now);
-    let candidates: SmallVec<[DeviceId; 5]> = full_eligible
-        .iter()
-        .copied()
-        .filter(|d| !ctx.excluded.contains(d))
-        .collect();
+    // The SAME candidate set the arrival path computes, pin included. A job
+    // that queued because its pinned device was busy must drain onto that
+    // device or onto nothing — `candidates_for`'s `Err` (the pinned device went
+    // into cooldown while the job waited) fails the request here exactly as it
+    // does on arrival, rather than falling back to the queue: a stall the
+    // client recovers from beats a segment no client can decode.
+    let candidates = match candidates_for(state, job_id, &ctx, &full_eligible) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ctx.reply.send(Err(e));
+            return;
+        }
+    };
     if candidates.is_empty() {
         let err = ctx
             .last_error
@@ -1833,9 +1867,14 @@ fn try_place_no_queue(
         return;
     }
     // The same reserve the arrival path applies, recomputed against the device
-    // table as it is now. Speculative work reached this path for the first time
-    // in this task, so without it a queued prefetch would drain straight onto
-    // the permit `background_headroom` exists to hold open for a client.
+    // table as it is now — and, because `candidates` is now the pinned set,
+    // counted over the permits this job can actually use. Counted over the
+    // unpinned set it reported another device's free permits as this job's
+    // headroom, so a pinned job was admitted against capacity it could never
+    // reach. Speculative work reached this path for the first time in this
+    // task, so without the reserve at all a queued prefetch would drain
+    // straight onto the permit `background_headroom` exists to hold open for a
+    // client.
     if ctx.class == JobClass::Background && !background_may_dispatch(state, &candidates) {
         requeue.push_back((job_id, ctx));
         return;
@@ -2035,6 +2074,52 @@ mod tests {
     fn file_sink() -> SinkRequest {
         SinkRequest::FileDirect {
             out_path: PathBuf::from("/dev/null"),
+        }
+    }
+
+    /// The tag a test gave a job, recovered from its input path.
+    fn job_name(spec: &JobSpec) -> String {
+        spec.input
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    type DelayFn = dyn Fn(&JobSpec) -> Duration + Send + Sync;
+
+    /// Spawner whose per-job duration is a function of the job.
+    ///
+    /// [`ScriptedSpawner`]'s single delay cannot express "this device's permit
+    /// frees while that one is still held", which is the only way to make the
+    /// drain run against a PARTLY busy pool — and a partly busy pool is where
+    /// every candidate-set bug lives.
+    struct VariableSpawner(Arc<DelayFn>);
+
+    impl WorkerSpawner for VariableSpawner {
+        fn spawn(&self, id: WorkerId) -> SpawnFuture {
+            let f = self.0.clone();
+            Box::pin(async move { Ok(Box::new(VariableWorker { id, f }) as Box<dyn Worker>) })
+        }
+    }
+
+    struct VariableWorker {
+        id: WorkerId,
+        f: Arc<DelayFn>,
+    }
+
+    impl Worker for VariableWorker {
+        fn id(&self) -> WorkerId {
+            self.id
+        }
+        fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+            let f = self.f.clone();
+            Box::pin(async move {
+                let d = f(&job);
+                if !d.is_zero() {
+                    tokio::time::sleep(d).await;
+                }
+                WorkerRunResult::Done { out_bytes: 1 }
+            })
         }
     }
 
@@ -4521,5 +4606,122 @@ mod tests {
             "both viewers' next-needed segment must run before either viewer's \
              distant one, whatever order they were submitted in: {got:?}"
         );
+    }
+
+    /// Spec 003 R8 / issue #114, on the path the queue created.
+    ///
+    /// A shared-init fMP4 rendition resolves to exactly ONE device, and
+    /// `device_supports` keeps hardware ELIGIBLE for H264+fMP4 on purpose — the
+    /// one-encoder guarantee is the pin, not an exclusion, because excluding
+    /// hardware wholesale cost the GPU for all browser playback. So a CMAF job
+    /// sees a wide `eligible_for`, and any dispatch path that rebuilds its
+    /// candidate set without re-applying the pin will hand it to a second
+    /// encoder: libx264 output (High, `log2_max_frame_num` 4) under an init
+    /// carrying NVENC's SPS (Main, 8), which no ffmpeg flag reconciles.
+    /// Undecodable video, served with a 200.
+    ///
+    /// The QUEUE is what makes that reachable in volume rather than in theory:
+    /// browser H264 is all CMAF, its prefetch is `Background`, and speculative
+    /// work only began to queue at all in this change — so the drain became the
+    /// dominant producer of fMP4 segments. Run for both classes: an interactive
+    /// job could already reach the drain, and the reserve arithmetic that gates
+    /// the speculative one is counted over the candidate set, so both have to be
+    /// pinned by the same code.
+    ///
+    /// The shape: the pinned device is busy for the whole test, a permit on
+    /// ANOTHER device frees underneath the queued job, and it must still wait.
+    #[tokio::test]
+    async fn a_queued_cmaf_job_waits_for_its_pinned_device_rather_than_spilling() {
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        for class in [JobClass::Interactive, JobClass::Background] {
+            let spawner = Arc::new(VariableSpawner(Arc::new(|spec: &JobSpec| {
+                match job_name(spec).as_str() {
+                    // Holds the pinned device past everything else.
+                    "hold-gpu" => Duration::from_millis(400),
+                    // Frees a CPU permit — and with it a drain — while the GPU
+                    // is still busy.
+                    "free-cpu" => Duration::from_millis(60),
+                    _ => Duration::from_millis(20),
+                }
+            })));
+            // One GPU permit and two CPU ones, so the CPU still has spare
+            // capacity above `background_headroom` at the moment the drain runs.
+            // That is deliberate: the reserve must not be what saves this.
+            let s = TranscodeScheduler::spawn(
+                DeviceTable::from_probe(&[(gpu, 1)], 2),
+                spawner,
+                SchedConfig::default(),
+            );
+
+            let hold = {
+                let s2 = s.clone();
+                tokio::spawn(async move {
+                    s2.submit(
+                        PathBuf::from("/m/hold-gpu"),
+                        h264(),
+                        file_sink(),
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // VP9 has no NVENC encoder, so this can only land on the CPU.
+            let free_cpu = {
+                let s2 = s.clone();
+                let mut o = h264();
+                o.video = Some(VideoCodec::Vp9);
+                tokio::spawn(async move {
+                    s2.submit(
+                        PathBuf::from("/m/free-cpu"),
+                        o,
+                        file_sink(),
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(30)).await;
+
+            let probe = {
+                let s2 = s.clone();
+                tokio::spawn(async move {
+                    s2.submit(
+                        PathBuf::from("/m/probe"),
+                        cmaf(),
+                        file_sink(),
+                        class,
+                        JobHint::default(),
+                    )
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let snap = s.snapshot().await.expect("snapshot");
+            assert_eq!(
+                snap.pending, 1,
+                "precondition ({class:?}): the pinned job must be queued, not \
+                 already placed elsewhere"
+            );
+
+            free_cpu.await.unwrap().expect("cpu blocker");
+            hold.await.unwrap().expect("gpu blocker");
+            let done = probe
+                .await
+                .unwrap()
+                .expect("a queued shared-init job must still complete");
+            assert_eq!(
+                done.device, gpu,
+                "a queued CMAF job ({class:?}) must drain onto the device its \
+                 rendition pins to, never onto whichever permit freed first"
+            );
+            assert!(
+                done.queue_wait_ms > 0,
+                "precondition ({class:?}): the job must actually have waited, \
+                 or this proves nothing about the drain path"
+            );
+        }
     }
 }
