@@ -12,7 +12,11 @@
 //!   request registers the segment as in flight and drives the encode on a
 //!   detached task, later requests await the value it publishes. Nobody
 //!   holds exclusion across the encode, so a slow segment cannot make a
-//!   later requester for the same key wait on a lock (B108).
+//!   later requester for the same key wait on a lock (B108). The encode
+//!   outlives the requester that started it but NOT the last requester
+//!   wanting it: when every receiver has gone the driver stops
+//!   (`await_last_requester_gone`), so an episode swap still reclaims the
+//!   previous episode's speculative encodes (V58, PR #75).
 //! - LRU tracking via `(access_counter, key) → bytes`; eviction is
 //!   triggered after each insert and runs lazily until total bytes is
 //!   under the configured cap.
@@ -192,6 +196,17 @@ enum SegmentOutcome {
     /// is a fault. `shed + coalesced_shed` is the shedding total, disjoint from
     /// the failure total.
     CoalescedShed,
+    /// Every requester for this segment went away before it was produced, so
+    /// the encode was stopped rather than finished.
+    ///
+    /// Not a failure and not a shed: nothing went wrong and nothing was
+    /// refused — the work stopped being wanted, which is what an episode swap
+    /// or a `DELETE /Videos/ActiveEncodings` does to a window of prefetch. It is
+    /// the arm that keeps `pharos_segment_produced_total` a partition of
+    /// production attempts (V128) now that an attempt can end this way, and it
+    /// is the query that says how much speculative encoding a swap actually
+    /// reclaims — the thing PR #75 existed to do and could never be shown doing.
+    Cancelled,
 }
 
 impl SegmentOutcome {
@@ -208,6 +223,7 @@ impl SegmentOutcome {
             Self::Shed => "shed",
             Self::CoalescedFailed => "coalesced_failed",
             Self::CoalescedShed => "coalesced_shed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -807,6 +823,12 @@ pub struct HlsSegmentCache {
     /// poisonous: the client's own later request for that segment inherited the
     /// entire wait (B108).
     inflight: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
+    /// Source of [`InFlightSegment::id`]. One registration is not
+    /// interchangeable with the next for the same key, and two places have to
+    /// be able to say so under the map's shard lock: the driver's deregistration
+    /// (which must never remove a SUCCESSOR's entry) and the abandonment check
+    /// beside it.
+    next_registration: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The eventual outcome of one in-flight segment encode, as every waiter sees
@@ -858,8 +880,22 @@ impl SegmentWait {
 /// A segment somebody is already producing.
 #[derive(Clone)]
 struct InFlightSegment {
-    /// Resolves to `Some(outcome)` exactly once, when the driver publishes.
-    rx: tokio::sync::watch::Receiver<Option<SharedSegment>>,
+    /// Distinguishes this registration from any later one for the same key.
+    /// Compared under the map's shard lock, so a driver can only ever
+    /// deregister ITSELF.
+    id: u64,
+    /// The driver's publish channel. The registry holds the SENDER and no
+    /// receiver, and that is load-bearing rather than incidental: it makes
+    /// `receiver_count()` exactly the number of REQUESTERS still waiting on
+    /// these bytes, so the driver can be told when the last of them has gone.
+    /// A receiver parked here for bookkeeping would sit in that count forever,
+    /// and the driver could never tell "somebody is waiting" from "nobody is".
+    ///
+    /// A joiner therefore `subscribe()`s rather than cloning a stored receiver;
+    /// a requester holds only its own receiver, so a requester going away is
+    /// visible here while a requester can still be woken by the sender's
+    /// disappearance ([`SegmentWait::DriverGone`]).
+    tx: Arc<tokio::sync::watch::Sender<Option<SharedSegment>>>,
     /// Who the driver submitted as. A joiner that is blocked on these bytes
     /// while the driver is speculative has to say so — the outcome is shared,
     /// but the driver's PRIORITY was decided about the driver (V127), and a
@@ -915,6 +951,63 @@ fn shared_copy(err: &HlsCacheError) -> HlsCacheError {
     }
 }
 
+/// What one call to [`HlsSegmentCache::register_or_join`] got.
+struct Registration {
+    /// Where this requester waits for the outcome. The ONLY receiver it holds,
+    /// so this requester going away is visible to the driver.
+    rx: tokio::sync::watch::Receiver<Option<SharedSegment>>,
+    /// Whether THIS call is the one driving the encode.
+    driving: bool,
+    /// Which registration was joined, so a later look at the map can tell this
+    /// one from a successor for the same key.
+    id: u64,
+}
+
+/// Resolve when the last REQUESTER of `key` has gone, deregistering `key` in
+/// the same breath.
+///
+/// This is what makes `PrefetchRegistry`'s `h.abort()` mean something again.
+/// Detaching the driver was right for the case where somebody else is still
+/// waiting for the bytes and wrong for the case where nobody is: aborting a
+/// prefetch task killed only the WAITER, the scheduler's `oneshot` stayed alive
+/// inside the detached driver, so `reply.is_closed()` was false for every
+/// abandoned prefetch and `reap_abandoned` / `QueueOutcome::Abandoned` were
+/// near-dead for the case they were written for. An episode swap left roughly
+/// 6-14 orphaned encodes for the previous episode draining onto the GPU while
+/// the new episode was starting, and V58's claim that "a seek or a track swap
+/// closes its `oneshot` and the abandonment sweep collects it" had quietly
+/// become false. This is PR #75's fix, re-made against the shared-result design.
+///
+/// `Sender::closed()` is the signal precisely because the registry holds no
+/// receiver: every receiver in existence belongs to a requester, so zero
+/// receivers means nobody is waiting. It is awaited in a LOOP because a joiner
+/// may `subscribe` after it resolves, reopening the channel.
+///
+/// The race that would otherwise make this unsafe — a joiner arriving in the
+/// instant between the wake and the abandonment — is closed by taking the
+/// decision UNDER the map's shard lock. `remove_if` and a joiner's `entry()`
+/// contend for the same lock, so either the joiner subscribed first (the
+/// predicate sees its receiver, declines, and the encode carries on) or it will
+/// not find the entry at all and drives a fresh one. There is no interleaving
+/// in which a live requester is left waiting on an encode that has decided to
+/// stop.
+async fn await_last_requester_gone(
+    tx: &tokio::sync::watch::Sender<Option<SharedSegment>>,
+    map: &DashMap<SegmentIdentity, InFlightSegment>,
+    key: SegmentIdentity,
+    id: u64,
+) {
+    loop {
+        tx.closed().await;
+        if map
+            .remove_if(&key, |_, v| v.id == id && v.tx.receiver_count() == 0)
+            .is_some()
+        {
+            return;
+        }
+    }
+}
+
 /// Drops the in-flight registration however the driver ends.
 ///
 /// A `Drop` impl rather than a line at the end of the driver because the entry
@@ -925,11 +1018,18 @@ fn shared_copy(err: &HlsCacheError) -> HlsCacheError {
 struct InFlightGuard {
     map: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
     key: SegmentIdentity,
+    /// Remove OUR registration and no other. A driver that abandons its encode
+    /// deregisters early — under the shard lock, so a fresh driver may already
+    /// have registered this key by the time the guard runs — and an unqualified
+    /// `remove` would then delete a live successor's entry, leaving its
+    /// requesters waiting on a channel nothing can publish to: exactly the state
+    /// this guard exists to prevent, produced by the guard itself.
+    id: u64,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.map.remove(&self.key);
+        self.map.remove_if(&self.key, |_, v| v.id == self.id);
     }
 }
 
@@ -1040,6 +1140,7 @@ impl HlsSegmentCache {
             scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
             inflight: Arc::new(DashMap::new()),
+            next_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1228,8 +1329,11 @@ impl HlsSegmentCache {
         let mut attempt = 0u8;
         let (outcome, driving, driver_gone) = loop {
             attempt += 1;
-            let (mut rx, driving) =
-                self.register_or_join(key, source, opts, media_id, seg_index, class, hint);
+            let Registration {
+                mut rx,
+                driving,
+                id: registration_id,
+            } = self.register_or_join(key, source, opts, media_id, seg_index, class, hint);
             let wait = Self::await_segment(&mut rx).await;
             let driver_gone = matches!(wait, SegmentWait::DriverGone);
             let outcome = wait.into_outcome();
@@ -1265,12 +1369,12 @@ impl HlsSegmentCache {
             // few instructions wide and only reachable across threads, so one
             // `yield_now` is enough to let the guard run; if it somehow is not,
             // the second attempt inherits the shed and we are exactly where
-            // this branch found us, never worse. Matched by channel identity so
+            // this branch found us, never worse. Matched by registration id so
             // a NEW driver's registration is never mistaken for the corpse.
             let corpse_still_registered = self
                 .inflight
                 .get(&key)
-                .is_some_and(|e| e.rx.same_channel(&rx));
+                .is_some_and(|e| e.id == registration_id);
             if corpse_still_registered {
                 tokio::task::yield_now().await;
             }
@@ -1361,30 +1465,39 @@ impl HlsSegmentCache {
         seg_index: u32,
         class: JobClass,
         hint: JobHint,
-    ) -> (
-        tokio::sync::watch::Receiver<Option<SharedSegment>>,
-        bool, // driving
-    ) {
+    ) -> Registration {
         let job_slot = pharos_transcode::scheduler::JobSlot::new();
         let promoted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (rx, tx, joined) = match self.inflight.entry(key) {
+        let id = self
+            .next_registration
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (rx, registration_id, tx, joined) = match self.inflight.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
                 let e = e.get();
                 (
-                    e.rx.clone(),
+                    // `subscribe`, not a clone of a stored receiver: the registry
+                    // deliberately holds none, so every receiver that exists
+                    // belongs to a requester.
+                    e.tx.subscribe(),
+                    e.id,
                     None,
                     Some((e.driver_class, e.job.clone(), e.promoted.clone())),
                 )
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 let (tx, rx) = tokio::sync::watch::channel(None);
+                let tx = Arc::new(tx);
                 e.insert(InFlightSegment {
-                    rx: rx.clone(),
+                    id,
+                    tx: tx.clone(),
                     driver_class: class,
                     job: job_slot.subscribe(),
                     promoted: promoted.clone(),
                 });
-                (rx, Some(tx), None)
+                // `rx` is this requester's own, taken before the driver is even
+                // spawned — so the driver can never observe "no requesters"
+                // before its own requester has one.
+                (rx, id, Some(tx), None)
             }
         };
         if let Some((driver_class, job, promoted)) = joined {
@@ -1400,11 +1513,19 @@ impl HlsSegmentCache {
                 promoted.store(true, std::sync::atomic::Ordering::Release);
                 self.promote_driver(job);
             }
-            return (rx, false);
+            return Registration {
+                rx,
+                driving: false,
+                id: registration_id,
+            };
         }
         // Only the Vacant arm reaches here, and it always produced a sender.
         let Some(tx) = tx else {
-            return (rx, false);
+            return Registration {
+                rx,
+                driving: false,
+                id: registration_id,
+            };
         };
         let driver = self.clone();
         let driver_source = source.to_path_buf();
@@ -1421,39 +1542,64 @@ impl HlsSegmentCache {
         let guard = InFlightGuard {
             map: self.inflight.clone(),
             key,
+            id,
         };
         // Carry this request's span into the detached task. Without it the
         // encode's own lines and its `write_segment` span land unparented, and
         // the miss line loses the request it belongs to — the trace would end
         // where the work begins.
         let span = tracing::Span::current();
+        let map = self.inflight.clone();
         tokio::spawn(
             async move {
                 // Named so the block CAPTURES it: registered until the driver
                 // ends, panic included.
                 let _guard = guard;
-                let out = driver
-                    .produce_segment(
-                        &driver_source,
-                        &driver_opts,
-                        key,
-                        media_id,
-                        seg_index,
-                        class,
-                        hint,
-                        job_slot,
-                        promoted,
-                    )
-                    .await
-                    .map(Arc::new)
-                    .map_err(Arc::new);
-                // Publish BEFORE the guard removes the entry, so a requester
-                // that cloned the receiver a moment ago always sees a value.
-                let _ = tx.send(Some(out));
+                let produce = driver.produce_segment(
+                    &driver_source,
+                    &driver_opts,
+                    key,
+                    media_id,
+                    seg_index,
+                    class,
+                    hint,
+                    job_slot,
+                    promoted,
+                );
+                tokio::pin!(produce);
+                tokio::select! {
+                    out = &mut produce => {
+                        // Publish BEFORE the guard removes the entry, so a
+                        // requester that subscribed a moment ago always sees a
+                        // value.
+                        let _ = tx.send(Some(out.map(Arc::new).map_err(Arc::new)));
+                    }
+                    () = await_last_requester_gone(&tx, &map, key, id) => {
+                        // Nobody is waiting for these bytes any more, and the
+                        // registration is already gone — removed under the shard
+                        // lock, so no joiner can attach to an encode that is
+                        // about to stop. Dropping `produce` drops the
+                        // scheduler's `submit()` future with it, closing that
+                        // job's `oneshot`, which is exactly what `place` and
+                        // `reap_abandoned` read to collect it as
+                        // `QueueOutcome::Abandoned`.
+                        record_segment_outcome(SegmentOutcome::Cancelled, class);
+                        tracing::debug!(
+                            media.id = media_id,
+                            seg = seg_index,
+                            class = class.label(),
+                            "hls segment encode cancelled: every requester went away"
+                        );
+                    }
+                }
             }
             .instrument(span),
         );
-        (rx, true)
+        Registration {
+            rx,
+            driving: true,
+            id,
+        }
     }
 
     /// Wait for the driver to publish this segment's outcome.
@@ -1490,6 +1636,12 @@ impl HlsSegmentCache {
     /// it replaced, that cancellation dropped the guard, and the next waiter
     /// re-checked the filesystem, found nothing, and encoded the same segment a
     /// second time.
+    ///
+    /// It does NOT outlive the last requester. The future this returns is
+    /// dropped the moment no receiver for the segment remains
+    /// (`await_last_requester_gone`), which drops the scheduler `submit()`
+    /// inside it and hands the job to the abandonment sweep. Detaching without
+    /// that made `PrefetchRegistry`'s abort a no-op against the encode itself.
     #[allow(clippy::too_many_arguments)]
     async fn produce_segment(
         &self,
@@ -3438,7 +3590,11 @@ mod tests {
     /// Cancellation safety, which the Mutex design cannot express: today, if the
     /// lock holder is dropped mid-transcode the guard releases, the next waiter
     /// re-checks the filesystem, finds nothing, and encodes the SAME segment
-    /// again. A detached driver outlives the requester that started it.
+    /// again. A detached driver outlives the requester that started it — for as
+    /// long as SOMEBODY is still waiting for the bytes, which is the whole
+    /// content of the rule and what
+    /// `an_encode_nobody_is_waiting_for_is_cancelled_rather_than_run_to_completion`
+    /// pins from the other side.
     #[tokio::test]
     async fn cancelling_the_first_requester_does_not_abort_the_encode() {
         let dir = TempDir::new().unwrap();
@@ -3476,6 +3632,116 @@ mod tests {
             encode_count(&encodes),
             1,
             "the segment was encoded twice after a cancellation"
+        );
+    }
+
+    /// Block until `key`'s registration is present (or gone), or fail saying so.
+    ///
+    /// An observable, not a wall-clock premise — the same reasoning as
+    /// `await_coalescers`. A sleep long enough on an idle box and too short on a
+    /// loaded one produces a failure describing something that never happened.
+    async fn await_registration(
+        cache: &HlsSegmentCache,
+        key: SegmentIdentity,
+        present: bool,
+        within: std::time::Duration,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + within;
+        while cache.inflight.contains_key(&key) != present {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The other half of the detached-driver rule, and the half phase 2a lost.
+    ///
+    /// `PrefetchRegistry` cancels a session's outstanding prefetch on an episode
+    /// swap and on stop (PR #75), and it does so by aborting the spawned task.
+    /// Once the driver was detached, that abort killed only the WAITER: the
+    /// scheduler's `oneshot` lived on inside the driver with nothing holding a
+    /// handle to it, so `reply.is_closed()` was false for every abandoned
+    /// prefetch and `reap_abandoned` / `QueueOutcome::Abandoned` were near-dead
+    /// for the case they were written for. An episode swap left roughly 6-14
+    /// orphaned encodes for the previous episode draining onto the GPU while the
+    /// new episode was starting — and V58's claim that "a seek or a track swap
+    /// closes its `oneshot` and the abandonment sweep collects it" had become
+    /// false.
+    ///
+    /// Asserted on the two things a viewer would feel: the registration goes
+    /// well INSIDE the encode's own duration, so the work really stopped rather
+    /// than finishing quietly, and no segment is published for it.
+    #[test]
+    fn an_encode_nobody_is_waiting_for_is_cancelled_rather_than_run_to_completion() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(600));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(61, 9, None, None, &opts);
+        let path = cache.segment_path_keyed(key);
+        let cache = Arc::new(cache);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let prefetch = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(61, 9, Path::new("/no/source"), &o, JobClass::Background)
+                            .await
+                    })
+                };
+                await_registration(
+                    &cache,
+                    key,
+                    true,
+                    std::time::Duration::from_secs(5),
+                    "the prefetch never registered an encode, so there is nothing \
+                     here to abandon",
+                )
+                .await;
+
+                // The episode swap: exactly what `PrefetchRegistry` does.
+                prefetch.abort();
+
+                await_registration(
+                    &cache,
+                    key,
+                    false,
+                    std::time::Duration::from_millis(300),
+                    "the abandoned encode was still registered 300 ms in, i.e. it \
+                     is running to completion on a segment nobody will ever fetch",
+                )
+                .await;
+                // Past the point the encode would have finished, had it run.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            })
+        });
+
+        assert!(
+            !path.exists(),
+            "the abandoned encode published a segment, so it ran to completion"
+        );
+        let (labels, value) = produced_series(&snapshotter, "cancelled").expect(
+            "an encode stopped because every requester went away must be counted \
+             — it is the only signal that says how much speculative work an \
+             episode swap actually reclaims",
+        );
+        assert!(
+            labels.contains(&"class=background".to_string()),
+            "the abandoned driver's own class: {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one cancelled encode, got {value:?}"
         );
     }
 
@@ -3599,12 +3865,21 @@ mod tests {
     fn seed_inflight(
         cache: &HlsSegmentCache,
         key: SegmentIdentity,
-    ) -> tokio::sync::watch::Sender<Option<SharedSegment>> {
+    ) -> Arc<tokio::sync::watch::Sender<Option<SharedSegment>>> {
         let (tx, rx) = tokio::sync::watch::channel(None);
+        // Dropped at once: the registry holds no receiver, so every receiver
+        // that exists belongs to a requester. That is what a real registration
+        // does, and it is what makes `receiver_count()` mean "requesters" in
+        // `await_coalescers`.
+        drop(rx);
+        let tx = Arc::new(tx);
         cache.inflight.insert(
             key,
             InFlightSegment {
-                rx,
+                id: cache
+                    .next_registration
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                tx: tx.clone(),
                 driver_class: JobClass::Interactive,
                 job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
                 promoted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3620,7 +3895,7 @@ mod tests {
     fn finish_seeded_driver(
         cache: &HlsSegmentCache,
         key: SegmentIdentity,
-        tx: tokio::sync::watch::Sender<Option<SharedSegment>>,
+        tx: Arc<tokio::sync::watch::Sender<Option<SharedSegment>>>,
         outcome: SharedSegment,
     ) {
         let _ = tx.send(Some(outcome));
@@ -3637,7 +3912,7 @@ mod tests {
     fn abandon_seeded_driver(
         cache: &HlsSegmentCache,
         key: SegmentIdentity,
-        tx: tokio::sync::watch::Sender<Option<SharedSegment>>,
+        tx: Arc<tokio::sync::watch::Sender<Option<SharedSegment>>>,
     ) {
         cache.inflight.remove(&key);
         drop(tx);
@@ -3651,7 +3926,10 @@ mod tests {
     /// registration and drive its own encode, after which the test fails
     /// describing something that never happened. Deadlined, so a requester that
     /// never arrives fails here — naming that — instead of downstream.
-    async fn await_coalescers(tx: &tokio::sync::watch::Sender<Option<SharedSegment>>, n: usize) {
+    async fn await_coalescers(
+        tx: &Arc<tokio::sync::watch::Sender<Option<SharedSegment>>>,
+        n: usize,
+    ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while tx.receiver_count() < n {
             assert!(
@@ -3773,7 +4051,7 @@ mod tests {
                             .await
                     })
                 };
-                await_coalescers(&tx, 2).await;
+                await_coalescers(&tx, 1).await;
                 finish_seeded_driver(&cache, key, tx, Err(Arc::new(HlsCacheError::SchedulerBusy)));
                 waiter
                     .await
@@ -4681,26 +4959,17 @@ mod tests {
                             .await
                     })
                 };
-                await_coalescers(&first, 2).await;
+                await_coalescers(&first, 1).await;
 
                 // A SECOND encode registers before the first publishes, so the
                 // fall-through re-registers onto a live driver instead of
                 // becoming one. Ordered this way deliberately: seeding after the
                 // publish would race the woken requester.
-                let (second, second_rx) = tokio::sync::watch::channel(None);
-                cache.inflight.insert(
-                    key,
-                    InFlightSegment {
-                        rx: second_rx,
-                        driver_class: JobClass::Interactive,
-                        job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
-                        promoted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    },
-                );
+                let second = seed_inflight(&cache, key);
                 let _ = first.send(Some(Err(Arc::new(HlsCacheError::SchedulerBusy))));
                 drop(first);
 
-                await_coalescers(&second, 2).await;
+                await_coalescers(&second, 1).await;
                 finish_seeded_driver(
                     &cache,
                     key,
@@ -4912,7 +5181,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let (_rx, driving) = cache.register_or_join(
+            let Registration { driving, .. } = cache.register_or_join(
                 key,
                 Path::new("/no/source"),
                 &opts,
@@ -4977,7 +5246,7 @@ mod tests {
             })
         };
         // The join itself, not an interval in which it probably happened.
-        await_coalescers(&tx, 2).await;
+        await_coalescers(&tx, 1).await;
 
         // The driver goes away mid-encode: registration gone, sender dropped,
         // nothing ever published.
@@ -5220,6 +5489,7 @@ mod tests {
             SegmentOutcome::Shed,
             SegmentOutcome::CoalescedFailed,
             SegmentOutcome::CoalescedShed,
+            SegmentOutcome::Cancelled,
         ];
         for o in all {
             match o {
@@ -5229,7 +5499,8 @@ mod tests {
                 | SegmentOutcome::Failed
                 | SegmentOutcome::Shed
                 | SegmentOutcome::CoalescedFailed
-                | SegmentOutcome::CoalescedShed => {}
+                | SegmentOutcome::CoalescedShed
+                | SegmentOutcome::Cancelled => {}
             }
         }
         let labels: Vec<&str> = all.iter().map(|o| o.label()).collect();
@@ -5242,7 +5513,8 @@ mod tests {
                 "failed",
                 "shed",
                 "coalesced_failed",
-                "coalesced_shed"
+                "coalesced_shed",
+                "cancelled"
             ]
         );
         let mut uniq = labels.clone();

@@ -46,6 +46,25 @@ found that the design did not know:
    counted an inherited `SchedulerBusy` as an encode failure, which under a
    prefetch storm would have made an alert fire on admission control working
    correctly. `coalesced_shed` keeps the two sums disjoint.
+5. **The detached driver had to learn when to stop.** 2a's detachment made
+   `PrefetchRegistry`'s abort a no-op against the encode itself, silently
+   reversing PR #75 and falsifying a clause of V58. A driver now races its
+   encode against "every requester has gone", decided under the registry's shard
+   lock, and an encode stopped that way is counted `outcome="cancelled"`. See
+   the cancellation table in phase 2b.
+6. **A promoted job is measured from the promotion, and labelled from it.**
+   The controller judged every interactive completion from `dispatched`, which
+   for a promoted job predates the client — a 5 s encode joined at 4 s reported
+   5 s against a 3 s deadline and halved the allowance for a prefetch that
+   landed. The observation window is now the later of dispatch and promotion,
+   while `encode_ms` still measures the encode. Separately, the segment cache's
+   latency histograms label by who was WAITING, as §Consequences requires;
+   the production counters keep the driver's own class, since they count
+   attempts rather than waits.
+7. **Phase 2b has an off switch.** `SchedConfig::queue_background` (`[server]
+   transcode_queue_background`) returns speculation to shed-not-queue without
+   touching the interactive queue. `pending_cap = 0` is not the same lever: it
+   sheds clients too.
 
 Three defects this work found in already-shipped behaviour, all of which would
 have been silent:
@@ -338,13 +357,33 @@ Evaluated at dispatch, so no reaper task is needed:
 
 | condition | action |
 |---|---|
-| `reply.is_closed()` (session swap/stop via `PrefetchRegistry`) | drop — **already implemented** |
+| `reply.is_closed()` (session swap/stop via `PrefetchRegistry`) | drop — implemented, but see below: 2a broke it and it had to be re-made |
 | background job whose distance ≤ 0 (playhead passed it) | drop as stale |
 | queue full | evict the **least urgent background**, not the newest arrival |
 | nothing evictable | shed, as today |
 
 Eviction direction matters: FIFO overflow drops the newest, which is the most
 urgent. Evicting the least urgent is the opposite, and correct.
+
+The first row of that table is the one 2a quietly invalidated, and it is worth
+stating plainly because it is the shape of the mistake: two individually
+correct changes whose seam is wrong. `PrefetchRegistry` cancels by aborting the
+spawned prefetch task. With a caller-driven fill that dropped the scheduler
+`submit()` future with it. With a **detached driver** it drops only the
+*waiter* — the `oneshot` lives on inside the driver, which nothing holds a
+handle to — so `reply.is_closed()` is false for every abandoned prefetch and
+the abandonment sweep collects nothing.
+
+The fix is not to re-attach the driver. It is to make the driver outlive the
+requester that STARTED it and not the last requester WANTING it: the registry
+holds the publish channel's sender and no receiver, so `receiver_count() == 0`
+means nobody is waiting, and the driver races the encode against that condition.
+The abandonment is decided under the map's shard lock so a joiner arriving in
+that instant either attaches (and the encode continues) or misses the entry
+entirely (and drives a fresh one). An encode stopped this way is counted
+`pharos_segment_produced_total{outcome="cancelled"}` — which is also, for the
+first time, the query that says how much speculative work an episode swap
+reclaims.
 
 ### What the scheduler must learn
 
