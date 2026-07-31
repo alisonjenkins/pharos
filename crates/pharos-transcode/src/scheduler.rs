@@ -219,6 +219,12 @@ pub struct JobDone {
     /// speculative encodes on top of it". Measured on the deployment: 1 860 ms
     /// alone, 6 229 ms with six peers.
     pub peer_jobs: usize,
+    /// Of `peer_jobs`, how many were speculative. `peer_jobs` says a segment was
+    /// crowded; this says whether it was crowded by work somebody was waiting
+    /// for or by work nobody asked for — the difference between genuine
+    /// overload and a scheduling defect, and the input the admission controller
+    /// backs off on.
+    pub background_peers: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +395,8 @@ struct JobCtx {
     /// Re-stamped on each (re)dispatch, like `dispatched`, so a retry reports
     /// the company it actually kept rather than the company it first met.
     peer_jobs: usize,
+    /// Speculative subset of `peer_jobs`, stamped at the same moment.
+    background_peers: usize,
     /// The job's own span, opened at dispatch (when the device — and so the
     /// decode path — is finally known) and carried here so the completion
     /// arm, which runs in the ACTOR and not inside the job's task, can still
@@ -554,6 +562,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 class,
                 device: None,
                 peer_jobs: 0,
+                background_peers: 0,
                 // Replaced at dispatch, once the device is known.
                 span: tracing::Span::none(),
             };
@@ -703,6 +712,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                             queue_wait_ms = queue_ms,
                             encode_ms,
                             peer_jobs = ctx.peer_jobs,
+                            background_peers = ctx.background_peers,
                             retries = ctx.retries,
                             "transcode job done"
                         );
@@ -713,6 +723,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         queue_wait_ms: queue_ms,
                         encode_ms,
                         peer_jobs: ctx.peer_jobs,
+                        background_peers: ctx.background_peers,
                     }));
                 }
                 WorkerRunResult::Failed(err) if !err.is_transient() => {
@@ -856,6 +867,20 @@ fn peers_on(state: &SchedState, dev: DeviceId) -> usize {
         .count()
 }
 
+/// Of the segment jobs already running on `dev`, how many are speculative.
+///
+/// Split out from [`peers_on`] rather than derived from it: the admission
+/// controller must not back off because a device is busy with work clients are
+/// blocked on — that is the device doing its job, and shedding prefetch cannot
+/// make it faster.
+fn background_peers_on(state: &SchedState, dev: DeviceId) -> usize {
+    state
+        .inflight
+        .values()
+        .filter(|c| c.device == Some(dev) && c.class == JobClass::Background)
+        .count()
+}
+
 /// Permits currently free across the devices that could take a given job.
 /// Counted over the job's own candidate set, not the whole table: capacity on
 /// a device that cannot encode this target is not headroom for it.
@@ -961,6 +986,7 @@ fn record_placement(
         dur_secs = ctx.opts.duration_ticks.map(|t| t as f64 / 10_000_000.0),
         retries = ctx.retries,
         peer_jobs = tracing::field::Empty,
+        background_peers = tracing::field::Empty,
         queue_wait_ms = tracing::field::Empty,
         encode_ms = tracing::field::Empty,
         out_bytes = tracing::field::Empty,
@@ -1138,7 +1164,9 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             // Counted BEFORE this job joins `inflight`, so it is peers, not
             // occupancy: a job that runs alone reports 0.
             ctx.peer_jobs = peers_on(state, dev);
+            ctx.background_peers = background_peers_on(state, dev);
             span.record("peer_jobs", ctx.peer_jobs);
+            span.record("background_peers", ctx.background_peers);
             ctx.span = span.clone();
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
@@ -1238,6 +1266,13 @@ fn try_place_no_queue(
             span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
             ctx.device = Some(dev);
+            // B178 — same stamping as `place`. A job dispatched off the queue
+            // used to report zero peers regardless, and the queue is what runs
+            // when the device is busiest.
+            ctx.peer_jobs = peers_on(state, dev);
+            ctx.background_peers = background_peers_on(state, dev);
+            span.record("peer_jobs", ctx.peer_jobs);
+            span.record("background_peers", ctx.background_peers);
             ctx.span = span.clone();
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
@@ -2378,6 +2413,124 @@ mod tests {
         );
         assert!(first.await.unwrap().is_ok());
     }
+
+    /// B178 — a job that WAITED for its permit reported the company it kept as
+    /// zero, because only the first-attempt dispatch path stamped it. The
+    /// drain path is the one that runs when the device is busiest, so the
+    /// instrumentation was blind in precisely the case it exists for.
+    ///
+    /// This is a strengthened version of the brief's original two-job case (A
+    /// alone takes the only GPU permit, B queues behind it). That version
+    /// does not actually discriminate: `DeviceSlot::new` clamps ANY probed
+    /// capacity to at least 1, so a "one GPU permit" table still carries a
+    /// free CPU permit, and a second job lands there immediately instead of
+    /// queuing at all (confirmed empirically: it dispatched to `DeviceId::Cpu`
+    /// with `queue_wait_ms == 0`). And even fixed to force a real queue, "B
+    /// ran alone" makes the expected `peer_jobs`/`background_peers` both 0 --
+    /// exactly what `JobCtx` already carries as its zero-initialised default,
+    /// so a `try_place_no_queue` that stamps nothing would pass it too. This
+    /// version keeps a second job (A2, speculative) alive on the GPU when B
+    /// drains onto it, and a filler on the ever-present CPU permit so B is
+    /// forced to actually queue, so the expected counts are non-zero and a
+    /// no-op cannot produce them by accident.
+    #[tokio::test]
+    async fn a_job_dispatched_off_the_queue_reports_its_peers() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(300), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        // Two GPU permits: A1 and A2 both land there, back to back.
+        let s = TranscodeScheduler::spawn(one_gpu(2), spawner, SchedConfig::default());
+
+        let a1 = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/a1"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Second GPU slot -- speculative, so B's drain exercises
+        // `background_peers` and not just `peer_jobs`. Started just after A1
+        // with the same run length, so it is still inflight when A1's permit
+        // frees and B drains onto the device.
+        let a2 = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/a2"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The scheduler always keeps at least one CPU permit (a probed
+        // capacity of 0 is clamped up to 1 -- see `DeviceSlot::new` -- so the
+        // table never holds a dead slot). Without consuming it, B would land
+        // on that free CPU permit instead of queuing at all.
+        let filler_cpu = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/filler"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // B: both GPU slots and the one CPU slot are taken, so this one must
+        // actually queue.
+        let b = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/b"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+
+        let a1 = a1.await.unwrap().unwrap();
+        let filler_cpu = filler_cpu.await.unwrap().unwrap();
+        let b = b.await.unwrap().unwrap();
+        let a2 = a2.await.unwrap().unwrap();
+
+        assert_eq!(a1.peer_jobs, 0, "A1 was first onto the GPU, alone");
+        assert_eq!(
+            filler_cpu.device,
+            DeviceId::Cpu,
+            "the filler must have taken the always-present CPU permit"
+        );
+        assert_eq!(a2.device, DeviceId::hw(HwAccel::Nvenc, 0));
+
+        // B dispatched from `pending` once A1's permit freed. A2 -- a
+        // Background job -- was still running on the GPU at that moment, so
+        // a correctly-stamped B reports the company it kept: one peer, and
+        // that peer was speculative.
+        assert_eq!(
+            b.peer_jobs, 1,
+            "A2 was still running on the GPU when B drained onto it"
+        );
+        assert_eq!(b.background_peers, 1, "that peer (A2) was speculative");
+        assert!(b.queue_wait_ms > 0, "B must actually have queued");
+    }
+
     /// The fix. Speculative work must not pile onto the device that is
     /// encoding the segment a client is blocked on.
     ///
