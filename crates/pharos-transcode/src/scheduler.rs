@@ -460,10 +460,13 @@ pub struct SchedConfig {
     /// under sustained deadline misses, so a cold process behaves exactly as
     /// it did when this was the whole answer.
     ///
-    /// Not zero. Shedding ALL prefetch while a client job runs would starve
-    /// the pipeline that makes the next segment a 30 ms cache hit — prefetch
-    /// is shed, never queued, so what is refused here is not retried later,
-    /// and every segment would become a cold miss.
+    /// Not zero. Refusing ALL prefetch while a client job runs would starve
+    /// the pipeline that makes the next segment a 30 ms cache hit. That was
+    /// true when refused prefetch was dropped outright, and it stayed true when
+    /// it began to wait for a permit instead (V58): a job refused on every
+    /// device it could use is a job that is never selected, so a zero allowance
+    /// starves it just as completely — it merely starves it in the queue rather
+    /// than at the door.
     ///
     /// Derived from `admission.floor` in `Default` rather than restated as
     /// its own literal: this and `AdmissionConfig::floor` are the same number
