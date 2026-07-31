@@ -4228,10 +4228,21 @@ mod tests {
     /// missing from is the failure arm.
     ///
     /// The driver is put on its OWN runtime — entered for the duration of the
-    /// request, which is all `tokio::spawn` consults — and that runtime is then
-    /// shut down from a second thread while the requester survives on the first.
-    /// That is the production shape (the task is dropped, its sender with it,
-    /// nothing published) and needs no hook in production code.
+    /// request, which is all `tokio::spawn` consults — and that runtime is
+    /// ALREADY DEAD when the request is made. `Handle::spawn` on a shut-down
+    /// runtime constructs the task and drops it without ever polling it, which
+    /// is exactly the production shape (the task is dropped, its sender with
+    /// it, nothing published) and needs no hook in production code.
+    ///
+    /// Killing the runtime from a second thread once the registration appeared
+    /// in `inflight` looked more faithful and was a race: the registration is
+    /// made on the REQUESTER's thread, before `tokio::spawn`, so the driver
+    /// task could be polled and reach a `tokio::fs` call before the shutdown
+    /// landed. It then published a real `Io("background task failed")` instead
+    /// of dying silently, and the test failed on the error text — 5 runs in 25,
+    /// load-dependent, and indistinguishable from a regression in the code it
+    /// guards. Ordering the shutdown BEFORE the request removes the window
+    /// rather than narrowing it: there is no interleaving left to lose.
     #[test]
     fn a_requester_whose_driver_dies_before_producing_counts_itself() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -4239,7 +4250,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_secs(5));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(13, 7, None, None, &opts);
 
         let driver_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -4252,22 +4262,10 @@ mod tests {
             .build()
             .unwrap();
 
-        // Kills the driver's runtime as soon as the encode is registered —
-        // waiting on the observable rather than on a guessed interval.
-        let killer = {
-            let cache = cache.clone();
-            std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while !cache.inflight.contains_key(&key) {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the driver never registered its encode"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                driver_rt.shutdown_timeout(std::time::Duration::ZERO);
-            })
-        };
+        // The driver's runtime dies here, before anything is asked of it. The
+        // handle outlives it and still answers `enter()`, so the request below
+        // still spawns its driver ONTO the dead runtime — it just never runs.
+        driver_rt.shutdown_timeout(std::time::Duration::ZERO);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -4282,7 +4280,6 @@ mod tests {
             })
         })
         .expect_err("a driver that died without producing must fail the request that spawned it");
-        killer.join().unwrap();
 
         assert!(
             matches!(&err, HlsCacheError::Transcode(m)
