@@ -7259,6 +7259,186 @@ mod tests {
         );
     }
 
+    /// The three arms nothing else asserts, so the partition is a claim the
+    /// tests make rather than one the prose makes.
+    ///
+    /// `abandoned` and `failed` are the two exits that are NOT load management,
+    /// and folding either into `shed` would report the queue managing pressure
+    /// when it was doing nothing of the kind — a dashboard reading "we are
+    /// shedding" during an outage that was actually an unsupported target or a
+    /// wave of seeks. The third is `shed` reached with NO victim available at
+    /// all: a full queue of work a client is blocked on, which the eviction
+    /// rule must refuse to touch, so the arrival is turned away instead.
+    ///
+    /// Three phases on three schedulers under one recorder, because each needs
+    /// a different pool shape and the counters are what is being read.
+    #[test]
+    fn the_partition_covers_abandonment_failure_and_a_shed_with_no_victim() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                // 1. `failed` — a target no device can ever take. Nothing about
+                //    load, and nothing a retry or more capacity would help.
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+                let r = s
+                    .submit(
+                        PathBuf::from("/m/live"),
+                        h264(),
+                        SinkRequest::LiveStream,
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await;
+                assert_eq!(
+                    r,
+                    Err(SchedError::Unsupported),
+                    "precondition: the live sink must still be rejected"
+                );
+
+                // 2. `abandoned` — a queued guess whose caller went away. The
+                //    seek that orphaned it is not load either.
+                let spawner =
+                    Arc::new(VariableSpawner(Arc::new(
+                        |spec: &JobSpec| match job_name(spec).as_str() {
+                            "hold" => Duration::from_millis(200),
+                            _ => Duration::from_millis(20),
+                        },
+                    )));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[], 1),
+                    spawner,
+                    SchedConfig {
+                        background_headroom: 0,
+                        ..SchedConfig::default()
+                    },
+                );
+                let submit = |tag: &'static str, class: JobClass| {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from(format!("/m/{tag}")),
+                            h264(),
+                            file_sink(),
+                            class,
+                            JobHint::default(),
+                        )
+                        .await
+                    })
+                };
+                let hold = submit("hold", JobClass::Interactive);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let orphan = submit("orphan", JobClass::Background);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                orphan.abort();
+                assert!(
+                    orphan.await.is_err(),
+                    "precondition: the orphan's caller must really be gone"
+                );
+                hold.await.unwrap().expect("the client's own segment");
+                tokio::time::sleep(Duration::from_millis(60)).await;
+
+                // 3. `shed` with no victim — a full queue of work clients are
+                //    blocked on. Eviction may not reach past speculation, so
+                //    there is nothing to displace and the guess is turned away.
+                let spawner =
+                    Arc::new(VariableSpawner(Arc::new(
+                        |spec: &JobSpec| match job_name(spec).as_str() {
+                            "hold2" => Duration::from_millis(300),
+                            _ => Duration::from_millis(20),
+                        },
+                    )));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[], 1),
+                    spawner,
+                    SchedConfig {
+                        pending_cap: 2,
+                        background_headroom: 0,
+                        ..SchedConfig::default()
+                    },
+                );
+                let submit = |tag: &'static str, class: JobClass| {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from(format!("/m/{tag}")),
+                            h264(),
+                            file_sink(),
+                            class,
+                            JobHint::default(),
+                        )
+                        .await
+                    })
+                };
+                let hold2 = submit("hold2", JobClass::Interactive);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let c1 = submit("client-1", JobClass::Interactive);
+                let c2 = submit("client-2", JobClass::Interactive);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let guess = submit("guess", JobClass::Background);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let guess = guess.await.unwrap();
+                assert!(
+                    matches!(guess, Err(SchedError::Busy)),
+                    "a queue full of clients has nothing an arrival may take: {guess:?}"
+                );
+                for (tag, h) in [("hold2", hold2), ("client-1", c1), ("client-2", c2)] {
+                    h.await
+                        .unwrap()
+                        .unwrap_or_else(|e| panic!("{tag} was refused: {e:?}"));
+                }
+            })
+        });
+
+        let m = Metrics::capture(&snapshotter);
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=interactive", "outcome=failed"],
+            ),
+            1,
+            "a target no device can take must be counted as `failed`, not as \
+             load the scheduler chose to shed"
+        );
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=abandoned"],
+            ),
+            1,
+            "a queued job whose caller went away must be counted as \
+             `abandoned`: work that stopped existing, not work refused"
+        );
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=shed"],
+            ),
+            1,
+            "an arrival at a queue with no evictable victim must still be \
+             counted as `shed`"
+        );
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=evicted"],
+            ),
+            0,
+            "...and nothing may be recorded as evicted when nothing was: the \
+             partition is only a partition if each arm means one thing"
+        );
+    }
+
     /// Spec 003 R8 / issue #114, on the path the queue created.
     ///
     /// A shared-init fMP4 rendition resolves to exactly ONE device, and
