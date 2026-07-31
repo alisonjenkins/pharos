@@ -946,10 +946,65 @@ impl HlsSegmentCache {
         // Coalesce onto an encode already in progress for this exact key, or
         // become the one that starts it, then wait for the ANSWER rather than
         // for exclusion.
+        //
+        // At most TWO registration attempts. The second exists only for the
+        // inherited-shed fall-through below, and it is explicitly barred from
+        // falling through again (`attempt == 1`), so no interleaving — however
+        // pathological — can spin here: every path out of the loop is either a
+        // published outcome or the second attempt's outcome, whatever it is.
         let coalesced_started = std::time::Instant::now();
-        let (mut rx, driving) =
-            self.register_or_join(key, source, opts, media_id, seg_index, class);
-        let outcome = Self::await_segment(&mut rx).await;
+        let mut attempt = 0u8;
+        let (outcome, driving) = loop {
+            attempt += 1;
+            let (mut rx, driving) =
+                self.register_or_join(key, source, opts, media_id, seg_index, class);
+            let outcome = Self::await_segment(&mut rx).await;
+            // A request that did not drive this encode must not be failed by
+            // its driver's LOAD-SHED decision. `SchedulerBusy` says "the
+            // scheduler kept its permits for work a client is blocked on" — the
+            // right answer for the speculative prefetch that asked, and the
+            // wrong one for a client waiting on the segment, which reaches the
+            // browser as a 500 on a video segment. Prefetch, prewarm and burn
+            // warm-up all submit as `Background`, and Background is shed
+            // precisely when load is high, so this is load-correlated: shed
+            // probability approaches 1 exactly when an interactive request most
+            // needs to be admitted. Under the per-key mutex this replaced, the
+            // waiter re-checked the filesystem after the shed and submitted its
+            // OWN job, at its OWN class.
+            //
+            // So: fall through and drive it. This is NOT promotion — nobody's
+            // class is changed and the shed job is not resubmitted; the
+            // requester simply declines to adopt a decision made about somebody
+            // else's job. A DRIVING requester keeps its own shed (B108/V58):
+            // shedding work you submitted yourself is the intended behaviour.
+            let inherited_shed = !driving
+                && matches!(&outcome, Err(e) if matches!(**e, HlsCacheError::SchedulerBusy));
+            if !(inherited_shed && attempt == 1) {
+                break (outcome, driving);
+            }
+            tracing::debug!(
+                media.id = media_id,
+                seg = seg_index,
+                class = class.label(),
+                "hls segment: re-driving rather than inheriting another job's shed"
+            );
+            // The driver publishes and only THEN drops its guard, so between
+            // those two points the registration is a corpse: an entry whose
+            // outcome is already decided. Re-registering onto it would hand
+            // back the same shed and waste the one re-attempt. The window is a
+            // few instructions wide and only reachable across threads, so one
+            // `yield_now` is enough to let the guard run; if it somehow is not,
+            // the second attempt inherits the shed and we are exactly where
+            // this branch found us, never worse. Matched by channel identity so
+            // a NEW driver's registration is never mistaken for the corpse.
+            let corpse_still_registered = self
+                .inflight
+                .get(&key)
+                .is_some_and(|e| e.rx.same_channel(&rx));
+            if corpse_still_registered {
+                tokio::task::yield_now().await;
+            }
+        };
 
         let bytes = outcome.map_err(|e| shared_copy(&e))?;
         if !driving {
@@ -3073,6 +3128,145 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one coalesced hit, got {value:?}"
+        );
+    }
+
+    /// Register an in-flight encode the TEST drives, so its outcome and its
+    /// timing are chosen rather than raced for. Nothing production-only: this is
+    /// the same registration `register_or_join` makes, and the requester under
+    /// test reaches it through the ordinary public entry point.
+    fn seed_inflight(
+        cache: &HlsSegmentCache,
+        key: SegmentIdentity,
+    ) -> tokio::sync::watch::Sender<Option<SharedSegment>> {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        cache.inflight.insert(key, InFlightSegment { rx });
+        tx
+    }
+
+    /// End the seeded encode exactly as a real driver ends: publish the outcome,
+    /// THEN drop the registration, THEN drop the sender. That order is the one
+    /// the `InFlightGuard` enforces, and a test that used any other order would
+    /// be testing a driver pharos does not have.
+    fn finish_seeded_driver(
+        cache: &HlsSegmentCache,
+        key: SegmentIdentity,
+        tx: tokio::sync::watch::Sender<Option<SharedSegment>>,
+        outcome: SharedSegment,
+    ) {
+        let _ = tx.send(Some(outcome));
+        cache.inflight.remove(&key);
+        drop(tx);
+    }
+
+    /// `SchedulerBusy` is LOAD-SHEDDING, not breakage — the scheduler keeping
+    /// its permits for work a client is blocked on. It is the right answer for
+    /// the speculative prefetch that asked for it and the wrong one for a client
+    /// waiting on the segment, which sees it as a 500 on a video segment.
+    ///
+    /// Prefetch, cold-start prewarm and burn warm-up all submit as `Background`,
+    /// and Background is shed precisely when the devices are busy — so without
+    /// this, shed probability approaches 1 exactly when an interactive request
+    /// most needs to be admitted. Under the mutex this design replaced, the
+    /// waiter re-checked the filesystem after the shed and submitted its own job
+    /// at its own class; a requester must not lose that.
+    #[tokio::test]
+    async fn a_coalescing_requester_re_drives_rather_than_inheriting_a_shed() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(4, 2, None, None, &opts);
+        let tx = seed_inflight(&cache, key);
+
+        let waiter = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes(4, 2, Path::new("/no/source"), &o, JobClass::Interactive)
+                    .await
+            })
+        };
+        // Let it coalesce onto the in-flight encode before that encode is shed.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            encode_count(&encodes),
+            0,
+            "the requester started its own encode instead of coalescing"
+        );
+
+        finish_seeded_driver(&cache, key, tx, Err(Arc::new(HlsCacheError::SchedulerBusy)));
+
+        let bytes = waiter
+            .await
+            .unwrap()
+            .expect("a client request was failed by another job's load-shed decision");
+        assert_eq!(bytes, SLOW_SEGMENT_BYTES.as_bytes());
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "the requester did not drive an encode of its own"
+        );
+    }
+
+    /// A scheduler that sheds every speculative job: one device, whose whole
+    /// capacity is the headroom reserved for client work, so a `Background`
+    /// submission is refused before it is ever dispatched. The spawner is
+    /// therefore never called — a shed costs no worker.
+    fn always_sheds_background() -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::scheduler::{SchedConfig, SpawnFuture, TranscodeScheduler};
+
+        struct NeverSpawns;
+        impl pharos_transcode::scheduler::WorkerSpawner for NeverSpawns {
+            fn spawn(&self, _id: pharos_transcode::protocol::WorkerId) -> SpawnFuture {
+                Box::pin(async {
+                    Err(std::io::Error::other(
+                        "the shed path must not need a worker",
+                    ))
+                })
+            }
+        }
+
+        TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 1),
+            Arc::new(NeverSpawns),
+            SchedConfig {
+                background_headroom: 1,
+                ..SchedConfig::default()
+            },
+        )
+    }
+
+    /// A DRIVING requester keeps its own shed. Shedding work you submitted
+    /// yourself is the intended behaviour (B108/V58), and the fall-through above
+    /// must not quietly become a retry loop that defeats it: the re-drive is
+    /// "do not adopt somebody else's decision", not "ask again until admitted".
+    #[tokio::test]
+    async fn a_driving_requester_keeps_its_own_shed() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let cache = cache.with_scheduler(always_sheds_background());
+        let opts = slow_opts();
+
+        // Nothing is in flight, so this request drives its own encode — and its
+        // own encode is shed.
+        let err = cache
+            .segment_bytes(5, 1, Path::new("/no/source"), &opts, JobClass::Background)
+            .await
+            .expect_err("a speculative job the scheduler declined must report the shed");
+        assert!(
+            matches!(err, HlsCacheError::SchedulerBusy),
+            "a driving requester must surface its own shed unchanged: {err:?}"
+        );
+        assert_eq!(
+            encode_count(&encodes),
+            0,
+            "a shed job must not fall back to encoding anyway"
+        );
+        assert!(
+            !cache
+                .inflight
+                .contains_key(&SegmentIdentity::new(5, 1, None, None, &opts)),
+            "the shed left its registration behind"
         );
     }
 
