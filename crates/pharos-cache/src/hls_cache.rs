@@ -4256,6 +4256,16 @@ mod tests {
     /// load-dependent, and indistinguishable from a regression in the code it
     /// guards. Ordering the shutdown BEFORE the request removes the window
     /// rather than narrowing it: there is no interleaving left to lose.
+    ///
+    /// One constraint that binds future edits rather than this one. The dead
+    /// runtime is ENTERED for the whole request, so anything the REQUESTER path
+    /// does that needs a driver — a `tokio::time` timer above all, but any
+    /// reactor registration — resolves against it and PANICS ("A Tokio 1.x
+    /// context was found, but it is being shutdown") instead of failing an
+    /// assertion. Today that path only awaits a `oneshot`, which needs no
+    /// driver. Give the wait a timeout, or any deadline, and this test stops
+    /// reporting on the code it guards and starts reporting on its own
+    /// scaffolding.
     #[test]
     fn a_requester_whose_driver_dies_before_producing_counts_itself() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
