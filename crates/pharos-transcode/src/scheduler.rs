@@ -1486,13 +1486,109 @@ fn background_admission(state: &SchedState, candidates: &[DeviceId]) -> Backgrou
 /// client's 90 s wait, B108) and because it is re-ranked by urgency at dispatch
 /// rather than served FIFO (see `next_to_dispatch`).
 ///
-/// `pending_cap` is still a hard stop: a full queue replies `Busy` rather than
-/// growing without bound.
+/// `pending_cap` is still a hard stop on the queue's SIZE — it never grows past
+/// it. What changes when it is reached is WHICH job goes: see below.
 fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
-    if state.pending.len() >= state.cfg.pending_cap {
-        let _ = ctx.reply.send(Err(SchedError::Busy));
-    } else {
+    if state.pending.len() < state.cfg.pending_cap {
         state.pending.push_back((job_id, ctx));
+        return;
+    }
+    // A full FIFO refuses the newest arrival, and for speculative work the
+    // newest arrival is systematically the MOST urgent thing present: prefetch
+    // is submitted in playback order, so a job arriving now is close to the
+    // playhead while the incumbents are the deep guesses submitted when the
+    // client was further back. Overflow therefore threw away the segment the
+    // client was about to want and kept the one it would reach in a minute — if
+    // it ever did.
+    //
+    // Evict the least urgent instead, by the same key that ranks dispatch
+    // (`next_to_dispatch`) read at its maximum rather than its minimum. Same
+    // key, so the queue cannot evict a job it would have been happy to
+    // dispatch, and so passed work — which eviction, running on ARRIVAL between
+    // drains, sees before any drain has had the chance to drop it — is the
+    // first thing to go.
+    //
+    // Two rules make this a load-management decision rather than a lottery.
+    // Only `Background` is a candidate: somebody is blocked on every
+    // Interactive job in the queue, and freeing a slot by abandoning a client
+    // mid-request is a 500 on a segment somebody is watching. And the newcomer
+    // must actually BEAT the victim: an arriving guess deeper than everything
+    // queued is refused rather than admitted at the cost of work nearer the
+    // viewer, so a burst of far-out prefetch cannot churn the queue.
+    //
+    // Today the second rule already implies the first — an Interactive
+    // incumbent's key is (0, .., its arrival index) and an arrival's is
+    // (0, .., pending.len()) at best, so no arrival can ever beat one. The
+    // filter is kept anyway, because that is an accident of the Interactive
+    // tiebreak being arrival order: give the tier any other tiebreak (a
+    // deadline, a client's buffer depth) and the guarantee that nobody evicts a
+    // waiting client would disappear without a line of this function changing.
+    //
+    // The victim's reply is resolved here, exactly as a shed arrival's is. An
+    // evicted job whose `oneshot` is merely dropped leaves its caller's
+    // `submit().await` resolving through a `RecvError` with nothing to say.
+    let mine = urgency_key(state, &ctx, state.pending.len());
+    let victim = state
+        .pending
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, c))| c.class == JobClass::Background)
+        .map(|(idx, (_, c))| (idx, urgency_key(state, c, idx)))
+        .max_by_key(|(_, key)| *key);
+    match victim {
+        Some((idx, worst)) if worst > mine => {
+            // `VecDeque::remove` preserves the order of everything else, so
+            // Interactive arrival order — which `next_to_dispatch` breaks ties
+            // on — survives an eviction from the middle of the queue.
+            if let Some((victim_id, victim_ctx)) = state.pending.remove(idx) {
+                tracing::debug!(
+                    job_id = %victim_id,
+                    class = %victim_ctx.class,
+                    stream = victim_ctx.stream.0,
+                    segment = victim_ctx.segment,
+                    distance = lookahead_distance(state, &victim_ctx),
+                    replaced_by = %job_id,
+                    replaced_by_class = %ctx.class,
+                    pending = state.pending.len(),
+                    input = %victim_ctx.input.display(),
+                    "speculative transcode evicted: a more urgent job arrived at a full queue"
+                );
+                let _ = victim_ctx.reply.send(Err(SchedError::Busy));
+            }
+            state.pending.push_back((job_id, ctx));
+        }
+        _ => {
+            tracing::debug!(
+                %job_id,
+                class = %ctx.class,
+                pending = state.pending.len(),
+                evictable = victim.is_some(),
+                "transcode job refused: the queue is full of work at least as urgent"
+            );
+            let _ = ctx.reply.send(Err(SchedError::Busy));
+        }
+    }
+}
+
+/// Where one queued job ranks. Lower is more urgent; the total order is the
+/// scheduler's whole opinion about what to do next, and there is exactly one of
+/// it — `next_to_dispatch` takes its minimum, `queue_or_refuse` its maximum.
+///
+/// `arrival` is the job's index in `pending`, which is arrival order. For a job
+/// that is not in the queue yet (an arrival being weighed against the
+/// incumbents) pass `pending.len()`: it would go to the back. It cannot change
+/// that comparison's answer either way, because it is only ever read within the
+/// Interactive tier and eviction only ever considers Background victims.
+fn urgency_key(state: &SchedState, ctx: &JobCtx, arrival: usize) -> (i64, bool, i64) {
+    match ctx.class {
+        JobClass::Interactive => (0, false, arrival as i64),
+        JobClass::Background => {
+            let d = lookahead_distance(state, ctx);
+            // `abs` cannot overflow: both operands are `u32`-derived, so `d`
+            // is bounded well inside `i64`, and `i64::MAX` (no playhead)
+            // maps to itself.
+            (1, has_been_passed(d), d.abs())
+        }
     }
 }
 
@@ -1546,16 +1642,7 @@ fn next_to_dispatch(state: &SchedState) -> Option<usize> {
         .pending
         .iter()
         .enumerate()
-        .min_by_key(|(idx, (_, ctx))| match ctx.class {
-            JobClass::Interactive => (0i64, false, *idx as i64),
-            JobClass::Background => {
-                let d = lookahead_distance(state, ctx);
-                // `abs` cannot overflow: both operands are `u32`-derived, so `d`
-                // is bounded well inside `i64`, and `i64::MAX` (no playhead)
-                // maps to itself.
-                (1i64, has_been_passed(d), d.abs())
-            }
-        })
+        .min_by_key(|(idx, (_, ctx))| urgency_key(state, ctx, *idx))
         .map(|(idx, _)| idx)
 }
 
@@ -5543,6 +5630,211 @@ mod tests {
             ["blocker", "standing"],
             "distance 0 is the segment being fetched, not one that has been \
              played past: {got:?}"
+        );
+    }
+
+    /// A FIFO that is full refuses the NEWEST arrival, and for speculative work
+    /// the newest arrival is systematically the MOST urgent thing present:
+    /// prefetch is submitted in playback order, so the job that just arrived is
+    /// the one closest to the playhead while the incumbents are the deep
+    /// guesses submitted when the client was further back. Overflow therefore
+    /// threw away exactly the segment the client was about to want and kept the
+    /// one it would reach in a minute — if it ever did.
+    ///
+    /// Two halves, both asserted here because each without the other is a
+    /// different bug: eviction must take the LEAST urgent job, and it must only
+    /// happen when the arrival actually beats it. `further`, submitted last and
+    /// ten segments beyond anything queued, is refused rather than admitted at
+    /// the cost of work nearer the viewer.
+    ///
+    /// Asserted as an ORDER of encodes plus the queue's own occupancy, not as
+    /// error codes alone: FIFO overflow would refuse `near` and `further` and
+    /// encode `mid` then `far`, so no arrangement of "did nothing" produces
+    /// this.
+    #[tokio::test]
+    async fn a_full_queue_evicts_its_least_urgent_speculation_not_its_newest_arrival() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(400),
+                _ => Duration::from_millis(60),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        // One permit and room for two queued jobs. `background_headroom: 0` for
+        // the usual reason: a pool that cannot hold the reserve and a job at
+        // once sheds speculation outright, and there would be no queue to fill.
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                pending_cap: 2,
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let stream = StreamKey::of("viewer");
+
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            })
+        };
+
+        // The client is at 100 and holds the only permit.
+        let blocker = submit("blocker", JobClass::Interactive, 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Two deep guesses fill the queue...
+        let far = submit("far", JobClass::Background, 110);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mid = submit("mid", JobClass::Background, 105);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // ...and then the segment the client will ask for next arrives to a
+        // full queue.
+        let near = submit("near", JobClass::Background, 101);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // ...as does one deeper than anything already queued, which must NOT
+        // displace work nearer the viewer.
+        let further = submit("further", JobClass::Background, 120);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            queued.pending_background, 2,
+            "precondition: the queue must be at its cap, never above it"
+        );
+
+        blocker.await.unwrap().expect("the client's own segment");
+        let far = far.await.unwrap();
+        assert!(
+            matches!(far, Err(SchedError::Busy)),
+            "the least urgent queued job must be the one evicted: {far:?}"
+        );
+        let further = further.await.unwrap();
+        assert!(
+            matches!(further, Err(SchedError::Busy)),
+            "an arrival that does not beat the incumbents must be refused, not \
+             admitted at their expense: {further:?}"
+        );
+        near.await
+            .unwrap()
+            .expect("the segment the client needs next must have taken the slot");
+        mid.await.unwrap().expect("the surviving incumbent");
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "near", "mid"],
+            "a full queue must keep the work nearest the viewer: {got:?}"
+        );
+    }
+
+    /// Eviction is a decision about SPECULATION, and it must never reach past
+    /// it. Somebody is blocked on every Interactive job in the queue, so an
+    /// eviction rule that ranks purely by urgency and forgets the tier would
+    /// free a slot by abandoning a client mid-request — a 500 on a segment
+    /// somebody is watching, which is the exact shape of B134.
+    ///
+    /// The arrival here is itself a client's request, so this also pins the
+    /// other direction: a client arriving at a full queue takes a speculative
+    /// job's place rather than being refused, which is what `pending_cap` was
+    /// for before speculation started sharing it.
+    #[tokio::test]
+    async fn eviction_never_takes_the_job_a_client_is_blocked_on() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(400),
+                _ => Duration::from_millis(60),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                pending_cap: 2,
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let stream = StreamKey::of("viewer");
+
+        let submit = |tag: &'static str, class: JobClass, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            })
+        };
+
+        let blocker = submit("blocker", JobClass::Interactive, 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // A second client request queues behind it, and one prefetch fills the
+        // cap.
+        let waiter = submit("waiter", JobClass::Interactive, 101);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let guess = submit("guess", JobClass::Background, 110);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A third client request arrives to a full queue.
+        let client = submit("client", JobClass::Interactive, 102);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            (queued.pending_interactive, queued.pending_background),
+            (2, 0),
+            "the arriving client must have taken the prefetch's slot, and the \
+             client already waiting must still be in the queue"
+        );
+
+        blocker.await.unwrap().expect("the client's first segment");
+        let guess = guess.await.unwrap();
+        assert!(
+            matches!(guess, Err(SchedError::Busy)),
+            "the speculative job is the only one that may be evicted: {guess:?}"
+        );
+        waiter
+            .await
+            .unwrap()
+            .expect("a client already in the queue must never be evicted");
+        client.await.unwrap().expect(
+            "a client arriving at a full queue must not be refused \
+                     while speculation occupies it",
+        );
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "waiter", "client"],
+            "eviction must leave Interactive arrival order intact: {got:?}"
         );
     }
 
