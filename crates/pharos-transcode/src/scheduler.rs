@@ -1264,6 +1264,48 @@ fn record_dispatch(state: &SchedState, ctx: &JobCtx) {
     }
 }
 
+/// Why a `Playhead` update never reached the actor. The two `try_send`
+/// failure arms are opposite faults and call for opposite responses: `Full`
+/// says the actor is alive and busy — the inbox is saturated, which is a
+/// load/tuning question (`inbox_depth`, or what else is filling it). `Closed`
+/// says the actor task itself is GONE — every interactive cache hit on the
+/// process will report this from now on, which is an outage, not saturation.
+/// Collapsing `try_send(..).is_err()` into one counter, as this used to,
+/// reads a dead actor as sustained-under-load: the standing project rule is
+/// to carry the cause rather than a bare class, applied here to the very
+/// counter whose job is to say why a reading stopped moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayheadDropReason {
+    /// The inbox is at `inbox_depth` capacity; the actor is still running.
+    Full,
+    /// The actor's receiver is gone (task panicked or was dropped).
+    Closed,
+}
+
+impl PlayheadDropReason {
+    /// Stable metric-label string, same contract as [`PinOutcome::label`]:
+    /// this is the `reason` label on `pharos_transcode_playhead_dropped_total`,
+    /// so a rename breaks the dashboard silently. Pinned by a test.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Closed => "closed",
+        }
+    }
+
+    fn from_try_send_error(e: &mpsc::error::TrySendError<SchedMsg>) -> Self {
+        match e {
+            mpsc::error::TrySendError::Full(_) => Self::Full,
+            mpsc::error::TrySendError::Closed(_) => Self::Closed,
+        }
+    }
+
+    fn record(self) {
+        metrics::counter!("pharos_transcode_playhead_dropped_total", "reason" => self.label())
+            .increment(1);
+    }
+}
+
 impl TranscodeScheduler {
     pub fn spawn(
         devices: DeviceTable,
@@ -1397,21 +1439,18 @@ impl TranscodeScheduler {
     /// and a full inbox drops the update rather than applying backpressure to
     /// the HTTP handler. Dropping is safe by construction: a lost reading leaves
     /// the map exactly as stale as it was before this existed and never staler.
-    /// It is counted, because a snapshot showing a reading that stopped moving
-    /// otherwise cannot distinguish a viewer who stopped from an inbox that is
-    /// saturated.
+    /// It is counted under [`PlayheadDropReason`], because a snapshot showing a
+    /// reading that stopped moving otherwise cannot distinguish a viewer who
+    /// stopped, an inbox that is saturated, or an actor that is gone — and the
+    /// last of those needs a page, not a shrug at sustained load.
     ///
     /// See [`PlayheadMotion`] for the only direction a hit may move a reading.
     pub fn note_playhead(&self, stream: StreamKey, segment: u32) {
         if stream == StreamKey::NONE {
             return;
         }
-        if self
-            .tx
-            .try_send(SchedMsg::Playhead { stream, segment })
-            .is_err()
-        {
-            metrics::counter!("pharos_transcode_playhead_dropped_total").increment(1);
+        if let Err(e) = self.tx.try_send(SchedMsg::Playhead { stream, segment }) {
+            PlayheadDropReason::from_try_send_error(&e).record();
         }
     }
 
@@ -6061,14 +6100,96 @@ mod tests {
             .into_vec()
             .into_iter()
             .find_map(|(ck, _, _, v)| {
-                (ck.key().name() == "pharos_transcode_playhead_dropped_total").then_some(v)
+                let k = ck.key();
+                if k.name() != "pharos_transcode_playhead_dropped_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                labels.contains(&"reason=full".to_string()).then_some(v)
             });
         assert!(
             matches!(dropped, Some(DebugValue::Counter(n)) if n > 0),
-            "a refused playhead update must be COUNTED: the snapshot shows a \
-             reading that stopped moving, and this is the only signal that says \
-             whether it stopped because the viewer stopped or because the \
-             actor's inbox is saturated; got {dropped:?}"
+            "a refused playhead update must be COUNTED under reason=\"full\": \
+             the actor is alive here, just saturated, and this is the only \
+             signal that says whether a reading stopped moving because the \
+             viewer stopped or because the actor's inbox is saturated; \
+             got {dropped:?}"
+        );
+    }
+
+    /// The counterpart to the test above: an inbox with no receiver AT ALL —
+    /// the actor task is gone — must be reported as `closed`, never folded
+    /// into `full`. The two are opposite faults calling for opposite
+    /// responses (saturation is a load/tuning question; an outage is a page),
+    /// and `try_send(..).is_err()` alone cannot tell them apart — which is
+    /// exactly the defect this test disarms: reverting `note_playhead` to
+    /// the bare `is_err()` check makes this test fail, because the dropped
+    /// update would then carry no `reason` label at all.
+    #[test]
+    fn a_closed_actor_inbox_is_reported_as_closed_not_full() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            // No `tokio::spawn`, no actor: the receiver is dropped immediately,
+            // so `note_playhead` meets a channel with nobody on the other end
+            // rather than merely a full one.
+            let (tx, rx) = mpsc::channel::<SchedMsg>(8);
+            drop(rx);
+            let s = TranscodeScheduler { tx };
+            s.note_playhead(StreamKey::of("play-session-actor-gone"), 0);
+        });
+
+        let reason = |wanted: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| {
+                    let k = ck.key();
+                    if k.name() != "pharos_transcode_playhead_dropped_total" {
+                        return None;
+                    }
+                    let labels: Vec<String> = k
+                        .labels()
+                        .map(|l| format!("{}={}", l.key(), l.value()))
+                        .collect();
+                    labels.contains(&wanted.to_string()).then_some(v)
+                })
+        };
+
+        assert!(
+            matches!(reason("reason=closed"), Some(DebugValue::Counter(n)) if n > 0),
+            "a dropped actor task must be reported as `closed`: a dashboard \
+             reading sustained `full` drops under load could actually be \
+             staring at a scheduler that died, and the two need different \
+             responses"
+        );
+        assert!(
+            reason("reason=full").is_none(),
+            "an inbox with no receiver was never merely saturated; recording \
+             `full` here would hide that the actor is gone entirely"
+        );
+    }
+
+    #[test]
+    fn playhead_drop_reason_labels_are_distinct_and_stable() {
+        const ALL: [PlayheadDropReason; 2] = [PlayheadDropReason::Full, PlayheadDropReason::Closed];
+        assert_eq!(PlayheadDropReason::Full.label(), "full");
+        assert_eq!(PlayheadDropReason::Closed.label(), "closed");
+
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "playhead drop reason labels collide: {labels:?} — folding \
+             `closed` into `full` hides a dead scheduler as sustained \
+             saturation"
         );
     }
 
