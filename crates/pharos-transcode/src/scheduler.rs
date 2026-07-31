@@ -721,6 +721,11 @@ struct SchedState {
     /// "how soon will this be needed" answerable: the scheduler otherwise has no
     /// idea where a viewer is. Bounded at MAX_TRACKED_STREAMS with the
     /// least-recently-updated evicted, mirroring PrefetchRegistry.
+    ///
+    /// Moved only by an interactive submission. A stream's FIRST speculative
+    /// submission may SEED an entry that does not exist yet — see the `Submit`
+    /// arm — which is where a cold-start prewarm's segments stop being
+    /// unknowable; it can never overwrite a reading a client established.
     playheads: HashMap<StreamKey, (u32, u64)>,
     /// Monotonic tick used only to order `playheads` for eviction.
     playhead_clock: u64,
@@ -761,6 +766,12 @@ fn note_playhead(state: &mut SchedState, stream: StreamKey, segment: u32) {
 /// Jobs with no stream or no segment return `i64::MAX`: nothing is known to be
 /// about to need them, so they sort behind all useful work — but still ahead of
 /// work that is known to be useless.
+///
+/// What is left in that bucket is only work that genuinely has no viewer: the
+/// transcode tool, tests, whole-file jobs, `StreamKey::NONE`. A numbered
+/// segment of a real playback stream is not there any more, because the
+/// stream's first submission seeds its playhead (see the `Submit` arm), so the
+/// cold-start prewarm is measured rather than merely unknown.
 fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
     let (Some(seg), Some((head, _))) = (ctx.segment, state.playheads.get(&ctx.stream)) else {
         return i64::MAX;
@@ -1082,8 +1093,29 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             // is. A speculative request says nothing about the playhead;
             // letting prefetch move it would make the lookahead distance
             // measure itself.
-            if class == JobClass::Interactive {
-                if let Some(seg) = hint.segment {
+            //
+            // A stream with NO playhead yet is the one exception, and it is a
+            // different act: seeding cannot MOVE an existing reading, so it
+            // cannot make any active viewer's lookahead self-referential. What
+            // it can do is stop the cold-start prewarm being permanently
+            // unknowable. `prewarm_cold_start` submits `Background` against a
+            // brand-new `StreamKey` no interactive request has ever touched, so
+            // its distance was `i64::MAX` BY CONSTRUCTION for the whole of its
+            // life. Ranked behind every live guess for DISPATCH that is fine —
+            // deferral is recoverable. Handed to `queue_or_refuse` it made a
+            // new viewer's opening segments the second most useless thing in
+            // the queue: refused, or admitted and then evicted, in favour of a
+            // guess a minute ahead of somebody already playing — and the
+            // viewer then took exactly the opening `fragLoadTimeOut` the
+            // prewarm exists to prevent. Eviction is not recoverable.
+            //
+            // The caller already knows the answer — the prewarm picks its base
+            // from the resume position — and this is the cheapest way to let it
+            // say so: the first speculative submission on an unseen stream
+            // states where that stream begins, and the client's own first
+            // request overwrites it a moment later.
+            if let Some(seg) = hint.segment {
+                if class == JobClass::Interactive || !state.playheads.contains_key(&hint.stream) {
                     note_playhead(state, hint.stream, seg);
                 }
             }
@@ -3755,11 +3787,15 @@ mod tests {
         );
         // Promotion says a client is WAITING on this segment, not that it has
         // reached it. Moving the playhead here would let work already in flight
-        // advance the distance its own urgency is judged against.
-        assert!(
-            after.playheads.is_empty(),
-            "promotion must not move a playhead: {:?}",
-            after.playheads
+        // advance the distance its own urgency is judged against. (The
+        // submission itself seeded this stream, since nothing else had ever
+        // named it — see `speculation_may_seed_a_playhead_but_never_moves_one`
+        // — so the claim is that promotion changed nothing, not that the map
+        // is empty.)
+        assert_eq!(
+            after.playheads, before.playheads,
+            "promotion must not move a playhead: {:?} -> {:?}",
+            before.playheads, after.playheads
         );
         assert!(job.await.unwrap().is_ok());
     }
@@ -4996,35 +5032,85 @@ mod tests {
     }
 
     /// A speculative request says nothing about where the viewer actually is —
-    /// only what somebody guessed they might want next. If prefetch could move
+    /// only what somebody guessed they might want next. If prefetch could MOVE
     /// the playhead, a deep speculative submission would advance the very
     /// distance measurement its own urgency is judged against.
+    ///
+    /// Seeding a stream that has no reading at all is the one thing it may do,
+    /// and it is not the same act: it cannot overwrite anything a client
+    /// established, and without it the cold-start prewarm — which submits
+    /// `Background` against a `StreamKey` no interactive request has ever
+    /// touched — is unknowable for its whole life and is the first thing a full
+    /// queue throws away.
+    ///
+    /// Both halves in one test: seeding without the freeze would let prefetch
+    /// walk the playhead forward, and the freeze without seeding brings back
+    /// the permanently-unknown prewarm.
     #[tokio::test]
-    async fn only_interactive_submissions_move_the_playhead() {
+    async fn speculation_may_seed_a_playhead_but_never_moves_one() {
         let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(20), |_, _| {
             WorkerRunResult::Done { out_bytes: 1 }
         });
         let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
         let stream = StreamKey::of("play-session-background-only");
 
+        let speculate = |seg: u32| {
+            let s2 = s.clone();
+            async move {
+                s2.submit(
+                    PathBuf::from("/m/a"),
+                    cmaf(),
+                    file_sink(),
+                    JobClass::Background,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // Nothing is known about this stream yet, so the prewarm's own base is
+        // the best available statement of where it starts.
+        speculate(50).await;
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            Some(50),
+            "the first speculative submission on an unseen stream must seed it, \
+             or a cold-start prewarm can never be ranked against anything"
+        );
+
+        // ...and from here on it is frozen against speculation, however deep.
+        speculate(400).await;
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            Some(50),
+            "a speculative submission must never MOVE a playhead: the distance \
+             it is judged by would then be measuring itself"
+        );
+
+        // A client's own request is still the only thing that moves it.
         s.submit(
             PathBuf::from("/m/a"),
             cmaf(),
             file_sink(),
-            JobClass::Background,
+            JobClass::Interactive,
             JobHint {
                 stream,
-                segment: Some(50),
+                segment: Some(60),
             },
         )
         .await
         .unwrap();
-
         let snap = s.snapshot().await.unwrap();
         assert_eq!(
-            snap.playheads.get(&stream),
-            None,
-            "a Background submission must not create a playhead entry"
+            snap.playheads.get(&stream).copied(),
+            Some(60),
+            "the client's own request must still overwrite the seed"
         );
     }
 
@@ -6275,6 +6361,118 @@ mod tests {
             got,
             ["blocker", "near", "mid"],
             "a full queue must keep the work nearest the viewer: {got:?}"
+        );
+    }
+
+    /// A second viewer pressing play must not lose its opening segments to a
+    /// guess a minute ahead of somebody already playing.
+    ///
+    /// `prewarm_cold_start` submits `Background` against a brand-new
+    /// `StreamKey` that no interactive request has ever touched, so its
+    /// lookahead distance was `i64::MAX` by construction for its whole life —
+    /// which `queue_or_refuse`, reading the same key at its MAXIMUM, made the
+    /// second most useless thing in the queue. The prewarm was refused at a
+    /// full queue however deep the incumbents were, and evicted first if it
+    /// ever got in. The new viewer then took exactly the opening
+    /// `fragLoadTimeOut` the prewarm exists to prevent.
+    ///
+    /// Both halves, because each without the other still loses the feature:
+    /// `prewarm` must be able to displace a deep incumbent when it ARRIVES, and
+    /// must not be the victim when the next arrival displaces something.
+    /// Reverting the seed refuses it outright; ranking it as unknown again
+    /// makes `closer` take it instead of `mid`.
+    #[tokio::test]
+    async fn a_new_viewers_cold_start_beats_a_deep_guess_at_a_full_queue() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                "blocker" => Duration::from_millis(500),
+                _ => Duration::from_millis(40),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                pending_cap: 2,
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let incumbent = StreamKey::of("already-playing");
+        // Never named by an interactive request — this is what a session looks
+        // like at `PlaybackInfo`, before the client has fetched anything.
+        let newcomer = StreamKey::of("just-pressed-play");
+
+        let submit = |tag: &'static str, class: JobClass, stream: StreamKey, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            })
+        };
+
+        // The incumbent viewer is at 100 and holds the only permit.
+        let blocker = submit("blocker", JobClass::Interactive, incumbent, 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Its own prefetch fills the queue: a minute out, and six segments out.
+        let deep = submit("deep", JobClass::Background, incumbent, 112);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mid = submit("mid", JobClass::Background, incumbent, 106);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // A second viewer presses play. Its prewarm is the first thing anybody
+        // has ever said about this stream, and it must beat `deep`.
+        let prewarm = submit("prewarm", JobClass::Background, newcomer, 300);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // ...and then the incumbent guesses three ahead, which must take `mid`
+        // — the least urgent thing left — and not the newcomer's opening
+        // segment.
+        let closer = submit("closer", JobClass::Background, incumbent, 103);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            queued.pending_background, 2,
+            "precondition: the queue must be at its cap, never above it"
+        );
+
+        blocker.await.unwrap().expect("the client's own segment");
+        let deep = deep.await.unwrap();
+        assert!(
+            matches!(deep, Err(SchedError::Busy)),
+            "a guess a minute out must lose to a viewer pressing play: {deep:?}"
+        );
+        let mid = mid.await.unwrap();
+        assert!(
+            matches!(mid, Err(SchedError::Busy)),
+            "the least urgent job LEFT must be the next victim: {mid:?}"
+        );
+        prewarm
+            .await
+            .unwrap()
+            .expect("a new viewer's opening segment must survive both arrivals");
+        closer.await.unwrap().expect("the nearer incumbent guess");
+
+        let got = order.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["blocker", "prewarm", "closer"],
+            "the queue must keep the work nearest each viewer, including the \
+             viewer who has not fetched anything yet: {got:?}"
         );
     }
 
