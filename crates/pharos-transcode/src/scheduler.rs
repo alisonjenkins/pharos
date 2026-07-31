@@ -718,6 +718,18 @@ pub struct SchedConfig {
     /// (V125/V126) and the shared-result registry are untouched — so a
     /// regression found in production costs a config flip, not a revert of
     /// thirty-odd commits.
+    ///
+    /// One consequence is worth stating rather than discovering. `false` also
+    /// applies to the RETRY path: a `Background` job whose attempt hit a
+    /// TRANSIENT device failure is re-placed with that device excluded, and if
+    /// no other candidate has a free permit it lands in `queue_or_refuse` like
+    /// any other refusal — so it is shed instead of waiting for the permit that
+    /// would have carried it. That is the pre-2b rule working exactly as it did
+    /// before speculation could queue at all, not a regression; but the caller
+    /// sees `SchedError::Busy`, and the `last_error` that
+    /// `background_never_error` is careful to preserve on the other refusal path
+    /// is dropped with it, so a device flapping under this switch reads as load
+    /// shedding rather than as the hardware fault it is.
     pub queue_background: bool,
 }
 
