@@ -721,6 +721,24 @@ struct JobCtx {
     /// Who is waiting. Carried through retries + requeues so a job's class is
     /// the same wherever it is observed (queued, inflight, finished).
     class: JobClass,
+    /// When a client turned out to be waiting on this job — the instant
+    /// [`promote_job`] reclassified it. `None` for a job that was somebody's
+    /// own request from the start.
+    ///
+    /// It exists because the admission controller judges an interactive
+    /// completion against a DEADLINE, and a promoted job's encode began before
+    /// any client existed. Measured from `dispatched`, a prefetch started at T0
+    /// and joined at T0+4 s reports a 5 s encode against a 3 s deadline when the
+    /// client waited one second: the loop then halves the allowance for a case
+    /// where the design worked exactly as intended. Worse, the bias is
+    /// self-reinforcing in the wrong direction — the deeper the buffer a high
+    /// allowance buys, the earlier prefetch runs relative to the join, the
+    /// larger the over-attribution.
+    ///
+    /// Only the CONTROLLER's window moves; `encode_ms` on the log line and on
+    /// `JobDone` still measures from dispatch, because that genuinely is how
+    /// long the encode took.
+    promoted_at: Option<Instant>,
     /// Which client stream this job belongs to, so its urgency can be judged
     /// against that stream's playhead. `StreamKey::NONE` for jobs with no
     /// known session (the transcode tool, tests, non-playback work).
@@ -1288,6 +1306,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 enqueued: Instant::now(),
                 dispatched: None,
                 class,
+                promoted_at: None,
                 device: None,
                 peer_jobs: 0,
                 background_peers: 0,
@@ -1459,7 +1478,24 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     // a speculative encode being slow is not a symptom, it is
                     // the system working as designed.
                     if ctx.class == JobClass::Interactive {
-                        observe_margin(state, device, &ctx, encode_ms);
+                        // The LATER of dispatch and promotion, not `dispatched`.
+                        // A job promoted while it was still running began its
+                        // encode before any client existed, and charging the
+                        // client's deadline for that head start punishes the
+                        // system for a prefetch that landed (see
+                        // `JobCtx::promoted_at`). A job promoted while it was
+                        // still QUEUED takes `dispatched`, which is the same
+                        // window every unpromoted interactive job is judged on:
+                        // the wait it served before the permit is queue-wait,
+                        // and `pharos_transcode_queue_wait_seconds` is where
+                        // that is read.
+                        let observed_ms = match (ctx.dispatched, ctx.promoted_at) {
+                            (Some(d), Some(p)) => {
+                                now.saturating_duration_since(d.max(p)).as_millis() as u64
+                            }
+                            _ => encode_ms,
+                        };
+                        observe_margin(state, device, &ctx, observed_ms);
                     }
                     let _ = ctx.reply.send(Ok(JobDone {
                         device,
@@ -1605,9 +1641,14 @@ fn promote_job(state: &mut SchedState, job_id: JobId, self_tx: &mpsc::Sender<Sch
         return;
     }
     ctx.class = JobClass::Interactive;
-    let waited_ms = Instant::now()
-        .saturating_duration_since(ctx.enqueued)
-        .as_millis() as u64;
+    let now = Instant::now();
+    // The instant a client started waiting on these bytes. Everything this job
+    // does from here is done for that client, and the admission controller
+    // judges it against a deadline measured from here rather than from a
+    // dispatch that may predate the client by seconds — see
+    // `JobCtx::promoted_at`.
+    ctx.promoted_at = Some(now);
+    let waited_ms = now.saturating_duration_since(ctx.enqueued).as_millis() as u64;
     let input = ctx.input.clone();
     outcome.record();
     tracing::info!(
@@ -1728,7 +1769,13 @@ fn emit_allowance_gauge(admission: &AdmissionController, device: DeviceId, capac
 /// all-`ignored` observations means no signal reached the loop — a completely
 /// different problem from a device that genuinely cannot go faster, and
 /// indistinguishable from it if the ignored arm is silent.
-fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode_ms: u64) {
+///
+/// `observed_ms` is how long the job ran FOR A CLIENT, which is the encode
+/// duration for a job that was a client's from the start and the post-promotion
+/// remainder for one a client joined. The caller decides which; this function
+/// only reports which it was told, so the log line can never disagree with the
+/// arithmetic above it.
+fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, observed_ms: u64) {
     let capacity = state.devices.slot(device).map(|s| s.capacity).unwrap_or(1);
     // Read before `observe` takes `state.admission` mutably below — this is
     // the actual value the control law applies, not a copy of it, so the log
@@ -1737,7 +1784,7 @@ fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode
     let obs = Observation {
         // Live/progressive jobs have no duration and so no deadline.
         segment_seconds: ctx.opts.duration_ticks.map(|t| t as f64 / 10_000_000.0),
-        encode_seconds: encode_ms as f64 / 1000.0,
+        encode_seconds: observed_ms as f64 / 1000.0,
         background_peers: ctx.background_peers,
         // A retried job's encode time is the duration of a bounce.
         usable: ctx.retries == 0,
@@ -1761,6 +1808,14 @@ fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode
             %device,
             verdict = verdict.label(),
             encode_secs = obs.encode_seconds,
+            // Which instant the figure above was measured from. Without it, a
+            // promoted job's shorter observation looks like a faster encode,
+            // and the two need opposite readings.
+            measured_from = if ctx.promoted_at.is_some() {
+                "promotion"
+            } else {
+                "dispatch"
+            },
             deadline_secs = obs.segment_seconds.map(|s| s * margin_ratio),
             background_peers = obs.background_peers,
             allowance_from = before,
@@ -3163,6 +3218,16 @@ mod tests {
         o
     }
 
+    /// [`cmaf_with_duration`] with the segment length — and so the controller's
+    /// deadline, `margin_ratio × this` — chosen by the caller, for tests that
+    /// have to place a scripted encode on one side of it or the other without
+    /// sleeping for seconds.
+    fn cmaf_lasting(secs: f64) -> TranscodeOptions {
+        let mut o = cmaf();
+        o.duration_ticks = Some((secs * 10_000_000.0) as u64);
+        o
+    }
+
     /// Spec 003 US2 — every segment of one CMAF rendition must come from the
     /// SAME device. Dispatch many segments (they differ only in start position,
     /// so they share a rendition key) and assert they all land together, with
@@ -3978,6 +4043,114 @@ mod tests {
             "promotion outcome labels collide: {labels:?} — folding `unassigned` \
              into `unknown` would hide the window where a client can still \
              inherit a speculative tier"
+        );
+    }
+
+    /// A promoted job is judged on the wait the CLIENT actually paid, not on
+    /// the head start the prefetch had before that client existed.
+    ///
+    /// `observe_margin` fires for anything Interactive at completion, and a
+    /// promoted job's `dispatched` is when the SPECULATIVE encode began —
+    /// potentially seconds before any client. Measured from there, the worked
+    /// case is: a prefetch dispatched at T0, joined at T0+4 s, done at T0+5 s
+    /// reports a 5 s encode against a 3 s deadline and the controller HALVES
+    /// the device's allowance. The client waited one second. The design worked
+    /// exactly as intended and the control loop punished it for working — and
+    /// the bias is self-reinforcing in the wrong direction, since the deeper
+    /// the buffer a high allowance buys, the earlier prefetch runs relative to
+    /// the join, the larger the over-attribution.
+    ///
+    /// Scripted at a tenth the scale: a 0.5 s segment (deadline 0.25 s), an
+    /// 800 ms encode, and a client joining at 700 ms. From dispatch that is
+    /// 800 ms — a clear miss; from promotion it is ~100 ms — a comfortable
+    /// meet. The VERDICT is the assertion because the verdict is what the
+    /// control law consumes; the allowance alone would not discriminate here
+    /// (a miss with no speculative peers leaves it where it is), which is
+    /// exactly the trap a "the number did not move" assertion falls into.
+    #[test]
+    fn a_promoted_job_is_judged_from_when_the_client_arrived() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(800), |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+                let slot = JobSlot::new();
+                let mut watch_id = slot.subscribe();
+
+                let job = {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit_tracked(
+                            PathBuf::from("/m/prefetch"),
+                            cmaf_lasting(0.5),
+                            file_sink(),
+                            JobClass::Background,
+                            JobHint {
+                                stream: StreamKey::of("viewer"),
+                                segment: Some(7),
+                                seeds_playhead: PlayheadSeed::Observes,
+                            },
+                            Some(slot),
+                        )
+                        .await
+                    })
+                };
+                let job_id = await_job_id(&mut watch_id)
+                    .await
+                    .expect("the scheduler must name a submission it accepted");
+                // The client turns up late in an encode it did not start.
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                s.promote(job_id).await;
+                job.await.unwrap().expect("the encode itself succeeded");
+                // Drain the actor so `JobFinished` — and the observation it
+                // makes — has certainly been processed before the snapshot.
+                let _ = s.snapshot().await;
+            })
+        });
+
+        let verdicts: Vec<(Vec<String>, DebugValue)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_margin_total" {
+                    return None;
+                }
+                Some((
+                    k.labels()
+                        .map(|l| format!("{}={}", l.key(), l.value()))
+                        .collect(),
+                    v,
+                ))
+            })
+            .collect();
+
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "exactly one interactive completion happened here: {verdicts:?}"
+        );
+        assert!(
+            verdicts[0].0.contains(&"verdict=met".to_string()),
+            "a promoted job must be judged from the moment a client joined it, \
+             not from a dispatch that predates the client — the client waited \
+             ~100 ms against a 250 ms deadline: {verdicts:?}"
+        );
+        assert!(
+            matches!(verdicts[0].1, DebugValue::Counter(1)),
+            "got {:?}",
+            verdicts[0].1
         );
     }
 
