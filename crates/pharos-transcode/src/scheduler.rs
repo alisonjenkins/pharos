@@ -116,6 +116,40 @@ impl std::fmt::Display for JobClass {
     }
 }
 
+/// Identifies one client's playback stream, so the scheduler can tell "the
+/// segment this viewer needs next" from "a segment some other viewer wanted
+/// first". Opaque hash of the play-session id — bounded cardinality, no PII, and
+/// nothing for the scheduler to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamKey(pub u64);
+
+impl StreamKey {
+    /// Paths with no play session: the transcode tool, tests, and any
+    /// non-playback job. Never gets a playhead, so its background work sorts
+    /// last — which is correct, since nothing is about to need it.
+    pub const NONE: StreamKey = StreamKey(0);
+
+    pub fn of(session_id: &str) -> StreamKey {
+        // Non-zero so a real session can never collide with NONE.
+        StreamKey(xxhash_rust::xxh3::xxh3_64(session_id.as_bytes()) | 1)
+    }
+}
+
+impl Default for StreamKey {
+    fn default() -> Self {
+        StreamKey::NONE
+    }
+}
+
+/// What the caller knows about a job that the scheduler cannot work out for
+/// itself: whose stream it belongs to, and which segment of it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JobHint {
+    pub stream: StreamKey,
+    /// Segment index. `None` for anything that is not a numbered segment.
+    pub segment: Option<u32>,
+}
+
 /// A live transcode output as a stream of muxed byte chunks. Boxed so the
 /// type stays platform-agnostic (the concrete unix worker stream lives in
 /// `worker::proc`). The stream owns the worker process + its device
@@ -282,6 +316,9 @@ pub struct SchedSnapshot {
     /// is not working, which is indistinguishable from a correctly cautious loop
     /// unless the value itself is visible.
     pub background_allowance: Vec<(DeviceId, f64)>,
+    /// Where each tracked stream's client has reached. Read by the queue's
+    /// urgency ordering; exposed so a wedged queue can be explained.
+    pub playheads: HashMap<StreamKey, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +399,7 @@ enum SchedMsg {
         opts: TranscodeOptions,
         sink: SinkRequest,
         class: JobClass,
+        hint: JobHint,
         reply: oneshot::Sender<Result<JobDone, SchedError>>,
     },
     SubmitLive {
@@ -404,6 +442,19 @@ struct JobCtx {
     /// Who is waiting. Carried through retries + requeues so a job's class is
     /// the same wherever it is observed (queued, inflight, finished).
     class: JobClass,
+    /// Which client stream this job belongs to, so its urgency can be judged
+    /// against that stream's playhead. `StreamKey::NONE` for jobs with no
+    /// known session (the transcode tool, tests, non-playback work).
+    ///
+    /// Read by `lookahead_distance`, which nothing calls yet — queue
+    /// ordering lands in a later task. `#[allow(dead_code)]` until then.
+    #[allow(dead_code)]
+    stream: StreamKey,
+    /// Segment index within `stream`. `None` for anything that is not a
+    /// numbered segment (e.g. a whole-file/live job). Same "not read until
+    /// queue ordering lands" note as `stream`.
+    #[allow(dead_code)]
+    segment: Option<u32>,
     /// Device this job is currently running on. `None` while queued. Lets a
     /// snapshot attribute each device's occupancy to the jobs holding it,
     /// instead of reporting a bare count with nothing behind it.
@@ -440,6 +491,52 @@ struct SchedState {
     live: Arc<AtomicUsize>,
     next_job: u64,
     next_worker: u64,
+    /// Last segment each stream's CLIENT actually asked for. This is what makes
+    /// "how soon will this be needed" answerable: the scheduler otherwise has no
+    /// idea where a viewer is. Bounded at MAX_TRACKED_STREAMS with the
+    /// least-recently-updated evicted, mirroring PrefetchRegistry.
+    playheads: HashMap<StreamKey, (u32, u64)>,
+    /// Monotonic tick used only to order `playheads` for eviction.
+    playhead_clock: u64,
+}
+
+/// Mirrors `MAX_TRACKED_SESSIONS` in `PrefetchRegistry`. A map that grows
+/// without bound is a leak dressed as a cache.
+const MAX_TRACKED_STREAMS: usize = 256;
+
+/// Record where a stream's client has reached, and bound the map.
+fn note_playhead(state: &mut SchedState, stream: StreamKey, segment: u32) {
+    if stream == StreamKey::NONE {
+        return;
+    }
+    state.playhead_clock += 1;
+    let tick = state.playhead_clock;
+    state.playheads.insert(stream, (segment, tick));
+    if state.playheads.len() > MAX_TRACKED_STREAMS {
+        if let Some((&oldest, _)) = state.playheads.iter().min_by_key(|(_, (_, t))| *t) {
+            state.playheads.remove(&oldest);
+        }
+    }
+}
+
+/// How many segments ahead of its client's last request this job sits.
+///
+/// Recomputed at dispatch, never frozen at submit: a job queued 30 s ago at
+/// distance 6 may now be distance 1 — the most urgent thing in the queue — or
+/// already passed, and a frozen value gets both cases backwards.
+///
+/// `i64` so "already passed" is representable. Jobs with no stream or no segment
+/// sort last: nothing is known to be about to need them.
+///
+/// Unused for now — this task is plumbing (the stream/segment hint and the
+/// playhead bookkeeping); queue ordering that actually reads this distance
+/// lands in a later task. `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
+fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
+    let (Some(seg), Some((head, _))) = (ctx.segment, state.playheads.get(&ctx.stream)) else {
+        return i64::MAX;
+    };
+    seg as i64 - *head as i64
 }
 
 impl TranscodeScheduler {
@@ -482,6 +579,8 @@ impl TranscodeScheduler {
             next_job: 0,
             live: Arc::new(AtomicUsize::new(0)),
             next_worker: 0,
+            playheads: HashMap::new(),
+            playhead_clock: 0,
         };
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -499,6 +598,7 @@ impl TranscodeScheduler {
         opts: TranscodeOptions,
         sink: SinkRequest,
         class: JobClass,
+        hint: JobHint,
     ) -> Result<JobDone, SchedError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -507,6 +607,7 @@ impl TranscodeScheduler {
                 opts,
                 sink,
                 class,
+                hint,
                 reply,
             })
             .await
@@ -583,12 +684,22 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             opts,
             sink,
             class,
+            hint,
             reply,
         } => {
             if matches!(sink, SinkRequest::LiveStream) {
                 // Wired in the fd-passing step; not yet schedulable.
                 let _ = reply.send(Err(SchedError::Unsupported));
                 return;
+            }
+            // Only an INTERACTIVE submission tells us where the viewer actually
+            // is. A speculative request says nothing about the playhead;
+            // letting prefetch move it would make the lookahead distance
+            // measure itself.
+            if class == JobClass::Interactive {
+                if let Some(seg) = hint.segment {
+                    note_playhead(state, hint.stream, seg);
+                }
             }
             let job_id = JobId(state.next_job);
             state.next_job += 1;
@@ -606,6 +717,8 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 device: None,
                 peer_jobs: 0,
                 background_peers: 0,
+                stream: hint.stream,
+                segment: hint.segment,
                 // Replaced at dispatch, once the device is known.
                 span: tracing::Span::none(),
             };
@@ -871,6 +984,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     .iter()
                     .map(|s| (s.id, state.admission.raw_allowance(s.id, s.capacity)))
                     .collect(),
+                playheads: state.playheads.iter().map(|(k, (s, _))| (*k, *s)).collect(),
             });
         }
     }
@@ -1656,6 +1770,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -1705,6 +1820,7 @@ mod tests {
                     o,
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
                 .unwrap();
@@ -1732,6 +1848,7 @@ mod tests {
                 cmaf(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -1743,6 +1860,7 @@ mod tests {
                 other,
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -1784,6 +1902,7 @@ mod tests {
                 cmaf(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await;
         match res {
@@ -1806,7 +1925,13 @@ mod tests {
         let mut o = h264();
         o.video = Some(VideoCodec::Vp9);
         let done = s
-            .submit(PathBuf::from("/m/x"), o, file_sink(), JobClass::Interactive)
+            .submit(
+                PathBuf::from("/m/x"),
+                o,
+                file_sink(),
+                JobClass::Interactive,
+                JobHint::default(),
+            )
             .await
             .unwrap();
         assert_eq!(done.device, DeviceId::hw(HwAccel::Vaapi, 0));
@@ -1824,6 +1949,7 @@ mod tests {
                 h264(),
                 SinkRequest::LiveStream,
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await;
         assert_eq!(r, Err(SchedError::Unsupported));
@@ -1851,6 +1977,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -1888,6 +2015,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -1919,6 +2047,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -2010,6 +2139,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -2061,6 +2191,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await;
         assert_eq!(
@@ -2093,6 +2224,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -2104,6 +2236,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -2128,6 +2261,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             ),
         )
         .await
@@ -2159,6 +2293,7 @@ mod tests {
                         h264(),
                         file_sink(),
                         JobClass::Interactive,
+                        JobHint::default(),
                     )
                     .await
                 }));
@@ -2205,6 +2340,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2223,6 +2359,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2240,6 +2377,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
         });
@@ -2334,8 +2472,14 @@ mod tests {
             for _ in 0..n {
                 let s2 = s.clone();
                 handles.push(tokio::spawn(async move {
-                    s2.submit(PathBuf::from("/m/run"), h264(), file_sink(), class)
-                        .await
+                    s2.submit(
+                        PathBuf::from("/m/run"),
+                        h264(),
+                        file_sink(),
+                        class,
+                        JobHint::default(),
+                    )
+                    .await
                 }));
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -2349,6 +2493,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2401,6 +2546,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2414,6 +2560,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Background,
+                JobHint::default(),
             )
             .await;
         assert_eq!(
@@ -2430,6 +2577,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
         });
@@ -2461,6 +2609,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Background,
+                JobHint::default(),
             )
             .await
             .expect("idle pool must accept speculative work");
@@ -2486,6 +2635,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2497,6 +2647,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Background,
+                JobHint::default(),
             )
             .await,
             Err(SchedError::Busy),
@@ -2509,6 +2660,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .expect("client must get the reserved permit");
@@ -2544,6 +2696,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2556,6 +2709,7 @@ mod tests {
                 h264(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .expect("second job must be admitted");
@@ -2601,6 +2755,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2619,6 +2774,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2637,6 +2793,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2653,6 +2810,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2713,6 +2871,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2731,6 +2890,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2775,6 +2935,7 @@ mod tests {
                     h264(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2835,6 +2996,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2851,6 +3013,7 @@ mod tests {
                 cmaf_with_duration(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -2887,6 +3050,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2902,6 +3066,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -2963,6 +3128,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -2974,6 +3140,7 @@ mod tests {
                 cmaf_with_duration(),
                 file_sink(),
                 JobClass::Interactive,
+                JobHint::default(),
             )
             .await
             .unwrap();
@@ -3008,6 +3175,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
             })
@@ -3023,6 +3191,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Background,
+                    JobHint::default(),
                 )
                 .await
             }));
@@ -3069,6 +3238,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
                 .unwrap();
@@ -3139,6 +3309,7 @@ mod tests {
                     cmaf(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
                 .unwrap();
@@ -3225,6 +3396,7 @@ mod tests {
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Interactive,
+                    JobHint::default(),
                 )
                 .await
                 .unwrap();
@@ -3333,6 +3505,151 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Gauge(v) if v == 1.0),
             "a cold, never-observed device must read the floor (1.0); got {value:?}"
+        );
+    }
+
+    /// Distance is a property of NOW, not of the job. A prefetch queued at
+    /// distance 6 becomes the most urgent thing in the queue once the client has
+    /// consumed five segments — freezing urgency at submit time gets this
+    /// exactly backwards.
+    #[tokio::test]
+    async fn a_prefetch_becomes_more_urgent_as_its_client_advances() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(50), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let stream = StreamKey::of("play-session-a");
+
+        // The client asks for segment 100.
+        s.submit(
+            PathBuf::from("/m/a"),
+            cmaf(),
+            file_sink(),
+            JobClass::Interactive,
+            JobHint {
+                stream,
+                segment: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(snap.playheads.get(&stream).copied(), Some(100));
+
+        // ...and then for 104.
+        s.submit(
+            PathBuf::from("/m/a"),
+            cmaf(),
+            file_sink(),
+            JobClass::Interactive,
+            JobHint {
+                stream,
+                segment: Some(104),
+            },
+        )
+        .await
+        .unwrap();
+
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(snap.playheads.get(&stream).copied(), Some(104));
+    }
+
+    /// A speculative request says nothing about where the viewer actually is —
+    /// only what somebody guessed they might want next. If prefetch could move
+    /// the playhead, a deep speculative submission would advance the very
+    /// distance measurement its own urgency is judged against.
+    #[tokio::test]
+    async fn only_interactive_submissions_move_the_playhead() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(20), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let stream = StreamKey::of("play-session-background-only");
+
+        s.submit(
+            PathBuf::from("/m/a"),
+            cmaf(),
+            file_sink(),
+            JobClass::Background,
+            JobHint {
+                stream,
+                segment: Some(50),
+            },
+        )
+        .await
+        .unwrap();
+
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream),
+            None,
+            "a Background submission must not create a playhead entry"
+        );
+    }
+
+    /// Mirrors `MAX_TRACKED_SESSIONS` in `PrefetchRegistry`: an unbounded
+    /// playhead map is a leak dressed as a cache. Push the map one past its
+    /// cap and check both halves of the contract — the size never exceeds it,
+    /// and the entry evicted is the LEAST-recently-touched one, not an
+    /// arbitrary one (which would risk dropping a stream still actively
+    /// playing in favour of one touched once and abandoned).
+    #[tokio::test]
+    async fn the_playhead_map_is_bounded_and_evicts_the_stream_touched_longest_ago() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+
+        let oldest = StreamKey::of("stream-oldest");
+        s.submit(
+            PathBuf::from("/m/a"),
+            cmaf(),
+            file_sink(),
+            JobClass::Interactive,
+            JobHint {
+                stream: oldest,
+                segment: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Touch 256 MORE distinct streams — one past the cap — so `oldest`
+        // is now the least-recently-updated entry.
+        let mut last = oldest;
+        for n in 1..=256u32 {
+            let stream = StreamKey::of(&format!("stream-{n}"));
+            s.submit(
+                PathBuf::from("/m/a"),
+                cmaf(),
+                file_sink(),
+                JobClass::Interactive,
+                JobHint {
+                    stream,
+                    segment: Some(n),
+                },
+            )
+            .await
+            .unwrap();
+            last = stream;
+        }
+
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.len(),
+            256,
+            "the map must stay bounded at MAX_TRACKED_STREAMS regardless of how many \
+             distinct streams have submitted"
+        );
+        assert!(
+            !snap.playheads.contains_key(&oldest),
+            "the least-recently-updated stream must be the one evicted, not an arbitrary one"
+        );
+        assert_eq!(
+            snap.playheads.get(&last).copied(),
+            Some(256),
+            "the most recently touched stream must survive"
         );
     }
 }

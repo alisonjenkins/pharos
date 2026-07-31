@@ -20,7 +20,7 @@ use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_cache::HlsSegmentCache;
 use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
-use pharos_transcode::scheduler::JobClass;
+use pharos_transcode::scheduler::{JobClass, StreamKey};
 use pharos_transcode::{
     AudioCodec, AudioDelivery, Container, ContinuousAudio, FfmpegTranscoder, SegmentAudio,
     SegmentContainer, SegmentOpts, SegmentVideo, VideoCodec,
@@ -1143,6 +1143,11 @@ async fn serve_segment(
             wanted_burn,
             q.play_session_id.as_deref(),
         );
+        let stream = q
+            .play_session_id
+            .as_deref()
+            .map(StreamKey::of)
+            .unwrap_or(StreamKey::NONE);
         let bytes = cache
             .segment_bytes_keyed(
                 id_num,
@@ -1152,6 +1157,7 @@ async fn serve_segment(
                 &item.path,
                 &opts,
                 JobClass::Interactive,
+                stream,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
@@ -1915,7 +1921,7 @@ async fn vp9_init(
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
-    let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    let raw = vp9_segment_raw(&state, &item, 0, &opts, q.play_session_id.as_deref()).await?;
     // The init IS the rendition's clock. Judge it too: an init on the wrong
     // timescale mis-reads every segment that follows it, not just itself.
     fmp4::record_track_timescale(&raw, item.id, 0);
@@ -1991,7 +1997,7 @@ async fn vp9_segment(
         wanted_burn,
         q.play_session_id.as_deref(),
     );
-    let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    let raw = vp9_segment_raw(&state, &item, seg, &opts, q.play_session_id.as_deref()).await?;
     // A/V-sync diagnostic (T-avsync): log each track's tfdt + content duration
     // so real playback reveals a per-segment gap/overlap or an audio-vs-video
     // duration mismatch — the mechanism behind the reported drift + clicks.
@@ -2081,7 +2087,7 @@ async fn h264cmaf_init(
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
-    let raw = vp9_segment_raw(&state, &item, 0, &opts).await?;
+    let raw = vp9_segment_raw(&state, &item, 0, &opts, q.play_session_id.as_deref()).await?;
     // The init IS the rendition's clock. Judge it too: an init on the wrong
     // timescale mis-reads every segment that follows it, not just itself.
     fmp4::record_track_timescale(&raw, item.id, 0);
@@ -2145,7 +2151,7 @@ async fn h264cmaf_segment(
         wanted_burn,
         q.play_session_id.as_deref(),
     );
-    let raw = vp9_segment_raw(&state, &item, seg, &opts).await?;
+    let raw = vp9_segment_raw(&state, &item, seg, &opts, q.play_session_id.as_deref()).await?;
     fmp4::record_track_timescale(&raw, item.id, seg);
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
@@ -2393,6 +2399,13 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             &item.path,
                             &o,
                             JobClass::Background,
+                            // `segment_opts_for_media` (state.rs) discards the
+                            // play_session_id key it iterates over, so no
+                            // session is available here to attribute this
+                            // prewarm to. Gap: threading the psid through would
+                            // let a SyncPlay seek's own prewarm move that
+                            // member's playhead.
+                            StreamKey::NONE,
                         )
                         .await;
                 });
@@ -2472,9 +2485,11 @@ fn prewarm_base_segment(
 /// URL-carried `VideoBitrate` cap + clamp. `&VideoBitrate=` equals the
 /// session's negotiated ceiling, so the two agree and the prewarmed bytes hit
 /// the exact cache key the client's request keys on. No-op without a cache.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prewarm_cold_start(
     state: &web::Data<AppState>,
     session: crate::transcode_sessions::TranscodeSession,
+    play_session_id: &str,
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
     video_bitrate_cap: Option<u64>,
@@ -2485,6 +2500,7 @@ pub(super) fn prewarm_cold_start(
         return;
     }
     let media_id = session.media_id;
+    let stream = StreamKey::of(play_session_id);
     let state = state.clone();
     actix_web::rt::spawn(async move {
         let Ok(item) = fetch_item(&state, media_id).await else {
@@ -2581,6 +2597,7 @@ pub(super) fn prewarm_cold_start(
                         &item.path,
                         &opts,
                         JobClass::Background,
+                        stream,
                     )
                     .await
                 {
@@ -2613,10 +2630,12 @@ fn spawn_one_prefetch(
     seg: u32,
     opts: &SegmentOpts,
     wanted_burn: Option<u32>,
+    psid: Option<&str>,
 ) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     let item = item.clone();
     let mut o = opts.clone();
+    let stream = psid.map(StreamKey::of).unwrap_or(StreamKey::NONE);
     // Same frame-aligned boundary the live handler uses, so the prefetched
     // bytes are byte-identical to (and cache-key-match) the client's own
     // eventual request for this segment.
@@ -2654,6 +2673,7 @@ fn spawn_one_prefetch(
                 &item.path,
                 &o,
                 JobClass::Background,
+                stream,
             )
             .await
         {
@@ -2697,7 +2717,7 @@ fn spawn_segment_prefetch(
     let near_end = base_seg + ahead;
     let mut handles: Vec<tokio::task::JoinHandle<()>> = near
         .iter()
-        .map(|seg| spawn_one_prefetch(state, item, *seg, opts, wanted_burn))
+        .map(|seg| spawn_one_prefetch(state, item, *seg, opts, wanted_burn, psid))
         .collect();
 
     // B51 — window-aware deep prefetch: when a subtitle is selected, look
@@ -2732,7 +2752,16 @@ fn spawn_segment_prefetch(
             );
             let inner: Vec<tokio::task::JoinHandle<()>> = targets
                 .iter()
-                .map(|seg| spawn_one_prefetch(&state_c, &item_c, *seg, &opts_c, wanted_burn))
+                .map(|seg| {
+                    spawn_one_prefetch(
+                        &state_c,
+                        &item_c,
+                        *seg,
+                        &opts_c,
+                        wanted_burn,
+                        psid_owned.as_deref(),
+                    )
+                })
                 .collect();
             // Append only if the session is STILL on this media — the scan above
             // is async, so it may have swapped episodes meanwhile; then these
@@ -3007,8 +3036,12 @@ async fn vp9_segment_raw(
     item: &pharos_core::MediaItem,
     seg: u32,
     opts: &SegmentOpts,
+    play_session_id: Option<&str>,
 ) -> Result<Vec<u8>, actix_web::Error> {
     if let Some(cache) = state.hls.as_ref() {
+        let stream = play_session_id
+            .map(StreamKey::of)
+            .unwrap_or(StreamKey::NONE);
         return cache
             .segment_bytes_keyed(
                 item.id,
@@ -3018,6 +3051,7 @@ async fn vp9_segment_raw(
                 &item.path,
                 opts,
                 JobClass::Interactive,
+                stream,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));

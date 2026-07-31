@@ -21,6 +21,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "fs", "time", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true
+xxhash-rust.workspace = true
 # P48 — optional libav FFI backend, enabled via the `backend-lib`
 # feature. `ffmpeg-the-third` is the actively-maintained rust-ffmpeg
 # fork; v5 supports ffmpeg 8.1, so the FFI build links the SAME libav the
