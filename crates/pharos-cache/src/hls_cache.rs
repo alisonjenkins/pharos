@@ -1109,6 +1109,20 @@ impl HlsSegmentCache {
                 "device" => t.device.to_string(),
             )
             .record(t.encode_ms as f64 / 1000.0);
+            // What that encode was COMPETING WITH. `encode_seconds` rising is
+            // ambiguous on a shared encoder — a heavier source and a crowded
+            // device look identical — and the two need opposite fixes: a
+            // cheaper ladder versus a scheduler that stops piling speculative
+            // work onto the segment a client is blocked on. Measured on the
+            // deployment before this shipped: 1 860 ms with no peers, 6 229 ms
+            // with six. Paired with `encode_seconds` by the same labels so the
+            // two divide.
+            metrics::histogram!(
+                "pharos_transcode_peer_jobs",
+                "class" => class.label(),
+                "device" => t.device.to_string(),
+            )
+            .record(t.peer_jobs as f64);
         }
         // Split total transcode_ms into scheduler queue-wait vs actual encode
         // (from the scheduler's JobDone), plus the winning device + retry count,
@@ -1139,6 +1153,7 @@ impl HlsSegmentCache {
             lock_wait_ms,
             queue_wait_ms = timing.as_ref().map(|t| t.queue_wait_ms),
             encode_ms = timing.as_ref().map(|t| t.encode_ms),
+            peer_jobs = timing.as_ref().map(|t| t.peer_jobs),
             device = timing.as_ref().map(|t| t.device.to_string()),
             bytes = bytes.len(),
             codec = codec_tag(opts.video, opts.audio_codec(), opts.container),

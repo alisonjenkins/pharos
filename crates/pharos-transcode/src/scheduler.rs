@@ -212,6 +212,13 @@ pub struct JobDone {
     pub queue_wait_ms: u64,
     /// Time the winning device took to actually encode. High = slow encoder.
     pub encode_ms: u64,
+    /// How many OTHER jobs were already running on the same device when this
+    /// one was dispatched. `encode_ms` says a segment was slow; this says
+    /// whether it was slow or merely crowded, which is the difference between
+    /// "the encoder is too slow for this source" and "we scheduled six
+    /// speculative encodes on top of it". Measured on the deployment: 1 860 ms
+    /// alone, 6 229 ms with six peers.
+    pub peer_jobs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +368,10 @@ struct JobCtx {
     /// snapshot attribute each device's occupancy to the jobs holding it,
     /// instead of reporting a bare count with nothing behind it.
     device: Option<DeviceId>,
+    /// Jobs already on that device at the moment this one was dispatched.
+    /// Re-stamped on each (re)dispatch, like `dispatched`, so a retry reports
+    /// the company it actually kept rather than the company it first met.
+    peer_jobs: usize,
     /// The job's own span, opened at dispatch (when the device — and so the
     /// decode path — is finally known) and carried here so the completion
     /// arm, which runs in the ACTOR and not inside the job's task, can still
@@ -525,6 +536,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 dispatched: None,
                 class,
                 device: None,
+                peer_jobs: 0,
                 // Replaced at dispatch, once the device is known.
                 span: tracing::Span::none(),
             };
@@ -673,6 +685,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                             class = %ctx.class,
                             queue_wait_ms = queue_ms,
                             encode_ms,
+                            peer_jobs = ctx.peer_jobs,
                             retries = ctx.retries,
                             "transcode job done"
                         );
@@ -682,6 +695,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         out_bytes,
                         queue_wait_ms: queue_ms,
                         encode_ms,
+                        peer_jobs: ctx.peer_jobs,
                     }));
                 }
                 WorkerRunResult::Failed(err) if !err.is_transient() => {
@@ -797,6 +811,18 @@ fn retry_or_fail(
     place(state, job_id, ctx, self_tx);
 }
 
+/// Segment jobs already running on `dev`. This is what sets encode time on a
+/// shared encoder — a device at capacity finishes each of its jobs several
+/// times slower than the same device running one — and nothing recorded it, so
+/// a slow segment and a crowded one produced identical telemetry.
+fn peers_on(state: &SchedState, dev: DeviceId) -> usize {
+    state
+        .inflight
+        .values()
+        .filter(|c| c.device == Some(dev))
+        .count()
+}
+
 /// Permits currently free across the devices that could take a given job.
 /// Counted over the job's own candidate set, not the whole table: capacity on
 /// a device that cannot encode this target is not headroom for it.
@@ -901,6 +927,7 @@ fn record_placement(
         seek_secs = ctx.opts.start_position_ticks as f64 / 10_000_000.0,
         dur_secs = ctx.opts.duration_ticks.map(|t| t as f64 / 10_000_000.0),
         retries = ctx.retries,
+        peer_jobs = tracing::field::Empty,
         queue_wait_ms = tracing::field::Empty,
         encode_ms = tracing::field::Empty,
         out_bytes = tracing::field::Empty,
@@ -1067,6 +1094,10 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
             ctx.device = Some(dev);
+            // Counted BEFORE this job joins `inflight`, so it is peers, not
+            // occupancy: a job that runs alone reports 0.
+            ctx.peer_jobs = peers_on(state, dev);
+            span.record("peer_jobs", ctx.peer_jobs);
             ctx.span = span.clone();
             state.inflight.insert(job_id, ctx);
             spawn_run_task(
@@ -2257,5 +2288,53 @@ mod tests {
         for h in running {
             assert!(h.await.unwrap().is_ok());
         }
+    }
+    /// A single GPU, so a job's peers are unambiguous.
+    fn one_gpu(capacity: usize) -> DeviceTable {
+        DeviceTable::from_probe(&[(DeviceId::hw(HwAccel::Nvenc, 0), capacity)], 0)
+    }
+
+    /// ODD — what a job encoded BESIDE is the thing that sets how long it took,
+    /// and nothing recorded it.
+    ///
+    /// Measured on the deployment: one 6 s segment costs 1 860 ms alone and
+    /// 6 229 ms when six speculative encodes share the device. `encode_ms`
+    /// reports the 6 229 and cannot say why, so a slow encode is
+    /// indistinguishable from a crowded one — the two need opposite fixes.
+    #[tokio::test]
+    async fn a_finished_job_reports_how_many_peers_shared_its_device() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(300), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+
+        let first = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/a"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let second = s
+            .submit(
+                PathBuf::from("/m/b"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
+            .expect("second job must be admitted");
+        assert_eq!(
+            second.peer_jobs, 1,
+            "a job dispatched onto a device already running one job has one peer"
+        );
+        assert!(first.await.unwrap().is_ok());
     }
 }
