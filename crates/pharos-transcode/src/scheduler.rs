@@ -308,39 +308,44 @@ pub struct SchedConfig {
     /// free across the devices that could take it, so a burst of prefetch can
     /// never occupy the last slot a client request would have used.
     pub background_headroom: usize,
-    /// How many speculative jobs may run on a device that is ALSO running a
-    /// client's segment.
+    /// FLOOR for the learned speculative allowance — see
+    /// [`crate::admission::AdmissionController`].
     ///
-    /// `background_headroom` reserves a permit, which is what a client needs
-    /// to start; it does nothing about what the client needs to finish, since
-    /// an encoder shared N ways runs each of its jobs several times slower.
-    /// Measured on the deployment: one segment costs 1 860 ms alone and
-    /// 6 358 ms when the six prefetches its own request launched are admitted
-    /// beside it.
+    /// This was the allowance itself, a number calibrated by hand on one GTX
+    /// 1070 against one 23 Mbps HEVC source. It is now the value a device sits
+    /// on before it has learned anything, and the value it collapses back to
+    /// under sustained deadline misses, so a cold process behaves exactly as
+    /// it did when this was the whole answer.
     ///
     /// Not zero. Shedding ALL prefetch while a client job runs would starve
     /// the pipeline that makes the next segment a 30 ms cache hit — prefetch
     /// is shed, never queued, so what is refused here is not retried later,
-    /// and every segment would become a cold miss. One keeps the buffer
-    /// filling while leaving the client's segment most of the device.
+    /// and every segment would become a cold miss.
+    ///
+    /// Derived from `admission.floor` in `Default` rather than restated as
+    /// its own literal: this and `AdmissionConfig::floor` are the same number
+    /// in two types (`usize` here for the pre-learning admission math that
+    /// used to read it directly, `f64` there for the AIMD arithmetic), and a
+    /// hand-kept duplicate is exactly the kind of pair that drifts apart one
+    /// edit at a time.
     pub background_alongside_client: usize,
-    /// How the per-device speculative allowance is learned. `floor` here is the
-    /// value `background_alongside_client` used to be, and a cold controller
-    /// sits exactly on it — so a fresh process behaves precisely like the
-    /// constant this replaces.
+    /// How the per-device speculative allowance is learned. `floor` here is
+    /// the value `background_alongside_client` used to be — see that field's
+    /// doc comment for why the two cannot be set independently.
     pub admission: AdmissionConfig,
 }
 
 impl Default for SchedConfig {
     fn default() -> Self {
+        let admission = AdmissionConfig::default();
         Self {
             inbox_depth: 256,
             pending_cap: 256,
             cooldown: Duration::from_secs(2),
             max_retries: 3,
             background_headroom: 1,
-            background_alongside_client: 1,
-            admission: AdmissionConfig::default(),
+            background_alongside_client: admission.floor as usize,
+            admission,
         }
     }
 }
@@ -871,10 +876,15 @@ fn retry_or_fail(
 }
 
 /// Would admitting a speculative job to `dev` put it beside a client's segment
-/// past the allowance? Speculative work is wanted — it is what turns the next
-/// segment into a cache hit — but not at the cost of the segment somebody is
-/// currently staring at a spinner for.
-fn crowds_a_client(state: &SchedState, dev: DeviceId, cfg: &SchedConfig) -> bool {
+/// past what that device has EARNED? Speculative work is wanted — it is what
+/// turns the next segment into a cache hit — but not at the cost of the
+/// segment somebody is currently staring at a spinner for.
+///
+/// The allowance is learned per device rather than configured, because the
+/// number that matters is a property of the hardware and the source mix, not
+/// of the config file: the same constant that under-uses a four-engine card
+/// overloads a laptop.
+fn crowds_a_client(state: &SchedState, dev: DeviceId) -> bool {
     let mut interactive = 0usize;
     let mut background = 0usize;
     for c in state.inflight.values().filter(|c| c.device == Some(dev)) {
@@ -883,7 +893,20 @@ fn crowds_a_client(state: &SchedState, dev: DeviceId, cfg: &SchedConfig) -> bool
             JobClass::Background => background += 1,
         }
     }
-    interactive > 0 && background >= cfg.background_alongside_client
+    let capacity = state.devices.slot(dev).map(|s| s.capacity).unwrap_or(1);
+    let allowance = state.admission.allowance(dev, capacity);
+    if interactive > 0 && background >= allowance {
+        tracing::debug!(
+            %dev,
+            allowance,
+            background,
+            interactive,
+            "speculative job refused: device has not earned this slot"
+        );
+        true
+    } else {
+        false
+    }
 }
 
 /// Segment jobs already running on `dev`. This is what sets encode time on a
@@ -1224,7 +1247,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         // allowance, and let this job try the next device — or be shed below.
         // This is what `background_headroom` intends but cannot deliver on its
         // own: reserving a permit gets a client STARTED, not finished.
-        if ctx.class == JobClass::Background && crowds_a_client(state, dev, &state.cfg) {
+        if ctx.class == JobClass::Background && crowds_a_client(state, dev) {
             continue;
         }
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
@@ -2740,23 +2763,28 @@ mod tests {
     /// Strengthened per controller review: asserting the allowance is still
     /// 1.0 after one job is satisfied by a controller that is never fed at all
     /// — precisely the wiring bug this test exists to catch. So this puts a
-    /// speculative job on the GPU FIRST (admission still uses the shipped
-    /// constant, `background_alongside_client == 1`, so exactly one may share
-    /// the device with an interactive one), then submits the interactive job
+    /// speculative job on the GPU FIRST (a device with nothing else on it
+    /// admits it unconditionally either way), then submits the interactive job
     /// the controller actually learns from. It sees one background peer
     /// already running, meets its deadline comfortably, and
     /// `background_peers (1) >= current allowance.floor() (1)` makes the
     /// success EXERCISED — the only kind that raises the allowance. If
     /// `observe` were never called the raw allowance could not move off 1.0.
     ///
-    /// The second half proves the OTHER direction: even with the learned
-    /// value sitting at 2.0, admission itself is unchanged — a fresh client
-    /// held open while a burst of speculative jobs targets its device still
-    /// sees only the CONSTANT `background_alongside_client` (1) join it. A
-    /// controller that fed the learned value into `crowds_a_client` instead of
-    /// the constant would let a second job through here and fail this.
+    /// Renamed from `..._without_changing_admission`: that name described
+    /// shadow mode (Task 3), where the controller learned but nothing
+    /// consulted it. Closing the loop (Task 4) means admission now DOES
+    /// change once the allowance rises — that is the feature, not a
+    /// regression — so the second half now proves admission tracks the
+    /// learned value: a fresh client held open while a burst of speculative
+    /// jobs targets its device lets exactly `floor(2.0) == 2` of them join,
+    /// not the shipped constant's 1. (The case that a constant CANNOT drift
+    /// past what it was measured on lives in
+    /// `speculative_work_does_not_crowd_the_segment_a_client_is_waiting_for`,
+    /// which starts a cold controller and never teaches it, so it still
+    /// stays pinned at the floor.)
     #[tokio::test]
-    async fn a_finished_segment_teaches_the_controller_without_changing_admission() {
+    async fn a_finished_segment_teaches_the_controller_and_admission_follows_it() {
         // 6 s segments (via `cmaf_with_duration`), 100 ms encode: comfortably
         // inside the 3 s deadline. `ScriptedSpawner` applies one script to
         // every worker it spawns, so every job below shares this delay.
@@ -2815,10 +2843,10 @@ mod tests {
              never reached the controller if this is still 1.0"
         );
 
-        // Admission itself must be UNCHANGED: even though the learned
-        // allowance is now 2.0, a fresh client held open while a burst of
-        // speculative jobs targets its device must still see only the
-        // CONSTANT `background_alongside_client` (1) join it.
+        // Admission must now TRACK the learned value: with the allowance at
+        // 2.0, a fresh client held open while a burst of speculative jobs
+        // targets its device lets 2 of them join, not the shipped
+        // constant's 1.
         let client2 = {
             let s2 = s.clone();
             tokio::spawn(async move {
@@ -2856,12 +2884,132 @@ mod tests {
             .filter(|r| matches!(r, Ok(d) if d.device == gpu))
             .count();
         assert_eq!(
-            joined_the_client,
-            SchedConfig::default().background_alongside_client,
-            "admission must still read the shipped CONSTANT, not the learned \
-             2.0 allowance: {results:?}"
+            joined_the_client, 2,
+            "admission must track the learned 2.0 allowance (floor(2.0) == 2), \
+             not the shipped constant's 1: {results:?}"
         );
         assert!(client2.await.unwrap().is_ok());
+    }
+
+    /// The payoff, proven where it actually has to hold: not in the raw
+    /// learned number (that already climbs in shadow mode -- Task 3's own
+    /// `a_finished_segment_teaches_the_controller_and_admission_follows_it`
+    /// seeds an exercised success from a background job that pre-dates the
+    /// client and is never gated by `crowds_a_client` at all, constant or
+    /// learned), but in ADMISSION: once the controller has learned an
+    /// allowance above the constant it replaces, MORE speculative jobs must
+    /// be let onto a device that already has a client's segment running on
+    /// it than the constant ever allowed.
+    ///
+    /// An earlier draft of this test asserted only `background_allowance`
+    /// rose above the floor and passed unmodified against the constant-gated
+    /// `crowds_a_client` -- confirmed empirically before this version was
+    /// written. Learning happens independently of admission (that
+    /// independence is the whole point of shadow mode); only a count of
+    /// jobs actually ADMITTED beside a running client can tell the two
+    /// implementations apart.
+    #[tokio::test]
+    async fn a_learned_allowance_lets_more_speculative_work_join_an_inflight_client() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(300), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(8), spawner, SchedConfig::default());
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+
+        // Seed: a background job dispatches uncontested -- no client is on
+        // the device yet, so `crowds_a_client` cannot block it under EITHER
+        // implementation (`interactive > 0` is false). A client dispatched
+        // next sees it as a pre-existing peer: exactly the shape
+        // `AdmissionController::observe` needs to call the success
+        // EXERCISED, raising the learned allowance from the floor (1.0) to
+        // 2.0.
+        let seed_bg = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/seed"),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let seeded = s
+            .submit(
+                PathBuf::from("/m/seed-client"),
+                cmaf_with_duration(),
+                file_sink(),
+                JobClass::Interactive,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seeded.background_peers, 1,
+            "the seed job must be pre-existing at the client's own dispatch"
+        );
+        assert!(seed_bg.await.unwrap().is_ok());
+
+        let snap = s.snapshot().await.unwrap();
+        let learned = snap
+            .background_allowance
+            .iter()
+            .find(|(d, _)| *d == gpu)
+            .map(|(_, v)| *v);
+        assert_eq!(
+            learned,
+            Some(2.0),
+            "one exercised success must raise the allowance by increase_step: {snap:?}"
+        );
+
+        // Now prove ADMISSION consults that 2.0, not the shipped constant
+        // (1): hold a fresh client open on the same device and let a burst
+        // target it, using the same staggered-burst shape
+        // `speculative_work_does_not_crowd_the_segment_a_client_is_waiting_for`
+        // uses to prove the constant's cap deterministically.
+        let client = {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from("/m/held"),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let mut handles = Vec::new();
+        for n in 0..4 {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/burst{n}")),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Background,
+                )
+                .await
+            }));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        let joined = results
+            .iter()
+            .filter(|r| matches!(r, Ok(d) if d.device == gpu))
+            .count();
+        assert_eq!(
+            joined, 2,
+            "a learned allowance of 2 must admit 2 speculative jobs beside an \
+             already-inflight client, not the shipped constant's 1: {results:?}"
+        );
+        assert!(client.await.unwrap().is_ok());
     }
 
     /// The verdict counter is the signal that says whether the loop is hearing
@@ -2932,7 +3080,7 @@ mod tests {
     /// allowance frozen at the floor is also exactly what a controller that
     /// was never wired up at all would produce, which is the trap two earlier
     /// reviews on this branch already caught (see
-    /// `a_finished_segment_teaches_the_controller_without_changing_admission`'s
+    /// `a_finished_segment_teaches_the_controller_and_admission_follows_it`'s
     /// doc comment). Only the counter distinguishes "no signal reached the
     /// loop" from "the device genuinely cannot go faster".
     #[test]
