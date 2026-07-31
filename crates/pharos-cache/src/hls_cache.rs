@@ -1401,6 +1401,7 @@ impl HlsSegmentCache {
                         hit_started.elapsed().as_millis() as u64,
                         cached_age_secs(&meta),
                     );
+                    self.note_client_playhead(class, stream, seg_index);
                     return Ok(b);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
@@ -1507,8 +1508,40 @@ impl HlsSegmentCache {
                 coalesced_started.elapsed().as_millis() as u64,
                 None,
             );
+            // `stream` is THIS requester's — the joiner's — which is the whole
+            // care needed here. The driver's stream belongs to a viewer who
+            // never asked for this segment (it is their prefetch, running ahead
+            // of them), and declaring THEM to be standing on it is the bug
+            // `JobHint::on_behalf_of_a_joiner` exists to prevent, arriving by
+            // another route. A driving requester takes no branch: it did not get
+            // a hit, and its own `Submit` already moved its reading.
+            self.note_client_playhead(class, stream, seg_index);
         }
         Ok(bytes.as_ref().clone())
+    }
+
+    /// Tell the scheduler where this viewer has reached, for a segment the
+    /// scheduler never saw a job for.
+    ///
+    /// Both hit paths land here, and only a hit does: a MISS reports itself,
+    /// through the `Submit` that services it. Without this the reading is
+    /// miss-driven, so a viewer whose buffer is warm — the healthiest stream on
+    /// the box — stops updating it entirely, and every consumer of
+    /// `lookahead_distance` degrades in proportion to how well prefetch is
+    /// working.
+    ///
+    /// Interactive only. A speculative hit says where somebody GUESSED the
+    /// viewer would be, which is the self-measurement `PlayheadSeed` forbids on
+    /// the submit side; there is no reason to let it in through the cache. And
+    /// the send itself never blocks or awaits — see
+    /// [`TranscodeScheduler::note_playhead`] for why a lost update is safe.
+    fn note_client_playhead(&self, class: JobClass, stream: StreamKey, seg_index: u32) {
+        if class != JobClass::Interactive || stream == StreamKey::NONE {
+            return;
+        }
+        if let Some(sched) = &self.scheduler {
+            sched.note_playhead(stream, seg_index);
+        }
     }
 
     /// Ask the scheduler to re-rank the driver of a segment a client is now
@@ -5048,6 +5081,287 @@ mod tests {
             "a submission made on a JOINER's behalf must not declare the \
              driver's viewer to have reached the segment being guessed at — \
              everything that viewer has queued between the two becomes stale"
+        );
+    }
+
+    /// Put a segment on disk for `seg` so the next request for it is a FAST
+    /// cache hit — what a viewer sees once prefetch is a segment or two ahead.
+    async fn already_cached(cache: &HlsSegmentCache, media: u64, seg: u32, opts: &SegmentOpts) {
+        let path = cache.segment_path_keyed(SegmentIdentity::new(media, seg, None, None, opts));
+        tokio::fs::create_dir_all(path.parent().expect("a segment path has a parent"))
+            .await
+            .expect("cache dir");
+        tokio::fs::write(&path, vec![b'x'; 256])
+            .await
+            .expect("cached segment");
+    }
+
+    /// T109 — a viewer being served WELL must not go dark to the scheduler.
+    ///
+    /// The reading was miss-driven: `note_playhead` fired on an interactive
+    /// `Submit`, and a `Submit` only happens when the cache could not answer. So
+    /// the better prefetch worked, the staler the number got — a viewer at 104
+    /// whose reading still said 100 had every one of its guesses ranked four
+    /// segments further out than they were, and its next genuine miss queued
+    /// behind another stream's shallower work.
+    ///
+    /// The miss first is the control: it proves this harness really does reach
+    /// the scheduler, so the hits that follow are asserted against a reading
+    /// that is demonstrably live rather than against an absent one.
+    #[tokio::test]
+    async fn a_warm_viewers_playhead_advances_on_cache_hits() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(5));
+        let sched = writes_each_segment(std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(sched.clone());
+        let opts = slow_opts();
+        let viewer = StreamKey::of("warm-buffer-viewer");
+
+        cache
+            .segment_bytes_keyed(
+                80,
+                100,
+                None,
+                None,
+                Path::new("/no/source"),
+                &opts,
+                JobClass::Interactive,
+                viewer,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("the cold segment");
+        let snap = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.playheads.get(&viewer).copied(),
+            Some(100),
+            "control: a MISS still moves the reading, so this harness reaches \
+             the scheduler at all"
+        );
+
+        // ...and from here prefetch is far enough ahead that the viewer never
+        // misses again.
+        for seg in 101..=104u32 {
+            already_cached(&cache, 80, seg, &opts).await;
+            let bytes = cache
+                .segment_bytes_keyed(
+                    80,
+                    seg,
+                    None,
+                    None,
+                    Path::new("/no/source"),
+                    &opts,
+                    JobClass::Interactive,
+                    viewer,
+                    PlayheadSeed::Observes,
+                )
+                .await
+                .expect("a warm hit");
+            assert_eq!(bytes.len(), 256, "segment {seg} must be the CACHED bytes");
+        }
+
+        let snap = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.playheads.get(&viewer).copied(),
+            Some(104),
+            "a segment served from cache is the same evidence about where this \
+             viewer stands as one that had to be encoded — a reading only a miss \
+             can move goes stale exactly when playback is going well"
+        );
+    }
+
+    /// ...and a hit that lands BEHIND the reading must not undo it.
+    ///
+    /// A client's parallel fetches around a seek complete out of order, and a
+    /// hit says when the bytes were read rather than when they were asked for.
+    /// A reading dragged back to 120 by a late hit ranks every guess on that
+    /// stream twenty segments further out than it is — the exact error T109
+    /// exists to remove, reintroduced from the other side.
+    ///
+    /// The MISS is what may move a reading in either direction: that is how a
+    /// backward seek is expressed, and it is what keeps the hit rule from being
+    /// a one-way ratchet.
+    ///
+    /// BOTH edges are asserted here on purpose, and the second is what makes the
+    /// first mean anything. "The reading did not move backwards" is also what an
+    /// implementation that never reports a hit at all produces — it is the
+    /// behaviour this task exists to remove — so a test asserting only that
+    /// would be green today and green forever. The forward hit that follows
+    /// pins, in this same test, that hits DO reach the scheduler from here: the
+    /// pair is passed only by an implementation that reports every hit and
+    /// applies the backward one.
+    #[tokio::test]
+    async fn a_late_hit_behind_the_viewer_does_not_drag_the_playhead_back() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(5));
+        let sched = writes_each_segment(std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(sched.clone());
+        let opts = slow_opts();
+        let viewer = StreamKey::of("seeking-viewer");
+
+        cache
+            .segment_bytes_keyed(
+                81,
+                140,
+                None,
+                None,
+                Path::new("/no/source"),
+                &opts,
+                JobClass::Interactive,
+                viewer,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("the segment the viewer jumped to");
+
+        // Segment 120's bytes — asked for before the jump — arrive now.
+        already_cached(&cache, 81, 120, &opts).await;
+        cache
+            .segment_bytes_keyed(
+                81,
+                120,
+                None,
+                None,
+                Path::new("/no/source"),
+                &opts,
+                JobClass::Interactive,
+                viewer,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("the late hit");
+
+        let snap = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.playheads.get(&viewer).copied(),
+            Some(140),
+            "a hit is evidence the viewer REACHED that segment, never evidence \
+             they went back to it: going back produces a request, and a request \
+             is the thing allowed to move a reading either way"
+        );
+
+        // ...and hits are not simply going nowhere from here: the very next one
+        // ahead of the reading moves it.
+        already_cached(&cache, 81, 141, &opts).await;
+        cache
+            .segment_bytes_keyed(
+                81,
+                141,
+                None,
+                None,
+                Path::new("/no/source"),
+                &opts,
+                JobClass::Interactive,
+                viewer,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("the next segment, already warm");
+
+        let snap = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.playheads.get(&viewer).copied(),
+            Some(141),
+            "the assertion above must be the RULE working, not the hit path \
+             being silent: an implementation that reports no hit at all also \
+             leaves the reading at 140"
+        );
+    }
+
+    /// The coalesced half of T109, and the seam
+    /// `a_promoted_retry_does_not_move_the_drivers_playhead` guards from the
+    /// other side.
+    ///
+    /// A joiner served off somebody else's encode took a hit
+    /// (`hit_path="coalesced"`), so it too reached the scheduler with nothing to
+    /// say about where its own viewer stands. Reporting it has to move the
+    /// JOINER'S reading and only the joiner's: the driver's viewer never asked
+    /// for this segment — it is six ahead of them, a guess — and declaring them
+    /// to be standing on it makes everything they have queued in between
+    /// instantly stale.
+    #[tokio::test]
+    async fn a_coalesced_hit_moves_the_joiners_playhead_and_not_the_drivers() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(5));
+        let sched = writes_each_segment(std::time::Duration::from_millis(150));
+        let cache = Arc::new(cache.with_scheduler(sched.clone()));
+        let opts = slow_opts();
+        let driver_viewer = StreamKey::of("coalesce-driver-viewer");
+        let joiner_viewer = StreamKey::of("coalesce-joiner-viewer");
+
+        // Where the driver's viewer actually stands.
+        cache
+            .segment_bytes_keyed(
+                82,
+                100,
+                None,
+                None,
+                Path::new("/no/source"),
+                &opts,
+                JobClass::Interactive,
+                driver_viewer,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("the driver's own segment");
+
+        // Its prefetch runs six ahead...
+        let driver = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes_keyed(
+                    82,
+                    106,
+                    None,
+                    None,
+                    Path::new("/no/source"),
+                    &o,
+                    JobClass::Background,
+                    driver_viewer,
+                    PlayheadSeed::Observes,
+                )
+                .await
+            })
+        };
+        // ...and a different viewer turns out to want that segment now, and is
+        // served by joining it rather than by an encode of its own.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let joiner = {
+            let c = cache.clone();
+            let o = opts.clone();
+            tokio::spawn(async move {
+                c.segment_bytes_keyed(
+                    82,
+                    106,
+                    None,
+                    None,
+                    Path::new("/no/source"),
+                    &o,
+                    JobClass::Interactive,
+                    joiner_viewer,
+                    PlayheadSeed::Observes,
+                )
+                .await
+            })
+        };
+        driver.await.unwrap().expect("the driver's bytes");
+        joiner.await.unwrap().expect("the joiner's bytes");
+
+        let snap = sched.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.playheads.get(&joiner_viewer).copied(),
+            Some(106),
+            "a coalesced hit is still a hit: the viewer it served has reached \
+             that segment, and 42% of interactive hits on the deployment arrive \
+             this way"
+        );
+        assert_eq!(
+            snap.playheads.get(&driver_viewer).copied(),
+            Some(100),
+            "and it must move the JOINER'S reading only — the driver's viewer \
+             never asked for this segment, and declaring them to be standing on \
+             it makes everything they have queued in between stale"
         );
     }
 
