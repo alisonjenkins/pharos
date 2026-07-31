@@ -14,9 +14,12 @@
 //!   holds exclusion across the encode, so a slow segment cannot make a
 //!   later requester for the same key wait on a lock (B108). The encode
 //!   outlives the requester that started it but NOT the last requester
-//!   wanting it: when every receiver has gone the driver stops
-//!   (`await_last_requester_gone`), so an episode swap still reclaims the
-//!   previous episode's speculative encodes (V58, PR #75).
+//!   wanting it: while the encode is still QUEUED, a driver whose receivers
+//!   have all gone stops (`await_last_requester_gone`), so an episode swap
+//!   reclaims the previous episode's queued speculative encodes (V58, PR #75).
+//!   What it does not reclaim is a DISPATCHED encode — that one holds a worker
+//!   and a device permit and runs to completion whatever anyone does, so the
+//!   driver stays with it and keeps the bytes.
 //! - LRU tracking via `(access_counter, key) → bytes`; eviction is
 //!   triggered after each insert and runs lazily until total bytes is
 //!   under the configured cap.
@@ -991,14 +994,46 @@ struct Registration {
 /// not find the entry at all and drives a fresh one. There is no interleaving
 /// in which a live requester is left waiting on an encode that has decided to
 /// stop.
+///
+/// It stops being armed at DISPATCH, and that boundary is the point of
+/// `JobSlot::is_dispatched`. Abandoning a queued job hands its capacity back;
+/// abandoning a running one hands nothing back — `spawn_run_task` is detached
+/// and owns the worker and the permit, and the only `reply.is_closed()` reads in
+/// the scheduler are pre-dispatch. So past dispatch the choice is not "stop the
+/// encode or let it run", it is "let it run and keep the bytes, or let it run
+/// and throw them away". That alone would settle it, and there is worse: the
+/// orphan keeps writing to `{seg}.ts.tmp` and its `-progress` sidecar, both
+/// derived from the KEY, so the next requester for the same key starts a second
+/// worker on the same two files. `read_progress` consumes the sidecar and
+/// `short_of_frames(None, _)` fails OPEN, so the completeness gate can be
+/// defeated by the collision and `rename` then publishes an inode the orphan is
+/// still writing into — a corrupt segment, cached, served with a 200 for as long
+/// as it stays on disk. Ending the region at dispatch costs zero reclaim and
+/// removes that shape.
+///
+/// `published` is the same boundary for the path that has no scheduler (the
+/// inline transcoder, whose encode really does die with the future): once the
+/// segment has been renamed into the cache path, abandoning would count one
+/// attempt twice — `Ok` and then `Cancelled`, breaking V128's partition — and
+/// would leave a published `.ts` that `record` never saw, so the LRU under-counts
+/// `total_bytes` permanently and never evicts it.
 async fn await_last_requester_gone(
     tx: &tokio::sync::watch::Sender<Option<SharedSegment>>,
     map: &DashMap<SegmentIdentity, InFlightSegment>,
     key: SegmentIdentity,
     id: u64,
+    job: &pharos_transcode::scheduler::JobSlot,
+    published: &std::sync::atomic::AtomicBool,
 ) {
     loop {
         tx.closed().await;
+        if job.is_dispatched() || published.load(std::sync::atomic::Ordering::Acquire) {
+            // Past reclaiming: never resolve again, so the `select!` can only
+            // end by the encode finishing. Not a `return` — that IS the
+            // cancellation — and not a `break` out of the loop either, because
+            // resolving at all drops the produce future.
+            std::future::pending::<()>().await;
+        }
         if map
             .remove_if(&key, |_, v| v.id == id && v.tx.receiver_count() == 0)
             .is_some()
@@ -1550,6 +1585,12 @@ impl HlsSegmentCache {
         // where the work begins.
         let span = tracing::Span::current();
         let map = self.inflight.clone();
+        // Raised by the driver the instant its segment is renamed into the cache
+        // path. See `await_last_requester_gone`: from there an abandonment would
+        // count one attempt twice and orphan a file the LRU never learns about.
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_job = job_slot.clone();
+        let cancel_published = published.clone();
         tokio::spawn(
             async move {
                 // Named so the block CAPTURES it: registered until the driver
@@ -1565,6 +1606,7 @@ impl HlsSegmentCache {
                     hint,
                     job_slot,
                     promoted,
+                    published,
                 );
                 tokio::pin!(produce);
                 tokio::select! {
@@ -1574,7 +1616,9 @@ impl HlsSegmentCache {
                         // value.
                         let _ = tx.send(Some(out.map(Arc::new).map_err(Arc::new)));
                     }
-                    () = await_last_requester_gone(&tx, &map, key, id) => {
+                    () = await_last_requester_gone(
+                        &tx, &map, key, id, &cancel_job, &cancel_published,
+                    ) => {
                         // Nobody is waiting for these bytes any more, and the
                         // registration is already gone — removed under the shard
                         // lock, so no joiner can attach to an encode that is
@@ -1582,7 +1626,9 @@ impl HlsSegmentCache {
                         // scheduler's `submit()` future with it, closing that
                         // job's `oneshot`, which is exactly what `place` and
                         // `reap_abandoned` read to collect it as
-                        // `QueueOutcome::Abandoned`.
+                        // `QueueOutcome::Abandoned`. Reachable only while the
+                        // job is still QUEUED — that is the whole population an
+                        // abandonment can reclaim.
                         record_segment_outcome(SegmentOutcome::Cancelled, class);
                         tracing::debug!(
                             media.id = media_id,
@@ -1637,11 +1683,16 @@ impl HlsSegmentCache {
     /// re-checked the filesystem, found nothing, and encoded the same segment a
     /// second time.
     ///
-    /// It does NOT outlive the last requester. The future this returns is
-    /// dropped the moment no receiver for the segment remains
+    /// It does NOT outlive the last requester, UNTIL its encode is dispatched.
+    /// While the job is still queued, the future this returns is dropped the
+    /// moment no receiver for the segment remains
     /// (`await_last_requester_gone`), which drops the scheduler `submit()`
     /// inside it and hands the job to the abandonment sweep. Detaching without
     /// that made `PrefetchRegistry`'s abort a no-op against the encode itself.
+    /// Once a worker has the job, the encode runs to completion whatever anyone
+    /// does — see `JobSlot::is_dispatched` — so this future runs to completion
+    /// too, and the bytes reach the cache instead of being thrown away by a
+    /// cancellation that reclaimed nothing.
     #[allow(clippy::too_many_arguments)]
     async fn produce_segment(
         &self,
@@ -1661,6 +1712,9 @@ impl HlsSegmentCache {
         // Read on the retry, whose submission is a NEW job that no joiner will
         // promote a second time.
         promoted: Arc<std::sync::atomic::AtomicBool>,
+        // Raised at the rename, so the cancellation this future races against
+        // cannot fire once the segment exists. See `await_last_requester_gone`.
+        published: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let path = self.segment_path_keyed(key);
         // V128: every exit from this function has to land in exactly one arm of
@@ -1889,6 +1943,11 @@ impl HlsSegmentCache {
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
         }
+        // Raised BEFORE the rename, not after: a flag set afterwards leaves the
+        // window it exists to close. Setting it early can only cost a
+        // cancellation that was about to become unsafe anyway — the encode is
+        // finished by this line, so there is nothing left to reclaim either way.
+        published.store(true, std::sync::atomic::Ordering::Release);
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| counted("publish_rename", e.into()))?;
@@ -3742,6 +3801,121 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one cancelled encode, got {value:?}"
+        );
+    }
+
+    /// Block until the scheduler is actually RUNNING `n` jobs, or fail saying so.
+    ///
+    /// The observable that separates "queued" from "dispatched", which is the
+    /// whole subject of
+    /// `a_dispatched_encode_survives_its_last_requester_and_reaches_the_cache`.
+    /// A sleep cannot stand in for it: too short and the job is still in the
+    /// queue, where cancelling it is correct, so the test would pass while
+    /// asserting nothing.
+    async fn await_inflight(
+        sched: &pharos_transcode::scheduler::TranscodeScheduler,
+        n: usize,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if sched.snapshot().await.map(|s| s.inflight) == Some(n) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The other edge of the cancellation rule, and the one the inline stub
+    /// cannot see.
+    ///
+    /// `an_encode_nobody_is_waiting_for_is_cancelled_rather_than_run_to_completion`
+    /// runs on the inline transcoder, where dropping the driver genuinely stops
+    /// the encode — so it is green either way and says nothing about this. On the
+    /// SCHEDULER, dropping the driver stops nothing: `spawn_run_task` is detached
+    /// and owns the worker plus the device permit, and every `reply.is_closed()`
+    /// read is pre-dispatch. Cancelling there spends the encode and then throws
+    /// the bytes away, and leaves the orphan writing to `{seg}.ts.tmp` and its
+    /// `-progress` sidecar — both derived from the KEY — so the next requester
+    /// for the same key (a refresh, an `hls.js` `fragLoadTimeout` retry, a
+    /// swap-and-swap-back) starts a second worker on the same two files, and
+    /// `short_of_frames(None, _)` fails open when the sidecar has been consumed
+    /// by the wrong reader. A corrupt segment, cached, served with a 200.
+    ///
+    /// Asserted on the two consequences an operator would see: the segment is
+    /// published (the work was not wasted) and the attempt is counted `ok`, never
+    /// `cancelled` — one attempt, one arm, which is what V128 requires.
+    #[test]
+    fn a_dispatched_encode_survives_its_last_requester_and_reaches_the_cache() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(62, 4, None, None, &opts);
+        let path = cache.segment_path_keyed(key);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let sched = writes_each_segment(std::time::Duration::from_millis(400));
+                let cache = Arc::new(cache.with_scheduler(sched.clone()));
+                let prefetch = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(62, 4, Path::new("/no/source"), &o, JobClass::Background)
+                            .await
+                    })
+                };
+                await_inflight(
+                    &sched,
+                    1,
+                    "the encode never reached a worker, so nothing here is about a \
+                     DISPATCHED job",
+                )
+                .await;
+
+                // The episode swap, arriving after the GPU has already been
+                // spent on this segment.
+                prefetch.abort();
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !path.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a dispatched encode was abandoned: the worker held its permit \
+                         and ran to completion anyway, and the bytes it produced were \
+                         thrown away instead of cached — while its orphaned tmp file \
+                         stayed open on the path the next requester will write to"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        });
+
+        assert!(
+            produced_series(&snapshotter, "cancelled").is_none(),
+            "an encode that ran to completion and published a segment must not \
+             also be counted as cancelled — the arms of \
+             pharos_segment_produced_total partition production attempts (V128)"
+        );
+        let (labels, value) = produced_series(&snapshotter, "ok")
+            .expect("the segment was published, so the attempt ended `ok`");
+        assert!(
+            labels.contains(&"class=background".to_string()),
+            "the driver's own class: {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one produced segment, got {value:?}"
         );
     }
 
