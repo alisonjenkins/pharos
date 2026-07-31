@@ -11,6 +11,7 @@
 //! no IO traits leak into core. Transcoder swap (e.g. a future GPU-
 //! accelerated impl) happens at the wiring layer.
 
+pub mod admission;
 pub mod backend;
 pub mod capability;
 pub mod device;
