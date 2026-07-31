@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use pharos_transcode::scheduler::{JobClass, JobHint, StreamKey};
+use pharos_transcode::scheduler::{JobClass, JobHint, PlayheadSeed, StreamKey};
 use pharos_transcode::{
     progress_sidecar_path, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
     SegmentVideo, TranscodeOptions, VideoCodec,
@@ -1093,6 +1093,7 @@ impl HlsSegmentCache {
             opts,
             class,
             StreamKey::NONE,
+            PlayheadSeed::Observes,
         )
         .await
     }
@@ -1112,6 +1113,15 @@ impl HlsSegmentCache {
     /// transcode scheduler as identical jobs, which is why a segment a browser
     /// was waiting for could sit behind a pile of segments nobody had asked for
     /// with nothing in any log or metric to say so.
+    ///
+    /// `seeds_playhead` says whether this caller KNOWS where `stream`'s playback
+    /// begins — [`PlayheadSeed::StatesTheStart`] for the two prewarms, which
+    /// pick their base from the resume position or the group's seek target, and
+    /// [`PlayheadSeed::Observes`] for everything else. It cannot be inferred
+    /// down in the scheduler from the playhead map being empty, because THIS
+    /// function returns on the fast cache-hit path below without ever reaching
+    /// the scheduler: a session whose opening segments are already on disk has
+    /// no playhead entry when its first deep prefetch is submitted.
     // The parameter list is the cache key plus the caller's intent, and V30
     // makes this the single mint entry point on purpose — collapsing the
     // dimensions into a struct would hide which of them key the cache.
@@ -1131,10 +1141,12 @@ impl HlsSegmentCache {
         opts: &SegmentOpts,
         class: JobClass,
         stream: StreamKey,
+        seeds_playhead: PlayheadSeed,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let hint = JobHint {
             stream,
             segment: Some(seg_index),
+            seeds_playhead,
         };
         let key = SegmentIdentity::new(media_id, seg_index, audio_index, subtitle_index, opts);
         let path = self.segment_path_keyed(key);
@@ -3174,6 +3186,7 @@ mod tests {
                         &opts,
                         JobClass::Interactive,
                         StreamKey::NONE,
+                        PlayheadSeed::Observes,
                     )
                     .await
                     .unwrap()

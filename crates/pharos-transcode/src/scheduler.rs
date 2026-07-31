@@ -366,13 +366,53 @@ impl Default for StreamKey {
     }
 }
 
+/// May this submission state where its stream's playback BEGINS?
+///
+/// The scheduler learns a stream's position from the client's own requests, and
+/// a speculative submission must never move that reading — the lookahead
+/// distance a guess is ranked by would then be measuring itself. A stream with
+/// no reading at all is the one exception, because seeding cannot overwrite
+/// anything a client established. But "the map has no entry" is not the same
+/// fact as "the caller knows where playback starts", and only the second
+/// justifies seeding.
+///
+/// They come apart because the playhead map is MISS-driven: a cache hit returns
+/// from `segment_bytes_keyed` before the scheduler is ever reached. A re-watch,
+/// a second viewer on the same media, any session whose opening segments are
+/// already on disk — all of them reach an ordinary deep prefetch with no entry
+/// for the stream, and letting THAT seed would have a guess measuring itself
+/// after all, in bounded form. So the entitlement is carried on the job instead
+/// of inferred from the map, and only the two prewarm call sites — which pick
+/// their base from the resume position or the seek target and therefore
+/// genuinely know it — set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlayheadSeed {
+    /// This submission is a guess relative to a position somebody else
+    /// established. It never writes the playhead map.
+    #[default]
+    Observes,
+    /// This caller knows where this stream's playback starts, and may say so if
+    /// nothing else has. Still never OVERWRITES an existing reading.
+    StatesTheStart,
+}
+
+impl PlayheadSeed {
+    fn may_seed(self) -> bool {
+        matches!(self, PlayheadSeed::StatesTheStart)
+    }
+}
+
 /// What the caller knows about a job that the scheduler cannot work out for
-/// itself: whose stream it belongs to, and which segment of it.
+/// itself: whose stream it belongs to, which segment of it, and whether the
+/// caller is entitled to say where that stream begins.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JobHint {
     pub stream: StreamKey,
     /// Segment index. `None` for anything that is not a numbered segment.
     pub segment: Option<u32>,
+    /// See [`PlayheadSeed`]. Defaults to `Observes`, so a caller has to opt in
+    /// to seeding rather than fall into it.
+    pub seeds_playhead: PlayheadSeed,
 }
 
 /// A live transcode output as a stream of muxed byte chunks. Boxed so the
@@ -744,10 +784,11 @@ struct SchedState {
     /// idea where a viewer is. Bounded at MAX_TRACKED_STREAMS with the
     /// least-recently-updated evicted, mirroring PrefetchRegistry.
     ///
-    /// Moved only by an interactive submission. A stream's FIRST speculative
-    /// submission may SEED an entry that does not exist yet — see the `Submit`
-    /// arm — which is where a cold-start prewarm's segments stop being
-    /// unknowable; it can never overwrite a reading a client established.
+    /// Moved only by an interactive submission. A speculative submission that
+    /// carries [`PlayheadSeed::StatesTheStart`] may SEED an entry that does not
+    /// exist yet — see the `Submit` arm — which is where a cold-start prewarm's
+    /// segments stop being unknowable; it can never overwrite a reading a
+    /// client established, and no ordinary prefetch can seed at all.
     playheads: HashMap<StreamKey, (u32, u64)>,
     /// Monotonic tick used only to order `playheads` for eviction.
     playhead_clock: u64,
@@ -789,11 +830,11 @@ fn note_playhead(state: &mut SchedState, stream: StreamKey, segment: u32) {
 /// about to need them, so they sort behind all useful work — but still ahead of
 /// work that is known to be useless.
 ///
-/// What is left in that bucket is only work that genuinely has no viewer: the
-/// transcode tool, tests, whole-file jobs, `StreamKey::NONE`. A numbered
-/// segment of a real playback stream is not there any more, because the
-/// stream's first submission seeds its playhead (see the `Submit` arm), so the
-/// cold-start prewarm is measured rather than merely unknown.
+/// What is left in that bucket is work with no viewer at all (the transcode
+/// tool, tests, whole-file jobs, `StreamKey::NONE`) plus speculation on a stream
+/// nobody has yet stated a position for. The cold-start prewarm is no longer in
+/// it: it carries [`PlayheadSeed::StatesTheStart`] and seeds its own stream (see
+/// the `Submit` arm), so it is measured rather than merely unknown.
 fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
     let (Some(seg), Some((head, _))) = (ctx.segment, state.playheads.get(&ctx.stream)) else {
         return i64::MAX;
@@ -1143,13 +1184,18 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             // viewer then took exactly the opening `fragLoadTimeOut` the
             // prewarm exists to prevent. Eviction is not recoverable.
             //
-            // The caller already knows the answer — the prewarm picks its base
-            // from the resume position — and this is the cheapest way to let it
-            // say so: the first speculative submission on an unseen stream
-            // states where that stream begins, and the client's own first
-            // request overwrites it a moment later.
+            // The entitlement is the CALLER'S, carried on the hint
+            // ([`PlayheadSeed`]), not inferred from the map being empty. The
+            // caller already knows the answer — the prewarm picks its base from
+            // the resume position or the group's seek target — while "no entry
+            // yet" is a much weaker fact than it looks: the map is miss-driven,
+            // so a re-watch whose opening segments are already cached reaches an
+            // ordinary deep prefetch with no entry, and letting that seed puts
+            // a guess back to measuring itself.
             if let Some(seg) = hint.segment {
-                if class == JobClass::Interactive || !state.playheads.contains_key(&hint.stream) {
+                let may_seed =
+                    hint.seeds_playhead.may_seed() && !state.playheads.contains_key(&hint.stream);
+                if class == JobClass::Interactive || may_seed {
                     note_playhead(state, hint.stream, seg);
                 }
             }
@@ -3817,6 +3863,7 @@ mod tests {
                     JobHint {
                         stream: StreamKey::of("viewer"),
                         segment: Some(7),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                     Some(slot),
                 )
@@ -5078,6 +5125,7 @@ mod tests {
             JobHint {
                 stream,
                 segment: Some(100),
+                seeds_playhead: PlayheadSeed::Observes,
             },
         )
         .await
@@ -5095,6 +5143,7 @@ mod tests {
             JobHint {
                 stream,
                 segment: Some(104),
+                seeds_playhead: PlayheadSeed::Observes,
             },
         )
         .await
@@ -5116,9 +5165,19 @@ mod tests {
     /// touched — is unknowable for its whole life and is the first thing a full
     /// queue throws away.
     ///
-    /// Both halves in one test: seeding without the freeze would let prefetch
-    /// walk the playhead forward, and the freeze without seeding brings back
-    /// the permanently-unknown prewarm.
+    /// The entitlement is the CALLER'S ([`PlayheadSeed`]), not "the map has no
+    /// entry". Those look equivalent and are not, because the map is
+    /// MISS-driven: a re-watch, or a second viewer on the same media, hits the
+    /// cache on its opening segments and never reaches the scheduler, so an
+    /// ordinary deep prefetch arrives on a stream with no entry — and an
+    /// entry-shaped gate would let that prefetch seed the stream at its own
+    /// index and rank itself top of the band, which is the self-measurement the
+    /// rule exists to forbid, in bounded form.
+    ///
+    /// All three halves in one test: an ordinary guess seeding brings that
+    /// back; a prewarm NOT seeding brings back the permanently-unknown
+    /// cold start; and either one MOVING a reading lets prefetch walk the
+    /// playhead forward.
     #[tokio::test]
     async fn speculation_may_seed_a_playhead_but_never_moves_one() {
         let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(20), |_, _| {
@@ -5127,7 +5186,7 @@ mod tests {
         let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
         let stream = StreamKey::of("play-session-background-only");
 
-        let speculate = |seg: u32| {
+        let speculate = |seg: u32, seeds_playhead: PlayheadSeed| {
             let s2 = s.clone();
             async move {
                 s2.submit(
@@ -5138,6 +5197,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead,
                     },
                 )
                 .await
@@ -5145,19 +5205,31 @@ mod tests {
             }
         };
 
-        // Nothing is known about this stream yet, so the prewarm's own base is
-        // the best available statement of where it starts.
-        speculate(50).await;
+        // An ordinary prefetch on an unseen stream — which is what a re-watch's
+        // deep guesses look like, its opening segments having been served from
+        // cache — says nothing about where the viewer is.
+        speculate(50, PlayheadSeed::Observes).await;
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            None,
+            "an ordinary guess must not seed a stream just because nothing has \
+             been recorded for it yet: it would be ranking itself"
+        );
+
+        // A prewarm does know: it picked its base from the resume position.
+        speculate(50, PlayheadSeed::StatesTheStart).await;
         let snap = s.snapshot().await.unwrap();
         assert_eq!(
             snap.playheads.get(&stream).copied(),
             Some(50),
-            "the first speculative submission on an unseen stream must seed it, \
+            "a caller that knows where playback starts must be able to say so, \
              or a cold-start prewarm can never be ranked against anything"
         );
 
-        // ...and from here on it is frozen against speculation, however deep.
-        speculate(400).await;
+        // ...and from here on it is frozen against speculation, however deep,
+        // and whatever it claims to know.
+        speculate(400, PlayheadSeed::StatesTheStart).await;
         let snap = s.snapshot().await.unwrap();
         assert_eq!(
             snap.playheads.get(&stream).copied(),
@@ -5175,6 +5247,7 @@ mod tests {
             JobHint {
                 stream,
                 segment: Some(60),
+                seeds_playhead: PlayheadSeed::Observes,
             },
         )
         .await
@@ -5209,6 +5282,7 @@ mod tests {
             JobHint {
                 stream: oldest,
                 segment: Some(0),
+                seeds_playhead: PlayheadSeed::Observes,
             },
         )
         .await
@@ -5227,6 +5301,7 @@ mod tests {
                 JobHint {
                     stream,
                     segment: Some(n),
+                    seeds_playhead: PlayheadSeed::Observes,
                 },
             )
             .await
@@ -5293,6 +5368,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: seg,
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -5320,6 +5396,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                     assigned,
                 )
@@ -5483,6 +5560,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(100),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -5505,6 +5583,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(100 + ahead),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -5807,6 +5886,7 @@ mod tests {
                             JobHint {
                                 stream,
                                 segment: Some(seg),
+                                seeds_playhead: PlayheadSeed::Observes,
                             },
                         )
                         .await
@@ -5944,6 +6024,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -5969,6 +6050,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -6071,6 +6153,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -6174,6 +6257,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -6278,6 +6362,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -6382,6 +6467,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -6481,8 +6567,15 @@ mod tests {
         // like at `PlaybackInfo`, before the client has fetched anything.
         let newcomer = StreamKey::of("just-pressed-play");
 
+        // Only the cold-start prewarm claims to know where its stream begins;
+        // the incumbent's own prefetch is an ordinary guess.
         let submit = |tag: &'static str, class: JobClass, stream: StreamKey, seg: u32| {
             let s2 = s.clone();
+            let seeds_playhead = if tag == "prewarm" {
+                PlayheadSeed::StatesTheStart
+            } else {
+                PlayheadSeed::Observes
+            };
             tokio::spawn(async move {
                 s2.submit(
                     PathBuf::from(format!("/m/{tag}")),
@@ -6492,6 +6585,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead,
                     },
                 )
                 .await
@@ -6598,6 +6692,7 @@ mod tests {
         let on = |seg: u32| JobHint {
             stream,
             segment: Some(seg),
+            seeds_playhead: PlayheadSeed::Observes,
         };
 
         // The client is at 100 and holds the only permit.
@@ -6686,6 +6781,7 @@ mod tests {
             JobHint {
                 stream,
                 segment: Some(100),
+                seeds_playhead: PlayheadSeed::Observes,
             },
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -6707,6 +6803,7 @@ mod tests {
             JobHint {
                 stream,
                 segment: Some(101),
+                seeds_playhead: PlayheadSeed::Observes,
             },
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -6784,6 +6881,7 @@ mod tests {
                     JobHint {
                         stream,
                         segment: Some(seg),
+                        seeds_playhead: PlayheadSeed::Observes,
                     },
                 )
                 .await
@@ -6985,6 +7083,7 @@ mod tests {
                             JobHint {
                                 stream,
                                 segment: Some(100),
+                                seeds_playhead: PlayheadSeed::Observes,
                             },
                         )
                         .await
@@ -7004,6 +7103,7 @@ mod tests {
                             JobHint {
                                 stream,
                                 segment: Some(104),
+                                seeds_playhead: PlayheadSeed::Observes,
                             },
                         )
                         .await
@@ -7107,6 +7207,7 @@ mod tests {
                             JobHint {
                                 stream,
                                 segment: Some(seg),
+                                seeds_playhead: PlayheadSeed::Observes,
                             },
                         )
                         .await
@@ -7199,6 +7300,7 @@ mod tests {
                             JobHint {
                                 stream,
                                 segment: Some(seg),
+                                seeds_playhead: PlayheadSeed::Observes,
                             },
                         )
                         .await
