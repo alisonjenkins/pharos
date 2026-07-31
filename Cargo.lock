@@ -3467,6 +3467,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "workspace-hack",
+ "xxhash-rust",
 ]
 
 [[package]]

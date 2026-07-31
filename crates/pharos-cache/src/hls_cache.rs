@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use pharos_transcode::scheduler::JobClass;
+use pharos_transcode::scheduler::{JobClass, JobHint, StreamKey};
 use pharos_transcode::{
     progress_sidecar_path, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
     SegmentVideo, TranscodeOptions, VideoCodec,
@@ -1060,8 +1060,20 @@ impl HlsSegmentCache {
         opts: &SegmentOpts,
         class: JobClass,
     ) -> Result<Vec<u8>, HlsCacheError> {
-        self.segment_bytes_keyed(media_id, seg_index, None, None, source, opts, class)
-            .await
+        // No play session reaches this legacy wrapper (see its own doc
+        // comment) — nothing is known about who is asking, so this stream's
+        // work sorts last, same as any other unattributed job.
+        self.segment_bytes_keyed(
+            media_id,
+            seg_index,
+            None,
+            None,
+            source,
+            opts,
+            class,
+            StreamKey::NONE,
+        )
+        .await
     }
 
     /// W1/W2 — per-stream cache lookup. `audio_index` + `subtitle_index`
@@ -1097,7 +1109,12 @@ impl HlsSegmentCache {
         source: &Path,
         opts: &SegmentOpts,
         class: JobClass,
+        stream: StreamKey,
     ) -> Result<Vec<u8>, HlsCacheError> {
+        let hint = JobHint {
+            stream,
+            segment: Some(seg_index),
+        };
         let key = SegmentIdentity::new(media_id, seg_index, audio_index, subtitle_index, opts);
         let path = self.segment_path_keyed(key);
 
@@ -1146,7 +1163,7 @@ impl HlsSegmentCache {
         let (outcome, driving, driver_gone) = loop {
             attempt += 1;
             let (mut rx, driving) =
-                self.register_or_join(key, source, opts, media_id, seg_index, class);
+                self.register_or_join(key, source, opts, media_id, seg_index, class, hint);
             let wait = Self::await_segment(&mut rx).await;
             let driver_gone = matches!(wait, SegmentWait::DriverGone);
             let outcome = wait.into_outcome();
@@ -1253,6 +1270,7 @@ impl HlsSegmentCache {
         media_id: u64,
         seg_index: u32,
         class: JobClass,
+        hint: JobHint,
     ) -> (
         tokio::sync::watch::Receiver<Option<SharedSegment>>,
         bool, // driving
@@ -1302,6 +1320,7 @@ impl HlsSegmentCache {
                         media_id,
                         seg_index,
                         class,
+                        hint,
                     )
                     .await
                     .map(Arc::new)
@@ -1349,6 +1368,7 @@ impl HlsSegmentCache {
     /// it replaced, that cancellation dropped the guard, and the next waiter
     /// re-checked the filesystem, found nothing, and encoded the same segment a
     /// second time.
+    #[allow(clippy::too_many_arguments)]
     async fn produce_segment(
         &self,
         source: &Path,
@@ -1357,6 +1377,7 @@ impl HlsSegmentCache {
         media_id: u64,
         seg_index: u32,
         class: JobClass,
+        hint: JobHint,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let path = self.segment_path_keyed(key);
         if let Some(parent) = path.parent() {
@@ -1410,7 +1431,7 @@ impl HlsSegmentCache {
                     Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
             }
             timing = match self
-                .write_segment(source, &attempt_opts, &tmp, class)
+                .write_segment(source, &attempt_opts, &tmp, class, hint)
                 .instrument(tracing::info_span!("write_segment"))
                 .await
             {
@@ -1703,6 +1724,7 @@ impl HlsSegmentCache {
         opts: &TranscodeOptions,
         out: &Path,
         class: JobClass,
+        hint: JobHint,
     ) -> Result<Option<pharos_transcode::scheduler::JobDone>, HlsCacheError> {
         let _ = source.to_str().ok_or(HlsCacheError::NonUtf8Path)?;
         // Scheduler path: the worker writes the segment file itself,
@@ -1717,6 +1739,7 @@ impl HlsSegmentCache {
                         out_path: out.to_path_buf(),
                     },
                     class,
+                    hint,
                 )
                 .await
                 .map_err(|e| match e {
@@ -3037,6 +3060,7 @@ mod tests {
                         Path::new("/definitely/not/a/real/source.mkv"),
                         &opts,
                         JobClass::Interactive,
+                        StreamKey::NONE,
                     )
                     .await
                     .unwrap()
@@ -3916,6 +3940,7 @@ mod tests {
                 3,
                 0,
                 JobClass::Interactive,
+                JobHint::default(),
             );
             assert!(driving, "nothing was in flight, so this call must drive");
             assert!(

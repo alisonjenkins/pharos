@@ -2741,6 +2741,7 @@ async fn playback_info(
                 // the segment handler must assume each one needs burning.
                 burn_subtitle_indices: burn_text_indices.clone(),
             },
+            &play_session_id,
             audio_idx,
             sub_idx,
             video_bitrate_cap,

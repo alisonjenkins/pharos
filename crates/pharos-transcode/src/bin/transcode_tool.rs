@@ -225,7 +225,9 @@ fn build_table(
 #[cfg(unix)]
 async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
     use pharos_transcode::hwaccel::detect_available;
-    use pharos_transcode::scheduler::{JobClass, SchedConfig, SinkRequest, TranscodeScheduler};
+    use pharos_transcode::scheduler::{
+        JobClass, JobHint, SchedConfig, SinkRequest, TranscodeScheduler,
+    };
     use pharos_transcode::worker::{exec, ProcSpawner};
     use std::sync::Arc;
     use std::time::Instant;
@@ -245,6 +247,8 @@ async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
                 out_path: output.clone(),
             },
             JobClass::Interactive,
+            // CLI one-shot: no play session to attach a stream/playhead to.
+            JobHint::default(),
         )
         .await;
     let elapsed = t0.elapsed();
@@ -268,7 +272,9 @@ async fn run_one(input: std::path::PathBuf, output: std::path::PathBuf) -> i32 {
 #[cfg(unix)]
 async fn stress(input: std::path::PathBuf, n: usize, saturate: bool) -> i32 {
     use pharos_transcode::hwaccel::detect_available;
-    use pharos_transcode::scheduler::{JobClass, SchedConfig, SinkRequest, TranscodeScheduler};
+    use pharos_transcode::scheduler::{
+        JobClass, JobHint, SchedConfig, SinkRequest, TranscodeScheduler,
+    };
     use pharos_transcode::worker::{exec, ProcSpawner};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -304,6 +310,8 @@ async fn stress(input: std::path::PathBuf, n: usize, saturate: bool) -> i32 {
                     opts,
                     SinkRequest::FileDirect { out_path: out },
                     JobClass::Interactive,
+                    // CLI stress run: no play session in this tool.
+                    JobHint::default(),
                 )
                 .await
         }));
@@ -364,7 +372,9 @@ async fn bench(input: std::path::PathBuf) -> i32 {
     use pharos_transcode::device::DeviceTable;
     use pharos_transcode::hwaccel::detect_available;
     use pharos_transcode::protocol::DeviceId;
-    use pharos_transcode::scheduler::{JobClass, SchedConfig, SinkRequest, TranscodeScheduler};
+    use pharos_transcode::scheduler::{
+        JobClass, JobHint, SchedConfig, SinkRequest, TranscodeScheduler,
+    };
     use pharos_transcode::worker::{exec, ProcSpawner};
     use std::sync::Arc;
     use std::time::Instant;
@@ -397,6 +407,8 @@ async fn bench(input: std::path::PathBuf) -> i32 {
                 opts,
                 SinkRequest::FileDirect { out_path: out },
                 JobClass::Interactive,
+                // CLI bench loop: no play session in this tool.
+                JobHint::default(),
             )
             .await;
         let el = t0.elapsed().as_secs_f64();
