@@ -1823,6 +1823,39 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
     queue_or_refuse(state, job_id, ctx);
 }
 
+/// Drop queued jobs whose caller has gone.
+///
+/// `try_place_no_queue` already declines to dispatch one, but only a job that
+/// gets SELECTED ever reaches it — and under saturation speculative work is
+/// never selected (tier is absolute) and the drain loop exits the moment no
+/// permit is free. So abandoned prefetch accumulated in `pending` and was reaped
+/// only when the pool went quiet, which is precisely when the queue's bound does
+/// not matter. Every seek and every track swap orphans a window of it.
+///
+/// That bound is shared now. While `pending` held interactive work only,
+/// `pending_cap` was pure client backpressure; with speculative work in the same
+/// queue, a full queue of work NOBODY is waiting for replies `Busy` to a client.
+///
+/// Swept here rather than by reserving a slice of `pending_cap` for interactive
+/// work: a reserve would leave the dead entries in place, still occupying their
+/// own share, still growing on every seek, and would add a second tunable to
+/// keep in step with the first. This removes the cause. It runs before the
+/// permit check, so a drain that can place nothing still reaps — and drains fire
+/// on every completion, so under saturation it runs at segment rate, exactly
+/// when it is needed.
+fn reap_abandoned(state: &mut SchedState) {
+    let before = state.pending.len();
+    state.pending.retain(|(_, ctx)| !ctx.reply.is_closed());
+    let dropped = before - state.pending.len();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            pending = state.pending.len(),
+            "dropped queued transcode jobs whose caller had gone"
+        );
+    }
+}
+
 /// On a freed permit, dispatch queued work in urgency order until nothing else
 /// fits.
 ///
@@ -1849,6 +1882,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
 /// instead would push the client who waited longest behind the one who waited
 /// least, one drain at a time.
 fn drain_pending(state: &mut SchedState, self_tx: &mpsc::Sender<SchedMsg>) {
+    reap_abandoned(state);
     let mut passed_over: VecDeque<(JobId, JobCtx)> = VecDeque::new();
     while any_permit_free(state) {
         let Some(idx) = next_to_dispatch(state) else {
@@ -4641,6 +4675,102 @@ mod tests {
             "both viewers' next-needed segment must run before either viewer's \
              distant one, whatever order they were submitted in: {got:?}"
         );
+    }
+
+    /// `pending_cap` is client backpressure, and speculative work now shares it.
+    ///
+    /// A queued job whose caller has gone is only noticed inside
+    /// `try_place_no_queue`, which only a SELECTED job reaches — and under
+    /// saturation speculative work is never selected (tier is absolute) and the
+    /// drain stops the moment no permit is free. So orphaned prefetch, which
+    /// every seek and every track swap produces a window of, sat in `pending`
+    /// until the pool went quiet: exactly the opposite of when the cap matters.
+    /// A queue full of work nobody is waiting for then replies `Busy` to a
+    /// client.
+    ///
+    /// Here the drain runs, places the one job somebody IS waiting for, and
+    /// stops with the pool full — so nothing else in the queue is ever examined.
+    #[tokio::test]
+    async fn abandoned_speculation_must_not_fill_the_queue_a_client_needs() {
+        let spawner = Arc::new(VariableSpawner(Arc::new(|spec: &JobSpec| {
+            match job_name(spec).as_str() {
+                // Both of these outlive the whole observation, so the pool is
+                // full again the moment the drain has placed `waiter` and
+                // nothing further in the queue is ever looked at.
+                "hold-long" | "waiter" => Duration::from_millis(800),
+                // Frees one permit — and with it a drain — while the other is
+                // still held, so the drain has exactly one job's worth of room.
+                "hold-short" => Duration::from_millis(150),
+                _ => Duration::from_millis(20),
+            }
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 2),
+            spawner,
+            SchedConfig {
+                pending_cap: 4,
+                ..SchedConfig::default()
+            },
+        );
+        let submit = |tag: &str, class: JobClass| {
+            let s2 = s.clone();
+            let p = PathBuf::from(format!("/m/{tag}"));
+            tokio::spawn(async move {
+                s2.submit(p, h264(), file_sink(), class, JobHint::default())
+                    .await
+            })
+        };
+
+        let long = submit("hold-long", JobClass::Interactive);
+        let short = submit("hold-short", JobClass::Interactive);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Three prefetches queue, and then their callers go — a seek, a track
+        // swap, a client that closed the connection. Aborting the task drops
+        // the `submit()` future and with it the reply receiver, which is
+        // precisely what those do.
+        let orphans: Vec<_> = (0..3)
+            .map(|i| submit(&format!("orphan-{i}"), JobClass::Background))
+            .collect();
+        // One job somebody IS waiting for, queued behind them.
+        let waiter = submit("waiter", JobClass::Interactive);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let before = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            (before.pending_background, before.pending_interactive),
+            (3, 1),
+            "precondition: the queue must be full, three of it speculative"
+        );
+        for o in &orphans {
+            o.abort();
+        }
+        for o in orphans {
+            assert!(o.await.is_err(), "the orphan's caller must really be gone");
+        }
+
+        // `hold-short` finishes, the drain places `waiter` in the freed permit,
+        // and the pool is full again with the orphans never examined.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            after.pending_background, 0,
+            "work whose caller has gone must not still be occupying the queue"
+        );
+
+        // ...and the cap those entries were holding must be a client's to use.
+        let c1 = submit("client-1", JobClass::Interactive);
+        let c2 = submit("client-2", JobClass::Interactive);
+        for (tag, h) in [
+            ("hold-short", short),
+            ("waiter", waiter),
+            ("client-1", c1),
+            ("client-2", c2),
+            ("hold-long", long),
+        ] {
+            h.await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("{tag} was refused: {e:?}"));
+        }
     }
 
     /// A viewer outruns their own prefetch, which under saturation is the
