@@ -1483,8 +1483,36 @@ impl HlsSegmentCache {
         promoted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let path = self.segment_path_keyed(key);
+        // V128: every exit from this function has to land in exactly one arm of
+        // `pharos_segment_produced_total`, or the arms do not partition
+        // production attempts and V91's `failed + coalesced_failed` sum is
+        // short by whatever leaked. Four `?`s here recorded nothing — making
+        // the cache directory, resolving the continuous-audio slice, and the
+        // two that PUBLISH a finished encode — while every requester that
+        // coalesced onto a driver dying at one of them WAS counted. So one
+        // failed encode could produce N `coalesced_failed` and zero `failed`,
+        // which reads as a blast radius with no blast.
+        //
+        // These are the paths a full, read-only or vanished cache volume takes,
+        // which is the incident where the number is read.
+        let counted = |step: &'static str, err: HlsCacheError| -> HlsCacheError {
+            tracing::error!(
+                media.id = media_id,
+                seg = seg_index,
+                step,
+                reason = failure_reason(&err),
+                error = %err,
+                codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
+                path = %path.display(),
+                "hls segment production failed outside the encode itself"
+            );
+            record_segment_failure(SegmentOutcome::Failed, failure_reason(&err), class);
+            err
+        };
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| counted("create_dir", e.into()))?;
         }
         let tmp = path.with_extension("ts.tmp");
         // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
@@ -1514,7 +1542,8 @@ impl HlsSegmentCache {
                     start_secs + dur_secs,
                 )
             })
-            .await?;
+            .await
+            .map_err(|e| counted("resolve_audio", e))?;
         let mut attempt_opts = resolved.to_transcode_options();
         let mut timing = None;
         // A produced segment can be short of video frames while ffmpeg exits 0
@@ -1680,9 +1709,13 @@ impl HlsSegmentCache {
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
         }
-        tokio::fs::rename(&tmp, &path).await?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| counted("publish_rename", e.into()))?;
 
-        let bytes = tokio::fs::read(&path).await?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| counted("publish_read_back", e.into()))?;
         let transcode_ms = started.elapsed().as_millis();
         record_segment_outcome(SegmentOutcome::Ok, class);
         // Same label set as the hit arm so `sum by (result)` stays meaningful
@@ -4016,6 +4049,82 @@ mod tests {
             "an encode a client is blocked on must be timed as interactive, \
              whoever submitted it — otherwise the interactive p95 phase 1 is \
              validated against cannot see it"
+        );
+    }
+
+    /// Publishing a finished encode into the cache is still PRODUCING it, so a
+    /// failure there is counted like any other.
+    ///
+    /// The rename and the read-back were the one route out of `produce_segment`
+    /// that recorded nothing. V91 makes `failed + coalesced_failed` the
+    /// client-visible failure total and V128 makes
+    /// `pharos_segment_produced_total`'s arms a partition of production
+    /// attempts — and every COALESCER onto a driver that died here WAS counted,
+    /// while the driver was not. The partition claim was simply false on this
+    /// path, and it is the path a full or read-only cache volume takes.
+    ///
+    /// Forced by making the destination path a directory, so the rename cannot
+    /// succeed while everything before it does.
+    #[test]
+    fn a_segment_that_cannot_be_published_is_counted_as_a_failure() {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let dir = TempDir::new().unwrap();
+        let (base, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let opts = slow_opts();
+        let blocked = base.segment_path_keyed(SegmentIdentity::new(41, 2, None, None, &opts));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let err = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let sched = writes_each_segment(std::time::Duration::from_millis(400));
+                let cache = Arc::new(base.with_scheduler(sched));
+                let req = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(41, 2, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                // Occupy the destination AFTER the cache-hit lookup has already
+                // missed it, so the encode runs in full and it is the PUBLISH
+                // that fails — a directory cannot be the target of a file
+                // rename. Placing it up front would instead be answered by the
+                // fast-hit read, which never reaches production at all.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                std::fs::create_dir_all(&blocked).unwrap();
+                req.await.unwrap()
+            })
+        })
+        .expect_err("the rename cannot succeed onto a directory");
+        assert!(
+            matches!(err, HlsCacheError::Io(_)),
+            "the caller must be told what actually went wrong: {err:?}"
+        );
+
+        let (labels, value) = produced_series(&snapshotter, "failed").expect(
+            "an encode that could not be published must be counted — every \
+             requester that coalesced onto it already is, so leaving the driver \
+             out makes the produced-total partition false exactly where a full \
+             cache volume shows up",
+        );
+        for want in ["outcome=failed", "reason=io", "class=interactive"] {
+            assert!(
+                labels.contains(&want.to_string()),
+                "missing label {want}; got {labels:?}"
+            );
+        }
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one publish failure, got {value:?}"
         );
     }
 
