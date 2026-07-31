@@ -50,8 +50,11 @@ found that the design did not know:
    `PrefetchRegistry`'s abort a no-op against the encode itself, silently
    reversing PR #75 and falsifying a clause of V58. A driver now races its
    encode against "every requester has gone", decided under the registry's shard
-   lock, and an encode stopped that way is counted `outcome="cancelled"`. See
-   the cancellation table in phase 2b.
+   lock, and an encode stopped that way is counted `outcome="cancelled"`. The
+   region it races over ends at DISPATCH: a job with a worker keeps its permit
+   and finishes regardless, so abandoning it reclaims nothing and merely leaves
+   an orphan writing to its successor's temp file. See the cancellation table in
+   phase 2b.
 6. **A promoted job is measured from the promotion, and labelled from it.**
    The controller judged every interactive completion from `dispatched`, which
    for a promoted job predates the client — a 5 s encode joined at 4 s reported
@@ -381,9 +384,14 @@ means nobody is waiting, and the driver races the encode against that condition.
 The abandonment is decided under the map's shard lock so a joiner arriving in
 that instant either attaches (and the encode continues) or misses the entry
 entirely (and drives a fresh one). An encode stopped this way is counted
-`pharos_segment_produced_total{outcome="cancelled"}` — which is also, for the
-first time, the query that says how much speculative work an episode swap
-reclaims.
+`pharos_segment_produced_total{outcome="cancelled"}` — which is, for the first
+time, the query that says how much speculative work an episode swap ABANDONS.
+Not how much capacity it returns: the cancellable region ends at dispatch
+(`JobSlot::is_dispatched`), because a job already handed to a worker keeps its
+permit and runs to completion whatever the caller does, so only the QUEUED share
+of that count was ever reclaimable. Ending the region there costs nothing —
+those jobs were never going to be given back — and it stops an orphaned worker
+writing to the key-derived `{seg}.ts.tmp` its own successor is about to use.
 
 ### What the scheduler must learn
 

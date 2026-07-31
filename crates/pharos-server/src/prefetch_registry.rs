@@ -28,6 +28,16 @@
 //! last receiver gone -> `produce_segment` future dropped -> `submit()` dropped
 //! -> `QueueOutcome::Abandoned`. An encode any OTHER session is still waiting on
 //! is untouched, which is the shared result working as intended.
+//!
+//! What an abort can reclaim is the QUEUED part of that prefetch and no more.
+//! Once the scheduler has handed a job to a worker it owns the worker and the
+//! device permit (`spawn_run_task` is detached, and the only `reply.is_closed()`
+//! reads are pre-dispatch), so a dispatched encode runs to completion whatever
+//! happens here — and the segment cache deliberately stops trying to stop it at
+//! that point (`JobSlot::is_dispatched`), keeping the bytes rather than paying
+//! for the encode and discarding them. So an episode swap frees the queue behind
+//! the old episode, not the encodes already on the GPU: the depth of the ladder
+//! bounds what is in flight, and V125's allowance bounds the rest.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
