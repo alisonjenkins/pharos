@@ -4010,9 +4010,16 @@ mod tests {
                 // recorder is torn down with the closure, so the increment
                 // lands nowhere. Wait for the observable actually being
                 // asserted, not for a proxy that precedes it.
+                //
+                // Its own deadline, not the publish loop's: reusing that one
+                // would let a slow publish eat most of the 5 s budget and then
+                // fail this wait almost immediately, blaming the counter for a
+                // timeout the publish partition actually spent.
+                let counter_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while produced_series(&snapshotter, "ok").is_none() {
                     assert!(
-                        std::time::Instant::now() < deadline,
+                        std::time::Instant::now() < counter_deadline,
                         "the segment was published but no production attempt was \
                          ever counted: pharos_segment_produced_total must partition \
                          attempts (V128), so a published segment with no arm is a \
