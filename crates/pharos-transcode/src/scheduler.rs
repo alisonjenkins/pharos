@@ -127,6 +127,81 @@ impl PinOutcome {
     }
 }
 
+/// How a job left the scheduler's queue.
+///
+/// `pending_background` says the queue is deep; it cannot say whether that
+/// depth is work about to be needed or work already wasted, and those are the
+/// two diagnoses that matter. These arms say which: `stale` and `evicted`
+/// together are the statement that the queue DISCRIMINATES rather than merely
+/// accumulates. A queue that never drops stale work and never evicts is a queue
+/// that has quietly become the FIFO B108 deleted, and no other signal the
+/// scheduler emits can tell those apart.
+///
+/// The arms PARTITION every submitted segment job: exactly one is recorded per
+/// job, so their sum is submissions and any one of them over that sum is a
+/// meaningful fraction. That is a contract, not a description — see
+/// [`record_queue_outcome`] for what enforces it, and why a job re-examined on
+/// every drain pass must not be counted per examination (the defect
+/// `pharos_transcode_pin_total{outcome="followed"}` shipped with).
+///
+/// Six values because six is how many ways a job can leave, not because four
+/// were nicer: a job whose caller went away and a job no device can encode both
+/// vacate the queue, and folding either into `shed` would report the queue
+/// managing load when it was doing nothing of the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Took a device permit and started encoding. What happens to it after that
+    /// belongs to `pharos_segment_produced_total` and the job's span; a retry
+    /// re-dispatches the SAME job and is deliberately not counted again.
+    Dispatched,
+    /// Speculative work the viewer played past while it waited. Dropped at
+    /// dispatch rather than encoded — see `has_been_passed`.
+    Stale,
+    /// Displaced from a full queue by a more urgent arrival.
+    Evicted,
+    /// Refused for want of capacity: a full queue with nothing less urgent to
+    /// displace, or a candidate pool that cannot hold the speculative reserve
+    /// and a job at once. Deliberate load management, and the only one of the
+    /// six that means the system is working as configured under pressure.
+    Shed,
+    /// The caller was gone before the job could run — a seek or a track swap
+    /// dropped the `submit()` future. Not load, not waste the scheduler chose:
+    /// work that stopped existing.
+    Abandoned,
+    /// No device could take it: an unsupported target, a pinned rendition whose
+    /// device went into cooldown (V80), or every candidate excluded by an
+    /// earlier transient failure.
+    Failed,
+}
+
+impl QueueOutcome {
+    /// Stable metric-label string. Same contract as [`JobClass::label`] and
+    /// [`PinOutcome::label`]: these are the `outcome` label on
+    /// `pharos_transcode_queue_outcome_total`, a rename breaks dashboards
+    /// silently, and a COLLISION is worse — `stale` folded into `dispatched`
+    /// reports a queue throwing work away as a queue doing work. Pinned by a
+    /// test.
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueOutcome::Dispatched => "dispatched",
+            QueueOutcome::Stale => "stale",
+            QueueOutcome::Evicted => "evicted",
+            QueueOutcome::Shed => "shed",
+            QueueOutcome::Abandoned => "abandoned",
+            QueueOutcome::Failed => "failed",
+        }
+    }
+
+    fn record(self, class: JobClass) {
+        metrics::counter!(
+            "pharos_transcode_queue_outcome_total",
+            "class" => class.label(),
+            "outcome" => self.label(),
+        )
+        .increment(1);
+    }
+}
+
 impl std::fmt::Display for JobClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
@@ -696,6 +771,51 @@ fn has_been_passed(distance: i64) -> bool {
     distance < 0
 }
 
+/// Count how one job left the queue — at most once, ever, for that job.
+///
+/// [`QueueOutcome`]'s arms are only a partition if nothing is counted twice,
+/// and the one thing that can happen twice to a job is placement: a transient
+/// device failure sends it back through `place`, where it may dispatch again,
+/// shed again, or fail. `retries` is the flag that says so. It is incremented
+/// before every re-placement and the only way to reach one is to have been
+/// dispatched, so `retries == 0` means exactly "this job's first pass, not yet
+/// counted".
+///
+/// The alternative — counting each re-placement — would make `dispatched` count
+/// DISPATCHES while `stale` and `evicted` count jobs, which is precisely the
+/// defect `pharos_transcode_pin_total{outcome="followed"}` shipped with:
+/// two arms of one counter with different denominators, whose ratio is
+/// meaningless and whose absolute values look fine.
+fn record_queue_outcome(ctx: &JobCtx, outcome: QueueOutcome) {
+    if ctx.retries > 0 {
+        return;
+    }
+    outcome.record(ctx.class);
+}
+
+/// The dispatch arm, plus the distance the job was dispatched AT.
+///
+/// Recorded here rather than at examination for the reason in
+/// [`record_queue_outcome`]: a queued job is re-examined on every drain pass,
+/// and a histogram fed there would report the distances of the jobs that waited
+/// longest, over and over, instead of the distances work actually ran at.
+///
+/// No label on the histogram. The two that suggest themselves — the stream and
+/// the distance — are unbounded and per-viewer respectively, and the question
+/// it exists to answer ("is speculation being served shallow-first, or is the
+/// queue serving deep guesses while near ones wait?") is a distribution, not a
+/// breakdown. Jobs with no playhead contribute nothing: `i64::MAX` is "no
+/// answer", and recording it would drag every percentile to the ceiling.
+fn record_dispatch(state: &SchedState, ctx: &JobCtx) {
+    record_queue_outcome(ctx, QueueOutcome::Dispatched);
+    if ctx.class == JobClass::Background && ctx.retries == 0 {
+        let distance = lookahead_distance(state, ctx);
+        if distance != i64::MAX {
+            metrics::histogram!("pharos_transcode_queue_distance").record(distance as f64);
+        }
+    }
+}
+
 impl TranscodeScheduler {
     pub fn spawn(
         devices: DeviceTable,
@@ -883,7 +1003,10 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             reply,
         } => {
             if matches!(sink, SinkRequest::LiveStream) {
-                // Wired in the fd-passing step; not yet schedulable.
+                // Wired in the fd-passing step; not yet schedulable. Counted
+                // like any other "no device can take this", so the outcome
+                // counter's total really is every `Submit` the actor saw.
+                QueueOutcome::Failed.record(class);
                 let _ = reply.send(Err(SchedError::Unsupported));
                 return;
             }
@@ -1553,6 +1676,7 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
                     input = %victim_ctx.input.display(),
                     "speculative transcode evicted: a more urgent job arrived at a full queue"
                 );
+                record_queue_outcome(&victim_ctx, QueueOutcome::Evicted);
                 let _ = victim_ctx.reply.send(Err(SchedError::Busy));
             }
             state.pending.push_back((job_id, ctx));
@@ -1565,6 +1689,7 @@ fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
                 evictable = victim.is_some(),
                 "transcode job refused: the queue is full of work at least as urgent"
             );
+            record_queue_outcome(&ctx, QueueOutcome::Shed);
             let _ = ctx.reply.send(Err(SchedError::Busy));
         }
     }
@@ -1901,6 +2026,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
     // waiting for. This is the post-seek contention fix — a dead prefetch job
     // must not sit ahead of the seek-target segment in a device queue.
     if ctx.reply.is_closed() {
+        record_queue_outcome(&ctx, QueueOutcome::Abandoned);
         return;
     }
     let now = Instant::now();
@@ -1908,6 +2034,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
     if full_eligible.is_empty() {
         // No supporting device at all (e.g. cooldown could hide all HW
         // but CPU always supports; truly empty ⇒ unsupported target).
+        record_queue_outcome(&ctx, QueueOutcome::Failed);
         let _ = ctx.reply.send(Err(SchedError::Unsupported));
         return;
     }
@@ -1918,12 +2045,14 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
     let (candidates, pin_outcome) = match candidates_for(state, job_id, &ctx, &full_eligible) {
         Ok(c) => c,
         Err(e) => {
+            record_queue_outcome(&ctx, QueueOutcome::Failed);
             let _ = ctx.reply.send(Err(e));
             return;
         }
     };
     if candidates.is_empty() {
         // Every supporting device has been tried + failed transiently.
+        record_queue_outcome(&ctx, QueueOutcome::Failed);
         let err = ctx
             .last_error
             .clone()
@@ -1975,6 +2104,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                     "speculative transcode admitted to neither wait nor dispatch: \
                      reserve cannot fit in this candidate pool"
                 );
+                record_queue_outcome(&ctx, QueueOutcome::Shed);
                 let _ = ctx.reply.send(Err(err));
                 return;
             }
@@ -2002,6 +2132,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             if let Some(outcome) = pin_outcome {
                 outcome.record();
             }
+            record_dispatch(state, &ctx);
             let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
@@ -2069,7 +2200,14 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
 /// when it is needed.
 fn reap_abandoned(state: &mut SchedState) {
     let before = state.pending.len();
-    state.pending.retain(|(_, ctx)| !ctx.reply.is_closed());
+    state.pending.retain(|(_, ctx)| {
+        if ctx.reply.is_closed() {
+            record_queue_outcome(ctx, QueueOutcome::Abandoned);
+            false
+        } else {
+            true
+        }
+    });
     let dropped = before - state.pending.len();
     if dropped > 0 {
         tracing::debug!(
@@ -2140,6 +2278,7 @@ fn try_place_no_queue(
     // Drop a queued job whose caller has gone (see `place`): on a freed permit
     // we dispatch the seek-target instead of resurrecting dead prefetch work.
     if ctx.reply.is_closed() {
+        record_queue_outcome(&ctx, QueueOutcome::Abandoned);
         return;
     }
     // ...and drop speculation the viewer has gone PAST, which is a different
@@ -2173,6 +2312,7 @@ fn try_place_no_queue(
                 input = %ctx.input.display(),
                 "speculative transcode dropped: the viewer has played past it"
             );
+            record_queue_outcome(&ctx, QueueOutcome::Stale);
             let _ = ctx.reply.send(Err(SchedError::Busy));
             return;
         }
@@ -2191,11 +2331,13 @@ fn try_place_no_queue(
     let (candidates, pin_outcome) = match candidates_for(state, job_id, &ctx, &full_eligible) {
         Ok(c) => c,
         Err(e) => {
+            record_queue_outcome(&ctx, QueueOutcome::Failed);
             let _ = ctx.reply.send(Err(e));
             return;
         }
     };
     if candidates.is_empty() {
+        record_queue_outcome(&ctx, QueueOutcome::Failed);
         let err = ctx
             .last_error
             .clone()
@@ -2237,6 +2379,7 @@ fn try_place_no_queue(
                     "queued speculative transcode admitted to neither wait nor dispatch: \
                      reserve cannot fit in this candidate pool"
                 );
+                record_queue_outcome(&ctx, QueueOutcome::Shed);
                 let _ = ctx.reply.send(Err(err));
                 return;
             }
@@ -2255,10 +2398,11 @@ fn try_place_no_queue(
         }
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
             // Same rule as `place`: only an examination that actually
-            // dispatches records the pin outcome.
+            // dispatches records the pin outcome — or the queue outcome.
             if let Some(outcome) = pin_outcome {
                 outcome.record();
             }
+            record_dispatch(state, &ctx);
             let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
@@ -5835,6 +5979,427 @@ mod tests {
             got,
             ["blocker", "waiter", "client"],
             "eviction must leave Interactive arrival order intact: {got:?}"
+        );
+    }
+
+    /// One series per outcome, and no two of them the same string. A collision
+    /// here is worse than a missing metric: `stale` folded into `dispatched`
+    /// reports a queue throwing work away as a queue doing work, and the
+    /// dashboard looks healthier the worse it gets.
+    ///
+    /// A real guard only because the strings live on the enum. Asserting them
+    /// at their call sites would compare constants in the test against
+    /// constants written beside them.
+    #[test]
+    fn queue_outcome_labels_are_distinct_and_stable() {
+        const ALL: [QueueOutcome; 6] = [
+            QueueOutcome::Dispatched,
+            QueueOutcome::Stale,
+            QueueOutcome::Evicted,
+            QueueOutcome::Shed,
+            QueueOutcome::Abandoned,
+            QueueOutcome::Failed,
+        ];
+        assert_eq!(QueueOutcome::Dispatched.label(), "dispatched");
+        assert_eq!(QueueOutcome::Stale.label(), "stale");
+        assert_eq!(QueueOutcome::Evicted.label(), "evicted");
+        assert_eq!(QueueOutcome::Shed.label(), "shed");
+        assert_eq!(QueueOutcome::Abandoned.label(), "abandoned");
+        assert_eq!(QueueOutcome::Failed.label(), "failed");
+
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "queue outcome labels collide: {labels:?} — a folded bucket reports \
+             work thrown away as work done"
+        );
+    }
+
+    /// One snapshot, queried many times.
+    ///
+    /// `Snapshotter::snapshot()` DRAINS histogram buckets, so taking a second
+    /// one to answer a second assertion reads an empty histogram and is
+    /// indistinguishable from an instrument that was never recorded. Captured
+    /// once, into plain values, so every assertion in a test sees the same run.
+    struct Metrics {
+        counters: Vec<(String, Vec<String>, u64)>,
+        histograms: Vec<(String, Vec<f64>)>,
+    }
+
+    impl Metrics {
+        fn capture(snapshotter: &metrics_util::debugging::Snapshotter) -> Metrics {
+            use metrics_util::debugging::DebugValue;
+            let mut counters = Vec::new();
+            let mut histograms = Vec::new();
+            for (ck, _, _, v) in snapshotter.snapshot().into_vec() {
+                let k = ck.key();
+                let name = k.name().to_string();
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                match v {
+                    DebugValue::Counter(n) => counters.push((name, labels, n)),
+                    DebugValue::Histogram(vals) => {
+                        histograms.push((name, vals.iter().map(|v| v.0).collect()))
+                    }
+                    _ => {}
+                }
+            }
+            Metrics {
+                counters,
+                histograms,
+            }
+        }
+
+        /// Absent is zero: a series that was never recorded is exactly the
+        /// "this never happened" the assertions are checking for.
+        fn counter(&self, name: &str, labels: &[&str]) -> u64 {
+            self.counters
+                .iter()
+                .find(|(n, got, _)| {
+                    n == name && labels.iter().all(|want| got.iter().any(|g| g == want))
+                })
+                .map(|(_, _, v)| *v)
+                .unwrap_or(0)
+        }
+
+        fn histogram(&self, name: &str) -> Vec<f64> {
+            self.histograms
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// The `pin_total{followed}` lesson, applied before it can be repeated: a
+    /// queued job is re-examined on EVERY drain pass, so a counter incremented
+    /// where the job is looked at counts examinations while its sibling arms
+    /// count jobs, and their ratio means nothing. `dispatched` must be recorded
+    /// where the job actually takes a permit, once.
+    ///
+    /// The histogram rides along, for the same reason and in the same place:
+    /// "shallow beats deep" is only a query if each dispatched job contributes
+    /// one sample of the distance it was dispatched AT.
+    ///
+    /// The shape: pin a speculative job to a single-permit GPU, hold that GPU
+    /// for the whole test, and drive three separate drains off unrelated CPU
+    /// completions while it waits.
+    #[test]
+    fn a_queued_job_is_counted_once_however_many_drains_examine_it() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+                let spawner =
+                    Arc::new(VariableSpawner(Arc::new(
+                        |spec: &JobSpec| match job_name(spec).as_str() {
+                            "hold-gpu" => Duration::from_millis(260),
+                            _ => Duration::from_millis(15),
+                        },
+                    )));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[(gpu, 1)], 3),
+                    spawner,
+                    // The pinned pool is one permit; with the default reserve
+                    // it could hold no speculative job at all and there would
+                    // be nothing queued to examine.
+                    SchedConfig {
+                        background_headroom: 0,
+                        ..SchedConfig::default()
+                    },
+                );
+                let stream = StreamKey::of("viewer");
+
+                // Holds the GPU — and the pin's only candidate — and puts the
+                // viewer's playhead at 100.
+                let hold = {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from("/m/hold-gpu"),
+                            cmaf(),
+                            file_sink(),
+                            JobClass::Interactive,
+                            JobHint {
+                                stream,
+                                segment: Some(100),
+                            },
+                        )
+                        .await
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                // Four segments ahead, and pinned to the same busy device.
+                let probe = {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from("/m/probe"),
+                            cmaf(),
+                            file_sink(),
+                            JobClass::Background,
+                            JobHint {
+                                stream,
+                                segment: Some(104),
+                            },
+                        )
+                        .await
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let snap = s.snapshot().await.expect("snapshot");
+                assert_eq!(
+                    snap.pending_background, 1,
+                    "precondition: the speculative job must be QUEUED, or there \
+                     are no re-examinations to over-count"
+                );
+
+                // Each of these lands on a free CPU permit and its completion
+                // drives a drain that re-examines the still-queued job.
+                for tag in ["cpu-1", "cpu-2", "cpu-3"] {
+                    s.submit(
+                        PathBuf::from(format!("/m/{tag}")),
+                        h264(),
+                        file_sink(),
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await
+                    .expect("cpu job");
+                }
+
+                hold.await.unwrap().expect("gpu blocker");
+                let done = probe.await.unwrap().expect("the queued job");
+                assert!(
+                    done.queue_wait_ms > 0,
+                    "precondition: it must actually have waited"
+                );
+            })
+        });
+
+        let m = Metrics::capture(&snapshotter);
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=dispatched"],
+            ),
+            1,
+            "a job examined across several drains must be counted ONCE, where \
+             it takes a permit — not once per examination"
+        );
+        assert_eq!(
+            m.histogram("pharos_transcode_queue_distance"),
+            [4.0],
+            "one sample per dispatched speculative job, carrying the distance \
+             it was dispatched at"
+        );
+    }
+
+    /// The load-bearing arm. A queue that never drops stale work is a queue
+    /// that has quietly become the FIFO B108 deleted, and nothing else in the
+    /// scheduler's telemetry can tell the two apart: `pending_background` looks
+    /// identical whether the depth is work about to be needed or work already
+    /// wasted.
+    ///
+    /// Both background jobs here are the same shape, one segment apart, so the
+    /// assertion is that the counter DISCRIMINATES between them — not merely
+    /// that some series exists.
+    #[test]
+    fn a_prefetch_dropped_for_staleness_is_counted_as_stale() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let spawner =
+                    Arc::new(VariableSpawner(Arc::new(
+                        |spec: &JobSpec| match job_name(spec).as_str() {
+                            "blocker" => Duration::from_millis(260),
+                            _ => Duration::from_millis(40),
+                        },
+                    )));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[], 1),
+                    spawner,
+                    SchedConfig {
+                        background_headroom: 0,
+                        ..SchedConfig::default()
+                    },
+                );
+                let stream = StreamKey::of("viewer");
+                let submit = |tag: &'static str, class: JobClass, seg: u32| {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from(format!("/m/{tag}")),
+                            h264(),
+                            file_sink(),
+                            class,
+                            JobHint {
+                                stream,
+                                segment: Some(seg),
+                            },
+                        )
+                        .await
+                    })
+                };
+
+                let blocker = submit("blocker", JobClass::Interactive, 100);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let standing = submit("standing", JobClass::Background, 100);
+                let passed = submit("passed", JobClass::Background, 99);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                blocker.await.unwrap().expect("the client's own segment");
+                standing.await.unwrap().expect("still wanted");
+                assert!(
+                    matches!(passed.await.unwrap(), Err(SchedError::Busy)),
+                    "precondition: the passed job must actually have been dropped"
+                );
+            })
+        });
+
+        let m = Metrics::capture(&snapshotter);
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=stale"],
+            ),
+            1,
+            "the dropped prefetch must be counted as `stale`, or a queue full \
+             of work nobody wants is indistinguishable from a busy one"
+        );
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=dispatched"],
+            ),
+            1,
+            "...and the one still wanted must be counted as dispatched, in the \
+             same denominator"
+        );
+    }
+
+    /// The other load-bearing arm, and its opposite in the same run: a queue
+    /// that evicts nothing under pressure has simply become a FIFO with extra
+    /// steps, and one that evicts on every arrival is churning. `evicted` and
+    /// `shed` say which is happening.
+    #[test]
+    fn an_evicted_job_and_a_refused_arrival_are_counted_apart() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let spawner =
+                    Arc::new(VariableSpawner(Arc::new(
+                        |spec: &JobSpec| match job_name(spec).as_str() {
+                            "blocker" => Duration::from_millis(300),
+                            _ => Duration::from_millis(40),
+                        },
+                    )));
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[], 1),
+                    spawner,
+                    SchedConfig {
+                        pending_cap: 2,
+                        background_headroom: 0,
+                        ..SchedConfig::default()
+                    },
+                );
+                let stream = StreamKey::of("viewer");
+                let submit = |tag: &'static str, class: JobClass, seg: u32| {
+                    let s2 = s.clone();
+                    tokio::spawn(async move {
+                        s2.submit(
+                            PathBuf::from(format!("/m/{tag}")),
+                            h264(),
+                            file_sink(),
+                            class,
+                            JobHint {
+                                stream,
+                                segment: Some(seg),
+                            },
+                        )
+                        .await
+                    })
+                };
+
+                let blocker = submit("blocker", JobClass::Interactive, 100);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let far = submit("far", JobClass::Background, 110);
+                let mid = submit("mid", JobClass::Background, 105);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                // Beats `far`, so it takes its slot.
+                let near = submit("near", JobClass::Background, 101);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                // Beats nothing, so it is refused instead.
+                let further = submit("further", JobClass::Background, 120);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                blocker.await.unwrap().expect("the client's own segment");
+                assert!(
+                    matches!(far.await.unwrap(), Err(SchedError::Busy)),
+                    "precondition: the least urgent incumbent must have been evicted"
+                );
+                assert!(
+                    matches!(further.await.unwrap(), Err(SchedError::Busy)),
+                    "precondition: the deepest arrival must have been refused"
+                );
+                near.await.unwrap().expect("near");
+                mid.await.unwrap().expect("mid");
+            })
+        });
+
+        let m = Metrics::capture(&snapshotter);
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=evicted"],
+            ),
+            1,
+            "the job displaced from a full queue must be counted as `evicted`"
+        );
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=shed"],
+            ),
+            1,
+            "the arrival refused at a full queue must be counted as `shed` — \
+             folding the two would make eviction pressure unreadable"
+        );
+        assert_eq!(
+            m.counter(
+                "pharos_transcode_queue_outcome_total",
+                &["class=background", "outcome=dispatched"],
+            ),
+            2,
+            "...in the same denominator as the two that survived"
         );
     }
 
