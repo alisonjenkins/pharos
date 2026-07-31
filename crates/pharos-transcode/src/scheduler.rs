@@ -659,6 +659,23 @@ struct JobCtx {
     /// numbered segment (e.g. a whole-file/live job), which sorts last: nothing
     /// is known to be about to need it.
     segment: Option<u32>,
+    /// Value of `playhead_clock` when this job was admitted, i.e. how much the
+    /// scheduler knew about every viewer's position at the moment somebody
+    /// asked for this segment.
+    ///
+    /// This is what separates "the viewer outran this guess" from "this guess
+    /// was aimed behind the viewer on purpose" — two things a negative
+    /// [`lookahead_distance`] cannot tell apart on its own, and the second of
+    /// which is a shipped feature (the SyncPlay seek prewarm submits for the
+    /// seek TARGET on a member's existing stream, before that member's own
+    /// interactive request moves the playhead there; a backward group seek
+    /// makes every one of those jobs negative by construction). See
+    /// [`is_stale`].
+    ///
+    /// Frozen at admission, unlike the distance, and correctly so: the question
+    /// it answers is about the past ("what did we know when this was
+    /// submitted?"), not about now.
+    playhead_tick_at_submit: u64,
     /// Device this job is currently running on. `None` while queued. Lets a
     /// snapshot attribute each device's occupancy to the jobs holding it,
     /// instead of reporting a bare count with nothing behind it.
@@ -748,12 +765,12 @@ fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
 
 /// Has the viewer gone past the segment a [`lookahead_distance`] describes?
 ///
-/// The ONE definition of "already passed", shared by the ranking band in
-/// `next_to_dispatch`, the drop in `try_place_no_queue` and the victim choice
-/// in `queue_or_refuse`. Three places that must agree: a queue that ranks a job
-/// last for a reason it then declines to drop it for, or evicts a job it would
-/// have been happy to dispatch, is a queue with two opinions about the same
-/// number.
+/// The ONE definition of "already passed", and the first half of [`is_stale`],
+/// which is what the ranking band in `next_to_dispatch`, the drop and the
+/// victim choice in `queue_or_refuse` all actually read. Three places that must
+/// agree: a queue that ranks a job last for a reason it then declines to drop
+/// it for, or evicts a job it would have been happy to dispatch, is a queue
+/// with two opinions about the same number.
 ///
 /// STRICTLY negative, and the boundary is the whole content of this function.
 /// `lookahead_distance` measures against the last segment the client ASKED FOR,
@@ -769,6 +786,52 @@ fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
 /// the same as knowing nothing does.
 fn has_been_passed(distance: i64) -> bool {
     distance < 0
+}
+
+/// Is this speculative job work the viewer OUTRAN — as opposed to work aimed
+/// behind them deliberately?
+///
+/// [`has_been_passed`] answers "is this segment behind the playhead", which is
+/// necessary and NOT sufficient. A job can be behind the playhead for two
+/// opposite reasons:
+///
+/// * it was submitted ahead of the viewer and the viewer overtook it while it
+///   waited — genuinely wasted work, the case the drop exists for; or
+/// * it was submitted behind the viewer on purpose, because somebody knows the
+///   viewer is about to go there. The SyncPlay seek prewarm does exactly this:
+///   it submits `Background` for the seek TARGET on the member's EXISTING
+///   stream, before that member issues its own interactive request for the
+///   target, so on a backward group seek — the documented rewind shape — every
+///   one of its jobs is negative the instant it arrives.
+///
+/// Dropping the second as if it were the first makes a shipped feature a
+/// load-dependent no-op: with a free permit the prewarm goes straight through
+/// `place`, and only under saturation does it queue and get thrown away — with
+/// nothing to show for it but a `stale` increment indistinguishable from a
+/// genuinely wasted guess.
+///
+/// `playhead_clock` already tells them apart and cost nothing extra to read.
+/// A playhead is stamped with the tick at which it was set; a job with the tick
+/// at which it was admitted. If the stream's playhead tick is NEWER, the viewer
+/// moved after this job was submitted and the job is a leftover. If it is not,
+/// the submitter saw this playhead and asked for a segment behind it anyway —
+/// a statement about the future, not a leftover, and the queue has no business
+/// second-guessing it.
+///
+/// A stream with no playhead at all is not stale either: `lookahead_distance`
+/// is `i64::MAX` there, which [`has_been_passed`] already declines to call
+/// passed.
+fn is_stale(state: &SchedState, ctx: &JobCtx) -> bool {
+    if ctx.class != JobClass::Background {
+        return false;
+    }
+    if !has_been_passed(lookahead_distance(state, ctx)) {
+        return false;
+    }
+    state
+        .playheads
+        .get(&ctx.stream)
+        .is_some_and(|(_, tick)| *tick > ctx.playhead_tick_at_submit)
 }
 
 /// Count how one job left the queue — at most once, ever, for that job.
@@ -1043,6 +1106,9 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 background_peers: 0,
                 stream: hint.stream,
                 segment: hint.segment,
+                // Read AFTER the `note_playhead` above, so an interactive
+                // submission's own playhead move is not a move "since" it.
+                playhead_tick_at_submit: state.playhead_clock,
                 // Replaced at dispatch, once the device is known.
                 span: tracing::Span::none(),
             };
@@ -1709,10 +1775,14 @@ fn urgency_key(state: &SchedState, ctx: &JobCtx, arrival: usize) -> (i64, bool, 
         JobClass::Interactive => (0, false, arrival as i64),
         JobClass::Background => {
             let d = lookahead_distance(state, ctx);
+            // The band is STALENESS, not sign: a job aimed behind the playhead
+            // on purpose (the SyncPlay seek prewarm) is live work and must not
+            // be ranked, or evicted, as a leftover. See `is_stale`.
+            //
             // `abs` cannot overflow: both operands are `u32`-derived, so `d`
             // is bounded well inside `i64`, and `i64::MAX` (no playhead)
             // maps to itself.
-            (1, has_been_passed(d), d.abs())
+            (1, is_stale(state, ctx), d.abs())
         }
     }
 }
@@ -2281,10 +2351,15 @@ fn try_place_no_queue(
         record_queue_outcome(&ctx, QueueOutcome::Abandoned);
         return;
     }
-    // ...and drop speculation the viewer has gone PAST, which is a different
-    // thing entirely: the caller is still there, still waiting, and the bytes
-    // it asked for will never be fetched. Encoding one spends a permit — and,
-    // on a saturated pool, a client's place in the queue — on nothing.
+    // ...and drop speculation the viewer OUTRAN, which is a different thing
+    // entirely: the caller is still there, still waiting, and the bytes it
+    // asked for will never be fetched. Encoding one spends a permit — and, on a
+    // saturated pool, a client's place in the queue — on nothing.
+    //
+    // Outran, not merely behind: `is_stale` requires the playhead to have moved
+    // AFTER this job was submitted. A job aimed behind the playhead on purpose
+    // — the SyncPlay seek prewarm, whose whole job is to warm a backward seek
+    // target before the member asks for it — is live work and survives here.
     //
     // Judged HERE, at dispatch, rather than by a reaper task, because the
     // playhead moves under a queued job continuously and this is the point
@@ -2299,7 +2374,7 @@ fn try_place_no_queue(
     // bare class, so "why did this segment never appear" is answerable.
     if ctx.class == JobClass::Background {
         let distance = lookahead_distance(state, &ctx);
-        if has_been_passed(distance) {
+        if is_stale(state, &ctx) {
             tracing::debug!(
                 %job_id,
                 stream = ctx.stream.0,
@@ -5481,6 +5556,12 @@ mod tests {
     /// would tie the stale job with distance 0 and hand it the tiebreak on
     /// arrival.
     ///
+    /// The viewer ADVANCES here rather than the job being submitted behind a
+    /// standing playhead: staleness is being outrun, and a job submitted behind
+    /// a playhead that never moved is a deliberate backward guess instead (see
+    /// `is_stale` and
+    /// `a_backward_prewarm_survives_while_work_the_viewer_outran_still_dies`).
+    ///
     /// Ranking passed work last was the first half of the answer and is no
     /// longer the whole of it: a job the viewer has gone past is now DROPPED
     /// when it is examined, because a permit spent on it buys nothing at any
@@ -5513,28 +5594,30 @@ mod tests {
         );
         let stream = StreamKey::of("viewer");
 
-        // The client's own request occupies the one permit and puts the
-        // playhead at 100 — the only way a playhead is ever set.
-        let blocker = {
+        let interactive = |tag: &'static str, seg: u32| {
             let s2 = s.clone();
             tokio::spawn(async move {
                 s2.submit(
-                    PathBuf::from("/m/block"),
+                    PathBuf::from(format!("/m/{tag}")),
                     h264(),
                     file_sink(),
                     JobClass::Interactive,
                     JobHint {
                         stream,
-                        segment: Some(100),
+                        segment: Some(seg),
                     },
                 )
                 .await
             })
         };
+
+        // The client's own request occupies the one permit and puts the
+        // playhead at 90 — the only way a playhead is ever set.
+        let blocker = interactive("block", 90);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        // `stale` was queued for a segment the viewer has since gone past;
-        // `next` and `far` are one and ten ahead. Submitted stale-first.
+        // All three are AHEAD of the playhead when submitted, so all three are
+        // good work at that moment. Submitted stale-first.
         let mut handles = Vec::new();
         for (tag, seg) in [("stale", 95u32), ("next", 101), ("far", 110)] {
             let s2 = s.clone();
@@ -5558,8 +5641,13 @@ mod tests {
             snap.pending_background, 3,
             "precondition: all three must be waiting, or there is no order to rank"
         );
+        // ...and now the viewer moves to 100, leaving `stale` behind it. This
+        // is what makes it stale: not where it sits, but being overtaken.
+        let advance = interactive("advance", 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         blocker.await.unwrap().expect("the client's own segment");
+        advance.await.unwrap().expect("the client's next segment");
         let mut results = Vec::new();
         for h in handles {
             results.push(h.await.unwrap());
@@ -5577,7 +5665,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|n| *n != "block")
+            .filter(|n| *n != "block" && *n != "advance")
             .cloned()
             .collect();
         assert_eq!(
@@ -5692,6 +5780,119 @@ mod tests {
         );
     }
 
+    /// Behind the playhead is not the same as outrun, and the queue must not
+    /// treat a deliberate backward guess as a leftover.
+    ///
+    /// The SyncPlay seek prewarm submits `Background` for the seek TARGET on a
+    /// member's EXISTING stream, before that member's own interactive request
+    /// moves the playhead there. On a backward group seek every one of those
+    /// jobs is negative the instant it arrives — so a drop keyed on the sign
+    /// alone silently deletes a shipped feature, and deletes it only under
+    /// saturation (with a free permit the same job goes straight through
+    /// `place`, which never checks). Load-dependent, and the only trace is a
+    /// `stale` increment that looks exactly like a genuinely wasted guess.
+    ///
+    /// Both directions in one test, on two streams so neither disarms the
+    /// other: `prewarm` is behind its viewer and must survive; `outrun` was
+    /// ahead of its viewer when submitted, was overtaken while it waited, and
+    /// must still die. Reverting `is_stale` to the bare sign test kills
+    /// `prewarm`; removing the drop encodes `outrun`.
+    #[tokio::test]
+    async fn a_backward_prewarm_survives_while_work_the_viewer_outran_still_dies() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let spawner = Arc::new(VariableSpawner(Arc::new(move |spec: &JobSpec| {
+            let name = job_name(spec);
+            let d = match name.as_str() {
+                // Holds the one permit until the whole queue is in place.
+                "blocker" => Duration::from_millis(400),
+                _ => Duration::from_millis(40),
+            };
+            seen.lock().unwrap().push(name);
+            d
+        })));
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig {
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
+        );
+        // Two viewers. One is about to be rewound by its group; the other just
+        // keeps playing forward and leaves its own prefetch behind.
+        let rewinder = StreamKey::of("rewinder");
+        let runner = StreamKey::of("runner");
+
+        let submit = |tag: &'static str, class: JobClass, stream: StreamKey, seg: u32| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    class,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                )
+                .await
+            })
+        };
+
+        // The rewinder is at 500 and its own request holds the only permit.
+        let blocker = submit("blocker", JobClass::Interactive, rewinder, 500);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // The group seeks back to 100: warm the landing segment BEFORE the
+        // member asks for it. Distance -400 the moment it is submitted, and
+        // deliberately so.
+        let prewarm = submit("prewarm", JobClass::Background, rewinder, 100);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The other viewer, on its own stream: a request at 10, prefetch for
+        // 11 (good work when submitted), then a jump to 40 that leaves it
+        // behind.
+        let head = submit("head", JobClass::Interactive, runner, 10);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let outrun = submit("outrun", JobClass::Background, runner, 11);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let jump = submit("jump", JobClass::Interactive, runner, 40);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            (queued.pending_background, queued.pending_interactive),
+            (2, 2),
+            "precondition: everything must be waiting behind the blocker, or \
+             nothing is examined at dispatch"
+        );
+
+        blocker.await.unwrap().expect("the rewinder's own segment");
+        head.await.unwrap().expect("the runner's own segment");
+        jump.await.unwrap().expect("the runner's seek target");
+        prewarm
+            .await
+            .unwrap()
+            .expect("a seek target warmed before the member asked for it is not stale");
+        let dropped = outrun.await.unwrap();
+        assert!(
+            matches!(dropped, Err(SchedError::Busy)),
+            "a prefetch its viewer overtook must still be dropped: {dropped:?}"
+        );
+
+        let got = order.lock().unwrap().clone();
+        assert!(
+            got.contains(&"prewarm".to_string()),
+            "the backward seek target must reach an encoder: {got:?}"
+        );
+        assert!(
+            !got.contains(&"outrun".to_string()),
+            "the segment the runner left behind must never reach an encoder: \
+             {got:?}"
+        );
+    }
+
     /// Where the line is, and it is not `<= 0`.
     ///
     /// `lookahead_distance` measures against the last segment the client ASKED
@@ -5744,8 +5945,11 @@ mod tests {
             })
         };
 
-        // The client asked for 100, so 100 is what it is waiting for.
-        let blocker = submit("blocker", JobClass::Interactive, 100);
+        // The client's own request holds the permit and puts the playhead at
+        // 98. Both speculative jobs are AHEAD of it when submitted, so the
+        // viewer has to overtake one of them for staleness to be in play at
+        // all (see `is_stale`).
+        let blocker = submit("blocker", JobClass::Interactive, 98);
         tokio::time::sleep(Duration::from_millis(30)).await;
         let standing = submit("standing", JobClass::Background, 100);
         let passed = submit("passed", JobClass::Background, 99);
@@ -5757,7 +5961,13 @@ mod tests {
             "precondition: both must be waiting, or neither boundary is tested"
         );
 
+        // The client now asks for 100, so 100 is what it is waiting for: 99 is
+        // behind it, 100 is the segment being fetched right now.
+        let advance = submit("advance", JobClass::Interactive, 100);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
         blocker.await.unwrap().expect("the client's own segment");
+        advance.await.unwrap().expect("the client's next segment");
         standing
             .await
             .unwrap()
@@ -5771,7 +5981,7 @@ mod tests {
         let got = order.lock().unwrap().clone();
         assert_eq!(
             got,
-            ["blocker", "standing"],
+            ["blocker", "advance", "standing"],
             "distance 0 is the segment being fetched, not one that has been \
              played past: {got:?}"
         );
@@ -6262,13 +6472,18 @@ mod tests {
                     })
                 };
 
-                let blocker = submit("blocker", JobClass::Interactive, 100);
+                let blocker = submit("blocker", JobClass::Interactive, 98);
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 let standing = submit("standing", JobClass::Background, 100);
                 let passed = submit("passed", JobClass::Background, 99);
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                // The viewer overtakes `passed`, which is what makes it stale
+                // rather than a deliberate backward guess (`is_stale`).
+                let advance = submit("advance", JobClass::Interactive, 100);
+                tokio::time::sleep(Duration::from_millis(20)).await;
 
                 blocker.await.unwrap().expect("the client's own segment");
+                advance.await.unwrap().expect("the client's next segment");
                 standing.await.unwrap().expect("still wanted");
                 assert!(
                     matches!(passed.await.unwrap(), Err(SchedError::Busy)),
