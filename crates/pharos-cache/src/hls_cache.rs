@@ -5377,8 +5377,7 @@ mod tests {
             snap.playheads.get(&joiner_viewer).copied(),
             Some(106),
             "a coalesced hit is still a hit: the viewer it served has reached \
-             that segment, and 42% of interactive hits on the deployment arrive \
-             this way"
+             that segment"
         );
         assert_eq!(
             snap.playheads.get(&driver_viewer).copied(),
