@@ -1362,6 +1362,19 @@ fn free_permits(state: &SchedState, candidates: &[DeviceId]) -> usize {
         .sum()
 }
 
+/// What speculative work may do with `candidates`' permits *right now*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundAdmission {
+    /// There is capacity above the reserve: take a permit.
+    Dispatch,
+    /// The reserve is intact but currently spoken for. Queue and be
+    /// reconsidered, at a freshly computed urgency, on the next freed permit.
+    Wait,
+    /// The reserve is as large as the pool, so free permits can NEVER exceed it.
+    /// Shed.
+    Never,
+}
+
 /// May speculative work take one of `candidates`' permits *right now*?
 ///
 /// The one admission rule, consulted identically by both dispatch paths so the
@@ -1369,23 +1382,32 @@ fn free_permits(state: &SchedState, candidates: &[DeviceId]) -> usize {
 /// amounts. Recomputed each time it is asked: it is a statement about the
 /// device table now, never a verdict cached on a job.
 ///
-/// The reserve is clamped to the candidate pool's own capacity minus one. That
-/// clamp used to be unnecessary — a refused speculative job was DROPPED, so a
-/// reserve as large as the pool merely meant "no prefetch on this pool". Now
-/// the job queues instead, and a job that can never satisfy the reserve is a
-/// job whose caller's `submit().await` never resolves. A pool cannot reserve
-/// its own last permit against itself.
-fn background_may_dispatch(state: &SchedState, candidates: &[DeviceId]) -> bool {
+/// The `Never` arm is what keeps the reserve honest on a small pool. It was
+/// once a clamp — `background_headroom.min(capacity - 1)` — which did stop the
+/// hang it was written against (a job whose reserve can never be satisfied
+/// queues forever, and its caller's `submit().await` never resolves), but paid
+/// for it by disabling the reserve completely on a one-permit candidate pool:
+/// `min(1, 0) == 0`, so speculation was free to take the only permit a client
+/// needed. V58's first clause is that speculative work NEVER takes capacity a
+/// client request needs, and it does not carry an exemption for narrow pools —
+/// a pinned CMAF rendition resolves to exactly one device, so narrow pools are
+/// not hypothetical. Refusing outright resolves the caller just as promptly as
+/// the clamp did and keeps the reserve.
+fn background_admission(state: &SchedState, candidates: &[DeviceId]) -> BackgroundAdmission {
     let capacity: usize = candidates
         .iter()
         .filter_map(|d| state.devices.slot(*d))
         .map(|s| s.capacity)
         .sum();
-    let reserve = state
-        .cfg
-        .background_headroom
-        .min(capacity.saturating_sub(1));
-    free_permits(state, candidates) > reserve
+    let reserve = state.cfg.background_headroom;
+    if reserve >= capacity {
+        return BackgroundAdmission::Never;
+    }
+    if free_permits(state, candidates) > reserve {
+        BackgroundAdmission::Dispatch
+    } else {
+        BackgroundAdmission::Wait
+    }
 }
 
 /// Park a job that could not be dispatched, or refuse it if the queue is full.
@@ -1753,16 +1775,32 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
     //
     // Refused here it now WAITS rather than dying: the reserve says "not out of
     // this permit", not "not ever", and the queue re-ranks it by urgency on
-    // every completion.
-    if ctx.class == JobClass::Background && !background_may_dispatch(state, &candidates) {
-        tracing::debug!(
-            %job_id,
-            candidates = ?candidates,
-            headroom = state.cfg.background_headroom,
-            "speculative transcode queued: no spare capacity above the reserve"
-        );
-        queue_or_refuse(state, job_id, ctx);
-        return;
+    // every completion. Unless it really is "not ever" — a pool that cannot
+    // hold the reserve and a job at once has nothing to wait FOR.
+    if ctx.class == JobClass::Background {
+        match background_admission(state, &candidates) {
+            BackgroundAdmission::Dispatch => {}
+            BackgroundAdmission::Wait => {
+                tracing::debug!(
+                    %job_id,
+                    candidates = ?candidates,
+                    headroom = state.cfg.background_headroom,
+                    "speculative transcode queued: no spare capacity above the reserve"
+                );
+                queue_or_refuse(state, job_id, ctx);
+                return;
+            }
+            BackgroundAdmission::Never => {
+                tracing::debug!(
+                    %job_id,
+                    candidates = ?candidates,
+                    headroom = state.cfg.background_headroom,
+                    "speculative transcode shed: this pool cannot hold the reserve and a job at once"
+                );
+                let _ = ctx.reply.send(Err(SchedError::Busy));
+                return;
+            }
+        }
     }
 
     for dev in candidates.iter().copied() {
@@ -1944,9 +1982,22 @@ fn try_place_no_queue(
     // task, so without the reserve at all a queued prefetch would drain
     // straight onto the permit `background_headroom` exists to hold open for a
     // client.
-    if ctx.class == JobClass::Background && !background_may_dispatch(state, &candidates) {
-        requeue.push_back((job_id, ctx));
-        return;
+    if ctx.class == JobClass::Background {
+        match background_admission(state, &candidates) {
+            BackgroundAdmission::Dispatch => {}
+            BackgroundAdmission::Wait => {
+                requeue.push_back((job_id, ctx));
+                return;
+            }
+            // A cooldown can narrow a queued job's candidate set until the
+            // reserve no longer fits in it. Re-queueing then parks it forever
+            // on a condition only a device coming back can meet; shed it,
+            // exactly as arrival would have.
+            BackgroundAdmission::Never => {
+                let _ = ctx.reply.send(Err(SchedError::Busy));
+                return;
+            }
+        }
     }
     for dev in candidates.iter().copied() {
         let Some(slot) = state.devices.slot(dev) else {
@@ -4677,6 +4728,54 @@ mod tests {
         );
     }
 
+    /// V58's first clause has no exemption for narrow pools.
+    ///
+    /// The reserve used to be clamped to the candidate pool's capacity minus
+    /// one, which resolved the caller of a job that could otherwise never be
+    /// admitted — but on a ONE-permit pool that clamp is `min(1, 0) == 0`, so
+    /// the reserve vanished and speculation was free to take the only permit a
+    /// client needed. A pinned shared-init rendition (V80) resolves to exactly
+    /// one device, so a one-permit candidate pool is not hypothetical.
+    ///
+    /// Refusing outright resolves the caller just as promptly and keeps the
+    /// reserve. The device must be left untouched, which is the part the old
+    /// clamp got wrong.
+    #[tokio::test]
+    async fn a_pool_that_cannot_hold_the_reserve_sheds_speculation_rather_than_queueing_it() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        // One permit, and `background_headroom` reserves one.
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig::default(),
+        );
+
+        let got = s
+            .submit(
+                PathBuf::from("/m/prefetch"),
+                h264(),
+                file_sink(),
+                JobClass::Background,
+                JobHint::default(),
+            )
+            .await;
+        assert_eq!(
+            got.err(),
+            Some(SchedError::Busy),
+            "a reserve that can never be satisfied must shed, not park a caller \
+             on a condition that cannot arrive"
+        );
+        let snap = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.devices.iter().map(|d| d.in_use).sum::<usize>(),
+            0,
+            "the permit the reserve exists to hold open must still be free"
+        );
+        assert_eq!(snap.pending, 0, "and nothing must be left in the queue");
+    }
+
     /// `pending_cap` is client backpressure, and speculative work now shares it.
     ///
     /// A queued job whose caller has gone is only noticed inside
@@ -4798,10 +4897,19 @@ mod tests {
             seen.lock().unwrap().push(job_name(spec));
             WorkerRunResult::Done { out_bytes: 1 }
         });
+        // One permit, so the queue drains strictly one job at a time and the
+        // recorded order IS the dispatch order. `background_headroom` has to be
+        // 0 to say that: a pool that cannot hold the reserve and a job at once
+        // sheds speculation outright rather than queueing it, and there would
+        // be no queue left to rank. Ranking is what is under test here; the
+        // reserve has its own guards.
         let s = TranscodeScheduler::spawn(
             DeviceTable::from_probe(&[], 1),
             spawner,
-            SchedConfig::default(),
+            SchedConfig {
+                background_headroom: 0,
+                ..SchedConfig::default()
+            },
         );
         let stream = StreamKey::of("viewer");
 
@@ -4898,36 +5006,38 @@ mod tests {
         for class in [JobClass::Interactive, JobClass::Background] {
             let spawner = Arc::new(VariableSpawner(Arc::new(|spec: &JobSpec| {
                 match job_name(spec).as_str() {
-                    // Holds the pinned device past everything else.
-                    "hold-gpu" => Duration::from_millis(400),
                     // Frees a CPU permit — and with it a drain — while the GPU
                     // is still busy.
                     "free-cpu" => Duration::from_millis(60),
-                    _ => Duration::from_millis(20),
+                    // Everything else holds the pinned device past the drain.
+                    _ => Duration::from_millis(400),
                 }
             })));
-            // One GPU permit and two CPU ones, so the CPU still has spare
-            // capacity above `background_headroom` at the moment the drain runs.
-            // That is deliberate: the reserve must not be what saves this.
+            // Two GPU permits and two CPU ones. Both numbers matter: the GPU
+            // pool must be able to hold `background_headroom` AND a job, or
+            // speculation is shed outright rather than queued; and the CPU must
+            // still have spare capacity above the reserve when the drain runs,
+            // so that the reserve is not what saves this.
             let s = TranscodeScheduler::spawn(
-                DeviceTable::from_probe(&[(gpu, 1)], 2),
+                DeviceTable::from_probe(&[(gpu, 2)], 2),
                 spawner,
                 SchedConfig::default(),
             );
 
-            let hold = {
+            let mut holds = Vec::new();
+            for tag in ["hold-gpu-a", "hold-gpu-b"] {
                 let s2 = s.clone();
-                tokio::spawn(async move {
+                holds.push(tokio::spawn(async move {
                     s2.submit(
-                        PathBuf::from("/m/hold-gpu"),
+                        PathBuf::from(format!("/m/{tag}")),
                         h264(),
                         file_sink(),
                         JobClass::Interactive,
                         JobHint::default(),
                     )
                     .await
-                })
-            };
+                }));
+            }
             tokio::time::sleep(Duration::from_millis(30)).await;
             // VP9 has no NVENC encoder, so this can only land on the CPU.
             let free_cpu = {
@@ -4969,7 +5079,9 @@ mod tests {
             );
 
             free_cpu.await.unwrap().expect("cpu blocker");
-            hold.await.unwrap().expect("gpu blocker");
+            for h in holds {
+                h.await.unwrap().expect("gpu blocker");
+            }
             let done = probe
                 .await
                 .unwrap()
