@@ -413,15 +413,19 @@ impl Default for StreamKey {
 /// fact as "the caller knows where playback starts", and only the second
 /// justifies seeding.
 ///
-/// They come apart because the playhead map is MISS-driven: a cache hit returns
-/// from `segment_bytes_keyed` before the scheduler is ever reached. A re-watch,
-/// a second viewer on the same media, any session whose opening segments are
-/// already on disk — all of them reach an ordinary deep prefetch with no entry
-/// for the stream, and letting THAT seed would have a guess measuring itself
-/// after all, in bounded form. So the entitlement is carried on the job instead
-/// of inferred from the map, and only the two prewarm call sites — which pick
-/// their base from the resume position or the seek target and therefore
-/// genuinely know it — set it.
+/// They come apart because a submission is not the only thing that can leave the
+/// map empty. It used to be the whole story — the map was MISS-driven, so a
+/// re-watch, a second viewer on the same media, any session whose opening
+/// segments were already on disk reached an ordinary deep prefetch with no entry
+/// at all. [`TranscodeScheduler::note_playhead`] (T109) closes that particular
+/// hole by reporting the hits too, so those sessions now DO have a reading. What
+/// it does not close is the gap the rule is actually about: a stream can still
+/// be entryless at its very first request — nothing has been served yet, hit or
+/// miss — and letting an ordinary guess seed THERE would have it measuring
+/// itself, in bounded form. So the entitlement stays on the job rather than
+/// inferred from the map, and only the two prewarm call sites — which pick their
+/// base from the resume position or the seek target and therefore genuinely know
+/// it — set it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlayheadSeed {
     /// This submission is a guess relative to a position somebody else
@@ -767,6 +771,16 @@ enum SchedMsg {
     },
     /// Somebody a client is blocked on turned out to be speculative work.
     Promote { job_id: JobId },
+    /// A client was served a segment the scheduler never saw a job for.
+    ///
+    /// It cannot ride on [`SchedMsg::Submit`] — there is no job — and it cannot
+    /// be inferred in here, because a cache hit returns from
+    /// `segment_bytes_keyed` without the scheduler hearing anything at all. So
+    /// the reading arrives as its own message or it does not arrive: see
+    /// [`TranscodeScheduler::note_playhead`] for why that message is worth a
+    /// send per served segment, and [`PlayheadMotion`] for the one way it is
+    /// allowed to move the map.
+    Playhead { stream: StreamKey, segment: u32 },
     SubmitLive {
         input: PathBuf,
         opts: TranscodeOptions,
@@ -907,7 +921,12 @@ struct SchedState {
     /// idea where a viewer is. Bounded at MAX_TRACKED_STREAMS with the
     /// least-recently-updated evicted, mirroring PrefetchRegistry.
     ///
-    /// Moved only by an interactive submission. A speculative submission that
+    /// Moved by an interactive submission, or by a `Playhead` message reporting
+    /// a segment the cache served without the scheduler ever seeing a job for it
+    /// — the second because a viewer whose buffer is warm takes hits and nothing
+    /// else, so a reading only a MISS could move went stale exactly when
+    /// playback was going well. A hit may only ADVANCE it; see
+    /// [`PlayheadMotion`]. A speculative submission that
     /// carries [`PlayheadSeed::StatesTheStart`] may SEED an entry that does not
     /// exist yet — see the `Submit` arm — which is where a cold-start prewarm's
     /// segments stop being unknowable; it can never overwrite a reading a
@@ -921,14 +940,83 @@ struct SchedState {
 /// without bound is a leak dressed as a cache.
 const MAX_TRACKED_STREAMS: usize = 256;
 
+/// Which way a new reading is allowed to move an existing one.
+///
+/// The two writers of the playhead map carry different evidence, and collapsing
+/// them onto one rule gets one of them wrong.
+///
+/// A SUBMISSION is the client's request itself, arriving in the actor in the
+/// order the client made it. Wherever it points is where the viewer is, so it
+/// may move the reading in either direction — which is how a BACKWARD SEEK is
+/// expressed, and the only way it can be.
+///
+/// A HIT is weaker in exactly one respect: it is evidence the viewer REACHED
+/// that segment, and it arrives when the bytes were read rather than when the
+/// request was made. Two hits, or a hit and a miss, can therefore land out of
+/// order — a viewer's parallel fetches around a seek routinely do — and an
+/// unconditional write would let the later-landing, lower-numbered one declare
+/// the viewer to be further back than the scheduler already knows they are.
+/// Every guess on that stream is then ranked further out than it really is, and
+/// the stream's next genuine miss queues behind another viewer's shallower work.
+///
+/// So a hit may only ADVANCE. That is one rule with no ordering metadata on the
+/// message and no per-stream sequence in the map, and it is never worse than
+/// the behaviour it replaces, in which a hit moved nothing at all.
+///
+/// What it does NOT capture is a backward seek that lands on a segment still in
+/// the cache — a rewind inside material the viewer just watched, which is the
+/// common shape of a rewind and is a HIT, not a miss. The reading then stays
+/// where the viewer was rather than following them back. That is a pre-existing
+/// staleness, not one introduced here: today the reading stays at the last MISS,
+/// which is just as wrong and in the same direction. Fixing it needs the message
+/// to carry the instant its REQUEST arrived and `Submit` to carry one too, so
+/// the map can be written in request order rather than in completion order; that
+/// is a strictly larger change ([`JobHint`] gains a field at every construction
+/// site) and it is not what T109 is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayheadMotion {
+    /// A client's own request: the reading follows it, forwards or backwards.
+    Anywhere,
+    /// A segment served from cache: it may raise the reading, never lower it.
+    ForwardOnly,
+}
+
 /// Record where a stream's client has reached, and bound the map.
 fn note_playhead(state: &mut SchedState, stream: StreamKey, segment: u32) {
+    write_playhead(state, stream, segment, PlayheadMotion::Anywhere);
+}
+
+fn write_playhead(state: &mut SchedState, stream: StreamKey, segment: u32, motion: PlayheadMotion) {
     if stream == StreamKey::NONE {
         return;
     }
     state.playhead_clock += 1;
     let tick = state.playhead_clock;
-    state.playheads.insert(stream, (segment, tick));
+    match state.playheads.entry(stream) {
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let (head, seen) = e.get_mut();
+            if motion == PlayheadMotion::Anywhere || segment > *head {
+                *head = segment;
+            }
+            // The tick is refreshed even when the VALUE is not. It orders
+            // eviction, and the question it answers is "is this stream still
+            // being watched?" — to which a hit that did not advance the reading
+            // is a yes. Leaving it stale would let a viewer served entirely out
+            // of cache, which is the healthiest stream on the box, be evicted
+            // ahead of one that has not asked for anything in a minute.
+            *seen = tick;
+        }
+        std::collections::hash_map::Entry::Vacant(v) => {
+            // A hit on a stream with NO reading establishes one, and this is the
+            // gap `PlayheadSeed` documents but could not close: the map was
+            // miss-driven, so a re-watch or a second viewer on the same media
+            // reached its first deep prefetch with nothing recorded, and letting
+            // that GUESS seed would have had it ranking itself. A hit is not a
+            // guess — it is a client's own request — so it carries exactly the
+            // entitlement an interactive `Submit` does.
+            v.insert((segment, tick));
+        }
+    }
     if state.playheads.len() > MAX_TRACKED_STREAMS {
         if let Some((&oldest, _)) = state.playheads.iter().min_by_key(|(_, (_, t))| *t) {
             state.playheads.remove(&oldest);
@@ -1025,8 +1113,9 @@ fn has_been_passed(distance: i64) -> bool {
 ///
 /// It is deliberately the VALUE at submit and not the TICK at submit. A tick
 /// answers "has the playhead moved since?", which sounds like the same question
-/// and is not: `note_playhead` bumps the clock on every interactive submission,
-/// whatever it does to the position. So a member still playing FORWARD while a
+/// and is not: the clock is bumped on every interactive submission and on every
+/// cache hit reported by [`TranscodeScheduler::note_playhead`], whatever either
+/// does to the position. So a member still playing FORWARD while a
 /// backward prewarm sits queued on its stream — the ordinary interleaving, since
 /// the prewarm fires the moment `/SyncPlay/Seek` is dispatched and the member
 /// applies the command seconds later — bumped the tick and condemned the
@@ -1263,6 +1352,43 @@ impl TranscodeScheduler {
         let _ = self.tx.send(SchedMsg::Promote { job_id }).await;
     }
 
+    /// Say that a client reached `segment` on `stream` without any job being
+    /// submitted for it — i.e. the segment came out of the cache.
+    ///
+    /// Without this the reading is MISS-DRIVEN, and a miss is what stops
+    /// happening when the system works: a viewer with a warm buffer takes fast
+    /// and coalesced cache hits, neither of which reaches here, so its last
+    /// reading is wherever it last missed and the error grows in proportion to
+    /// how well prefetch is doing. `lookahead_distance` — and with it which
+    /// guess is dispatched (`next_to_dispatch`), which is dropped (`is_stale`),
+    /// which is evicted (`queue_or_refuse`) and what
+    /// `pharos_transcode_queue_distance` reports — is then wrong for that stream
+    /// in one direction, all four at once.
+    ///
+    /// SYNCHRONOUS and fire-and-forget, which is the whole cost argument. A hit
+    /// is the common case, so this runs on the path holding a viewer's segment
+    /// response; `try_send` cannot await, so that path never waits on the actor,
+    /// and a full inbox drops the update rather than applying backpressure to
+    /// the HTTP handler. Dropping is safe by construction: a lost reading leaves
+    /// the map exactly as stale as it was before this existed and never staler.
+    /// It is counted, because a snapshot showing a reading that stopped moving
+    /// otherwise cannot distinguish a viewer who stopped from an inbox that is
+    /// saturated.
+    ///
+    /// See [`PlayheadMotion`] for the only direction a hit may move a reading.
+    pub fn note_playhead(&self, stream: StreamKey, segment: u32) {
+        if stream == StreamKey::NONE {
+            return;
+        }
+        if self
+            .tx
+            .try_send(SchedMsg::Playhead { stream, segment })
+            .is_err()
+        {
+            metrics::counter!("pharos_transcode_playhead_dropped_total").increment(1);
+        }
+    }
+
     /// Submit a live transcode and get a byte stream of the muxed output.
     /// The job is dispatched to the least-loaded eligible device; the
     /// returned stream owns the worker + its device permit, so the slot
@@ -1367,10 +1493,9 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             // ([`PlayheadSeed`]), not inferred from the map being empty. The
             // caller already knows the answer — the prewarm picks its base from
             // the resume position or the group's seek target — while "no entry
-            // yet" is a much weaker fact than it looks: the map is miss-driven,
-            // so a re-watch whose opening segments are already cached reaches an
-            // ordinary deep prefetch with no entry, and letting that seed puts
-            // a guess back to measuring itself.
+            // yet" is a much weaker fact than it looks: it holds for any stream
+            // nothing has been served on yet, and letting an ordinary guess seed
+            // there puts it back to measuring itself.
             if let Some(seg) = hint.segment {
                 let may_seed =
                     hint.seeds_playhead.may_seed() && !state.playheads.contains_key(&hint.stream);
@@ -1415,6 +1540,9 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
         }
         SchedMsg::Promote { job_id } => {
             promote_job(state, job_id, self_tx);
+        }
+        SchedMsg::Playhead { stream, segment } => {
+            write_playhead(state, stream, segment, PlayheadMotion::ForwardOnly);
         }
         SchedMsg::SubmitLive { input, opts, reply } => {
             // Live path: acquire a permit best-first, then spawn a
@@ -2244,9 +2372,10 @@ fn urgency_key(state: &SchedState, ctx: &JobCtx, arrival: usize) -> (i64, bool, 
 /// THIS function can no longer reach that band, and the honest statement of
 /// that belongs here rather than in a comment describing a live path. Stale
 /// work is swept unconditionally at the top of `drain_pending` (`reap_stale`),
-/// and no job can become stale during a drain — only `note_playhead`, on an
-/// interactive `Submit`, moves a playhead, and the actor processes no messages
-/// mid-drain. So by the time selection runs, `pending` holds no stale job.
+/// and no job can become stale during a drain — a playhead moves only in a
+/// message arm (an interactive `Submit`, or a `Playhead` reporting a cache hit),
+/// and the actor processes no messages mid-drain. So by the time selection runs,
+/// `pending` holds no stale job.
 ///
 /// The band is not dead: it is read at its MAXIMUM by `queue_or_refuse`, which
 /// runs on ARRIVAL, between drains — and an interactive arrival's own
@@ -2874,10 +3003,11 @@ fn try_place_no_queue(
     // point. Abandonment is driven from OUTSIDE the actor: a caller can drop
     // its `submit().await` at any instant, including halfway through a drain,
     // so it has to be re-checked on every examination. Staleness is driven from
-    // INSIDE it — only `note_playhead`, on an interactive `Submit`, moves a
-    // playhead — and the actor processes no messages mid-drain, so no job can
-    // become stale between `reap_stale` and here. Checking it again would be a
-    // condition that can no longer change.
+    // INSIDE it — a playhead moves only in a message arm, whether that is an
+    // interactive `Submit` or a `Playhead` reporting a cache hit — and the actor
+    // processes no messages mid-drain, so no job can become stale between
+    // `reap_stale` and here. Checking it again would be a condition that can no
+    // longer change.
     let now = Instant::now();
     let full_eligible = state.devices.eligible_for(&ctx.opts, now);
     // The SAME candidate set the arrival path computes, pin included. A job
@@ -5675,13 +5805,11 @@ mod tests {
     /// queue throws away.
     ///
     /// The entitlement is the CALLER'S ([`PlayheadSeed`]), not "the map has no
-    /// entry". Those look equivalent and are not, because the map is
-    /// MISS-driven: a re-watch, or a second viewer on the same media, hits the
-    /// cache on its opening segments and never reaches the scheduler, so an
-    /// ordinary deep prefetch arrives on a stream with no entry — and an
-    /// entry-shaped gate would let that prefetch seed the stream at its own
-    /// index and rank itself top of the band, which is the self-measurement the
-    /// rule exists to forbid, in bounded form.
+    /// entry". Those look equivalent and are not: a stream has no entry until
+    /// something has been SERVED on it, and a deep prefetch can be the first
+    /// thing submitted for one — an entry-shaped gate would let that prefetch
+    /// seed the stream at its own index and rank itself top of the band, which
+    /// is the self-measurement the rule exists to forbid, in bounded form.
     ///
     /// All three halves in one test: an ordinary guess seeding brings that
     /// back; a prewarm NOT seeding brings back the permanently-unknown
@@ -5766,6 +5894,155 @@ mod tests {
             snap.playheads.get(&stream).copied(),
             Some(60),
             "the client's own request must still overwrite the seed"
+        );
+    }
+
+    /// T109 — a segment SERVED FROM CACHE is the same evidence about where a
+    /// viewer stands as one that had to be encoded, and until now only the
+    /// second reached the scheduler.
+    ///
+    /// The rule this pins has two halves, and each is a different message. A
+    /// SUBMISSION is the client's request itself, so it may move the reading
+    /// anywhere — forward on ordinary playback, backward on a seek. A HIT may
+    /// only ever ADVANCE it: it is evidence the viewer reached that segment and
+    /// never evidence they went back to it, so a hit for segment N landing after
+    /// a request for N+2 (parallel fetches around a seek) cannot drag the
+    /// reading back to N.
+    ///
+    /// Ordering is guaranteed without sleeping: `note_playhead` and `snapshot`
+    /// travel the same mpsc, which the actor drains in order, so a snapshot
+    /// taken after a send has necessarily seen it.
+    #[tokio::test]
+    async fn a_hit_may_advance_a_playhead_but_never_drag_it_backwards() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let stream = StreamKey::of("play-session-warm-buffer");
+
+        // A stream whose OPENING segments were already on disk — a re-watch, a
+        // second viewer on the same media — reaches the scheduler with no
+        // reading at all. A hit is a client's own request, so it may establish
+        // one; that is the case `PlayheadSeed` had to leave unknowable, because
+        // the map was miss-driven and a guess is not allowed to seed itself.
+        s.note_playhead(stream, 40);
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            Some(40),
+            "a client's request served from cache must establish a reading: it is \
+             the same evidence as the request that missed"
+        );
+
+        // The warm viewer plays on, entirely out of cache.
+        s.note_playhead(stream, 41);
+        s.note_playhead(stream, 42);
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            Some(42),
+            "the better prefetch works the more of playback is hits — a reading \
+             that only misses can move goes stale exactly when the system is \
+             working"
+        );
+
+        // The out-of-order hit: segment 41's bytes land after 42's did.
+        s.note_playhead(stream, 41);
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            Some(42),
+            "a hit is evidence the viewer REACHED that segment, never evidence \
+             they went back to it — a late arrival must not rank every one of \
+             this stream's guesses a segment further out than it is"
+        );
+
+        // A backward seek is expressed by the SUBMISSION it causes, which may
+        // move the reading anywhere. That is what keeps `ForwardOnly` from
+        // being a one-way ratchet.
+        s.submit(
+            PathBuf::from("/m/a"),
+            cmaf(),
+            file_sink(),
+            JobClass::Interactive,
+            JobHint {
+                stream,
+                segment: Some(7),
+                seeds_playhead: PlayheadSeed::Observes,
+            },
+        )
+        .await
+        .unwrap();
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.playheads.get(&stream).copied(),
+            Some(7),
+            "a client's own request still says where the viewer is, in either \
+             direction"
+        );
+    }
+
+    /// T109 (a) — the cost decision, pinned as behaviour rather than left as a
+    /// claim in a commit message.
+    ///
+    /// A hit is the COMMON case, so this send happens per served segment on a
+    /// channel already fed at segment rate by submissions and completions.
+    /// `note_playhead` is therefore synchronous and fire-and-forget: it never
+    /// awaits, and a full inbox drops the update instead of applying
+    /// backpressure to the HTTP handler that is holding a viewer's segment.
+    /// Dropping is safe precisely because a lost update leaves the reading
+    /// exactly as stale as it is today and never staler.
+    ///
+    /// Deterministic without any timing: on a current-thread runtime the actor
+    /// task cannot be polled while this test never awaits, so the inbox fills
+    /// at `inbox_depth` and every later send must be refused. If `note_playhead`
+    /// ever became a blocking `send`, this test would deadlock rather than fail
+    /// — which is the failure it exists to make impossible to ship.
+    #[test]
+    fn a_playhead_update_is_dropped_rather_than_stalling_the_viewer_serving_it() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(
+                    one_gpu(4),
+                    spawner,
+                    SchedConfig {
+                        inbox_depth: 8,
+                        ..SchedConfig::default()
+                    },
+                );
+                let stream = StreamKey::of("play-session-saturated");
+                // No await anywhere in this loop, so the actor never runs.
+                for seg in 0..64u32 {
+                    s.note_playhead(stream, seg);
+                }
+            })
+        });
+
+        let dropped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                (ck.key().name() == "pharos_transcode_playhead_dropped_total").then_some(v)
+            });
+        assert!(
+            matches!(dropped, Some(DebugValue::Counter(n)) if n > 0),
+            "a refused playhead update must be COUNTED: the snapshot shows a \
+             reading that stopped moving, and this is the only signal that says \
+             whether it stopped because the viewer stopped or because the \
+             actor's inbox is saturated; got {dropped:?}"
         );
     }
 
