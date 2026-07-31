@@ -299,6 +299,10 @@ impl PromotionOutcome {
 #[derive(Clone, Debug)]
 pub struct JobSlot {
     tx: Arc<tokio::sync::watch::Sender<Option<JobId>>>,
+    /// See [`JobSlot::is_dispatched`]. A plain flag rather than a second
+    /// `watch`: nobody needs to be WOKEN by dispatch, only to ask about it at a
+    /// moment of their own choosing.
+    dispatched: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for JobSlot {
@@ -311,6 +315,7 @@ impl JobSlot {
     pub fn new() -> Self {
         Self {
             tx: Arc::new(tokio::sync::watch::channel(None).0),
+            dispatched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -318,6 +323,38 @@ impl JobSlot {
     /// sender alive, so it cannot keep a dead driver's slot open.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<JobId>> {
         self.tx.subscribe()
+    }
+
+    /// Has this slot's job been handed to a worker?
+    ///
+    /// Once it has, the caller CANNOT get the capacity back by walking away.
+    /// `spawn_run_task` is a detached task owning both the worker and the device
+    /// permit, and the `JobFinished` arm ignores a failed reply send, so a
+    /// dispatched job runs to completion however the caller feels about it.
+    /// `reply.is_closed()` — the only thing that stops a job — is read at
+    /// `place`, `reap_abandoned` and `try_place_no_queue`, every one of which is
+    /// PRE-dispatch.
+    ///
+    /// So this is the line between the population an abandonment can reclaim
+    /// (queued, and not yet examined) and the population it cannot (running).
+    /// A caller that abandons past this line spends the encode anyway and throws
+    /// the bytes away, and — because the worker keeps writing to a
+    /// deterministic, key-derived output path — leaves an orphan writing where
+    /// its own successor is about to write. Callers whose abandonment has that
+    /// shape ask here first.
+    ///
+    /// LATCHED, never cleared. A job re-placed after a transient device failure
+    /// has already had a worker touch its output, so "was this ever running?" is
+    /// the question that keeps the answer safe, not "is it running now?".
+    pub fn is_dispatched(&self) -> bool {
+        self.dispatched.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Latch [`Self::is_dispatched`]. The scheduler's to call, at the one place
+    /// a job takes a device permit.
+    pub fn mark_dispatched(&self) {
+        self.dispatched
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn assign(&self, id: JobId) {
@@ -755,6 +792,11 @@ struct JobCtx {
     /// `None` while queued. Re-stamped on each (re)dispatch so a retry's wait
     /// is counted in the queue, not the encode.
     dispatched: Option<Instant>,
+    /// The submitter's handle on this job, if it kept one. Latched at dispatch
+    /// so the submitter can tell the capacity it can still get back from the
+    /// capacity it cannot — see [`JobSlot::is_dispatched`]. `None` for callers
+    /// that never asked to name their job (the transcode tool, tests).
+    assigned: Option<JobSlot>,
     /// Who is waiting. Carried through retries + requeues so a job's class is
     /// the same wherever it is observed (queued, inflight, finished).
     class: JobClass,
@@ -1329,7 +1371,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             // Published BEFORE placement, so a requester that coalesces onto
             // this job can name it even while it is still queued — which is
             // exactly the case promotion exists for.
-            if let Some(slot) = assigned {
+            if let Some(slot) = &assigned {
                 slot.assign(job_id);
             }
             let ctx = JobCtx {
@@ -1342,6 +1384,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 last_error: None,
                 enqueued: Instant::now(),
                 dispatched: None,
+                assigned,
                 class,
                 promoted_at: None,
                 device: None,
@@ -2599,6 +2642,12 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             // was and where it landed.
             span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
+            // Told to the SUBMITTER, not just recorded here: from this line the
+            // permit and the worker are the detached run task's, and no caller
+            // can hand them back by walking away. See `JobSlot::is_dispatched`.
+            if let Some(slot) = &ctx.assigned {
+                slot.mark_dispatched();
+            }
             ctx.device = Some(dev);
             // Counted BEFORE this job joins `inflight`, so it is peers, not
             // occupancy: a job that runs alone reports 0.
@@ -2932,6 +2981,13 @@ fn try_place_no_queue(
             // was and where it landed.
             span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
+            // Same as `place`, and needed at BOTH: a job that waited in the
+            // queue and then drained onto a permit is exactly as unreclaimable
+            // as one dispatched on arrival, and the queue is where speculative
+            // work spends most of its life.
+            if let Some(slot) = &ctx.assigned {
+                slot.mark_dispatched();
+            }
             ctx.device = Some(dev);
             // B178 — same stamping as `place`. A job dispatched off the queue
             // used to report zero peers regardless, and the queue is what runs
@@ -4607,6 +4663,87 @@ mod tests {
     /// A single GPU, so a job's peers are unambiguous.
     fn one_gpu(capacity: usize) -> DeviceTable {
         DeviceTable::from_probe(&[(DeviceId::hw(HwAccel::Nvenc, 0), capacity)], 0)
+    }
+
+    /// The line an abandonment cannot cross, made askable.
+    ///
+    /// A caller that walks away from a QUEUED job really does hand the capacity
+    /// back — `place` / `reap_abandoned` / `try_place_no_queue` all read
+    /// `reply.is_closed()` before spending a permit. A caller that walks away
+    /// from a DISPATCHED one reclaims nothing: `spawn_run_task` is detached and
+    /// owns the worker and the permit, and the `JobFinished` arm ignores a
+    /// failed reply send. Nothing said which side of that line a job was on, so
+    /// a caller weighing "is abandoning this free?" had to guess — and the
+    /// segment cache guessed "always", which let an orphaned worker keep writing
+    /// to the output path its own successor was about to use.
+    ///
+    /// Asserted at both dispatch sites, because a job that waits in the queue
+    /// and drains onto a permit later is exactly as unreclaimable as one placed
+    /// on arrival, and the queue is where speculative work spends its life.
+    #[tokio::test]
+    async fn a_slot_says_when_its_job_is_past_reclaiming() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(200), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        // ONE permit in the whole table, so the second submission has to wait
+        // for the first — the queue is half of what this test is about.
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[], 1),
+            spawner,
+            SchedConfig::default(),
+        );
+
+        let first = JobSlot::new();
+        let second = JobSlot::new();
+        assert!(
+            !first.is_dispatched(),
+            "a slot that has not even been submitted cannot be running"
+        );
+
+        let mut handles = Vec::new();
+        for (tag, slot) in [("first", first.clone()), ("second", second.clone())] {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit_tracked(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint {
+                        stream: StreamKey::NONE,
+                        segment: None,
+                        seeds_playhead: PlayheadSeed::Observes,
+                    },
+                    Some(slot),
+                )
+                .await
+            }));
+        }
+        // Long enough for the actor to have placed what it can, short enough
+        // that the running job is still running.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let snap = s.snapshot().await.expect("snapshot");
+        assert_eq!(snap.inflight, 1, "precondition: one job holds the permit");
+        assert_eq!(snap.pending, 1, "precondition: the other one waits");
+        assert!(
+            first.is_dispatched(),
+            "a job that holds a device permit must say so — abandoning it \
+             reclaims nothing and leaves a worker writing to its output path"
+        );
+        assert!(
+            !second.is_dispatched(),
+            "a QUEUED job is still reclaimable: reporting it as running would \
+             throw away the only reclaim abandonment can actually make"
+        );
+
+        for h in handles {
+            h.await.unwrap().expect("both jobs must complete");
+        }
+        assert!(
+            second.is_dispatched(),
+            "a job dispatched off the QUEUE must latch too — `try_place_no_queue` \
+             spends a permit exactly as `place` does"
+        );
     }
 
     /// ODD — what a job encoded BESIDE is the thing that sets how long it took,
