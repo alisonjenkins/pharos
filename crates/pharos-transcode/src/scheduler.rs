@@ -921,6 +921,10 @@ fn background_peers_on(state: &SchedState, dev: DeviceId) -> usize {
 /// indistinguishable from it if the ignored arm is silent.
 fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode_ms: u64) {
     let capacity = state.devices.slot(device).map(|s| s.capacity).unwrap_or(1);
+    // Read before `observe` takes `state.admission` mutably below — this is
+    // the actual value the control law applies, not a copy of it, so the log
+    // line stays true after anyone tunes `margin_ratio`.
+    let margin_ratio = state.cfg.admission.margin_ratio;
     let obs = Observation {
         // Live/progressive jobs have no duration and so no deadline.
         segment_seconds: ctx.opts.duration_ticks.map(|t| t as f64 / 10_000_000.0),
@@ -953,7 +957,7 @@ fn observe_margin(state: &mut SchedState, device: DeviceId, ctx: &JobCtx, encode
             %device,
             verdict = verdict.label(),
             encode_secs = obs.encode_seconds,
-            deadline_secs = obs.segment_seconds.map(|s| s * 0.5),
+            deadline_secs = obs.segment_seconds.map(|s| s * margin_ratio),
             background_peers = obs.background_peers,
             allowance_from = before,
             allowance_to = after,
@@ -2916,5 +2920,177 @@ mod tests {
             "expected a met verdict; got {labels:?}"
         );
         assert!(matches!(value, DebugValue::Counter(1)), "got {value:?}");
+    }
+
+    /// The `ignored` arm at the SCHEDULER level, not just inside
+    /// `AdmissionController::observe` (already unit-tested there). `cmaf()`
+    /// carries no `duration_ticks` — a live/progressive job, per its own doc
+    /// comment above — so `observe_margin` must translate that into a
+    /// `verdict=ignored` count, not silence.
+    ///
+    /// Asserting the metric matters MORE than asserting the allowance: an
+    /// allowance frozen at the floor is also exactly what a controller that
+    /// was never wired up at all would produce, which is the trap two earlier
+    /// reviews on this branch already caught (see
+    /// `a_finished_segment_teaches_the_controller_without_changing_admission`'s
+    /// doc comment). Only the counter distinguishes "no signal reached the
+    /// loop" from "the device genuinely cannot go faster".
+    #[test]
+    fn a_duration_less_interactive_job_is_ignored_not_silently_dropped() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let allowance = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(50), |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+                // `cmaf()`, not `cmaf_with_duration()`: no `duration_ticks` at
+                // all, the live/progressive shape this arm exists for.
+                s.submit(
+                    PathBuf::from("/m/live"),
+                    cmaf(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+                .unwrap();
+                let snap = s.snapshot().await.unwrap();
+                snap.background_allowance
+                    .iter()
+                    .find(|(d, _)| *d == DeviceId::hw(HwAccel::Nvenc, 0))
+                    .map(|(_, v)| *v)
+            })
+        });
+
+        let verdict = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_margin_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = verdict.expect(
+            "a duration-less interactive job must still emit \
+             pharos_transcode_margin_total — silence here is indistinguishable \
+             from a controller nothing ever fed",
+        );
+        assert!(
+            labels.contains(&"verdict=ignored".to_string()),
+            "expected an ignored verdict; got {labels:?}"
+        );
+        assert!(matches!(value, DebugValue::Counter(1)), "got {value:?}");
+
+        assert_eq!(
+            allowance,
+            Some(1.0),
+            "a duration-less observation must leave the allowance at the floor \
+             (this alone would ALSO be true of a controller that was never \
+             wired up, which is why the metric assertion above is the one \
+             that matters)"
+        );
+    }
+
+    /// The other `ignored` condition — a retried job's encode time is the
+    /// duration of a bounce, not of an encode (`usable: ctx.retries == 0`).
+    /// Driven the same way `worker_death_retries_and_scheduler_survives`
+    /// forces a retry: script a worker death on the first attempt so the
+    /// job's `ctx.retries` is 1 by the time it completes, then finish
+    /// successfully on the retry so `observe_margin` runs at all.
+    #[test]
+    fn a_retried_interactive_job_is_ignored_not_silently_dropped() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let allowance = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let counter = Arc::new(Mutex::new(0u32));
+                let c2 = counter.clone();
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, _| {
+                    let mut n = c2.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        WorkerRunResult::Died
+                    } else {
+                        WorkerRunResult::Done { out_bytes: 1 }
+                    }
+                });
+                let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+                // A duration IS present here — the point of this test is the
+                // `usable` guard, not the `segment_seconds` one covered above.
+                s.submit(
+                    PathBuf::from("/m/a"),
+                    cmaf_with_duration(),
+                    file_sink(),
+                    JobClass::Interactive,
+                )
+                .await
+                .unwrap();
+                let snap = s.snapshot().await.unwrap();
+                snap.background_allowance
+                    .iter()
+                    .find(|(d, _)| *d == DeviceId::hw(HwAccel::Nvenc, 0))
+                    .map(|(_, v)| *v)
+            })
+        });
+
+        let verdict = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_margin_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            });
+
+        let (labels, value) = verdict.expect(
+            "a retried job's completion must still emit \
+             pharos_transcode_margin_total — silence here is indistinguishable \
+             from a controller nothing ever fed",
+        );
+        assert!(
+            labels.contains(&"verdict=ignored".to_string()),
+            "a retried job's encode time is the duration of a bounce, not an \
+             encode; expected an ignored verdict, got {labels:?}"
+        );
+        assert!(matches!(value, DebugValue::Counter(1)), "got {value:?}");
+
+        assert_eq!(
+            allowance,
+            Some(1.0),
+            "an unusable observation must leave the allowance at the floor \
+             (this alone would ALSO be true of a controller that was never \
+             wired up, which is why the metric assertion above is the one \
+             that matters)"
+        );
     }
 }
