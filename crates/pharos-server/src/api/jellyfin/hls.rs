@@ -20,7 +20,7 @@ use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_cache::HlsSegmentCache;
 use pharos_core::{MediaStore, Prober};
 use pharos_scanner::FfmpegProber;
-use pharos_transcode::scheduler::{JobClass, StreamKey};
+use pharos_transcode::scheduler::{JobClass, PlayheadSeed, StreamKey};
 use pharos_transcode::{
     AudioCodec, AudioDelivery, Container, ContinuousAudio, FfmpegTranscoder, SegmentAudio,
     SegmentContainer, SegmentOpts, SegmentVideo, VideoCodec,
@@ -1158,6 +1158,7 @@ async fn serve_segment(
                 &opts,
                 JobClass::Interactive,
                 stream,
+                PlayheadSeed::Observes,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
@@ -2405,6 +2406,11 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             &o,
                             JobClass::Background,
                             stream,
+                            // The group has been told to go here; the member
+                            // just has not applied it yet. If nothing has been
+                            // recorded for this member's stream, the seek
+                            // target is the best statement of where it is.
+                            PlayheadSeed::StatesTheStart,
                         )
                         .await;
                 });
@@ -2597,6 +2603,10 @@ pub(super) fn prewarm_cold_start(
                         &opts,
                         JobClass::Background,
                         stream,
+                        // This is the one caller that KNOWS where this stream
+                        // begins: `base` came from the resume position, and no
+                        // interactive request has touched the stream yet.
+                        PlayheadSeed::StatesTheStart,
                     )
                     .await
                 {
@@ -2673,6 +2683,9 @@ fn spawn_one_prefetch(
                 &o,
                 JobClass::Background,
                 stream,
+                // An ordinary guess, relative to a playhead somebody else
+                // established. It may not state one of its own.
+                PlayheadSeed::Observes,
             )
             .await
         {
@@ -3051,6 +3064,7 @@ async fn vp9_segment_raw(
                 opts,
                 JobClass::Interactive,
                 stream,
+                PlayheadSeed::Observes,
             )
             .await
             .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));
