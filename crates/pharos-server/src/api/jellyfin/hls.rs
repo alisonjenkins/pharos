@@ -2369,7 +2369,12 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
             .duration_ms
             .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32)
             .unwrap_or(u32::MAX);
-        for opts in variants {
+        for (play_session_id, opts) in variants {
+            // Same derivation as the segment handler's own `StreamKey::of`, so
+            // this prewarm is attributed to the member it is for and lands on
+            // that member's playhead rather than in the scheduler's
+            // no-known-stream bucket.
+            let stream = StreamKey::of(&play_session_id);
             // Warm the LANDING segment and the two behind it, directly (the
             // regular prefetch helper only warms base+1.. on the assumption
             // the base itself is being served — here nothing serves it yet).
@@ -2399,13 +2404,7 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             &item.path,
                             &o,
                             JobClass::Background,
-                            // `segment_opts_for_media` (state.rs) discards the
-                            // play_session_id key it iterates over, so no
-                            // session is available here to attribute this
-                            // prewarm to. Gap: threading the psid through would
-                            // let a SyncPlay seek's own prewarm move that
-                            // member's playhead.
-                            StreamKey::NONE,
+                            stream,
                         )
                         .await;
                 });
