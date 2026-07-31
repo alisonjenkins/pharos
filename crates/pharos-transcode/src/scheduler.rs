@@ -3039,13 +3039,27 @@ mod tests {
         }
     }
 
+    /// The defect this pins: prefetch is dispatched BEFORE the segment the
+    /// client is blocked on, and once shared one FIFO with it, so speculative
+    /// encodes could bury a client's own segment.
+    ///
+    /// The mechanism changed when speculative work began to WAIT for a permit
+    /// instead of being dropped (V58). "Never in the queue" was how that used
+    /// to be enforced and is no longer true; what must stay true is that being
+    /// in the queue never gets it dispatched ahead of a client. So this now
+    /// submits the prefetch FIRST and the client second, and asserts the client
+    /// still goes first — an ordering the old shed could not even express.
     #[tokio::test]
-    async fn speculative_work_is_shed_and_never_queues_in_front_of_a_client() {
-        // The defect this pins: prefetch is dispatched BEFORE the segment the
-        // client is blocked on, and shared one FIFO with it, so speculative
-        // encodes could bury a client's own segment. Background work must now
-        // run only out of spare capacity, and must never join the queue.
-        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
+    async fn speculative_work_waits_and_never_dispatches_in_front_of_a_client() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), move |_, spec| {
+            seen.lock().unwrap().push(
+                spec.input
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
             WorkerRunResult::Done { out_bytes: 1 }
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
@@ -3066,26 +3080,24 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // Speculative work is refused immediately rather than queued.
-        let shed = s
-            .submit(
+        // Speculative work waits for a permit rather than being dropped.
+        let s2 = s.clone();
+        let prefetch = tokio::spawn(async move {
+            s2.submit(
                 PathBuf::from("/m/prefetch"),
                 h264(),
                 file_sink(),
                 JobClass::Background,
                 JobHint::default(),
             )
-            .await;
-        assert_eq!(
-            shed,
-            Err(SchedError::Busy),
-            "prefetch must be shed, not queued"
-        );
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
 
-        // A client request in the same state still queues and still completes.
-        let s2 = s.clone();
+        // A client asks AFTER it, and must still be served BEFORE it.
+        let s3 = s.clone();
         let client = tokio::spawn(async move {
-            s2.submit(
+            s3.submit(
                 PathBuf::from("/m/client"),
                 h264(),
                 file_sink(),
@@ -3094,18 +3106,32 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
         let snap = s.snapshot().await.expect("snapshot");
         assert_eq!(
-            snap.pending_background, 0,
-            "nothing speculative in the queue"
+            snap.pending_background, 1,
+            "the prefetch must be held, not dropped"
         );
         assert_eq!(snap.pending_interactive, 1, "the client request is queued");
 
         assert!(client.await.unwrap().is_ok());
+        assert!(prefetch.await.unwrap().is_ok());
         for h in running {
             assert!(h.await.unwrap().is_ok());
         }
+        let got: Vec<String> = order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n != &"run")
+            .cloned()
+            .collect();
+        assert_eq!(
+            got,
+            ["client", "prefetch"],
+            "the client must take the first freed permit even though the \
+             prefetch asked for it first: {got:?}"
+        );
     }
 
     #[tokio::test]
@@ -3129,11 +3155,18 @@ mod tests {
         assert_eq!(done.out_bytes, 3);
     }
 
+    /// The last free permit is reserved: speculative work may not TAKE it while
+    /// only `background_headroom` permits remain, so a client request arriving a
+    /// moment later still finds a slot instead of queueing behind a guess.
+    ///
+    /// What the reserve refuses is the PERMIT, not the job. Since V58 the
+    /// refused prefetch waits rather than dying, so this asserts the permit was
+    /// not taken — the queue holds it and the device count is unchanged — where
+    /// it used to assert the error code the drop returned. That is the same
+    /// invariant measured one step closer to it: a `Busy` proves nothing about
+    /// what the device is doing.
     #[tokio::test]
     async fn speculative_work_leaves_headroom_for_a_client() {
-        // The last free permit is reserved: background is shed while only
-        // `background_headroom` permits remain, so a client request arriving a
-        // moment later still finds a slot instead of queueing behind a guess.
         let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
             WorkerRunResult::Done { out_bytes: 1 }
         });
@@ -3154,17 +3187,28 @@ mod tests {
             }));
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(
-            s.submit(
+        let s2 = s.clone();
+        let prefetch = tokio::spawn(async move {
+            s2.submit(
                 PathBuf::from("/m/prefetch"),
                 h264(),
                 file_sink(),
                 JobClass::Background,
                 JobHint::default(),
             )
-            .await,
-            Err(SchedError::Busy),
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let snap = s.snapshot().await.expect("snapshot");
+        assert_eq!(
+            snap.pending_background, 1,
             "the reserved permit is not for speculative work"
+        );
+        assert_eq!(
+            snap.devices.iter().map(|d| d.in_use).sum::<usize>(),
+            4,
+            "...so the free permit is still free: {:?}",
+            snap.devices
         );
         // ...and that reserved permit is there for the client.
         let done = s
@@ -3178,6 +3222,7 @@ mod tests {
             .await
             .expect("client must get the reserved permit");
         assert_eq!(done.queue_wait_ms, 0, "client did not wait");
+        assert!(prefetch.await.unwrap().is_ok(), "the prefetch still runs");
         for h in running {
             assert!(h.await.unwrap().is_ok());
         }
@@ -3367,6 +3412,15 @@ mod tests {
     /// speculative work everywhere: a prefetch that lands on an otherwise idle
     /// second device costs the client nothing, so the assertion counts what
     /// joined the client rather than what was admitted at all.
+    ///
+    /// The MECHANISM of that count changed when speculative work began to wait
+    /// for a permit instead of being dropped (V58). Counting GPU landings over
+    /// the whole test measured "beside the client" only while refused work
+    /// vanished; now a prefetch held back correctly still runs on that GPU a
+    /// moment after the client has finished with it, which is the design
+    /// working. `peer_jobs > background_peers` says the job was dispatched next
+    /// to at least one non-speculative peer, which is the invariant itself
+    /// rather than a proxy for it, and it is what the disarm check moves.
     #[tokio::test]
     async fn speculative_work_does_not_crowd_the_segment_a_client_is_waiting_for() {
         let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), |_, _| {
@@ -3416,16 +3470,18 @@ mod tests {
 
         let joined_the_client = results
             .iter()
-            .filter(|r| matches!(r, Ok(d) if d.device == gpu))
+            .filter(|r| matches!(r, Ok(d) if d.device == gpu && d.peer_jobs > d.background_peers))
             .count();
         assert_eq!(
             joined_the_client,
             SchedConfig::default().background_alongside_client,
-            "speculative jobs on the client's device: {results:?}"
+            "speculative jobs beside the client on its device: {results:?}"
         );
         assert!(
-            results.iter().any(|r| r == &Err(SchedError::Busy)),
-            "the cap must actually shed, not merely reorder: {results:?}"
+            results
+                .iter()
+                .any(|r| matches!(r, Ok(d) if d.queue_wait_ms > 0)),
+            "the cap must actually hold work back, not merely reorder it: {results:?}"
         );
         assert!(client.await.unwrap().is_ok());
     }
@@ -3589,9 +3645,12 @@ mod tests {
         for h in handles {
             results.push(h.await.unwrap());
         }
+        // Counted BESIDE the client rather than on the device at all: since V58
+        // a job the allowance held back is deferred, not dropped, and runs on
+        // this GPU once the client has left it.
         let joined_the_client = results
             .iter()
-            .filter(|r| matches!(r, Ok(d) if d.device == gpu))
+            .filter(|r| matches!(r, Ok(d) if d.device == gpu && d.peer_jobs > d.background_peers))
             .count();
         assert_eq!(
             joined_the_client, 2,
@@ -3714,9 +3773,13 @@ mod tests {
         for h in handles {
             results.push(h.await.unwrap());
         }
+        // Counted the same way as the crowding guard, and for the same reason:
+        // since V58 a job held back correctly still runs on this GPU once the
+        // client is done with it, so "landed on the GPU" is no longer the same
+        // question as "ran BESIDE the client".
         let joined = results
             .iter()
-            .filter(|r| matches!(r, Ok(d) if d.device == gpu))
+            .filter(|r| matches!(r, Ok(d) if d.device == gpu && d.peer_jobs > d.background_peers))
             .count();
         assert_eq!(
             joined, 2,

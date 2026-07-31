@@ -3578,43 +3578,16 @@ mod tests {
         );
     }
 
-    /// A scheduler that sheds every speculative job: one device, whose whole
-    /// capacity is the headroom reserved for client work, so a `Background`
-    /// submission is refused before it is ever dispatched. The spawner is
-    /// therefore never called — a shed costs no worker.
-    fn always_sheds_background() -> pharos_transcode::scheduler::TranscodeScheduler {
-        use pharos_transcode::scheduler::{SchedConfig, SpawnFuture, TranscodeScheduler};
-
-        struct NeverSpawns;
-        impl pharos_transcode::scheduler::WorkerSpawner for NeverSpawns {
-            fn spawn(&self, _id: pharos_transcode::protocol::WorkerId) -> SpawnFuture {
-                Box::pin(async {
-                    Err(std::io::Error::other(
-                        "the shed path must not need a worker",
-                    ))
-                })
-            }
-        }
-
-        TranscodeScheduler::spawn(
-            pharos_transcode::device::DeviceTable::from_probe(&[], 1),
-            Arc::new(NeverSpawns),
-            SchedConfig {
-                background_headroom: 1,
-                ..SchedConfig::default()
-            },
-        )
-    }
-
     /// A scheduler whose one worker holds its permit for `hold`, so a job can
     /// be observed mid-flight.
     fn holds_each_job(
         hold: std::time::Duration,
+        cpu_permits: usize,
+        cfg: pharos_transcode::scheduler::SchedConfig,
     ) -> pharos_transcode::scheduler::TranscodeScheduler {
         use pharos_transcode::protocol::{JobSpec, WorkerId};
         use pharos_transcode::scheduler::{
-            RunFuture, SchedConfig, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult,
-            WorkerSpawner,
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
         };
 
         struct Slow(std::time::Duration);
@@ -3642,9 +3615,9 @@ mod tests {
         }
 
         TranscodeScheduler::spawn(
-            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            pharos_transcode::device::DeviceTable::from_probe(&[], cpu_permits),
             Arc::new(Slow(hold)),
-            SchedConfig::default(),
+            cfg,
         )
     }
 
@@ -3662,7 +3635,11 @@ mod tests {
     async fn an_interactive_requester_joining_a_prefetch_promotes_it() {
         let dir = TempDir::new().unwrap();
         let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
-        let sched = holds_each_job(std::time::Duration::from_millis(600));
+        let sched = holds_each_job(
+            std::time::Duration::from_millis(600),
+            4,
+            pharos_transcode::scheduler::SchedConfig::default(),
+        );
         let cache = Arc::new(cache.with_scheduler(sched.clone()));
         let opts = slow_opts();
 
@@ -3724,6 +3701,68 @@ mod tests {
         let _ = joiner.await;
     }
 
+    /// The simplest thing the scheduler will place on the CPU: no video
+    /// judgement to make, nothing to resolve. It never encodes anything — it
+    /// exists only to hold the permit.
+    fn blocker_opts() -> pharos_transcode::TranscodeOptions {
+        slow_opts()
+            .resolve_with(|_| -> Result<_, std::convert::Infallible> {
+                unreachable!("Separate audio never asks for a slice")
+            })
+            .expect("infallible")
+            .to_transcode_options()
+    }
+
+    /// A scheduler that sheds every speculative job: one permit, already held
+    /// by a client's encode, and no room to queue behind it.
+    ///
+    /// Since V58 a refused `Background` submission WAITS for a permit rather
+    /// than dying, so "shed" is now what happens when the queue is full — which
+    /// is what `pending_cap: 0` makes of every refusal. The device is genuinely
+    /// occupied rather than merely reserved, because the reserve is clamped to
+    /// the pool's capacity minus one and an idle pool therefore always has room
+    /// for speculation; a helper that relied on the old "reserve >= capacity"
+    /// trick would silently start ADMITTING the job it exists to refuse.
+    ///
+    /// Returns once the permit is genuinely taken, so a `Background` submission
+    /// after this point is refused without ever reaching a worker.
+    async fn always_sheds_background() -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::scheduler::{
+            JobClass as JC, JobHint as JH, SchedConfig, SinkRequest,
+        };
+
+        let sched = holds_each_job(
+            std::time::Duration::from_secs(30),
+            1,
+            SchedConfig {
+                pending_cap: 0,
+                ..SchedConfig::default()
+            },
+        );
+        let blocker = sched.clone();
+        tokio::spawn(async move {
+            blocker
+                .submit(
+                    PathBuf::from("/no/source"),
+                    blocker_opts(),
+                    SinkRequest::FileDirect {
+                        out_path: PathBuf::from("/dev/null"),
+                    },
+                    JC::Interactive,
+                    JH::default(),
+                )
+                .await
+        });
+        for _ in 0..200 {
+            let snap = sched.snapshot().await.expect("snapshot");
+            if snap.devices.iter().map(|d| d.in_use).sum::<usize>() > 0 {
+                return sched;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the blocker never took the only permit");
+    }
+
     /// A DRIVING requester keeps its own shed, and SUBMITS ONCE. Shedding work
     /// you submitted yourself is the intended behaviour (B108/V58), and the
     /// fall-through above must not quietly become a retry loop that defeats it:
@@ -3755,7 +3794,7 @@ mod tests {
         let (cache, err) = metrics::with_local_recorder(&recorder, || {
             rt.block_on(async {
                 // The scheduler is built inside the runtime it will live on.
-                let cache = cache.with_scheduler(always_sheds_background());
+                let cache = cache.with_scheduler(always_sheds_background().await);
                 // Nothing is in flight, so this request drives its own encode —
                 // and its own encode is shed.
                 let err = cache
