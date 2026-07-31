@@ -557,14 +557,12 @@ struct JobCtx {
     /// against that stream's playhead. `StreamKey::NONE` for jobs with no
     /// known session (the transcode tool, tests, non-playback work).
     ///
-    /// Read by `lookahead_distance`, which nothing calls yet — queue
-    /// ordering lands in a later task. `#[allow(dead_code)]` until then.
-    #[allow(dead_code)]
+    /// Read by `lookahead_distance`, which `next_to_dispatch` consults on every
+    /// freed permit.
     stream: StreamKey,
     /// Segment index within `stream`. `None` for anything that is not a
-    /// numbered segment (e.g. a whole-file/live job). Same "not read until
-    /// queue ordering lands" note as `stream`.
-    #[allow(dead_code)]
+    /// numbered segment (e.g. a whole-file/live job), which sorts last: nothing
+    /// is known to be about to need it.
     segment: Option<u32>,
     /// Device this job is currently running on. `None` while queued. Lets a
     /// snapshot attribute each device's occupancy to the jobs holding it,
@@ -638,11 +636,6 @@ fn note_playhead(state: &mut SchedState, stream: StreamKey, segment: u32) {
 ///
 /// `i64` so "already passed" is representable. Jobs with no stream or no segment
 /// sort last: nothing is known to be about to need them.
-///
-/// Unused for now — this task is plumbing (the stream/segment hint and the
-/// playhead bookkeeping); queue ordering that actually reads this distance
-/// lands in a later task. `#[allow(dead_code)]` until then.
-#[allow(dead_code)]
 fn lookahead_distance(state: &SchedState, ctx: &JobCtx) -> i64 {
     let (Some(seg), Some((head, _))) = (ctx.segment, state.playheads.get(&ctx.stream)) else {
         return i64::MAX;
@@ -1358,16 +1351,117 @@ fn free_permits(state: &SchedState, candidates: &[DeviceId]) -> usize {
         .sum()
 }
 
-/// A job that waited longer than this before starting is reported with the
-/// state of the queue it just escaped. One segment covers 6 s of playback, so
-/// a wait past this is already eating a client's buffer.
+/// May speculative work take one of `candidates`' permits *right now*?
+///
+/// The one admission rule, consulted identically by both dispatch paths so the
+/// arrival path and the drain path cannot drift into reserving different
+/// amounts. Recomputed each time it is asked: it is a statement about the
+/// device table now, never a verdict cached on a job.
+///
+/// The reserve is clamped to the candidate pool's own capacity minus one. That
+/// clamp used to be unnecessary — a refused speculative job was DROPPED, so a
+/// reserve as large as the pool merely meant "no prefetch on this pool". Now
+/// the job queues instead, and a job that can never satisfy the reserve is a
+/// job whose caller's `submit().await` never resolves. A pool cannot reserve
+/// its own last permit against itself.
+fn background_may_dispatch(state: &SchedState, candidates: &[DeviceId]) -> bool {
+    let capacity: usize = candidates
+        .iter()
+        .filter_map(|d| state.devices.slot(*d))
+        .map(|s| s.capacity)
+        .sum();
+    let reserve = state
+        .cfg
+        .background_headroom
+        .min(capacity.saturating_sub(1));
+    free_permits(state, candidates) > reserve
+}
+
+/// Park a job that could not be dispatched, or refuse it if the queue is full.
+///
+/// Both classes now come through here. Speculative work queues because dropping
+/// it meant the loser of a two-viewer race took a cold interactive miss on every
+/// segment while the winner built a deep buffer; deferred beats never. It is
+/// safe to queue only because a queued job no longer holds the segment cache's
+/// per-key lock (006 phase 2a — that is what turned a deferred prefetch into a
+/// client's 90 s wait, B108) and because it is re-ranked by urgency at dispatch
+/// rather than served FIFO (see `next_to_dispatch`).
+///
+/// `pending_cap` is still a hard stop: a full queue replies `Busy` rather than
+/// growing without bound.
+fn queue_or_refuse(state: &mut SchedState, job_id: JobId, ctx: JobCtx) {
+    if state.pending.len() >= state.cfg.pending_cap {
+        let _ = ctx.reply.send(Err(SchedError::Busy));
+    } else {
+        state.pending.push_back((job_id, ctx));
+    }
+}
+
+/// Which queued job should take the permit that just freed.
+///
+/// Tier is absolute — every Interactive before any Background — because someone
+/// is blocked on each of the former and nobody on any of the latter. Within
+/// Interactive it is FIFO, by queue index: all equally urgent, so the one that
+/// asked first goes first. Within Background it is ascending lookahead
+/// distance, recomputed HERE against each stream's current playhead.
+///
+/// Recomputing is the whole point. Distance is a property of NOW: a job queued
+/// 30 s ago at distance 6 may now be distance 1 — the most urgent thing in the
+/// queue — or already passed. Freezing urgency at submit time ranks both cases
+/// exactly backwards, so the distance is never cached on the job.
+///
+/// O(n) over `pending_cap` (256) rather than a heap: every key moves whenever
+/// any client advances, so a heap would be re-keyed far more often than popped.
+fn next_to_dispatch(state: &SchedState) -> Option<usize> {
+    state
+        .pending
+        .iter()
+        .enumerate()
+        .min_by_key(|(idx, (_, ctx))| match ctx.class {
+            JobClass::Interactive => (0i64, *idx as i64),
+            JobClass::Background => (1i64, lookahead_distance(state, ctx)),
+        })
+        .map(|(idx, _)| idx)
+}
+
+/// Is there a permit anywhere for a queued job to take?
+///
+/// The one condition under which NO queued job of any class can be placed, and
+/// therefore the only safe reason to stop draining early — see `drain_pending`.
+fn any_permit_free(state: &SchedState) -> bool {
+    state.devices.slots().iter().any(|s| s.available() > 0)
+}
+
+/// A CLIENT'S job that waited longer than this before starting is reported with
+/// the state of the queue it just escaped. One segment covers 6 s of playback,
+/// so a wait past this is already eating a client's buffer.
 const LONG_WAIT_MS: u64 = 3_000;
 
+/// The same, for speculative work — an order of magnitude looser because a long
+/// wait means something completely different there.
+///
+/// Prefetch is submitted for a segment nobody has asked for and is now allowed
+/// to WAIT for a permit instead of being dropped; sitting in the queue for
+/// seconds is the design working, not an incident. Judged at `LONG_WAIT_MS`
+/// every queued prefetch under load would warn, and the client-side signal this
+/// exists for would be buried in noise the moment it mattered most. It stays
+/// reported, though — a prefetch that waited half a minute says the pool is
+/// oversubscribed, which is worth knowing — just at a threshold that only fires
+/// when the queue has genuinely stopped moving.
+const LONG_BACKGROUND_WAIT_MS: u64 = 30_000;
+
 /// Report a job that queued for a long time *together with what it queued
-/// behind*. `queue_wait_ms` on the finished job says a segment waited; only
-/// the composition of the queue at the moment it was finally dispatched says
-/// whether it waited behind other client requests (genuine overload) or behind
-/// speculative warm-up nobody was waiting for (a scheduling defect).
+/// behind*. `queue_wait_ms` on the finished job says a segment waited; only the
+/// composition of the queue at the moment it was finally dispatched says what it
+/// waited behind.
+///
+/// Read `inflight_background` for "this client waited behind speculation" — that
+/// is now the ONLY way it can happen. Queued speculation can no longer be ahead
+/// of a client, because selection is tier-absolute (see `next_to_dispatch`), so
+/// a large `pending_background` is speculative work being held back, which is
+/// the system working rather than the scheduling defect the same number used to
+/// mean. `pending_interactive` + `inflight_interactive` remain the genuine
+/// overload reading.
 fn warn_if_long_wait(
     state: &SchedState,
     job_id: JobId,
@@ -1378,7 +1472,11 @@ fn warn_if_long_wait(
     let waited_ms = dispatched_at
         .saturating_duration_since(ctx.enqueued)
         .as_millis() as u64;
-    if waited_ms < LONG_WAIT_MS {
+    let threshold_ms = match ctx.class {
+        JobClass::Interactive => LONG_WAIT_MS,
+        JobClass::Background => LONG_BACKGROUND_WAIT_MS,
+    };
+    if waited_ms < threshold_ms {
         return;
     }
     let (mut pend_i, mut pend_b) = (0usize, 0usize);
@@ -1400,6 +1498,11 @@ fn warn_if_long_wait(
         %device,
         class = %ctx.class,
         waited_ms,
+        // Which bar this line cleared. Without it a reader cannot tell a
+        // 4 s client wait from a 4 s prefetch wait that simply did not warn,
+        // and would read the absence of speculative lines as an absence of
+        // speculative waits.
+        threshold_ms,
         retries = ctx.retries,
         pending_interactive = pend_i,
         pending_background = pend_b,
@@ -1576,23 +1679,25 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
     }
 
     // Speculative work waits for nobody, so it must not make anybody wait.
-    // Prefetch is dispatched *before* the segment the client is blocked on
-    // (it pipelines, by design), and shared one FIFO with that request: a
+    // Prefetch is dispatched *before* the segment the client is blocked on (it
+    // pipelines, by design), and once shared one FIFO with that request: a
     // handful of requests could therefore bury a client's own segment under
     // tens of speculative encodes, turning a 3 s encode into a 90 s wait.
-    // Background work now runs only out of genuine spare capacity — it is
-    // shed the moment taking a permit would eat into the reserve, and it
-    // never enters the queue at all.
-    if ctx.class == JobClass::Background
-        && free_permits(state, &candidates) <= state.cfg.background_headroom
-    {
+    // Background work therefore takes a permit only out of capacity above the
+    // reserve, which is what keeps one within reach of a client arriving a
+    // moment later.
+    //
+    // Refused here it now WAITS rather than dying: the reserve says "not out of
+    // this permit", not "not ever", and the queue re-ranks it by urgency on
+    // every completion.
+    if ctx.class == JobClass::Background && !background_may_dispatch(state, &candidates) {
         tracing::debug!(
             %job_id,
             candidates = ?candidates,
             headroom = state.cfg.background_headroom,
-            "speculative transcode shed: no spare capacity"
+            "speculative transcode queued: no spare capacity above the reserve"
         );
-        let _ = ctx.reply.send(Err(SchedError::Busy));
+        queue_or_refuse(state, job_id, ctx);
         return;
     }
 
@@ -1649,34 +1754,49 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
         }
     }
 
-    // All candidate permits busy → queue (or backpressure). Background work
-    // never queues: by the time a permit frees, the client has usually asked
-    // for the segment itself, and a queued speculative job holds the cache's
-    // per-key fetch lock — so that client request would inherit the whole wait
-    // it was meant to be spared.
-    if ctx.class == JobClass::Background {
-        let _ = ctx.reply.send(Err(SchedError::Busy));
-        return;
-    }
-    if state.pending.len() >= state.cfg.pending_cap {
-        let _ = ctx.reply.send(Err(SchedError::Busy));
-    } else {
-        state.pending.push_back((job_id, ctx));
-    }
+    // Every candidate permit is busy (or, for speculative work, held by a
+    // client past what this device has earned) → wait for one.
+    queue_or_refuse(state, job_id, ctx);
 }
 
-/// On a freed permit, walk the pending queue and dispatch what now fits.
-/// Jobs that still don't fit stay queued in order.
+/// On a freed permit, dispatch queued work in urgency order until nothing else
+/// fits.
+///
+/// SELECTS rather than pops: order in `pending` is arrival order, and arrival
+/// order is not urgency order. A job passed over stays queued and is
+/// reconsidered — at a freshly computed distance — on the next free permit.
+///
+/// It deliberately does NOT stop at the first job it could not place. That
+/// shortcut reads as "the most urgent candidate found no permit, so no less
+/// urgent one will either", and that reasoning does not hold here: jobs have
+/// different ELIGIBLE DEVICE SETS. A VP9 job is CPU-only, and a job that has
+/// already failed transiently carries its own `excluded` list — so a free NVENC
+/// permit can sit idle behind a queued job that could never have used it. The
+/// loop instead runs while ANY permit is free, which is the only condition
+/// under which no job of any class can be placed, and terminates because every
+/// iteration removes exactly one entry from `pending`. Worst case is O(n²) key
+/// comparisons with n ≤ `pending_cap`, on an event that happens at segment rate.
+///
+/// Passed-over jobs go back in FRONT of what was never examined, not behind it.
+/// Selection walks Interactive in arrival order (tier is absolute, then queue
+/// index), so the examined interactive jobs are always an arrival-order prefix
+/// of the queued ones; putting them back at the front is what keeps
+/// `next_to_dispatch`'s FIFO tiebreak honest on the next pass. Appending them
+/// instead would push the client who waited longest behind the one who waited
+/// least, one drain at a time.
 fn drain_pending(state: &mut SchedState, self_tx: &mpsc::Sender<SchedMsg>) {
-    let mut requeue: VecDeque<(JobId, JobCtx)> = VecDeque::new();
-    while let Some((job_id, ctx)) = state.pending.pop_front() {
-        // Try to place; if it can't grab a permit it returns to the queue.
-        // To detect "couldn't place", check inflight membership after.
-        let before_inflight = state.inflight.contains_key(&job_id);
-        try_place_no_queue(state, job_id, ctx, self_tx, &mut requeue);
-        let _ = before_inflight; // (kept for clarity; placement tracked in requeue)
+    let mut passed_over: VecDeque<(JobId, JobCtx)> = VecDeque::new();
+    while any_permit_free(state) {
+        let Some(idx) = next_to_dispatch(state) else {
+            break;
+        };
+        let Some((job_id, ctx)) = state.pending.remove(idx) else {
+            break;
+        };
+        try_place_no_queue(state, job_id, ctx, self_tx, &mut passed_over);
     }
-    state.pending = requeue;
+    passed_over.append(&mut state.pending);
+    state.pending = passed_over;
 }
 
 /// Like `place` but never re-queues internally — a job that can't get a
@@ -1709,10 +1829,25 @@ fn try_place_no_queue(
         let _ = ctx.reply.send(Err(SchedError::Failed(err)));
         return;
     }
+    // The same reserve the arrival path applies, recomputed against the device
+    // table as it is now. Speculative work reached this path for the first time
+    // in this task, so without it a queued prefetch would drain straight onto
+    // the permit `background_headroom` exists to hold open for a client.
+    if ctx.class == JobClass::Background && !background_may_dispatch(state, &candidates) {
+        requeue.push_back((job_id, ctx));
+        return;
+    }
     for dev in candidates.iter().copied() {
         let Some(slot) = state.devices.slot(dev) else {
             continue;
         };
+        // ...and the same crowding gate, for the same reason: a free permit is
+        // not free throughput, and a queued prefetch that drains onto the
+        // device encoding a client's segment slows that client exactly as much
+        // as one admitted on arrival would have.
+        if ctx.class == JobClass::Background && crowds_a_client(state, dev) {
+            continue;
+        }
         if let Ok(permit) = slot.sem.clone().try_acquire_owned() {
             let span = record_placement(job_id, dev, &ctx, &candidates);
             let worker = state.idle.pop();
@@ -1754,8 +1889,8 @@ fn try_place_no_queue(
             return;
         }
     }
-    // Background work never enters `pending` (see `place`), so this can only
-    // be reached by a job that was queued as interactive. Re-queue it.
+    // No candidate had a permit to give (or every one that did is already
+    // carrying a client past what it has earned). Back into the queue.
     requeue.push_back((job_id, ctx));
 }
 
@@ -4025,6 +4160,300 @@ mod tests {
             snap.playheads.get(&last).copied(),
             Some(256),
             "the most recently touched stream must survive"
+        );
+    }
+
+    /// What makes it safe for speculative work to wait at all: the client that
+    /// joins it does not wait at its tier.
+    ///
+    /// The segment cache shares one encode between everybody who asks for that
+    /// segment, so a client arriving behind a prefetch waits on the prefetch's
+    /// job. If that job kept its class, the client would sit behind every guess
+    /// in the queue and behind every other client's work — including work
+    /// submitted after it started waiting. Promotion is what breaks that, and
+    /// this asserts it beats the distance ordering rather than merely joining
+    /// it: the promoted job is the FURTHEST from its playhead, so speculative
+    /// ranking alone would dispatch it last of the three.
+    #[tokio::test]
+    async fn a_promoted_queued_job_outranks_every_speculative_one() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(120), move |_, spec| {
+            seen.lock().unwrap().push(
+                spec.input
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(1), spawner, SchedConfig::default());
+        let stream = StreamKey::of("viewer");
+
+        // Two client requests occupy both permits; the first also puts the
+        // viewer's playhead at 100.
+        let mut blockers = Vec::new();
+        for (tag, seg) in [("block-1", Some(100)), ("block-2", None)] {
+            let s2 = s.clone();
+            blockers.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint {
+                        stream,
+                        segment: seg,
+                    },
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // `far` is six segments out; `near`/`mid` are one and two. On distance
+        // alone `far` goes last.
+        let slot = JobSlot::new();
+        let mut watch_id = slot.subscribe();
+        let mut handles = Vec::new();
+        for (tag, seg, assigned) in [
+            ("far", 106u32, Some(slot)),
+            ("near", 101, None),
+            ("mid", 102, None),
+        ] {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                s2.submit_tracked(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                    JobHint {
+                        stream,
+                        segment: Some(seg),
+                    },
+                    assigned,
+                )
+                .await
+            }));
+        }
+        let far_id = await_job_id(&mut watch_id).await.expect("an assigned id");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let queued = s.snapshot().await.expect("snapshot");
+        assert_eq!(queued.pending_background, 3, "precondition: all three wait");
+
+        // A client asks for `far`'s segment and coalesces onto it.
+        s.promote(far_id).await;
+
+        for h in blockers {
+            h.await.unwrap().unwrap();
+        }
+        for h in handles {
+            h.await.unwrap().expect("queued work must still complete");
+        }
+        let got: Vec<String> = order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| !n.starts_with("block-"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            got,
+            ["far", "near", "mid"],
+            "the job a client is blocked on must go first even though it is the \
+             least urgent guess in the queue"
+        );
+    }
+
+    /// Two things about the drain loop that a queue of interchangeable jobs
+    /// cannot show, because they only appear when queued jobs have DIFFERENT
+    /// eligible device sets. VP9 has no NVENC encoder, so a VP9 job here can
+    /// only ever run on the CPU while an H264 job can use either device.
+    ///
+    /// 1. A job that cannot be placed must not stall the queue behind it. "The
+    ///    most urgent candidate found no permit, so no less urgent one will
+    ///    either" is false: `i1` is stuck waiting for the CPU while the GPU
+    ///    permit that just freed is one `i2` could take. Stopping there leaves
+    ///    an encoder idle for a whole encode.
+    /// 2. ...and it must not lose its turn for being passed over. `i1` asked
+    ///    before `i3`; putting passed-over work at the BACK of the queue would
+    ///    hand `i3` the next CPU permit and push the client who has already
+    ///    waited longest further back, one drain at a time.
+    #[tokio::test]
+    async fn a_queued_job_that_cannot_be_placed_neither_stalls_the_queue_nor_loses_its_turn() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(400), move |_, spec| {
+            seen.lock().unwrap().push(
+                spec.input
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(1), spawner, SchedConfig::default());
+        let vp9 = || {
+            let mut o = h264();
+            o.video = Some(VideoCodec::Vp9);
+            o
+        };
+        let spawn_job = |tag: &'static str, opts: TranscodeOptions| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    opts,
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint::default(),
+                )
+                .await
+            })
+        };
+
+        // The GPU permit frees first (same encode duration, dispatched first),
+        // while the CPU one is still held.
+        let block_gpu = spawn_job("block-gpu", h264());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let block_cpu = spawn_job("block-cpu", vp9());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Queued in arrival order: a CPU-only job, then two that could use
+        // either device.
+        let i1 = spawn_job("i1", vp9());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let i2 = spawn_job("i2", h264());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let i3 = spawn_job("i3", h264());
+
+        for h in [block_gpu, block_cpu, i1, i2, i3] {
+            h.await.unwrap().unwrap();
+        }
+        let got: Vec<String> = order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| !n.starts_with("block-"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            got,
+            ["i2", "i1", "i3"],
+            "i2 must take the freed GPU permit i1 could not use, and i1 must \
+             still keep its place ahead of i3"
+        );
+    }
+
+    /// The motivating case: two viewers, each prefetching a window. Speculative
+    /// work used to be dropped the instant no permit was free, so whoever
+    /// submitted first took all the capacity and the loser of the race took a
+    /// cold interactive miss on every segment while the winner built a deep
+    /// buffer.
+    ///
+    /// Arrival order and urgency order are made to DISAGREE on purpose: viewer
+    /// A queues its whole window before viewer B queues anything, and inside
+    /// each window the DISTANT segment is submitted first. A queue that still
+    /// popped its front would dispatch `a-6` first and `b-1` last, so nothing
+    /// asserted here is reachable by leaving the dispatch order alone.
+    #[tokio::test]
+    async fn every_streams_nearest_segment_is_served_before_any_streams_distant_one() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = order.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(120), move |_, spec| {
+            seen.lock().unwrap().push(
+                spec.input
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        // One GPU permit plus the always-present CPU one. `h264()` (mpegts)
+        // rather than `cmaf()`: a shared-init fMP4 job is pinned to a single
+        // device, which would take the CPU permit out of play and make the
+        // capacity under test something other than what it looks like.
+        let s = TranscodeScheduler::spawn(one_gpu(1), spawner, SchedConfig::default());
+
+        let a = StreamKey::of("viewer-a");
+        let b = StreamKey::of("viewer-b");
+
+        // Both viewers are at segment 100, and each says so the only way a
+        // playhead is ever set: with a request a client is blocked on. The two
+        // blockers also occupy every permit, so everything below must queue.
+        let mut blockers = Vec::new();
+        for (stream, tag) in [(a, "block-a"), (b, "block-b")] {
+            let s2 = s.clone();
+            blockers.push(tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(format!("/m/{tag}")),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint {
+                        stream,
+                        segment: Some(100),
+                    },
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Viewer A submits its whole prefetch window before viewer B submits
+        // anything — the exact submission order that used to starve B.
+        let mut handles = Vec::new();
+        for (stream, tag, ahead) in [(a, "a", 6u32), (a, "a", 1), (b, "b", 6), (b, "b", 1)] {
+            let s2 = s.clone();
+            let p = PathBuf::from(format!("/m/{tag}-{ahead}"));
+            handles.push(tokio::spawn(async move {
+                s2.submit(
+                    p,
+                    h264(),
+                    file_sink(),
+                    JobClass::Background,
+                    JobHint {
+                        stream,
+                        segment: Some(100 + ahead),
+                    },
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snap = s.snapshot().await.unwrap();
+        assert_eq!(
+            snap.pending_background, 4,
+            "speculative work must wait for a permit, not be dropped on the floor"
+        );
+
+        for h in blockers {
+            h.await.unwrap().unwrap();
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("queued speculative work must still complete");
+        }
+
+        let got: Vec<String> = order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| !n.starts_with("block-"))
+            .cloned()
+            .collect();
+        assert_eq!(got.len(), 4, "every queued job must have run: {got:?}");
+        let first_two: std::collections::BTreeSet<&str> =
+            got[..2].iter().map(String::as_str).collect();
+        assert_eq!(
+            first_two,
+            ["a-1", "b-1"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "both viewers' next-needed segment must run before either viewer's \
+             distant one, whatever order they were submitted in: {got:?}"
         );
     }
 }
