@@ -325,6 +325,100 @@ mod tests {
         assert_eq!(c.allowance(DeviceId::Cpu, 4), 1);
     }
 
+    /// Raises a device above the floor via two exercised successes, then feeds
+    /// ONE contended miss and asserts the EXACT post-decrease value. This is
+    /// the case the review found missing: every existing decrease-path test
+    /// either starts at the floor or asserts a value the floor clamp would
+    /// produce anyway, so a decrease that was deleted outright — or replaced
+    /// by subtraction — would still pass the whole suite.
+    ///
+    /// Arithmetic (capacity 8 ⇒ ceiling 7; floor 1.0, increase_step 1.0,
+    /// decrease_factor 0.5, margin_ratio 0.5):
+    ///   start:                     1.0 (floor, device unseen)
+    ///   observe(met(peers=1)):     1 >= floor(1.0)=1 ⇒ exercised ⇒ 1.0 + 1.0 = 2.0
+    ///   observe(met(peers=2)):     2 >= floor(2.0)=2 ⇒ exercised ⇒ 2.0 + 1.0 = 3.0
+    ///   observe(missed(peers=1)):  contended miss    ⇒ 3.0 * 0.5           = 1.5
+    ///
+    /// `raw_allowance` must land exactly on 1.5. `allowance()` floors, and
+    /// floor(1.5) == floor(1.0) == 1, so only the unfloored value proves the
+    /// multiplication happened rather than, say, a subtraction (3.0 - 1.0 =
+    /// 2.0) or the decrease being a no-op (3.0 unchanged).
+    #[test]
+    fn a_contended_miss_multiplicatively_halves_an_elevated_allowance() {
+        let mut c = AdmissionController::new(AdmissionConfig::default());
+        assert_eq!(c.observe(gpu(), 8, met(1)), Verdict::Met);
+        assert_eq!(c.raw_allowance(gpu(), 8), 2.0);
+        assert_eq!(c.observe(gpu(), 8, met(2)), Verdict::Met);
+        assert_eq!(c.raw_allowance(gpu(), 8), 3.0);
+
+        let before = c.raw_allowance(gpu(), 8);
+        assert_eq!(c.observe(gpu(), 8, missed(1)), Verdict::Missed);
+        let after = c.raw_allowance(gpu(), 8);
+
+        assert_eq!(
+            after, 1.5,
+            "3.0 * decrease_factor(0.5) = 1.5 -- not 3.0-1.0=2.0 (subtraction) \
+             nor 3.0 (no-op)"
+        );
+        assert!(
+            after < before,
+            "a contended miss must strictly lower the allowance"
+        );
+        assert_eq!(
+            c.allowance(gpu(), 8),
+            1,
+            "floor(1.5) == floor(1.0) == 1, which is exactly why raw_allowance \
+             above is the assertion that matters"
+        );
+    }
+
+    /// The defensive input guards in `observe`/`ceiling` have no coverage
+    /// today. Each must report `Ignored` and leave state untouched -- and for
+    /// capacity 0, must not panic on the `capacity - 1` ceiling arithmetic.
+    #[test]
+    fn defensive_guards_reject_bad_input_without_panicking_or_mutating_state() {
+        let mut c = AdmissionController::new(AdmissionConfig::default());
+
+        // capacity == 0: `ceiling()` saturates instead of underflowing, so
+        // the device still reports the floor rather than panicking.
+        assert_eq!(c.allowance(gpu(), 0), 1);
+        assert_eq!(c.raw_allowance(gpu(), 0), 1.0);
+
+        // Seed a non-floor baseline so "state unchanged" below is a real
+        // assertion rather than another floor coincidence.
+        assert_eq!(c.observe(gpu(), 8, met(1)), Verdict::Met);
+        let baseline = c.raw_allowance(gpu(), 8);
+        assert_eq!(baseline, 2.0);
+
+        let nan = Observation {
+            encode_seconds: f64::NAN,
+            ..missed(1)
+        };
+        assert_eq!(c.observe(gpu(), 8, nan), Verdict::Ignored);
+        assert_eq!(c.raw_allowance(gpu(), 8), baseline);
+
+        let infinite = Observation {
+            encode_seconds: f64::INFINITY,
+            ..missed(1)
+        };
+        assert_eq!(c.observe(gpu(), 8, infinite), Verdict::Ignored);
+        assert_eq!(c.raw_allowance(gpu(), 8), baseline);
+
+        let zero_segment = Observation {
+            segment_seconds: Some(0.0),
+            ..missed(1)
+        };
+        assert_eq!(c.observe(gpu(), 8, zero_segment), Verdict::Ignored);
+        assert_eq!(c.raw_allowance(gpu(), 8), baseline);
+
+        let negative_segment = Observation {
+            segment_seconds: Some(-1.0),
+            ..missed(1)
+        };
+        assert_eq!(c.observe(gpu(), 8, negative_segment), Verdict::Ignored);
+        assert_eq!(c.raw_allowance(gpu(), 8), baseline);
+    }
+
     /// The verdict strings are a dashboard contract.
     #[test]
     fn verdict_labels_are_distinct_and_stable() {
