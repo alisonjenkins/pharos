@@ -610,47 +610,35 @@ pub struct SchedConfig {
     /// free across the devices that could take it, so a burst of prefetch can
     /// never occupy the last slot a client request would have used.
     pub background_headroom: usize,
-    /// FLOOR for the learned speculative allowance — see
-    /// [`crate::admission::AdmissionController`].
+    /// How the per-device speculative allowance is learned.
     ///
-    /// This was the allowance itself, a number calibrated by hand on one GTX
-    /// 1070 against one 23 Mbps HEVC source. It is now the value a device sits
-    /// on before it has learned anything, and the value it collapses back to
-    /// under sustained deadline misses, so a cold process behaves exactly as
-    /// it did when this was the whole answer.
+    /// `floor` here is what `background_alongside_client` used to be: a
+    /// concurrency constant calibrated by hand on one GTX 1070 against one
+    /// 23 Mbps HEVC source, now demoted to the value a device sits on before it
+    /// has learned anything and the value it collapses back to under sustained
+    /// deadline misses. That field is GONE rather than kept beside this one —
+    /// it had become a `usize` copy of `admission.floor` read by nothing except
+    /// a test asserting the code against it, which is a guard that cannot fail.
     ///
-    /// Not zero. Refusing ALL prefetch while a client job runs would starve
-    /// the pipeline that makes the next segment a 30 ms cache hit. That was
-    /// true when refused prefetch was dropped outright, and it stayed true when
-    /// it began to wait for a permit instead (V58): a job refused on every
-    /// device it could use is a job that is never selected, so a zero allowance
-    /// starves it just as completely — it merely starves it in the queue rather
-    /// than at the door.
-    ///
-    /// Derived from `admission.floor` in `Default` rather than restated as
-    /// its own literal: this and `AdmissionConfig::floor` are the same number
-    /// in two types (`usize` here for the pre-learning admission math that
-    /// used to read it directly, `f64` there for the AIMD arithmetic), and a
-    /// hand-kept duplicate is exactly the kind of pair that drifts apart one
-    /// edit at a time.
-    pub background_alongside_client: usize,
-    /// How the per-device speculative allowance is learned. `floor` here is
-    /// the value `background_alongside_client` used to be — see that field's
-    /// doc comment for why the two cannot be set independently.
+    /// The floor is not zero. Refusing ALL prefetch while a client job runs
+    /// would starve the pipeline that makes the next segment a 30 ms cache hit.
+    /// That was true when refused prefetch was dropped outright, and it stayed
+    /// true when it began to wait for a permit instead (V58): a job refused on
+    /// every device it could use is a job that is never selected, so a zero
+    /// allowance starves it just as completely — it merely starves it in the
+    /// queue rather than at the door.
     pub admission: AdmissionConfig,
 }
 
 impl Default for SchedConfig {
     fn default() -> Self {
-        let admission = AdmissionConfig::default();
         Self {
             inbox_depth: 256,
             pending_cap: 256,
             cooldown: Duration::from_secs(2),
             max_retries: 3,
             background_headroom: 1,
-            background_alongside_client: admission.floor as usize,
-            admission,
+            admission: AdmissionConfig::default(),
         }
     }
 }
@@ -4598,9 +4586,12 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, Ok(d) if d.device == gpu && d.peer_jobs > d.background_peers))
             .count();
+        // A LITERAL, not `SchedConfig::default().<the same constant>`. The
+        // expected value and the behaviour under test must not come from one
+        // source, or the guard restates the code instead of checking it: read
+        // off the floor, this assertion passed for any floor whatever.
         assert_eq!(
-            joined_the_client,
-            SchedConfig::default().background_alongside_client,
+            joined_the_client, 1,
             "speculative jobs beside the client on its device: {results:?}"
         );
         assert!(
