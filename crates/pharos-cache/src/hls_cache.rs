@@ -206,9 +206,16 @@ enum SegmentOutcome {
     /// refused — the work stopped being wanted, which is what an episode swap
     /// or a `DELETE /Videos/ActiveEncodings` does to a window of prefetch. It is
     /// the arm that keeps `pharos_segment_produced_total` a partition of
-    /// production attempts (V128) now that an attempt can end this way, and it
-    /// is the query that says how much speculative encoding a swap actually
-    /// reclaims — the thing PR #75 existed to do and could never be shown doing.
+    /// production attempts (V128) now that an attempt can end this way.
+    ///
+    /// It counts ABANDONMENTS, not capacity returned, and the two are different
+    /// numbers. An encode is only stopped while its job is still QUEUED — past
+    /// dispatch the worker owns a device permit and finishes regardless
+    /// (`JobSlot::is_dispatched`) — so this says how many encodes never started,
+    /// which is what PR #75 existed to prevent and could never be shown
+    /// preventing. GPU seconds handed back is a different question, and
+    /// `pharos_transcode_queue_outcome_total{outcome="abandoned"}` is nearer to
+    /// it.
     Cancelled,
 }
 
@@ -3857,7 +3864,7 @@ mod tests {
         let (labels, value) = produced_series(&snapshotter, "cancelled").expect(
             "an encode stopped because every requester went away must be counted \
              — it is the only signal that says how much speculative work an \
-             episode swap actually reclaims",
+             episode swap abandons before it can start",
         );
         assert!(
             labels.contains(&"class=background".to_string()),
