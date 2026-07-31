@@ -349,6 +349,39 @@ fn record_coalesced_shed(media_id: u64, seg_index: u32, opts: &SegmentOpts, clas
     );
 }
 
+/// Count one V127 re-drive: a requester declining an admission decision made
+/// about somebody else's job and driving its own encode instead.
+///
+/// This is the SAFETY VALVE for a defect that reached a viewer as a 500 on a
+/// video segment (B134): a client coalescing onto a speculative driver and
+/// inheriting its `SchedulerBusy`. It was `debug!`-only, which at the
+/// deployment's log level is invisible — so the one signal that says how often
+/// the valve is load-bearing could not be read at all, and neither could its
+/// disappearance if a refactor stopped the fall-through firing.
+///
+/// A COUNTER of its own rather than another `pharos_segment_produced_total`
+/// arm, and deliberately so. A re-drive produces no outcome yet — the second
+/// attempt does, and records itself — so folding it into that counter would
+/// break the partition V128 requires by double-counting one request. (The
+/// objection once raised against instrumenting this, that it would corrupt
+/// `outcome="shed"`, was already answered on this branch by `coalesced_shed`:
+/// the answer is a distinct series, not silence.)
+///
+/// `class` is the RE-DRIVING requester's own — two values, bounded.
+fn record_redrive(media_id: u64, seg_index: u32, class: JobClass) {
+    metrics::counter!(
+        "pharos_segment_redrive_total",
+        "class" => class.label(),
+    )
+    .increment(1);
+    tracing::debug!(
+        media.id = media_id,
+        seg = seg_index,
+        class = class.label(),
+        "hls segment: re-driving rather than inheriting another job's shed"
+    );
+}
+
 /// Which counter, if any, a failed wait on the shared registry belongs to.
 ///
 /// One decision in one place, because V91 tells an operator to SUM these and
@@ -1224,12 +1257,7 @@ impl HlsSegmentCache {
             if !(inherited_shed && attempt == 1) {
                 break (outcome, driving, driver_gone);
             }
-            tracing::debug!(
-                media.id = media_id,
-                seg = seg_index,
-                class = class.label(),
-                "hls segment: re-driving rather than inheriting another job's shed"
-            );
+            record_redrive(media_id, seg_index, class);
             // The driver publishes and only THEN drops its guard, so between
             // those two points the registration is a corpse: an entry whose
             // outcome is already decided. Re-registering onto it would hand
@@ -3708,6 +3736,84 @@ mod tests {
             encode_count(&encodes),
             1,
             "the requester did not drive an encode of its own"
+        );
+    }
+
+    /// ...and how often that fall-through fires is a QUERY, not a debug line.
+    ///
+    /// The re-drive is the safety valve for a defect that reached a viewer as a
+    /// 500 on a video segment (B134/V127). At `debug!` it is invisible at the
+    /// deployment's log level, so neither its rate — is the valve carrying real
+    /// load? — nor its disappearance, if a refactor stopped the fall-through
+    /// firing, could be seen at all.
+    #[test]
+    fn the_rate_a_requester_declines_another_jobs_shed_is_countable() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(44, 8, None, None, &opts);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let tx = seed_inflight(&cache, key);
+                let waiter = {
+                    let c = cache.clone();
+                    let o = opts.clone();
+                    tokio::spawn(async move {
+                        c.segment_bytes(44, 8, Path::new("/no/source"), &o, JobClass::Interactive)
+                            .await
+                    })
+                };
+                await_coalescers(&tx, 2).await;
+                finish_seeded_driver(&cache, key, tx, Err(Arc::new(HlsCacheError::SchedulerBusy)));
+                waiter
+                    .await
+                    .unwrap()
+                    .expect("the requester must drive its own encode");
+            })
+        });
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "precondition: the requester declined the shed and drove its own"
+        );
+
+        let (labels, value) = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_segment_redrive_total" {
+                    return None;
+                }
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                Some((labels, v))
+            })
+            .expect(
+                "a requester declining another job's admission verdict must emit \
+                 pharos_segment_redrive_total — a safety valve nobody can query \
+                 is a safety valve nobody can tell has stopped working",
+            );
+        assert!(
+            labels.contains(&"class=interactive".to_string()),
+            "the re-driving requester's own class: {labels:?}"
+        );
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "expected exactly one re-drive, got {value:?}"
         );
     }
 
