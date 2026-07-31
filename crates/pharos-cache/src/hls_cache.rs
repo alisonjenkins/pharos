@@ -1043,6 +1043,32 @@ async fn await_last_requester_gone(
     }
 }
 
+/// Where ONE REGISTRATION writes its segment before publishing it.
+///
+/// Qualified by the registration id, not by the key alone, so two drivers for
+/// the same key can never write the same file. That sounds impossible — a key
+/// has one registration at a time — and it is impossible in every ordinary
+/// interleaving. It is not impossible at the seam where a driver abandons:
+/// `await_last_requester_gone` ends its cancellable region at
+/// `JobSlot::is_dispatched`, and that flag is set by the scheduler in the same
+/// synchronous step as `spawn_run_task`, so there is a window — the width of an
+/// atomic load and a `remove_if` — in which a driver reads "not dispatched",
+/// deregisters, and drops its future while the actor is dispatching that very
+/// job. The scheduler's own `reply.is_closed()` check has the mirror-image
+/// window and cannot close it either; closing it properly would need the two
+/// decisions to exclude each other, which is a redesign of the dispatch path.
+///
+/// So the collision is made harmless instead of merely unlikely. The orphan
+/// writes to a name its successor will never choose, `read_progress` reads the
+/// sidecar its own encode wrote, and the completeness gate cannot be defeated by
+/// somebody else's file. What is left is one abandoned tmp file per crossing —
+/// unreferenced, never renamed, never served — which is the trade this makes on
+/// purpose: a leaked temp file is recoverable and a corrupt cached segment
+/// served with a 200 is not.
+fn segment_tmp_path(path: &Path, registration: u64) -> PathBuf {
+    path.with_extension(format!("{registration}.ts.tmp"))
+}
+
 /// Drops the in-flight registration however the driver ends.
 ///
 /// A `Drop` impl rather than a line at the end of the driver because the entry
@@ -1607,6 +1633,7 @@ impl HlsSegmentCache {
                     job_slot,
                     promoted,
                     published,
+                    id,
                 );
                 tokio::pin!(produce);
                 tokio::select! {
@@ -1630,6 +1657,15 @@ impl HlsSegmentCache {
                         // job is still QUEUED — that is the whole population an
                         // abandonment can reclaim.
                         record_segment_outcome(SegmentOutcome::Cancelled, class);
+                        // Usually there is nothing here: the job was queued, so
+                        // no worker ever opened this path. Removed anyway
+                        // because the crossing window `segment_tmp_path`
+                        // describes can leave an orphan writing to it, and
+                        // unlinking a file a worker still holds open costs
+                        // nothing and reclaims its space when that worker exits.
+                        let orphan = segment_tmp_path(&driver.segment_path_keyed(key), id);
+                        let _ = tokio::fs::remove_file(progress_sidecar_path(&orphan)).await;
+                        let _ = tokio::fs::remove_file(&orphan).await;
                         tracing::debug!(
                             media.id = media_id,
                             seg = seg_index,
@@ -1715,6 +1751,10 @@ impl HlsSegmentCache {
         // Raised at the rename, so the cancellation this future races against
         // cannot fire once the segment exists. See `await_last_requester_gone`.
         published: Arc<std::sync::atomic::AtomicBool>,
+        // This registration's id, which names its temp file — see
+        // `segment_tmp_path`. Two drivers for one key can only overlap at the
+        // abandonment seam, and they must not share a file when they do.
+        registration_id: u64,
     ) -> Result<Vec<u8>, HlsCacheError> {
         let path = self.segment_path_keyed(key);
         // V128: every exit from this function has to land in exactly one arm of
@@ -1748,7 +1788,7 @@ impl HlsSegmentCache {
                 .await
                 .map_err(|e| counted("create_dir", e.into()))?;
         }
-        let tmp = path.with_extension("ts.tmp");
+        let tmp = segment_tmp_path(&path, registration_id);
         // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
         // if this exceeds that wall-clock the encoder is below realtime and the
         // client will stall. Logged per miss so Loki/Tempo show exactly which
@@ -3916,6 +3956,43 @@ mod tests {
         assert!(
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one produced segment, got {value:?}"
+        );
+    }
+
+    /// The belt on the abandonment seam: two drivers for one key must not share
+    /// a temp file, nor the `-progress` sidecar derived from it.
+    ///
+    /// Ending the cancellable region at dispatch closes the ordinary case, but
+    /// the flag is set inside the actor's dispatch step while the driver reads
+    /// it outside — so a driver can read "not dispatched", deregister and drop
+    /// its future in the instant the actor dispatches that job. The successor
+    /// then shares `{seg}.ts.tmp` with a worker still writing it, and
+    /// `short_of_frames` fails open when the sidecar has been consumed by the
+    /// wrong reader: a corrupt segment, renamed into the cache and served with a
+    /// 200 for as long as it stays there. Distinct names make that interleaving
+    /// harmless rather than rare.
+    #[test]
+    fn two_registrations_for_one_key_never_write_the_same_file() {
+        let path = Path::new("/cache/61/9.ts");
+        let first = segment_tmp_path(path, 7);
+        let second = segment_tmp_path(path, 8);
+        assert_ne!(
+            first, second,
+            "an abandoned driver's worker and its successor would write the same \
+             temp file, and whichever renamed first would publish the other's \
+             half-written bytes"
+        );
+        assert_ne!(
+            progress_sidecar_path(&first),
+            progress_sidecar_path(&second),
+            "the completeness gate reads a sidecar it CONSUMES, so sharing one \
+             lets a successor judge its segment on somebody else's report — or on \
+             none at all, which fails open"
+        );
+        assert_ne!(
+            first, path,
+            "the temp file must never be the published path: a reader would serve \
+             a partial encode"
         );
     }
 
