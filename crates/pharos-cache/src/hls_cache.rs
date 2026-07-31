@@ -1034,10 +1034,35 @@ async fn await_last_requester_gone(
             // resolving at all drops the produce future.
             std::future::pending::<()>().await;
         }
-        if map
-            .remove_if(&key, |_, v| v.id == id && v.tx.receiver_count() == 0)
-            .is_some()
-        {
+        // Three outcomes, told apart under the ONE shard lock. The loop exists
+        // for exactly one of them.
+        let mut ours_but_awaited = false;
+        let removed = map.remove_if(&key, |_, v| {
+            if v.id != id {
+                // A successor's registration. Not ours to remove — that is what
+                // the id qualification is for.
+                return false;
+            }
+            if v.tx.receiver_count() == 0 {
+                return true;
+            }
+            ours_but_awaited = true;
+            false
+        });
+        if removed.is_some() {
+            return;
+        }
+        if !ours_but_awaited {
+            // The entry is gone, or it belongs to somebody else. Either way this
+            // driver has no registration left, so nobody can coalesce onto it
+            // and there is nothing to wait for. Looping would re-await a
+            // `closed()` that is ALREADY resolved (our own receiver count is
+            // zero) and re-take a decision that cannot change — an infinite
+            // loop with no await point in it, inside one poll, pegging a
+            // runtime worker and wedging this task for the life of the process.
+            // Only the id-qualified guard and this function remove entries in
+            // production, so today the loop cannot be entered that way; this is
+            // one `if` between "unreachable" and "impossible".
             return;
         }
     }
@@ -3957,6 +3982,63 @@ mod tests {
             matches!(value, DebugValue::Counter(1)),
             "expected exactly one produced segment, got {value:?}"
         );
+    }
+
+    /// A driver whose registration is not there any more must STOP, not spin.
+    ///
+    /// The wait loop re-takes its decision because a joiner may `subscribe`
+    /// after the wake, reopening the channel. That is the only reason to loop,
+    /// and it was inferred from a `remove_if` that MISSED — which is also what an
+    /// absent entry, or a successor's entry, looks like. In that state
+    /// `tx.closed()` is already resolved (our own receiver count is zero), so
+    /// the loop has no await point in it: one poll, spinning forever, pegging a
+    /// runtime worker and wedging the task.
+    ///
+    /// Unreachable in production today — the only removers are the id-qualified
+    /// guard and the wait loop itself — so this pins the property rather than a
+    /// bug, and pins it because the distance from "unreachable" to "reachable"
+    /// is one unqualified `inflight.remove` written by somebody who did not know.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_driver_whose_registration_vanished_stops_instead_of_spinning() {
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(70, 1, None, None, &opts);
+        let job = pharos_transcode::scheduler::JobSlot::new();
+        let published = std::sync::atomic::AtomicBool::new(false);
+
+        for (what, seed) in [
+            ("no entry at all", None),
+            ("a successor's entry", Some(8u64)),
+        ] {
+            let map: DashMap<SegmentIdentity, InFlightSegment> = DashMap::new();
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            // No receivers: the registry holds none, so this is "nobody is
+            // waiting" — the state the wait loop wakes on.
+            drop(rx);
+            if let Some(other) = seed {
+                map.insert(
+                    key,
+                    InFlightSegment {
+                        id: other,
+                        tx: Arc::new(tokio::sync::watch::channel(None).0),
+                        driver_class: JobClass::Interactive,
+                        job: pharos_transcode::scheduler::JobSlot::new().subscribe(),
+                        promoted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
+                );
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                await_last_requester_gone(&tx, &map, key, 7, &job, &published),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "with {what} the driver span without yielding: an infinite loop \
+                     inside one poll, which pegs a runtime worker and wedges this \
+                     task for the life of the process"
+                )
+            });
+        }
     }
 
     /// The belt on the abandonment seam: two drivers for one key must not share
