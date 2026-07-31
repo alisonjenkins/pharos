@@ -2574,6 +2574,14 @@ fn reap_abandoned(state: &mut SchedState) {
 /// own `note_playhead` is what turns incumbents stale a few lines before the
 /// victim is chosen.
 ///
+/// Which BOUNDS that bias rather than closing it. A job that turns stale
+/// between two drains and is chosen as a victim before the next one leaves as
+/// `evicted`, exactly as before — the sweep cannot see a job that is no longer
+/// in `pending`. What changed is the window: it was "until the pool goes quiet"
+/// and is now "until the next freed permit", so `stale` no longer
+/// systematically under-reports under saturation. Read the two arms together
+/// when the question is how much speculation is being wasted.
+///
 /// Cheap for the same reason `reap_abandoned` is: O(n) over `pending_cap` on
 /// an event that already happens at segment rate, and it recomputes the
 /// distance rather than trusting a cached one, so a playhead that moved while
