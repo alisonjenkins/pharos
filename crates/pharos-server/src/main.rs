@@ -1028,7 +1028,7 @@ async fn build_transcode_scheduler(
         probe_device_caps, probe_encodable_codecs, probe_encode_rate, ProbeConfig,
     };
     use pharos_transcode::protocol::{DeviceId, WorkerId};
-    use pharos_transcode::rate_store::RateStore;
+    use pharos_transcode::rate_store::{ProbedCapacity, RateStore};
     use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler, WorkerSpawner};
     use pharos_transcode::worker::ProcSpawner;
 
@@ -1102,8 +1102,27 @@ async fn build_transcode_scheduler(
     // the measurements the reference `min` is taken over, so it has to be in
     // the set that is probed and stored — leaving it out would key the store on
     // a different set than the one being weighted.
-    let mut to_weigh: Vec<(DeviceId, usize)> = caps.clone();
-    to_weigh.push((DeviceId::Cpu, default_cpu_permits()));
+    //
+    // Each row carries WHERE its capacity came from, because that decides
+    // whether `RateStore` may ratchet it. Only the trial-encode ramp above is a
+    // measurement; `hw_session_cap` is an operator's configured number and
+    // `default_cpu_permits()` is arithmetic over the core count, and holding a
+    // stale larger value against either would silently ignore an operator
+    // throttling a GPU or a down-sized VM (see `rate_store`'s module docs).
+    let mut to_weigh: Vec<ProbedCapacity> = caps
+        .iter()
+        .map(|&(d, c)| {
+            if probe_caps {
+                ProbedCapacity::measured(d, c)
+            } else {
+                ProbedCapacity::declared(d, c)
+            }
+        })
+        .collect();
+    to_weigh.push(ProbedCapacity::declared(
+        DeviceId::Cpu,
+        default_cpu_permits(),
+    ));
 
     // Measure every confirmed device plus software on the SAME synthetic clip,
     // so placement can weigh them against each other rather than treating a
@@ -1142,7 +1161,10 @@ async fn build_transcode_scheduler(
                  generation"
             );
             let mut out = Vec::with_capacity(to_weigh.len());
-            for &(device, capacity) in &to_weigh {
+            for &ProbedCapacity {
+                device, capacity, ..
+            } in &to_weigh
+            {
                 let rate = probe_encode_rate(device, probe_timeout).await;
                 if rate.is_none() {
                     tracing::warn!(
