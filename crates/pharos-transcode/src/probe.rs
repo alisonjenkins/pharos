@@ -225,6 +225,83 @@ fn codec_probe_args(device: DeviceId, codec: crate::VideoCodec) -> Option<Vec<St
     Some(a)
 }
 
+/// Frames per second this device encodes a fixed synthetic clip, or `None`
+/// when it cannot be measured.
+///
+/// **This is a RATIO instrument, not a cost model.** 006 established that a
+/// boot-time trial encode is a poor measure of what a real segment costs,
+/// because real cost is dominated by decode and I/O rather than by the encoder.
+/// That finding is unchanged and this does not contradict it: every device
+/// encodes the SAME synthetic input here, so decode and source I/O are
+/// common-mode and cancel in the comparison. The absolute number is close to
+/// meaningless; the ratio between two devices is the thing being measured, and
+/// it is the only hardware-neutral way to know that (say) a many-core software
+/// encoder outruns a weak accelerator on the machine this happens to be
+/// installed on.
+///
+/// Deliberately short and fixed-length so boot is not delayed; the frame count
+/// is what makes two devices comparable, so it must not vary by device.
+pub async fn probe_encode_rate(device: DeviceId, timeout: Duration) -> Option<f64> {
+    const RATE_PROBE_FRAMES: u32 = 120;
+    let bin = ffmpeg_bin();
+    let args = rate_probe_args(device, RATE_PROBE_FRAMES)?;
+    let started = Instant::now();
+    if !run_ffmpeg_probe(&bin, &args, timeout).await {
+        return None;
+    }
+    let secs = started.elapsed().as_secs_f64();
+    if secs <= 0.0 {
+        return None;
+    }
+    Some(f64::from(RATE_PROBE_FRAMES) / secs)
+}
+
+/// ffmpeg argv for the timed probe: one synthetic source, one encoder, null
+/// muxer. The SOURCE and FRAME COUNT are identical for every device — that is
+/// what makes the resulting rates comparable — and only the encoder differs.
+///
+/// H264 is the probe codec because it is the one target essentially every
+/// encoder implements; a device that cannot encode it is measured on its
+/// software fallback, which is what it would actually use.
+fn rate_probe_args(device: DeviceId, frames: u32) -> Option<Vec<String>> {
+    let mut a: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+    ];
+    if let Some(node) = device.vaapi_render_node() {
+        a.push("-vaapi_device".into());
+        a.push(node);
+    }
+    a.push("-f".into());
+    a.push("lavfi".into());
+    a.push("-i".into());
+    a.push(format!(
+        "testsrc2=size=1280x720:rate=30:duration={}",
+        f64::from(frames) / 30.0
+    ));
+    let encoder = match device {
+        DeviceId::Cpu => "libx264".to_string(),
+        DeviceId::Hw { accel, .. } => match accel.video_encoder(crate::VideoCodec::H264) {
+            Some(e) => e.to_string(),
+            None => "libx264".to_string(),
+        },
+    };
+    if device.vaapi_render_node().is_some() {
+        a.push("-vf".into());
+        a.push("format=nv12,hwupload".into());
+    }
+    a.push("-c:v".into());
+    a.push(encoder);
+    a.push("-frames:v".into());
+    a.push(frames.to_string());
+    a.push("-f".into());
+    a.push("null".into());
+    a.push("-".into());
+    Some(a)
+}
+
 async fn wait_status(mut child: tokio::process::Child) -> Option<bool> {
     child.wait().await.ok().map(|s| s.success())
 }
@@ -278,6 +355,72 @@ fn probe_args(device: DeviceId) -> Vec<String> {
     a.push("null".into());
     a.push("-".into());
     a
+}
+
+#[cfg(test)]
+mod rate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::time::Duration;
+
+    /// The CPU can always be measured — it is the terminal fallback and the
+    /// only device guaranteed to exist. If this returns `None` the weighting
+    /// has no software reference point and every ratio is unanchored.
+    #[tokio::test]
+    async fn the_software_encoder_reports_a_rate() {
+        let r = probe_encode_rate(DeviceId::Cpu, Duration::from_secs(30)).await;
+        let r = r.expect("the software encoder must be measurable");
+        assert!(
+            r > 0.0 && r.is_finite(),
+            "a rate must be positive and finite, got {r}"
+        );
+    }
+
+    /// Two runs on the same machine must agree closely enough that Task 2's
+    /// quantisation cannot see a difference. This is the property the whole
+    /// design's stability rests on.
+    #[tokio::test]
+    async fn two_runs_on_one_device_agree_within_a_wide_margin() {
+        let t = Duration::from_secs(30);
+        let a = probe_encode_rate(DeviceId::Cpu, t).await.unwrap();
+        let b = probe_encode_rate(DeviceId::Cpu, t).await.unwrap();
+        let ratio = a.max(b) / a.min(b);
+        assert!(
+            ratio < 3.0,
+            "two probes of the same device disagreed by {ratio}x (a={a}, b={b}); \
+             Task 2's quantisation must be coarser than this"
+        );
+    }
+
+    /// The two tests above would both pass a stub that always returns
+    /// `Some(1.0)` instantly (ratio 1.0/1.0 < 3.0 either way). Anchor the
+    /// result to real elapsed wall-clock time so a no-op cannot pass: an
+    /// actual ffmpeg encode of the fixed synthetic clip cannot complete in a
+    /// handful of milliseconds, and the reported rate must be internally
+    /// consistent with how long the call actually took.
+    #[tokio::test]
+    async fn the_rate_is_backed_by_real_elapsed_encode_time() {
+        let started = std::time::Instant::now();
+        let r = probe_encode_rate(DeviceId::Cpu, Duration::from_secs(30))
+            .await
+            .expect("the software encoder must be measurable");
+        let wall = started.elapsed().as_secs_f64();
+        assert!(
+            wall > 0.05,
+            "probe_encode_rate returned in {wall}s, far too fast to have \
+             actually run ffmpeg on the synthetic clip -- suspect a stub"
+        );
+        // rate = frames / secs by construction, so frames = rate * secs
+        // must land near the fixed probe frame count, not an unrelated
+        // constant a stub could have returned regardless of timing.
+        let implied_frames = r * wall;
+        assert!(
+            (60.0..=240.0).contains(&implied_frames),
+            "reported rate {r} over {wall}s implies {implied_frames} \
+             frames encoded; expected close to the fixed 120-frame clip"
+        );
+    }
 }
 
 #[cfg(test)]
