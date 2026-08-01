@@ -23,7 +23,10 @@ pub mod single_flight;
 pub mod subtitle_cache;
 pub mod trickplay_cache;
 
-pub use hls_cache::{AudioRenditionFile, HlsSegmentCache, HLS_GEN_VERSION};
+pub use hls_cache::{
+    compose_generation, generation, install_placement_fingerprint, AudioRenditionFile,
+    HlsSegmentCache, HLS_GEN_VERSION,
+};
 pub use image_cache::{ImageCache, ImageRole};
 pub use single_flight::KeyedLocks;
 pub use subtitle_cache::SubtitleCache;

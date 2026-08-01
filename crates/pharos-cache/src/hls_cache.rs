@@ -1234,10 +1234,76 @@ impl std::fmt::Debug for HlsSegmentCache {
 pub const HLS_GEN_VERSION: u32 = 16;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
+/// The composed generation this process is running under, installed once at
+/// boot by [`install_placement_fingerprint`].
+static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Combine the hand-maintained [`HLS_GEN_VERSION`] with a digest of the device
+/// table's placement-relevant state.
+///
+/// **Why the constant alone was not enough.** `HLS_GEN_VERSION` invalidates
+/// when a HUMAN notices the assignment rule moved. But since spec 007 the rule
+/// bands renditions by device WEIGHT, and in production the weight IS the boot
+/// probe's capacity — `probe_device_caps` ramps trial encodes until one fails
+/// and documents that a box already under encode load under-reports. So an
+/// ordinary restart during playback can measure 3 where the last boot measured
+/// 4, move every band, and re-place every rendition that falls between the two
+/// grids, with the constant sitting still and nothing invalidating: cached
+/// `.m4s` from the old encoder on disk, and — beyond any server-side wipe's
+/// reach — an `init.mp4?…&g=` the browser holds under `Cache-Control:
+/// immutable` for a year. That is issue #114 on a restart, delivered with a
+/// 200.
+///
+/// Deriving the generation FROM the placement state converts an invariant
+/// somebody has to remember into one enforced by construction: any change able
+/// to move a rendition changes this string, and this string is both the on-disk
+/// wipe key and the `g=` in the client's URL. A machine whose hardware did not
+/// change hashes the same and keeps its cache, which is the point — the digest
+/// must not be so eager that a restart costs 40 GiB of regeneration.
+///
+/// `None` means no device table exists (the scheduler is disabled or failed to
+/// come up), so no placement happens at all and the bare version is the whole
+/// identity. It cannot collide with a placed generation: those always carry the
+/// `-<hex>` suffix.
+pub fn compose_generation(placement_fingerprint: Option<u64>) -> String {
+    match placement_fingerprint {
+        Some(fp) => format!("{HLS_GEN_VERSION}-{fp:016x}"),
+        None => HLS_GEN_VERSION.to_string(),
+    }
+}
+
+/// Install the boot device table's placement digest, fixing the generation for
+/// the life of the process. Returns the composed generation.
+///
+/// Call this BEFORE constructing [`HlsSegmentCache`], which reconciles the
+/// on-disk cache against it. Calling it twice with different digests is a bug —
+/// the generation is already baked into URLs handed to clients — so the first
+/// value wins and the second is logged rather than silently applied.
+pub fn install_placement_fingerprint(placement_fingerprint: u64) -> &'static str {
+    let composed = compose_generation(Some(placement_fingerprint));
+    let held = GENERATION.get_or_init(|| composed.clone());
+    if held != &composed {
+        tracing::error!(
+            in_force = %held,
+            rejected = %composed,
+            "HLS generation already fixed; a second placement digest was ignored"
+        );
+    }
+    held.as_str()
+}
+
+/// The generation in force: what the on-disk marker holds and what every
+/// shared-init rendition URI carries as `g=`. Both readers MUST come through
+/// here — a wipe without a URL change leaves the browser's `immutable` init in
+/// place, and a URL change without a wipe leaves stale bytes on disk.
+pub fn generation() -> &'static str {
+    GENERATION.get_or_init(|| compose_generation(None)).as_str()
+}
+
 impl HlsSegmentCache {
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
         let root: PathBuf = root.into();
-        Self::reconcile_generation(&root);
+        Self::reconcile_generation(&root, generation());
         Self {
             root,
             max_bytes,
@@ -1249,17 +1315,34 @@ impl HlsSegmentCache {
         }
     }
 
-    /// Wipe every cached segment when the on-disk generation version doesn't
-    /// match [`HLS_GEN_VERSION`] (same pattern as the trickplay cache).
+    /// Wipe every cached segment when the on-disk generation doesn't match
+    /// [`generation()`] (same pattern as the trickplay cache).
     /// Best-effort: fs errors leave the cache as-is rather than failing boot.
-    fn reconcile_generation(root: &std::path::Path) {
+    ///
+    /// The marker holds the COMPOSED generation, not the bare
+    /// [`HLS_GEN_VERSION`], so a device table that re-places renditions wipes
+    /// the segments the previous placement produced. A marker written by an
+    /// older build holds a bare integer, which simply doesn't match — one cold
+    /// cache on upgrade, which is required anyway because the same deploy makes
+    /// `g=` change shape.
+    ///
+    /// `want` is passed rather than read from [`generation()`] so this stays a
+    /// pure function of its arguments: the generation is a process-wide
+    /// `OnceLock`, and a test that reconciled against it would fix it for every
+    /// other test sharing the binary.
+    fn reconcile_generation(root: &std::path::Path, want: &str) {
         let marker = root.join(GEN_VERSION_MARKER);
         let on_disk = std::fs::read_to_string(&marker)
             .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        if on_disk == Some(HLS_GEN_VERSION) {
+            .map(|s| s.trim().to_string());
+        if on_disk.as_deref() == Some(want) {
             return;
         }
+        tracing::info!(
+            on_disk = on_disk.as_deref().unwrap_or("<none>"),
+            generation = %want,
+            "HLS cache generation changed; discarding every cached artefact"
+        );
         if let Ok(entries) = std::fs::read_dir(root) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -1274,7 +1357,7 @@ impl HlsSegmentCache {
             }
         }
         let _ = std::fs::create_dir_all(root);
-        let _ = std::fs::write(&marker, HLS_GEN_VERSION.to_string());
+        let _ = std::fs::write(&marker, want);
     }
 
     /// Route segment transcodes through the load-balancing scheduler.
@@ -7168,5 +7251,118 @@ mod tests {
         assert!(msg.contains("stopped advancing"), "{msg}");
         assert!(msg.contains("3000ms"), "{msg}");
         assert!(msg.contains("a41.m4s"), "{msg}");
+    }
+}
+
+/// The composed cache generation — what makes a placement change invalidate
+/// itself instead of waiting for someone to remember a constant.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod generation_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Two device tables that place identically must produce the same
+    /// generation, or a restart on unchanged hardware throws away a 40 GiB
+    /// cache — and the browser's `immutable` init with it — for nothing.
+    #[test]
+    fn the_same_placement_digest_composes_the_same_generation() {
+        let fp = 0x0123_4567_89ab_cdefu64;
+        assert_eq!(compose_generation(Some(fp)), compose_generation(Some(fp)));
+    }
+
+    /// The production failure: `probe_device_caps` under-reports on a loaded
+    /// box, so boot A measures capacity 4 and boot B measures 3. Weights move,
+    /// bands move, renditions re-place — and the generation MUST move with
+    /// them, because `SegmentIdentity` carries no device and the client holds
+    /// its init for a year.
+    #[test]
+    fn a_drifted_placement_digest_composes_a_different_generation() {
+        let boot_a = compose_generation(Some(0xaaaa_aaaa_aaaa_aaaa));
+        let boot_b = compose_generation(Some(0xbbbb_bbbb_bbbb_bbbb));
+        assert_ne!(boot_a, boot_b);
+        // ...and neither is mistakable for the no-table case.
+        assert_ne!(boot_a, compose_generation(None));
+        assert_ne!(boot_b, compose_generation(None));
+    }
+
+    /// The hand-maintained version stays legible in the composed string: a
+    /// human reading `g=` in a browser's network tab, or the `.gen_version`
+    /// marker on the PVC, must still be able to tell which release wrote it.
+    #[test]
+    fn the_composed_generation_still_names_the_base_version() {
+        assert_eq!(compose_generation(None), HLS_GEN_VERSION.to_string());
+        assert!(
+            compose_generation(Some(1)).starts_with(&format!("{HLS_GEN_VERSION}-")),
+            "{}",
+            compose_generation(Some(1))
+        );
+    }
+
+    /// A marker matching the generation in force keeps the cache; anything else
+    /// — including the bare integer an older build wrote — wipes it and leaves
+    /// the new generation behind.
+    #[test]
+    fn reconcile_wipes_on_a_generation_change_and_keeps_it_otherwise() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let marker = root.join(GEN_VERSION_MARKER);
+        let seed = || {
+            std::fs::create_dir_all(root.join("media7")).unwrap();
+            std::fs::write(root.join("media7/seg0.m4s"), b"bytes").unwrap();
+        };
+
+        // Same generation → the cache survives.
+        seed();
+        std::fs::write(&marker, "16-aaaaaaaaaaaaaaaa").unwrap();
+        HlsSegmentCache::reconcile_generation(root, "16-aaaaaaaaaaaaaaaa");
+        assert!(root.join("media7/seg0.m4s").exists(), "no reason to wipe");
+
+        // A drifted placement digest → wiped, and the marker records the new one.
+        HlsSegmentCache::reconcile_generation(root, "16-bbbbbbbbbbbbbbbb");
+        assert!(
+            !root.join("media7/seg0.m4s").exists(),
+            "segments from the previous placement must be orphaned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "16-bbbbbbbbbbbbbbbb"
+        );
+
+        // A marker from a build that predates the digest is not a match.
+        seed();
+        std::fs::write(&marker, "16").unwrap();
+        HlsSegmentCache::reconcile_generation(root, "16-bbbbbbbbbbbbbbbb");
+        assert!(!root.join("media7/seg0.m4s").exists());
+    }
+
+    /// `install_placement_fingerprint` fixes the generation for the process and
+    /// both readers see exactly that string. The second install is a bug (URLs
+    /// are already out) so the first value wins.
+    ///
+    /// The only test in this crate that touches the process-wide `OnceLock`;
+    /// everything else goes through the pure `compose_generation`.
+    #[test]
+    fn installing_a_digest_fixes_the_generation_for_both_readers() {
+        let composed = install_placement_fingerprint(0xfeed_face_dead_beef);
+        assert_eq!(composed, generation(), "both readers must agree");
+        assert!(
+            composed.starts_with(&format!("{HLS_GEN_VERSION}-")),
+            "the installed digest must reach the generation: {composed}"
+        );
+        assert_eq!(
+            install_placement_fingerprint(0x1),
+            composed,
+            "a second install must not move a generation already in client URLs"
+        );
+
+        // And it is the string the on-disk marker is reconciled against.
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join(GEN_VERSION_MARKER), "stale").unwrap();
+        let _cache = HlsSegmentCache::new(td.path(), 1024);
+        assert_eq!(
+            std::fs::read_to_string(td.path().join(GEN_VERSION_MARKER)).unwrap(),
+            generation()
+        );
     }
 }
