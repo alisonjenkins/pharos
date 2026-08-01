@@ -623,25 +623,38 @@ mod tests {
     ///
     /// Asserted against the table's OWN weights, never a written-down ratio, so
     /// it stays true on hardware nobody has run it on.
+    ///
+    /// The share is taken over the SUPPORTING subset, not over every slot.
+    /// `rendition_device` only lays bands for devices `device_supports` admits,
+    /// so a table holding one device that cannot encode this codec would make
+    /// the whole-table denominator wrong — and the whole-table version of this
+    /// test passed only because every slot in `table()` happens to encode
+    /// H.264. That is a property of the fixture, not of the implementation.
     #[test]
     fn renditions_spread_across_every_supporting_device_by_weight() {
         let t = table();
         let mut cmaf = h264_opts();
         cmaf.container = Container::Fmp4;
 
-        // 4500 = 500 × the table's total weight, so the bands tile it exactly.
-        const N: u64 = 4500;
+        let supporting: Vec<&DeviceSlot> = t
+            .slots()
+            .iter()
+            .filter(|s| device_supports(s.id, &cmaf))
+            .collect();
+        let total: u32 = supporting.iter().map(|s| s.weight()).sum();
+        // 500 × the supporting total, so the bands tile the sample exactly.
+        let n = u64::from(total) * 500;
+
         let mut seen: std::collections::HashMap<DeviceId, usize> = std::collections::HashMap::new();
-        for k in 0..N {
+        for k in 0..n {
             *seen
                 .entry(t.rendition_device(&cmaf, k).expect("a device"))
                 .or_default() += 1;
         }
 
-        let total: u32 = t.slots().iter().map(|s| s.weight()).sum();
-        for slot in t.slots() {
+        for slot in &supporting {
             let expected = f64::from(slot.weight()) / f64::from(total);
-            let actual = *seen.get(&slot.id).unwrap_or(&0) as f64 / N as f64;
+            let actual = *seen.get(&slot.id).unwrap_or(&0) as f64 / n as f64;
             assert!(
                 (actual - expected).abs() < 0.02,
                 "{:?}: expected ~{expected:.3} of renditions by weight, got {actual:.3}",
@@ -650,9 +663,17 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            t.slots().len(),
+            supporting.len(),
             "every supporting device must take a share; got {seen:?}"
         );
+        // A device that cannot encode the codec must take none of them.
+        for slot in t.slots().iter().filter(|s| !device_supports(s.id, &cmaf)) {
+            assert!(
+                !seen.contains_key(&slot.id),
+                "{:?} cannot encode this codec and must never be placed on",
+                slot.id
+            );
+        }
     }
 
     /// With no hardware able to encode the codec, the pool is CPU — still one
@@ -746,7 +767,11 @@ mod tests {
             reached.iter().any(|d| matches!(d, DeviceId::Hw { .. })),
             "CMAF H264 must be able to reach hardware; got {reached:?}"
         );
-        for slot in t.slots() {
+        // Over the SUPPORTING subset — `rendition_device` lays no band for a
+        // device that cannot encode the codec, so demanding every slot be
+        // reached would be a claim about this fixture (whose devices all encode
+        // H.264) rather than about the rule.
+        for slot in t.slots().iter().filter(|s| device_supports(s.id, &cmaf)) {
             assert!(
                 reached.contains(&slot.id),
                 "{:?} never served a CMAF rendition; got {reached:?}",
