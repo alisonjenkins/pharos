@@ -4010,6 +4010,93 @@ mod tests {
         );
     }
 
+    /// V136 — a scan of a real root must not sweep URL-backed rows.
+    ///
+    /// `sweep_unseen` deletes every row under the scanned root that this pass
+    /// did not see. A synthetic `ytdlp://` path is not under any filesystem
+    /// root, so it survives — but that is a PROPERTY of the arrangement, not an
+    /// accident, and nothing else in the codebase pins it.
+    ///
+    /// Getting it wrong is silent and total. Park remote items beneath a real
+    /// root and the walk succeeds, finds none of them, and deletes the lot —
+    /// and B98's blast-radius guard does not save you, because it needs both
+    /// >=100 deletions AND >25% of the library. A household's 40 web videos
+    /// vanish without so much as a warning line.
+    #[tokio::test]
+    async fn a_scan_never_sweeps_a_url_backed_row() {
+        let root = TempDir::new().unwrap();
+        write_file(root.path(), "local.mkv", b"local").await;
+
+        let prober = FakeProber::default();
+        let s = FsScanner::new(prober.clone());
+        let store = MemStore::default();
+        s.scan_into(root.path(), &store).await.unwrap();
+
+        // A URL-backed item, written the way the ingestion endpoint writes it.
+        let remote_path = pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+            .expect("valid ref")
+            .to_synthetic_path();
+        let remote_id = stable_id(&remote_path);
+        store
+            .put(MediaItem {
+                id: remote_id,
+                path: remote_path,
+                title: "Never Gonna Give You Up".into(),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 2);
+
+        // A full, CLEAN rescan — walk_errors == 0, so the sweep really runs.
+        // (If it were skipped the test would pass for the wrong reason, which
+        // is exactly how this class of bug hides.)
+        let local_id = stable_id(&root.path().join("local.mkv"));
+        tokio::fs::remove_file(root.path().join("local.mkv"))
+            .await
+            .unwrap();
+        let outcome = s.scan_into(root.path(), &store).await.unwrap();
+
+        assert_eq!(
+            outcome.removed,
+            vec![local_id],
+            "the sweep must have actually run and taken the deleted local file"
+        );
+        assert!(
+            store.get(remote_id).await.is_ok(),
+            "a URL-backed row must survive a scan of a filesystem root"
+        );
+
+        // And the hazard is REAL, not hypothetical: the same row parked under
+        // the scanned root is destroyed by the very next pass. This half is
+        // what stops the assertion above from passing vacuously — it is only
+        // meaningful because the alternative arrangement demonstrably loses
+        // data.
+        let parked = root.path().join("ytdlp-youtube-dQw4w9WgXcQ");
+        let parked_id = stable_id(&parked);
+        store
+            .put(MediaItem {
+                id: parked_id,
+                path: parked,
+                title: "parked the wrong way".into(),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let outcome = s.scan_into(root.path(), &store).await.unwrap();
+        assert!(
+            outcome.removed.contains(&parked_id),
+            "parking a synthetic row under a real root loses it on the next scan — \
+             which is why the library root is a prefix no walk can reach (V136)"
+        );
+        assert!(
+            store.get(remote_id).await.is_ok(),
+            "while the correctly-placed row is still there"
+        );
+    }
+
     #[tokio::test]
     async fn deletion_reconciliation_sweeps_removed_files() {
         // LIB-A3 — a file deleted from disk between scans has its row
