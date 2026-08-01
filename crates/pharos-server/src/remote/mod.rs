@@ -138,6 +138,20 @@ impl ResolvedMedia {
             Self::Adaptive { video, .. } => video,
         }
     }
+
+    /// Every upstream locator this resolution names.
+    ///
+    /// Derived from the enum rather than hand-listed at the call site, so an
+    /// adaptive source cannot have its audio locator silently left behind — the
+    /// caller that evicts a superseded resolution has no way to enumerate them
+    /// otherwise, and forgetting the audio half would leave a full cached audio
+    /// stream on disk answering to a URL nothing will ask for again.
+    pub fn urls(&self) -> Vec<&str> {
+        match self {
+            Self::Progressive { url } => vec![url.as_str()],
+            Self::Adaptive { video, audio } => vec![video.as_str(), audio.as_str()],
+        }
+    }
 }
 
 /// yt-dlp's `-j` output, narrowed to the fields pharos reads.
@@ -317,14 +331,46 @@ pub struct ResolverCache {
     resolver: RemoteResolver,
     ttl: Duration,
     entries: tokio::sync::Mutex<std::collections::HashMap<RemoteRef, (Instant, ResolvedMedia)>>,
+    /// Where the bytes fetched against a resolution are held, so that a
+    /// SUPERSEDED resolution's bytes can be released.
+    ///
+    /// `None` genuinely means "there is no byte cache" — the listener failed to
+    /// start, and a remote item reads straight from upstream — rather than "the
+    /// wiring was forgotten". That distinction is why the cache is passed at
+    /// construction and not attached afterwards: with a setter, an unwired
+    /// resolver and a cacheless one are the same object.
+    evict_into: Option<std::sync::Arc<source_cache::SourceCache>>,
 }
 
 impl ResolverCache {
-    pub fn new(resolver: RemoteResolver, ttl: Duration) -> Self {
+    pub fn new(
+        resolver: RemoteResolver,
+        ttl: Duration,
+        evict_into: Option<std::sync::Arc<source_cache::SourceCache>>,
+    ) -> Self {
         Self {
             resolver,
             ttl,
             entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            evict_into,
+        }
+    }
+
+    /// Release the bytes held against locators nothing will ask for again.
+    ///
+    /// A signed URL is the cache's KEY, so a re-resolution does not update an
+    /// entry — it strands one and starts another. Over a feature-length watch
+    /// the TTL elapses many times, and each lapse strands everything downloaded
+    /// under the previous URL. The LRU cap means this is not an unbounded leak,
+    /// but it is a priority inversion: bytes for a locator that can never be
+    /// requested again sit ahead of bytes being watched, and evicting the dead
+    /// entry is the whole reason the cap ever has to evict a live one.
+    async fn release(&self, superseded: &ResolvedMedia) {
+        let Some(cache) = &self.evict_into else {
+            return;
+        };
+        for url in superseded.urls() {
+            cache.forget(url).await;
         }
     }
 
@@ -338,14 +384,33 @@ impl ResolverCache {
     /// household plays a handful of remote items at once; if that stops being
     /// true the fix is a per-key lock, not a shorter hold.
     pub async fn locate(&self, r: &RemoteRef) -> Result<ResolvedMedia, ResolveError> {
-        let mut entries = self.entries.lock().await;
-        if let Some((at, media)) = entries.get(r) {
-            if at.elapsed() < self.ttl {
-                return Ok(media.clone());
+        let (media, superseded) = {
+            let mut entries = self.entries.lock().await;
+            if let Some((at, media)) = entries.get(r) {
+                if at.elapsed() < self.ttl {
+                    return Ok(media.clone());
+                }
             }
+            let media = self.resolver.locate(r).await?;
+            let old = entries.insert(r.clone(), (Instant::now(), media.clone()));
+            let superseded = match old {
+                // Only when the locator actually MOVED. A site that hands back
+                // the same URL after the TTL lapses — a static file, a CDN with
+                // no signing — would otherwise have its warm cache thrown away
+                // on a timer, turning the memo's expiry into a guaranteed cold
+                // read of something that never changed.
+                Some((_, prev)) if prev != media => Some(prev),
+                _ => None,
+            };
+            (media, superseded)
+        };
+        // Outside the memo lock. Eviction touches the cache's own locks and its
+        // filesystem, and holding the resolve lock across that would make every
+        // concurrent segment of the rendition wait on a disk delete for bytes
+        // none of them want.
+        if let Some(prev) = superseded {
+            self.release(&prev).await;
         }
-        let media = self.resolver.locate(r).await?;
-        entries.insert(r.clone(), (Instant::now(), media.clone()));
         Ok(media)
     }
 
@@ -362,7 +427,31 @@ impl ResolverCache {
     /// Called when a locator turns out to be dead before its TTL — the case the
     /// TTL cannot cover, because expiry is the site's decision and not ours.
     pub async fn invalidate(&self, r: &RemoteRef) {
-        self.entries.lock().await.remove(r);
+        let dropped = self.entries.lock().await.remove(r);
+        // Same reasoning as the supersede path in `locate`, and the more
+        // clear-cut case: this is called BECAUSE the locator is known dead, so
+        // nothing will ever ask for those bytes again.
+        if let Some((_, media)) = dropped {
+            self.release(&media).await;
+        }
+    }
+
+    /// Drop every memo and release the bytes held against them.
+    ///
+    /// For removing a library: a URL-backed item's row goes with the library
+    /// root, and without this its cached bytes stay on disk answering to a
+    /// locator no item points at. Deliberately whole-cache rather than
+    /// per-item — the caller deleting a library holds roots, not `RemoteRef`s,
+    /// and re-deriving them would mean parsing paths out of rows that have
+    /// already been deleted.
+    pub async fn forget_all(&self) {
+        let dropped: Vec<ResolvedMedia> = {
+            let mut entries = self.entries.lock().await;
+            entries.drain().map(|(_, (_, m))| m).collect()
+        };
+        for media in &dropped {
+            self.release(media).await;
+        }
     }
 }
 
@@ -477,6 +566,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use tempfile::TempDir;
 
     /// A captured `yt-dlp -J` document for an adaptive YouTube video, trimmed
     /// to the fields pharos reads.
@@ -741,5 +831,247 @@ mod tests {
         // without its stderr is what makes "it didn't work" unactionable.
         assert!(all[2].to_string().contains('e'));
         assert!(all[4].to_string().contains('u'));
+    }
+
+    /// A stub standing in for `yt-dlp`: emits `bodies[n]` on its nth call.
+    ///
+    /// Driving the REAL `ResolverCache::locate` rather than seeding its private
+    /// map. The behaviour under test is what happens when a resolution is
+    /// DISPLACED, and a test that reaches past `locate` to install the "before"
+    /// state would not exercise the displacement at all — it would assert that
+    /// a helper it called does what it does.
+    fn stub_ytdlp(dir: &std::path::Path, bodies: &[String]) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let counter = dir.join("calls");
+        let bin = dir.join("stub-ytdlp");
+        let mut script = String::from("#!/bin/sh\n");
+        script.push_str(&format!(
+            "n=$(cat {c} 2>/dev/null || echo 0)\necho $((n+1)) > {c}\ncase \"$n\" in\n",
+            c = counter.display()
+        ));
+        for (i, body) in bodies.iter().enumerate() {
+            // The last arm is the catch-all, so a call beyond the script's end
+            // repeats the final answer instead of failing with an empty body —
+            // which would look like a resolver error rather than a stable URL.
+            let pat = if i + 1 == bodies.len() {
+                "*".to_string()
+            } else {
+                i.to_string()
+            };
+            script.push_str(&format!(
+                "  {pat}) cat <<'YTDLPEOF'\n{body}\nYTDLPEOF\n  ;;\n"
+            ));
+        }
+        script.push_str("esac\n");
+        let mut f = std::fs::File::create(&bin).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        f.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        bin
+    }
+
+    /// An upstream serving range requests, so the cache holds REAL bytes.
+    async fn upstream(body: Vec<u8>) -> (String, actix_web::dev::ServerHandle) {
+        use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+        let served = web::Data::new(body);
+        let srv = HttpServer::new(move || {
+            App::new().app_data(served.clone()).default_service(web::to(
+                |req: HttpRequest, body: web::Data<Vec<u8>>| async move {
+                    let range = req
+                        .headers()
+                        .get(actix_web::http::header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("bytes="))
+                        .and_then(|v| v.split_once('-'))
+                        .and_then(|(a, b)| {
+                            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                        });
+                    let (a, b) = range.unwrap_or((0, body.len() - 1));
+                    let b = b.min(body.len() - 1);
+                    HttpResponse::PartialContent()
+                        .insert_header((
+                            actix_web::http::header::CONTENT_RANGE,
+                            format!("bytes {a}-{b}/{}", body.len()),
+                        ))
+                        .body(body[a..=b].to_vec())
+                },
+            ))
+        })
+        .bind(("127.0.0.1", 0))
+        .unwrap();
+        let base = format!("http://{}", srv.addrs()[0]);
+        let srv = srv.run();
+        let handle = srv.handle();
+        tokio::spawn(srv);
+        (base, handle)
+    }
+
+    fn adaptive_doc(video: &str, audio: &str) -> String {
+        format!(
+            r#"{{"id":"dQw4w9WgXcQ","extractor":"youtube","extractor_key":"Youtube",
+               "title":"t","duration":212.0,"width":1920,"height":1080,"fps":25.0,
+               "vcodec":"avc1.640028","acodec":"mp4a.40.2","ext":"mp4","tbr":2500.0,
+               "requested_formats":[
+                 {{"url":"{video}","vcodec":"avc1.640028","acodec":"none"}},
+                 {{"url":"{audio}","vcodec":"none","acodec":"mp4a.40.2"}}]}}"#
+        )
+    }
+
+    async fn warm(cache: &source_cache::SourceCache, url: &str) {
+        let key = cache.register(url).await.expect("register");
+        cache.read(&key, 0, 4096).await.expect("read");
+    }
+
+    /// A re-resolution must release the bytes held under the locator it
+    /// replaced — BOTH of them, for an adaptive source.
+    ///
+    /// The cache is keyed by the signed URL, so a re-resolve does not update an
+    /// entry, it strands one. Over a feature-length watch the TTL lapses many
+    /// times and each lapse strands everything fetched under the previous URL;
+    /// the LRU cap then evicts LIVE bytes to make room for the next copy.
+    #[tokio::test]
+    async fn a_re_resolution_releases_the_bytes_held_under_the_old_locator() {
+        let dir = TempDir::new().unwrap();
+        let (base, handle) = upstream(vec![7u8; 40_000]).await;
+
+        let first = adaptive_doc(&format!("{base}/v?sig=1"), &format!("{base}/a?sig=1"));
+        let second = adaptive_doc(&format!("{base}/v?sig=2"), &format!("{base}/a?sig=2"));
+        let bin = stub_ytdlp(dir.path(), &[first, second]);
+
+        let cache = std::sync::Arc::new(
+            source_cache::SourceCache::new(
+                dir.path().join("cache"),
+                crate::bg_io::NetworkGate::new(2),
+                u64::MAX,
+            )
+            .await,
+        );
+        // TTL zero so the second `locate` re-resolves rather than memo-hits.
+        let rc = ResolverCache::new(
+            RemoteResolver::new(bin.to_string_lossy().to_string(), Duration::from_secs(10)),
+            Duration::ZERO,
+            Some(cache.clone()),
+        );
+        let r = RemoteRef::parse("ytdlp://youtube/dQw4w9WgXcQ").unwrap();
+
+        let one = rc.locate(&r).await.expect("first resolve");
+        for u in one.urls() {
+            warm(&cache, u).await;
+        }
+        assert_eq!(cache.len().await, 2, "both adaptive halves are cached");
+        let held = cache.held_bytes().await;
+        assert!(held > 0, "the cache must actually hold bytes");
+
+        let two = rc.locate(&r).await.expect("re-resolve");
+        assert_ne!(two, one, "the stub must have moved the locator");
+        assert_eq!(
+            cache.len().await,
+            0,
+            "both halves of the superseded resolution must be released; leaving \
+             the audio behind is the shape `ResolvedMedia::urls` exists to stop"
+        );
+        assert_eq!(cache.held_bytes().await, 0);
+        handle.stop(false).await;
+    }
+
+    /// ...but a locator that did NOT move keeps its warm cache.
+    ///
+    /// Without this the memo's TTL would become a guaranteed cold read on a
+    /// timer for any source whose URL is stable — a static file, a CDN that
+    /// does not sign — throwing away exactly the bytes the cache exists to
+    /// keep. The eviction is keyed on the locator CHANGING, not on the memo
+    /// expiring.
+    #[tokio::test]
+    async fn a_re_resolution_that_returns_the_same_locator_keeps_its_warm_cache() {
+        let dir = TempDir::new().unwrap();
+        let (base, handle) = upstream(vec![3u8; 40_000]).await;
+
+        let same = adaptive_doc(&format!("{base}/v?stable"), &format!("{base}/a?stable"));
+        let bin = stub_ytdlp(dir.path(), &[same.clone(), same]);
+
+        let cache = std::sync::Arc::new(
+            source_cache::SourceCache::new(
+                dir.path().join("cache"),
+                crate::bg_io::NetworkGate::new(2),
+                u64::MAX,
+            )
+            .await,
+        );
+        let rc = ResolverCache::new(
+            RemoteResolver::new(bin.to_string_lossy().to_string(), Duration::from_secs(10)),
+            Duration::ZERO,
+            Some(cache.clone()),
+        );
+        let r = RemoteRef::parse("ytdlp://youtube/dQw4w9WgXcQ").unwrap();
+
+        let one = rc.locate(&r).await.expect("first resolve");
+        for u in one.urls() {
+            warm(&cache, u).await;
+        }
+        let held = cache.held_bytes().await;
+
+        let two = rc.locate(&r).await.expect("re-resolve");
+        assert_eq!(one, two, "the stub returns an unchanged locator");
+        assert_eq!(
+            cache.held_bytes().await,
+            held,
+            "an unchanged locator must keep its bytes"
+        );
+        assert_eq!(cache.len().await, 2);
+        handle.stop(false).await;
+    }
+
+    /// Deleting the library releases everything, because no row points at those
+    /// locators any more.
+    #[tokio::test]
+    async fn forgetting_every_memo_releases_every_cached_source() {
+        let dir = TempDir::new().unwrap();
+        let (base, handle) = upstream(vec![9u8; 20_000]).await;
+
+        let doc = adaptive_doc(&format!("{base}/v?x"), &format!("{base}/a?x"));
+        let bin = stub_ytdlp(dir.path(), &[doc]);
+
+        let cache = std::sync::Arc::new(
+            source_cache::SourceCache::new(
+                dir.path().join("cache"),
+                crate::bg_io::NetworkGate::new(2),
+                u64::MAX,
+            )
+            .await,
+        );
+        let rc = ResolverCache::new(
+            RemoteResolver::new(bin.to_string_lossy().to_string(), Duration::from_secs(10)),
+            Duration::from_secs(600),
+            Some(cache.clone()),
+        );
+        let r = RemoteRef::parse("ytdlp://youtube/dQw4w9WgXcQ").unwrap();
+        let m = rc.locate(&r).await.expect("resolve");
+        for u in m.urls() {
+            warm(&cache, u).await;
+        }
+        assert!(cache.held_bytes().await > 0);
+
+        rc.forget_all().await;
+        assert_eq!(cache.len().await, 0, "a deleted library holds no bytes");
+        handle.stop(false).await;
+    }
+
+    /// A resolver with no cache must not panic or refuse to work — "the
+    /// listener failed to start" is a supported state, not a broken one.
+    #[tokio::test]
+    async fn a_resolver_with_no_cache_still_resolves() {
+        let dir = TempDir::new().unwrap();
+        let doc = adaptive_doc("https://cdn.example/v", "https://cdn.example/a");
+        let bin = stub_ytdlp(dir.path(), &[doc]);
+        let rc = ResolverCache::new(
+            RemoteResolver::new(bin.to_string_lossy().to_string(), Duration::from_secs(10)),
+            Duration::ZERO,
+            None,
+        );
+        let r = RemoteRef::parse("ytdlp://youtube/dQw4w9WgXcQ").unwrap();
+        assert!(rc.locate(&r).await.is_ok());
+        rc.invalidate(&r).await;
+        rc.forget_all().await;
     }
 }
