@@ -55,7 +55,13 @@ const RATE_STORE_VERSION: u32 = 1;
 /// Filename under the store directory. Dot-prefixed and parked beside the
 /// transcode cache, following the `.gen_version` marker the HLS cache already
 /// writes and compares at construction.
-const RATE_STORE_FILE: &str = ".device_rates.json";
+///
+/// Public because the HLS cache has to name it: `reconcile_generation` deletes
+/// every entry in that root except its own marker, so a generation change would
+/// otherwise take the rate store with it — forcing a re-probe on exactly the
+/// boot where placement stability matters most, and re-placing renditions for a
+/// second, avoidable reason. The cache preserves this file by name instead.
+pub const RATE_STORE_FILE: &str = ".device_rates.json";
 
 /// A stable digest of the device SET — the thing whose change genuinely should
 /// re-place renditions.

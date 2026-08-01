@@ -1330,6 +1330,14 @@ impl HlsSegmentCache {
     /// pure function of its arguments: the generation is a process-wide
     /// `OnceLock`, and a test that reconciled against it would fix it for every
     /// other test sharing the binary.
+    ///
+    /// Two entries survive the wipe: this cache's own marker, and the
+    /// transcode-rate store (`RATE_STORE_FILE`), which is parked in the same
+    /// root. Deleting the latter would force a re-probe on precisely the boot
+    /// where placement stability matters most — and a fresh probe is what moves
+    /// placement, so the wipe would be causing a second re-placement while
+    /// cleaning up after the first. Everything else in this root is a cached
+    /// artefact of the generation being discarded.
     fn reconcile_generation(root: &std::path::Path, want: &str) {
         let marker = root.join(GEN_VERSION_MARKER);
         let on_disk = std::fs::read_to_string(&marker)
@@ -1346,7 +1354,10 @@ impl HlsSegmentCache {
         if let Ok(entries) = std::fs::read_dir(root) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p.file_name().and_then(|n| n.to_str()) == Some(GEN_VERSION_MARKER) {
+                if matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some(GEN_VERSION_MARKER) | Some(pharos_transcode::rate_store::RATE_STORE_FILE)
+                ) {
                     continue;
                 }
                 if p.is_dir() {
@@ -7334,6 +7345,32 @@ mod generation_tests {
         std::fs::write(&marker, "16").unwrap();
         HlsSegmentCache::reconcile_generation(root, "16-bbbbbbbbbbbbbbbb");
         assert!(!root.join("media7/seg0.m4s").exists());
+    }
+
+    /// The persisted encode-rate probe lives in this same root, and a
+    /// generation wipe must not take it: re-probing is what MOVES placement, so
+    /// deleting the stored rates would make the cleanup cause a second
+    /// re-placement on the very boot that was recovering from the first.
+    #[test]
+    fn the_wipe_spares_the_persisted_rate_store() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let rates = root.join(pharos_transcode::rate_store::RATE_STORE_FILE);
+        std::fs::create_dir_all(root.join("media7")).unwrap();
+        std::fs::write(root.join("media7/seg0.m4s"), b"bytes").unwrap();
+        std::fs::write(&rates, b"{\"version\":1}").unwrap();
+
+        HlsSegmentCache::reconcile_generation(root, "16-cccccccccccccccc");
+
+        assert!(
+            !root.join("media7/seg0.m4s").exists(),
+            "cached artefacts of the old generation still go"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rates).unwrap(),
+            "{\"version\":1}",
+            "the rate store is boot-time state, not a cached artefact"
+        );
     }
 
     /// `install_placement_fingerprint` fixes the generation for the process and
