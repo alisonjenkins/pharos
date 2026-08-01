@@ -1470,17 +1470,13 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             resolve_ttl_secs = cfg.remote.resolve_ttl_secs,
             "URL-backed sources enabled",
         );
-        state = state.with_remote_resolver(std::sync::Arc::new(
-            pharos_server::remote::ResolverCache::new(
-                resolver,
-                std::time::Duration::from_secs(cfg.remote.resolve_ttl_secs),
-            ),
-        ));
-
-        // The byte-range cache in front of whatever the resolver returns. Its
-        // failure to start is not fatal — a remote item still plays, every
-        // segment just reaches the CDN itself, which is the pre-cache
-        // behaviour rather than a broken one.
+        // The byte-range cache is built FIRST, because the resolver needs it:
+        // a re-resolution strands the bytes held under the previous locator,
+        // and the resolver is the only place that sees the old value being
+        // displaced. Its failure to start is not fatal — a remote item still
+        // plays, every segment just reaches the CDN itself, which is the
+        // pre-cache behaviour rather than a broken one — and a resolver with no
+        // cache has nothing to evict, which is what `None` says.
         let cache_dir = cfg
             .remote
             .cache_dir
@@ -1501,16 +1497,29 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             )
             .await,
         );
-        match pharos_server::remote::source_cache::server::spawn(source_cache.clone()) {
+        let evict_into = match pharos_server::remote::source_cache::server::spawn(
+            source_cache.clone(),
+        ) {
             Ok(port) => {
                 tracing::info!(path = %cache_dir.display(), port, "remote source range cache ready");
-                state = state.with_remote_cache(source_cache, port);
+                state = state.with_remote_cache(source_cache.clone(), port);
+                Some(source_cache)
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not start the remote source cache listener; sources will be read directly",
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not start the remote source cache listener; sources will be read directly",
+                );
+                None
+            }
+        };
+        state = state.with_remote_resolver(std::sync::Arc::new(
+            pharos_server::remote::ResolverCache::new(
+                resolver,
+                std::time::Duration::from_secs(cfg.remote.resolve_ttl_secs),
+                evict_into,
             ),
-        }
+        ));
     }
     state = state.with_hw_encode_session_budget(hw_session_budget);
     // What THIS server can actually encode = trial-confirmed hardware families

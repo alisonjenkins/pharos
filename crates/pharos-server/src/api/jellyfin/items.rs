@@ -6672,6 +6672,14 @@ async fn remove_virtual_folder(
         .delete_library(&root)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // 008 — the rows are gone, so nothing will ever ask for the bytes fetched
+    // against their locators again. Left behind they still occupy the source
+    // cache's budget and get evicted only once they have pushed out something
+    // live. Done after the delete rather than before: a failed delete must not
+    // cost a warm cache.
+    if let Some(remote) = &state.remote {
+        remote.forget_all().await;
+    }
     reload_libraries_and_backfill(&state).await?;
     Ok(HttpResponse::NoContent().finish())
 }
