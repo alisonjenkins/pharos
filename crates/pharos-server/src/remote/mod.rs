@@ -93,13 +93,49 @@ pub struct ResolvedItem {
 
 /// The time-sensitive half — where the bytes are, right now.
 ///
-/// `audio` is separate whenever the site serves adaptive streams, which is the
-/// normal case above 720p: video and audio are different files and ffmpeg takes
-/// both as inputs.
+/// Two shapes, and which one a site gives you is not a detail: an adaptive
+/// source serves video and audio as SEPARATE files, which is the normal case
+/// above 720p, while a progressive one serves a single file carrying both.
+///
+/// Modelled as an enum rather than `{ video, audio: Option<_> }` because that
+/// shape cannot distinguish "one file with both streams" from "a video-only
+/// file whose audio went missing" — and the two want opposite handling. The
+/// first answers an audio request with itself; the second must fail, because
+/// using it would produce a silent video and nothing downstream would notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedMedia {
-    pub video: String,
-    pub audio: Option<String>,
+pub enum ResolvedMedia {
+    /// One file carrying both streams.
+    Progressive { url: String },
+    /// Separate adaptive streams sharing one timeline.
+    Adaptive { video: String, audio: String },
+}
+
+impl ResolvedMedia {
+    /// The locator to hand ffmpeg for a job that wants video, or audio.
+    ///
+    /// Each HLS rendition is a single input: the CMAF video rung is video-only
+    /// (`-an`) and the demuxed audio rung carries no video. A progressive source
+    /// answers either question with itself.
+    pub fn input_for(&self, wants_video: bool) -> &str {
+        match self {
+            Self::Progressive { url } => url,
+            Self::Adaptive { video, audio } => {
+                if wants_video {
+                    video
+                } else {
+                    audio
+                }
+            }
+        }
+    }
+
+    /// The video locator, for keying the source generation.
+    pub fn video(&self) -> &str {
+        match self {
+            Self::Progressive { url } => url,
+            Self::Adaptive { video, .. } => video,
+        }
+    }
 }
 
 /// yt-dlp's `-j` output, narrowed to the fields pharos reads.
@@ -261,6 +297,65 @@ impl RemoteResolver {
     }
 }
 
+/// A [`RemoteResolver`] plus a short-lived memo of what it last returned.
+///
+/// Resolution costs a process spawn and a round trip to the site, and a single
+/// playback asks for the source once per segment. Without a memo a six-second
+/// segment would carry a multi-second resolve, and a site would see one request
+/// per segment from one viewer — which is how a source gets rate-limited
+/// mid-film.
+///
+/// The TTL is a ceiling on pharos's own reuse and NOT a claim about the
+/// upstream lifetime. A signed URL carries its own expiry, that expiry varies
+/// by site and is not always honest, and a URL can be revoked before any TTL
+/// elapses — so an expired locator still has to be handled where it is used.
+/// What the memo guarantees is only that pharos will not keep one for longer
+/// than this.
+pub struct ResolverCache {
+    resolver: RemoteResolver,
+    ttl: Duration,
+    entries: tokio::sync::Mutex<std::collections::HashMap<RemoteRef, (Instant, ResolvedMedia)>>,
+}
+
+impl ResolverCache {
+    pub fn new(resolver: RemoteResolver, ttl: Duration) -> Self {
+        Self {
+            resolver,
+            ttl,
+            entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Where this item's bytes are, resolving only if the memo is cold or stale.
+    ///
+    /// Holds the lock across the resolve deliberately. Concurrent segments of
+    /// one rendition all want the SAME answer, and letting them each spawn a
+    /// yt-dlp would multiply exactly the upstream load the memo exists to
+    /// avoid — the first caller pays, the rest wait for its answer. The lock is
+    /// per-cache rather than per-reference, which is acceptable while a
+    /// household plays a handful of remote items at once; if that stops being
+    /// true the fix is a per-key lock, not a shorter hold.
+    pub async fn locate(&self, r: &RemoteRef) -> Result<ResolvedMedia, ResolveError> {
+        let mut entries = self.entries.lock().await;
+        if let Some((at, media)) = entries.get(r) {
+            if at.elapsed() < self.ttl {
+                return Ok(media.clone());
+            }
+        }
+        let media = self.resolver.locate(r).await?;
+        entries.insert(r.clone(), (Instant::now(), media.clone()));
+        Ok(media)
+    }
+
+    /// Forget a memo, so the next request resolves afresh.
+    ///
+    /// Called when a locator turns out to be dead before its TTL — the case the
+    /// TTL cannot cover, because expiry is the site's decision and not ours.
+    pub async fn invalidate(&self, r: &RemoteRef) {
+        self.entries.lock().await.remove(r);
+    }
+}
+
 /// The page URL for a reference, for handing back to yt-dlp.
 ///
 /// Only YouTube is special-cased because only YouTube's canonical form is
@@ -352,13 +447,16 @@ fn media_from_json(url: &str, doc: YtdlpJson) -> Result<ResolvedMedia, ResolveEr
             .iter()
             .find(|f| f.has_audio() && !f.has_video())
             .and_then(|f| f.url.clone());
-        if let Some(video) = video {
-            return Ok(ResolvedMedia { video, audio });
+        // BOTH or neither. A video-only adaptive result is not a usable source:
+        // playing it would give a picture with no sound, and every layer below
+        // here would report success.
+        if let (Some(video), Some(audio)) = (video, audio) {
+            return Ok(ResolvedMedia::Adaptive { video, audio });
         }
     }
     // Progressive case: one file carrying both.
     doc.url
-        .map(|video| ResolvedMedia { video, audio: None })
+        .map(|url| ResolvedMedia::Progressive { url })
         .ok_or(ResolveError::NoFormat {
             url: url.to_string(),
         })
@@ -485,8 +583,37 @@ mod tests {
     #[test]
     fn an_adaptive_document_yields_both_urls() {
         let m = media_from_json("u", doc(ADAPTIVE)).expect("locates");
-        assert_eq!(m.video, "https://cdn.example/video?sig=v");
-        assert_eq!(m.audio.as_deref(), Some("https://cdn.example/audio?sig=a"));
+        assert_eq!(
+            m,
+            ResolvedMedia::Adaptive {
+                video: "https://cdn.example/video?sig=v".into(),
+                audio: "https://cdn.example/audio?sig=a".into(),
+            }
+        );
+        // Each rendition takes ONE of them; the CMAF video rung is video-only
+        // and the demuxed audio rung carries no video.
+        assert_eq!(m.input_for(true), "https://cdn.example/video?sig=v");
+        assert_eq!(m.input_for(false), "https://cdn.example/audio?sig=a");
+    }
+
+    /// An adaptive result missing its audio half is REFUSED, not returned as a
+    /// video-only source.
+    ///
+    /// This is the case the old `{ video, audio: Option<_> }` shape could not
+    /// express: it looked identical to a progressive file, so the audio rung
+    /// would have been handed a video-only stream and the viewer would have got
+    /// a picture with no sound, with every layer below reporting success.
+    #[test]
+    fn an_adaptive_document_missing_its_audio_is_refused() {
+        let video_only = r#"{
+            "id": "x", "extractor": "youtube", "duration": 10.0,
+            "requested_formats": [
+                {"url": "https://cdn.example/video", "vcodec": "avc1.640028", "acodec": "none"}
+            ]
+        }"#;
+        let err = media_from_json("https://example/watch", doc(video_only))
+            .expect_err("a video-only adaptive result is not a usable source");
+        assert_eq!(err.label(), "no_format");
     }
 
     /// A progressive (single-file) source has no `requested_formats` and its
@@ -499,8 +626,15 @@ mod tests {
             "url": "https://cdn.example/both"
         }"#;
         let m = media_from_json("u", doc(prog)).expect("locates");
-        assert_eq!(m.video, "https://cdn.example/both");
-        assert_eq!(m.audio, None);
+        assert_eq!(
+            m,
+            ResolvedMedia::Progressive {
+                url: "https://cdn.example/both".into()
+            }
+        );
+        // One file, both streams — so it answers either request with itself.
+        assert_eq!(m.input_for(true), "https://cdn.example/both");
+        assert_eq!(m.input_for(false), "https://cdn.example/both");
     }
 
     /// No usable format at all is an error naming the URL, not an empty result
@@ -555,12 +689,11 @@ mod tests {
 
         // And the playback half finds the two adaptive streams.
         let m = media_from_json("u", doc(REAL_CAPTURE)).expect("locates");
-        assert!(m.video.starts_with("https://"));
-        assert!(
-            m.audio.is_some(),
-            "an adaptive document must yield audio separately, or the video is silent"
-        );
-        assert_ne!(Some(m.video.clone()), m.audio);
+        let ResolvedMedia::Adaptive { video, audio } = &m else {
+            panic!("a real YouTube document is adaptive, got {m:?}");
+        };
+        assert!(video.starts_with("https://"));
+        assert_ne!(video, audio, "video and audio must be distinct locators");
     }
 
     /// Every failure label is distinct — they are metric label values, and a
