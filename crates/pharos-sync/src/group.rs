@@ -98,6 +98,17 @@ pub const UNPAUSE_GATE_TIMEOUT_MS: u64 = 5_000;
 /// the group (V19) — the same contract B137's bound relies on.
 pub const SEEK_GATE_TIMEOUT_MS: u64 = 5_000;
 
+/// B184 — how soon after an `Unpause` superseded a V19 freeze a NEW freeze
+/// counts as the same stall rather than a fresh one.
+///
+/// Sized off the live loop it exists to break: the re-freeze arrived **3
+/// seconds** after the supersede (freeze at 13.4s of the item, superseded,
+/// re-frozen at 16.5s). 8s covers that with room, while staying far below any
+/// plausible gap between two genuinely separate stalls — a member that plays
+/// for eight uninterrupted seconds and then buffers again has recovered and
+/// hit something new, and deserves the full B137 escape hatch again.
+pub const REFREEZE_LOOP_WINDOW_MS: u64 = 8_000;
+
 /// T83 — how long a member may stay SILENT (no socket KeepAlive, no
 /// `/SyncPlay/Ping`, no command) before the group prunes it as a ghost.
 /// jellyfin-web KeepAlives every ~30s, so a live client refreshes several
@@ -912,6 +923,21 @@ struct GroupState {
     /// can never freeze the group past `BUFFERING_MAX_MS`. `None` whenever the
     /// group is not frozen for buffering. (B55.)
     buffering_since: Option<tokio::time::Instant>,
+    /// B184 — when an `Unpause` last SUPERSEDED a V19 buffering freeze.
+    ///
+    /// B137 made an explicit resume override the freeze and clear every
+    /// member's flag, on the reasoning that a frozen member has no player
+    /// transition left to make and so can never prove recovery; the V19
+    /// guarantee was to be "preserved by re-report". Re-report does work — and
+    /// when the member has NOT recovered it works immediately, which is a loop,
+    /// not a recovery. Measured live 2026-08-01: freeze (20.9s, superseded) →
+    /// re-freeze 3s later → freeze (30.0s, superseded), across which playback
+    /// advanced from 13.4s to 16.5s. Two seconds of video on repeat for a
+    /// minute, which is what the room actually experiences.
+    ///
+    /// Monotonic, NOT persisted: it bounds a loop measured in seconds, and a
+    /// replica takeover that forgets it costs one extra supersede.
+    freeze_superseded_at: Option<tokio::time::Instant>,
     /// Intent captured when the V19 buffering freeze engages: was the group
     /// PLAYING at that moment (→ resume Playing when it lifts) or not. Without
     /// it, every freeze-recovery path force-resumed Playing — so a user pause
@@ -965,6 +991,7 @@ impl GroupState {
             leader: None,
             group_paused_due_to_buffering: false,
             buffering_since: None,
+            freeze_superseded_at: None,
             buffering_resume_playing: false,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
@@ -2749,6 +2776,47 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // That is the same contract the sender-clear above has always
             // relied on — this only stops applying it selectively.
             if state.group_paused_due_to_buffering {
+                // B184 — but only once per stall. A freeze that BEGAN moments
+                // after the last supersede is proof the previous one was
+                // premature: the member re-reported `BufferingStart`, which is
+                // exactly the mechanism B137 relies on to stay safe, and it
+                // reported it because it never recovered. Superseding again
+                // just restarts the loop, and the room watches the same two
+                // seconds until whoever is stalling gives up or the link
+                // improves.
+                //
+                // Deliberately NOT a blanket refusal. The FIRST supersede is
+                // B137's escape hatch and stays exactly as it was — a member
+                // whose flag is stale has no other way to say so, and taking
+                // that away reinstates the hang B137 fixed. This declines only
+                // the repeat, where the member has already demonstrated, by
+                // re-reporting, that it is genuinely still buffering.
+                let refreeze_after_supersede =
+                    match (state.freeze_superseded_at, state.buffering_since) {
+                        (Some(superseded), Some(froze)) => {
+                            froze >= superseded
+                                && froze.duration_since(superseded)
+                                    < std::time::Duration::from_millis(REFREEZE_LOOP_WINDOW_MS)
+                        }
+                        _ => false,
+                    };
+                if refreeze_after_supersede {
+                    tracing::info!(
+                        group = %state.id,
+                        sender = %sender,
+                        held_ms = state
+                            .buffering_since
+                            .map(|t| t.elapsed().as_millis() as u64)
+                            .unwrap_or(0),
+                        buffering_members =
+                            state.members.values().filter(|m| m.buffering).count(),
+                        "syncplay: unpause declined — the group re-froze right after the \
+                         last supersede, so the member never recovered (B184)"
+                    );
+                    metrics::counter!("pharos_syncplay_unpause_declined_total", "reason" => "refreeze_loop")
+                        .increment(1);
+                    return;
+                }
                 tracing::info!(
                     group = %state.id,
                     sender = %sender,
@@ -2760,6 +2828,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     "syncplay: explicit unpause supersedes the V19 buffering freeze (B137)"
                 );
                 state.clear_buffering_freeze(FreezeOutcome::Superseded);
+                state.freeze_superseded_at = Some(tokio::time::Instant::now());
                 for m in state.members.values_mut() {
                     m.buffering = false;
                 }
@@ -4376,6 +4445,95 @@ mod tests {
         assert!(
             !server_pli.is_empty(),
             "seeded queue must mint a non-empty server PLI the creator never saw"
+        );
+    }
+
+    /// B184 — an unpause breaks a V19 freeze ONCE; a re-freeze moments later
+    /// means the member never recovered, and superseding again is a loop.
+    ///
+    /// Live 2026-08-01: freeze (held 20.9s, `superseded`) -> re-freeze 3s later
+    /// -> freeze (held 30.0s, `superseded`), across which playback advanced
+    /// from 13.4s to 16.5s of the episode. The room watched two seconds of
+    /// video on repeat for a minute. jellyfin-web auto-fires `Unpause` about a
+    /// second after a queue change, so this needs no human pressing anything.
+    ///
+    /// The FIRST supersede must still work — that is B137's escape hatch for a
+    /// member holding a stale flag it has no transition left to clear — so this
+    /// asserts both halves.
+    #[tokio::test(start_paused = true)]
+    async fn an_unpause_breaks_a_buffering_freeze_once_but_not_on_a_loop() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, _rx2) = add_member(&h, &sinks, "jana").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 13_461,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // jana stalls -> V19 freezes the group.
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 13_461,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "a buffering member must freeze the group (V19)"
+        );
+
+        // Her client auto-unpauses. B137: this supersedes the freeze.
+        h.tx.send(GroupMsg::Unpause { sender: m2 }).await.unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "the FIRST unpause must still break the freeze — removing that \
+             reinstates the hang B137 fixed"
+        );
+
+        // She never actually recovered: 3s later she re-reports, exactly as
+        // measured live.
+        tokio::time::advance(Duration::from_millis(3_000)).await;
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 16_541,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "the re-report must re-freeze the group"
+        );
+
+        // The auto-unpause fires again. THIS one must be declined, or the loop
+        // runs until the link improves.
+        h.tx.send(GroupMsg::Unpause { sender: m2 }).await.unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Paused,
+            "a re-freeze right after a supersede proves the member never \
+             recovered; superseding again is the replay loop"
+        );
+
+        // Declining must not become a hang: the freeze still ends the honest
+        // way, when the member actually recovers. (It is anti-wedge bounded
+        // too — see `buffering_freeze_times_out_via_anti_wedge`.) This is the
+        // whole difference between waiting for a real answer and looping on a
+        // fake one.
+        h.tx.send(GroupMsg::BufferingEnd { member_id: m2 })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Playing,
+            "a genuine recovery must still resume the group"
         );
     }
 
