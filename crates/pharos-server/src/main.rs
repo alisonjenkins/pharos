@@ -1010,6 +1010,12 @@ async fn build_transcode_scheduler(
     // sessions at several× realtime can safely warm a deeper buffer than
     // the CPU thread budget would ever allow.
     usize,
+    // Digest of the device table's placement-relevant state — the
+    // `(device id, weight)` pairs `DeviceTable::rendition_device` bands on.
+    // The HLS cache generation is composed from it, so a probe that measures a
+    // different capacity than the last boot invalidates the segments the
+    // previous placement produced AND changes the `g=` in every client URL.
+    u64,
 )> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
     use pharos_transcode::probe::{probe_device_caps, probe_encodable_codecs, ProbeConfig};
@@ -1084,6 +1090,9 @@ async fn build_transcode_scheduler(
         }
     }
     let table = DeviceTable::from_probe(&caps, default_cpu_permits());
+    // Read BEFORE the table is moved into the scheduler. This is the whole
+    // placement input, digested — see `DeviceTable::placement_fingerprint`.
+    let placement_fingerprint = table.placement_fingerprint();
     // Sum the probed session caps of the HARDWARE devices only (phantom GPUs
     // are already excluded from `caps`). This is the concurrency the encoder
     // fleet can actually sustain — the prefetch buffer scales on it.
@@ -1096,6 +1105,15 @@ async fn build_transcode_scheduler(
         devices = caps.len(),
         cpu_permits = default_cpu_permits(),
         hw_session_budget,
+        placement_fingerprint = format!("{placement_fingerprint:016x}"),
+        // The digest's own inputs, so "why did my cache wipe" is answerable
+        // from the boot log without a rebuild: compare these two lines across
+        // restarts and the drifted device is named.
+        placement_inputs = ?table
+            .slots()
+            .iter()
+            .map(|s| (s.id.to_string(), s.weight()))
+            .collect::<Vec<_>>(),
         "transcode scheduler device table built"
     );
     Some((
@@ -1109,6 +1127,7 @@ async fn build_transcode_scheduler(
         ),
         hw_codecs,
         hw_session_budget,
+        placement_fingerprint,
     ))
 }
 
@@ -1198,7 +1217,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // all-CPU, crash-isolated workers) once, shared by the HLS cache
     // (segment path) + the live/uncached path on AppState. Falls back to
     // inline ffmpeg when disabled or when the worker can't be brought up.
-    let (transcode_scheduler, confirmed_hw, hw_session_budget) =
+    let (transcode_scheduler, confirmed_hw, hw_session_budget, placement_fingerprint) =
         if cfg.server.transcode_hw_session_cap > 0 {
             match build_transcode_scheduler(
                 &detected,
@@ -1208,18 +1227,33 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             )
             .await
             {
-                Some((sched, hw, budget)) => {
+                Some((sched, hw, budget, fingerprint)) => {
                     tracing::info!("transcode scheduler enabled (load-balanced workers)");
-                    (Some(sched), hw, budget)
+                    (Some(sched), hw, budget, Some(fingerprint))
                 }
                 None => {
                     tracing::warn!("transcode worker unavailable; using the inline ffmpeg path");
-                    (None, Vec::new(), 0)
+                    (None, Vec::new(), 0, None)
                 }
             }
         } else {
-            (None, Vec::new(), 0)
+            (None, Vec::new(), 0, None)
         };
+    // Fix the HLS cache generation from the placement rule BEFORE the cache
+    // reconciles against it and before any playlist hands a client a `g=`.
+    // Without a device table there is no placement to digest, so the bare
+    // version stands (see `pharos_cache::compose_generation`).
+    if let Some(fingerprint) = placement_fingerprint {
+        pharos_cache::install_placement_fingerprint(fingerprint);
+    }
+    tracing::info!(
+        generation = %pharos_cache::generation(),
+        base_version = pharos_cache::HLS_GEN_VERSION,
+        placement_fingerprint = placement_fingerprint
+            .map(|f| format!("{f:016x}"))
+            .unwrap_or_else(|| "<no device table>".into()),
+        "HLS cache generation fixed for this process"
+    );
     if let Some(sched) = transcode_scheduler.as_ref() {
         state = state.with_transcode_scheduler(sched.clone());
     }

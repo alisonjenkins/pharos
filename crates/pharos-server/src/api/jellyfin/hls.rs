@@ -1631,11 +1631,19 @@ async fn resolve_text_burn_assets(
 /// init does not describe (issue #114). Wiping the server cache cannot fix
 /// that; the stale copy is in the browser.
 ///
-/// Embedding [`HLS_GEN_VERSION`] makes a generation change a URL change, so
-/// the client fetches a matching init instead of reusing an incompatible one.
+/// Embedding the generation makes a generation change a URL change, so the
+/// client fetches a matching init instead of reusing an incompatible one.
+///
+/// This is `pharos_cache::generation()`, NOT the bare `HLS_GEN_VERSION`: since
+/// spec 007 the assignment rule bands renditions by device weight, and the
+/// weight is what the boot probe measured, so an ordinary restart can re-place
+/// a rendition with the constant sitting still. The generation is composed from
+/// a digest of the placement state precisely so it moves whenever placement
+/// can — and it MUST be the same string the server-side cache reconciles
+/// against, or one of the two caches keeps bytes the other threw away.
 fn rendition_qs(req: &HttpRequest) -> String {
     let qs = playback_qs(req);
-    let gen = pharos_cache::HLS_GEN_VERSION;
+    let gen = pharos_cache::generation();
     if qs.is_empty() {
         format!("g={gen}")
     } else {
@@ -4559,9 +4567,20 @@ mod tests {
     /// so no amount of server-side cache wiping clears it: observed in
     /// production when CMAF moved from libx264 to NVENC, where the fault
     /// survived a full server cache wipe AND a playback restart.
+    ///
+    /// The generation carried is the COMPOSED one — the base version plus a
+    /// digest of the device table's placement state — and it has to be the very
+    /// string the server-side cache reconciles against, so this reads
+    /// `pharos_cache::generation()` rather than re-deriving it. A URL change
+    /// without a wipe leaves stale bytes on disk; a wipe without a URL change
+    /// leaves the browser's `immutable` init in place. Both readers, one value.
     #[test]
     async fn a_shared_init_rendition_uri_carries_the_cache_generation() {
-        let gen = pharos_cache::HLS_GEN_VERSION;
+        let gen = pharos_cache::generation();
+        assert!(
+            gen.starts_with(&pharos_cache::HLS_GEN_VERSION.to_string()),
+            "the base version must stay legible in the URL: {gen}"
+        );
 
         // With a playback query string, the generation is appended.
         let req = actix_web::test::TestRequest::get()
