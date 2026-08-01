@@ -1180,6 +1180,12 @@ async fn build_transcode_scheduler(
                     rate,
                 });
             }
+            // The same coverage gauge the stored path publishes. Its own
+            // argument demands it: absent, it is indistinguishable from a
+            // server that never got as far as probing — and this is the shape
+            // most likely to have an unstable measurement, since it re-probes
+            // on every boot.
+            pharos_transcode::rate_store::publish_probe_coverage(&out);
             out
         }
     };
