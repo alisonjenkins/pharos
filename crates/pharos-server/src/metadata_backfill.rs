@@ -401,6 +401,25 @@ fn record_enrich(kind: MediaKind, outcome: EnrichOutcome) {
 /// item was skipped, marked `none`, or hit a transient miss.
 ///
 /// `now` is injected (not read from the clock) so tests are deterministic.
+/// The string a provider search is built from.
+///
+/// A local item's FILENAME is the better key: it carries the release title and
+/// year that the display title has usually had stripped. A remote item's path is
+/// synthetic (`ytdlp://<extractor>/<id>` — 008), so its last component is a
+/// site's opaque video id — searching a provider for that would match something
+/// at random and then persist the match. Its title is what the resolver read off
+/// the source, which is the real name.
+fn search_stem(item: &MediaItem) -> &str {
+    match item.origin().local() {
+        Some(p) => p
+            .as_path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(item.title.as_str()),
+        None => item.title.as_str(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn enrich_one<Tm, Tv, S>(
     store: &S,
@@ -417,11 +436,7 @@ where
     Tv: OnlineEnricher,
     S: MediaStore + GenreStore + PersonStore,
 {
-    let stem = item
-        .path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(item.title.as_str());
+    let stem = search_stem(&item);
 
     // Search key: a movie parses (title, year) from its filename; an episode
     // searches by SERIES name/year (the fetch narrows to season/episode) — the
@@ -1516,6 +1531,36 @@ mod tests {
     use super::*;
     use crate::musicbrainz::AlbumArt;
     use pharos_core::{MediaItem, SearchCandidate};
+
+    /// A remote item searches by TITLE, a local one by FILENAME.
+    ///
+    /// Both directions in one test: a `search_stem` that always returned the
+    /// title would satisfy the remote half alone, and the filename is genuinely
+    /// the better key for a local item — it carries the year the display title
+    /// has had stripped. Getting this wrong is not a miss but a WRONG match: the
+    /// provider would be searched for `dQw4w9WgXcQ`, and whatever came back
+    /// would be persisted against the item.
+    #[test]
+    fn a_remote_item_searches_by_title_not_by_its_synthetic_path() {
+        let remote = MediaItem {
+            id: 1,
+            path: pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+                .expect("valid ref")
+                .to_synthetic_path(),
+            title: "Never Gonna Give You Up".into(),
+            ..Default::default()
+        };
+        assert_eq!(search_stem(&remote), "Never Gonna Give You Up");
+
+        let local = MediaItem {
+            id: 2,
+            path: "/media/Movies/Arrival (2016)/Arrival.2016.1080p.mkv".into(),
+            title: "Arrival".into(),
+            ..Default::default()
+        };
+        assert_eq!(search_stem(&local), "Arrival.2016.1080p");
+    }
+
     use pharos_store_sqlx::sqlite::SqliteStore;
     use tempfile::TempDir;
 
