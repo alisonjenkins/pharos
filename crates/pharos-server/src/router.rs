@@ -42,10 +42,29 @@ async fn sample_scheduler(state: Option<&crate::state::AppState>) {
     // report no job completion — so they are occupancy with nothing to
     // attribute it to. `in_use` minus inflight minus this is unexplained.
     metrics::gauge!("pharos_transcode_live_streams").set(snap.live_streams as f64);
-    for d in snap.devices {
+    publish_device_gauges(&snap.devices);
+}
+
+/// Per-device gauges from one scheduler snapshot.
+///
+/// Split out from [`sample_scheduler`] so it can be asserted without standing
+/// up an `AppState` and a scheduler: the interesting claim is what gets
+/// published for a given device row, and that is entirely a function of this
+/// loop.
+fn publish_device_gauges(devices: &[pharos_transcode::scheduler::DeviceStat]) {
+    for d in devices {
         let device = d.id.to_string();
         metrics::gauge!("pharos_transcode_device_capacity", "device" => device.clone())
             .set(d.capacity as f64);
+        // Spec 007 — capacity is what a device CAN run; the weight is the share
+        // of shared-init renditions the boot probe decided to give it, and the
+        // two differ by the measured speed ratio. Placement bands on the
+        // weight, so a rendition landing somewhere surprising is either a
+        // misplacement or a mis-weighting — and without this gauge published
+        // beside the pin counter those are one observation. On hardware nobody
+        // has tested, that is the first question anyone asks.
+        metrics::gauge!("pharos_transcode_device_weight", "device" => device.clone())
+            .set(f64::from(d.weight));
         metrics::gauge!("pharos_transcode_device_in_use", "device" => device.clone())
             .set(d.in_use as f64);
         // A device silently sidelined by cooldown looks identical to one that
@@ -87,6 +106,60 @@ mod tests {
         let req = test::TestRequest::get().uri("/").to_request();
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
+    }
+
+    /// ODD (spec 007) — the weight is the input placement bands on, and it is
+    /// derived at boot from a probe nobody watches. Publishing the capacity
+    /// beside it is not enough: on a table where every device happened to
+    /// measure the same speed the two coincide, which is exactly the case a
+    /// dashboard would look right in while a mis-weighting went unnoticed.
+    ///
+    /// So the fixture makes them differ. The device is given 2 permits and a
+    /// weight of 8, and both numbers are asserted in the rendered exposition:
+    /// a gauge wired to `capacity` renders 2, and one that is not wired at all
+    /// renders nothing.
+    #[actix_web::test]
+    async fn the_device_weight_is_published_and_is_not_the_capacity() {
+        use pharos_transcode::protocol::DeviceId;
+        use pharos_transcode::scheduler::DeviceStat;
+
+        let _ = crate::obs::init("info", None);
+        publish_device_gauges(&[DeviceStat {
+            id: DeviceId::Cpu,
+            capacity: 2,
+            weight: 8,
+            in_use: 0,
+            in_cooldown: false,
+            inflight_interactive: 0,
+            inflight_background: 0,
+        }]);
+        let rendered = crate::obs::render();
+        let weight_line = rendered
+            .lines()
+            .find(|l| l.starts_with("pharos_transcode_device_weight{"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "pharos_transcode_device_weight must be published — without it a \
+                     misplacement cannot be told from a mis-weighting.\n{rendered}"
+                )
+            });
+        assert!(
+            weight_line.contains(r#"device="cpu""#),
+            "the weight must be per-device: {weight_line}"
+        );
+        assert!(
+            weight_line.ends_with(" 8"),
+            "the weight gauge must carry the placement weight, not the permit \
+             count: {weight_line}"
+        );
+        // ...and the capacity gauge still says 2, so the two are genuinely
+        // distinct series rather than one renamed.
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("pharos_transcode_device_capacity{") && l.ends_with(" 2")),
+            "the capacity gauge must be unchanged:\n{rendered}"
+        );
     }
 
     #[actix_web::test]
