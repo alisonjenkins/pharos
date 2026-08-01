@@ -316,6 +316,24 @@ pub enum WorkerError {
     /// without it an operator cannot tell a card that is saturated from one
     /// that is broken.
     DeviceBusy(String),
+    /// Non-recoverable: the SOURCE could not be decoded on the device this job
+    /// ran on. Carries the ffmpeg reason.
+    ///
+    /// Split out of `DeviceBusy` because it is the opposite verdict about the
+    /// same hardware. A decode failure says nothing about the card's health —
+    /// it says this SOURCE and this DECODER cannot work together — and on
+    /// 2026-08-01 collapsing the two took a whole GPU out of service for an
+    /// AV1 file a Pascal card has no decoder for, failing 453 client segments
+    /// of unrelated titles that were merely pinned to the same device.
+    ///
+    /// Deliberately NOT transient. Retrying the identical job elsewhere cannot
+    /// help: the decision to offload decode is made per (source, device) before
+    /// dispatch, so a job that reached the decoder and failed there would fail
+    /// the same way again. The fix for the recurrence is upstream — do not ask
+    /// a device to decode what it has no decoder for — and this class exists so
+    /// that when the upstream capability answer is wrong, the cost is one
+    /// rendition rather than the device.
+    DecodeFailed(String),
     /// Non-recoverable: target codec not encodable by this build. Carries
     /// the underlying reason (which codec / why) so the log is actionable.
     UnsupportedCodec(String),
@@ -339,6 +357,7 @@ impl WorkerError {
     pub fn label(&self) -> &'static str {
         match self {
             Self::DeviceBusy(_) => "device_unusable",
+            Self::DecodeFailed(_) => "decode_failed",
             Self::UnsupportedCodec(_) => "unsupported_codec",
             Self::BadInput(_) => "bad_input",
             Self::Io(_) => "io",
@@ -356,6 +375,7 @@ impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkerError::DeviceBusy(why) => write!(f, "hardware device unusable: {why}"),
+            WorkerError::DecodeFailed(why) => write!(f, "source decode failed: {why}"),
             WorkerError::UnsupportedCodec(s) => write!(f, "unsupported codec: {s}"),
             WorkerError::BadInput(s) => write!(f, "bad input: {s}"),
             WorkerError::Io(s) => write!(f, "io: {s}"),
