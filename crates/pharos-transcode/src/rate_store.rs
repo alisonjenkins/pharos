@@ -296,6 +296,7 @@ impl RateStore {
             if ratcheted {
                 self.save(fp, &out);
             }
+            self.publish_measurement_coverage(&out, true);
             return out;
         }
 
@@ -320,7 +321,59 @@ impl RateStore {
             });
         }
         self.save(fp, &measured);
+        self.publish_measurement_coverage(&measured, false);
         measured
+    }
+
+    /// Whether each device's weight is backed by a real encode-rate
+    /// measurement — `pharos_transcode_device_rate_unmeasured{device}`, 1 when
+    /// it is not.
+    ///
+    /// A gauge rather than a log line, because the condition is a STATE and not
+    /// an event. An unmeasured device weighs its capacity alone AND drops out
+    /// of the reference `min`, holding down every other device's weight; and
+    /// once that failure is persisted, no later boot re-measures it. It is
+    /// indefinite, recoverable only by deleting a file, and invisible in every
+    /// other signal the process emits — the weights that result look perfectly
+    /// ordinary, and the boot WARN scrolls past exactly once. A log cannot be
+    /// alerted on days later; a gauge that is still 1 can.
+    ///
+    /// Published for MEASURED devices too, as an explicit 0. A gauge that only
+    /// appears on failure cannot be read as a rate, and its absence would be
+    /// indistinguishable from a server that never got as far as probing.
+    ///
+    /// Cardinality is the device count — the same bound as
+    /// `pharos_transcode_device_capacity`, which shares the `device` label
+    /// values.
+    fn publish_measurement_coverage(&self, devices: &[DeviceProbe], reused: bool) {
+        for d in devices {
+            metrics::gauge!(
+                "pharos_transcode_device_rate_unmeasured",
+                "device" => d.device.to_string(),
+            )
+            .set(if d.rate.is_some() { 0.0 } else { 1.0 });
+        }
+        if reused {
+            let stuck: Vec<String> = devices
+                .iter()
+                .filter(|d| d.rate.is_none())
+                .map(|d| d.device.to_string())
+                .collect();
+            if !stuck.is_empty() {
+                // The gauge says WHICH; this says what to do about it, at the
+                // one moment an operator reading a boot log can act on it.
+                tracing::warn!(
+                    devices = ?stuck,
+                    path = %self.path.display(),
+                    "these devices have a STORED failed encode-rate measurement: they \
+                     weigh their capacity alone, they hold down every other device's \
+                     weight by dropping out of the reference minimum, and they will \
+                     NOT be re-measured while the device set is unchanged. Delete this \
+                     file to force a re-probe (it costs one boot's probe time and \
+                     re-places renditions)"
+                );
+            }
+        }
     }
 
     /// Stored `(device, capacity, rate)` for this exact device set, in the
@@ -812,6 +865,105 @@ mod tests {
         let out = store.resolve(&devices, probe.as_probe()).await;
         assert_eq!(probe.calls(), 0, "the file is valid, so it is still reused");
         assert_eq!(out[0].rate, None, "but the rate is unusable");
+    }
+
+    /// ODD — a stored `None` is the one failure mode this design deliberately
+    /// makes STICKY. An unmeasured device weighs its capacity alone AND drops
+    /// out of the reference `min`, which holds down every other device's
+    /// weight; and because the failure is persisted, no later boot re-measures
+    /// it. That is the right trade (the alternative is the intermittent
+    /// re-weighting this module exists to prevent) but it is indefinite, it is
+    /// only recoverable by deleting a file, and nothing else in the process
+    /// ever mentions it again — the WARN scrolls past once at boot and the
+    /// weights themselves look perfectly ordinary.
+    ///
+    /// So it gets a gauge. Asserted with a 1 AND a 0 in the same snapshot: a
+    /// stub that never publishes, or one that publishes a constant, cannot
+    /// satisfy both.
+    #[test]
+    fn an_unmeasured_device_is_visible_as_a_gauge_including_when_reused() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let devices = [(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)];
+
+        let unmeasured_devices = |recorder: &DebuggingRecorder| {
+            let mut out: Vec<(String, f64)> = recorder
+                .snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(ck, _, _, v)| {
+                    let k = ck.key();
+                    if k.name() != "pharos_transcode_device_rate_unmeasured" {
+                        return None;
+                    }
+                    let device = k
+                        .labels()
+                        .find(|l| l.key() == "device")
+                        .map(|l| l.value().to_string())?;
+                    match v {
+                        DebugValue::Gauge(g) => Some((device, g.into_inner())),
+                        other => panic!("expected a gauge, got {other:?}"),
+                    }
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+
+        // First boot: the probe cannot measure one device.
+        let first = DebuggingRecorder::new();
+        metrics::with_local_recorder(&first, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                RateStore::new(dir.path())
+                    .resolve(
+                        &devices,
+                        CountingProbe::new().cannot_measure(vaapi()).as_probe(),
+                    )
+                    .await
+            });
+        });
+        let measured_boot = unmeasured_devices(&first);
+        assert_eq!(
+            measured_boot,
+            vec![
+                (gpu().to_string(), 0.0),
+                (vaapi().to_string(), 1.0),
+                (DeviceId::Cpu.to_string(), 0.0),
+            ],
+            "the failed measurement must be nameable, and the measured ones must \
+             say so too — a gauge only on failure cannot be alerted on as a rate"
+        );
+
+        // The restart. Nothing is probed, the `None` comes off disk, and it is
+        // now permanent until the device set changes — which is exactly when a
+        // signal has to still be there.
+        let second = DebuggingRecorder::new();
+        metrics::with_local_recorder(&second, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let probe = CountingProbe::new();
+            let out = rt.block_on(async {
+                RateStore::new(dir.path())
+                    .resolve(&devices, probe.as_probe())
+                    .await
+            });
+            assert_eq!(probe.calls(), 0, "this must be the reuse path");
+            assert_eq!(probe_of(&out, vaapi()).rate, None);
+        });
+        assert_eq!(
+            unmeasured_devices(&second),
+            measured_boot,
+            "a reused failure is MORE serious than a fresh one, not less: it is \
+             the one that will never re-measure itself"
+        );
     }
 
     impl RateStore {
