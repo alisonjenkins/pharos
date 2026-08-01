@@ -129,6 +129,69 @@ struct EntryMeta {
 /// happened (codec-blind keys served an HEVC copy to h264-only clients)
 /// and any silent arg-order slip mis-keys the cache. Named fields make
 /// that class unrepresentable.
+/// Which generation of an item's SOURCE BYTES a segment was cut from — 008.
+///
+/// A file on disk is always [`SourceGen::LOCAL`]: its path names its bytes, and
+/// a silently-rewritten file is a pre-existing hazard this does not pretend to
+/// solve. For a URL-backed item the bytes behind one `media_id` are whatever the
+/// resolver last returned, and re-resolution is the NORMAL case rather than an
+/// edge — a signed URL expires, a format is withdrawn, a CDN serves a different
+/// variant. Without this, `media_id` plus rendition parameters would key two
+/// genuinely different encodes to one entry, and the browser would hold the
+/// first for a year behind `immutable`.
+///
+/// **Derived, never maintained beside the thing it describes.** That is 007's
+/// V129 lesson applied one level down: the generation is computed from the
+/// source pharos is actually about to read, so a re-resolution cannot change the
+/// bytes without changing the key. Nothing has to remember to bump it.
+///
+/// This deliberately does NOT ride `pharos_cache::generation()`. That is a
+/// process-wide `OnceLock` fixed at boot answering "did the server's placement
+/// rule change" — bumping it because one video re-resolved would wipe every
+/// local title's segments. This is a per-ITEM question and moves independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct SourceGen(u32);
+
+impl SourceGen {
+    /// A file on disk. Its path is its identity, so there is one generation.
+    pub const LOCAL: Self = Self(0);
+
+    /// Derive the generation from the source pharos is about to read.
+    ///
+    /// The rule is syntactic and does no I/O: anything carrying a URI scheme is
+    /// a resolvable source whose bytes can change under a stable `media_id`, so
+    /// it is keyed by the resolved locator itself. Everything else is an
+    /// ordinary path and is [`LOCAL`](Self::LOCAL).
+    ///
+    /// Forced non-zero for the remote case so `LOCAL` stays unambiguous: zero
+    /// means "a file", and no resolved source may collide with that.
+    pub fn for_source(source: &Path) -> Self {
+        let Some(s) = source.to_str() else {
+            return Self::LOCAL;
+        };
+        if !s.contains("://") {
+            return Self::LOCAL;
+        }
+        use xxhash_rust::xxh3::xxh3_64;
+        let h = (xxh3_64(s.as_bytes()) as u32) | 1;
+        Self(h)
+    }
+
+    /// The raw value, for the URL parameter that carries it to clients.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this is the local, single-generation case.
+    ///
+    /// Load-bearing for the cache layout: a local segment's filename is
+    /// unchanged by this field existing, so adding it does not invalidate an
+    /// existing 40 GiB cache on deploy.
+    pub fn is_local(self) -> bool {
+        self == Self::LOCAL
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SegmentIdentity {
     media_id: u64,
@@ -150,6 +213,10 @@ pub struct SegmentIdentity {
     audio_bitrate_kbps: u32,
     /// See `codec_tag` — distinguishes output codec generations.
     codec_tag: u32,
+    /// 008 — which generation of the SOURCE bytes these were cut from.
+    /// [`SourceGen::LOCAL`] for every file-backed item, so their cache
+    /// filenames are byte-identical to what they were before this existed.
+    source_gen: SourceGen,
 }
 
 const NO_SUBTITLE: i32 = -1;
@@ -694,6 +761,7 @@ impl SegmentIdentity {
         audio_index: Option<u32>,
         subtitle_index: Option<u32>,
         opts: &SegmentOpts,
+        source_gen: SourceGen,
     ) -> Self {
         let kbps = |b: Option<u64>| {
             b.map(|b| (b / 1000).min(u32::MAX as u64) as u32)
@@ -715,6 +783,7 @@ impl SegmentIdentity {
             video_bitrate_kbps: kbps(opts.video_bitrate_bps),
             audio_bitrate_kbps: kbps(opts.audio_bitrate_bps()),
             codec_tag: codec_tag(opts.video, opts.audio_codec(), opts.container),
+            source_gen,
         }
     }
 
@@ -734,7 +803,18 @@ impl SegmentIdentity {
             video_bitrate_kbps,
             audio_bitrate_kbps,
             codec_tag,
+            source_gen,
         } = self;
+        // A local item contributes NOTHING here, so every existing cache
+        // filename is byte-identical to what it was before this field existed
+        // and the deploy does not wipe a 40 GiB cache. `LOCAL` and absent are
+        // the same thing, and the mapping stays injective because no resolved
+        // source may hash to zero.
+        let gen = if source_gen.is_local() {
+            String::new()
+        } else {
+            format!("-g{}", source_gen.get())
+        };
         let sub = if *subtitle_index == NO_SUBTITLE {
             "off".to_string()
         } else {
@@ -748,7 +828,7 @@ impl SegmentIdentity {
             }
         };
         format!(
-            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}.ts",
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}.ts",
             br(*video_bitrate_kbps),
             br(*audio_bitrate_kbps),
         )
@@ -1481,7 +1561,14 @@ impl HlsSegmentCache {
             segment: Some(seg_index),
             seeds_playhead,
         };
-        let key = SegmentIdentity::new(media_id, seg_index, audio_index, subtitle_index, opts);
+        let key = SegmentIdentity::new(
+            media_id,
+            seg_index,
+            audio_index,
+            subtitle_index,
+            opts,
+            SourceGen::for_source(source),
+        );
         let path = self.segment_path_keyed(key);
 
         // Fast hit path: file present, just bump LRU. A concurrent
@@ -2348,6 +2435,7 @@ impl HlsSegmentCache {
             video_bitrate_kbps: 0,
             audio_bitrate_kbps: 0,
             codec_tag: 0,
+            source_gen: SourceGen::LOCAL,
         })
     }
 
@@ -3683,7 +3771,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let cache = HlsSegmentCache::new(td.path(), 1 << 30);
         let opts = segment_opts();
-        let key = SegmentIdentity::new(7, 27, None, None, &opts);
+        let key = SegmentIdentity::new(7, 27, None, None, &opts, SourceGen::LOCAL);
         let path = cache.segment_path_keyed(key);
 
         let recorder = DebuggingRecorder::new();
@@ -3951,7 +4039,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(600));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(61, 9, None, None, &opts);
+        let key = SegmentIdentity::new(61, 9, None, None, &opts, SourceGen::LOCAL);
         let path = cache.segment_path_keyed(key);
         let cache = Arc::new(cache);
 
@@ -4067,7 +4155,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(62, 4, None, None, &opts);
+        let key = SegmentIdentity::new(62, 4, None, None, &opts, SourceGen::LOCAL);
         let path = cache.segment_path_keyed(key);
 
         let recorder = DebuggingRecorder::new();
@@ -4174,7 +4262,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_driver_whose_registration_vanished_stops_instead_of_spinning() {
         let opts = slow_opts();
-        let key = SegmentIdentity::new(70, 1, None, None, &opts);
+        let key = SegmentIdentity::new(70, 1, None, None, &opts, SourceGen::LOCAL);
         let job = pharos_transcode::scheduler::JobSlot::new();
         let published = std::sync::atomic::AtomicBool::new(false);
 
@@ -4490,7 +4578,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(4, 2, None, None, &opts);
+        let key = SegmentIdentity::new(4, 2, None, None, &opts, SourceGen::LOCAL);
         let tx = seed_inflight(&cache, key);
 
         let waiter = {
@@ -4537,7 +4625,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(44, 8, None, None, &opts);
+        let key = SegmentIdentity::new(44, 8, None, None, &opts, SourceGen::LOCAL);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -4963,7 +5051,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (base, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
         let opts = slow_opts();
-        let blocked = base.segment_path_keyed(SegmentIdentity::new(41, 2, None, None, &opts));
+        let blocked = base.segment_path_keyed(SegmentIdentity::new(
+            41,
+            2,
+            None,
+            None,
+            &opts,
+            SourceGen::LOCAL,
+        ));
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -5220,7 +5315,14 @@ mod tests {
     /// Put a segment on disk for `seg` so the next request for it is a FAST
     /// cache hit — what a viewer sees once prefetch is a segment or two ahead.
     async fn already_cached(cache: &HlsSegmentCache, media: u64, seg: u32, opts: &SegmentOpts) {
-        let path = cache.segment_path_keyed(SegmentIdentity::new(media, seg, None, None, opts));
+        let path = cache.segment_path_keyed(SegmentIdentity::new(
+            media,
+            seg,
+            None,
+            None,
+            opts,
+            SourceGen::LOCAL,
+        ));
         tokio::fs::create_dir_all(path.parent().expect("a segment path has a parent"))
             .await
             .expect("cache dir");
@@ -5610,9 +5712,14 @@ mod tests {
             "a shed job must not fall back to encoding anyway"
         );
         assert!(
-            !cache
-                .inflight
-                .contains_key(&SegmentIdentity::new(5, 1, None, None, &opts)),
+            !cache.inflight.contains_key(&SegmentIdentity::new(
+                5,
+                1,
+                None,
+                None,
+                &opts,
+                SourceGen::LOCAL
+            )),
             "the shed left its registration behind"
         );
 
@@ -5641,7 +5748,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, _encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(11, 5, None, None, &opts);
+        let key = SegmentIdentity::new(11, 5, None, None, &opts, SourceGen::LOCAL);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -5725,7 +5832,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(12, 6, None, None, &opts);
+        let key = SegmentIdentity::new(12, 6, None, None, &opts, SourceGen::LOCAL);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -5960,7 +6067,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(3, 0, None, None, &opts);
+        let key = SegmentIdentity::new(3, 0, None, None, &opts, SourceGen::LOCAL);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6020,7 +6127,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(50));
         let opts = slow_opts();
-        let key = SegmentIdentity::new(7, 1, None, None, &opts);
+        let key = SegmentIdentity::new(7, 1, None, None, &opts, SourceGen::LOCAL);
 
         let tx = seed_inflight(&cache, key);
         let waiter = {
@@ -6338,7 +6445,7 @@ mod tests {
             Some(4_000_000),
             Some(128_000),
         );
-        let base = SegmentIdentity::new(1, 5, Some(1), Some(2), &base_opts);
+        let base = SegmentIdentity::new(1, 5, Some(1), Some(2), &base_opts, SourceGen::LOCAL);
 
         let mut vbr = base_opts.clone();
         vbr.video_bitrate_bps = Some(2_000_000);
@@ -6353,34 +6460,34 @@ mod tests {
         let cases: Vec<(&str, SegmentIdentity)> = vec![
             (
                 "media",
-                SegmentIdentity::new(2, 5, Some(1), Some(2), &base_opts),
+                SegmentIdentity::new(2, 5, Some(1), Some(2), &base_opts, SourceGen::LOCAL),
             ),
             (
                 "segment index",
-                SegmentIdentity::new(1, 6, Some(1), Some(2), &base_opts),
+                SegmentIdentity::new(1, 6, Some(1), Some(2), &base_opts, SourceGen::LOCAL),
             ),
             (
                 "audio track",
-                SegmentIdentity::new(1, 5, Some(0), Some(2), &base_opts),
+                SegmentIdentity::new(1, 5, Some(0), Some(2), &base_opts, SourceGen::LOCAL),
             ),
             (
                 "subtitle burn",
-                SegmentIdentity::new(1, 5, Some(1), None, &base_opts),
+                SegmentIdentity::new(1, 5, Some(1), None, &base_opts, SourceGen::LOCAL),
             ),
             (
                 "video bitrate",
-                SegmentIdentity::new(1, 5, Some(1), Some(2), &vbr),
+                SegmentIdentity::new(1, 5, Some(1), Some(2), &vbr, SourceGen::LOCAL),
             ),
             // Previously invisible: one "governing" bitrate took the video
             // figure whenever there was one, so two clients on the same video
             // rung with different audio bitrates shared a cache entry.
             (
                 "audio bitrate",
-                SegmentIdentity::new(1, 5, Some(1), Some(2), &abr),
+                SegmentIdentity::new(1, 5, Some(1), Some(2), &abr, SourceGen::LOCAL),
             ),
             (
                 "container",
-                SegmentIdentity::new(1, 5, Some(1), Some(2), &codec),
+                SegmentIdentity::new(1, 5, Some(1), Some(2), &codec, SourceGen::LOCAL),
             ),
         ];
         for (what, other) in cases {
@@ -6518,6 +6625,7 @@ mod tests {
                     video_bitrate_kbps: 0,
                     audio_bitrate_kbps: 0,
                     codec_tag: 0,
+                    source_gen: SourceGen::LOCAL,
                 },
                 body.len() as u64,
             )
@@ -6568,6 +6676,7 @@ mod tests {
                 Some(4_000_000),
                 None,
             ),
+            SourceGen::LOCAL,
         );
         let key_m4 = SegmentIdentity::new(
             1,
@@ -6581,8 +6690,101 @@ mod tests {
                 Some(4_000_000),
                 None,
             ),
+            SourceGen::LOCAL,
         );
         assert_ne!(key_ts, key_m4, "distinct cache keys per container");
+    }
+
+    /// 008 / V132 — a re-resolved source cannot serve the previous
+    /// resolution's bytes, on disk OR out of the browser's `immutable` cache.
+    ///
+    /// Both surfaces are asserted because they fail independently: the disk key
+    /// is a filename and the client-facing one is an ETag, and a fix that moved
+    /// only one of them would leave a segment cached for a year behind
+    /// `Cache-Control: immutable`, beyond any server-side wipe's reach.
+    #[test]
+    fn a_re_resolved_source_gets_a_different_key_and_etag() {
+        let opts = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            None,
+        );
+        let key = |src: &str| {
+            SegmentIdentity::new(
+                1,
+                0,
+                Some(0),
+                None,
+                &opts,
+                SourceGen::for_source(Path::new(src)),
+            )
+        };
+
+        // Same item, same rendition, same segment — only the signed URL rotated.
+        let first = key("https://cdn.example/videoplayback?expire=1000&sig=aaa");
+        let second = key("https://cdn.example/videoplayback?expire=2000&sig=bbb");
+        assert_ne!(first, second, "a rotated source must not share a cache key");
+        assert_ne!(
+            first.etag(),
+            second.etag(),
+            "nor an ETag — the browser holds segments immutable for a year"
+        );
+
+        // Re-resolving to the SAME locator is a cache hit, not a wipe: a stable
+        // URL must not churn the cache on every playback.
+        assert_eq!(
+            first,
+            key("https://cdn.example/videoplayback?expire=1000&sig=aaa")
+        );
+    }
+
+    /// A local item's on-disk name is byte-identical to what it was before
+    /// `source_gen` existed, so deploying 008 does not wipe a 40 GiB cache.
+    ///
+    /// This is the assertion that would catch someone "tidying up" the
+    /// conditional suffix into an unconditional one.
+    #[test]
+    fn adding_the_source_generation_does_not_rename_a_local_segment() {
+        let opts = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            None,
+        );
+        let local = SegmentIdentity::new(1, 7, Some(2), None, &opts, SourceGen::LOCAL);
+        let remote = SegmentIdentity::new(
+            1,
+            7,
+            Some(2),
+            None,
+            &opts,
+            SourceGen::for_source(Path::new("https://cdn.example/x")),
+        );
+        // Asserted as a property rather than a literal: the codec tag and
+        // bitrate spelling belong to other invariants, and pinning them here
+        // would make this test fail for reasons that have nothing to do with it.
+        assert!(
+            !local.filename().contains("-g"),
+            "a local segment's filename must not gain a generation suffix, got {}",
+            local.filename()
+        );
+        assert!(
+            remote.filename().contains("-g"),
+            "a resolved source's filename must carry one, or the two collide: {}",
+            remote.filename()
+        );
+        assert_ne!(local.filename(), remote.filename());
+        assert_eq!(
+            SourceGen::for_source(Path::new("/media/Movies/Arrival.mkv")),
+            SourceGen::LOCAL,
+            "an ordinary path is the local, single-generation case"
+        );
+        // And a resolved source is never zero, so it can never be mistaken for
+        // a local one.
+        assert!(!SourceGen::for_source(Path::new("https://cdn.example/x")).is_local());
     }
 
     #[test]
@@ -6607,6 +6809,7 @@ mod tests {
                     None,
                     Some(bps),
                 ),
+                SourceGen::LOCAL,
             )
         };
         let a64 = rung(64_000);
@@ -6638,6 +6841,7 @@ mod tests {
                 Some(4_000_000),
                 Some(128_000),
             ),
+            SourceGen::LOCAL,
         );
         assert_eq!(v.video_bitrate_kbps, 4_000);
         assert_eq!(v.audio_bitrate_kbps, 128);
@@ -7160,8 +7364,8 @@ mod tests {
             Some(4_000_000),
             None,
         );
-        let track0 = SegmentIdentity::new(1, 7, Some(0), None, &opts);
-        let track1 = SegmentIdentity::new(1, 7, Some(1), None, &opts);
+        let track0 = SegmentIdentity::new(1, 7, Some(0), None, &opts, SourceGen::LOCAL);
+        let track1 = SegmentIdentity::new(1, 7, Some(1), None, &opts, SourceGen::LOCAL);
         assert_eq!(track0, track1);
         assert_eq!(track0.filename(), track1.filename());
         assert_eq!(track0.etag(), track1.etag());
@@ -7180,8 +7384,8 @@ mod tests {
             Some(128_000),
         );
         assert_ne!(
-            SegmentIdentity::new(1, 7, Some(0), None, &opts),
-            SegmentIdentity::new(1, 7, Some(1), None, &opts)
+            SegmentIdentity::new(1, 7, Some(0), None, &opts, SourceGen::LOCAL),
+            SegmentIdentity::new(1, 7, Some(1), None, &opts, SourceGen::LOCAL)
         );
     }
 
