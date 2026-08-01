@@ -372,14 +372,27 @@ impl DeviceTable {
     /// The ONE device a shared-init fMP4 rendition must use (spec 003 R8).
     ///
     /// A pure function of `rendition_key` over the devices that support the
-    /// encode, so it returns the same answer after a restart — an in-memory pin
-    /// would not, and a rendition re-pinned to a different device mid-playback
-    /// serves segments that no longer match the client's init (issue #114).
-    /// Because it is deterministic, cached segments for a rendition were also
-    /// necessarily produced by the device that rendition still resolves to.
+    /// encode, weighted by what the boot probe measured — so it returns the
+    /// same answer after a restart on unchanged hardware. An in-memory or
+    /// load-aware pin would not, and a rendition re-pinned mid-playback serves
+    /// segments that no longer match the client's init (issue #114).
     ///
-    /// Hardware is preferred as a pool; hashing ACROSS that pool spreads
-    /// renditions over multiple GPUs while keeping each rendition on one.
+    /// Purity matters beyond restarts: `SegmentIdentity` carries no device, so
+    /// a rendition whose device changed would serve its CACHED segments from
+    /// the old encoder beside fresh ones from the new one, under a single init,
+    /// with no restart involved at all.
+    ///
+    /// Every supporting device is in the pool — including software. The #114
+    /// rule is "one rendition, one encoder", never "hardware only", and
+    /// excluding software made it unreachable for every codec an accelerator
+    /// happened to support, however many permits it had and however fast it
+    /// was. Weighting (see [`device_weight`]) is what makes that correct on
+    /// hardware where software is the stronger device.
+    ///
+    /// [`device_supports`] remains the eligibility gate, and only that: a
+    /// device with no encoder for the codec genuinely cannot produce it. No
+    /// device FAMILY appears in the placement itself, so this adapts to
+    /// whatever encoders the machine turns out to have.
     ///
     /// Deliberately ignores cooldown and load: both are transient, and letting
     /// them change the answer would reintroduce the non-determinism this
@@ -390,22 +403,32 @@ impl DeviceTable {
         opts: &TranscodeOptions,
         rendition_key: u64,
     ) -> Option<DeviceId> {
-        let supporting: SmallVec<[DeviceId; 5]> = self
+        let supporting: SmallVec<[(DeviceId, u64); 5]> = self
             .slots
             .iter()
-            .map(|s| s.id)
-            .filter(|id| device_supports(*id, opts))
+            .filter(|s| device_supports(s.id, opts))
+            .map(|s| (s.id, u64::from(s.weight())))
             .collect();
-        if supporting.is_empty() {
-            return None;
+        let last = *supporting.last()?;
+
+        // Weighted pick: lay the devices out as adjacent bands whose widths are
+        // their weights, and walk the cumulative widths until the key's position
+        // falls inside one. Deterministic in the key, the device order and the
+        // weights — all three fixed for the life of the table — which is the
+        // whole contract.
+        let total: u64 = supporting.iter().map(|&(_, w)| w).sum();
+        // `DeviceSlot::new` floors every weight at 1, so `total` is at least 1
+        // here; `.max(1)` keeps a future zero weight from dividing by zero
+        // rather than depending on that floor from a distance.
+        let mut pos = rendition_key % total.max(1);
+        for &(id, w) in &supporting {
+            if pos < w {
+                return Some(id);
+            }
+            pos -= w;
         }
-        let hw: SmallVec<[DeviceId; 5]> = supporting
-            .iter()
-            .copied()
-            .filter(|d| matches!(d, DeviceId::Hw { .. }))
-            .collect();
-        let pool = if hw.is_empty() { supporting } else { hw };
-        Some(pool[(rendition_key % pool.len() as u64) as usize])
+        // Unreachable: the bands tile `[0, total)` exactly.
+        Some(last.0)
     }
 
     pub fn slot(&self, id: DeviceId) -> Option<&DeviceSlot> {
@@ -548,25 +571,50 @@ mod tests {
         );
     }
 
-    /// Hardware is preferred, and renditions SPREAD across a multi-GPU pool
-    /// rather than all piling onto the first device.
+    /// Renditions SPREAD across the devices that can serve them, in proportion
+    /// to the weights the probe derived, rather than piling onto one device
+    /// while the rest of the machine idles.
+    ///
+    /// Renamed from `renditions_prefer_hardware_and_spread_across_it`, and its
+    /// first assertion replaced, when spec 007 widened the pool. That name and
+    /// that assertion ("hardware supports h264, so no rendition should land on
+    /// CPU") stated the rule 007 removes: excluding software made it
+    /// unreachable for every codec an accelerator supported, however many
+    /// permits it had and however fast it was. The half worth guarding is kept
+    /// and strengthened — placement is deterministic AND follows the derived
+    /// weights, which is what stops any device being starved.
+    ///
+    /// Asserted against the table's OWN weights, never a written-down ratio, so
+    /// it stays true on hardware nobody has run it on.
     #[test]
-    fn renditions_prefer_hardware_and_spread_across_it() {
+    fn renditions_spread_across_every_supporting_device_by_weight() {
         let t = table();
         let mut cmaf = h264_opts();
         cmaf.container = Container::Fmp4;
 
-        let picked: Vec<DeviceId> = (0..64)
-            .map(|k| t.rendition_device(&cmaf, k).expect("a device"))
-            .collect();
-        assert!(
-            picked.iter().all(|d| matches!(d, DeviceId::Hw { .. })),
-            "hardware supports h264, so no rendition should land on CPU"
-        );
-        let distinct: std::collections::HashSet<_> = picked.iter().collect();
-        assert!(
-            distinct.len() > 1,
-            "with several hw devices, renditions must spread; got {distinct:?}"
+        // 4500 = 500 × the table's total weight, so the bands tile it exactly.
+        const N: u64 = 4500;
+        let mut seen: std::collections::HashMap<DeviceId, usize> = std::collections::HashMap::new();
+        for k in 0..N {
+            *seen
+                .entry(t.rendition_device(&cmaf, k).expect("a device"))
+                .or_default() += 1;
+        }
+
+        let total: u32 = t.slots().iter().map(|s| s.weight()).sum();
+        for slot in t.slots() {
+            let expected = f64::from(slot.weight()) / f64::from(total);
+            let actual = *seen.get(&slot.id).unwrap_or(&0) as f64 / N as f64;
+            assert!(
+                (actual - expected).abs() < 0.02,
+                "{:?}: expected ~{expected:.3} of renditions by weight, got {actual:.3}",
+                slot.id
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            t.slots().len(),
+            "every supporting device must take a share; got {seen:?}"
         );
     }
 
@@ -630,6 +678,14 @@ mod tests {
     /// libx264 emit SPS that differ in `log2_max_frame_num`, which is the bit
     /// WIDTH of `frame_num` in every slice header, so mixing them under one
     /// init is undecodable (issue #114, re-measured in research R7).
+    ///
+    /// The CMAF assertion changed when spec 007 widened the pool: it read
+    /// `matches!(t.rendition_device(&cmaf, 42), DeviceId::Hw { .. })`, which
+    /// held only because software was excluded outright. Key 42 landing on any
+    /// particular device is an accident of the weights, so the claim is now
+    /// made over enough keys to be a property of the TABLE rather than of one
+    /// arbitrary rendition. That each rendition resolves to exactly one device
+    /// is asserted by `a_rendition_always_resolves_to_the_same_device`.
     #[test]
     fn cmaf_h264_reaches_hardware_and_mpegts_is_unchanged() {
         let t = table();
@@ -644,11 +700,22 @@ mod tests {
             ],
             "CMAF H264 must now be able to reach hardware"
         );
-        // ...but only ONE of them may actually serve the rendition.
-        assert!(matches!(
-            t.rendition_device(&cmaf, 42).expect("a device"),
-            DeviceId::Hw { .. }
-        ));
+        // ...and hardware really does serve CMAF renditions: over enough keys
+        // every device in the table is reached, hardware included.
+        let reached: std::collections::HashSet<DeviceId> = (0..256u64)
+            .filter_map(|k| t.rendition_device(&cmaf, k))
+            .collect();
+        assert!(
+            reached.iter().any(|d| matches!(d, DeviceId::Hw { .. })),
+            "CMAF H264 must be able to reach hardware; got {reached:?}"
+        );
+        for slot in t.slots() {
+            assert!(
+                reached.contains(&slot.id),
+                "{:?} never served a CMAF rendition; got {reached:?}",
+                slot.id
+            );
+        }
 
         let mpegts = h264_opts();
         assert_eq!(
@@ -741,6 +808,144 @@ mod tests {
         assert_eq!(n, 1);
         // First wins.
         assert_eq!(t.slot(DeviceId::hw(HwAccel::Nvenc, 0)).unwrap().capacity, 3);
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::hwaccel::HwAccel;
+    use crate::options::{AudioCodec, Container, VideoCodec};
+
+    fn gpu() -> DeviceId {
+        DeviceId::hw(HwAccel::Nvenc, 0)
+    }
+
+    /// `TranscodeOptions` has no `Default`; built field-by-field the way the
+    /// other test modules in this file do.
+    fn fmp4(video: VideoCodec) -> TranscodeOptions {
+        TranscodeOptions {
+            source_frame_rate: None,
+            container: Container::Fmp4,
+            video: Some(video),
+            audio: Some(AudioCodec::Aac),
+            video_bitrate_bps: None,
+            audio_bitrate_bps: None,
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            decode_preroll_seconds: None,
+            muxed_audio_source: None,
+        }
+    }
+
+    fn h264_fmp4() -> TranscodeOptions {
+        fmp4(VideoCodec::H264)
+    }
+
+    fn vp9_fmp4() -> TranscodeOptions {
+        fmp4(VideoCodec::Vp9)
+    }
+
+    fn table(gpu_cap: usize, gpu_rate: f64, cpu_permits: usize, cpu_rate: f64) -> DeviceTable {
+        DeviceTable::from_probe_weighted(
+            &[(gpu(), gpu_cap, Some(gpu_rate))],
+            cpu_permits,
+            Some(cpu_rate),
+        )
+    }
+
+    /// THE invariant. Two tables built from the same probe result must place
+    /// every rendition identically, or a restart serves segments from a
+    /// different encoder than the init a client is holding (#114).
+    #[test]
+    fn the_same_probe_result_places_every_rendition_identically() {
+        let a = table(8, 400.0, 4, 100.0);
+        let b = table(8, 400.0, 4, 100.0);
+        for key in 0..500u64 {
+            assert_eq!(
+                a.rendition_device(&h264_fmp4(), key),
+                b.rendition_device(&h264_fmp4(), key),
+                "rendition {key} moved between two identical tables"
+            );
+        }
+    }
+
+    /// The defect this task fixes: software was unreachable for any codec an
+    /// accelerator supported, however many permits it had.
+    #[test]
+    fn software_takes_a_share_of_work_an_accelerator_could_also_do() {
+        let t = table(8, 400.0, 4, 100.0);
+        let mut on_cpu = 0;
+        for key in 0..1000u64 {
+            if t.rendition_device(&h264_fmp4(), key) == Some(DeviceId::Cpu) {
+                on_cpu += 1;
+            }
+        }
+        assert!(
+            on_cpu > 0,
+            "software got no renditions at all — the pool is still hardware-only"
+        );
+        assert!(on_cpu < 1000, "the accelerator got no renditions at all");
+    }
+
+    /// The split must follow the DERIVED weights, never a written-down ratio.
+    /// Asserted against the table's own weights so this test stays true on
+    /// hardware nobody has run it on.
+    #[test]
+    fn the_split_follows_the_derived_weights() {
+        let t = table(8, 400.0, 4, 100.0);
+        let total: u32 = t.slots().iter().map(|s| s.weight()).sum();
+        let cpu_weight = t
+            .slots()
+            .iter()
+            .find(|s| s.id == DeviceId::Cpu)
+            .map(|s| s.weight())
+            .unwrap();
+        let expected = f64::from(cpu_weight) / f64::from(total);
+
+        const N: u64 = 4000;
+        let on_cpu = (0..N)
+            .filter(|k| t.rendition_device(&h264_fmp4(), *k) == Some(DeviceId::Cpu))
+            .count();
+        let actual = on_cpu as f64 / N as f64;
+        assert!(
+            (actual - expected).abs() < 0.05,
+            "expected ~{expected:.3} of renditions on software, got {actual:.3}"
+        );
+    }
+
+    /// A codec no accelerator can encode still resolves to software, on a
+    /// table where an accelerator exists.
+    #[test]
+    fn a_codec_no_accelerator_supports_resolves_to_software() {
+        let t = table(8, 400.0, 4, 100.0);
+        for key in 0..200u64 {
+            assert_eq!(t.rendition_device(&vp9_fmp4(), key), Some(DeviceId::Cpu));
+        }
+    }
+
+    /// Degenerate tables must not panic and must never return `None` for a
+    /// codec something can encode.
+    #[test]
+    fn degenerate_tables_still_place() {
+        let software_only = DeviceTable::from_probe_weighted(&[], 1, Some(50.0));
+        assert_eq!(
+            software_only.rendition_device(&h264_fmp4(), 7),
+            Some(DeviceId::Cpu)
+        );
+
+        let equal = table(4, 100.0, 4, 100.0);
+        assert!(equal.rendition_device(&h264_fmp4(), 7).is_some());
+
+        let unmeasured = DeviceTable::from_probe_weighted(&[(gpu(), 8, None)], 4, None);
+        assert!(unmeasured.rendition_device(&h264_fmp4(), 7).is_some());
     }
 }
 
