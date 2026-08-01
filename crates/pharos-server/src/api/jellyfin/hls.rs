@@ -1110,6 +1110,7 @@ async fn serve_segment(
         opts.audio_source_stream_index,
         opts.burn_subtitle_stream_index,
         &opts,
+        &item.path,
     );
 
     // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
@@ -1230,6 +1231,13 @@ async fn serve_segment(
 /// drives the disk-cache filename so mutating any of them produces a different
 /// ETag.
 ///
+/// Takes the SOURCE rather than a pre-computed generation, and derives it with
+/// the same function [`segment_bytes_keyed`] uses, so the ETag and the disk key
+/// cannot describe different things — which is the failure this helper's
+/// argument list already caused once (008, V132).
+///
+/// [`segment_bytes_keyed`]: pharos_cache::hls_cache::HlsCache::segment_bytes_keyed
+///
 /// Takes the whole [`SegmentOpts`] rather than a hand-picked argument list: the
 /// list drifted from the cache key and dropped the AUDIO codec + bitrate, so
 /// the five rungs of an audio-only item's bitrate ladder — which differ in
@@ -1243,8 +1251,17 @@ fn segment_etag(
     audio_idx: Option<u32>,
     sub_idx: Option<u32>,
     opts: &SegmentOpts,
+    source: &std::path::Path,
 ) -> String {
-    pharos_cache::hls_cache::SegmentIdentity::new(media_id, seg, audio_idx, sub_idx, opts).etag()
+    pharos_cache::hls_cache::SegmentIdentity::new(
+        media_id,
+        seg,
+        audio_idx,
+        sub_idx,
+        opts,
+        pharos_cache::hls_cache::SourceGen::for_source(source),
+    )
+    .etag()
 }
 
 /// Resolve the per-segment [`SegmentOpts`] for this request.
