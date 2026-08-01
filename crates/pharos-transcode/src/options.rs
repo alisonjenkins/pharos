@@ -135,6 +135,93 @@ impl VideoCodec {
     }
 }
 
+/// A SOURCE video codec — what a file already contains.
+///
+/// Deliberately a different type from [`VideoCodec`], which names what a
+/// transcode TARGETS. The two answer different questions about different
+/// hardware blocks: a GTX 1070 encodes H.264 and HEVC and decodes H.264, HEVC
+/// and VP9, and it does neither for AV1 — so "this device can encode X" says
+/// nothing about whether it can decode X, and a single enum shared between the
+/// two invites exactly that substitution. `TranscodeOptions` carries one of
+/// each, and mixing them up would be a compile error rather than a GPU asked
+/// to decode a bitstream it has no block for.
+///
+/// The variants are the codecs a decode probe can build a sample for (every
+/// one has a software encoder in this ffmpeg build). A source codec outside
+/// this set parses to `None`, which the decode gate reads as "cannot be
+/// proved decodable" and keeps on software — the safe direction, since the
+/// cost of being wrong that way is a slower encode rather than a dead
+/// rendition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SourceCodec {
+    H264,
+    Hevc,
+    Vp9,
+    Av1,
+    Vp8,
+    Mpeg2,
+}
+
+impl SourceCodec {
+    /// Every variant, in the order the boot probe trials them.
+    pub const ALL: [Self; 6] = [
+        Self::H264,
+        Self::Hevc,
+        Self::Vp9,
+        Self::Av1,
+        Self::Vp8,
+        Self::Mpeg2,
+    ];
+
+    /// Resolve an ffmpeg/probe `codec_name` (`MediaProbe::video_codec`) to the
+    /// enum. `None` for anything this build cannot build a decode sample for.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "h264" | "avc" | "avc1" => Some(Self::H264),
+            "hevc" | "h265" | "hvc1" | "hev1" => Some(Self::Hevc),
+            "vp9" => Some(Self::Vp9),
+            "av1" | "av01" => Some(Self::Av1),
+            "vp8" => Some(Self::Vp8),
+            "mpeg2video" | "mpeg2" => Some(Self::Mpeg2),
+            _ => None,
+        }
+    }
+
+    /// The ffmpeg decoder/codec name — also the sample file's extension.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Vp9 => "vp9",
+            Self::Av1 => "av1",
+            Self::Vp8 => "vp8",
+            Self::Mpeg2 => "mpeg2video",
+        }
+    }
+
+    /// A SOFTWARE encoder for this codec, used to build the decode probe's
+    /// sample. `libsvtav1` rather than `libaom-av1` (which
+    /// [`VideoCodec::ffmpeg_codec`] names for real encodes): the sample is
+    /// five frames of 128x128 and libaom would spend seconds on it at boot.
+    pub fn sample_encoder(self) -> &'static str {
+        match self {
+            Self::H264 => "libx264",
+            Self::Hevc => "libx265",
+            Self::Vp9 => "libvpx-vp9",
+            Self::Av1 => "libsvtav1",
+            Self::Vp8 => "libvpx",
+            Self::Mpeg2 => "mpeg2video",
+        }
+    }
+
+    /// Stable, bounded label for a metric/log field. Renaming one breaks a
+    /// dashboard silently, so the mapping is spelled out rather than derived
+    /// from the variant name.
+    pub fn label(self) -> &'static str {
+        self.ffmpeg_name()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioCodec {
     Aac,
