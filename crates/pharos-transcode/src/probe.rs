@@ -752,7 +752,6 @@ mod tests {
         assert_eq!(caps.caps.as_slice(), &[(dev, 4)]);
     }
 
-    #[test]
     /// The decode trial must test the SAME thing production runs, or a codec it
     /// blesses can still fail on a real segment. Both flags matter: `-hwaccel`
     /// is what production emits, and `-hwaccel_device` is what pins the trial to

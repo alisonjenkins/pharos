@@ -537,6 +537,11 @@ async fn stream_transcoded_webm(
         source_frame_rate: None,
         container: Container::WebM,
         video: Some(VideoCodec::Vp9),
+        source_video_codec: item
+            .probe
+            .video_codec
+            .as_deref()
+            .and_then(pharos_transcode::SourceCodec::from_name),
         audio: Some(AudioCodec::Opus),
         video_bitrate_bps: Some(cap),
         audio_bitrate_bps: Some(128_000),

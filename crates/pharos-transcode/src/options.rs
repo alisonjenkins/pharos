@@ -289,6 +289,32 @@ pub struct TranscodeOptions {
     #[serde(default)]
     pub source_frame_rate: Option<pharos_core::FrameRate>,
     pub video: Option<VideoCodec>,
+    /// What the SOURCE contains, when it could be named.
+    ///
+    /// Carried purely so the scheduler can ask its device table whether the
+    /// device it is about to place this job on can actually DECODE this — a
+    /// question nothing used to ask, which is how a 10-bit AV1 file reached a
+    /// GPU with no AV1 decode block and failed every frame. `None` means the
+    /// source codec was not named (an unusual container, or a caller with no
+    /// probe to hand) and reads as "do not offload the decode": the two ways of
+    /// being wrong cost a dead rendition and a software decode respectively.
+    ///
+    /// Distinct from `video` above, which is the TARGET. They are different
+    /// hardware blocks and a device answers about them independently.
+    ///
+    /// `#[serde(skip)]`, and that is load-bearing twice over. It keeps this
+    /// field out of the wire frame, where the worker has no use for it — the
+    /// worker is told the VERDICT ([`crate::protocol::JobSpec::decode_offload`]),
+    /// not the input to it. And it keeps this field out of [`RenditionKey`],
+    /// which digests these options through serde: the key decides which encoder
+    /// a rendition pins to, nothing keyed on the HLS cache generation can see it
+    /// move, and a field that adds no information (the source codec is a
+    /// property of the input path, which the key already hashes) would
+    /// nonetheless re-place two thirds of the live fMP4 renditions on deploy —
+    /// serving cached segments from the previous encoder under an init the
+    /// browser holds `immutable` for a year, which is issue #114 exactly.
+    #[serde(skip)]
+    pub source_video_codec: Option<SourceCodec>,
     pub audio: Option<AudioCodec>,
     pub video_bitrate_bps: Option<u64>,
     pub audio_bitrate_bps: Option<u64>,
@@ -392,6 +418,13 @@ impl RenditionKey {
     /// SAME rendition. Everything else — codec, container, bitrate, audio
     /// track, burn variant, frame rate — distinguishes renditions that cannot
     /// share an init.
+    ///
+    /// A field that is FUNCTIONALLY DETERMINED by `input` (hashed separately
+    /// below) does not belong in the digest at all, and is kept out with
+    /// `#[serde(skip)]` at its declaration rather than cleared here — clearing
+    /// is not enough, because serde still emits the key and the resulting
+    /// canon, and therefore the pin, still moves. See
+    /// [`TranscodeOptions::source_video_codec`] for what that costs.
     pub fn new(input: &std::path::Path, opts: &TranscodeOptions) -> Self {
         let mut o = opts.clone();
         o.start_position_ticks = 0;
@@ -435,6 +468,7 @@ mod tests {
     #[test]
     fn ticks_to_seconds_roundtrip() {
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mp4,
             video: None,
@@ -458,6 +492,7 @@ mod tests {
     #[test]
     fn zero_start_returns_none() {
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mp4,
             video: None,
@@ -502,6 +537,7 @@ mod tests {
 
     fn cmaf_opts() -> TranscodeOptions {
         TranscodeOptions {
+            source_video_codec: None,
             container: Container::Fmp4,
             source_frame_rate: None,
             video: Some(VideoCodec::H264),
@@ -583,5 +619,61 @@ mod tests {
     fn audio_codec_maps_to_known_ffmpeg_lib() {
         assert_eq!(AudioCodec::Aac.ffmpeg_codec(), "aac");
         assert_eq!(AudioCodec::Opus.ffmpeg_codec(), "libopus");
+    }
+
+    /// A field that is determined by the input path must not move the rendition
+    /// key, and one that genuinely distinguishes renditions must.
+    ///
+    /// The first half is the load-bearing one. `RenditionKey` decides which
+    /// ENCODER a rendition pins to, and nothing keyed on the HLS cache
+    /// generation observes it — so a key that shifts for no new information
+    /// re-places live renditions with a warm cache and an unchanged `g=` in
+    /// every client's year-long `immutable` init. Adding
+    /// `source_video_codec` did exactly that until it was neutralised here,
+    /// and two placement tests caught it only by accident.
+    #[test]
+    fn only_fields_that_distinguish_renditions_move_the_key() {
+        let path = std::path::Path::new("/m/x.mkv");
+        let base = TranscodeOptions {
+            container: Container::Fmp4,
+            source_frame_rate: None,
+            video: Some(VideoCodec::H264),
+            source_video_codec: None,
+            audio: None,
+            video_bitrate_bps: Some(3_000_000),
+            audio_bitrate_bps: None,
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            decode_preroll_seconds: None,
+            muxed_audio_source: None,
+        };
+        let mut named = base.clone();
+        named.source_video_codec = Some(SourceCodec::Av1);
+        assert_eq!(
+            RenditionKey::new(path, &base),
+            RenditionKey::new(path, &named),
+            "the source codec is a property of the path, which is already in \
+             the key; letting it in re-places every rendition for nothing"
+        );
+
+        // The neutralisation must be surgical, not a blanket "ignore new
+        // fields": a rendition that targets a different codec still cannot
+        // share an init with this one.
+        let mut other_target = base.clone();
+        other_target.video = Some(VideoCodec::H265);
+        assert_ne!(
+            RenditionKey::new(path, &base),
+            RenditionKey::new(path, &other_target)
+        );
+        // And two different files are two different renditions.
+        assert_ne!(
+            RenditionKey::new(path, &base),
+            RenditionKey::new(std::path::Path::new("/m/y.mkv"), &base)
+        );
     }
 }

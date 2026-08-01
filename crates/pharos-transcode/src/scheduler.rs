@@ -1704,11 +1704,13 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             );
             let live = state.live.clone();
             live.fetch_add(1, Ordering::Relaxed);
+            let decode_offload = decode_offload_for(state, device, opts.source_video_codec);
             let spec = JobSpec {
                 job_id,
                 input,
                 opts,
                 device,
+                decode_offload,
                 sink: OutputSink::Stdout,
             };
             let spawner = state.spawner.clone();
@@ -2652,13 +2654,55 @@ fn warn_if_long_wait(
 /// At INFO because that is the level the deployment runs at. The line naming
 /// the winning device sat at DEBUG while prod placed 60% of its segments on
 /// the CPU, so the record that would have said so was never emitted.
+/// May this job offload its source decode to the device it just landed on?
+///
+/// The ONE place the question is asked. It has to live here, at dispatch,
+/// because the answer is a fact about the (source codec, device) PAIR and the
+/// device is not known until placement — and it has to be recorded onto the
+/// [`JobSpec`] rather than re-derived, because the worker that builds the argv
+/// is a separate process with no device table.
+///
+/// Counted, not just decided. A decode silently falling back to software looks
+/// exactly like one that was never offloaded: the deployment ran for months
+/// emitting `-hwaccel` for every hardware job while nothing recorded whether
+/// the flag had engaged, and the incident that exposed it was diagnosed from a
+/// stderr tail rather than from any signal pharos published. The verdict
+/// carries the CODEC that produced it — a reason that does not name the
+/// offending value is another round of guessing.
+fn decode_offload_for(
+    state: &SchedState,
+    dev: DeviceId,
+    codec: Option<crate::SourceCodec>,
+) -> crate::DecodeOffload {
+    let allowed = state.devices.may_offload_decode(dev, codec);
+    let verdict = if allowed {
+        crate::DecodeOffload::Allowed
+    } else {
+        crate::DecodeOffload::Denied
+    };
+    // Only for hardware placements: on the CPU there is nothing to offload and
+    // counting every software job here would bury the interesting cases under
+    // the one that is never in question.
+    if matches!(dev, DeviceId::Hw { .. }) {
+        metrics::counter!(
+            "pharos_transcode_decode_offload_total",
+            "device" => dev.to_string(),
+            "verdict" => if allowed { "allowed" } else { "denied" },
+            "source_codec" => codec.map_or("unknown", |c| c.label()),
+        )
+        .increment(1);
+    }
+    verdict
+}
+
 fn record_placement(
     job_id: JobId,
     dev: DeviceId,
     ctx: &JobCtx,
     candidates: &[DeviceId],
+    offload: crate::DecodeOffload,
 ) -> tracing::Span {
-    let decode = crate::DecodeAccel::of(&ctx.opts, dev);
+    let decode = crate::DecodeAccel::of(&ctx.opts, dev, offload);
     // `queue_wait_ms`/`encode_ms`/`out_bytes`/`outcome` are declared empty and
     // recorded when the job finishes, so one span carries the whole life of a
     // segment: what it was, where it went, how long it waited, how it ended.
@@ -2918,7 +2962,8 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 record_pin_dispatch(outcome, dev);
             }
             record_dispatch(state, &ctx);
-            let span = record_placement(job_id, dev, &ctx, &candidates);
+            let decode_offload = decode_offload_for(state, dev, ctx.opts.source_video_codec);
+            let span = record_placement(job_id, dev, &ctx, &candidates, decode_offload);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
@@ -2927,6 +2972,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 input: ctx.input.clone(),
                 opts: ctx.opts.clone(),
                 device: dev,
+                decode_offload,
                 sink: to_output_sink(&ctx.sink),
             };
             let dispatched_at = Instant::now();
@@ -3258,7 +3304,8 @@ fn try_place_no_queue(
                 record_pin_dispatch(outcome, dev);
             }
             record_dispatch(state, &ctx);
-            let span = record_placement(job_id, dev, &ctx, &candidates);
+            let decode_offload = decode_offload_for(state, dev, ctx.opts.source_video_codec);
+            let span = record_placement(job_id, dev, &ctx, &candidates, decode_offload);
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
@@ -3267,6 +3314,7 @@ fn try_place_no_queue(
                 input: ctx.input.clone(),
                 opts: ctx.opts.clone(),
                 device: dev,
+                decode_offload,
                 sink: to_output_sink(&ctx.sink),
             };
             let dispatched_at = Instant::now();
@@ -3427,6 +3475,7 @@ mod tests {
 
     fn h264() -> TranscodeOptions {
         TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -3443,6 +3492,73 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
         }
+    }
+
+    /// The whole chain, end to end: a probed device's decode answer reaches the
+    /// argv the worker will run.
+    ///
+    /// The pieces are unit-tested separately — the table answers, the argv
+    /// builder honours the answer — but nothing joined them, and the join is
+    /// where the 2026-08-01 bug actually lived: `-hwaccel` was chosen at argv
+    /// time from the device alone, in a different PROCESS from the one holding
+    /// any capability knowledge. So this asserts on the `JobSpec` the spawner
+    /// receives, which is the only artefact that crosses that boundary.
+    #[tokio::test]
+    async fn a_source_the_device_cannot_decode_is_dispatched_without_hardware_decode() {
+        use std::sync::Mutex;
+
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        type Dispatched = Vec<(Option<crate::SourceCodec>, crate::DecodeOffload)>;
+        let seen: Arc<Mutex<Dispatched>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+            if let Ok(mut g) = recorder.lock() {
+                g.push((spec.opts.source_video_codec, spec.decode_offload));
+            }
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        // A GTX 1070: H.264 decode block, no AV1 one. Only the CPU is left with
+        // any permits for a job the GPU cannot take, so pin the GPU as the sole
+        // hardware device and give it room for both jobs.
+        let mut table = DeviceTable::from_probe(&[(gpu, 4)], 4);
+        table.set_decodable(gpu, &[crate::SourceCodec::H264]);
+        let s = TranscodeScheduler::spawn(table, spawner, SchedConfig::default());
+
+        for codec in [crate::SourceCodec::H264, crate::SourceCodec::Av1] {
+            let mut o = h264();
+            o.source_video_codec = Some(codec);
+            let _ = s
+                .submit(
+                    PathBuf::from(format!("/m/{}.mkv", codec.label())),
+                    o,
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint::default(),
+                )
+                .await;
+        }
+
+        let seen = seen.lock().expect("recorder poisoned").clone();
+        let verdict = |c: crate::SourceCodec| {
+            seen.iter()
+                .find(|(sc, _)| *sc == Some(c))
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("no job dispatched for {}: {seen:?}", c.label()))
+        };
+        assert_eq!(
+            verdict(crate::SourceCodec::Av1),
+            crate::DecodeOffload::Denied,
+            "an AV1 source on a card with no AV1 decode block must reach the \
+             worker with hardware decode denied; allowing it is what failed \
+             every frame and (before the classification split) cooled the card"
+        );
+        assert_eq!(
+            verdict(crate::SourceCodec::H264),
+            crate::DecodeOffload::Allowed,
+            "and the gate must not be a blanket refusal — a codec the trial \
+             decode confirmed still offloads, or the fix costs the GPU decode \
+             it exists to keep"
+        );
     }
 
     fn file_sink() -> SinkRequest {

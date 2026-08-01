@@ -96,6 +96,7 @@ fn transcode_segment(
     burn_text: bool,
 ) -> bool {
     let opts = TranscodeOptions {
+        source_video_codec: None,
         source_frame_rate: None,
         container: Container::Mp4,
         video: Some(VideoCodec::H264),
@@ -117,6 +118,7 @@ fn transcode_segment(
         &opts,
         DeviceId::Cpu,
         out.to_str().unwrap(),
+        pharos_transcode::DecodeOffload::Allowed,
     );
     eprintln!("argv: ffmpeg {}", args.join(" "));
     let status = Command::new("ffmpeg")
@@ -175,6 +177,7 @@ fn transcode_segment_from_sidecar(
     dur_secs: u64,
 ) -> bool {
     let opts = TranscodeOptions {
+        source_video_codec: None,
         source_frame_rate: None,
         container: Container::Mp4,
         video: Some(VideoCodec::H264),
@@ -198,6 +201,7 @@ fn transcode_segment_from_sidecar(
         &opts,
         DeviceId::Cpu,
         out.to_str().unwrap(),
+        pharos_transcode::DecodeOffload::Allowed,
     );
     eprintln!("argv: ffmpeg {}", args.join(" "));
     let status = Command::new("ffmpeg")
