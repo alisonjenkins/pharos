@@ -1079,13 +1079,48 @@ fn source_unreadable(item: &MediaItem, e: &std::io::Error) -> actix_web::Error {
     error::ErrorNotFound("media source unreadable")
 }
 
+/// 008 — refuse a URL-backed item at the byte routes, or `None` for a file.
+///
+/// Every route in this module serves bytes straight off the filesystem
+/// (`NamedFile` / `tokio::fs`), so a synthetic path cannot be served here at
+/// all. `playback_info` already declines to advertise direct play for these, so
+/// arriving here means a client followed a stale URL or ignored the verdict —
+/// uncommon, and not worth alarming on.
+///
+/// The metric reason is DISTINCT from the unreadable-file reasons on purpose.
+/// `pharos_source_unreadable_total` is what an operator reads as "media has
+/// gone from disk", and filing a by-design refusal in that bucket would turn a
+/// working feature into a permanent false alarm.
+fn refuse_remote(item: &MediaItem) -> Option<actix_web::Error> {
+    let r = item.origin().remote()?;
+    tracing::debug!(
+        media.id = item.id,
+        extractor = r.extractor(),
+        "refusing a byte route for a URL-backed item; it is served over HLS"
+    );
+    metrics::counter!("pharos_source_unreadable_total", "reason" => "remote_source").increment(1);
+    Some(error::ErrorNotFound("media source is not a local file"))
+}
+
 async fn load_item(state: &AppState, id_str: &str) -> Result<MediaItem, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    state.stores.get(id).await.map_err(|e| match e {
+    let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
-    })
+    })?;
+    // 008 — every route in this module serves bytes straight off the filesystem
+    // (NamedFile / tokio::fs), so a URL-backed item cannot be served here at
+    // all. Refused ONCE, at the single point every byte route loads through, so
+    // a new route inherits the refusal instead of having to remember it.
+    //
+    // `playback_info` already declines to advertise direct play for these, so
+    // reaching this is a client following a stale URL or ignoring the verdict —
+    // uncommon but not an error worth alarming on.
+    if let Some(e) = refuse_remote(&item) {
+        return Err(e);
+    }
+    Ok(item)
 }
 
 #[derive(serde::Deserialize)]
@@ -1107,6 +1142,42 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pharos_core::{MediaItem, MediaKind, MediaProbe};
+
+    /// 008 — a URL-backed item is refused by the byte routes, and the refusal
+    /// is NOT filed under the reason that means "media has gone from disk".
+    ///
+    /// Both directions asserted: a helper that refused everything would satisfy
+    /// the first half on its own, and refusing local items would take the whole
+    /// library offline.
+    #[test]
+    fn a_remote_item_is_refused_by_the_byte_routes() {
+        let _ = crate::obs::init("info", None);
+        let remote = MediaItem {
+            id: 1,
+            path: pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+                .expect("valid ref")
+                .to_synthetic_path(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        let err = refuse_remote(&remote).expect("a remote item must be refused here");
+        assert_eq!(err.as_response_error().status_code(), 404);
+        assert!(
+            !err.to_string().contains("ytdlp://"),
+            "the refusal must not hand the client the server's locator: {err}"
+        );
+
+        let local = MediaItem {
+            id: 2,
+            path: "/media/Movies/Arrival.mkv".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        };
+        assert!(
+            refuse_remote(&local).is_none(),
+            "an ordinary local item must still be served"
+        );
+    }
 
     /// A catalogued item whose bytes are gone still answers 404 — the client
     /// contract is unchanged — but it must no longer be MUTE about it, and it

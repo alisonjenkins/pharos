@@ -10,8 +10,8 @@ use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
         device_profile::{
-            negotiate_explained, CodecCap, Decision, DeviceProfile, ServerCodecSupport,
-            SourceMedia, SubtitleProfileDto,
+            negotiate_explained, CodecCap, Decision, DeviceProfile, DirectPlayBlock,
+            ServerCodecSupport, SourceMedia, SubtitleProfileDto,
         },
         dto::{
             build_media_attachments, build_media_streams_with_subtitles, container_for,
@@ -2220,7 +2220,36 @@ async fn playback_info(
     // server encode capabilities (empty in tests → h264 fallback, matching the
     // old hardcode).
     let server_codecs = server_codec_support(&state.encode_capabilities);
-    let (decision, direct_play_block) = negotiate_explained(&profile, &source, &server_codecs);
+    // 008 — a URL-backed item has no file, and every byte route that serves a
+    // direct play or a remux (`/videos/{id}/stream`) is built on NamedFile +
+    // tokio::fs. So direct play is impossible for it regardless of what the
+    // client would accept, and a remux is too: both copy a bitstream out of a
+    // file that is not there.
+    //
+    // Expressed by negotiating against a profile with NO DirectPlayProfiles
+    // rather than by rewriting the verdict afterwards. That reuses the
+    // negotiator's own tested fall-through — which picks a target container and
+    // codecs from the client's TranscodingProfile — instead of inventing a
+    // transcode target here, where nothing knows what the client can decode.
+    //
+    // The reason is then restated as RemoteSource, because the fall-through
+    // would otherwise report `no_profile`: true of the profile this code just
+    // constructed, but a lie about the client, and indistinguishable on the
+    // dashboard from the real "clients are sending nothing" failure.
+    let remote = item.origin().is_remote();
+    let (decision, direct_play_block) = if remote {
+        let mut forced = profile.clone();
+        forced.direct_play_profiles.clear();
+        let (d, _) = negotiate_explained(&forced, &source, &server_codecs);
+        (
+            d,
+            DirectPlayBlock::RemoteSource {
+                locator: item.path.display().to_string(),
+            },
+        )
+    } else {
+        negotiate_explained(&profile, &source, &server_codecs)
+    };
     // Which post-negotiation override (if any) replaced the negotiator's
     // decision. These fire AFTER `negotiate` and can turn a DirectPlay into a
     // transcode, so a log carrying only the negotiator's reason would name a
