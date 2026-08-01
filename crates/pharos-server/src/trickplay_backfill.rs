@@ -191,7 +191,7 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
     let Some(seed) = items.iter().find(|i| i.id == id) else {
         return Vec::new();
     };
-    if !is_video(seed) {
+    if !sweepable(seed) {
         return Vec::new();
     }
     let mut units = vec![(seed.clone(), true)];
@@ -209,7 +209,7 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
             .iter()
             .filter(|i| {
                 i.id != seed.id
-                    && is_video(i)
+                    && sweepable(i)
                     && i.series.as_ref().is_some_and(|si| {
                         series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
                     })
@@ -240,7 +240,7 @@ async fn run_sweep(ctx: GenCtx) {
     // seconds of boot) while truncated ones fall through to regeneration.
     if let Ok(items) = ctx.stores.list().await {
         let mut verified = 0usize;
-        for item in items.iter().filter(|i| is_video(i)) {
+        for item in items.iter().filter(|i| sweepable(i)) {
             for &width in &ctx.widths {
                 if ctx.cache.is_generated(item.id, width).await {
                     continue;
@@ -270,7 +270,7 @@ async fn run_sweep(ctx: GenCtx) {
                 continue;
             }
         };
-        let mut general: Vec<&MediaItem> = items.iter().filter(|i| is_video(i)).collect();
+        let mut general: Vec<&MediaItem> = items.iter().filter(|i| sweepable(i)).collect();
         general.sort_by_key(|i| std::cmp::Reverse(i.created_at.unwrap_or(i64::MIN)));
         tracing::info!(videos = general.len(), "trickplay sweep: pass starting");
         let mut done_before = 0usize;
@@ -300,6 +300,24 @@ fn is_video(item: &MediaItem) -> bool {
     matches!(item.kind, MediaKind::Movie | MediaKind::Episode)
 }
 
+/// Whether a background sweep can do any work on this item at all.
+///
+/// Two ways to be out of scope, and they fail differently. A non-video has
+/// nothing to generate and is simply skipped. A REMOTE item (008) has no file to
+/// decode — every generator here hands `item.path` to ffmpeg, which fails on an
+/// unknown protocol, so `is_generated` never becomes true and the item is
+/// re-selected on the NEXT pass, and the one after, taking a background-I/O
+/// permit each time it is attempted. Declining is not an optimisation; retrying
+/// is an unbounded leak that competes with live playback for the gate (V134).
+///
+/// Deriving these assets for a remote item is not merely unimplemented, it is
+/// unwanted: trickplay and poster extraction are whole-file decodes, and doing
+/// one over the network on a bulk sweep is exactly the traffic the resolver
+/// exists to avoid.
+fn sweepable(item: &MediaItem) -> bool {
+    is_video(item) && item.origin().local().is_some()
+}
+
 /// The recorded local Primary sidecar (`poster.jpg` / `cover.jpg` discovered at
 /// scan) for an item, if one still exists on disk. Mirrors
 /// `images::local_artwork_path` but off the raw [`Stores`] — the warm worker has
@@ -322,7 +340,7 @@ async fn local_primary_sidecar(stores: &Stores, id: u64) -> Option<std::path::Pa
 /// trickplay sprites for each configured width, its text subtitles, its
 /// embedded fonts, then its Primary poster + grid-sized scale.
 async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
-    if !is_video(item) {
+    if !sweepable(item) {
         return;
     }
     // All configured widths from ONE source decode (B72/T96): the largest width
@@ -554,6 +572,41 @@ mod tests {
             ..Default::default()
         };
         assert!(priority_units(7, &[audio]).is_empty());
+    }
+
+    /// A remote item (008) is declined by the sweep, and a LOCAL video of the
+    /// same kind is still accepted — otherwise a predicate that returned `false`
+    /// for everything would satisfy the first half on its own.
+    ///
+    /// The cost of getting this wrong is not a wasted pass: every generator here
+    /// hands `path` to ffmpeg, which fails on the `ytdlp://` protocol, so
+    /// `is_generated` never becomes true, the item is re-selected forever, and
+    /// each attempt takes a background-I/O permit away from live playback (V134).
+    #[test]
+    fn the_sweep_declines_a_remote_item_and_still_takes_a_local_one() {
+        let remote = MediaItem {
+            id: 42,
+            kind: MediaKind::Movie,
+            path: pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+                .expect("valid ref")
+                .to_synthetic_path(),
+            title: "Never Gonna Give You Up".into(),
+            ..Default::default()
+        };
+        assert!(
+            !sweepable(&remote),
+            "a remote item must never be selected for whole-file generation"
+        );
+        assert!(
+            is_video(&remote),
+            "and it is declined for its ORIGIN, not for its kind — otherwise \
+             this test would pass for the wrong reason"
+        );
+        assert!(
+            sweepable(&ep(1, "arrow", 1, 1)),
+            "an ordinary local video must still be swept"
+        );
+        assert!(priority_units(42, &[remote]).is_empty());
     }
 
     /// PREEMPTION: a fresh nudge's units are PREPENDED, so the item someone

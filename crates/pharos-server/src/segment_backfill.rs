@@ -110,12 +110,24 @@ async fn run_sweep(ctx: Ctx) {
     }
 }
 
+/// Whether intro/outro detection can run against this item at all.
+///
+/// Detection only ever applies to episodes, and it needs a FILE: `fingerprint`
+/// and `fingerprint_multi` open `ep.path` directly, so a remote item's synthetic
+/// path (008) is ENOENT. That failure is not self-limiting — the season never
+/// reaches the current `SEGMENT_DETECT_VERSION`, so `season_is_current` stays
+/// false and the whole season is re-analysed on every pass, each attempt taking
+/// a background-I/O permit away from live playback (V134).
+fn analysable(it: &MediaItem) -> bool {
+    it.kind == pharos_core::MediaKind::Episode && it.origin().local().is_some()
+}
+
 /// Group episodes by (series identity, season) and analyze each season that
 /// isn't already covered at the current schema version.
 async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
     let mut seasons: HashMap<String, Vec<&MediaItem>> = HashMap::new();
     for it in items {
-        if it.kind != pharos_core::MediaKind::Episode {
+        if !analysable(it) {
             continue;
         }
         let Some(s) = it.series.as_ref() else {
@@ -468,6 +480,44 @@ async fn compute_fp(
 mod tests {
     use super::*;
     use pharos_transcode::fingerprint::align::Span;
+
+    /// Detection declines a remote item (008) and still accepts a local
+    /// episode. Both directions, because a predicate returning `false` for
+    /// everything would satisfy the first half on its own — and the failure this
+    /// guards is unbounded: an ENOENT fingerprint never advances the season's
+    /// detect version, so the whole season is re-analysed every pass, each try
+    /// taking a background-I/O permit from live playback (V134).
+    #[test]
+    fn detection_declines_a_remote_episode_and_still_takes_a_local_one() {
+        let remote = MediaItem {
+            id: 1,
+            kind: pharos_core::MediaKind::Episode,
+            path: pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+                .expect("valid ref")
+                .to_synthetic_path(),
+            ..Default::default()
+        };
+        assert!(!analysable(&remote));
+
+        let local = MediaItem {
+            id: 2,
+            kind: pharos_core::MediaKind::Episode,
+            path: "/tv/Arrow/s01e01.mkv".into(),
+            ..Default::default()
+        };
+        assert!(analysable(&local));
+
+        // Declined for its ORIGIN, not its kind: a local MOVIE is refused too,
+        // so an assertion on kind alone would not have caught a missing origin
+        // check.
+        let movie = MediaItem {
+            id: 3,
+            kind: pharos_core::MediaKind::Movie,
+            path: "/media/Movies/Arrival.mkv".into(),
+            ..Default::default()
+        };
+        assert!(!analysable(&movie));
+    }
 
     fn verdict(
         id: u64,
