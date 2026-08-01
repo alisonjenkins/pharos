@@ -144,6 +144,12 @@ pub struct AppState {
     /// present, the live/uncached HLS path streams through it; the cached
     /// path uses its own clone held inside `HlsSegmentCache`.
     pub transcode_scheduler: Option<pharos_transcode::scheduler::TranscodeScheduler>,
+    /// 008 — resolves a URL-backed item's locator at play time, memoised.
+    /// `None` when `[remote].enabled` is false, which is the default: with no
+    /// resolver an item whose origin is remote cannot be played, and the
+    /// handler says so rather than handing ffmpeg a `ytdlp://` path it would
+    /// reject with an unhelpful protocol error.
+    pub remote: Option<std::sync::Arc<crate::remote::ResolverCache>>,
     /// What THIS server can encode (trial-confirmed hardware families + software
     /// encoders in this ffmpeg build). The negotiator targets the best codec in
     /// (client-decodable ∩ server-encodable), hardware-preferred. Empty default
@@ -556,6 +562,7 @@ impl AppState {
             images: None,
             hls: None,
             transcode_scheduler: None,
+            remote: None,
             encode_capabilities: std::sync::Arc::new(Default::default()),
             hw_encode_session_budget: 0,
             trickplay: None,
@@ -644,6 +651,7 @@ impl AppState {
             images: None,
             hls: None,
             transcode_scheduler: None,
+            remote: None,
             encode_capabilities: std::sync::Arc::new(Default::default()),
             hw_encode_session_budget: 0,
             trickplay: None,
@@ -793,6 +801,17 @@ impl AppState {
         sched: pharos_transcode::scheduler::TranscodeScheduler,
     ) -> Self {
         self.transcode_scheduler = Some(sched);
+        self
+    }
+
+    /// 008 — attach the URL-backed source resolver. Absent unless
+    /// `[remote].enabled`, and its absence is what makes a remote item
+    /// unplayable with a message that names the reason.
+    pub fn with_remote_resolver(
+        mut self,
+        resolver: std::sync::Arc<crate::remote::ResolverCache>,
+    ) -> Self {
+        self.remote = Some(resolver);
         self
     }
 

@@ -472,6 +472,18 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
     let duration_seconds = match item.probe.duration_ms {
         Some(ms) => ms as f64 / 1000.0,
         None => {
+            // 008 — never reachable for a URL-backed item, and deliberately not
+            // made so. The resolver REFUSES to ingest one without a duration
+            // precisely so this fallback stays a local-file concern: turning it
+            // into a network probe would put an unbounded upstream call inside
+            // the libav worker pool, where one dead URL parks a worker for
+            // every other title. A remote row arriving here is a bug in
+            // whatever wrote it, and says so.
+            if item.origin().is_remote() {
+                return Err(error::ErrorInternalServerError(
+                    "a URL-backed item was catalogued without a duration;                      re-add it rather than probing the source on the playback path",
+                ));
+            }
             let prober = FfmpegProber::new();
             let info = prober
                 .probe(&item.path)
@@ -1110,13 +1122,19 @@ async fn serve_segment(
     // `(media_id, seg, audio_idx, sub_idx, bitrate)` tuple drives the
     // disk cache, so the ETag implicitly invalidates whenever the
     // cached bytes would.
+    // 008 — resolve the locator ONCE, before anything derives from it. The
+    // ETag, the disk cache key and the ffmpeg input must all come from the same
+    // value: derive the ETag from the synthetic path and the bytes from a
+    // resolved URL, and a re-resolution would serve the previous resolution's
+    // segments under an unchanged ETag, held `immutable` for a year (V132).
+    let source = transcode_source(&state, &item.path, opts.video.is_some()).await?;
     let etag = segment_etag(
         id_num,
         seg,
         opts.audio_source_stream_index,
         opts.burn_subtitle_stream_index,
         &opts,
-        &item.path,
+        &source,
     );
 
     // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
@@ -1161,7 +1179,7 @@ async fn serve_segment(
                 seg,
                 opts.audio_source_stream_index,
                 opts.burn_subtitle_stream_index,
-                &item.path,
+                &source,
                 &opts,
                 JobClass::Interactive,
                 stream,
@@ -1197,7 +1215,7 @@ async fn serve_segment(
     })?;
     if let Some(sched) = state.transcode_scheduler.as_ref() {
         match sched
-            .submit_live(item.path.clone(), resolved.to_transcode_options())
+            .submit_live(source.clone(), resolved.to_transcode_options())
             .await
         {
             Ok(stream) => {
@@ -1220,7 +1238,7 @@ async fn serve_segment(
 
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
-        .transcode(&item.path, &resolved.to_transcode_options())
+        .transcode(&source, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok(HttpResponse::Ok()
@@ -1251,6 +1269,50 @@ async fn serve_segment(
 /// a `304 Not Modified` for bytes at the other bitrate. Reading the fields off
 /// one struct means a new byte-affecting option shows up here as a compile-time
 /// site to update, not a silent omission.
+/// The locator to hand ffmpeg for this item and rendition — 008.
+///
+/// A local item is its own path. A URL-backed one is resolved fresh (memoised
+/// by `ResolverCache`), because the stored `ytdlp://` path is an identity, not
+/// a location — deliberately so, since the real locator is signed and rotates.
+///
+/// `wants_video` picks between an adaptive source's two files. Each HLS
+/// rendition is a SINGLE input: the CMAF video rung is video-only (`-an`) and
+/// the demuxed audio rung carries no video, so neither needs a second ffmpeg
+/// input. A progressive source answers either question with itself.
+///
+/// Returns the locator, whose CHANGE is what moves the cache generation — see
+/// `SourceGen::for_source`. The two must be derived from the same value or a
+/// re-resolution would serve the previous resolution's bytes.
+async fn transcode_source(
+    state: &AppState,
+    item_path: &std::path::Path,
+    wants_video: bool,
+) -> Result<std::path::PathBuf, actix_web::Error> {
+    let Some(r) = pharos_core::Origin::classify(item_path).remote() else {
+        return Ok(item_path.to_path_buf());
+    };
+    let Some(resolver) = state.remote.as_ref() else {
+        // The row exists but the feature that created it is off. Say which,
+        // rather than letting ffmpeg reject a `ytdlp://` path with a protocol
+        // error that names nothing an operator can act on.
+        return Err(error::ErrorServiceUnavailable(
+            "this item is URL-backed and [remote] is not enabled on this server",
+        ));
+    };
+    let media = resolver.locate(&r).await.map_err(|e| {
+        tracing::warn!(
+            extractor = r.extractor(),
+            error = %e,
+            "could not resolve a URL-backed source for playback"
+        );
+        // The resolver's own message carries the site's reason ("video
+        // unavailable", "sign in to confirm your age"); a bare class here would
+        // be another round of guessing.
+        error::ErrorBadGateway(format!("could not resolve source: {e}"))
+    })?;
+    Ok(std::path::PathBuf::from(media.input_for(wants_video)))
+}
+
 fn segment_etag(
     media_id: u64,
     seg: u32,
@@ -3126,6 +3188,8 @@ async fn vp9_segment_raw(
     opts: &SegmentOpts,
     play_session_id: Option<&str>,
 ) -> Result<Vec<u8>, actix_web::Error> {
+    // 008 — resolved once, so the cache key and the ffmpeg input agree.
+    let source = transcode_source(state, &item.path, opts.video.is_some()).await?;
     if let Some(cache) = state.hls.as_ref() {
         let stream = play_session_id
             .map(StreamKey::of)
@@ -3136,7 +3200,7 @@ async fn vp9_segment_raw(
                 seg,
                 opts.audio_source_stream_index,
                 opts.burn_subtitle_stream_index,
-                &item.path,
+                &source,
                 opts,
                 JobClass::Interactive,
                 stream,
@@ -3156,7 +3220,7 @@ async fn vp9_segment_raw(
     })?;
     if let Some(sched) = state.transcode_scheduler.as_ref() {
         match sched
-            .submit_live(item.path.clone(), resolved.to_transcode_options())
+            .submit_live(source.clone(), resolved.to_transcode_options())
             .await
         {
             Ok(stream) => return collect_stream(stream).await,
@@ -3167,7 +3231,7 @@ async fn vp9_segment_raw(
     }
     let transcoder = FfmpegTranscoder::new();
     let stream = transcoder
-        .transcode(&item.path, &resolved.to_transcode_options())
+        .transcode(&source, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     collect_stream(stream.into_stream()).await
@@ -4634,6 +4698,43 @@ mod tests {
     /// `pharos_cache::generation()` rather than re-deriving it. A URL change
     /// without a wipe leaves stale bytes on disk; a wipe without a URL change
     /// leaves the browser's `immutable` init in place. Both readers, one value.
+    /// 008 — a URL-backed item with no resolver configured fails with a message
+    /// that names the reason, and a LOCAL item is unaffected.
+    ///
+    /// Without the first half, `[remote].enabled = false` would hand ffmpeg a
+    /// `ytdlp://` path and the viewer would see a protocol error naming nothing
+    /// actionable. Without the second, the check would have taken every local
+    /// item offline and this test would still pass.
+    #[tokio::test]
+    async fn a_remote_item_without_a_resolver_says_so() {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .expect("stores");
+        let state = crate::state::AppState::new(stores, "test".into());
+        assert!(state.remote.is_none(), "the default is no resolver");
+
+        let remote = pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+            .expect("valid ref")
+            .to_synthetic_path();
+        let err = transcode_source(&state, &remote, true)
+            .await
+            .expect_err("a remote item cannot play without a resolver");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote"),
+            "the failure must name the feature that is off: {msg}"
+        );
+
+        // A local item resolves to itself, resolver or no resolver.
+        let local = std::path::Path::new("/media/Movies/Arrival.mkv");
+        assert_eq!(
+            transcode_source(&state, local, true)
+                .await
+                .expect("a local item never needs a resolver"),
+            local.to_path_buf()
+        );
+    }
+
     #[test]
     async fn a_shared_init_rendition_uri_carries_the_cache_generation() {
         let gen = pharos_cache::generation();
