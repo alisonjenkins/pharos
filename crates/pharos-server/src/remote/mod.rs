@@ -347,6 +347,14 @@ impl ResolverCache {
         Ok(media)
     }
 
+    /// Describe a URL for ingestion. Deliberately NOT memoised: this runs once
+    /// when a person adds a link, and the descriptive facts it returns are
+    /// persisted, so serving them from a memo could write a stale title for a
+    /// video that has since been renamed.
+    pub async fn describe(&self, url: &str) -> Result<ResolvedItem, ResolveError> {
+        self.resolver.describe(url).await
+    }
+
     /// Forget a memo, so the next request resolves afresh.
     ///
     /// Called when a locator turns out to be dead before its TTL — the case the
