@@ -386,6 +386,17 @@ pub enum DirectPlayBlock {
     /// CodecProfile condition (level, profile, bit depth, channel count)
     /// rejected the source — see [`codec_profile_passes`].
     CodecCondition,
+    /// 008 — the item has no file behind it, so there is nothing to direct
+    /// play. The client's profile was never consulted.
+    ///
+    /// This is the only variant that is not about the CLIENT. Every other
+    /// reason says "this viewer cannot take these bytes"; this one says "these
+    /// bytes are not a file", which is a fact about the item and true for every
+    /// client at once. It is a distinct label rather than being folded into
+    /// `NoProfile` because an operator reading the dashboard needs to tell
+    /// "clients are sending nothing" from "this library is URL-backed" — the
+    /// first is a compatibility problem to chase and the second is by design.
+    RemoteSource { locator: String },
 }
 
 impl DirectPlayBlock {
@@ -401,6 +412,7 @@ impl DirectPlayBlock {
             Self::AudioCodec { .. } => "audio_codec",
             Self::Bitrate { .. } => "bitrate",
             Self::CodecCondition => "codec_condition",
+            Self::RemoteSource { .. } => "remote_source",
         }
     }
 
@@ -415,7 +427,12 @@ impl DirectPlayBlock {
             Self::AudioCodec { .. } => 3,
             Self::Bitrate { .. } => 4,
             Self::CodecCondition => 5,
-            Self::NotBlocked => 6,
+            // Ranked above every client-side reason: it is not a negotiation
+            // outcome at all, so if it applies it is the whole answer and must
+            // not be masked by a profile that also happened to reject the
+            // container.
+            Self::RemoteSource { .. } => 6,
+            Self::NotBlocked => 7,
         }
     }
 }
@@ -437,6 +454,9 @@ impl std::fmt::Display for DirectPlayBlock {
                 cap_bps,
             } => write!(f, "source {source_bps} bps over client cap {cap_bps} bps"),
             Self::CodecCondition => write!(f, "a CodecProfile condition rejected the source"),
+            Self::RemoteSource { locator } => {
+                write!(f, "source {locator} is not a file; direct play impossible")
+            }
         }
     }
 }
@@ -1058,12 +1078,16 @@ mod tests {
                 cap_bps: 2,
             },
             DirectPlayBlock::CodecCondition,
+            DirectPlayBlock::RemoteSource {
+                locator: "ytdlp://youtube/dQw4w9WgXcQ".into(),
+            },
         ];
         let labels: std::collections::BTreeSet<_> = all.iter().map(|b| b.label()).collect();
         assert_eq!(labels.len(), all.len());
         // The Display form must carry the offending value, not just the class.
         assert!(all[2].to_string().contains('x'));
         assert!(all[5].to_string().contains('2'));
+        assert!(all[7].to_string().contains("dQw4w9WgXcQ"));
     }
 
     #[test]
