@@ -20,6 +20,7 @@ use crate::worker::exec::ffmpeg_bin;
 use smallvec::SmallVec;
 use std::future::Future;
 use std::time::{Duration, Instant};
+use tokio::sync::OnceCell;
 
 #[derive(Debug, Clone)]
 pub struct ProbeConfig {
@@ -241,19 +242,73 @@ fn codec_probe_args(device: DeviceId, codec: crate::VideoCodec) -> Option<Vec<St
 ///
 /// Deliberately short and fixed-length so boot is not delayed; the frame count
 /// is what makes two devices comparable, so it must not vary by device.
+///
+/// The timed region includes process spawn and ffmpeg init/filter-graph
+/// setup, which are roughly constant per invocation regardless of device. On
+/// a fast enough hardware encoder the 120-frame encode itself could complete
+/// in the same order of magnitude as that fixed overhead, which would
+/// compress the fast end of exactly the ratio this instrument exists to
+/// produce. Rather than picking a frame count large enough for today's
+/// fastest accelerator (a hardware-specific constant this whole spec exists
+/// to avoid — V126), the fixed overhead is measured once per process by
+/// [`rate_probe_baseline`] and subtracted before computing the rate.
 pub async fn probe_encode_rate(device: DeviceId, timeout: Duration) -> Option<f64> {
     const RATE_PROBE_FRAMES: u32 = 120;
     let bin = ffmpeg_bin();
     let args = rate_probe_args(device, RATE_PROBE_FRAMES)?;
+    let baseline = rate_probe_baseline().await;
     let started = Instant::now();
     if !run_ffmpeg_probe(&bin, &args, timeout).await {
         return None;
     }
-    let secs = started.elapsed().as_secs_f64();
+    let wall = started.elapsed();
+    // The baseline is spawn + init + teardown with essentially no encoding.
+    // If it's not strictly less than this device's measured wall time, the
+    // actual encode was lost in that noise; a rate here would be mostly a
+    // spawn-time measurement, not a device measurement, so the honest
+    // answer is None rather than a huge or negative number.
+    if wall <= baseline {
+        return None;
+    }
+    let secs = (wall - baseline).as_secs_f64();
     if secs <= 0.0 {
         return None;
     }
     Some(f64::from(RATE_PROBE_FRAMES) / secs)
+}
+
+/// This machine's fixed per-invocation overhead for the rate probe's argv
+/// shape: process spawn + ffmpeg init/filter-graph setup + teardown, with
+/// (almost) no actual encoding. Measured once by running the same probe argv
+/// at the minimum possible frame count (1) on the CPU device — always
+/// available, and the shape every device shares before its encoder-specific
+/// args.
+///
+/// Cached in a `tokio::sync::OnceCell` (the same pattern already used by
+/// `hwaccel::DETECTED` and `capability::ENCODERS` in this crate) rather than
+/// threaded through as a parameter: the baseline is a property of the
+/// machine, not of any one device probe, so every caller of
+/// `probe_encode_rate` should see the same value without having to know it
+/// exists or pass it explicitly. `OnceCell` (vs. `std::sync::OnceLock`) is
+/// needed because computing it requires `.await`ing a real ffmpeg spawn.
+async fn rate_probe_baseline() -> Duration {
+    static BASELINE: OnceCell<Duration> = OnceCell::const_new();
+    *BASELINE
+        .get_or_init(|| async {
+            let bin = ffmpeg_bin();
+            let Some(args) = rate_probe_args(DeviceId::Cpu, 1) else {
+                return Duration::ZERO;
+            };
+            let started = Instant::now();
+            // Best-effort: if this throwaway spawn itself fails, treat the
+            // overhead as zero rather than poisoning every later probe on
+            // this process with a bogus timeout-sized value. A real device
+            // probe sharing the same ffmpeg binary will fail the same way
+            // and correctly report None on its own.
+            let _ = run_ffmpeg_probe(&bin, &args, Duration::from_secs(30)).await;
+            started.elapsed()
+        })
+        .await
 }
 
 /// ffmpeg argv for the timed probe: one synthetic source, one encoder, null
@@ -442,6 +497,54 @@ mod rate_tests {
             (60.0..=240.0).contains(&implied_frames),
             "reported rate {r} over {wall}s implies {implied_frames} \
              frames encoded; expected close to the fixed 120-frame clip"
+        );
+    }
+
+    /// Finding 2: the fixed per-invocation overhead (spawn + ffmpeg init) must
+    /// be measured and subtracted before computing the rate, not folded into
+    /// it. There is no fast accelerator on this machine to make the effect
+    /// dramatic, but the arithmetic itself is directly observable without
+    /// one: the encode time implied by the reported rate (`frames / rate`)
+    /// must be shorter than the call's own wall-clock time by at least the
+    /// measured baseline. Without the subtraction, rate = frames / wall
+    /// exactly, so the implied encode time equals wall and this margin would
+    /// be zero — this assertion would fail without the fix.
+    #[tokio::test]
+    async fn reported_rate_implies_the_overhead_was_subtracted() {
+        // Prime the baseline first so its one-time cost isn't attributed to
+        // the timed call below.
+        let baseline = rate_probe_baseline().await;
+        assert!(
+            baseline > Duration::ZERO,
+            "expected a measurable nonzero per-invocation overhead on a real \
+             ffmpeg binary, got {baseline:?}"
+        );
+
+        let started = Instant::now();
+        let r = probe_encode_rate(DeviceId::Cpu, Duration::from_secs(30))
+            .await
+            .expect("the software encoder must be measurable");
+        let wall = started.elapsed();
+
+        let implied_encode_time = Duration::from_secs_f64(120.0 / r);
+        assert!(
+            implied_encode_time + baseline <= wall,
+            "implied encode time {implied_encode_time:?} + measured baseline \
+             {baseline:?} should not exceed wall {wall:?}; if it does, the \
+             baseline was never subtracted from the timed region"
+        );
+    }
+
+    /// No test previously covered `probe_encode_rate`'s `None` path. A
+    /// timeout too short for ffmpeg to possibly finish spawning and encoding
+    /// is a cheap, hardware-independent way to force it without needing a
+    /// slow or absent device.
+    #[tokio::test]
+    async fn a_timeout_too_short_to_finish_reports_none() {
+        let r = probe_encode_rate(DeviceId::Cpu, Duration::from_nanos(1)).await;
+        assert!(
+            r.is_none(),
+            "a timeout that cannot possibly complete must report None, got {r:?}"
         );
     }
 }
