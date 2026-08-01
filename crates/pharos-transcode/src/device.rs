@@ -750,11 +750,20 @@ mod weight_tests {
 
     use super::*;
 
-    /// The stability property the whole design rests on: ordinary measurement
-    /// noise must not change a weight, because a changed weight re-places
-    /// renditions and a re-placed rendition mixes encoders under one init.
+    fn weight_of(t: &DeviceTable, id: DeviceId) -> u32 {
+        t.slot(id).expect("device is in the table").weight()
+    }
+
+    /// Noise tolerance AT A BUCKET CENTRE — the point of MAXIMUM margin.
+    ///
+    /// Named for what it actually checks. `400/100 = 4` sits exactly on a
+    /// bucket centre, so ±41%/−29% of noise is absorbed; this says nothing
+    /// about a rate that lands near a boundary, which
+    /// [`a_rate_near_a_bucket_boundary_does_flip_on_noise`] characterises
+    /// instead. Bucketing buys coarseness, not stability — stability comes from
+    /// [`crate::rate_store`] not re-probing unchanged hardware at all.
     #[test]
-    fn measurement_noise_does_not_change_a_weight() {
+    fn measurement_noise_does_not_change_a_weight_at_a_bucket_centre() {
         let reference = Some(100.0);
         let base = device_weight(4, Some(400.0), reference);
         for noise in [0.85_f64, 0.95, 1.0, 1.05, 1.15] {
@@ -764,6 +773,141 @@ mod weight_tests {
                 "a {noise}x measurement changed the weight"
             );
         }
+    }
+
+    /// A CHARACTERISATION of the residual risk, deliberately asserting the
+    /// unwanted behaviour rather than hiding it.
+    ///
+    /// `.round()` bucketing does not shrink the zero-margin set, it RELOCATES
+    /// it from `{2^k}` to `{2^(k+0.5)}`. A device whose true ratio is ~2.83
+    /// (= 2^1.5) sits exactly between two buckets and needs arbitrarily small
+    /// noise to flip — so on a fresh probe every boot it would flip on roughly
+    /// half of them, forever. No bucket width fixes this; it only moves where
+    /// the knife-edge is.
+    ///
+    /// This is exactly why the probe result is PERSISTED (`crate::rate_store`):
+    /// unchanged hardware reuses the stored rates and never re-measures, so the
+    /// knife-edge is never stepped on twice. If this test ever goes green by
+    /// the flip disappearing, the reasoning behind that persistence has changed
+    /// and should be re-derived, not assumed.
+    #[test]
+    fn a_rate_near_a_bucket_boundary_does_flip_on_noise() {
+        let reference = Some(100.0);
+        // 283/100 ≈ 2^1.5 — the midpoint between the 2x and 4x buckets.
+        let at_boundary = device_weight(1, Some(283.0), reference);
+        let one_percent_slower = device_weight(1, Some(283.0 * 0.99), reference);
+        assert_eq!(at_boundary, 4, "2.83 rounds up into the 4x bucket");
+        assert_eq!(one_percent_slower, 2, "2.80 rounds down into the 2x bucket");
+        assert_ne!(
+            at_boundary, one_percent_slower,
+            "a boundary rate flips on 1% noise — persistence, not bucketing, \
+             is what stops that re-placing a rendition"
+        );
+    }
+
+    /// The reference is the MINIMUM measured rate, so every speed term is a
+    /// ratio against the slowest thing on this machine and the slowest device
+    /// weighs its capacity alone. A maximum (or any fixed number) would clamp
+    /// every ratio to 1 and flatten the table.
+    #[test]
+    fn the_reference_rate_is_the_slowest_measured_device() {
+        let fast = DeviceId::hw(HwAccel::Nvenc, 0);
+        let mid = DeviceId::hw(HwAccel::Vaapi, 0);
+        let t = DeviceTable::from_probe_weighted(
+            &[(fast, 1, Some(400.0)), (mid, 1, Some(200.0))],
+            1,
+            Some(100.0),
+        );
+        assert_eq!(weight_of(&t, fast), 4, "400/100 → 4x the slowest device");
+        assert_eq!(weight_of(&t, mid), 2, "200/100 → 2x");
+        assert_eq!(
+            weight_of(&t, DeviceId::Cpu),
+            1,
+            "the slowest measured device is the unit, so it weighs capacity only"
+        );
+    }
+
+    /// The compatibility claim `from_probe` makes: callers with no rate
+    /// measurement (tests, the CLI tool) still get a working table, weighted on
+    /// capacity alone. If this drifts, every existing caller's placement moves.
+    #[test]
+    fn from_probe_weighs_capacity_alone() {
+        let a = DeviceId::hw(HwAccel::Nvenc, 0);
+        let b = DeviceId::hw(HwAccel::Vaapi, 0);
+        let t = DeviceTable::from_probe(&[(a, 3), (b, 2)], 4);
+        assert_eq!(weight_of(&t, a), 3);
+        assert_eq!(weight_of(&t, b), 2);
+        assert_eq!(weight_of(&t, DeviceId::Cpu), 4);
+    }
+
+    /// A duplicate id contributes NOTHING — not its capacity (already covered),
+    /// and not its rate. It has no slot of its own, so folding its rate into the
+    /// `min` would shift every other device's weight on behalf of a device that
+    /// isn't in the table.
+    #[test]
+    fn a_duplicate_entry_contributes_neither_its_capacity_nor_its_rate() {
+        let dev = DeviceId::hw(HwAccel::Nvenc, 0);
+        let t = DeviceTable::from_probe_weighted(
+            &[(dev, 1, Some(800.0)), (dev, 9, Some(50.0))],
+            1,
+            Some(100.0),
+        );
+        assert_eq!(
+            t.slots().iter().filter(|s| s.id == dev).count(),
+            1,
+            "one slot per device id"
+        );
+        assert_eq!(
+            t.slot(dev).expect("slot").capacity,
+            1,
+            "first wins for capacity"
+        );
+        // reference = min(800, 100) = 100. NOT 50: the duplicate is not a slot.
+        assert_eq!(
+            weight_of(&t, dev),
+            8,
+            "first wins for the RATE too: 800/100"
+        );
+        assert_eq!(weight_of(&t, DeviceId::Cpu), 1);
+    }
+
+    /// The failure mode most likely to bite in production, pinned with the
+    /// worked example that motivated persisting the probe result.
+    ///
+    /// The reference is a `min` over a SET, so a single device's missing
+    /// measurement moves every OTHER device's weight — no code touched that
+    /// device, and nothing about it changed. CPU 100 / GPU 400 at capacity 4
+    /// each weighs 16 and 4. Lose the CPU measurement to a probe timeout and
+    /// the reference jumps to 400: both weigh 4, and a 4:1 split has collapsed
+    /// to 1:1 from a routine transient.
+    ///
+    /// This is correct arithmetic on the evidence available — an absent rate is
+    /// a missing observation, never proof a device is slow — so the fix is not
+    /// here. It is that `crate::rate_store` does not re-probe unchanged
+    /// hardware, so a transient timeout cannot reach a second boot and re-place
+    /// live renditions.
+    #[test]
+    fn one_missing_rate_moves_every_other_devices_weight() {
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+
+        let measured = DeviceTable::from_probe_weighted(&[(gpu, 4, Some(400.0))], 4, Some(100.0));
+        assert_eq!(weight_of(&measured, gpu), 16, "cap 4 × 4x bucket");
+        assert_eq!(weight_of(&measured, DeviceId::Cpu), 4, "cap 4 × 1x bucket");
+
+        // Same hardware; the CPU probe timed out.
+        let cpu_timed_out = DeviceTable::from_probe_weighted(&[(gpu, 4, Some(400.0))], 4, None);
+        assert_eq!(
+            weight_of(&cpu_timed_out, gpu),
+            4,
+            "the GPU is now the slowest MEASURED device, so its ratio is 1"
+        );
+        assert_eq!(weight_of(&cpu_timed_out, DeviceId::Cpu), 4);
+        assert_eq!(
+            weight_of(&cpu_timed_out, gpu),
+            weight_of(&cpu_timed_out, DeviceId::Cpu),
+            "4:1 collapsed to 1:1 — the transient that persistence exists to \
+             keep out of a second boot"
+        );
     }
 
     /// A faster device must weigh more than a slower one at equal capacity,
