@@ -114,9 +114,10 @@ const RATE_BUCKET_RATIO: f64 = 2.0;
 /// move a rendition — see that constant for why that matters more than
 /// precision.
 ///
-/// Buckets are centred ON each power of two (`.round()`, not `.floor()`), so
-/// a bucket's edges sit roughly `sqrt(2)`≈41% away from its centre in either
-/// direction. `.floor()` would instead put a bucket edge AT every power of
+/// Buckets are centred ON each power of two (`.round()`, not `.floor()`), so a
+/// bucket's edges sit `sqrt(2)` away from its centre — which is symmetric in
+/// LOG space, not in percent: **+41.4% above the centre, −29.3% below it**.
+/// `.floor()` would instead put a bucket edge AT every power of
 /// two — and a rate that measures exactly on one (a plausible, not even
 /// unlucky, outcome against a whole-number reference) would flip buckets on
 /// noise alone, which is precisely the instability this function exists to
@@ -166,8 +167,11 @@ pub struct DeviceSlot {
     pub capacity: usize,
     /// Probe-derived share of new renditions — see [`device_weight`]. Fixed for
     /// the life of the table: placement must not move while segments are
-    /// cached or a client holds an init.
-    pub weight: u32,
+    /// cached or a client holds an init. PRIVATE for exactly that reason —
+    /// "fixed" was only a doc comment while the field was `pub mut`, and a
+    /// single stray assignment anywhere in the tree would re-place live
+    /// renditions with nothing to catch it. Read it via [`DeviceSlot::weight`].
+    weight: u32,
 }
 
 impl DeviceSlot {
@@ -182,6 +186,12 @@ impl DeviceSlot {
             capacity: permits,
             weight: weight.max(1),
         }
+    }
+
+    /// This device's probe-derived share of new renditions. Read-only: see the
+    /// field's comment for why it may never be reassigned.
+    pub fn weight(&self) -> u32 {
+        self.weight
     }
 
     /// Permits currently free (not handed to an in-flight encode).
@@ -296,7 +306,25 @@ impl DeviceTable {
         cpu_permits: usize,
         cpu_rate: Option<f64>,
     ) -> Self {
-        let reference = caps
+        // Resolve WHICH entries become slots BEFORE taking the reference. A
+        // `caps` entry that is skipped — a `DeviceId::Cpu` row (CPU is appended
+        // once, below, with `cpu_rate`) or a duplicate id (first wins) — has no
+        // slot of its own, so letting its rate into the `min` would shift every
+        // other device's weight on behalf of a device that isn't in the table.
+        // Harmless while callers pass clean input; a silent trap the first time
+        // one doesn't.
+        let mut kept: SmallVec<[(DeviceId, usize, Option<f64>); 5]> = SmallVec::new();
+        for &(id, cap, rate) in caps {
+            if matches!(id, DeviceId::Cpu) {
+                continue;
+            }
+            if kept.iter().any(|&(k, _, _)| k == id) {
+                continue; // first wins — for the RATE as well as the capacity
+            }
+            kept.push((id, cap, rate));
+        }
+
+        let reference = kept
             .iter()
             .map(|&(_, _, r)| r)
             .chain(std::iter::once(cpu_rate))
@@ -305,13 +333,7 @@ impl DeviceTable {
             .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |a: f64| a.min(r))));
 
         let mut slots: SmallVec<[DeviceSlot; 5]> = SmallVec::new();
-        for &(id, cap, rate) in caps {
-            if matches!(id, DeviceId::Cpu) {
-                continue; // CPU is appended once, below
-            }
-            if slots.iter().any(|s| s.id == id) {
-                continue;
-            }
+        for &(id, cap, rate) in &kept {
             slots.push(DeviceSlot::new(
                 id,
                 cap,
