@@ -1001,6 +1001,12 @@ async fn build_transcode_scheduler(
     // speculative work to shed-not-queue without touching the interactive
     // queue — see `SchedConfig::queue_background`.
     queue_background: bool,
+    // Where the probe result is persisted — the transcode cache directory, so
+    // the measurement that decided a placement ages out with the segments that
+    // placement produced. `None` disables persistence (no cache dir
+    // configured), which costs a re-probe every boot and lets two boots
+    // disagree; see the WARN this raises.
+    probe_store_dir: Option<std::path::PathBuf>,
 ) -> Option<(
     pharos_transcode::scheduler::TranscodeScheduler,
     Vec<(pharos_transcode::HwAccel, pharos_transcode::VideoCodec)>,
@@ -1018,8 +1024,11 @@ async fn build_transcode_scheduler(
     u64,
 )> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
-    use pharos_transcode::probe::{probe_device_caps, probe_encodable_codecs, ProbeConfig};
+    use pharos_transcode::probe::{
+        probe_device_caps, probe_encodable_codecs, probe_encode_rate, ProbeConfig,
+    };
     use pharos_transcode::protocol::{DeviceId, WorkerId};
+    use pharos_transcode::rate_store::RateStore;
     use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler, WorkerSpawner};
     use pharos_transcode::worker::ProcSpawner;
 
@@ -1089,21 +1098,114 @@ async fn build_transcode_scheduler(
             }
         }
     }
-    let table = DeviceTable::from_probe(&caps, default_cpu_permits());
+    // Everything that will get a slot, CPU included. The CPU's rate is one of
+    // the measurements the reference `min` is taken over, so it has to be in
+    // the set that is probed and stored — leaving it out would key the store on
+    // a different set than the one being weighted.
+    let mut to_weigh: Vec<(DeviceId, usize)> = caps.clone();
+    to_weigh.push((DeviceId::Cpu, default_cpu_permits()));
+
+    // Measure every confirmed device plus software on the SAME synthetic clip,
+    // so placement can weigh them against each other rather than treating a
+    // weak accelerator and a many-core software encoder as interchangeable.
+    // Runs on the boot pass that already trials every device.
+    //
+    // Through `RateStore`, which is what makes the answer STABLE: it persists
+    // the probe result beside the segment cache and reconciles this boot's
+    // measurement against it, so unchanged hardware weighs identically to last
+    // boot and does not re-probe at all. That matters because the HLS cache
+    // generation is composed from the placement digest — any weight that moves
+    // wipes the segment cache and invalidates every client's `immutable` init.
+    // Without the store, `probe_device_caps`'s documented under-reporting on a
+    // loaded box would do exactly that on a restart during playback.
+    let resolved = match probe_store_dir {
+        Some(dir) => {
+            let store = RateStore::new(&dir);
+            tracing::info!(
+                path = %store.path().display(),
+                "reconciling the device probe against its persisted result; delete \
+                 this file to force a full re-probe"
+            );
+            store
+                .resolve(&to_weigh, |d| probe_encode_rate(d, probe_timeout))
+                .await
+        }
+        None => {
+            // No transcode cache dir means nowhere to persist. Degrade to
+            // probing every boot and SAY SO: the rates are still measured and
+            // the weighting still works, but two boots can now disagree, and
+            // a disagreement re-places renditions.
+            tracing::warn!(
+                "no transcode cache directory, so the device probe cannot be \
+                 persisted — every boot re-probes, and a probe that measures \
+                 differently will re-place renditions and change the HLS cache \
+                 generation"
+            );
+            let mut out = Vec::with_capacity(to_weigh.len());
+            for &(device, capacity) in &to_weigh {
+                let rate = probe_encode_rate(device, probe_timeout).await;
+                if rate.is_none() {
+                    tracing::warn!(
+                        device = %device,
+                        "encode rate NOT measurable — this device weighs its capacity \
+                         alone, and it drops out of the reference minimum, which \
+                         shifts every other device's weight"
+                    );
+                }
+                out.push(pharos_transcode::rate_store::DeviceProbe {
+                    device,
+                    capacity,
+                    rate,
+                });
+            }
+            out
+        }
+    };
+
+    // Split back out: hardware devices become the weighted `caps` rows, and the
+    // CPU's own measurement is the `cpu_rate` the reference is taken against.
+    let hw_rated: Vec<(DeviceId, usize, Option<f64>)> = resolved
+        .iter()
+        .filter(|d| matches!(d.device, DeviceId::Hw { .. }))
+        .map(|d| (d.device, d.capacity, d.rate))
+        .collect();
+    let cpu = resolved
+        .iter()
+        .find(|d| matches!(d.device, DeviceId::Cpu))
+        .copied();
+    let cpu_permits = cpu.map_or_else(default_cpu_permits, |d| d.capacity);
+    let table = DeviceTable::from_probe_weighted(&hw_rated, cpu_permits, cpu.and_then(|d| d.rate));
     // Read BEFORE the table is moved into the scheduler. This is the whole
     // placement input, digested — see `DeviceTable::placement_fingerprint`.
     let placement_fingerprint = table.placement_fingerprint();
-    // Sum the probed session caps of the HARDWARE devices only (phantom GPUs
-    // are already excluded from `caps`). This is the concurrency the encoder
-    // fleet can actually sustain — the prefetch buffer scales on it.
-    let hw_session_budget: usize = caps
-        .iter()
-        .filter(|(d, _)| matches!(d, DeviceId::Hw { .. }))
-        .map(|(_, c)| *c)
-        .sum();
+    // Sum the session caps of the HARDWARE devices only (phantom GPUs are
+    // already excluded from `caps`). This is the concurrency the encoder fleet
+    // can actually sustain — the prefetch buffer scales on it. Taken from the
+    // RECONCILED capacities, not the raw probe, so the prefetch depth does not
+    // drift on a loaded boot while the weights hold still.
+    let hw_session_budget: usize = hw_rated.iter().map(|&(_, c, _)| c).sum();
+    // One line per device carrying the decision's INPUTS beside its verdict.
+    // The summary below digests the weights; only this says why a device got
+    // the weight it did, which is the difference between "the GPU is taking a
+    // sixteenth of the renditions" and knowing whether that is the measurement
+    // or the arithmetic.
+    for slot in table.slots() {
+        let rate = resolved
+            .iter()
+            .find(|d| d.device == slot.id)
+            .and_then(|d| d.rate);
+        tracing::info!(
+            device = %slot.id,
+            capacity = slot.capacity,
+            weight = slot.weight(),
+            rate_fps = rate,
+            rate_measured = rate.is_some(),
+            "device weighted for rendition placement"
+        );
+    }
     tracing::info!(
         devices = caps.len(),
-        cpu_permits = default_cpu_permits(),
+        cpu_permits,
         hw_session_budget,
         placement_fingerprint = format!("{placement_fingerprint:016x}"),
         // The digest's own inputs, so "why did my cache wipe" is answerable
@@ -1224,6 +1326,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 cfg.server.transcode_hw_session_cap,
                 cfg.server.transcode_probe_caps,
                 cfg.server.transcode_queue_background,
+                cfg.server.transcode_cache_dir.clone(),
             )
             .await
             {
