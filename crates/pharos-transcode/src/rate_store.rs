@@ -51,13 +51,13 @@
 //! absorb was precisely a capacity drift, and it invalidated the store that was
 //! supposed to absorb it.
 //!
-//! **Capacity RATCHETS; it never falls.** [`RateStore::resolve`] takes
-//! `max(stored, freshly probed)`. That is sound rather than optimistic because
-//! of what `probe_caps` returns: the highest concurrency at which *every*
-//! simultaneous trial encode succeeded. A reported N is a demonstrated lower
-//! bound — the device really did run N at once — so the maximum over boots is
-//! the best estimate available and converges upward to the truth. Three
-//! properties follow, and the alternatives lack at least one each:
+//! **A MEASURED capacity ratchets; it never falls.** [`RateStore::resolve`]
+//! takes `max(stored, freshly probed)`. That is sound rather than optimistic
+//! because of what `probe_caps` returns: the highest concurrency at which
+//! *every* simultaneous trial encode succeeded. A reported N is a demonstrated
+//! lower bound — the device really did run N at once — so the maximum over
+//! boots is the best estimate available and converges upward to the truth.
+//! Three properties follow, and the alternatives lack at least one each:
 //!
 //! - *Stable.* A loaded boot measuring 3 against a stored 4 keeps 4, so the
 //!   weight does not move and the cache is not wiped.
@@ -69,13 +69,37 @@
 //!   caps attempts), each time on real evidence, and then never again — versus
 //!   today's flap on every restart under load.
 //!
-//! The cost is stated rather than hidden: a device whose true capacity genuinely
-//! FALLS — a shared GPU handed a smaller share, a driver-imposed session limit,
-//! a down-sized VM's core count behind `default_cpu_permits` — keeps the larger
-//! stored value and is over-subscribed. The scheduler already degrades on that
-//! (a refused session is a transient failure and puts the device in cooldown),
-//! and the recovery is the same one this module already prescribes for an
-//! ffmpeg upgrade: delete the file, whose path is logged at boot.
+//! **A capacity that was never measured does not ratchet.** Every one of those
+//! three properties is an argument about a NOISY RAMP, and it is worth nothing
+//! applied to a number that has no noise term. Two of the capacities this store
+//! is handed are exactly that:
+//!
+//! - `default_cpu_permits()` is `available_parallelism() / sw_encode_threads()`
+//!   — arithmetic over a core count, not a trial. Ratcheting it means a
+//!   16-vCPU node down-sized to 8 keeps 4 permits: four concurrent software
+//!   encodes at four threads each on eight cores, 2× over-subscribed
+//!   permanently. And the usual mitigation does not reach it — "a refused
+//!   session puts the device in cooldown" is a property of a hardware SESSION
+//!   LIMIT, whereas a software encode is never refused, it just runs slower.
+//!   Nothing would ever surface the mistake.
+//! - with `transcode_probe_caps = false`, every device's capacity is
+//!   `transcode_hw_session_cap` — an operator's configured number, not a
+//!   measurement at all. Ratcheting it means lowering the cap from 8 to 2 to
+//!   throttle a GPU is silently ignored for the life of the deployment.
+//!
+//! So the rule is: **ratchet what a noisy ramp measured; trust what is computed
+//! or declared.** [`CapacitySource`] carries that per row, set by the caller
+//! that knows which it produced, and a `Declared` capacity is taken at face
+//! value — it may fall, it moves the weight when it does, and the boot log says
+//! so without attributing the change to a measurement artefact.
+//!
+//! The residual cost is stated rather than hidden: a MEASURED device whose true
+//! capacity genuinely falls — a shared GPU handed a smaller share, a
+//! driver-imposed session limit — keeps the larger stored value and is
+//! over-subscribed. The scheduler already degrades on that (a refused session
+//! is a transient failure and puts the device in cooldown), and the recovery is
+//! the one this module already prescribes for an ffmpeg upgrade: delete the
+//! file, whose path is logged at boot.
 //!
 //! **Scope limit, stated rather than implied.** When the fingerprint DOES
 //! differ, renditions re-place — which is correct, because the device set they
@@ -135,7 +159,7 @@ pub const RATE_STORE_FILE: &str = ".device_rates.json";
 ///   capacity is a MEASUREMENT, it drifts on a box under encode load
 ///   ([`crate::probe`] says so itself), and keying on it meant the routine
 ///   drift this module exists to absorb invalidated the store that was supposed
-///   to absorb it. Capacity is payload now, reconciled by the ratchet in
+///   to absorb it. Capacity is payload now, reconciled in
 ///   [`RateStore::resolve`], and re-sizing a device is therefore not a
 ///   device-set change;
 /// - the measured rates themselves — they are the payload, and keying on them
@@ -160,12 +184,63 @@ pub fn fingerprint(devices: &[DeviceId]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(rendered.join(";").as_bytes())
 }
 
+/// Where a capacity number came from — and therefore whether the ratchet in
+/// [`RateStore::resolve`] is entitled to hold a larger stored value against it.
+///
+/// This is deliberately NOT persisted. It describes how THIS boot arrived at
+/// the number it is offering, so it is an input to the reconciliation and never
+/// payload; the caller that produced the number is the only thing that knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacitySource {
+    /// A ramp of concurrent trial encodes demonstrated it
+    /// ([`crate::probe::probe_device_caps`]). Under-reports on a loaded box and
+    /// can never over-report, which is exactly what makes `max` over boots the
+    /// right reconciler. Ratchets.
+    Measured,
+    /// Computed from a machine fact or declared in config — no trial ran, so
+    /// there is no measurement artefact to absorb and nothing to ratchet
+    /// against. Taken at face value, including when it falls.
+    Declared,
+}
+
+/// One device's capacity as this boot determined it, paired with the provenance
+/// that decides how [`RateStore::resolve`] reconciles it against the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbedCapacity {
+    pub device: DeviceId,
+    pub capacity: usize,
+    pub source: CapacitySource,
+}
+
+impl ProbedCapacity {
+    /// A capacity a ramp of concurrent trial encodes demonstrated.
+    pub fn measured(device: DeviceId, capacity: usize) -> Self {
+        Self {
+            device,
+            capacity,
+            source: CapacitySource::Measured,
+        }
+    }
+
+    /// A capacity that was computed or configured rather than trialled.
+    pub fn declared(device: DeviceId, capacity: usize) -> Self {
+        Self {
+            device,
+            capacity,
+            source: CapacitySource::Declared,
+        }
+    }
+}
+
 /// One device's whole probe result, as placement will read it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeviceProbe {
     pub device: DeviceId,
-    /// Concurrent encode sessions — the ratcheted `max(stored, probed)`, not
-    /// necessarily this boot's measurement. See the module docs.
+    /// Concurrent encode sessions, reconciled against the store: for a
+    /// [`CapacitySource::Measured`] row the ratcheted `max(stored, probed)`,
+    /// which need not be this boot's measurement; for a
+    /// [`CapacitySource::Declared`] row this boot's value verbatim. See the
+    /// module docs.
     pub capacity: usize,
     /// Frames/sec on the shared synthetic clip, or `None` when unmeasurable.
     pub rate: Option<f64>,
@@ -216,17 +291,20 @@ impl RateStore {
     /// what is on disk so that unchanged hardware weighs identically to the
     /// last boot.
     ///
-    /// `probed` is `(device, capacity measured by this boot's
-    /// [`crate::probe::probe_device_caps`])`, and it must include EVERY device
-    /// that will get a slot, CPU included: the CPU's rate is one of the
-    /// measurements the reference `min` is taken over, so leaving it out would
-    /// key the store on a different set than the one being weighted.
+    /// `probed` must include EVERY device that will get a slot, CPU included:
+    /// the CPU's rate is one of the measurements the reference `min` is taken
+    /// over, so leaving it out would key the store on a different set than the
+    /// one being weighted.
     ///
     /// Two reconciliations, for the weight's two factors:
     ///
-    /// - **capacity** is `max(stored, probed)` — a ratchet, because
-    ///   `probe_caps` can only under-report (see the module docs). This is what
-    ///   stops a restart under load from re-placing renditions.
+    /// - **capacity** depends on its [`CapacitySource`]. A `Measured` one is
+    ///   `max(stored, probed)` — a ratchet, because `probe_caps` can only
+    ///   under-report (see the module docs), and this is what stops a restart
+    ///   under load from re-placing renditions. A `Declared` one is taken as
+    ///   given: nothing measured it, so there is no artefact to absorb, and
+    ///   holding a stale larger value against it would silently ignore a
+    ///   down-sized machine or an operator lowering a configured cap.
     /// - **rate** is reused verbatim when the device set is unchanged, and no
     ///   probe runs at all. Boot is faster as a side effect, but the point is
     ///   that a rate which is never re-measured cannot differ between boots.
@@ -242,44 +320,78 @@ impl RateStore {
     /// Nothing here is fatal. A missing file is a first boot, a corrupt or
     /// unreadable one is reported at WARN and falls back to probing, and a
     /// failed write costs the next boot a re-probe and nothing else.
-    pub async fn resolve<F, Fut>(&self, probed: &[(DeviceId, usize)], probe: F) -> Vec<DeviceProbe>
+    pub async fn resolve<F, Fut>(&self, probed: &[ProbedCapacity], probe: F) -> Vec<DeviceProbe>
     where
         F: Fn(DeviceId) -> Fut,
         Fut: std::future::Future<Output = Option<f64>>,
     {
-        let ids: Vec<DeviceId> = probed.iter().map(|&(id, _)| id).collect();
+        let ids: Vec<DeviceId> = probed.iter().map(|r| r.device).collect();
         let fp = fingerprint(&ids);
         if let Some(stored) = self.load(fp, &ids) {
             let mut out: Vec<DeviceProbe> = Vec::with_capacity(probed.len());
-            let mut ratcheted = false;
-            for (&(device, fresh_cap), &(_, stored_cap, rate)) in probed.iter().zip(stored.iter()) {
-                let capacity = fresh_cap.max(stored_cap);
-                if capacity != stored_cap {
-                    // Real evidence, so it is allowed to move the weight — and
-                    // the operator is told, because this is one of the few
-                    // things that legitimately wipes the segment cache.
-                    ratcheted = true;
-                    tracing::info!(
-                        device = %device,
-                        was = stored_cap,
-                        now = capacity,
-                        "device demonstrated more concurrent encode capacity than ever \
-                         before; its share of renditions rises and the HLS cache \
-                         generation moves with it"
-                    );
-                } else if fresh_cap < stored_cap {
-                    // THE case this module exists for. Loud enough to read in a
-                    // boot log, because the alternative — silently accepting
-                    // the lower number — is a 40 GiB cache wipe.
-                    tracing::info!(
-                        device = %device,
-                        probed = fresh_cap,
-                        using = stored_cap,
-                        "this boot measured less capacity than the stored probe; keeping \
-                         the stored value so placement does not move on a measurement \
-                         artefact"
-                    );
+            let mut moved = false;
+            for (row, &(stored_id, stored_cap, rate)) in probed.iter().zip(stored.iter()) {
+                // `load` rebuilds in the order asked for, which is what makes
+                // pairing these positionally correct — but attributing one
+                // device's capacity to another is the single thing this module
+                // must never do, so the convention is checked here rather than
+                // left to hold two functions apart.
+                debug_assert_eq!(
+                    row.device, stored_id,
+                    "stored rows must come back in the order asked for; \
+                     positional pairing is only safe because they do"
+                );
+                let device = row.device;
+                let fresh_cap = row.capacity;
+                let capacity = match row.source {
+                    CapacitySource::Measured => fresh_cap.max(stored_cap),
+                    // Nothing measured this, so there is no artefact to absorb.
+                    CapacitySource::Declared => fresh_cap,
+                };
+                match row.source {
+                    CapacitySource::Measured if capacity > stored_cap => {
+                        // Real evidence, so it is allowed to move the weight —
+                        // and the operator is told, because this is one of the
+                        // few things that legitimately wipes the segment cache.
+                        tracing::info!(
+                            device = %device,
+                            was = stored_cap,
+                            now = capacity,
+                            "device demonstrated more concurrent encode capacity than ever \
+                             before; its share of renditions rises and the HLS cache \
+                             generation moves with it"
+                        );
+                    }
+                    CapacitySource::Measured if fresh_cap < stored_cap => {
+                        // THE case this module exists for. Loud enough to read
+                        // in a boot log, because the alternative — silently
+                        // accepting the lower number — is a 40 GiB cache wipe.
+                        tracing::info!(
+                            device = %device,
+                            probed = fresh_cap,
+                            using = stored_cap,
+                            "this boot measured less capacity than the stored probe; keeping \
+                             the stored value so placement does not move on a measurement \
+                             artefact"
+                        );
+                    }
+                    CapacitySource::Declared if fresh_cap != stored_cap => {
+                        // Not an artefact and not evidence: a machine was
+                        // re-sized or an operator changed a cap. It is taken at
+                        // face value in BOTH directions, and the log must not
+                        // claim a measurement it never made.
+                        tracing::info!(
+                            device = %device,
+                            was = stored_cap,
+                            now = fresh_cap,
+                            "this device's capacity is computed or configured, not measured, \
+                             so it is taken at face value rather than ratcheted; placement \
+                             moves and the HLS cache generation moves with it"
+                        );
+                    }
+                    _ => {}
                 }
+                moved |= capacity != stored_cap;
                 out.push(DeviceProbe {
                     device,
                     capacity,
@@ -293,7 +405,7 @@ impl RateStore {
                 "reusing the stored device probe: device set unchanged, so every \
                  rendition keeps the device it was placed on"
             );
-            if ratcheted {
+            if moved {
                 self.save(fp, &out);
             }
             self.publish_measurement_coverage(&out, true);
@@ -301,7 +413,10 @@ impl RateStore {
         }
 
         let mut measured: Vec<DeviceProbe> = Vec::with_capacity(probed.len());
-        for &(device, capacity) in probed {
+        for &ProbedCapacity {
+            device, capacity, ..
+        } in probed
+        {
             let rate = probe(device).await;
             // Symmetry: a measured rate and a failed measurement are both
             // decisions about placement and both get recorded.
@@ -559,10 +674,59 @@ mod tests {
         }
     }
 
+    /// Fixture: rows a trial-encode ramp MEASURED — the shape the ratchet
+    /// exists for. A declared capacity is a different contract and gets its own
+    /// tests below.
+    fn measured(rows: &[(DeviceId, usize)]) -> Vec<ProbedCapacity> {
+        rows.iter()
+            .map(|&(d, c)| ProbedCapacity::measured(d, c))
+            .collect()
+    }
+
+    /// Fixture: rows nothing measured — a configured cap or a computed permit
+    /// count.
+    fn declared(rows: &[(DeviceId, usize)]) -> Vec<ProbedCapacity> {
+        rows.iter()
+            .map(|&(d, c)| ProbedCapacity::declared(d, c))
+            .collect()
+    }
+
     fn probe_of(out: &[DeviceProbe], id: DeviceId) -> DeviceProbe {
         *out.iter()
             .find(|d| d.device == id)
             .expect("device is in the resolved probe")
+    }
+
+    /// Every `(device label, value)` a named gauge published, sorted — so a
+    /// snapshot can be asserted whole rather than one series at a time, which
+    /// is what stops a stub that publishes a constant from passing.
+    fn gauge_by_device(
+        recorder: &metrics_util::debugging::DebuggingRecorder,
+        name: &str,
+    ) -> Vec<(String, f64)> {
+        use metrics_util::debugging::DebugValue;
+        let mut out: Vec<(String, f64)> = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != name {
+                    return None;
+                }
+                let device = k
+                    .labels()
+                    .find(|l| l.key() == "device")
+                    .map(|l| l.value().to_string())?;
+                match v {
+                    DebugValue::Gauge(g) => Some((device, g.into_inner())),
+                    other => panic!("expected a gauge, got {other:?}"),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// THE invariant this module exists for: on an unchanged device set the
@@ -572,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn a_matching_fingerprint_reuses_stored_rates_without_probing() {
         let dir = tempfile::tempdir().unwrap();
-        let devices = [(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)];
+        let devices = measured(&[(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)]);
 
         // One device is unmeasurable on purpose: a `None` must round-trip as a
         // `None`, or reuse silently changes the reference minimum and re-places
@@ -615,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn a_boot_under_load_measuring_less_capacity_keeps_the_stored_one() {
         let dir = tempfile::tempdir().unwrap();
-        let quiet_boot = [(gpu(), 4), (DeviceId::Cpu, 4)];
+        let quiet_boot = measured(&[(gpu(), 4), (DeviceId::Cpu, 4)]);
         let seed = CountingProbe::new();
         let first = RateStore::new(dir.path())
             .resolve(&quiet_boot, seed.as_probe())
@@ -624,7 +788,7 @@ mod tests {
 
         // The same box, restarted while it is still serving: the ramp gets to 2
         // before a level fails.
-        let under_load = [(gpu(), 2), (DeviceId::Cpu, 4)];
+        let under_load = measured(&[(gpu(), 2), (DeviceId::Cpu, 4)]);
         let reboot = CountingProbe::new();
         let second = RateStore::new(dir.path())
             .resolve(&under_load, reboot.as_probe())
@@ -651,13 +815,13 @@ mod tests {
     async fn a_larger_measurement_ratchets_up_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         // First boot happens to be under load.
-        let loaded = [(gpu(), 2), (DeviceId::Cpu, 4)];
+        let loaded = measured(&[(gpu(), 2), (DeviceId::Cpu, 4)]);
         RateStore::new(dir.path())
             .resolve(&loaded, CountingProbe::new().as_probe())
             .await;
 
         // A quiet boot demonstrates more.
-        let quiet = [(gpu(), 6), (DeviceId::Cpu, 4)];
+        let quiet = measured(&[(gpu(), 6), (DeviceId::Cpu, 4)]);
         let out = RateStore::new(dir.path())
             .resolve(&quiet, CountingProbe::new().as_probe())
             .await;
@@ -666,7 +830,7 @@ mod tests {
         // ...and the higher value is what a subsequent loaded boot keeps, which
         // only holds if the ratchet was WRITTEN BACK rather than merely
         // returned.
-        let loaded_again = [(gpu(), 3), (DeviceId::Cpu, 4)];
+        let loaded_again = measured(&[(gpu(), 3), (DeviceId::Cpu, 4)]);
         let after = RateStore::new(dir.path())
             .resolve(&loaded_again, CountingProbe::new().as_probe())
             .await;
@@ -685,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn a_changed_device_set_reprobes_but_a_resize_does_not() {
         let dir = tempfile::tempdir().unwrap();
-        let before = [(gpu(), 4), (DeviceId::Cpu, 4)];
+        let before = measured(&[(gpu(), 4), (DeviceId::Cpu, 4)]);
         let seed = CountingProbe::new();
         RateStore::new(dir.path())
             .resolve(&before, seed.as_probe())
@@ -693,7 +857,7 @@ mod tests {
         assert_eq!(seed.calls(), 2);
 
         // Same devices, one re-sized — no longer a device-set change.
-        let resized = [(gpu(), 8), (DeviceId::Cpu, 4)];
+        let resized = measured(&[(gpu(), 8), (DeviceId::Cpu, 4)]);
         let after_resize = CountingProbe::new();
         RateStore::new(dir.path())
             .resolve(&resized, after_resize.as_probe())
@@ -706,7 +870,7 @@ mod tests {
         );
 
         // A device ADDED is a genuine set change.
-        let added = [(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)];
+        let added = measured(&[(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)]);
         let after_add = CountingProbe::new();
         RateStore::new(dir.path())
             .resolve(&added, after_add.as_probe())
@@ -714,7 +878,7 @@ mod tests {
         assert_eq!(after_add.calls(), 3, "a new device must re-probe the set");
 
         // ...and so is a device removed.
-        let cpu_only = [(DeviceId::Cpu, 4)];
+        let cpu_only = measured(&[(DeviceId::Cpu, 4)]);
         let after_removal = CountingProbe::new();
         RateStore::new(dir.path())
             .resolve(&cpu_only, after_removal.as_probe())
@@ -731,8 +895,8 @@ mod tests {
     #[tokio::test]
     async fn listing_the_same_devices_in_another_order_still_reuses() {
         let dir = tempfile::tempdir().unwrap();
-        let a = [(gpu(), 4), (DeviceId::Cpu, 4)];
-        let b = [(DeviceId::Cpu, 4), (gpu(), 4)];
+        let a = measured(&[(gpu(), 4), (DeviceId::Cpu, 4)]);
+        let b = measured(&[(DeviceId::Cpu, 4), (gpu(), 4)]);
         assert_eq!(
             fingerprint(&[gpu(), DeviceId::Cpu]),
             fingerprint(&[DeviceId::Cpu, gpu()])
@@ -763,7 +927,7 @@ mod tests {
         let store = RateStore::new(dir.path());
         std::fs::write(store.path(), b"{ not json at all").unwrap();
 
-        let devices = [(gpu(), 4), (DeviceId::Cpu, 4)];
+        let devices = measured(&[(gpu(), 4), (DeviceId::Cpu, 4)]);
         let probe = CountingProbe::new();
         let out = store.resolve(&devices, probe.as_probe()).await;
         assert_eq!(probe.calls(), 2, "a corrupt file must degrade to a probe");
@@ -782,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_missing_a_device_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let devices = [(gpu(), 4), (DeviceId::Cpu, 4)];
+        let devices = measured(&[(gpu(), 4), (DeviceId::Cpu, 4)]);
         let store = RateStore::new(dir.path());
         store.write_raw(
             &[gpu(), DeviceId::Cpu],
@@ -801,7 +965,7 @@ mod tests {
     #[tokio::test]
     async fn a_different_format_version_reprobes() {
         let dir = tempfile::tempdir().unwrap();
-        let devices = [(DeviceId::Cpu, 4)];
+        let devices = measured(&[(DeviceId::Cpu, 4)]);
         let store = RateStore::new(dir.path());
         store.write_raw(
             &[DeviceId::Cpu],
@@ -824,7 +988,7 @@ mod tests {
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
 
-        let devices = [(DeviceId::Cpu, 4)];
+        let devices = measured(&[(DeviceId::Cpu, 4)]);
         let probe = CountingProbe::new();
         let out = RateStore::new(blocked.join("sub"))
             .resolve(&devices, probe.as_probe())
@@ -853,7 +1017,7 @@ mod tests {
     #[tokio::test]
     async fn a_nonsense_stored_rate_reads_back_as_unmeasured() {
         let dir = tempfile::tempdir().unwrap();
-        let devices = [(DeviceId::Cpu, 4)];
+        let devices = measured(&[(DeviceId::Cpu, 4)]);
         let store = RateStore::new(dir.path());
         store.write_raw(
             &[DeviceId::Cpu],
@@ -882,35 +1046,13 @@ mod tests {
     /// satisfy both.
     #[test]
     fn an_unmeasured_device_is_visible_as_a_gauge_including_when_reused() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::debugging::DebuggingRecorder;
 
         let dir = tempfile::tempdir().unwrap();
-        let devices = [(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)];
+        let devices = measured(&[(gpu(), 4), (vaapi(), 2), (DeviceId::Cpu, 4)]);
 
-        let unmeasured_devices = |recorder: &DebuggingRecorder| {
-            let mut out: Vec<(String, f64)> = recorder
-                .snapshotter()
-                .snapshot()
-                .into_vec()
-                .into_iter()
-                .filter_map(|(ck, _, _, v)| {
-                    let k = ck.key();
-                    if k.name() != "pharos_transcode_device_rate_unmeasured" {
-                        return None;
-                    }
-                    let device = k
-                        .labels()
-                        .find(|l| l.key() == "device")
-                        .map(|l| l.value().to_string())?;
-                    match v {
-                        DebugValue::Gauge(g) => Some((device, g.into_inner())),
-                        other => panic!("expected a gauge, got {other:?}"),
-                    }
-                })
-                .collect();
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-            out
-        };
+        let unmeasured_devices =
+            |r: &DebuggingRecorder| gauge_by_device(r, "pharos_transcode_device_rate_unmeasured");
 
         // First boot: the probe cannot measure one device.
         let first = DebuggingRecorder::new();
@@ -963,6 +1105,97 @@ mod tests {
             measured_boot,
             "a reused failure is MORE serious than a fresh one, not less: it is \
              the one that will never re-measure itself"
+        );
+    }
+
+    /// The ratchet is an argument about a NOISY RAMP, and it is worth nothing
+    /// applied to a number nothing measured.
+    ///
+    /// `default_cpu_permits()` is `available_parallelism() /
+    /// sw_encode_threads()` — arithmetic over a core count. A 16-vCPU node
+    /// down-sized to 8 must go 4 permits → 2. Ratcheting it holds 4: four
+    /// concurrent software encodes at four threads each on eight cores, 2×
+    /// over-subscribed for the life of the deployment — and NOTHING would ever
+    /// surface that, because a software encode is never refused, it just runs
+    /// slower, so the cooldown path the ratchet's cost note relies on is never
+    /// entered.
+    ///
+    /// The measured GPU in the same table is under-reporting on the same boot,
+    /// and it must still be held — the distinction is per row, not a global
+    /// switch.
+    #[tokio::test]
+    async fn a_declared_capacity_falls_while_a_measured_one_in_the_same_table_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        // 16 vCPU ⇒ 4 permits, beside a GPU whose 8 sessions a ramp proved.
+        let big = vec![
+            ProbedCapacity::measured(gpu(), 8),
+            ProbedCapacity::declared(DeviceId::Cpu, 4),
+        ];
+        RateStore::new(dir.path())
+            .resolve(&big, CountingProbe::new().as_probe())
+            .await;
+
+        // Re-sized to 8 vCPU, and this boot is loaded so the GPU ramp
+        // under-reports at the same time.
+        let smaller = vec![
+            ProbedCapacity::measured(gpu(), 3),
+            ProbedCapacity::declared(DeviceId::Cpu, 2),
+        ];
+        let out = RateStore::new(dir.path())
+            .resolve(&smaller, CountingProbe::new().as_probe())
+            .await;
+        assert_eq!(
+            probe_of(&out, DeviceId::Cpu).capacity,
+            2,
+            "a computed permit count has no noise term to absorb — holding the \
+             stale 4 over-subscribes software encoding 2× and nothing ever \
+             refuses a software encode to reveal it"
+        );
+        assert_eq!(
+            probe_of(&out, gpu()).capacity,
+            8,
+            "and the MEASURED row must still ratchet: provenance is per device, \
+             not a mode the whole table is in"
+        );
+
+        // The fall is written back, so the stale larger value cannot be
+        // resurrected by anything that later reads the file.
+        let raw = std::fs::read_to_string(RateStore::new(dir.path()).path()).unwrap();
+        let doc: StoredRates = serde_json::from_str(&raw).unwrap();
+        let stored_cpu = doc
+            .rates
+            .iter()
+            .find(|r| r.device == DeviceId::Cpu)
+            .expect("the CPU row is stored");
+        assert_eq!(
+            stored_cpu.capacity, 2,
+            "the declared fall must be persisted"
+        );
+    }
+
+    /// The second instance of the same defect: with `transcode_probe_caps =
+    /// false` a device's capacity IS `transcode_hw_session_cap` — an operator's
+    /// configured number, not a measurement at all. Lowering it from 8 to 2 to
+    /// throttle a GPU must take effect on the next boot, not be silently
+    /// ignored for the life of the deployment while the boot log claims this
+    /// boot "measured less capacity than the stored probe".
+    #[tokio::test]
+    async fn lowering_a_configured_session_cap_is_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let generous = declared(&[(gpu(), 8), (DeviceId::Cpu, 4)]);
+        RateStore::new(dir.path())
+            .resolve(&generous, CountingProbe::new().as_probe())
+            .await;
+
+        let throttled = declared(&[(gpu(), 2), (DeviceId::Cpu, 4)]);
+        let out = RateStore::new(dir.path())
+            .resolve(&throttled, CountingProbe::new().as_probe())
+            .await;
+        assert_eq!(
+            probe_of(&out, gpu()).capacity,
+            2,
+            "nothing measured this number, so there is no artefact to absorb — \
+             an operator lowering the cap must be obeyed"
         );
     }
 
