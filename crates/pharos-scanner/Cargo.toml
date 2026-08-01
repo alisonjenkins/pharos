@@ -42,6 +42,7 @@ boko = { workspace = true }
 # expression list (SxxEyy, 1x02, EP12, absolute anime numbering, …).
 regex = "1"
 serde = { workspace = true }
+serde_json = "1"
 sonic-rs.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "macros", "rt-multi-thread", "io-util", "sync", "time"] }

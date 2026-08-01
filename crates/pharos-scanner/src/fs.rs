@@ -198,6 +198,12 @@ pub struct FsScanner<P: Prober> {
     /// seen only a subset of what's on disk, so sweeping would prune every
     /// not-yet-visited file). `None` (CLI/tests) = never cancels.
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Remembers files that failed to probe, so a scan does not re-read them
+    /// every pass. A failed probe writes no row, so the incremental
+    /// `(mtime, size)` skip can never apply to it and the file is re-opened
+    /// forever — see [`crate::probe_memo`]. `None` (CLI scans, tests) keeps the
+    /// old behaviour of retrying everything.
+    probe_memo: Option<Arc<crate::probe_memo::ProbeMemo>>,
     /// 004-books (T063) — where a book's extracted cover BYTES are written.
     ///
     /// A cover lives INSIDE the book file, so unlike every other artwork source
@@ -275,6 +281,7 @@ impl<P: Prober> FsScanner<P> {
             io_gate: None,
             progress: None,
             cancel: None,
+            probe_memo: None,
             cover_sink: None,
         }
     }
@@ -290,6 +297,7 @@ impl<P: Prober> FsScanner<P> {
             io_gate: None,
             progress: None,
             cancel: None,
+            probe_memo: None,
             cover_sink: None,
         }
     }
@@ -300,6 +308,17 @@ impl<P: Prober> FsScanner<P> {
     /// (e.g. embedded-font MediaAttachments) onto already-indexed items.
     pub fn with_force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    /// Attach a probe-failure memo so files that cannot be probed are skipped
+    /// until they change on disk. See [`crate::probe_memo`] for why a repeated
+    /// failure is not merely wasteful.
+    ///
+    /// `--force` still overrides it: an operator asking for a full re-probe
+    /// means every file, including the ones already known to be broken.
+    pub fn with_probe_memo(mut self, memo: Arc<crate::probe_memo::ProbeMemo>) -> Self {
+        self.probe_memo = Some(memo);
         self
     }
 
@@ -585,6 +604,24 @@ impl<P: Prober> FsScanner<P> {
             // `None` for an absent row (genuinely new) or a pre-0016 row with
             // no signature yet — both are re-probed below, but only the truly
             // new ones count as `added`.
+            // A file that FAILED to probe writes no row at all, so nothing below
+            // can skip it: `scan_state` is `None`, the move-detection
+            // fingerprint runs a whole-file hash, and the probe then re-reads
+            // it in full — on every pass, forever. The memo is the only record
+            // that the attempt happened. `--force` still overrides it.
+            if !self.force
+                && self
+                    .probe_memo
+                    .as_ref()
+                    .is_some_and(|m| m.is_known_bad(id, sig))
+            {
+                // Deliberately NOT added to `seen_batch`: there is no row to
+                // mark seen, and inventing one would put an unplayable item in
+                // the library (V6).
+                outcome.skipped += 1;
+                continue;
+            }
+
             let existing_state = store.scan_state(id).await?;
             if let Some(state) = existing_state {
                 // Existing-by-path: the row is keyed on this exact path
@@ -758,7 +795,7 @@ impl<P: Prober> FsScanner<P> {
             })
             .buffer_unordered(self.probe_concurrency);
 
-        while let Some((_id, sig, existed, fp, item, meta)) = stream.next().await {
+        while let Some((probed_id, sig, existed, fp, item, meta)) = stream.next().await {
             // Cancellation: stop draining the probe stream. Already-written rows
             // stay (each `put` is atomic); the sweep below is skipped so nothing
             // is pruned. Remaining in-flight probes are dropped with the stream.
@@ -769,6 +806,16 @@ impl<P: Prober> FsScanner<P> {
             // even when a file fails to probe (V6 — a miss writes nothing).
             probed_done += 1;
             emit(phase1_done + probed_done);
+            // Record the outcome either way, so the next pass can skip a file
+            // that cannot be probed and re-try one that has been replaced. This
+            // is the only place a probe MISS leaves any trace — a miss writes
+            // no row (V6), which is what made it repeat forever.
+            if let Some(memo) = self.probe_memo.as_ref() {
+                match &item {
+                    Some(_) => memo.forget(probed_id),
+                    None => memo.record(probed_id, sig),
+                }
+            }
             let Some(mut item) = item else { continue };
             let item_id = item.id;
             // LIB-D7 — merge resolved metadata onto the probe-built item
@@ -896,6 +943,30 @@ impl<P: Prober> FsScanner<P> {
         // reach 100%, so don't claim it did.
         if !cancelled {
             emit(total);
+        }
+        // Persist what this pass learned about unreadable files. Written here
+        // rather than by the caller because the scanner owns the memo and is
+        // the only thing that knows a pass has ended — both the CLI scan and
+        // the server's watcher get it without either having to remember.
+        //
+        // A cancelled run still saves: what it recorded is true, and losing it
+        // only means re-reading those files next time.
+        if let Some(memo) = self.probe_memo.as_ref() {
+            match memo.save() {
+                Ok(()) => tracing::info!(
+                    known_bad = memo.len(),
+                    path = %memo.path().display(),
+                    "probe-failure memo saved; these files are skipped until they change on disk",
+                ),
+                // Never fatal: the memo is an optimisation, and failing a whole
+                // scan because a cache file could not be written would trade a
+                // slow scan for no scan.
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    path = %memo.path().display(),
+                    "could not save the probe-failure memo; unreadable files will be re-probed next pass",
+                ),
+            }
         }
         Ok(outcome)
     }
@@ -3308,6 +3379,130 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A file that cannot be probed is re-read on EVERY scan today, because a
+    /// failed probe writes no row and the incremental skip has nothing to
+    /// compare against. With a memo the second pass does not touch it.
+    ///
+    /// The prober's CALL COUNT is the assertion, not the item count: the item
+    /// count is 1 either way, which is exactly why this went unnoticed.
+    #[tokio::test]
+    async fn a_file_that_cannot_be_probed_is_not_re_probed_next_scan() {
+        let td = TempDir::new().unwrap();
+        let memo_dir = TempDir::new().unwrap();
+        touch(td.path(), "good.mkv").await;
+        touch(td.path(), "bad.mkv").await;
+        let prober = FakeProber {
+            calls: Arc::new(AtomicUsize::new(0)),
+            force_fail_for: Some("bad".into()),
+            genre: None,
+            ..Default::default()
+        };
+        let memo = Arc::new(crate::probe_memo::ProbeMemo::load(
+            memo_dir.path().join("probe_failures.json"),
+            7,
+        ));
+        let store = MemStore::default();
+
+        FsScanner::new(prober.clone())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            2,
+            "first pass probes both"
+        );
+        assert_eq!(memo.len(), 1, "the failure is remembered");
+
+        // Second pass: `good` is skipped by its stored (mtime, size); `bad` is
+        // skipped by the memo. Neither reaches the prober.
+        FsScanner::new(prober.clone())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            2,
+            "second pass must probe NOTHING; without the memo `bad` is re-read forever"
+        );
+    }
+
+    /// Replacing the broken file makes it probe again — a memo that outlived
+    /// the damage would be worse than the repetition it replaces.
+    #[tokio::test]
+    async fn replacing_a_broken_file_clears_its_memo() {
+        let td = TempDir::new().unwrap();
+        let memo_dir = TempDir::new().unwrap();
+        touch(td.path(), "bad.mkv").await;
+        let prober = FakeProber {
+            calls: Arc::new(AtomicUsize::new(0)),
+            force_fail_for: Some("bad".into()),
+            genre: None,
+            ..Default::default()
+        };
+        let memo = Arc::new(crate::probe_memo::ProbeMemo::load(
+            memo_dir.path().join("probe_failures.json"),
+            7,
+        ));
+        let store = MemStore::default();
+        FsScanner::new(prober.clone())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(prober.calls.load(Ordering::SeqCst), 1);
+
+        // Rewrite it: same name, different size, so the signature moves.
+        write_file(td.path(), "bad.mkv", b"now with actual content").await;
+        FsScanner::new(prober.clone())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            2,
+            "a replaced file must be probed again"
+        );
+    }
+
+    /// `--force` means every file, including the ones already known broken.
+    #[tokio::test]
+    async fn force_overrides_the_probe_memo() {
+        let td = TempDir::new().unwrap();
+        let memo_dir = TempDir::new().unwrap();
+        touch(td.path(), "bad.mkv").await;
+        let prober = FakeProber {
+            calls: Arc::new(AtomicUsize::new(0)),
+            force_fail_for: Some("bad".into()),
+            genre: None,
+            ..Default::default()
+        };
+        let memo = Arc::new(crate::probe_memo::ProbeMemo::load(
+            memo_dir.path().join("probe_failures.json"),
+            7,
+        ));
+        let store = MemStore::default();
+        FsScanner::new(prober.clone())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        FsScanner::new(prober.clone())
+            .with_probe_memo(memo.clone())
+            .with_force(true)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            2,
+            "--force must re-probe a memoised file"
+        );
     }
 
     /// AppleDouble sidecars carry the original's extension, so an
