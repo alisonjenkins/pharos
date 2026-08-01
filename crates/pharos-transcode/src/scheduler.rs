@@ -1847,10 +1847,45 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     // `Unsupported`/`Failed` for a perfectly encodable job (and
                     // for any other job arriving during the window).
                     if device != DeviceId::Cpu {
+                        // SYMMETRY (§ODD). The arm directly above logs a
+                        // non-recoverable failure; this one used to log nothing
+                        // at all — while doing something strictly more
+                        // consequential, namely taking a device out of service
+                        // for every OTHER job too. A real incident left a
+                        // 2m17s hole in the timeline exactly here: 1,605
+                        // client-blocking segment failures whose trigger was
+                        // never written down.
+                        //
+                        // WARN, not debug: under the shared-init pin a cooled
+                        // device does not merely slow a job down, it FAILS
+                        // every rendition banded to it until the window
+                        // expires.
                         state
                             .devices
                             .set_cooldown(device, Instant::now() + state.cfg.cooldown);
                         ctx.excluded.push(device);
+                        ctx.span.in_scope(|| {
+                            tracing::warn!(
+                                %job_id,
+                                %device,
+                                error = %err,
+                                cooldown_ms = state.cfg.cooldown.as_millis() as u64,
+                                retries = ctx.retries,
+                                "device cooled after a transient failure; every rendition pinned to it will fail until the window expires",
+                            );
+                        });
+                        // Counted as well as logged: a log answers "what
+                        // happened once", a counter answers "is this the
+                        // normal state of this card". The reason is the
+                        // error's CLASS, which is bounded, while the specific
+                        // ffmpeg string stays in the log where unbounded
+                        // cardinality is free.
+                        metrics::counter!(
+                            "pharos_transcode_device_cooldown_total",
+                            "device" => device.to_string(),
+                            "reason" => err.label(),
+                        )
+                        .increment(1);
                     }
                     ctx.span.record("outcome", "transient_retry");
                     ctx.retries += 1;
@@ -3816,7 +3851,7 @@ mod tests {
         // off Nvenc (Vaapi or Cpu) and succeed.
         let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, spec| {
             if spec.device == DeviceId::hw(HwAccel::Nvenc, 0) {
-                WorkerRunResult::Failed(WorkerError::DeviceBusy)
+                WorkerRunResult::Failed(WorkerError::DeviceBusy("test: out of sessions".into()))
             } else {
                 WorkerRunResult::Done { out_bytes: 7 }
             }
@@ -6880,6 +6915,88 @@ mod tests {
         assert_eq!(snap.pending, 0, "and nothing must be left in the queue");
     }
 
+    /// Cooling a device is COUNTED, and the count says which device and why.
+    ///
+    /// This is the event that ended a real incident's usefulness: a device went
+    /// out of service, 1,605 client-blocking segments failed because every
+    /// rendition pinned to it had nowhere else to go, and the trigger left no
+    /// trace at all. The arm that fails a job non-recoverably logged; the arm
+    /// that took a whole device offline did not.
+    ///
+    /// Asserted on the counter rather than the log because a log answers "what
+    /// happened once" and this needs to answer "is this the normal state of
+    /// this card". The reason is the error CLASS — bounded, so it can be a
+    /// label — while the specific ffmpeg string stays in the log where
+    /// unbounded cardinality is free.
+    #[test]
+    fn cooling_a_device_is_counted_against_that_device_with_a_reason() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+                    if spec.device == gpu {
+                        WorkerRunResult::Failed(WorkerError::DeviceBusy(
+                            "OpenEncodeSessionEx failed: out of memory".into(),
+                        ))
+                    } else {
+                        WorkerRunResult::Done { out_bytes: 1 }
+                    }
+                });
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[(gpu, 1)], 2),
+                    spawner,
+                    SchedConfig::default(),
+                );
+                // Succeeds on CPU after the GPU cools — the point is the
+                // counter, not the outcome.
+                let _ = s
+                    .submit(
+                        PathBuf::from("/m/x"),
+                        h264(),
+                        file_sink(),
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await;
+            });
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        let cooled: Vec<_> = metrics
+            .iter()
+            .filter(|(k, _, _, _)| k.key().name() == "pharos_transcode_device_cooldown_total")
+            .collect();
+        assert!(
+            !cooled.is_empty(),
+            "taking a device out of service must be counted; silence here is \
+             what made a 1,605-failure incident undiagnosable"
+        );
+        let (key, _, _, value) = cooled[0];
+        let labels: Vec<String> = key
+            .key()
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("Nvenc")),
+            "the counter must name the DEVICE that was cooled, not just that one was: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "reason=device_unusable"),
+            "and why, as a bounded class: {labels:?}"
+        );
+        assert_eq!(*value, DebugValue::Counter(1));
+    }
+
     /// `BackgroundAdmission::Never` used to reply `SchedError::Busy` —
     /// "deliberate load management" — unconditionally, even when the reason
     /// the candidate pool could no longer hold the reserve was that a PRIOR
@@ -6902,7 +7019,7 @@ mod tests {
         let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
         let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
             if spec.device == gpu {
-                WorkerRunResult::Failed(WorkerError::DeviceBusy)
+                WorkerRunResult::Failed(WorkerError::DeviceBusy("test: out of sessions".into()))
             } else {
                 WorkerRunResult::Done { out_bytes: 1 }
             }
@@ -6926,7 +7043,7 @@ mod tests {
             )
             .await;
         match got {
-            Err(SchedError::Failed(WorkerError::DeviceBusy)) => {}
+            Err(SchedError::Failed(WorkerError::DeviceBusy(_))) => {}
             other => panic!(
                 "a job shed after its own transient failure must report that \
                  failure as the cause, not a bare load-shed `Busy`; got {other:?}"

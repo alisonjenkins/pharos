@@ -299,9 +299,23 @@ pub struct Handshake {
 /// fail the job's reply, log, never touch scheduler health.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerError {
-    /// Transient: device out of encode sessions / `EAGAIN` opening the
-    /// hw context. Retry elsewhere.
-    DeviceBusy,
+    /// Transient: a HARDWARE device failed in a way that another device might
+    /// not. Retry elsewhere.
+    ///
+    /// Carries the underlying ffmpeg reason, for the same purpose every other
+    /// variant here does: this is the one error class that takes a device OUT
+    /// OF SERVICE, and it used to be a unit variant. `classify_failure`
+    /// computed the stderr tail, handed it to `BadInput` and `Other`, and threw
+    /// it away on this path — so the single most consequential failure in the
+    /// scheduler was also the only one that could not say what happened.
+    ///
+    /// The name is now wider than "busy", and deliberately so. Every
+    /// non-source hardware failure lands here — out of sessions, out of VRAM,
+    /// a missing libcuda, a VAAPI format-link error — because they are all
+    /// reasons to try elsewhere. The STRING is what distinguishes them, and
+    /// without it an operator cannot tell a card that is saturated from one
+    /// that is broken.
+    DeviceBusy(String),
     /// Non-recoverable: target codec not encodable by this build. Carries
     /// the underlying reason (which codec / why) so the log is actionable.
     UnsupportedCodec(String),
@@ -316,16 +330,32 @@ pub enum WorkerError {
 }
 
 impl WorkerError {
+    /// Stable metric label — the error's CLASS, not its message.
+    ///
+    /// Bounded on purpose: the specific ffmpeg string belongs in the log, where
+    /// unbounded cardinality costs nothing, and would wreck a metric. A
+    /// dashboard keyed on these breaks silently if they are renamed, so the
+    /// mapping is spelled out here rather than formatted at the emission site.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::DeviceBusy(_) => "device_unusable",
+            Self::UnsupportedCodec(_) => "unsupported_codec",
+            Self::BadInput(_) => "bad_input",
+            Self::Io(_) => "io",
+            Self::Other(_) => "other",
+        }
+    }
+
     /// True when the scheduler should retry this job on another device.
     pub fn is_transient(&self) -> bool {
-        matches!(self, WorkerError::DeviceBusy)
+        matches!(self, WorkerError::DeviceBusy(_))
     }
 }
 
 impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorkerError::DeviceBusy => write!(f, "device busy (out of encode sessions)"),
+            WorkerError::DeviceBusy(why) => write!(f, "hardware device unusable: {why}"),
             WorkerError::UnsupportedCodec(s) => write!(f, "unsupported codec: {s}"),
             WorkerError::BadInput(s) => write!(f, "bad input: {s}"),
             WorkerError::Io(s) => write!(f, "io: {s}"),
@@ -465,7 +495,7 @@ mod tests {
             },
             WorkerEvent::Failed {
                 job_id: JobId(2),
-                error: WorkerError::DeviceBusy,
+                error: WorkerError::DeviceBusy("out of sessions".into()),
             },
         ];
         for e in &events {
@@ -499,7 +529,7 @@ mod tests {
 
     #[test]
     fn transient_classification() {
-        assert!(WorkerError::DeviceBusy.is_transient());
+        assert!(WorkerError::DeviceBusy("out of sessions".into()).is_transient());
         assert!(!WorkerError::UnsupportedCodec(String::new()).is_transient());
         assert!(!WorkerError::BadInput(String::new()).is_transient());
     }
