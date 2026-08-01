@@ -93,6 +93,50 @@ pub fn vaapi_render_node_indices() -> Vec<u8> {
     idxs
 }
 
+/// How coarsely a measured rate is bucketed before it can affect placement.
+///
+/// This is the STABILITY CONTRACT, not a tuning knob. A weight change
+/// re-places renditions, and `SegmentIdentity` does not include the device —
+/// so a re-placed rendition serves cached segments from the old encoder beside
+/// fresh ones from the new one, under a single init, with no restart involved.
+/// The bucket must therefore be wider than any plausible run-to-run variation
+/// in the probe. Doubling steps: a device has to measure twice as fast before
+/// placement notices.
+const RATE_BUCKET_RATIO: f64 = 2.0;
+
+/// A device's share of new renditions, derived entirely from probe-time facts.
+///
+/// `capacity` is how many encodes it sustains; `rate` is its measured speed on
+/// the shared synthetic clip and `reference_rate` the slowest measured device,
+/// so the speed term is a pure ratio and no device family is named anywhere.
+///
+/// Quantised via [`RATE_BUCKET_RATIO`] so ordinary measurement noise cannot
+/// move a rendition — see that constant for why that matters more than
+/// precision.
+///
+/// Buckets are centred ON each power of two (`.round()`, not `.floor()`), so
+/// a bucket's edges sit roughly `sqrt(2)`≈41% away from its centre in either
+/// direction. `.floor()` would instead put a bucket edge AT every power of
+/// two — and a rate that measures exactly on one (a plausible, not even
+/// unlucky, outcome against a whole-number reference) would flip buckets on
+/// noise alone, which is precisely the instability this function exists to
+/// prevent.
+pub fn device_weight(capacity: usize, rate: Option<f64>, reference_rate: Option<f64>) -> u32 {
+    let cap = capacity.clamp(1, 1024) as u32;
+    let speed_bucket = match (rate, reference_rate) {
+        (Some(r), Some(base)) if r.is_finite() && base.is_finite() && r > 0.0 && base > 0.0 => {
+            // How many doublings above the slowest device this one measured.
+            let ratio = (r / base).clamp(1.0, 1024.0);
+            let doublings = ratio.log(RATE_BUCKET_RATIO).round();
+            2u32.saturating_pow(doublings as u32)
+        }
+        // No usable measurement: capacity alone. Absence of a rate is a missing
+        // observation, never evidence the device is slow.
+        _ => 1,
+    };
+    cap.saturating_mul(speed_bucket).max(1)
+}
+
 /// One device's capacity + transient-failure cooldown.
 pub struct DeviceSlot {
     pub id: DeviceId,
@@ -105,10 +149,14 @@ pub struct DeviceSlot {
     /// The probed/configured permit count, retained for snapshots
     /// (`Semaphore` exposes only the *current* available count).
     pub capacity: usize,
+    /// Probe-derived share of new renditions — see [`device_weight`]. Fixed for
+    /// the life of the table: placement must not move while segments are
+    /// cached or a client holds an init.
+    pub weight: u32,
 }
 
 impl DeviceSlot {
-    fn new(id: DeviceId, capacity: usize) -> Self {
+    fn new(id: DeviceId, capacity: usize, weight: u32) -> Self {
         // At least one permit — a device with a probed cap of 0 would be
         // useless; clamp so the table never holds a dead slot.
         let permits = capacity.max(1);
@@ -117,6 +165,7 @@ impl DeviceSlot {
             sem: Arc::new(Semaphore::new(permits)),
             cooldown_until: None,
             capacity: permits,
+            weight: weight.max(1),
         }
     }
 
@@ -212,18 +261,53 @@ impl DeviceTable {
     /// budget. `caps` is taken in the caller's preferred priority order
     /// (the scheduler dispatches in this order); CPU is appended last and
     /// deduped if the caller already included it.
+    ///
+    /// Capacity-only weighting: every device weighs its permit count. Used by
+    /// callers with no rate measurement (tests, the CLI tool). Placement still
+    /// spreads; it just cannot tell a fast device from a slow one.
     pub fn from_probe(caps: &[(DeviceId, usize)], cpu_permits: usize) -> Self {
+        let with_rates: SmallVec<[(DeviceId, usize, Option<f64>); 5]> =
+            caps.iter().map(|&(d, c)| (d, c, None)).collect();
+        Self::from_probe_weighted(&with_rates, cpu_permits, None)
+    }
+
+    /// Build from probed `(device, session-cap, measured-rate)` triples.
+    ///
+    /// The reference rate is the SLOWEST measured device, so every speed term
+    /// is a ratio against something real on this machine rather than against a
+    /// constant — which is what keeps the weighting hardware-neutral.
+    pub fn from_probe_weighted(
+        caps: &[(DeviceId, usize, Option<f64>)],
+        cpu_permits: usize,
+        cpu_rate: Option<f64>,
+    ) -> Self {
+        let reference = caps
+            .iter()
+            .map(|&(_, _, r)| r)
+            .chain(std::iter::once(cpu_rate))
+            .flatten()
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |a: f64| a.min(r))));
+
         let mut slots: SmallVec<[DeviceSlot; 5]> = SmallVec::new();
-        for &(id, cap) in caps {
+        for &(id, cap, rate) in caps {
             if matches!(id, DeviceId::Cpu) {
                 continue; // CPU is appended once, below
             }
             if slots.iter().any(|s| s.id == id) {
                 continue;
             }
-            slots.push(DeviceSlot::new(id, cap));
+            slots.push(DeviceSlot::new(
+                id,
+                cap,
+                device_weight(cap, rate, reference),
+            ));
         }
-        slots.push(DeviceSlot::new(DeviceId::Cpu, cpu_permits));
+        slots.push(DeviceSlot::new(
+            DeviceId::Cpu,
+            cpu_permits,
+            device_weight(cpu_permits, cpu_rate, reference),
+        ));
         Self { slots }
     }
 
@@ -610,5 +694,76 @@ mod tests {
         assert_eq!(n, 1);
         // First wins.
         assert_eq!(t.slot(DeviceId::hw(HwAccel::Nvenc, 0)).unwrap().capacity, 3);
+    }
+}
+
+#[cfg(test)]
+mod weight_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// The stability property the whole design rests on: ordinary measurement
+    /// noise must not change a weight, because a changed weight re-places
+    /// renditions and a re-placed rendition mixes encoders under one init.
+    #[test]
+    fn measurement_noise_does_not_change_a_weight() {
+        let reference = Some(100.0);
+        let base = device_weight(4, Some(400.0), reference);
+        for noise in [0.85_f64, 0.95, 1.0, 1.05, 1.15] {
+            assert_eq!(
+                device_weight(4, Some(400.0 * noise), reference),
+                base,
+                "a {noise}x measurement changed the weight"
+            );
+        }
+    }
+
+    /// A faster device must weigh more than a slower one at equal capacity,
+    /// and MORE CAPACITY must weigh more at equal speed. Both directions, or
+    /// the weight is not measuring what it claims.
+    #[test]
+    fn weight_rises_with_both_speed_and_capacity() {
+        let r = Some(100.0);
+        assert!(device_weight(4, Some(400.0), r) > device_weight(4, Some(100.0), r));
+        assert!(device_weight(8, Some(100.0), r) > device_weight(4, Some(100.0), r));
+    }
+
+    /// The case that makes this portable rather than a second hardware
+    /// assumption: a machine whose SOFTWARE encoder is the stronger device.
+    /// Nothing may prevent it outweighing an accelerator.
+    #[test]
+    fn a_fast_software_encoder_can_outweigh_a_slow_accelerator() {
+        let reference = Some(500.0);
+        let software = device_weight(16, Some(500.0), reference);
+        let accelerator = device_weight(2, Some(120.0), reference);
+        assert!(
+            software > accelerator,
+            "software {software} did not outweigh a slower accelerator {accelerator}"
+        );
+    }
+
+    /// An unmeasurable device must still be placeable, weighted on capacity
+    /// alone. A `None` rate is a missing measurement, not a zero-speed device.
+    #[test]
+    fn an_unmeasured_device_falls_back_to_capacity() {
+        assert!(device_weight(4, None, Some(100.0)) > 0);
+        assert!(device_weight(8, None, None) > device_weight(4, None, None));
+    }
+
+    /// Degenerate inputs must not panic or produce a zero weight, which would
+    /// make a device unreachable rather than merely unlikely.
+    #[test]
+    fn degenerate_inputs_still_yield_a_usable_weight() {
+        for (cap, rate, refr) in [
+            (0usize, None, None),
+            (1, Some(0.0), Some(0.0)),
+            (1, Some(f64::NAN), Some(100.0)),
+            (1, Some(f64::INFINITY), Some(100.0)),
+            (usize::MAX, Some(1e12), Some(1.0)),
+        ] {
+            let w = device_weight(cap, rate, refr);
+            assert!(w > 0, "cap={cap} rate={rate:?} ref={refr:?} gave weight 0");
+        }
     }
 }
