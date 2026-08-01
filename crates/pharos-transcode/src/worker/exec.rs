@@ -77,7 +77,12 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 /// 1. A **hard source-decode error** (corrupt/missing input, missing
 ///    decoder) is `BadInput` — non-recoverable; it would fail on every
 ///    device, so retrying elsewhere is pointless.
-/// 2. Otherwise, a failure on a **hardware device** is `DeviceBusy`
+/// 2. A **decode** that failed on its own terms — the decoder ran and could
+///    not produce pictures — is `DecodeFailed`, on any device. This is
+///    checked BEFORE the hardware arm below, and that order is the whole
+///    point: it is the one non-source failure that is not evidence about the
+///    device.
+/// 3. Otherwise, a failure on a **hardware device** is `DeviceBusy`
 ///    (transient) so the scheduler falls back to the next device / CPU.
 ///    Real hardware faults are myriad and version-specific ("Cannot load
 ///    libcuda.so.1", "no capable devices", VAAPI format-link errors, out
@@ -85,7 +90,7 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 ///    non-source-error HW failure as a reason to fall back. The CPU is
 ///    the terminal device, so a genuinely broken job still surfaces a
 ///    real error there.
-/// 3. A failure on the **CPU** device that isn't a source error is
+/// 4. A failure on the **CPU** device that isn't a source error is
 ///    `Other` — a genuine, non-recoverable encode error.
 pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
     // Drop the chatter first: the reported window is only useful if it is
@@ -104,6 +109,25 @@ pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
         || s.contains("unable to find a suitable output format");
     if hard_bad_input {
         return WorkerError::BadInput(tail);
+    }
+    // A decoder that ran and could not produce pictures. Both strings name the
+    // DECODE side explicitly, which is what makes them safe to lift out of the
+    // hardware arm below:
+    //
+    // - "Decode error rate N exceeds maximum M" is ffmpeg's verdict after
+    //   counting failed frames against the `max_error_rate` threshold — the
+    //   decisive line in the 2026-08-01 incident, where an AV1 source was sent
+    //   to a Pascal card that has no AV1 decode block and every single frame
+    //   failed.
+    // - "hwaccel initialisation returned error" is NVDEC/VAAPI reporting that
+    //   this DECODER could not be set up on this device — a codec answer, not
+    //   a health answer. The card encodes fine either side of it.
+    //
+    // Classified before the `is_hw` arm because that arm cools the device, and
+    // a source the device cannot decode is not a reason to stop encoding
+    // everything else on it.
+    if s.contains("decode error rate") || s.contains("hwaccel initialisation returned error") {
+        return WorkerError::DecodeFailed(tail);
     }
     if is_hw {
         // Carry the tail here too. This is the branch the doc comment above is
@@ -203,6 +227,82 @@ mod tests {
             classify_failure("x.mkv: No such file or directory", false),
             WorkerError::BadInput(s) if s.contains("No such file")
         ));
+    }
+
+    /// The 2026-08-01 outage, verbatim. An AV1 source was placed on a GTX 1070
+    /// (Pascal — no AV1 decode block), every frame failed to decode, and the
+    /// failure was classified as a HARDWARE fault. That cooled the whole GPU
+    /// for two seconds, and under 007's shared-init pin a cooled device does
+    /// not slow a rendition down, it FAILS it: 453 client segments of unrelated
+    /// titles died because one file could not be decoded.
+    ///
+    /// So the assertion that matters is `!is_transient()` — that is the bit the
+    /// scheduler reads to decide whether to cool the device. Without the
+    /// `DecodeFailed` arm this stderr classifies as `DeviceBusy`, which IS
+    /// transient, and this test goes red.
+    #[test]
+    fn a_decode_failure_does_not_take_the_device_out_of_service() {
+        let stderr = "[dec:av1 @ 0x7f2c] Decode error rate 1 exceeds maximum 0.666667\n\
+                      [dec:av1 @ 0x7f2c] Task finished with error code: -1145393733\n";
+        for is_hw in [true, false] {
+            let e = classify_failure(stderr, is_hw);
+            assert!(
+                !e.is_transient(),
+                "a source the decoder cannot handle must not cool the device \
+                 (is_hw={is_hw}), got {e:?}"
+            );
+            let WorkerError::DecodeFailed(why) = &e else {
+                panic!("expected DecodeFailed on is_hw={is_hw}, got {e:?}");
+            };
+            // The offending value, not a bare class: "decode failed" alone does
+            // not say which decoder or how badly, and that is the first thing
+            // asked.
+            assert!(
+                why.contains("Decode error rate"),
+                "the cause must survive classification, got {why:?}"
+            );
+            assert!(
+                e.to_string().contains("Decode error rate"),
+                "Display drops the cause: {e}"
+            );
+        }
+        assert_eq!(
+            classify_failure(stderr, true).label(),
+            "decode_failed",
+            "the dashboard must be able to tell a dead card from an undecodable \
+             source; they were one label during the outage"
+        );
+        assert_ne!(
+            classify_failure(stderr, true).label(),
+            WorkerError::DeviceBusy(String::new()).label()
+        );
+    }
+
+    /// NVDEC/VAAPI's other way of saying the same thing: the decoder itself
+    /// could not be set up on this device for this codec. Also a codec answer,
+    /// not a health answer — the card keeps encoding fine.
+    #[test]
+    fn a_failed_hwaccel_decoder_setup_is_a_decode_failure_not_a_device_fault() {
+        let stderr = "[h264 @ 0x55] Failed setup for format cuda: \
+                      hwaccel initialisation returned error.\n";
+        let e = classify_failure(stderr, true);
+        assert!(!e.is_transient(), "must not cool the device, got {e:?}");
+        assert!(
+            matches!(&e, WorkerError::DecodeFailed(w) if w.contains("hwaccel initialisation")),
+            "got {e:?}"
+        );
+    }
+
+    /// The lift must not swallow the hardware arm. A genuine device fault has
+    /// no decode wording in it and still has to be transient, or a saturated
+    /// card stops being retried elsewhere.
+    #[test]
+    fn a_real_device_fault_is_still_transient() {
+        let e = classify_failure(
+            "[h264_nvenc] OpenEncodeSessionEx failed: out of memory",
+            true,
+        );
+        assert!(e.is_transient(), "got {e:?}");
     }
 
     #[test]

@@ -1838,6 +1838,19 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     ctx.span.in_scope(|| {
                         tracing::warn!(%job_id, %device, error = %err, "transcode job failed (non-recoverable)");
                     });
+                    // Counted as well as logged, and keyed on the same bounded
+                    // CLASS the cooldown counter uses. The pair is the whole
+                    // question after 2026-08-01: a failure that DID cool the
+                    // device and one that did not are different incidents, and
+                    // with only the cooldown counter instrumented the second
+                    // was invisible — a rendition could fail every segment
+                    // forever without moving a single series.
+                    metrics::counter!(
+                        "pharos_transcode_job_failed_total",
+                        "device" => device.to_string(),
+                        "reason" => err.label(),
+                    )
+                    .increment(1);
                     let _ = ctx.reply.send(Err(SchedError::Failed(err)));
                 }
                 WorkerRunResult::Failed(err) => {
@@ -6913,6 +6926,91 @@ mod tests {
             "the permit the reserve exists to hold open must still be free"
         );
         assert_eq!(snap.pending, 0, "and nothing must be left in the queue");
+    }
+
+    /// A job that fails WITHOUT cooling its device is counted too.
+    ///
+    /// The counter beside this one only fires when a device goes into cooldown,
+    /// which was the whole instrumentation for a failed job until
+    /// `DecodeFailed` existed. A non-transient failure moved nothing: a
+    /// rendition could fail every segment it ever produced and no series
+    /// changed. That is exactly the shape a source the device cannot decode now
+    /// takes — deliberately not transient, precisely so it does NOT cool the
+    /// card — so without this counter the fix for one blind spot would have
+    /// opened another.
+    #[test]
+    fn a_non_recoverable_failure_is_counted_against_its_device_with_a_reason() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+                    if spec.device == gpu {
+                        WorkerRunResult::Failed(WorkerError::DecodeFailed(
+                            "Decode error rate 1 exceeds maximum 0.666667".into(),
+                        ))
+                    } else {
+                        WorkerRunResult::Done { out_bytes: 1 }
+                    }
+                });
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[(gpu, 1)], 2),
+                    spawner,
+                    SchedConfig::default(),
+                );
+                let _ = s
+                    .submit(
+                        PathBuf::from("/m/av1.mkv"),
+                        h264(),
+                        file_sink(),
+                        JobClass::Interactive,
+                        JobHint::default(),
+                    )
+                    .await;
+            });
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        let failed: Vec<_> = metrics
+            .iter()
+            .filter(|(k, _, _, _)| k.key().name() == "pharos_transcode_job_failed_total")
+            .collect();
+        assert!(
+            !failed.is_empty(),
+            "a job that fails without cooling its device must still be counted"
+        );
+        let (key, _, _, value) = failed[0];
+        let labels: Vec<String> = key
+            .key()
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("Nvenc")),
+            "the counter must name the device the job ran on: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "reason=decode_failed"),
+            "and why, as a bounded class: {labels:?}"
+        );
+        assert_eq!(*value, DebugValue::Counter(1));
+
+        // And the device it failed on was NOT cooled — the property the whole
+        // `DecodeFailed` split exists for.
+        assert!(
+            !metrics
+                .iter()
+                .any(|(k, _, _, _)| k.key().name() == "pharos_transcode_device_cooldown_total"),
+            "an undecodable source must not take the card out of service"
+        );
     }
 
     /// Cooling a device is COUNTED, and the count says which device and why.
