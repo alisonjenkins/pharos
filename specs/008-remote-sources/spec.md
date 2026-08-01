@@ -96,15 +96,26 @@ answers "did the server's placement rule change" — a per-process question. Thi
 one answers "did the bytes behind this id change" — a per-item question. They are
 different questions and need different mechanisms.
 
-### V133 — a cache key derived from a file's existence lies about a source that has none
+### V133 — WITHDRAWN. The claim was wrong.
 
-`mtime_secs` returns **0 for any nonexistent path**
-(`subtitle_cache.rs:486-489`), silently and by design. Every remote item would
-therefore key its burnt-subtitle and waveform cache at mtime 0 — identical across
-every remote item, and permanently stale across re-resolution, with no error
-anywhere to say so. Ten sites: `hls.rs:1518,2763`,
-`subtitles.rs:220,269,457,597,810,944,1536`, `waveform.rs:101`. Remote origins
-use the source generation instead.
+The original text said `mtime_secs` returning **0 for any nonexistent path**
+(`subtitle_cache.rs:486-489`) would make every remote item share one
+burnt-subtitle and waveform cache key. **It does not.** Every one of those keys
+already carries the item's own identity — `(path, mtime, stream_index, kind)`
+for subtitles, `(id, mtime, bins)` for the waveform — so two remote items with
+mtime 0 do not collide. The collision this invariant was written to prevent
+cannot occur.
+
+What survives is much narrower and not worth a mechanism: a remote item's
+derived artefacts never invalidate on a content change, because 0 never moves.
+The exposure is close to nil — the resolver populates no subtitle tracks, so
+those endpoints are not reached for a remote item, and re-resolving the same
+video yields the same content. If that stops being true, the fix belongs
+wherever the resolved locator is known, which is not any of these call sites.
+
+Recorded rather than deleted because a withdrawn invariant is itself evidence:
+the error was reading `mtime_secs`'s implementation and reasoning about the key
+from it, instead of reading the keys.
 
 ### V134 — a background sweep that cannot succeed on an item must decline it, not retry it
 
@@ -213,9 +224,10 @@ worker pool. It carries a timeout, or one dead URL parks a worker.
   captured `yt-dlp -j` JSON; source-generation propagation into all four sites of
   V132.
 - **Regression, each must fail without its fix**: a remote item under a real scan
-  root is not swept (V136); a re-resolved source serves neither stale disk
-  segments nor a stale `immutable` browser entry (V132); a background sweep
-  declines a remote item instead of retrying it (V134).
+  root is not swept (V136) — and the same row parked under a real root IS lost,
+  so the first half cannot pass vacuously; a re-resolved source serves neither
+  stale disk segments nor a stale `immutable` browser entry (V132); a background
+  sweep declines a remote item instead of retrying it (V134).
 - **Integration**: a local HTTP server serving a fixture, resolved through a stub
   resolver, driven end to end through `/videos/{id}/master.m3u8`.
 - **Live, by query not assertion**: play a URL in stock jellyfin-web, then
