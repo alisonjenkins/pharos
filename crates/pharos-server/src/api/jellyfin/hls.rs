@@ -1310,8 +1310,34 @@ async fn transcode_source(
         // be another round of guessing.
         error::ErrorBadGateway(format!("could not resolve source: {e}"))
     })?;
-    Ok(std::path::PathBuf::from(media.input_for(wants_video)))
+    let upstream = media.input_for(wants_video);
+
+    // Read through the byte-range cache when it is configured. ffmpeg then
+    // opens a loopback URL and every segment after the first reads local bytes
+    // instead of re-opening a TLS connection to the CDN and re-reading the
+    // container index.
+    //
+    // A cache failure is NOT fatal: fall back to the upstream locator, which is
+    // exactly what the pre-cache behaviour was. Refusing to play because an
+    // optimisation could not start would trade a slow film for no film.
+    if let Some((cache, port)) = state.remote_cache.as_ref() {
+        match cache.register(upstream).await {
+            Ok(key) => {
+                return Ok(std::path::PathBuf::from(pharos_server_local_url(
+                    *port, &key,
+                )))
+            }
+            Err(e) => tracing::warn!(
+                extractor = r.extractor(),
+                error = %e,
+                "range cache could not take this source; reading upstream directly",
+            ),
+        }
+    }
+    Ok(std::path::PathBuf::from(upstream))
 }
+
+use crate::remote::source_cache::local_url as pharos_server_local_url;
 
 fn segment_etag(
     media_id: u64,

@@ -79,12 +79,25 @@ struct EntryState {
     present: HashSet<u64>,
 }
 
+impl EntryState {
+    /// Bytes actually fetched, which is what fills the volume — not the source's
+    /// total, most of which is usually still a hole.
+    fn held_bytes(&self) -> u64 {
+        self.present.len() as u64 * super::chunks::CHUNK
+    }
+}
+
 /// Read-through cache over remote sources, served to ffmpeg over loopback.
 pub struct SourceCache {
     dir: PathBuf,
     http: reqwest::Client,
     gate: NetworkGate,
+    max_bytes: u64,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
+    /// Keys in least-recently-used order, oldest first. A `Vec` rather than
+    /// anything cleverer because a household holds a handful of sources at
+    /// once, and the cost of a linear scan is nothing beside a range fetch.
+    lru: Mutex<Vec<String>>,
 }
 
 impl SourceCache {
@@ -92,7 +105,7 @@ impl SourceCache {
     ///
     /// The wipe is not tidiness — see the module docs on why a present-set
     /// cannot outlive the process that built it.
-    pub async fn new(dir: impl Into<PathBuf>, gate: NetworkGate) -> Self {
+    pub async fn new(dir: impl Into<PathBuf>, gate: NetworkGate, max_bytes: u64) -> Self {
         let dir = dir.into();
         let _ = tokio::fs::remove_dir_all(&dir).await;
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
@@ -102,7 +115,9 @@ impl SourceCache {
             dir,
             http: reqwest::Client::new(),
             gate,
+            max_bytes,
             entries: Mutex::new(HashMap::new()),
+            lru: Mutex::new(Vec::new()),
         }
     }
 
@@ -172,7 +187,9 @@ impl SourceCache {
             state: Mutex::new(state),
         });
         self.entries.lock().await.insert(key.clone(), entry);
+        self.touch(&key).await;
         tracing::info!(key, total, "remote source registered with the range cache");
+        self.evict_over_cap().await;
         Ok(key)
     }
 
@@ -186,6 +203,7 @@ impl SourceCache {
         let Some(entry) = self.entries.lock().await.get(key).cloned() else {
             return Ok(Vec::new());
         };
+        self.touch(key).await;
         let end = end.min(entry.total);
         if end <= start {
             return Ok(Vec::new());
@@ -249,13 +267,74 @@ impl SourceCache {
     /// Drop a source's entry and its file — for item deletion and eviction.
     pub async fn forget(&self, upstream: &str) {
         let key = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(upstream.as_bytes()));
-        self.entries.lock().await.remove(&key);
-        let _ = tokio::fs::remove_file(self.dir.join(&key)).await;
+        self.drop_key(&key).await;
     }
 
     /// Bytes currently held, for the eviction decision and the gauge.
+    pub async fn held_bytes(&self) -> u64 {
+        let entries: Vec<_> = self.entries.lock().await.values().cloned().collect();
+        let mut sum = 0;
+        for e in entries {
+            sum += e.state.lock().await.held_bytes();
+        }
+        sum
+    }
+
+    /// Sources currently held.
     pub async fn len(&self) -> usize {
         self.entries.lock().await.len()
+    }
+
+    async fn touch(&self, key: &str) {
+        let mut lru = self.lru.lock().await;
+        lru.retain(|k| k != key);
+        lru.push(key.to_string());
+    }
+
+    /// Drop least-recently-used sources until the cache is under its cap.
+    ///
+    /// Evicting a WHOLE source rather than individual chunks: a half-evicted
+    /// source is the same hazard as a stale present-set, and the thing being
+    /// protected is the volume, which cares about files rather than ranges.
+    ///
+    /// The most recent source is never evicted even when it alone exceeds the
+    /// cap. It is almost certainly what someone is watching, and dropping it
+    /// would send the next segment straight back upstream to re-fetch what was
+    /// just discarded — a cache that thrashes is worse than none.
+    async fn evict_over_cap(&self) {
+        loop {
+            let held = self.held_bytes().await;
+            if held <= self.max_bytes {
+                return;
+            }
+            let victim = {
+                let lru = self.lru.lock().await;
+                if lru.len() <= 1 {
+                    tracing::warn!(
+                        held,
+                        max = self.max_bytes,
+                        "the remote source cache is over its cap with one source held; \
+                         not evicting what is being watched",
+                    );
+                    return;
+                }
+                lru[0].clone()
+            };
+            self.drop_key(&victim).await;
+            metrics::counter!("pharos_remote_cache_evicted_total").increment(1);
+            tracing::info!(
+                key = victim,
+                held,
+                max = self.max_bytes,
+                "evicted a remote source"
+            );
+        }
+    }
+
+    async fn drop_key(&self, key: &str) {
+        self.entries.lock().await.remove(key);
+        self.lru.lock().await.retain(|k| k != key);
+        let _ = tokio::fs::remove_file(self.dir.join(key)).await;
     }
 
     pub async fn is_empty(&self) -> bool {
@@ -397,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn a_rotated_upstream_url_gets_its_own_entry() {
         let dir = TempDir::new().unwrap();
-        let cache = SourceCache::new(dir.path(), NetworkGate::new(2)).await;
+        let cache = SourceCache::new(dir.path(), NetworkGate::new(2), u64::MAX).await;
         assert!(cache.is_empty().await);
 
         // Unknown keys read as empty rather than erroring — a request for a
@@ -472,7 +551,7 @@ mod tests {
         tokio::spawn(handle);
 
         let dir = TempDir::new().unwrap();
-        let cache = SourceCache::new(dir.path(), NetworkGate::new(2)).await;
+        let cache = SourceCache::new(dir.path(), NetworkGate::new(2), u64::MAX).await;
         let url = format!("http://127.0.0.1:{port}/source.mp4");
         let key = cache.register(&url).await.expect("register");
         assert_eq!(cache.total(&key).await, Some(total as u64));
@@ -541,11 +620,135 @@ mod tests {
             .await
             .unwrap();
 
-        let _cache = SourceCache::new(&stale, NetworkGate::new(1)).await;
+        let _cache = SourceCache::new(&stale, NetworkGate::new(1), u64::MAX).await;
         assert!(
             !stale.join("abcdef0123456789").exists(),
             "a file surviving startup would be served as if its holes were data"
         );
         assert!(stale.exists(), "but the directory itself is recreated");
+    }
+}
+
+/// The loopback HTTP listener ffmpeg reads through.
+///
+/// Bound to 127.0.0.1 on an ephemeral port and deliberately unauthenticated:
+/// it exposes only what the cache already holds, addressed by a key that is a
+/// hash of a URL the caller must already know, and it is unreachable off the
+/// host. Adding auth would mean teaching ffmpeg a credential for no gain.
+pub mod server {
+    use super::SourceCache;
+    use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+    use std::sync::Arc;
+
+    /// Parse a `Range: bytes=a-b` header into a half-open byte range.
+    ///
+    /// HTTP ranges are INCLUSIVE at both ends and everything else here is
+    /// half-open, so the `+1` is the whole point of this function existing
+    /// separately — getting it wrong drops the last byte of every read, which
+    /// in a video is a truncated frame rather than an error.
+    pub fn parse_range(header: Option<&str>, total: u64) -> (u64, u64) {
+        let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
+            return (0, total);
+        };
+        let (a, b) = match spec.split_once('-') {
+            Some(p) => p,
+            None => return (0, total),
+        };
+        let start: u64 = a.parse().unwrap_or(0);
+        // An open-ended `bytes=N-` means "to the end", which is what ffmpeg
+        // sends when it wants to stream forward from a seek point.
+        let end = b
+            .trim()
+            .parse::<u64>()
+            .map(|last| last.saturating_add(1))
+            .unwrap_or(total);
+        (start.min(total), end.min(total))
+    }
+
+    async fn serve(
+        req: HttpRequest,
+        key: web::Path<String>,
+        cache: web::Data<Arc<SourceCache>>,
+    ) -> HttpResponse {
+        let key = key.into_inner();
+        let Some(total) = cache.total(&key).await else {
+            return HttpResponse::NotFound().finish();
+        };
+        let header = req
+            .headers()
+            .get(actix_web::http::header::RANGE)
+            .and_then(|v| v.to_str().ok());
+        let ranged = header.is_some();
+        let (start, end) = parse_range(header, total);
+        match cache.read(&key, start, end).await {
+            Ok(bytes) => {
+                let len = bytes.len() as u64;
+                if ranged {
+                    HttpResponse::PartialContent()
+                        .insert_header((
+                            actix_web::http::header::CONTENT_RANGE,
+                            format!("bytes {start}-{}/{total}", start + len.saturating_sub(1)),
+                        ))
+                        .body(bytes)
+                } else {
+                    // `Accept-Ranges` is not decoration: without it libavformat
+                    // treats the input as unseekable and falls back to reading
+                    // from the beginning for every segment, which is precisely
+                    // the cost this cache exists to remove.
+                    HttpResponse::Ok()
+                        .insert_header((actix_web::http::header::ACCEPT_RANGES, "bytes"))
+                        .body(bytes)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key, error = %e, "serving a cached remote range failed");
+                HttpResponse::BadGateway().finish()
+            }
+        }
+    }
+
+    /// Start the listener, returning the port ffmpeg URLs should address.
+    pub fn spawn(cache: Arc<SourceCache>) -> std::io::Result<u16> {
+        let data = web::Data::new(cache);
+        let srv = HttpServer::new(move || {
+            App::new()
+                .app_data(data.clone())
+                .route("/src/{key}", web::get().to(serve))
+                .route("/src/{key}", web::head().to(serve))
+        })
+        // Workers kept low: this only reads local files and the upstream fetch
+        // it may trigger is already bounded by the network gate.
+        .workers(2)
+        .bind("127.0.0.1:0")?;
+        let port = srv.addrs()[0].port();
+        tokio::spawn(srv.run());
+        tracing::info!(port, "remote source cache listening on loopback");
+        Ok(port)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use super::*;
+
+        /// HTTP ranges are inclusive at both ends; everything else here is
+        /// half-open. Dropping the `+1` loses the last byte of every read,
+        /// which in a video is a truncated frame rather than a visible error.
+        #[test]
+        fn an_http_range_converts_to_a_half_open_range() {
+            assert_eq!(parse_range(Some("bytes=0-99"), 1000), (0, 100));
+            assert_eq!(parse_range(Some("bytes=100-199"), 1000), (100, 200));
+            // Open-ended: what ffmpeg sends to stream forward from a seek.
+            assert_eq!(parse_range(Some("bytes=500-"), 1000), (500, 1000));
+            // No header at all is the whole body.
+            assert_eq!(parse_range(None, 1000), (0, 1000));
+            // Past the end clamps rather than overruns.
+            assert_eq!(parse_range(Some("bytes=900-5000"), 1000), (900, 1000));
+            assert_eq!(parse_range(Some("bytes=5000-6000"), 1000), (1000, 1000));
+            // Garbage degrades to the whole body instead of panicking.
+            assert_eq!(parse_range(Some("bytes=abc-def"), 1000), (0, 1000));
+            assert_eq!(parse_range(Some("nonsense"), 1000), (0, 1000));
+        }
     }
 }
