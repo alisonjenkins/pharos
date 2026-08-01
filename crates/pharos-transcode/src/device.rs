@@ -186,6 +186,26 @@ pub struct DeviceSlot {
     /// single stray assignment anywhere in the tree would re-place live
     /// renditions with nothing to catch it. Read it via [`DeviceSlot::weight`].
     weight: u32,
+    /// SOURCE codecs a boot-time trial DECODE proved this device can handle,
+    /// or `None` when no decode probe ever ran (the CLI tool, tests).
+    ///
+    /// The `None` / `Some(empty)` distinction is load-bearing and the two must
+    /// not be collapsed. `None` means unprobed, and reads as "keep the previous
+    /// behaviour" — offload decode as before, because a caller that never
+    /// probed has no evidence either way and silently disabling GPU decode for
+    /// it would be an invisible throughput regression. `Some(set)` means a real
+    /// probe answered, and then only what it named may be offloaded; an empty
+    /// set is a real answer (this card decoded none of the samples) and must
+    /// not be mistaken for "not asked".
+    ///
+    /// Deliberately NOT part of [`DeviceTable::placement_fingerprint`], which
+    /// composes the HLS cache generation. Hardware decode does not change the
+    /// ENCODER, and this build takes decoded frames back into system memory (no
+    /// `-hwaccel_output_format`), so the encoder sees the same input either
+    /// way. Folding it in would wipe every cached segment and invalidate every
+    /// client's `immutable` init whenever a driver upgrade added a decode
+    /// block.
+    decodable: Option<SmallVec<[crate::options::SourceCodec; 6]>>,
 }
 
 impl DeviceSlot {
@@ -199,7 +219,14 @@ impl DeviceSlot {
             cooldown_until: None,
             capacity: permits,
             weight: weight.max(1),
+            decodable: None,
         }
+    }
+
+    /// SOURCE codecs a trial decode proved this device can handle, or `None`
+    /// when it was never probed. See the field.
+    pub fn decodable(&self) -> Option<&[crate::options::SourceCodec]> {
+        self.decodable.as_deref()
     }
 
     /// This device's probe-derived share of new renditions. Read-only: see the
@@ -467,6 +494,54 @@ impl DeviceTable {
         &self.slots
     }
 
+    /// Record what a boot-time trial DECODE proved `device` can handle.
+    ///
+    /// Separate from construction on purpose. The decode probe costs two ffmpeg
+    /// runs per codec per device and only the server pays it; threading it
+    /// through `from_probe`/`from_probe_weighted` would force every test and
+    /// the CLI tool to supply an answer they have no way to measure, and the
+    /// value they'd pass would be a guess that then governs real argv.
+    ///
+    /// An unknown device is ignored rather than added — the table's membership
+    /// is decided by the encode probe, and a device that failed that one must
+    /// not re-enter through this door.
+    pub fn set_decodable(&mut self, device: DeviceId, codecs: &[crate::options::SourceCodec]) {
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == device) {
+            slot.decodable = Some(codecs.iter().copied().collect());
+        }
+    }
+
+    /// May a job whose SOURCE is `codec` offload its decode to `device`?
+    ///
+    /// This is the one place the question is answered, and it answers `false`
+    /// whenever it cannot answer `true` from evidence:
+    ///
+    /// - not a hardware device, or not in this table → nothing to offload to.
+    /// - probed → only a codec the trial decode actually named.
+    /// - probed, but the job's source codec is unknown (a container we could
+    ///   not name, or a caller that did not carry one) → `false`. An unnamed
+    ///   source is precisely the case where the card's ability is unproven, and
+    ///   the two outcomes are not symmetric: guessing "yes" wrongly kills the
+    ///   rendition, guessing "no" wrongly costs a software decode.
+    /// - never probed → `true`, preserving the pre-probe behaviour for callers
+    ///   with no measurement (see [`DeviceSlot::decodable`]).
+    pub fn may_offload_decode(
+        &self,
+        device: DeviceId,
+        codec: Option<crate::options::SourceCodec>,
+    ) -> bool {
+        if !matches!(device, DeviceId::Hw { .. }) {
+            return false;
+        }
+        let Some(slot) = self.slots.iter().find(|s| s.id == device) else {
+            return false;
+        };
+        match slot.decodable() {
+            None => true,
+            Some(proved) => codec.is_some_and(|c| proved.contains(&c)),
+        }
+    }
+
     /// A digest of exactly the state [`DeviceTable::rendition_device`] reads —
     /// the `(device id, weight)` pairs — so that anything able to MOVE a
     /// rendition is visible to whatever keys the cache on it.
@@ -513,6 +588,73 @@ mod tests {
     use crate::hwaccel::HwAccel;
     use crate::options::{AudioCodec, Container, VideoCodec};
     use std::time::Duration;
+
+    #[test]
+    /// The 2026-08-01 outage in one assertion. A card that decodes H.264, HEVC
+    /// and VP9 and has no AV1 block must be told to decode H.264 and refused
+    /// AV1 — the whole point being that "it is a GPU" is not the question.
+    #[test]
+    fn a_probed_device_offloads_only_the_codecs_its_trial_decode_named() {
+        use crate::options::SourceCodec;
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        let mut t = DeviceTable::from_probe(&[(gpu, 4)], 2);
+        // A GTX 1070: H.264/HEVC/VP9 decode blocks, no AV1.
+        t.set_decodable(
+            gpu,
+            &[SourceCodec::H264, SourceCodec::Hevc, SourceCodec::Vp9],
+        );
+
+        assert!(t.may_offload_decode(gpu, Some(SourceCodec::H264)));
+        assert!(t.may_offload_decode(gpu, Some(SourceCodec::Vp9)));
+        assert!(
+            !t.may_offload_decode(gpu, Some(SourceCodec::Av1)),
+            "AV1 on a card with no AV1 decode block is the failure that cooled \
+             the GPU and killed 453 unrelated client segments"
+        );
+        // An unnamed source is unproven, not permitted: the two ways of being
+        // wrong cost a dead rendition and a slower encode respectively.
+        assert!(!t.may_offload_decode(gpu, None));
+        // There is no decode to offload TO on the CPU.
+        assert!(!t.may_offload_decode(DeviceId::Cpu, Some(SourceCodec::H264)));
+        // A device that is not in the table cannot be offloaded to either.
+        assert!(!t.may_offload_decode(DeviceId::hw(HwAccel::Vaapi, 0), Some(SourceCodec::H264)));
+    }
+
+    /// `Some(empty)` is a real answer and `None` is not an answer at all. Left
+    /// collapsed, a probe that legitimately found nothing would read as
+    /// "unprobed" and offload everything — reinstating the exact bug.
+    #[test]
+    fn an_empty_probe_result_is_not_the_same_as_never_probing() {
+        use crate::options::SourceCodec;
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+
+        let unprobed = DeviceTable::from_probe(&[(gpu, 4)], 2);
+        assert!(
+            unprobed.may_offload_decode(gpu, Some(SourceCodec::H264)),
+            "a caller that never probed keeps the pre-probe behaviour"
+        );
+
+        let mut probed = DeviceTable::from_probe(&[(gpu, 4)], 2);
+        probed.set_decodable(gpu, &[]);
+        assert!(
+            !probed.may_offload_decode(gpu, Some(SourceCodec::H264)),
+            "a card that decoded none of the samples must be believed"
+        );
+    }
+
+    /// The decode answer must not reach the HLS cache generation. It is not a
+    /// placement input, and folding it in would wipe every cached segment — and
+    /// invalidate every client's year-long `immutable` init — the first time a
+    /// driver upgrade added a decode block.
+    #[test]
+    fn decode_capability_does_not_move_the_placement_fingerprint() {
+        use crate::options::SourceCodec;
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        let before = DeviceTable::from_probe(&[(gpu, 4)], 2).placement_fingerprint();
+        let mut t = DeviceTable::from_probe(&[(gpu, 4)], 2);
+        t.set_decodable(gpu, &[SourceCodec::H264, SourceCodec::Av1]);
+        assert_eq!(before, t.placement_fingerprint());
+    }
 
     #[test]
     fn cpu_permits_match_thread_budget_not_core_count() {

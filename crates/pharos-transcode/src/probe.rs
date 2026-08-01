@@ -184,6 +184,152 @@ pub async fn probe_encodable_codecs(device: DeviceId, timeout: Duration) -> Vec<
     out
 }
 
+/// Which SOURCE codecs `device` can actually hardware-DECODE, confirmed by a
+/// real trial decode each.
+///
+/// The mirror of [`probe_encodable_codecs`], and needed for the same reason
+/// that one is: naming a decoder is not having one. `-hwaccel cuda` was emitted
+/// for every job placed on an NVENC device, decided from the DEVICE alone and
+/// never from the source codec, on the strength of a comment asserting that
+/// ffmpeg "falls back to software and exits 0" when the codec is unsupported.
+/// That assertion is false. On 2026-08-01 a 10-bit AV1 source on a GTX 1070
+/// (Pascal — H.264/HEVC/VP9 decode blocks, no AV1) produced
+/// `hwaccel initialisation returned error`, a decode error rate of 1.0, and a
+/// dead rendition. There is no way to know which codecs a card decodes short of
+/// asking it, and a hand-written per-family table would be exactly the
+/// hardware-specific constant V126 exists to forbid — NVDEC's AV1 support
+/// arrived mid-generation, so "NVENC" is not the unit the answer varies on.
+///
+/// Each codec costs two throwaway ffmpeg runs: a five-frame 128x128 software
+/// encode to a scratch file, then a decode of that file with the device's
+/// `-hwaccel`. A codec whose SAMPLE fails to encode is skipped rather than
+/// reported undecodable — the probe failing to build its own input says nothing
+/// about the card.
+///
+/// The CPU and any device whose family has no `-hwaccel` name return empty:
+/// there is no offload to gate.
+pub async fn probe_decodable_codecs(
+    device: DeviceId,
+    timeout: Duration,
+) -> Vec<crate::options::SourceCodec> {
+    use crate::options::SourceCodec;
+    if !matches!(device, DeviceId::Hw { .. }) || device.hwaccel().decoder_hwaccel().is_none() {
+        return Vec::new();
+    }
+    let Some(dir) = decode_probe_scratch_dir(device) else {
+        tracing::warn!(
+            device = %device,
+            "could not create a scratch directory for the decode probe; this \
+             device will decode every source in software"
+        );
+        return Vec::new();
+    };
+    let bin = ffmpeg_bin();
+    let mut out = Vec::new();
+    for codec in SourceCodec::ALL {
+        let sample = dir.join(format!("sample.{}", codec.ffmpeg_name()));
+        if !run_ffmpeg_probe(&bin, &decode_sample_args(codec, &sample), timeout).await {
+            tracing::debug!(
+                device = %device,
+                codec = codec.label(),
+                encoder = codec.sample_encoder(),
+                "decode probe could not build its own sample; codec not trialled"
+            );
+            continue;
+        }
+        if run_ffmpeg_probe(&bin, &decode_probe_args(device, &sample), timeout).await {
+            out.push(codec);
+        }
+    }
+    // Best-effort: the samples are a few kilobytes and the directory is
+    // pid-scoped, so a failure to clean up cannot collide with another run.
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// A pid-scoped scratch directory for one device's decode probe samples.
+/// Removed by the caller; pid-scoped so two servers probing at once cannot
+/// read each other's half-written samples.
+fn decode_probe_scratch_dir(device: DeviceId) -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!(
+        "pharos-decode-probe-{}-{}",
+        std::process::id(),
+        device.to_string().replace([':', '/'], "-"),
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// ffmpeg argv writing a tiny SOFTWARE-encoded sample of `codec` to `path` —
+/// the input the decode trial then reads back.
+///
+/// Five frames of 128x128, the same shape [`codec_probe_args`] uses, so boot
+/// pays milliseconds per codec. `-pix_fmt yuv420p` is explicit because the
+/// filter source's default is encoder-dependent and a rejected pixel format
+/// would look like "this codec cannot be sampled".
+fn decode_sample_args(codec: crate::options::SourceCodec, path: &std::path::Path) -> Vec<String> {
+    vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        "testsrc=size=128x128:rate=5:duration=1".into(),
+        "-c:v".into(),
+        codec.sample_encoder().into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-frames:v".into(),
+        "5".into(),
+        // Matroska takes every one of these codecs, so the container is one
+        // constant rather than a per-codec mapping that could go stale.
+        "-f".into(),
+        "matroska".into(),
+        path.to_string_lossy().into_owned(),
+    ]
+}
+
+/// ffmpeg argv decoding `sample` on `device`'s hardware decoder into the null
+/// muxer. Exit status is the verdict — which is exactly the failure the live
+/// incident produced, and exactly what the emitted `-hwaccel` will do to a real
+/// segment.
+///
+/// The flags mirror [`crate::ffmpeg_transcode_args`]'s decode block so the
+/// probe tests the same thing production runs: same `-hwaccel` name, and the
+/// same `-hwaccel_device` pinning for CUDA so a multi-GPU box probes the card
+/// it will encode on rather than device 0.
+fn decode_probe_args(device: DeviceId, sample: &std::path::Path) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+    ];
+    if let Some(node) = device.vaapi_render_node() {
+        a.push("-vaapi_device".into());
+        a.push(node);
+    }
+    if let Some(name) = device.hwaccel().decoder_hwaccel() {
+        a.push("-hwaccel".into());
+        a.push(name.into());
+        if name == "cuda" {
+            if let Some(idx) = device.index() {
+                a.push("-hwaccel_device".into());
+                a.push(idx.to_string());
+            }
+        }
+    }
+    a.push("-i".into());
+    a.push(sample.to_string_lossy().into_owned());
+    a.push("-f".into());
+    a.push("null".into());
+    a.push("-".into());
+    a
+}
+
 /// ffmpeg argv for a tiny throwaway encode of `codec` on `device` (lavfi source
 /// → the device's hardware encoder → null muxer). `None` when the device's
 /// family names no hardware encoder for `codec` (so there's nothing to trial).
@@ -604,6 +750,71 @@ mod tests {
         };
         let caps = probe_caps(&[dev], &cfg, |_d| async { true }).await;
         assert_eq!(caps.caps.as_slice(), &[(dev, 4)]);
+    }
+
+    #[test]
+    /// The decode trial must test the SAME thing production runs, or a codec it
+    /// blesses can still fail on a real segment. Both flags matter: `-hwaccel`
+    /// is what production emits, and `-hwaccel_device` is what pins the trial to
+    /// the card that will encode rather than to CUDA device 0 — a multi-GPU box
+    /// would otherwise probe one card and offload to another.
+    #[test]
+    fn the_decode_trial_uses_the_same_hwaccel_flags_production_emits() {
+        let sample = std::path::Path::new("/tmp/s.av1");
+        let a = decode_probe_args(DeviceId::hw(HwAccel::Nvenc, 2), sample).join(" ");
+        assert!(a.contains("-hwaccel cuda"), "{a}");
+        assert!(a.contains("-hwaccel_device 2"), "{a}");
+        assert!(a.contains("-i /tmp/s.av1"), "{a}");
+        assert!(a.contains("-f null"), "{a}");
+
+        let v = decode_probe_args(DeviceId::hw(HwAccel::Vaapi, 1), sample).join(" ");
+        assert!(v.contains("-vaapi_device /dev/dri/renderD129"), "{v}");
+        assert!(v.contains("-hwaccel vaapi"), "{v}");
+        // `-hwaccel_device` is CUDA's index flag; VAAPI selects by render node.
+        assert!(!v.contains("-hwaccel_device"), "{v}");
+    }
+
+    /// Every codec the probe trials must be able to build its own sample, or
+    /// the probe reports "undecodable" for a codec it never actually tested and
+    /// silently drops GPU decode for it. Runs real ffmpeg — the encoder names
+    /// are the thing being checked, and a table of them tests nothing.
+    #[tokio::test]
+    async fn every_probed_codec_can_have_a_sample_built_for_it() {
+        use crate::options::SourceCodec;
+        let dir = std::env::temp_dir().join(format!("pharos-sample-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = ffmpeg_bin();
+        for codec in SourceCodec::ALL {
+            let path = dir.join(format!("s.{}", codec.ffmpeg_name()));
+            let ok = run_ffmpeg_probe(
+                &bin,
+                &decode_sample_args(codec, &path),
+                Duration::from_secs(30),
+            )
+            .await;
+            assert!(
+                ok,
+                "no sample could be built for {} with {} — the decode probe \
+                 would skip this codec and it would never be offloaded",
+                codec.ffmpeg_name(),
+                codec.sample_encoder()
+            );
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(len > 0, "{} sample is empty", codec.ffmpeg_name());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The CPU has no decode offload to gate, and a probe that returned codecs
+    /// for it would let `may_offload_decode` answer about a device with no
+    /// `-hwaccel` name at all.
+    #[tokio::test]
+    async fn the_cpu_has_no_decodable_set() {
+        assert!(
+            probe_decodable_codecs(DeviceId::Cpu, Duration::from_secs(5))
+                .await
+                .is_empty()
+        );
     }
 
     #[test]

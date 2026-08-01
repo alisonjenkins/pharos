@@ -37,7 +37,7 @@ pub use backend::SpawnBackend;
 pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, WaveformPoint};
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
-pub use options::{AudioCodec, Container, MuxedAudio, TranscodeOptions, VideoCodec};
+pub use options::{AudioCodec, Container, MuxedAudio, SourceCodec, TranscodeOptions, VideoCodec};
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
 };
