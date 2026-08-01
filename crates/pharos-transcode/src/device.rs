@@ -94,14 +94,24 @@ pub fn vaapi_render_node_indices() -> Vec<u8> {
 }
 
 /// How coarsely a measured rate is bucketed before it can affect placement.
+/// Doubling steps: a device has to measure twice as fast before placement
+/// notices.
 ///
-/// This is the STABILITY CONTRACT, not a tuning knob. A weight change
-/// re-places renditions, and `SegmentIdentity` does not include the device —
-/// so a re-placed rendition serves cached segments from the old encoder beside
-/// fresh ones from the new one, under a single init, with no restart involved.
-/// The bucket must therefore be wider than any plausible run-to-run variation
-/// in the probe. Doubling steps: a device has to measure twice as fast before
-/// placement notices.
+/// **This buys coarseness, not stability.** It was documented as "the
+/// STABILITY CONTRACT" when it landed, and it cannot be one — no bucket width
+/// can be. Rounding does not SHRINK the set of rates with zero margin, it
+/// RELOCATES it, from `{2^k}` to `{2^(k+0.5)}`. A device that lands on a
+/// boundary still flips on arbitrarily small noise, on roughly half of all
+/// boots, forever; widening the bucket only moves where the knife-edge is.
+/// Two further reasons it could never have worked: both sides of the ratio are
+/// measured, so the noise is the sum of both devices'; and the reference is a
+/// `min` over a SET, so ONE noisy device moves every OTHER device's weight.
+///
+/// Stability comes from [`crate::rate_store`] instead: unchanged hardware
+/// reuses the stored probe result and is never re-measured, so a rate cannot
+/// differ between two boots at all. What this constant contributes is
+/// legibility — differences too small to be worth distinguishing don't reach
+/// the weight.
 const RATE_BUCKET_RATIO: f64 = 2.0;
 
 /// A device's share of new renditions, derived entirely from probe-time facts.
@@ -110,9 +120,9 @@ const RATE_BUCKET_RATIO: f64 = 2.0;
 /// the shared synthetic clip and `reference_rate` the slowest measured device,
 /// so the speed term is a pure ratio and no device family is named anywhere.
 ///
-/// Quantised via [`RATE_BUCKET_RATIO`] so ordinary measurement noise cannot
-/// move a rendition — see that constant for why that matters more than
-/// precision.
+/// Quantised via [`RATE_BUCKET_RATIO`], which discards differences too small to
+/// be worth distinguishing. It does NOT make the weight noise-proof — see that
+/// constant, and [`crate::rate_store`] for what actually does.
 ///
 /// Buckets are centred ON each power of two (`.round()`, not `.floor()`), so a
 /// bucket's edges sit `sqrt(2)` away from its centre — which is symmetric in
