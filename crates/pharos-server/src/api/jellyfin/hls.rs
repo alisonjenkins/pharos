@@ -452,6 +452,11 @@ struct HlsItem {
     /// real video timeline on a non-integer-fps source.
     frame_rate_mille: Option<u32>,
     kind: pharos_core::MediaKind,
+    /// The item's stored source locator — a filesystem path, or a synthetic
+    /// `ytdlp://` reference for a URL-backed item (008). Carried so playlist
+    /// URLs can embed the SOURCE generation alongside the placement one; see
+    /// [`rendition_qs`].
+    path: std::path::PathBuf,
 }
 
 async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_web::Error> {
@@ -488,6 +493,7 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
         audio_codec: item.probe.audio_codec.clone(),
         frame_rate_mille: item.probe.frame_rate_mille,
         kind: item.kind,
+        path: item.path.clone(),
     })
 }
 
@@ -1679,14 +1685,29 @@ async fn resolve_text_burn_assets(
 /// a digest of the placement state precisely so it moves whenever placement
 /// can — and it MUST be the same string the server-side cache reconciles
 /// against, or one of the two caches keeps bytes the other threw away.
-fn rendition_qs(req: &HttpRequest) -> String {
+fn rendition_qs(req: &HttpRequest, source: &std::path::Path) -> String {
     let qs = playback_qs(req);
     let gen = pharos_cache::generation();
-    if qs.is_empty() {
+    // 008 / V132 — `g=` answers "did the SERVER's placement rule change", which
+    // is a per-process question. It cannot answer "did the bytes behind this
+    // item change", which for a URL-backed source is a per-ITEM one that moves
+    // whenever the resolver returns something new. Bumping `g=` for that would
+    // wipe every local title's segments; omitting it entirely would leave this
+    // item's init in the browser for a year, describing bytes that no longer
+    // exist. So the two travel together and neither substitutes for the other.
+    //
+    // Emitted only for a resolvable source, so a local item's URLs are
+    // byte-identical to what they were before 008 and no client re-fetches.
+    let src = pharos_cache::hls_cache::SourceGen::for_source(source);
+    let mut out = if qs.is_empty() {
         format!("g={gen}")
     } else {
         format!("{qs}&g={gen}")
+    };
+    if !src.is_local() {
+        out.push_str(&format!("&s={}", src.get()));
     }
+    out
 }
 
 fn playback_qs(req: &HttpRequest) -> String {
@@ -1784,7 +1805,7 @@ async fn vp9_audio_playlist(
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, media_id).await?;
-    let qs = rendition_qs(&req);
+    let qs = rendition_qs(&req, &item.path);
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
     // Geass) so switching track selects a different rendition session.
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
@@ -1923,7 +1944,7 @@ async fn vp9_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
-    let qs = rendition_qs(&req);
+    let qs = rendition_qs(&req, &item.path);
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
@@ -2092,7 +2113,7 @@ async fn h264cmaf_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &id).await?;
-    let qs = rendition_qs(&req);
+    let qs = rendition_qs(&req, &item.path);
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
@@ -4625,7 +4646,8 @@ mod tests {
         let req = actix_web::test::TestRequest::get()
             .uri("/videos/9/h264cmaf.m3u8?PlaySessionId=abc")
             .to_http_request();
-        let qs = rendition_qs(&req);
+        let local = std::path::Path::new("/media/Movies/Arrival.mkv");
+        let qs = rendition_qs(&req, local);
         assert!(
             qs.ends_with(&format!("g={gen}")),
             "generation must be present: {qs}"
@@ -4640,8 +4662,32 @@ mod tests {
         let bare = actix_web::test::TestRequest::get()
             .uri("/videos/9/h264cmaf.m3u8")
             .to_http_request();
-        let qs = rendition_qs(&bare);
+        let qs = rendition_qs(&bare, local);
         assert_eq!(qs, format!("g={gen}"), "no stray separator: {qs}");
         assert!(!qs.starts_with('&'));
+
+        // 008 / V132 — a URL-backed item carries its SOURCE generation too, and
+        // a local one does not. Both halves matter: without `s=` the browser
+        // keeps this item's init for a year after the source re-resolved, and
+        // emitting it unconditionally would change every local URL and make
+        // every client re-fetch a cache that is still perfectly valid.
+        let remote = pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
+            .expect("valid ref")
+            .to_synthetic_path();
+        let remote_qs = rendition_qs(&bare, &remote);
+        let sg = pharos_cache::hls_cache::SourceGen::for_source(&remote);
+        assert!(
+            !sg.is_local(),
+            "a synthetic path must be a resolvable source"
+        );
+        assert_eq!(remote_qs, format!("g={gen}&s={}", sg.get()));
+        assert!(
+            !qs.contains("s="),
+            "a local item's URL must be unchanged by 008: {qs}"
+        );
+
+        // And the placement generation is still there — `s=` supplements `g=`,
+        // it does not replace it. They answer different questions.
+        assert!(remote_qs.contains(&format!("g={gen}")));
     }
 }
