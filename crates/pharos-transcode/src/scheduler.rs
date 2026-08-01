@@ -127,6 +127,37 @@ impl PinOutcome {
     }
 }
 
+/// Record a pin outcome at the moment a job is actually DISPATCHED, together
+/// with the device it went to.
+///
+/// Both dispatch sites call this rather than each recording for themselves,
+/// because the two paths have already drifted apart once: the drain path
+/// skipped the pin entirely and spilled shared-init renditions onto a second
+/// encoder (#114). One function is what keeps `pharos_transcode_pin_total` and
+/// `pharos_transcode_rendition_pin_total` counting the same events.
+///
+/// `pharos_transcode_rendition_pin_total{device}` is the per-device half, and
+/// only `Followed` contributes to it: it is the one outcome where a device was
+/// chosen and encoded. `Unresolved` has no device to attribute (placement fell
+/// through to the load-balancer), and `Invalidated` never reaches a dispatch at
+/// all. Reading it against `pharos_transcode_device_weight` is the whole point
+/// — the weight says what share a device was given, this says what it got, and
+/// a divergence separates a misplacement from a mis-weighting.
+///
+/// Cardinality is the device count, and the label values are the same
+/// `DeviceId` renderings already carried by
+/// `pharos_transcode_device_capacity`.
+fn record_pin_dispatch(outcome: PinOutcome, dev: DeviceId) {
+    outcome.record();
+    if matches!(outcome, PinOutcome::Followed) {
+        metrics::counter!(
+            "pharos_transcode_rendition_pin_total",
+            "device" => dev.to_string(),
+        )
+        .increment(1);
+    }
+}
+
 /// How a job left the scheduler's queue.
 ///
 /// `pending_background` says the queue is deep; it cannot say whether that
@@ -2828,7 +2859,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             // a queued pinned job re-examined on later drains is not
             // double-counted.
             if let Some(outcome) = pin_outcome {
-                outcome.record();
+                record_pin_dispatch(outcome, dev);
             }
             record_dispatch(state, &ctx);
             let span = record_placement(job_id, dev, &ctx, &candidates);
@@ -3168,7 +3199,7 @@ fn try_place_no_queue(
             // Same rule as `place`: only an examination that actually
             // dispatches records the pin outcome — or the queue outcome.
             if let Some(outcome) = pin_outcome {
-                outcome.record();
+                record_pin_dispatch(outcome, dev);
             }
             record_dispatch(state, &ctx);
             let span = record_placement(job_id, dev, &ctx, &candidates);
@@ -4196,7 +4227,10 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
-        metrics::with_local_recorder(&recorder, || {
+        // The pinned device is chosen from the table inside, and the per-device
+        // assertion below needs it — so it is handed back out rather than
+        // restated, which would let the two drift apart.
+        let held = metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -4305,28 +4339,26 @@ mod tests {
                     done.device, held,
                     "must still land on the pinned device, not spill"
                 );
+                held
             })
         });
 
-        let found = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(ck, _, _, v)| {
-                let k = ck.key();
-                if k.name() != "pharos_transcode_pin_total" {
-                    return None;
-                }
-                let labels: Vec<String> = k
-                    .labels()
-                    .map(|l| format!("{}={}", l.key(), l.value()))
-                    .collect();
-                if labels.contains(&"outcome=followed".to_string()) {
-                    Some(v)
-                } else {
-                    None
-                }
-            });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let found = snapshot.iter().find_map(|(ck, _, _, v)| {
+            let k = ck.key();
+            if k.name() != "pharos_transcode_pin_total" {
+                return None;
+            }
+            let labels: Vec<String> = k
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            if labels.contains(&"outcome=followed".to_string()) {
+                Some(v)
+            } else {
+                None
+            }
+        });
         let value = found.expect(
             "pharos_transcode_pin_total{outcome=\"followed\"} must be recorded \
              for the one pinned job that dispatched",
@@ -4336,6 +4368,133 @@ mod tests {
             "a pinned job re-examined across several drains must record \
              `followed` exactly ONCE, at actual dispatch — not once per \
              examination; got {value:?}"
+        );
+
+        // The per-device counter is recorded at the SAME point and inherits the
+        // same hazard, so it is asserted on the same fixture rather than in a
+        // test of its own that could drift away from this one.
+        let per_device: Vec<(String, &DebugValue)> = snapshot
+            .iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_rendition_pin_total" {
+                    return None;
+                }
+                let device = k
+                    .labels()
+                    .find(|l| l.key() == "device")
+                    .map(|l| l.value().to_string())?;
+                Some((device, v))
+            })
+            .collect();
+        assert_eq!(
+            per_device.len(),
+            1,
+            "one pinned job dispatched, so exactly one device series: {per_device:?}"
+        );
+        assert_eq!(per_device[0].0, held.to_string());
+        assert!(
+            matches!(per_device[0].1, DebugValue::Counter(1)),
+            "the per-device pin counter must count DISPATCHES, not the drain \
+             passes a queued job survives; got {:?}",
+            per_device[0].1
+        );
+    }
+
+    /// ODD (spec 007) — placement is now a decision with an input nobody can
+    /// see. `pharos_transcode_device_weight` says what share each device was
+    /// GIVEN; only this says what it actually GOT. Without the pair, a
+    /// misplacement and a mis-weighting are the same observation, and on
+    /// unfamiliar hardware that is the first question anyone asks.
+    ///
+    /// Two renditions pinned to two DIFFERENT devices, each asserted to have
+    /// its own count of exactly 1. That shape is deliberate: a counter that
+    /// hardcoded a device, or emitted one series for all placements, satisfies
+    /// neither half. The devices are read out of the table via `eligible_for`
+    /// and an input is SEARCHED for that pins to each — no family is named, so
+    /// this stays true on whatever hardware it runs on.
+    #[test]
+    fn a_followed_pin_is_counted_against_the_device_it_resolved_to() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let placed: Arc<std::sync::Mutex<Vec<DeviceId>>> = Arc::new(std::sync::Mutex::new(vec![]));
+
+        let expected = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let devices = table();
+                let eligible = devices.eligible_for(&cmaf(), Instant::now());
+                assert!(
+                    eligible.len() >= 2,
+                    "this test needs two devices that can serve a shared-init \
+                     rendition, or a per-device counter proves nothing"
+                );
+                let (a, b) = (eligible[0], eligible[1]);
+                let input_a = input_pinning_to(&devices, &cmaf(), a, "pin-a");
+                let input_b = input_pinning_to(&devices, &cmaf(), b, "pin-b");
+
+                let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(10), |_, _| {
+                    WorkerRunResult::Done { out_bytes: 1 }
+                });
+                let s = TranscodeScheduler::spawn(devices, spawner, SchedConfig::default());
+                for input in [input_a, input_b] {
+                    let done = s
+                        .submit(
+                            input,
+                            cmaf(),
+                            file_sink(),
+                            JobClass::Interactive,
+                            JobHint::default(),
+                        )
+                        .await
+                        .expect("a pinned job must dispatch");
+                    placed.lock().expect("placed devices").push(done.device);
+                }
+                (a, b)
+            })
+        });
+
+        // The counter must name the device the encode ACTUALLY ran on, so the
+        // expectation is taken from the scheduler's own report, not restated.
+        let ran_on = placed.lock().expect("placed devices").clone();
+        assert_eq!(
+            ran_on,
+            vec![expected.0, expected.1],
+            "precondition: the two jobs must really have gone to two devices"
+        );
+
+        let mut counted: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_transcode_rendition_pin_total" {
+                    return None;
+                }
+                let device = k
+                    .labels()
+                    .find(|l| l.key() == "device")
+                    .map(|l| l.value().to_string())?;
+                match v {
+                    DebugValue::Counter(c) => Some((device, c)),
+                    other => panic!("expected a counter, got {other:?}"),
+                }
+            })
+            .collect();
+        counted.sort();
+
+        let mut want = vec![(ran_on[0].to_string(), 1u64), (ran_on[1].to_string(), 1)];
+        want.sort();
+        assert_eq!(
+            counted, want,
+            "a followed pin must be counted against the device it resolved to — \
+             without it a misplacement cannot be told from a mis-weighting"
         );
     }
 
