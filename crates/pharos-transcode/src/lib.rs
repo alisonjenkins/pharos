@@ -23,6 +23,7 @@ pub mod options;
 #[cfg(unix)]
 pub mod probe;
 pub mod protocol;
+pub mod rate_store;
 pub mod scheduler;
 pub mod segment;
 pub mod subwin;
