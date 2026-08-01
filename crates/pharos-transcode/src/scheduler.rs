@@ -4212,13 +4212,18 @@ mod tests {
                             _ => Duration::from_millis(15),
                         },
                     )));
-                let s = TranscodeScheduler::spawn(
-                    DeviceTable::from_probe(&[(gpu, 1)], 3),
-                    spawner,
-                    SchedConfig::default(),
-                );
+                let devices = DeviceTable::from_probe(&[(gpu, 1)], 3);
+                // The unpinned `hold` job takes the BEST device (first in
+                // `eligible_for`), so the pinned job has to be pinned there for
+                // it to queue at all. Since 007 the pin can resolve to any
+                // supporting device, so the probe's input is CHOSEN to pin to
+                // the held device instead of assumed to — and that device is
+                // read from the table, never named.
+                let held = devices.eligible_for(&h264(), Instant::now())[0];
+                let probe_input = input_pinning_to(&devices, &cmaf(), held, "probe");
+                let s = TranscodeScheduler::spawn(devices, spawner, SchedConfig::default());
 
-                // Holds the GPU (and with it the pin's only candidate) for
+                // Holds the best device (and with it the pin's candidate) for
                 // the whole test.
                 let hold = {
                     let s2 = s.clone();
@@ -4241,7 +4246,7 @@ mod tests {
                     let s2 = s.clone();
                     tokio::spawn(async move {
                         s2.submit(
-                            PathBuf::from("/m/probe"),
+                            probe_input,
                             cmaf(),
                             file_sink(),
                             JobClass::Interactive,
@@ -4284,7 +4289,7 @@ mod tests {
                     .unwrap()
                     .expect("the pinned job must eventually dispatch");
                 assert_eq!(
-                    done.device, gpu,
+                    done.device, held,
                     "must still land on the pinned device, not spill"
                 );
             })
@@ -4872,6 +4877,41 @@ mod tests {
         DeviceTable::from_probe(&[(DeviceId::hw(HwAccel::Nvenc, 0), capacity)], 0)
     }
 
+    /// An input whose shared-init rendition pins to `device`, found by search.
+    ///
+    /// Several tests below need CONTENTION on one device: two jobs running (or
+    /// queueing) on the same encoder at the same time. They used to get that for
+    /// free, because `rendition_device` pinned every shared-init rendition to
+    /// hardware and these tables hold exactly one hardware device — so any two
+    /// CMAF inputs collided automatically.
+    ///
+    /// Spec 007 put every supporting device in the pool, so two inputs now pin
+    /// together only if their rendition keys land in the same weight band. The
+    /// contention has to be ARRANGED rather than assumed, and this is what
+    /// arranges it: the caller reads the device it wants out of the table
+    /// (`eligible_for`), never names a family, and this finds an input that pins
+    /// there. A test that hardcodes `DeviceId::hw(..)` is only true on the
+    /// hardware it was written for, which is the assumption 007 exists to remove.
+    ///
+    /// `prefix` keeps the file name greppable for `VariableSpawner`'s per-job
+    /// script, which matches on it.
+    fn input_pinning_to(
+        devices: &DeviceTable,
+        opts: &TranscodeOptions,
+        device: DeviceId,
+        prefix: &str,
+    ) -> PathBuf {
+        use crate::options::RenditionKey;
+        for n in 0..10_000u32 {
+            let p = PathBuf::from(format!("/m/{prefix}{n}"));
+            let key = RenditionKey::new(&p, opts).value();
+            if devices.rendition_device(opts, key) == Some(device) {
+                return p;
+            }
+        }
+        panic!("no input with prefix {prefix:?} pinned to {device} in 10k tries");
+    }
+
     /// The line an abandonment cannot cross, made askable.
     ///
     /// A caller that walks away from a QUEUED job really does hand the capacity
@@ -5277,15 +5317,27 @@ mod tests {
         let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(100), |_, _| {
             WorkerRunResult::Done { out_bytes: 1 }
         });
-        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
-        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        let devices = one_gpu(4);
+        // Every job below must land on ONE device, or the interactive job has no
+        // background peer and the success is never EXERCISED. Since 007 that no
+        // longer happens by itself, so the inputs are chosen to pin together —
+        // on the device the table nominates as best, never a named family.
+        let gpu = devices.eligible_for(&cmaf_with_duration(), Instant::now())[0];
+        let pre_input = input_pinning_to(&devices, &cmaf_with_duration(), gpu, "pre");
+        let a_input = input_pinning_to(&devices, &cmaf_with_duration(), gpu, "a");
+        let b_input = input_pinning_to(&devices, &cmaf_with_duration(), gpu, "b");
+        let burst_inputs: Vec<PathBuf> = ["pre2a", "pre2b", "pre2c"]
+            .iter()
+            .map(|p| input_pinning_to(&devices, &cmaf_with_duration(), gpu, p))
+            .collect();
+        let s = TranscodeScheduler::spawn(devices, spawner, SchedConfig::default());
 
-        // A speculative job claims the GPU first...
+        // A speculative job claims the device first...
         let bg = {
             let s2 = s.clone();
             tokio::spawn(async move {
                 s2.submit(
-                    PathBuf::from("/m/pre"),
+                    pre_input,
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Background,
@@ -5302,7 +5354,7 @@ mod tests {
         // needs.
         let done = s
             .submit(
-                PathBuf::from("/m/a"),
+                a_input,
                 cmaf_with_duration(),
                 file_sink(),
                 JobClass::Interactive,
@@ -5339,7 +5391,7 @@ mod tests {
             let s2 = s.clone();
             tokio::spawn(async move {
                 s2.submit(
-                    PathBuf::from("/m/b"),
+                    b_input,
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Interactive,
@@ -5351,11 +5403,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let mut handles = Vec::new();
-        for n in 0..3 {
+        for input in burst_inputs {
             let s2 = s.clone();
             handles.push(tokio::spawn(async move {
                 s2.submit(
-                    PathBuf::from(format!("/m/pre2{n}")),
+                    input,
                     cmaf_with_duration(),
                     file_sink(),
                     JobClass::Background,
@@ -8350,15 +8402,25 @@ mod tests {
                 .unwrap();
             rt.block_on(async {
                 let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
-                let spawner =
-                    Arc::new(VariableSpawner(Arc::new(
-                        |spec: &JobSpec| match job_name(spec).as_str() {
-                            "hold-gpu" => Duration::from_millis(260),
-                            _ => Duration::from_millis(15),
-                        },
-                    )));
+                let spawner = Arc::new(VariableSpawner(Arc::new(|spec: &JobSpec| {
+                    if job_name(spec).starts_with("hold") {
+                        Duration::from_millis(260)
+                    } else {
+                        Duration::from_millis(15)
+                    }
+                })));
+                let devices = DeviceTable::from_probe(&[(gpu, 1)], 3);
+                // Both CMAF jobs must pin to the SAME one-permit device, or the
+                // speculative one never queues and there is nothing to
+                // re-examine. Since 007 every supporting device is in the pool,
+                // so the inputs are chosen to collide rather than assumed to —
+                // on the device the table itself nominates as best, never a
+                // named family.
+                let saturated = devices.eligible_for(&cmaf(), Instant::now())[0];
+                let hold_input = input_pinning_to(&devices, &cmaf(), saturated, "hold");
+                let probe_input = input_pinning_to(&devices, &cmaf(), saturated, "probe");
                 let s = TranscodeScheduler::spawn(
-                    DeviceTable::from_probe(&[(gpu, 1)], 3),
+                    devices,
                     spawner,
                     // The pinned pool is one permit; with the default reserve
                     // it could hold no speculative job at all and there would
@@ -8370,13 +8432,13 @@ mod tests {
                 );
                 let stream = StreamKey::of("viewer");
 
-                // Holds the GPU — and the pin's only candidate — and puts the
-                // viewer's playhead at 100.
+                // Holds the pinned device — the pin's only candidate — and puts
+                // the viewer's playhead at 100.
                 let hold = {
                     let s2 = s.clone();
                     tokio::spawn(async move {
                         s2.submit(
-                            PathBuf::from("/m/hold-gpu"),
+                            hold_input,
                             cmaf(),
                             file_sink(),
                             JobClass::Interactive,
@@ -8396,7 +8458,7 @@ mod tests {
                     let s2 = s.clone();
                     tokio::spawn(async move {
                         s2.submit(
-                            PathBuf::from("/m/probe"),
+                            probe_input,
                             cmaf(),
                             file_sink(),
                             JobClass::Background,
@@ -8417,8 +8479,9 @@ mod tests {
                      are no re-examinations to over-count"
                 );
 
-                // Each of these lands on a free CPU permit and its completion
-                // drives a drain that re-examines the still-queued job.
+                // Unpinned, so each of these lands on whichever device is not
+                // saturated, and its completion drives a drain that re-examines
+                // the still-queued job.
                 for tag in ["cpu-1", "cpu-2", "cpu-3"] {
                     s.submit(
                         PathBuf::from(format!("/m/{tag}")),
@@ -8488,14 +8551,26 @@ mod tests {
                 let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(5), |_, _| {
                     WorkerRunResult::Done { out_bytes: 1 }
                 });
-                let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+                let devices = one_gpu(4);
+                // All three are one member's stream, so they must pin to one
+                // device — and it has to be a device with permits to spare, or
+                // the speculative pair is refused before it can be measured.
+                // Since 007 the pin can resolve anywhere, so the inputs are
+                // chosen to collide on the table's best device rather than
+                // assumed to land there.
+                let target = devices.eligible_for(&cmaf(), Instant::now())[0];
+                let inputs: Vec<PathBuf> = ["head", "forward", "prewarm"]
+                    .iter()
+                    .map(|p| input_pinning_to(&devices, &cmaf(), target, p))
+                    .collect();
+                let s = TranscodeScheduler::spawn(devices, spawner, SchedConfig::default());
                 let stream = StreamKey::of("rewinder");
 
-                let submit = |tag: &'static str, class: JobClass, seg: u32| {
+                let submit = |input: PathBuf, tag: &'static str, class: JobClass, seg: u32| {
                     let s2 = s.clone();
                     async move {
                         s2.submit(
-                            PathBuf::from(format!("/m/{tag}")),
+                            input,
                             cmaf(),
                             file_sink(),
                             class,
@@ -8511,11 +8586,11 @@ mod tests {
                 };
 
                 // The member is at 500...
-                submit("head", JobClass::Interactive, 500).await;
+                submit(inputs[0].clone(), "head", JobClass::Interactive, 500).await;
                 // ...its ordinary prefetch is five ahead...
-                submit("forward", JobClass::Background, 505).await;
+                submit(inputs[1].clone(), "forward", JobClass::Background, 505).await;
                 // ...and the group has just seeked it back to 100.
-                submit("prewarm", JobClass::Background, 100).await;
+                submit(inputs[2].clone(), "prewarm", JobClass::Background, 100).await;
             })
         });
 
