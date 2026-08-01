@@ -17,6 +17,7 @@ pub mod parental;
 pub mod person_image_backfill;
 pub mod prefetch_registry;
 pub mod quick_connect;
+pub mod remote;
 pub mod router;
 #[cfg(unix)]
 pub mod scan_tasks;
