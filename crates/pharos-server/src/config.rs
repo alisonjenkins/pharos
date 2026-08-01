@@ -34,6 +34,90 @@ pub struct Config {
     /// own defaults, which is what every user got before this existed.
     #[serde(default)]
     pub user_defaults: UserDefaultsConfig,
+    /// 008 — URL-backed media sources. Absent / `enabled = false` (the default)
+    /// leaves the feature entirely off.
+    #[serde(default)]
+    pub remote: RemoteConfig,
+}
+
+/// `[remote]` — URL-backed media sources (008).
+///
+/// Off by default, and deliberately not merely "unconfigured but harmless":
+/// restreaming from most sites is contrary to their terms of service, so
+/// switching this on is an operator's decision to make explicitly rather than
+/// something a fresh install inherits.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RemoteConfig {
+    /// Master switch. `false` (the default) means the ingestion endpoint refuses
+    /// and no resolver is ever spawned.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The `yt-dlp` executable. Follows the `PHAROS_FFMPEG` precedent — a bare
+    /// name is resolved on `PATH`, so the devShell and the OCI image both work
+    /// without configuration, and an operator can pin an absolute path.
+    #[serde(default = "default_ytdlp_bin")]
+    pub ytdlp_bin: String,
+    /// Where fetched source bytes are cached. `None` places it beside the
+    /// transcode cache, which is where every other derived artefact lives and is
+    /// what the deployment already sizes and retains.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Ceiling on the source cache, in bytes. This is TRANSIENT working space,
+    /// not library storage: a remote item's row survives eviction because its
+    /// identity is the synthetic path, not the bytes, so the only cost of
+    /// evicting is re-fetching on next play.
+    #[serde(default = "default_remote_cache_max_bytes")]
+    pub cache_max_bytes: u64,
+    /// How long a resolved media URL is reused before being re-resolved.
+    ///
+    /// Signed URLs carry their own expiry, which is generally hours, but it is
+    /// neither uniform across sites nor always honestly advertised. This is a
+    /// ceiling on pharos's own reuse, not a claim about the upstream lifetime:
+    /// an expired URL still has to be handled when it is used, because a URL can
+    /// be revoked before any TTL elapses.
+    #[serde(default = "default_resolve_ttl_secs")]
+    pub resolve_ttl_secs: u64,
+}
+
+fn default_ytdlp_bin() -> String {
+    "yt-dlp".to_string()
+}
+
+/// Parse a boolean env override, or `None` if the value is not recognised.
+///
+/// Unrecognised is deliberately NOT "false": a typo in a chart value would then
+/// silently disable a feature the operator had just switched on, and nothing
+/// would say so. `None` leaves the configured value alone and the caller warns.
+fn env_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// 8 GiB — a few films' worth of working space, small enough not to crowd the
+/// segment cache on the same volume.
+fn default_remote_cache_max_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+/// 30 minutes. Comfortably inside the shortest signed-URL lifetimes seen in
+/// practice while still amortising the resolver spawn across a whole viewing.
+fn default_resolve_ttl_secs() -> u64 {
+    30 * 60
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ytdlp_bin: default_ytdlp_bin(),
+            cache_dir: None,
+            cache_max_bytes: default_remote_cache_max_bytes(),
+            resolve_ttl_secs: default_resolve_ttl_secs(),
+        }
+    }
 }
 
 /// `[user_defaults]` — the track preferences a newly created user starts with.
@@ -734,6 +818,28 @@ impl Config {
                 self.musicbrainz.contact = Some(v.to_string());
             }
         }
+        // 008 — the feature switch is env-overridable so a deployment can turn
+        // URL-backed sources on without a chart edit, and the binary path
+        // follows the `PHAROS_FFMPEG` precedent for the same reason it exists
+        // there: the image knows where its tools are, the repo does not.
+        // Anything other than a recognised truthy value leaves the default
+        // (off) in place rather than guessing.
+        if let Ok(v) = std::env::var("PHAROS_REMOTE_ENABLED") {
+            match env_bool(&v) {
+                Some(b) => self.remote.enabled = b,
+                None if !v.trim().is_empty() => tracing::warn!(
+                    value = %v,
+                    "PHAROS_REMOTE_ENABLED is not a recognised boolean; leaving [remote].enabled unchanged"
+                ),
+                None => {}
+            }
+        }
+        if let Ok(v) = std::env::var("PHAROS_YTDLP") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.remote.ytdlp_bin = v.to_string();
+            }
+        }
         self
     }
 }
@@ -743,6 +849,54 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// 008 — the feature is off unless somebody says otherwise, and the rest of
+    /// the section still has usable defaults so turning it on is one line.
+    #[test]
+    fn remote_sources_are_off_by_default_but_fully_defaulted() {
+        let r = RemoteConfig::default();
+        assert!(!r.enabled, "restreaming must never be on by default");
+        assert_eq!(r.ytdlp_bin, "yt-dlp");
+        assert_eq!(r.cache_dir, None);
+        assert!(
+            r.cache_max_bytes > 0,
+            "an unbounded source cache fills the volume"
+        );
+        assert!(
+            r.resolve_ttl_secs > 0,
+            "a zero TTL re-resolves on every segment"
+        );
+
+        // The section is optional: a config.toml that predates 008 still parses,
+        // and lands on exactly the same defaults.
+        let parsed: RemoteConfig = toml::from_str("").expect("empty section parses");
+        assert_eq!(parsed, r);
+
+        // And enabling it does not require restating everything else.
+        let parsed: RemoteConfig = toml::from_str("enabled = true").expect("parses");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.ytdlp_bin, "yt-dlp");
+        assert_eq!(parsed.cache_max_bytes, r.cache_max_bytes);
+    }
+
+    /// An unrecognised env value leaves the configured setting ALONE.
+    ///
+    /// Mapping it to `false` would mean a typo in a chart value silently
+    /// disables a feature the operator had just switched on, with nothing to
+    /// show for it. Both truthy and falsy spellings are pinned because the chart
+    /// and a shell disagree about which one is idiomatic.
+    #[test]
+    fn an_unrecognised_boolean_override_is_not_silently_false() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert_eq!(env_bool(v), Some(true), "{v:?}");
+        }
+        for v in ["0", "false", "No", "off"] {
+            assert_eq!(env_bool(v), Some(false), "{v:?}");
+        }
+        for v in ["", "  ", "maybe", "tru", "2", "enabled"] {
+            assert_eq!(env_bool(v), None, "{v:?}");
+        }
+    }
 
     const SAMPLE: &str = r#"
         [server]
