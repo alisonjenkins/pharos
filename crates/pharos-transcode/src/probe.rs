@@ -263,7 +263,24 @@ pub async fn probe_encode_rate(device: DeviceId, timeout: Duration) -> Option<f6
 /// H264 is the probe codec because it is the one target essentially every
 /// encoder implements; a device that cannot encode it is measured on its
 /// software fallback, which is what it would actually use.
+///
+/// The VAAPI `format=nv12,hwupload` filter runs inside the timed region
+/// (same as `probe_args`/`codec_probe_args`), not before it. That cost is
+/// unavoidable on this device family — a real segment transcode pays it too
+/// — so excluding it would make the VAAPI number incomparable to what the
+/// device actually costs in production, the same comparability concern 006
+/// raises about the instrument as a whole.
+///
+/// Always returns `Some`: an `Hw` device with no H264 encoder falls back to
+/// `libx264` rather than bailing, so there is currently no input that makes
+/// this fail to build an argv. That's still worth keeping as `Option` rather
+/// than collapsing it, though: with the GPU index now wired through (below),
+/// a *nonexistent* NVENC index is a valid argv here but fails at ffmpeg
+/// runtime, which is exactly where `probe_encode_rate`'s `?`/`None` handling
+/// is supposed to catch it — the fallibility has moved from argv
+/// construction to process exit status, not disappeared.
 fn rate_probe_args(device: DeviceId, frames: u32) -> Option<Vec<String>> {
+    use crate::hwaccel::HwAccel;
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -294,6 +311,12 @@ fn rate_probe_args(device: DeviceId, frames: u32) -> Option<Vec<String>> {
     }
     a.push("-c:v".into());
     a.push(encoder);
+    if let DeviceId::Hw { accel, index } = device {
+        if matches!(accel, HwAccel::Nvenc) {
+            a.push("-gpu".into());
+            a.push(index.to_string());
+        }
+    }
     a.push("-frames:v".into());
     a.push(frames.to_string());
     a.push("-f".into());
@@ -487,5 +510,21 @@ mod tests {
         assert!(a.contains("format=nv12,hwupload"), "{a}");
         assert!(a.contains("-c:v h264_vaapi"), "{a}");
         assert!(a.contains("-f null"), "{a}");
+    }
+
+    /// Finding 1: `rate_probe_args` must carry the requested NVENC index
+    /// through as `-gpu`, exactly like `probe_args` and `codec_probe_args`
+    /// already do. Without it, every index probes ffmpeg's default GPU 0,
+    /// so distinct indices become indistinguishable (or a nonexistent index
+    /// silently "succeeds" against GPU 0 instead of failing).
+    #[test]
+    fn rate_probe_args_carry_the_requested_gpu_index() {
+        let a = rate_probe_args(DeviceId::hw(HwAccel::Nvenc, 3), 120)
+            .expect("rate_probe_args is currently infallible")
+            .join(" ");
+        assert!(
+            a.contains("-gpu 3"),
+            "rate probe for NVENC index 3 must pin -gpu 3, got: {a}"
+        );
     }
 }
