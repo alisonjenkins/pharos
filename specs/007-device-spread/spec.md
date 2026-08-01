@@ -1,8 +1,44 @@
 # 007-device-spread — use every encoder the machine actually has
 
-**Status**: designed 2026-08-01
+**Status**: designed 2026-08-01; **phase A implemented 2026-08-01, pending
+deploy**; **phase B built, measured and dropped** (see its section).
 **Depends on**: 006 (the queue, the learned per-device allowance, `urgency_key`,
 and **V126**), spec 003 R8 / V80 / #114 (the shared-init one-encoder rule)
+
+## What shipped, and where it diverged from this design
+
+Phase A landed as designed. Three things the design did not anticipate, each
+forced by something implementation found:
+
+1. **Quantisation cannot deliver placement stability, so persistence does.** The
+   design leaned on bucketing the measured rate coarsely enough that noise could
+   not move a weight. That is not achievable: `.round()` *relocates* the
+   zero-margin set from `{2^k}` to `{2^(k+0.5)}` rather than shrinking it, both
+   sides of the ratio are noisy, the reference is a `min` over a set so one noisy
+   device re-places renditions on every other, and a probe **timeout** shifts the
+   reference discontinuously on unchanged hardware. The measured rates are now
+   persisted (`rate_store`) keyed by device identity, so unchanged hardware
+   reuses them and skips probing — placement is stable by construction rather
+   than by probability, and boot is faster.
+2. **The cache generation is derived from the placement rule.** `HLS_GEN_VERSION`
+   alone closed only the deploy transition. Because weight is capacity in
+   production and `probe_device_caps` under-reports on a loaded box — its own doc
+   says so, and the chart runs it every pod start — a restart under load could
+   re-place renditions with a warm cache and an unchanged `g=` in the client's
+   immutable init. The generation is now
+   `{HLS_GEN_VERSION}-{digest of the sorted (device_id, weight) list}`, read by
+   both the server-side wipe and the client-visible `g=`. Any future change to
+   the weighting, the probe or the device set invalidates automatically.
+3. **A capacity is ratcheted only if a probe measured it.** `max(stored, probed)`
+   is sound for `probe_device_caps` output, because it only ever reports a
+   concurrency it demonstrated — so a drift down is an artefact. It is *not*
+   sound for a computed CPU permit count or an operator's configured session cap,
+   where a change is genuine; ratcheting those would latch a down-sized VM's old
+   core count forever, silently, since a software encode is never refused.
+
+**Phase B was implemented and then dropped**, which is recorded in full in its
+own section: a device weight measured on one codec cannot order work for another,
+and `vp9_lands_on_vaapi_hardware` caught it.
 
 ## The portability rule this spec is answerable to
 
