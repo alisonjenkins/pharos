@@ -4219,7 +4219,20 @@ mod tests {
                 // supporting device, so the probe's input is CHOSEN to pin to
                 // the held device instead of assumed to — and that device is
                 // read from the table, never named.
+                //
+                // The hold job runs `h264()` (mpegts) and the pinned job
+                // `cmaf()` (fMP4), so the target is read from ONE and used
+                // against the OTHER. They coincide here only because every
+                // device in this fixture can encode H.264; say so, rather than
+                // let a future fixture make the test silently vacuous.
                 let held = devices.eligible_for(&h264(), Instant::now())[0];
+                assert!(
+                    devices
+                        .eligible_for(&cmaf(), Instant::now())
+                        .contains(&held),
+                    "the device the hold job takes must also be able to serve \
+                     the pinned CMAF job, or nothing contends"
+                );
                 let probe_input = input_pinning_to(&devices, &cmaf(), held, "probe");
                 let s = TranscodeScheduler::spawn(devices, spawner, SchedConfig::default());
 
