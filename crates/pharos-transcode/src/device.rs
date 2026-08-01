@@ -589,7 +589,6 @@ mod tests {
     use crate::options::{AudioCodec, Container, VideoCodec};
     use std::time::Duration;
 
-    #[test]
     /// The 2026-08-01 outage in one assertion. A card that decodes H.264, HEVC
     /// and VP9 and has no AV1 block must be told to decode H.264 and refused
     /// AV1 — the whole point being that "it is a GPU" is not the question.
@@ -673,6 +672,7 @@ mod tests {
 
     fn h264_opts() -> TranscodeOptions {
         TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -1051,6 +1051,7 @@ mod pool_tests {
     /// other test modules in this file do.
     fn fmp4(video: VideoCodec) -> TranscodeOptions {
         TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(video),

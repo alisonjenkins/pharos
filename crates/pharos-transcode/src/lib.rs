@@ -114,8 +114,13 @@ impl FfmpegTranscoder {
         opts: &TranscodeOptions,
     ) -> Result<TranscodeStream, TranscodeError> {
         let input_str = input.to_str().ok_or(TranscodeError::NonUtf8Path)?;
-        let args =
-            build_args_for_device(input_str, opts, hwaccel_to_device(self.hwaccel), "pipe:1");
+        let args = build_args_for_device(
+            input_str,
+            opts,
+            hwaccel_to_device(self.hwaccel),
+            "pipe:1",
+            crate::DecodeOffload::Allowed,
+        );
         let mut cmd = Command::new(&self.ffmpeg_bin);
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
@@ -374,7 +379,13 @@ fn push_video_filters(
 
 #[cfg(test)]
 fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
-    build_args_for_device(input, opts, crate::protocol::DeviceId::Cpu, "pipe:1")
+    build_args_for_device(
+        input,
+        opts,
+        crate::protocol::DeviceId::Cpu,
+        "pipe:1",
+        crate::DecodeOffload::Allowed,
+    )
 }
 
 /// Map a legacy `HwAccel` selection to a concrete `DeviceId` (GPU
@@ -466,11 +477,23 @@ pub enum DecodeAccel {
     /// A hardware device whose accel carries no decode side (`HwAccel::Off` /
     /// `Auto` have no `-hwaccel` name).
     NoDecoderForAccel,
+    /// The device is real and has a decoder, but nothing proved it can decode
+    /// THIS source codec — so the decode stays in software.
+    ///
+    /// The interesting failure this prevents: a 10-bit AV1 file placed on a
+    /// GTX 1070, whose Pascal silicon has H.264/HEVC/VP9 decode blocks and no
+    /// AV1 one. See [`DecodeOffload`].
+    NotProvenDecodable,
 }
 
 impl DecodeAccel {
-    /// The verdict for `opts` placed on `device`.
-    pub fn of(opts: &TranscodeOptions, device: crate::protocol::DeviceId) -> Self {
+    /// The verdict for `opts` placed on `device`, given whether the caller
+    /// established that this device can decode this source (`offload`).
+    pub fn of(
+        opts: &TranscodeOptions,
+        device: crate::protocol::DeviceId,
+        offload: DecodeOffload,
+    ) -> Self {
         use crate::protocol::DeviceId;
         if opts.video.is_none() || matches!(opts.video, Some(VideoCodec::Copy)) {
             return Self::NoVideoDecode;
@@ -482,9 +505,24 @@ impl DecodeAccel {
         // ffmpeg 8.1: with the device missing, ffmpeg reports `Device creation
         // failed` and exits 255 rather than falling back, so emitting
         // `-hwaccel` speculatively would break every transcode on a box
-        // without the device. With the device present but the codec
+        // without the device.
+        //
+        // This used to continue: "with the device present but the codec
         // unsupported by its decoder it falls back to software and exits 0 —
-        // which is why an odd codec on a real GPU is safe.
+        // which is why an odd codec on a real GPU is safe." That was written
+        // down as a measurement and it is FALSE. On 2026-08-01 a 10-bit AV1
+        // source on a real, healthy GTX 1070 produced `hwaccel initialisation
+        // returned error`, a decode error rate of 1.0, and a job that failed —
+        // no software fallback, no exit 0. The claim was probably measured on
+        // VAAPI, where the fallback does happen; it does not generalise to
+        // NVDEC, and nothing here was ever codec-aware enough to notice.
+        //
+        // So the safety now comes from evidence rather than from that
+        // assertion: `offload` carries a boot-time trial decode's answer for
+        // this exact (source codec, device) pair.
+        if matches!(offload, DecodeOffload::Denied) {
+            return Self::NotProvenDecodable;
+        }
         match device.hwaccel().decoder_hwaccel() {
             Some(name) => Self::Gpu { name },
             None => Self::NoDecoderForAccel,
@@ -505,8 +543,27 @@ impl DecodeAccel {
             Self::NoVideoDecode => "no_video_decode",
             Self::SoftwareDevice => "software_device",
             Self::NoDecoderForAccel => "no_decoder_for_accel",
+            Self::NotProvenDecodable => "not_proven_decodable",
         }
     }
+}
+
+/// Whether a job may offload its SOURCE DECODE to the device it was placed on.
+///
+/// A named type, not a `bool`, because it is decided in one process and
+/// consumed in another. The server holds the boot-time decode probe
+/// ([`probe::probe_decodable_codecs`]) and the device table it answered into;
+/// the transcode worker is a separate process with no capability table of its
+/// own, and no way to re-derive this. It therefore travels on [`protocol::JobSpec`]
+/// alongside the device, and every argv builder takes it explicitly so that
+/// "nobody decided" is a compile error rather than a silent `Allowed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DecodeOffload {
+    /// A trial decode proved this device handles this source codec.
+    Allowed,
+    /// It did not — or the source codec is unknown, or nobody asked. Decode in
+    /// software; the encoder still runs on the device.
+    Denied,
 }
 
 impl std::fmt::Display for DecodeAccel {
@@ -530,8 +587,9 @@ pub fn ffmpeg_transcode_args(
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
     output: &str,
+    offload: DecodeOffload,
 ) -> Vec<String> {
-    build_args_for_device(input, opts, device, output)
+    build_args_for_device(input, opts, device, output, offload)
 }
 
 fn build_args_for_device(
@@ -539,6 +597,7 @@ fn build_args_for_device(
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
     output: &str,
+    offload: DecodeOffload,
 ) -> Vec<String> {
     use crate::protocol::DeviceId;
     let preroll_seconds = opts
@@ -560,10 +619,13 @@ fn build_args_for_device(
     // A real decode: `-c:v copy` decodes nothing and an audio-only job has no
     // video decoder. Shares its definition with `DecodeAccel::of`, which is
     // the ONE place the GPU-decode question is answered.
-    let decoding_video = !matches!(DecodeAccel::of(opts, device), DecodeAccel::NoVideoDecode);
+    let decoding_video = !matches!(
+        DecodeAccel::of(opts, device, offload),
+        DecodeAccel::NoVideoDecode
+    );
     // Decode on the GPU as well as encode there — see [`DecodeAccel`], so what
     // the scheduler reports and what ffmpeg is actually told cannot drift.
-    if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device) {
+    if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device, offload) {
         a.push("-hwaccel".into());
         a.push(name.into());
         // Decode on the SAME GPU that will encode. Without this a multi-GPU
@@ -1120,6 +1182,7 @@ mod tests {
 
     fn opts() -> TranscodeOptions {
         TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mp4,
             video: Some(VideoCodec::H264),
@@ -1161,6 +1224,7 @@ mod tests {
                 index: 0,
             },
             "/out.ts",
+            crate::DecodeOffload::Allowed,
         );
         assert!(
             !hw.iter().any(|x| x == "-enc_time_base"),
@@ -1173,7 +1237,13 @@ mod tests {
         assert_eq!(hw[r + 1], "24000/1001", "{hw:?}");
 
         // Software keeps the exact-timebase route and must NOT be changed.
-        let sw = build_args_for_device("/m/foo.mkv", &o, crate::protocol::DeviceId::Cpu, "/out.ts");
+        let sw = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Cpu,
+            "/out.ts",
+            crate::DecodeOffload::Allowed,
+        );
         let e = sw
             .iter()
             .position(|x| x == "-enc_time_base")
@@ -1212,9 +1282,15 @@ mod tests {
                 index: 0,
             },
             "/out.m4s",
+            crate::DecodeOffload::Allowed,
         );
-        let sw =
-            build_args_for_device("/m/foo.mkv", &o, crate::protocol::DeviceId::Cpu, "/out.m4s");
+        let sw = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Cpu,
+            "/out.m4s",
+            crate::DecodeOffload::Allowed,
+        );
         pinned(&hw, "hardware");
         pinned(&sw, "software");
         // The frame-grid routes stay device-specific — the timescale pin is
@@ -1239,6 +1315,7 @@ mod tests {
                 index: 0,
             },
             "/out.ts",
+            crate::DecodeOffload::Allowed,
         );
         assert!(!hw.iter().any(|x| x == "-r"), "{hw:?}");
     }
@@ -1311,6 +1388,7 @@ mod tests {
             &opts(),
             crate::protocol::DeviceId::hw(HwAccel::Nvenc, 0),
             "pipe:1",
+            crate::DecodeOffload::Allowed,
         );
         let joined = a.join(" ");
         assert!(joined.contains("h264_nvenc"), "{joined}");
@@ -1352,6 +1430,7 @@ mod tests {
     #[test]
     fn vp9_webm_args_are_realtime_and_skip_movflags() {
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::WebM,
             video: Some(VideoCodec::Vp9),
@@ -1411,6 +1490,7 @@ mod tests {
         //   negative; fmp4.rs clamps that).
         // - `+frag_discont`: per-segment runs are discontinuous by design.
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(VideoCodec::Vp9),
@@ -1447,6 +1527,7 @@ mod tests {
         // codec/encoder-agnostic and MUST still be present so hw fMP4 segments
         // tile on one timeline.
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(VideoCodec::H264),
@@ -1463,9 +1544,14 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
         };
-        let nvenc =
-            build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.m4s")
-                .join(" ");
+        let nvenc = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::hw(HwAccel::Nvenc, 0),
+            "out.m4s",
+            crate::DecodeOffload::Allowed,
+        )
+        .join(" ");
         assert!(
             !nvenc.contains("-enc_time_base"),
             "nvenc fMP4 must NOT force enc_time_base: {nvenc}"
@@ -1479,8 +1565,15 @@ mod tests {
             "hw fMP4 keeps source anchoring: {nvenc}"
         );
 
-        // The SAME opts on the software (CPU) encoder DO keep the flag.
-        let cpu = build_args_for_device("/m/x.mkv", &o, DeviceId::Cpu, "out.m4s").join(" ");
+        // The SAME opts on the software (CPU, crate::DecodeOffload::Allowed) encoder DO keep the flag.
+        let cpu = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::Cpu,
+            "out.m4s",
+            crate::DecodeOffload::Allowed,
+        )
+        .join(" ");
         assert!(
             cpu.contains("-enc_time_base 1:90000"),
             "software fMP4 keeps enc_time_base: {cpu}"
@@ -1535,6 +1628,7 @@ mod tests {
     #[test]
     fn copy_codecs_skip_bitrate() {
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mp4,
             video: Some(VideoCodec::Copy),
@@ -1562,6 +1656,7 @@ mod tests {
     #[test]
     fn no_video_emits_vn() {
         let o = TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mp3,
             video: None,
@@ -1835,7 +1930,13 @@ mod tests {
     fn vaapi_device_emits_render_node_and_hwupload() {
         use crate::protocol::DeviceId;
         let o = opts(); // H264
-        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Vaapi, 1), "out.ts");
+        let a = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::hw(HwAccel::Vaapi, 1),
+            "out.ts",
+            crate::DecodeOffload::Allowed,
+        );
         let joined = a.join(" ");
         assert!(
             joined.contains("-vaapi_device /dev/dri/renderD129"),
@@ -1944,6 +2045,58 @@ mod tests {
         (at(&a[..i]), at(&a[i..]))
     }
 
+    /// A denied offload emits NO `-hwaccel`, on a device that would otherwise
+    /// get one.
+    ///
+    /// This is the argv-level statement of the 2026-08-01 fix. The encoder is
+    /// unaffected — the job still runs `h264_nvenc` on the GPU — and only the
+    /// DECODE moves back to software, which is what makes the gate cheap enough
+    /// to apply whenever the card's ability is unproven.
+    ///
+    /// The comment this replaced asserted the opposite was safe: "with the
+    /// device present but the codec unsupported by its decoder it falls back to
+    /// software and exits 0". A real GTX 1070 given a 10-bit AV1 source
+    /// returned `hwaccel initialisation returned error` and a decode error rate
+    /// of 1.0 instead.
+    #[test]
+    fn a_denied_decode_offload_emits_no_hwaccel_but_keeps_the_hardware_encoder() {
+        use crate::protocol::DeviceId;
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        let dev = DeviceId::hw(HwAccel::Nvenc, 1);
+
+        let denied = build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Denied);
+        assert!(
+            !denied.iter().any(|x| x == "-hwaccel"),
+            "a source this card was never proved able to decode must not be \
+             handed to its decoder: {denied:?}"
+        );
+        assert!(!denied.iter().any(|x| x == "-hwaccel_device"), "{denied:?}");
+        assert!(
+            denied
+                .windows(2)
+                .any(|w| w[0] == "-c:v" && w[1] == "h264_nvenc"),
+            "only the DECODE moves to software; the encoder stays on the \
+             device the scheduler placed this job on: {denied:?}"
+        );
+
+        // And the same options with the offload allowed DO reach the decoder,
+        // so the assertion above is about the gate rather than about this
+        // device never emitting `-hwaccel` at all.
+        let allowed = build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Allowed);
+        assert!(allowed.iter().any(|x| x == "-hwaccel"), "{allowed:?}");
+
+        // The reported verdict and the argv are one decision, not two.
+        assert_eq!(
+            DecodeAccel::of(&o, dev, DecodeOffload::Denied),
+            DecodeAccel::NotProvenDecodable
+        );
+        assert_eq!(
+            DecodeAccel::of(&o, dev, DecodeOffload::Denied).label(),
+            "not_proven_decodable"
+        );
+    }
+
     #[test]
     fn a_hardware_job_decodes_on_the_gpu_too() {
         use crate::protocol::DeviceId;
@@ -1951,7 +2104,13 @@ mod tests {
         // GPU transcode still decoded every source frame on the CPU.
         let mut o = opts();
         o.container = Container::Mpegts;
-        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 1), "out.ts");
+        let a = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::hw(HwAccel::Nvenc, 1),
+            "out.ts",
+            crate::DecodeOffload::Allowed,
+        );
         let i = a.iter().position(|x| x == "-i").expect("input");
         let h = a.iter().position(|x| x == "-hwaccel").expect("-hwaccel");
         assert!(h < i, "-hwaccel is an INPUT option: {a:?}");
@@ -1965,7 +2124,13 @@ mod tests {
         assert_eq!(a[d + 1], "1", "{a:?}");
         assert!(a.windows(2).any(|w| w[0] == "-gpu" && w[1] == "1"), "{a:?}");
 
-        let v = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Vaapi, 0), "out.ts");
+        let v = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::hw(HwAccel::Vaapi, 0),
+            "out.ts",
+            crate::DecodeOffload::Allowed,
+        );
         let vh = v.iter().position(|x| x == "-hwaccel").expect("-hwaccel");
         assert_eq!(v[vh + 1], "vaapi", "{v:?}");
     }
@@ -1979,7 +2144,13 @@ mod tests {
         // would break every software transcode.
         let mut o = opts();
         o.container = Container::Mpegts;
-        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::Cpu, "out.ts");
+        let a = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::Cpu,
+            "out.ts",
+            crate::DecodeOffload::Allowed,
+        );
         assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
     }
 
@@ -1989,7 +2160,13 @@ mod tests {
         let mut o = opts();
         o.container = Container::Mpegts;
         o.video = Some(VideoCodec::Copy);
-        let a = build_args_for_device("/m/x.mkv", &o, DeviceId::hw(HwAccel::Nvenc, 0), "out.ts");
+        let a = build_args_for_device(
+            "/m/x.mkv",
+            &o,
+            DeviceId::hw(HwAccel::Nvenc, 0),
+            "out.ts",
+            crate::DecodeOffload::Allowed,
+        );
         assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
     }
 
@@ -2051,9 +2228,15 @@ mod tests {
             (&copy, DeviceId::Cpu, DecodeAccel::NoVideoDecode),
         ];
         for (o, device, want) in cases {
-            let got = DecodeAccel::of(o, device);
+            let got = DecodeAccel::of(o, device, crate::DecodeOffload::Allowed);
             assert_eq!(got, want, "verdict for {device}");
-            let a = build_args_for_device("/m/x.mkv", o, device, "out.ts");
+            let a = build_args_for_device(
+                "/m/x.mkv",
+                o,
+                device,
+                "out.ts",
+                crate::DecodeOffload::Allowed,
+            );
             match got {
                 DecodeAccel::Gpu { name } => {
                     let i = a

@@ -1258,6 +1258,24 @@ fn segment_etag(
 /// cap when the session is missing (jellyfin clients that go
 /// straight at /master.m3u8 without a PlaySessionId — rare but
 /// possible).
+/// The SOURCE video codec of `item`, in the form the scheduler's decode gate
+/// reads.
+///
+/// One helper rather than the expression repeated at each `SegmentOpts` site:
+/// the whole value of the gate is that it cannot be forgotten on one path, and
+/// four hand-copied `and_then`s is exactly how one path ends up with `None` —
+/// which reads as "do not offload" and silently costs that rendition its GPU
+/// decode with nothing to notice it.
+///
+/// `None` when the probe never named a video codec, or named one the decode
+/// probe has no sample for. Both are honest answers: unproven, so software.
+fn source_video_codec(probe: &pharos_core::MediaProbe) -> Option<pharos_transcode::SourceCodec> {
+    probe
+        .video_codec
+        .as_deref()
+        .and_then(pharos_transcode::SourceCodec::from_name)
+}
+
 fn build_segment_opts(
     session: Option<crate::transcode_sessions::TranscodeSession>,
     item: &pharos_core::MediaItem,
@@ -1403,6 +1421,7 @@ fn build_segment_opts(
                         item.probe.bitrate_bps,
                     )),
                     window,
+                    source_video_codec: source_video_codec(&item.probe),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
                     burn_subtitle_is_text: subtitle_is_text,
@@ -1433,6 +1452,7 @@ fn build_segment_opts(
 
                     video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
                     window,
+                    source_video_codec: source_video_codec(&item.probe),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
                     burn_subtitle_is_text: subtitle_is_text,
@@ -1463,6 +1483,7 @@ fn build_segment_opts(
 
         video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
         window,
+        source_video_codec: source_video_codec(&item.probe),
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index: subtitle_stream_index,
         burn_subtitle_is_text: subtitle_is_text,
@@ -3001,6 +3022,7 @@ fn fmp4_segment_opts_resolved(
         audio: AudioDelivery::Separate,
         video_bitrate_bps: Some(bitrate),
         window,
+        source_video_codec: source_video_codec(&item.probe),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
         burn_subtitle_is_text: sub_is_text,

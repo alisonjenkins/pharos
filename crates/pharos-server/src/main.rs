@@ -1055,7 +1055,8 @@ async fn build_transcode_scheduler(
 )> {
     use pharos_transcode::device::{default_cpu_permits, enumerate, DeviceTable};
     use pharos_transcode::probe::{
-        probe_device_caps, probe_encodable_codecs, probe_encode_rate, ProbeConfig,
+        probe_decodable_codecs, probe_device_caps, probe_encodable_codecs, probe_encode_rate,
+        ProbeConfig,
     };
     use pharos_transcode::protocol::{DeviceId, WorkerId};
     use pharos_transcode::rate_store::{ProbedCapacity, RateStore};
@@ -1233,7 +1234,44 @@ async fn build_transcode_scheduler(
         .find(|d| matches!(d.device, DeviceId::Cpu))
         .copied();
     let cpu_permits = cpu.map_or_else(default_cpu_permits, |d| d.capacity);
-    let table = DeviceTable::from_probe_weighted(&hw_rated, cpu_permits, cpu.and_then(|d| d.rate));
+    let mut table =
+        DeviceTable::from_probe_weighted(&hw_rated, cpu_permits, cpu.and_then(|d| d.rate));
+    // Ask each confirmed device which SOURCE codecs it can actually DECODE, by
+    // trial decode — the mirror of the encode trial above, and needed for the
+    // same reason. `-hwaccel` was emitted for every job on a hardware device,
+    // chosen from the device alone and never from the source, so on 2026-08-01
+    // a 10-bit AV1 file reached a GTX 1070 whose Pascal silicon has no AV1
+    // decode block, failed every frame, and (before the classification split)
+    // cooled the whole card and took 453 unrelated client segments with it.
+    //
+    // Runs unconditionally, not under `probe_caps`: an unprobed device keeps
+    // the old offload-everything behaviour, which is exactly the behaviour that
+    // caused the incident. The result is recorded even when EMPTY — that is a
+    // real answer meaning "decode nothing here in hardware", and it must not be
+    // confused with never having asked.
+    for (d, _) in &caps {
+        if !matches!(d, DeviceId::Hw { .. }) {
+            continue;
+        }
+        let decodable = probe_decodable_codecs(*d, probe_timeout).await;
+        // Logged with the REJECTED set beside the confirmed one. A device that
+        // decodes nothing and a device that was never probed produce the same
+        // silence otherwise, and the difference between them is whether GPU
+        // decode is off by measurement or by accident.
+        let rejected: Vec<&str> = pharos_transcode::SourceCodec::ALL
+            .iter()
+            .filter(|c| !decodable.contains(c))
+            .map(|c| c.label())
+            .collect();
+        tracing::info!(
+            device = %d,
+            decodes = ?decodable.iter().map(|c| c.label()).collect::<Vec<_>>(),
+            cannot_decode = ?rejected,
+            "hardware DECODE capability confirmed by trial decode; sources \
+             outside the confirmed set decode in software on this device"
+        );
+        table.set_decodable(*d, &decodable);
+    }
     // Read BEFORE the table is moved into the scheduler. This is the whole
     // placement input, digested — see `DeviceTable::placement_fingerprint`.
     let placement_fingerprint = table.placement_fingerprint();

@@ -134,6 +134,15 @@ pub struct JobSpec {
     /// Scheduler's chosen device. The worker opens exactly this device
     /// (or fails with `DeviceBusy` so the scheduler can retry elsewhere).
     pub device: DeviceId,
+    /// Whether this job may offload SOURCE DECODE to `device`.
+    ///
+    /// Travels beside the device because it is a fact about the PAIR, and only
+    /// the scheduler knows both: it picks the device, and it is the process
+    /// holding the boot-time decode probe's answer. A worker cannot re-derive
+    /// it — it is a separate process with no capability table — and the
+    /// previous behaviour of deciding from the device alone is what sent a
+    /// 10-bit AV1 source to a card with no AV1 decode block.
+    pub decode_offload: crate::DecodeOffload,
     pub sink: OutputSink,
 }
 
@@ -449,9 +458,11 @@ mod tests {
 
     fn sample_job() -> JobSpec {
         JobSpec {
+            decode_offload: crate::DecodeOffload::Allowed,
             job_id: JobId(7),
             input: PathBuf::from("/m/in.mkv"),
             opts: TranscodeOptions {
+                source_video_codec: None,
                 source_frame_rate: None,
                 container: Container::Mpegts,
                 video: Some(VideoCodec::H264),

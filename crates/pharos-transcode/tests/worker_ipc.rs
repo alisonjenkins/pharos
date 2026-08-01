@@ -58,9 +58,11 @@ async fn worker_transcodes_file_direct() {
         .expect("spawn worker");
 
     let spec = JobSpec {
+        decode_offload: pharos_transcode::DecodeOffload::Allowed,
         job_id: JobId(1),
         input: input.clone(),
         opts: TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -110,9 +112,11 @@ async fn worker_reports_bad_input() {
         .expect("spawn worker");
 
     let spec = JobSpec {
+        decode_offload: pharos_transcode::DecodeOffload::Allowed,
         job_id: JobId(2),
         input: dir.path().join("does-not-exist.mkv"),
         opts: TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -157,9 +161,11 @@ async fn worker_streams_live_to_stdout() {
 
     let spawner = ProcSpawner::with_worker_bin(WORKER_BIN);
     let spec = JobSpec {
+        decode_offload: pharos_transcode::DecodeOffload::Allowed,
         job_id: JobId(9),
         input,
         opts: TranscodeOptions {
+            source_video_codec: None,
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),

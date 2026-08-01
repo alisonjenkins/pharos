@@ -115,6 +115,7 @@ fn make_chaptered_source(dir: &Path) -> PathBuf {
 /// h264-CMAF and VP9 rungs serve, where audio is a separate rendition.
 fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
     let opts = SegmentOpts {
+        source_video_codec: None,
         container: SegmentContainer::Fmp4,
         video: Some(SegmentVideo::H264),
         audio: AudioDelivery::Separate,
@@ -135,6 +136,7 @@ fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
             .to_transcode_options(),
         DeviceId::Cpu,
         out.to_str().unwrap(),
+        pharos_transcode::DecodeOffload::Allowed,
     );
     let res = Command::new("ffmpeg")
         .args(&args)

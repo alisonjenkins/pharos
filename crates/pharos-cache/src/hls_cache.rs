@@ -3610,6 +3610,7 @@ mod tests {
     /// A 6.006 s video segment's options, matching the production grid.
     fn segment_transcode_opts() -> TranscodeOptions {
         SegmentOpts {
+            source_video_codec: None,
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
             audio: AudioDelivery::Muxed(ContinuousAudio {
@@ -3644,6 +3645,7 @@ mod tests {
     /// UNRESOLVED `SegmentOpts` the cache is keyed on.
     fn segment_opts() -> SegmentOpts {
         SegmentOpts {
+            source_video_codec: None,
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
             audio: AudioDelivery::Muxed(ContinuousAudio {
@@ -3797,6 +3799,7 @@ mod tests {
     /// slice to resolve (`Separate` never calls the resolver).
     fn slow_opts() -> SegmentOpts {
         SegmentOpts {
+            source_video_codec: None,
             container: SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -6240,6 +6243,7 @@ mod tests {
         audio_bitrate_bps: Option<u64>,
     ) -> SegmentOpts {
         SegmentOpts {
+            source_video_codec: None,
             container,
             video,
             audio: match audio {
@@ -6645,6 +6649,7 @@ mod tests {
         let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
         force_insert(&cache, 7, 0, b"segment-bytes").await;
         let opts = SegmentOpts {
+            source_video_codec: None,
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -6668,6 +6673,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
         let opts = SegmentOpts {
+            source_video_codec: None,
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -6694,6 +6700,7 @@ mod tests {
         force_insert(&cache, 7, 1, b"0123456789").await;
         // Touch seg 0 so it's more-recent than seg 1.
         let opts = SegmentOpts {
+            source_video_codec: None,
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -6733,6 +6740,7 @@ mod tests {
         let one = async {
             counter.fetch_add(1, Ordering::SeqCst);
             let opts = SegmentOpts {
+                source_video_codec: None,
                 container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
                 audio: AudioDelivery::Separate,
@@ -6752,6 +6760,7 @@ mod tests {
         let (a, b) = tokio::join!(one, async {
             counter.fetch_add(1, Ordering::SeqCst);
             let opts = SegmentOpts {
+                source_video_codec: None,
                 container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
                 audio: AudioDelivery::Separate,

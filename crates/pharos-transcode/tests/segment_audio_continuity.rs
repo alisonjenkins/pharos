@@ -148,6 +148,7 @@ fn make_continuous_audio(src: &Path, dir: &Path) -> PathBuf {
 fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBuf {
     let rate = pharos_core::FrameRate::from_mille(FPS_MILLE);
     let opts = SegmentOpts {
+        source_video_codec: None,
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
         audio: AudioDelivery::Muxed(ContinuousAudio {
@@ -179,6 +180,7 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
             .to_transcode_options(),
         DeviceId::Cpu,
         out.to_str().unwrap(),
+        pharos_transcode::DecodeOffload::Allowed,
     );
     let res = Command::new("ffmpeg")
         .args(&args)
