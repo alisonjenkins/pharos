@@ -107,9 +107,13 @@ pub fn vaapi_render_node_indices() -> Vec<u8> {
 /// measured, so the noise is the sum of both devices'; and the reference is a
 /// `min` over a SET, so ONE noisy device moves every OTHER device's weight.
 ///
-/// Stability comes from [`crate::rate_store`] instead: unchanged hardware
-/// reuses the stored probe result and is never re-measured, so a rate cannot
-/// differ between two boots at all. What this constant contributes is
+/// Stability is meant to come from [`crate::rate_store`] instead: unchanged
+/// hardware reuses the stored probe result and is never re-measured, so a rate
+/// cannot differ between two boots at all. **That store has no production
+/// caller yet** — it is the next task — and even once wired it is a boot-time
+/// optimisation, not the correctness mechanism: what actually makes a moved
+/// placement safe is that the HLS cache generation is derived from
+/// [`DeviceTable::placement_fingerprint`]. What this constant contributes is
 /// legibility — differences too small to be worth distinguishing don't reach
 /// the weight.
 const RATE_BUCKET_RATIO: f64 = 2.0;
@@ -372,10 +376,27 @@ impl DeviceTable {
     /// The ONE device a shared-init fMP4 rendition must use (spec 003 R8).
     ///
     /// A pure function of `rendition_key` over the devices that support the
-    /// encode, weighted by what the boot probe measured — so it returns the
-    /// same answer after a restart on unchanged hardware. An in-memory or
-    /// load-aware pin would not, and a rendition re-pinned mid-playback serves
-    /// segments that no longer match the client's init (issue #114).
+    /// encode, banded by [`DeviceSlot::weight`]. An in-memory or load-aware pin
+    /// would not be, and a rendition re-pinned mid-playback serves segments
+    /// that no longer match the client's init (issue #114).
+    ///
+    /// **What the weight is in the shipped binary, today.** `main.rs` builds
+    /// the table with [`DeviceTable::from_probe`], which passes no rate, so
+    /// [`device_weight`]'s speed bucket is 1 and the weight is the probed
+    /// CAPACITY alone. `from_probe_weighted`, [`crate::rate_store`] and
+    /// `probe_encode_rate` exist but have no production caller — the rate path
+    /// is the next task. Until it lands, do not read this as "returns the same
+    /// answer after a restart on unchanged hardware": `probe_device_caps` ramps
+    /// trial encodes until one fails and documents that a loaded box
+    /// under-reports, so a restart under playback CAN measure a smaller
+    /// capacity, move the bands, and re-place renditions.
+    ///
+    /// That is survivable only because nothing downstream trusts the claim: the
+    /// HLS cache generation is composed from
+    /// [`DeviceTable::placement_fingerprint`], so a table that would place
+    /// differently invalidates the cached segments AND changes the `g=` in the
+    /// URL the client holds. Stability is an optimisation here, not the
+    /// correctness mechanism.
     ///
     /// Purity matters beyond restarts: `SegmentIdentity` carries no device, so
     /// a rendition whose device changed would serve its CACHED segments from

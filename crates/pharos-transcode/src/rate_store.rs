@@ -34,14 +34,27 @@
 //! for what it is actually good at: making the weight insensitive to
 //! differences too small to be worth distinguishing.
 //!
+//! **Not yet wired.** Nothing outside this module's own tests constructs a
+//! [`RateStore`]; production still builds the table with
+//! `DeviceTable::from_probe`, so the weight is capacity alone and no rate is
+//! measured or stored. The wiring is the next task. Read everything above as
+//! the design this module implements, not as what the shipped binary does.
+//!
 //! **Scope limit, stated rather than implied.** When the fingerprint DOES
 //! differ, renditions re-place — which is correct, because the device set they
 //! were placed into no longer exists — but a client holding an init from before
 //! the hardware change still holds a stale one, and cached segments for a
-//! re-placed rendition are still from the previous encoder. Closing that needs
-//! cache invalidation plus getting the client to re-fetch its init, which is
-//! out of scope here. This module narrows the hazard from "any boot" to "a boot
-//! where the hardware genuinely changed"; it does not remove it.
+//! re-placed rendition are still from the previous encoder.
+//!
+//! That gap is now closed elsewhere, and this module is not what closes it:
+//! `DeviceTable::placement_fingerprint` digests the `(device id, weight)` pairs
+//! placement actually reads, and the HLS cache generation — the on-disk wipe key
+//! AND the `g=` in every shared-init URI — is composed from it. So a re-placed
+//! rendition invalidates its own cached segments and its client's `immutable`
+//! init. Note this store's own [`fingerprint`] could NOT have done that job: it
+//! keys on CAPACITY, so a capacity drift invalidates the store and re-places
+//! anyway. What this module contributes is that unchanged hardware need not
+//! re-probe — a boot-time optimisation that keeps a warm cache warm.
 
 use crate::protocol::DeviceId;
 use serde::{Deserialize, Serialize};
