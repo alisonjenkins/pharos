@@ -25,7 +25,9 @@
 //!
 //! [`MediaProbe`]: pharos_core::MediaProbe
 
+pub mod chunks;
 pub mod codec;
+pub mod source_cache;
 
 use pharos_core::{MediaProbe, RemoteRef};
 use serde::Deserialize;
