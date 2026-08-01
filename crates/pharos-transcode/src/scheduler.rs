@@ -699,6 +699,13 @@ pub struct SchedSnapshot {
 pub struct DeviceStat {
     pub id: DeviceId,
     pub capacity: usize,
+    /// This device's probe-derived share of new shared-init renditions — see
+    /// [`crate::device::device_weight`]. NOT the capacity: a device measured
+    /// faster than the reference weighs a multiple of its permits, and that
+    /// multiple is the whole placement decision. Carried here because the
+    /// snapshot is the only route it has to a metric, and without it a
+    /// misplacement and a mis-weighting are the same observation.
+    pub weight: u32,
     pub in_use: usize,
     pub in_cooldown: bool,
     /// Occupancy attributed to segment jobs, split by class. `in_use` minus
@@ -1875,6 +1882,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 .map(|s| DeviceStat {
                     id: s.id,
                     capacity: s.capacity,
+                    weight: s.weight(),
                     in_use: s.in_use(),
                     in_cooldown: matches!(s.cooldown_until, Some(t) if t > Instant::now()),
                     inflight_interactive: state
@@ -4175,6 +4183,38 @@ mod tests {
         assert_eq!(snap.devices.len(), 3);
         let total_cap: usize = snap.devices.iter().map(|d| d.capacity).sum();
         assert_eq!(total_cap, 2 + 1 + 2);
+    }
+
+    /// The snapshot is the only route the probe-derived weight has to a metric,
+    /// and the weight is what decides where a shared-init rendition is placed.
+    /// A snapshot that reported capacity here would be indistinguishable from a
+    /// correct one on every capacity-only table — which is every table this
+    /// suite built before 007 — so the fixture is deliberately rate-weighted:
+    /// a device four bucket-steps faster than the reference weighs four times
+    /// its permits, and `weight == capacity` fails.
+    #[tokio::test]
+    async fn snapshot_reports_the_placement_weight_not_the_capacity() {
+        let gpu = DeviceId::hw(HwAccel::Nvenc, 0);
+        let devices = DeviceTable::from_probe_weighted(&[(gpu, 2, Some(400.0))], 2, Some(100.0));
+        // Read out of the table, never written down: the bucket arithmetic
+        // belongs to `device_weight`'s own tests, not to this one.
+        let expected: Vec<(DeviceId, u32)> =
+            devices.slots().iter().map(|s| (s.id, s.weight())).collect();
+        assert!(
+            expected.iter().any(|&(id, w)| id == gpu && w != 2),
+            "precondition: the fixture must weigh something other than its \
+             permit count, or this test passes on a snapshot that reports \
+             capacity: {expected:?}"
+        );
+
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
+        let s = TranscodeScheduler::spawn(devices, spawner, SchedConfig::default());
+        let snap = s.snapshot().await.unwrap();
+        let reported: Vec<(DeviceId, u32)> =
+            snap.devices.iter().map(|d| (d.id, d.weight)).collect();
+        assert_eq!(reported, expected);
     }
 
     /// T020a — `pharos_transcode_pin_total{outcome}` is how V80's one-encoder
