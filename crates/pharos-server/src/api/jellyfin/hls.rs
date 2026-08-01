@@ -907,7 +907,7 @@ async fn render_variant_playlist(
     variant: &str,
 ) -> Result<impl Responder, actix_web::Error> {
     let item = load_hls_item(&state, &id).await?;
-    let qs = playback_qs(&req);
+    let qs = source_qs(&req, &item.path);
     let body = MediaPlaylist {
         version: 3,
         independent_segments: true,
@@ -1786,16 +1786,46 @@ fn rendition_qs(req: &HttpRequest, source: &std::path::Path) -> String {
     //
     // Emitted only for a resolvable source, so a local item's URLs are
     // byte-identical to what they were before 008 and no client re-fetches.
-    let src = pharos_cache::hls_cache::SourceGen::for_source(source);
-    let mut out = if qs.is_empty() {
+    let base = if qs.is_empty() {
         format!("g={gen}")
     } else {
         format!("{qs}&g={gen}")
     };
-    if !src.is_local() {
-        out.push_str(&format!("&s={}", src.get()));
+    with_source_gen(base, source)
+}
+
+/// `playback_qs` plus the per-item source generation — for a playlist whose
+/// segments are served `immutable` but which has NO shared init, so the
+/// process-wide `g=` has nothing to say about it.
+///
+/// The mpegts rung is exactly that case and was missed: it repeats its
+/// parameter sets per segment, so it is exempt from the `#114` init hazard `g=`
+/// exists for, and it therefore never adopted `rendition_qs`. But `V132` is a
+/// different question with the same answer — `serve_segment` hands those `.ts`
+/// files back `public, max-age=31536000, immutable` like every other segment,
+/// so a re-resolved source leaves a year of the PREVIOUS resolution's bytes in
+/// the browser regardless of which rung produced them.
+fn source_qs(req: &HttpRequest, source: &std::path::Path) -> String {
+    with_source_gen(playback_qs(req), source)
+}
+
+/// Append `s=` when — and only when — the source is one that can be
+/// re-resolved.
+///
+/// One place, because the rule has a trap on each side. Omit it and an
+/// `immutable` response outlives the bytes it describes; apply it
+/// unconditionally and every LOCAL item's segment URLs change, busting a warm
+/// cache and every client's held init for an item whose bytes cannot move.
+fn with_source_gen(qs: String, source: &std::path::Path) -> String {
+    let src = pharos_cache::hls_cache::SourceGen::for_source(source);
+    if src.is_local() {
+        return qs;
     }
-    out
+    if qs.is_empty() {
+        format!("s={}", src.get())
+    } else {
+        format!("{qs}&s={}", src.get())
+    }
 }
 
 fn playback_qs(req: &HttpRequest) -> String {
@@ -4811,6 +4841,38 @@ mod tests {
         assert!(
             !qs.contains("s="),
             "a local item's URL must be unchanged by 008: {qs}"
+        );
+
+        // The mpegts rung answers the same V132 question and was missed. It
+        // repeats its parameter sets per segment, so it is exempt from the
+        // `#114` init hazard `g=` exists for and never adopted `rendition_qs`
+        // — but `serve_segment` hands its `.ts` files back
+        // `max-age=31536000, immutable` like every other segment, so a
+        // re-resolved source would otherwise leave a year of the previous
+        // resolution's bytes in the browser.
+        let ts_local = source_qs(&bare, local);
+        assert!(
+            !ts_local.contains("s="),
+            "a local mpegts URL must be byte-identical to what it was: {ts_local}"
+        );
+        assert!(
+            !ts_local.contains("g="),
+            "and must NOT gain the placement generation, which would change \
+             every existing local segment URL for a rung that cannot suffer \
+             #114: {ts_local}"
+        );
+        assert_eq!(
+            source_qs(&bare, &remote),
+            format!("s={}", sg.get()),
+            "a URL-backed mpegts rung carries its source generation"
+        );
+        let with_params = actix_web::test::TestRequest::get()
+            .uri("/videos/9/main.m3u8?PlaySessionId=abc")
+            .to_http_request();
+        assert_eq!(
+            source_qs(&with_params, &remote),
+            format!("PlaySessionId=abc&s={}", sg.get()),
+            "and keeps the playback params it was given"
         );
 
         // And the placement generation is still there — `s=` supplements `g=`,
