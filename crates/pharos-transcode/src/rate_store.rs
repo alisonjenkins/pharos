@@ -408,7 +408,8 @@ impl RateStore {
             if moved {
                 self.save(fp, &out);
             }
-            self.publish_measurement_coverage(&out, true);
+            publish_probe_coverage(&out);
+            self.warn_about_stored_failures(&out);
             return out;
         }
 
@@ -436,58 +437,30 @@ impl RateStore {
             });
         }
         self.save(fp, &measured);
-        self.publish_measurement_coverage(&measured, false);
+        publish_probe_coverage(&measured);
         measured
     }
 
-    /// Whether each device's weight is backed by a real encode-rate
-    /// measurement — `pharos_transcode_device_rate_unmeasured{device}`, 1 when
-    /// it is not.
-    ///
-    /// A gauge rather than a log line, because the condition is a STATE and not
-    /// an event. An unmeasured device weighs its capacity alone AND drops out
-    /// of the reference `min`, holding down every other device's weight; and
-    /// once that failure is persisted, no later boot re-measures it. It is
-    /// indefinite, recoverable only by deleting a file, and invisible in every
-    /// other signal the process emits — the weights that result look perfectly
-    /// ordinary, and the boot WARN scrolls past exactly once. A log cannot be
-    /// alerted on days later; a gauge that is still 1 can.
-    ///
-    /// Published for MEASURED devices too, as an explicit 0. A gauge that only
-    /// appears on failure cannot be read as a rate, and its absence would be
-    /// indistinguishable from a server that never got as far as probing.
-    ///
-    /// Cardinality is the device count — the same bound as
-    /// `pharos_transcode_device_capacity`, which shares the `device` label
-    /// values.
-    fn publish_measurement_coverage(&self, devices: &[DeviceProbe], reused: bool) {
-        for d in devices {
-            metrics::gauge!(
-                "pharos_transcode_device_rate_unmeasured",
-                "device" => d.device.to_string(),
-            )
-            .set(if d.rate.is_some() { 0.0 } else { 1.0 });
-        }
-        if reused {
-            let stuck: Vec<String> = devices
-                .iter()
-                .filter(|d| d.rate.is_none())
-                .map(|d| d.device.to_string())
-                .collect();
-            if !stuck.is_empty() {
-                // The gauge says WHICH; this says what to do about it, at the
-                // one moment an operator reading a boot log can act on it.
-                tracing::warn!(
-                    devices = ?stuck,
-                    path = %self.path.display(),
-                    "these devices have a STORED failed encode-rate measurement: they \
-                     weigh their capacity alone, they hold down every other device's \
-                     weight by dropping out of the reference minimum, and they will \
-                     NOT be re-measured while the device set is unchanged. Delete this \
-                     file to force a re-probe (it costs one boot's probe time and \
-                     re-places renditions)"
-                );
-            }
+    /// The reuse path's operator advice for a stored measurement failure. The
+    /// gauge says WHICH device; this says what to do about it, at the one
+    /// moment a boot log can be acted on.
+    fn warn_about_stored_failures(&self, devices: &[DeviceProbe]) {
+        let stuck: Vec<String> = devices
+            .iter()
+            .filter(|d| d.rate.is_none())
+            .map(|d| d.device.to_string())
+            .collect();
+        if !stuck.is_empty() {
+            tracing::warn!(
+                devices = ?stuck,
+                path = %self.path.display(),
+                "these devices have a STORED failed encode-rate measurement: they \
+                 weigh their capacity alone, they hold down every other device's \
+                 weight by dropping out of the reference minimum, and they will \
+                 NOT be re-measured while the device set is unchanged. Delete this \
+                 file to force a re-probe (it costs one boot's probe time and \
+                 re-places renditions)"
+            );
         }
     }
 
@@ -603,6 +576,42 @@ impl RateStore {
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &body)?;
         std::fs::rename(&tmp, &self.path)
+    }
+}
+
+/// Publish the per-device gauge that says whether a device's weight is backed
+/// by a real encode-rate measurement —
+/// `pharos_transcode_device_rate_unmeasured{device}`, 1 when it is not.
+///
+/// Public, and taking a plain resolved list rather than living on [`RateStore`],
+/// because the server ALSO reaches these weights without a store at all — when
+/// there is no transcode cache directory it probes inline every boot. That path
+/// is the one most likely to have an unstable measurement, and the argument
+/// below for publishing an explicit 0 applies to it verbatim: a metric absent
+/// there would be indistinguishable from a server that never got as far as
+/// probing.
+///
+/// A gauge rather than a log line, because the condition is a STATE and not an
+/// event. An unmeasured device weighs its capacity alone AND drops out of the
+/// reference `min`, holding down every other device's weight; and once that
+/// failure is persisted, no later boot re-measures it. It is indefinite,
+/// recoverable only by deleting a file, and invisible in every other signal the
+/// process emits — the weights that result look perfectly ordinary, and the
+/// boot WARN scrolls past exactly once. A log cannot be alerted on days later;
+/// a gauge that is still 1 can.
+///
+/// Published for MEASURED devices too, as an explicit 0. A gauge that only
+/// appears on failure cannot be read as a rate.
+///
+/// Cardinality is the device count — the same bound as
+/// `pharos_transcode_device_capacity`, which shares the `device` label values.
+pub fn publish_probe_coverage(devices: &[DeviceProbe]) {
+    for d in devices {
+        metrics::gauge!(
+            "pharos_transcode_device_rate_unmeasured",
+            "device" => d.device.to_string(),
+        )
+        .set(if d.rate.is_some() { 0.0 } else { 1.0 });
     }
 }
 
