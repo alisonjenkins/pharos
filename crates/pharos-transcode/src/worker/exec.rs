@@ -106,7 +106,11 @@ pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
         return WorkerError::BadInput(tail);
     }
     if is_hw {
-        return WorkerError::DeviceBusy;
+        // Carry the tail here too. This is the branch the doc comment above is
+        // about and the branch that used to drop it: `DeviceBusy` takes a
+        // device out of service, so it is the LAST error that should have been
+        // silent about why.
+        return WorkerError::DeviceBusy(tail);
     }
     // CPU failure that isn't a source error — non-recoverable encode error.
     WorkerError::Other(tail)
@@ -146,22 +150,47 @@ pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), Work
 mod tests {
     use super::*;
 
+    /// A hardware failure is transient — the scheduler retries elsewhere — AND
+    /// it says what went wrong.
+    ///
+    /// The second half is the one that matters. `DeviceBusy` is the only error
+    /// that takes a device out of service, and it used to be a unit variant:
+    /// `classify_failure` computed the stderr tail, gave it to `BadInput` and
+    /// `Other`, and dropped it here. So the most consequential failure in the
+    /// scheduler was the only one that could not name its cause, and a real
+    /// incident had to be diagnosed by reading this function rather than a log.
+    ///
+    /// These three are genuinely different problems — a missing driver, a
+    /// filter-graph mismatch, an exhausted card — and an operator who cannot
+    /// tell them apart cannot act on any of them.
     #[test]
-    fn hw_failure_is_transient_so_it_falls_back() {
-        // Real failures seen on a GPU-less box — all must be DeviceBusy
-        // when the device is HW, so the scheduler retries on CPU.
-        assert_eq!(
-            classify_failure("[h264_nvenc] Cannot load libcuda.so.1", true),
-            WorkerError::DeviceBusy
-        );
-        assert_eq!(
-            classify_failure("Impossible to convert between the formats", true),
-            WorkerError::DeviceBusy
-        );
-        assert_eq!(
-            classify_failure("OpenEncodeSessionEx failed: out of memory", true),
-            WorkerError::DeviceBusy
-        );
+    fn a_hardware_failure_is_transient_and_carries_its_cause() {
+        for (stderr, expect) in [
+            ("[h264_nvenc] Cannot load libcuda.so.1", "libcuda"),
+            (
+                "Impossible to convert between the formats",
+                "convert between the formats",
+            ),
+            ("OpenEncodeSessionEx failed: out of memory", "out of memory"),
+        ] {
+            let e = classify_failure(stderr, true);
+            assert!(
+                e.is_transient(),
+                "{stderr} must fall back to another device"
+            );
+            let WorkerError::DeviceBusy(why) = &e else {
+                panic!("{stderr} classified as {e:?}, not DeviceBusy");
+            };
+            assert!(
+                why.contains(expect),
+                "the cause must survive classification: wanted {expect:?} in {why:?}"
+            );
+            // And it reaches a log line, not just the struct.
+            assert!(
+                e.to_string().contains(expect),
+                "Display drops the cause: {e}"
+            );
+        }
     }
 
     #[test]
