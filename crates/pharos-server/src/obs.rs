@@ -109,6 +109,15 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
                 .with(otel_layer)
                 .try_init();
             install_panic_hook();
+            // NO `idle_timeout`, and some signals DEPEND on that. A boot-time
+            // gauge is set once and never touched again — the device-weighting
+            // pair `pharos_transcode_device_rate_unmeasured` and
+            // `pharos_transcode_device_capacity_suppressed` both describe a
+            // STATE that persists for the life of the process and is only
+            // recoverable by deleting a file. An idle timeout would expire them
+            // silently, and the alert that reads them would go quiet without
+            // the condition having cleared. Adding one means re-publishing
+            // those on a timer first.
             PrometheusBuilder::new()
                 .install_recorder()
                 .map_err(|e| ObsError::Prom(e.to_string()))

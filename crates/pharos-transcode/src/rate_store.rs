@@ -96,10 +96,25 @@
 //! The residual cost is stated rather than hidden: a MEASURED device whose true
 //! capacity genuinely falls — a shared GPU handed a smaller share, a
 //! driver-imposed session limit — keeps the larger stored value and is
-//! over-subscribed. The scheduler already degrades on that (a refused session
-//! is a transient failure and puts the device in cooldown), and the recovery is
-//! the one this module already prescribes for an ffmpeg upgrade: delete the
-//! file, whose path is logged at boot.
+//! over-subscribed. Two things follow, and the second is the sharper one:
+//!
+//! - the scheduler treats a refused session as a transient failure and cools
+//!   the device down; but under the pin rule that is NOT graceful degradation.
+//!   `scheduler::candidates_for` records `PinOutcome::Invalidated` and returns
+//!   `Err` for a shared-init rendition whose pinned device is in cooldown,
+//!   deliberately, rather than spilling to a second encoder — mixing encoders
+//!   under one init is the corruption this whole area exists to prevent. So a
+//!   permanently over-subscribed device fails its banded renditions' segments
+//!   on every cooldown cycle, indefinitely and viewer-visibly, until someone
+//!   deletes a dotfile. The case is rare enough that the ratchet is still the
+//!   right trade, but it is not cheap when it happens;
+//! - which is why the suppression is a GAUGE
+//!   (`pharos_transcode_device_capacity_suppressed`) and not only a boot log:
+//!   the failure loop above is otherwise diagnosable only by correlating three
+//!   metrics.
+//!
+//! The recovery is the one this module already prescribes for an ffmpeg
+//! upgrade: delete the file, whose path is logged at boot.
 //!
 //! **Scope limit, stated rather than implied.** When the fingerprint DOES
 //! differ, renditions re-place — which is correct, because the device set they
@@ -329,6 +344,7 @@ impl RateStore {
         let fp = fingerprint(&ids);
         if let Some(stored) = self.load(fp, &ids) {
             let mut out: Vec<DeviceProbe> = Vec::with_capacity(probed.len());
+            let mut suppressed: Vec<(DeviceId, usize)> = Vec::new();
             let mut moved = false;
             for (row, &(stored_id, stored_cap, rate)) in probed.iter().zip(stored.iter()) {
                 // `load` rebuilds in the order asked for, which is what makes
@@ -366,6 +382,7 @@ impl RateStore {
                         // THE case this module exists for. Loud enough to read
                         // in a boot log, because the alternative — silently
                         // accepting the lower number — is a 40 GiB cache wipe.
+                        suppressed.push((device, stored_cap - fresh_cap));
                         tracing::info!(
                             device = %device,
                             probed = fresh_cap,
@@ -408,7 +425,7 @@ impl RateStore {
             if moved {
                 self.save(fp, &out);
             }
-            publish_probe_coverage(&out);
+            publish_probe_coverage(&out, &suppressed);
             self.warn_about_stored_failures(&out);
             return out;
         }
@@ -437,7 +454,8 @@ impl RateStore {
             });
         }
         self.save(fp, &measured);
-        publish_probe_coverage(&measured);
+        // Nothing was reconciled against, so nothing is being suppressed.
+        publish_probe_coverage(&measured, &[]);
         measured
     }
 
@@ -579,9 +597,8 @@ impl RateStore {
     }
 }
 
-/// Publish the per-device gauge that says whether a device's weight is backed
-/// by a real encode-rate measurement —
-/// `pharos_transcode_device_rate_unmeasured{device}`, 1 when it is not.
+/// Publish the two per-device gauges that say how much of the weighting is
+/// backed by evidence, and how much of it is being held up by the ratchet.
 ///
 /// Public, and taking a plain resolved list rather than living on [`RateStore`],
 /// because the server ALSO reaches these weights without a store at all — when
@@ -591,27 +608,59 @@ impl RateStore {
 /// there would be indistinguishable from a server that never got as far as
 /// probing.
 ///
-/// A gauge rather than a log line, because the condition is a STATE and not an
-/// event. An unmeasured device weighs its capacity alone AND drops out of the
-/// reference `min`, holding down every other device's weight; and once that
-/// failure is persisted, no later boot re-measures it. It is indefinite,
-/// recoverable only by deleting a file, and invisible in every other signal the
-/// process emits — the weights that result look perfectly ordinary, and the
-/// boot WARN scrolls past exactly once. A log cannot be alerted on days later;
-/// a gauge that is still 1 can.
+/// `pharos_transcode_device_rate_unmeasured{device}` — 1 when a device's weight
+/// is NOT backed by a real encode-rate measurement. A gauge rather than a log
+/// line, because the condition is a STATE and not an event. An unmeasured
+/// device weighs its capacity alone AND drops out of the reference `min`,
+/// holding down every other device's weight; and once that failure is
+/// persisted, no later boot re-measures it. It is indefinite, recoverable only
+/// by deleting a file, and invisible in every other signal the process emits —
+/// the weights that result look perfectly ordinary, and the boot WARN scrolls
+/// past exactly once. A log cannot be alerted on days later; a gauge that is
+/// still 1 can.
 ///
-/// Published for MEASURED devices too, as an explicit 0. A gauge that only
-/// appears on failure cannot be read as a rate.
+/// `pharos_transcode_device_capacity_suppressed{device}` — how many sessions of
+/// capacity the ratchet is currently withholding from this boot's measurement
+/// (`stored − probed`, 0 when nothing is suppressed). Same argument, for the
+/// symmetric condition: a suppression is also a state, and an INFO log fires
+/// identically for the benign case (one loaded boot) and the genuine one (the
+/// device's capacity really fell, and it is now permanently over-subscribed —
+/// see the module docs for what that costs under the pin rule). The gauge tells
+/// them apart: `min_over_time(...[30d]) > 0` is a device that has
+/// under-reported on EVERY boot for a month, which is no longer a measurement
+/// artefact. Chosen over exporting stored-and-probed as a pair because one
+/// series answers both questions — `> 0` is the boolean "suppressed now", and
+/// the value is the magnitude — at half the cardinality.
 ///
-/// Cardinality is the device count — the same bound as
+/// A device absent from `suppressed` publishes an explicit 0, for the same
+/// reason the unmeasured gauge does: a gauge that only appears on failure
+/// cannot be read as a rate.
+///
+/// Cardinality for both is the device count — the same bound as
 /// `pharos_transcode_device_capacity`, which shares the `device` label values.
-pub fn publish_probe_coverage(devices: &[DeviceProbe]) {
+///
+/// **Both are set once, at boot, and never refreshed.** That is only sound
+/// because the Prometheus recorder is built without an `idle_timeout`, so a
+/// series that stops being touched is still exported. Adding one later would
+/// silently delete these signals; either keep it unset or re-publish these on a
+/// timer.
+pub fn publish_probe_coverage(devices: &[DeviceProbe], suppressed: &[(DeviceId, usize)]) {
     for d in devices {
+        let label = d.device.to_string();
         metrics::gauge!(
             "pharos_transcode_device_rate_unmeasured",
-            "device" => d.device.to_string(),
+            "device" => label.clone(),
         )
         .set(if d.rate.is_some() { 0.0 } else { 1.0 });
+        let held = suppressed
+            .iter()
+            .find(|&&(id, _)| id == d.device)
+            .map_or(0, |&(_, n)| n);
+        metrics::gauge!(
+            "pharos_transcode_device_capacity_suppressed",
+            "device" => label,
+        )
+        .set(held as f64);
     }
 }
 
@@ -1205,6 +1254,78 @@ mod tests {
             2,
             "nothing measured this number, so there is no artefact to absorb — \
              an operator lowering the cap must be obeyed"
+        );
+    }
+
+    /// ODD — a suppressed capacity is a STATE, exactly as a stored measurement
+    /// failure is, and the INFO log that reports it fires identically for the
+    /// benign case (one loaded boot) and the genuine one (the device's capacity
+    /// really fell, and it is now permanently over-subscribed — every
+    /// shared-init rendition banded to it fails its segments on every cooldown
+    /// cycle, because `candidates_for` refuses to spill a pinned rendition to a
+    /// second encoder). A log cannot be read a month later; a gauge that is
+    /// still non-zero can.
+    ///
+    /// Asserted as a whole snapshot with a non-zero, a zero-because-measured-
+    /// enough, and a zero-because-declared in it: a stub that never publishes,
+    /// one that publishes a constant, and one that ratchets declared rows too
+    /// all fail.
+    #[test]
+    fn a_suppressed_capacity_is_visible_as_a_gauge() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let quiet = vec![
+            ProbedCapacity::measured(gpu(), 4),
+            ProbedCapacity::measured(vaapi(), 2),
+            ProbedCapacity::declared(DeviceId::Cpu, 4),
+        ];
+        let run = |devices: &[ProbedCapacity]| {
+            let recorder = DebuggingRecorder::new();
+            metrics::with_local_recorder(&recorder, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    RateStore::new(dir.path())
+                        .resolve(devices, CountingProbe::new().as_probe())
+                        .await
+                });
+            });
+            gauge_by_device(&recorder, "pharos_transcode_device_capacity_suppressed")
+        };
+
+        assert_eq!(
+            run(&quiet),
+            vec![
+                (gpu().to_string(), 0.0),
+                (vaapi().to_string(), 0.0),
+                (DeviceId::Cpu.to_string(), 0.0),
+            ],
+            "a first boot reconciles against nothing, and the gauge must still \
+             be published as an explicit 0 — one that only appears on failure \
+             cannot be read as a rate"
+        );
+
+        // A loaded restart on a down-sized box: the GPU ramp under-reports by
+        // 3, VAAPI measures the same as before, and the CPU permit count fell
+        // for a real reason.
+        let loaded = vec![
+            ProbedCapacity::measured(gpu(), 1),
+            ProbedCapacity::measured(vaapi(), 2),
+            ProbedCapacity::declared(DeviceId::Cpu, 2),
+        ];
+        assert_eq!(
+            run(&loaded),
+            vec![
+                (gpu().to_string(), 3.0),
+                (vaapi().to_string(), 0.0),
+                (DeviceId::Cpu.to_string(), 0.0),
+            ],
+            "the value is how many sessions the ratchet is withholding, so `> 0` \
+             is 'suppressed now' and min_over_time distinguishes one loaded boot \
+             from a capacity that really fell; a declared row is never suppressed"
         );
     }
 
