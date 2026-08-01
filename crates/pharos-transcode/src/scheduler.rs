@@ -3689,6 +3689,16 @@ mod tests {
         // VAAPI has a VP9 encoder (`vp9_vaapi`); the scheduler routes a VP9 job
         // to it (hardware) rather than the CPU. NVENC has no VP9 encoder so it is
         // never eligible for a VP9 target.
+        //
+        // This is also the guard that stops a future class-preferred device
+        // ordering (spec 007 phase B) from shipping unsound: the device weight
+        // is measured on one codec (H264), and `table()`'s CPU permit count is
+        // not lower than VAAPI's H264-measured weight, so an ordering that
+        // prefers the higher-weight device for an interactive job would send
+        // this VP9 job to the CPU — dramatically slower than hardware VP9
+        // encode (`RelCost::Expensive`) — the moment CPU's H264 weight ties or
+        // beats VAAPI's. Phase B was built and reverted for exactly this
+        // reason (see spec.md); this test is what caught it, unedited.
         let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
             out_bytes: 1,
         });

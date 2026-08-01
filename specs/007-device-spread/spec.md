@@ -178,6 +178,48 @@ contended device first, each spilling when its preference has no free permit.
   box where the probe says software is faster, the preference should follow the
   probe, not the device class. Derive it; do not hardcode `is_hw()`.
 
+**Status: implemented, then reverted — this is not the "phase A did nothing"
+case, it is worse.** Phase B was built as Task 5:
+`DeviceTable::eligible_for_class` (weight-ordered, descending for an
+Interactive job, ascending for Background), wired into `candidates_for`'s
+`full_eligible` for the unpinned path. It passed its own TDD test
+(`preference_follows_the_probe_not_the_device_class`, proving the order comes
+from the probe and never from `is_hw()`) and the phase A standing guard
+(`speculative_work_does_not_crowd_the_segment_a_client_is_waiting_for`) kept
+passing. But it broke `scheduler::tests::vp9_lands_on_vaapi_hardware`, and
+that test was right to fail.
+
+The weight `eligible_for_class` would have to order by is measured on **one
+codec** — the boot probe's synthetic clip is H264 — because that is the only
+rate `crate::probe` collects. A single per-device number taken on H264 cannot
+express a *codec-dependent* relative speed. VP9 is the concrete, provable
+case: `capability::RelCost` already records that software VP9 (libvpx) is
+`Expensive` — dramatically slower than a hardware VP9 encoder — while software
+H264 is merely `Moderate`. So a device whose H264-measured weight ties or
+beats a VAAPI accelerator's (an ordinary fixture, not a contrived one —
+`table()` in `scheduler.rs`'s tests has CPU's permit-derived weight equal to
+or above VAAPI's) is "the strongest device" for an H264 job and *also* "the
+strongest device" for a VP9 job under this ordering, even though VAAPI is the
+only sane place to encode VP9 on that machine. Because a preference is never a
+restriction, that CPU placement is not a rare tail case: it is what any
+Interactive VP9 job hits whenever the CPU's permit is free — every time, on
+that fixture.
+
+So the honest ledger is not "phase B measured as neutral." It is: the benefit
+is mpegts-only (the smaller half, as stated above), and the cost is a genuine
+placement regression for any codec whose software/hardware speed ratio
+differs from H264's — VP9 provably does, and an existing test caught it on
+the first run. Making the ordering codec-aware would need a per-device rate
+measured **per codec**, not once on H264, which multiplies the boot probe's
+cost (one trial encode per device × per codec instead of per device) and is
+its own spec, not a follow-up inside this one.
+
+`eligible_for_class` was removed. `candidates_for` and `place()` read
+`eligible_for` for the unpinned path exactly as before phase B, unmodified.
+`vp9_lands_on_vaapi_hardware` is the guard against re-introducing this: its
+doc comment now says so, so the next attempt at phase B meets the reason
+before it re-derives it.
+
 ## What this looks like on a real box
 
 The single worked example in this document. Nothing depends on it.
