@@ -446,6 +446,43 @@ impl DeviceTable {
     pub fn slots(&self) -> &[DeviceSlot] {
         &self.slots
     }
+
+    /// A digest of exactly the state [`DeviceTable::rendition_device`] reads —
+    /// the `(device id, weight)` pairs — so that anything able to MOVE a
+    /// rendition is visible to whatever keys the cache on it.
+    ///
+    /// This exists because "the placement rule changed" and "a constant was
+    /// bumped" were two different things, and only the second one invalidated
+    /// anything. `rendition_device` bands by WEIGHT, and in production the
+    /// weight is the boot probe's capacity — which under-reports on a box
+    /// already under encode load ([`crate::probe`] says so itself). So a plain
+    /// restart during playback could re-band every rendition while
+    /// `HLS_GEN_VERSION` sat still: cached segments from the previous encoder,
+    /// served under an init the browser holds `immutable` for a year, delivered
+    /// with a 200 (issue #114). Deriving the cache generation from this digest
+    /// makes that self-invalidating, including for changes nobody remembered to
+    /// bump a constant for.
+    ///
+    /// **In**: every device id and its weight. **Out**: cooldown and current
+    /// load (transient, and letting them in would re-place renditions
+    /// mid-playback — the exact non-determinism `rendition_device` exists to
+    /// remove), and the caller's priority order (a scheduling decision, not a
+    /// placement input — hence the sort). Capacity is in only through the
+    /// weight it produced: two tables that weigh the same place the same, and
+    /// that is the property being digested.
+    ///
+    /// Order-stable by sorting the rendered pairs, so the same hardware
+    /// enumerated in a different order yields the same digest. No device family
+    /// is named: ids are hashed as opaque text.
+    pub fn placement_fingerprint(&self) -> u64 {
+        let mut rendered: Vec<String> = self
+            .slots
+            .iter()
+            .map(|s| format!("{}={}", s.id, s.weight()))
+            .collect();
+        rendered.sort_unstable();
+        xxhash_rust::xxh3::xxh3_64(rendered.join(";").as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -1161,5 +1198,120 @@ mod weight_tests {
             let w = device_weight(cap, rate, refr);
             assert!(w > 0, "cap={cap} rate={rate:?} ref={refr:?} gave weight 0");
         }
+    }
+}
+
+/// [`DeviceTable::placement_fingerprint`] — the digest that lets a cache
+/// invalidate itself when placement moves.
+///
+/// The property under test is narrow and load-bearing: the digest must change
+/// when, and only when, something that can move a rendition changes. Too
+/// sensitive and every restart wipes a 40 GiB cache; not sensitive enough and
+/// #114 ships as a 200.
+#[cfg(test)]
+mod placement_fingerprint_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::hwaccel::HwAccel;
+    use crate::protocol::DeviceId;
+    use std::time::Duration;
+
+    fn gpu() -> DeviceId {
+        DeviceId::hw(HwAccel::Nvenc, 0)
+    }
+
+    /// Same `(id, weight)` pairs → same digest, even when the two tables were
+    /// built through different constructors. The digest keys on what placement
+    /// READS, not on how the table was made: a capacity-only table and a
+    /// rate-weighted one whose ratio bucket is 1 weigh identically, so they must
+    /// place identically and must NOT wipe each other's cache.
+    #[test]
+    fn identical_weights_hash_identically() {
+        let capacity_only = DeviceTable::from_probe(&[(gpu(), 4)], 4);
+        let rate_weighted =
+            DeviceTable::from_probe_weighted(&[(gpu(), 4, Some(100.0))], 4, Some(100.0));
+
+        // Precondition — the two really do weigh the same, or the assertion
+        // below would be about the constructor rather than about the weights.
+        let weights = |t: &DeviceTable| -> Vec<(DeviceId, u32)> {
+            t.slots().iter().map(|s| (s.id, s.weight())).collect()
+        };
+        assert_eq!(weights(&capacity_only), weights(&rate_weighted));
+
+        assert_eq!(
+            capacity_only.placement_fingerprint(),
+            rate_weighted.placement_fingerprint(),
+            "tables that place identically must not invalidate each other"
+        );
+    }
+
+    /// A capacity drift of ONE moves the bands, so it must move the digest.
+    ///
+    /// This is the production failure, not a hypothetical: `probe_device_caps`
+    /// ramps trial encodes until one fails and documents that a box already
+    /// under encode load under-reports. Boot A measuring 4 and boot B measuring
+    /// 3 re-bands every rendition whose key position falls between the two
+    /// grids — and before this digest existed, nothing downstream could tell.
+    #[test]
+    fn a_capacity_drift_of_one_changes_the_digest() {
+        let boot_a = DeviceTable::from_probe(&[(gpu(), 4)], 4);
+        let boot_b = DeviceTable::from_probe(&[(gpu(), 3)], 4);
+        assert_ne!(
+            boot_a.placement_fingerprint(),
+            boot_b.placement_fingerprint(),
+            "an under-reported probe re-places renditions; the cache must know"
+        );
+    }
+
+    /// Adding or removing a device changes the pool, so it changes the digest.
+    #[test]
+    fn changing_the_device_set_changes_the_digest() {
+        let one = DeviceTable::from_probe(&[(gpu(), 4)], 4);
+        let two = DeviceTable::from_probe(&[(gpu(), 4), (DeviceId::hw(HwAccel::Vaapi, 0), 4)], 4);
+        assert_ne!(one.placement_fingerprint(), two.placement_fingerprint());
+    }
+
+    /// The caller's enumeration order is a scheduling preference, not a
+    /// hardware fact. Two tables holding the same devices in different order
+    /// place the same renditions on the same devices only if the ORDER is also
+    /// the same — but the digest exists to detect hardware change, and a
+    /// reshuffled `/dev/dri` scan must not masquerade as one.
+    ///
+    /// (Order does reach `rendition_device` through the band layout; it is
+    /// deliberately out of the digest because `enumerate` is itself sorted, so
+    /// the order is a function of the device set. Were that to stop being true,
+    /// this test is where the assumption is written down.)
+    #[test]
+    fn the_device_order_does_not_change_the_digest() {
+        let a = DeviceTable::from_probe(&[(gpu(), 3), (DeviceId::hw(HwAccel::Vaapi, 0), 2)], 4);
+        let b = DeviceTable::from_probe(&[(DeviceId::hw(HwAccel::Vaapi, 0), 2), (gpu(), 3)], 4);
+        assert_eq!(
+            a.placement_fingerprint(),
+            b.placement_fingerprint(),
+            "enumeration order is not a hardware change"
+        );
+    }
+
+    /// Cooldown and in-flight load are transient. If either reached the digest,
+    /// a single `DeviceBusy` would wipe the whole transcode cache and re-place
+    /// every live rendition — the failure this machinery exists to prevent,
+    /// caused by the machinery itself.
+    #[test]
+    fn transient_state_stays_out_of_the_digest() {
+        let mut t = DeviceTable::from_probe(&[(gpu(), 4)], 4);
+        let before = t.placement_fingerprint();
+        t.set_cooldown(gpu(), Instant::now() + Duration::from_secs(60));
+        assert_eq!(before, t.placement_fingerprint(), "cooldown is transient");
+
+        let permit = t
+            .slot(gpu())
+            .expect("gpu slot")
+            .sem
+            .clone()
+            .try_acquire_owned()
+            .expect("a free permit");
+        assert_eq!(before, t.placement_fingerprint(), "load is transient");
+        drop(permit);
     }
 }
