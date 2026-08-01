@@ -1457,6 +1457,26 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     if let Some(sched) = transcode_scheduler.as_ref() {
         state = state.with_transcode_scheduler(sched.clone());
     }
+    // 008 — URL-backed sources. Off by default; when on, one resolver is shared
+    // by every playback so a memoised locator is reused across renditions and
+    // segments rather than re-resolved per request.
+    if cfg.remote.enabled {
+        let resolver = pharos_server::remote::RemoteResolver::new(
+            cfg.remote.ytdlp_bin.clone(),
+            std::time::Duration::from_secs(60),
+        );
+        tracing::info!(
+            ytdlp = %cfg.remote.ytdlp_bin,
+            resolve_ttl_secs = cfg.remote.resolve_ttl_secs,
+            "URL-backed sources enabled",
+        );
+        state = state.with_remote_resolver(std::sync::Arc::new(
+            pharos_server::remote::ResolverCache::new(
+                resolver,
+                std::time::Duration::from_secs(cfg.remote.resolve_ttl_secs),
+            ),
+        ));
+    }
     state = state.with_hw_encode_session_budget(hw_session_budget);
     // What THIS server can actually encode = trial-confirmed hardware families
     // (empty when there's no usable GPU / the scheduler is off) + the software
