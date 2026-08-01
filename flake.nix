@@ -524,6 +524,12 @@
             pharos
             transcodeWorker
             pkgs.ffmpeg-headless
+            # 008 — URL-backed sources. Present unconditionally rather than
+            # behind a build flag: the feature is off by default at RUNTIME
+            # (`[remote].enabled`), so shipping the binary costs an unused
+            # dependency while omitting it would make enabling the feature
+            # require a rebuild rather than a config change.
+            pkgs.yt-dlp
             pkgs.cacert
             pkgs.tzdata
             subtitleFonts
@@ -550,7 +556,7 @@
             };
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "PATH=${pharos}/bin:${transcodeWorker}/bin:${pkgs.ffmpeg-headless}/bin"
+              "PATH=${pharos}/bin:${transcodeWorker}/bin:${pkgs.ffmpeg-headless}/bin:${pkgs.yt-dlp}/bin"
               # Explicit worker path so the transcode scheduler uses the
               # crash-isolated worker pool, not the inline-ffmpeg fallback.
               "PHAROS_TRANSCODE_WORKER=${transcodeWorker}/bin/transcode-worker"
@@ -966,6 +972,11 @@
             pkgs.dioxus-cli
             wasmBindgenCli
             pkgs.ffmpeg-headless
+            # 008 — resolves a URL-backed source's real locator. In the shell so
+            # the resolver's tests and a manual `just`-driven check use the same
+            # binary the image ships, rather than whatever the host happens to
+            # have on PATH.
+            pkgs.yt-dlp
             pkgs.pkg-config
             pkgs.git
             pkgs.just
