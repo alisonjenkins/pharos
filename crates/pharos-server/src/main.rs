@@ -1476,6 +1476,41 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 std::time::Duration::from_secs(cfg.remote.resolve_ttl_secs),
             ),
         ));
+
+        // The byte-range cache in front of whatever the resolver returns. Its
+        // failure to start is not fatal — a remote item still plays, every
+        // segment just reaches the CDN itself, which is the pre-cache
+        // behaviour rather than a broken one.
+        let cache_dir = cfg
+            .remote
+            .cache_dir
+            .clone()
+            .or_else(|| {
+                cfg.server
+                    .transcode_cache_dir
+                    .as_ref()
+                    .map(|d| d.join("remote-sources"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("pharos-remote-sources"));
+        let net_gate = pharos_server::bg_io::NetworkGate::new(4);
+        let source_cache = std::sync::Arc::new(
+            pharos_server::remote::source_cache::SourceCache::new(
+                &cache_dir,
+                net_gate,
+                cfg.remote.cache_max_bytes,
+            )
+            .await,
+        );
+        match pharos_server::remote::source_cache::server::spawn(source_cache.clone()) {
+            Ok(port) => {
+                tracing::info!(path = %cache_dir.display(), port, "remote source range cache ready");
+                state = state.with_remote_cache(source_cache, port);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not start the remote source cache listener; sources will be read directly",
+            ),
+        }
     }
     state = state.with_hw_encode_session_budget(hw_session_budget);
     // What THIS server can actually encode = trial-confirmed hardware families

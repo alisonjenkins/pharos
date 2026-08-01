@@ -150,6 +150,13 @@ pub struct AppState {
     /// handler says so rather than handing ffmpeg a `ytdlp://` path it would
     /// reject with an unhelpful protocol error.
     pub remote: Option<std::sync::Arc<crate::remote::ResolverCache>>,
+    /// 008 — the byte-range read-through cache in front of a remote source,
+    /// and the loopback port it is served on. `None` leaves ffmpeg reading the
+    /// CDN directly, which works but re-opens a connection per segment.
+    pub remote_cache: Option<(
+        std::sync::Arc<crate::remote::source_cache::SourceCache>,
+        u16,
+    )>,
     /// What THIS server can encode (trial-confirmed hardware families + software
     /// encoders in this ffmpeg build). The negotiator targets the best codec in
     /// (client-decodable ∩ server-encodable), hardware-preferred. Empty default
@@ -563,6 +570,7 @@ impl AppState {
             hls: None,
             transcode_scheduler: None,
             remote: None,
+            remote_cache: None,
             encode_capabilities: std::sync::Arc::new(Default::default()),
             hw_encode_session_budget: 0,
             trickplay: None,
@@ -652,6 +660,7 @@ impl AppState {
             hls: None,
             transcode_scheduler: None,
             remote: None,
+            remote_cache: None,
             encode_capabilities: std::sync::Arc::new(Default::default()),
             hw_encode_session_budget: 0,
             trickplay: None,
@@ -807,6 +816,18 @@ impl AppState {
     /// 008 — attach the URL-backed source resolver. Absent unless
     /// `[remote].enabled`, and its absence is what makes a remote item
     /// unplayable with a message that names the reason.
+    /// 008 — attach the byte-range source cache and the loopback port serving
+    /// it. Without this a remote item still plays; every segment just reaches
+    /// the CDN itself.
+    pub fn with_remote_cache(
+        mut self,
+        cache: std::sync::Arc<crate::remote::source_cache::SourceCache>,
+        port: u16,
+    ) -> Self {
+        self.remote_cache = Some((cache, port));
+        self
+    }
+
     pub fn with_remote_resolver(
         mut self,
         resolver: std::sync::Arc<crate::remote::ResolverCache>,
