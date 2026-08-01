@@ -59,6 +59,33 @@ async fn reconcile_libraries(
     Ok(libraries)
 }
 
+/// Where the probe-failure memo lives, and the memo itself.
+///
+/// Beside the transcode cache, which is the retained volume every other derived
+/// artefact already uses. Falls back to a temp dir so a deployment without a
+/// configured cache still gets the skip within one process — it just does not
+/// survive a restart, which is exactly the behaviour that existed before.
+///
+/// Keyed on `PROBE_SCHEMA_VERSION`: a probe change can be a BUG FIX, so a
+/// previously-unparseable file must be re-tried when the prober changes.
+use pharos_scanner::probe_memo::ProbeMemo;
+
+fn probe_memo_for(cfg: &pharos_server::config::Config) -> std::sync::Arc<ProbeMemo> {
+    let dir = cfg
+        .server
+        .transcode_cache_dir
+        .clone()
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(".probe_failures.json");
+    let memo = ProbeMemo::load(path, pharos_core::PROBE_SCHEMA_VERSION);
+    tracing::info!(
+        path = %memo.path().display(),
+        known_bad = memo.len(),
+        "probe-failure memo loaded; delete this file to force a re-probe of every unreadable file"
+    );
+    std::sync::Arc::new(memo)
+}
+
 #[actix_web::main]
 async fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
@@ -112,17 +139,20 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
     }
 
     let stores = Stores::connect(&cfg.database.url).await?;
+    let cli_memo = probe_memo_for(cfg);
     // P48 — `ffmpeg-lib` build probes in-process via a resident libav
     // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let scanner = FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
+        .with_probe_memo(cli_memo.clone())
         .with_force(force);
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner = FsScanner::new(FfmpegProber::new())
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
+        .with_probe_memo(cli_memo.clone())
         .with_force(force);
     // 004-books — the CLI scan writes book covers too. Without this a
     // `pharos scan` would index books with no tiles and the next server-side
@@ -1664,17 +1694,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         // P48 — same prober selection as the CLI scan + admin refresh paths.
         // The closure builds a fresh owned scanner per root (each spawned task
         // owns its own — the prober isn't required to be Clone).
+        let scan_memo = probe_memo_for(&cfg);
         let make_scanner = move || {
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
             let s =
                 pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
                     .with_rate_limit_ms(rate_limit_ms)
                     .with_probe_concurrency_opt(probe_concurrency)
+                    .with_probe_memo(scan_memo.clone())
                     .with_io_gate(io_gate.clone());
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
             let s = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
                 .with_rate_limit_ms(rate_limit_ms)
                 .with_probe_concurrency_opt(probe_concurrency)
+                .with_probe_memo(scan_memo.clone())
                 .with_io_gate(io_gate.clone());
             match cover_sink.clone() {
                 Some(sink) => s.with_cover_sink(sink),
