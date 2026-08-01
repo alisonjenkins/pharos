@@ -1904,6 +1904,30 @@ fn looks_like_season_dir(name: &str) -> bool {
     false
 }
 
+/// Whether this entry is a filesystem artefact wearing a media extension.
+///
+/// The walk recognises files by extension alone, which is right for real media
+/// and wrong for two things that carry one anyway:
+///
+/// - **AppleDouble sidecars** (`._Foo.mp4`). macOS writes one beside every file
+///   it copies to a filesystem without native extended-attribute support, and it
+///   inherits the original's name — extension included. They are a few KB of
+///   attribute data, never media, and ffmpeg rejects them with the same
+///   `Invalid data found` an actually-corrupt file gets, so they are
+///   indistinguishable from real damage in the log. One is in the library today.
+/// - **Hidden files** generally. A leading dot means "not for browsing", and
+///   cataloguing one surfaces it in the UI as an ordinary title. Jellyfin skips
+///   these too, so this also removes a parity difference.
+///
+/// Filtering at the WALK rather than at the probe matters: a skipped entry costs
+/// nothing, whereas reaching the prober costs a whole-file open over NFS and a
+/// background-I/O permit, on something that was never going to parse.
+fn is_sidecar_noise(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'))
+}
+
 /// Result of a filesystem [`walk`]: the recognised media file paths, plus a
 /// count of entries walkdir could not read this pass. A non-zero `errors`
 /// means the listing is *incomplete* — the caller must not treat a missing
@@ -1940,6 +1964,9 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                 }
             };
             if !e.file_type().is_file() {
+                continue;
+            }
+            if is_sidecar_noise(e.path()) {
                 continue;
             }
             let lower = e
@@ -3281,6 +3308,33 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "good");
         assert_eq!(prober.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// AppleDouble sidecars carry the original's extension, so an
+    /// extension-only walk picks them up — and ffmpeg rejects them with the
+    /// same error a genuinely corrupt file gets, making real damage
+    /// indistinguishable from filesystem litter in the log.
+    #[tokio::test]
+    async fn the_walk_skips_applestyle_sidecars_and_hidden_files() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "real.mkv").await;
+        touch(td.path(), "._real.mkv").await;
+        touch(td.path(), ".hidden.mkv").await;
+        let prober = FakeProber {
+            calls: Arc::new(AtomicUsize::new(0)),
+            ..Default::default()
+        };
+        let items = FsScanner::new(prober.clone())
+            .scan(td.path())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1, "only the real file is catalogued");
+        assert_eq!(items[0].title, "real");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            1,
+            "the sidecars must not even reach the prober"
+        );
     }
 
     #[cfg(unix)]
