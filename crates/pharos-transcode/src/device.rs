@@ -125,10 +125,25 @@ pub fn device_weight(capacity: usize, rate: Option<f64>, reference_rate: Option<
     let cap = capacity.clamp(1, 1024) as u32;
     let speed_bucket = match (rate, reference_rate) {
         (Some(r), Some(base)) if r.is_finite() && base.is_finite() && r > 0.0 && base > 0.0 => {
-            // How many doublings above the slowest device this one measured.
+            // How many BUCKET STEPS above the slowest device this one measured.
             let ratio = (r / base).clamp(1.0, 1024.0);
-            let doublings = ratio.log(RATE_BUCKET_RATIO).round();
-            2u32.saturating_pow(doublings as u32)
+            let steps = ratio.log(RATE_BUCKET_RATIO).round();
+            // The multiplier must be raised in the SAME base the step index was
+            // computed in. It used to be `2u32.saturating_pow(steps)`, which
+            // coincides with the index's base ONLY at `RATE_BUCKET_RATIO == 2.0`:
+            // at any smaller ratio the index grows like `log_ratio` while the
+            // multiplier grew like 2^index, so anything below ≈1.249 saturated
+            // every measured device to `u32::MAX` and collapsed them all to one
+            // weight. That is not a hypothetical — it is why disarming this
+            // function by setting the constant to 1.01 came back falsely GREEN:
+            // both sides of the comparison saturated to the same number. The
+            // constant is documented as a granularity knob, so it has to behave
+            // like one at every value, not just at the one it currently holds.
+            //
+            // `as u32` on `f64` saturates (u32::MAX at the top, 0 at the
+            // bottom); `.max(1)` turns that floor into the "no evidence of
+            // speed" weight rather than an unreachable device.
+            (RATE_BUCKET_RATIO.powf(steps) as u32).max(1)
         }
         // No usable measurement: capacity alone. Absence of a rate is a missing
         // observation, never evidence the device is slow.
