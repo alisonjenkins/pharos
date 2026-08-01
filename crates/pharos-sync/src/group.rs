@@ -75,6 +75,29 @@ pub const BUFFERING_MAX_MS: u64 = 30_000;
 /// re-freezes the group (V19).
 pub const UNPAUSE_GATE_TIMEOUT_MS: u64 = 5_000;
 
+/// B182 — the same bound, for a gate opened by a SEEK.
+///
+/// B137's argument was made about `BufferingUnpause` and applies verbatim here;
+/// only the trigger differs. Measured on the deployment 2026-08-01, **5 of 9
+/// seeks ran the full 30s** — `pharos_syncplay_gate_total{reason="seek",
+/// outcome="anti_wedge"} 5`, `gate_wait_seconds_sum 150.005`, i.e. 30.0s each
+/// — against 2 that resolved in ~4s. Both members were flagged buffering and
+/// neither ever acked, which is precisely the "cannot answer" case B137 named.
+///
+/// The distinction that decides the timeout is NOT who opened the gate but
+/// whether the member has to LOAD A NEW ITEM to satisfy it. `READY_TIMEOUT_MS`
+/// is sized for that — real acks reaching 18.1s while a client fetches an
+/// init segment and fills a buffer — and `QueueChange`/`NextItem`/
+/// `PlaylistItem` all genuinely do it. A seek does not: the item is already
+/// loaded, and if the target is inside the buffered range the player has
+/// nothing to transition THROUGH, so jellyfin-web emits no `Ready` and the
+/// gate is unsatisfiable from the instant it opens. Waiting 30s for an answer
+/// that cannot exist is the hang, not the patience.
+///
+/// A member genuinely still fetching re-reports `BufferingStart` and re-freezes
+/// the group (V19) — the same contract B137's bound relies on.
+pub const SEEK_GATE_TIMEOUT_MS: u64 = 5_000;
+
 /// T83 — how long a member may stay SILENT (no socket KeepAlive, no
 /// `/SyncPlay/Ping`, no command) before the group prunes it as a ghost.
 /// jellyfin-web KeepAlives every ~30s, so a live client refreshes several
@@ -713,8 +736,13 @@ impl GateReason {
     fn timeout_ms(self) -> u64 {
         match self {
             GateReason::BufferingUnpause => UNPAUSE_GATE_TIMEOUT_MS,
-            GateReason::Seek
-            | GateReason::QueueChange
+            // B182 — a seek does not load a new item, so it cannot inherit the
+            // timeout sized for loading one. See `SEEK_GATE_TIMEOUT_MS`.
+            GateReason::Seek => SEEK_GATE_TIMEOUT_MS,
+            // These four DO load a new item, which is what `READY_TIMEOUT_MS`
+            // is sized for (measured acks out to 18.1s). `Restored` keeps it
+            // because a gate rebuilt from a snapshot cannot know which it was.
+            GateReason::QueueChange
             | GateReason::PlaylistItem
             | GateReason::NextItem
             | GateReason::PreviousItem
@@ -893,6 +921,22 @@ struct GroupState {
     buffering_resume_playing: bool,
     playback: PlaybackState,
     queue: PlayQueue,
+    /// B183 — whether the current queue has ever been BROADCAST, as opposed to
+    /// only seeded into server state by `SeedQueue`.
+    ///
+    /// A seed deliberately sends nobody a `PlayQueue`: it exists so the creator
+    /// is not reloaded mid-episode, and it fills server state alone. The cost
+    /// is that NO client is bound to the server-minted `playlist_item_id` — the
+    /// seed's own log says so, `creator_bound = false` — and a group in that
+    /// state cannot start a joiner. Measured on the deployment 2026-08-01: a
+    /// member joined a seed-only group three times in 90s and never sent a
+    /// single `Ready`, while the same member joined a broadcast-backed group
+    /// and readied in 5s.
+    ///
+    /// `true` by default so a group restored from a snapshot never re-promotes:
+    /// it has necessarily broadcast already, and a spurious promote would
+    /// reload every member's player after a deploy.
+    queue_broadcast: bool,
     /// `Some` while the readiness gate is open (group is `Waiting`).
     waiting: Option<WaitingGate>,
     /// Display name shown in the join dialog (set from `/SyncPlay/New`).
@@ -924,6 +968,8 @@ impl GroupState {
             buffering_resume_playing: false,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
+            // A fresh group has no queue at all; the first real broadcast sets this.
+            queue_broadcast: true,
             waiting: None,
             group_name: "Watch Party".to_string(),
             delivery,
@@ -1054,6 +1100,9 @@ impl GroupState {
     /// `LastUpdate <=` staleness guard.
     fn broadcast_play_queue(&mut self, reason: &str, is_playing: bool, start_position_ms: u64) {
         self.queue.updated_unix_ms = unix_now_ms().max(self.queue.updated_unix_ms + 1);
+        // Every member now holds this queue and its `playlist_item_id`, so the
+        // group is bound and a joiner can be started from it (B183).
+        self.queue_broadcast = true;
         tracing::info!(
             group = %self.id,
             reason,
@@ -2277,6 +2326,42 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 is_leader: Some(member_id) == state.leader,
             };
             state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
+            // B183 — a queue that was only SEEDED has never been sent to anyone,
+            // so no client holds its `playlist_item_id` and the group is not
+            // startable: the joiner below would get a catch-up nobody else can
+            // follow, and the creator would remain unbound (the seed logs
+            // exactly that, `creator_bound = false`). Promote it to a real
+            // broadcast the moment a SECOND member arrives — which is the first
+            // moment the seed's whole reason for existing, "do not disturb the
+            // creator", stops being free.
+            //
+            // This reproduces by hand what the operator had to do manually
+            // during the 2026-08-01 session: recreate the group and re-start
+            // playback inside it. The creator's player reloads once, at the
+            // instant it invited somebody, and lands at the position it was
+            // already playing.
+            //
+            // No readiness gate: a gate here would be opened on members that
+            // may have nothing to transition through, which is the wedge B182
+            // is about. The playback state below resumes everyone directly.
+            let promote = !state.queue_broadcast && !state.queue.items.is_empty();
+            if promote {
+                let is_playing = matches!(state.playback, PlaybackState::Playing { .. });
+                let position_ms = state.current_position_ms();
+                tracing::info!(
+                    group = %state.id,
+                    %member_id,
+                    position_ms,
+                    is_playing,
+                    "syncplay: promoting a seed-only queue to a broadcast so the \
+                     joiner can start (B183)"
+                );
+                state.broadcast_play_queue("new_playlist", is_playing, position_ms);
+                for mid in state.members.keys().copied().collect::<Vec<_>>() {
+                    state.send_playback_state(mid);
+                }
+                return;
+            }
             // Queue + playback catch-up so the new member loads the SAME item at
             // the group's current position. Adding a member NEVER mutates
             // `playing_index` (A6: a join must not advance the group).
@@ -2899,6 +2984,9 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // Bump the change-timestamp so a fresh joiner's catch-up PlayQueue
             // looks newer than its (empty) client state and is applied.
             state.queue.updated_unix_ms = unix_now_ms().max(state.queue.updated_unix_ms + 1);
+            // Nobody has been told about this queue — not even the creator,
+            // deliberately (see below). B183: the first joiner promotes it.
+            state.queue_broadcast = false;
             state.playback = if is_paused {
                 PlaybackState::Paused { position_ms }
             } else {
@@ -4288,6 +4376,118 @@ mod tests {
         assert!(
             !server_pli.is_empty(),
             "seeded queue must mint a non-empty server PLI the creator never saw"
+        );
+    }
+
+    /// B183 — a joiner into a SEED-ONLY group must leave everyone bound to one
+    /// queue, creator included.
+    ///
+    /// The seed deliberately tells nobody, so that a creator already watching is
+    /// not reloaded. That is free while the creator is alone and stops being
+    /// free the instant it invites somebody: no client holds the server-minted
+    /// `playlist_item_id`, so the joiner is handed a queue nobody else can
+    /// follow and the creator can never satisfy a gate. Live on 2026-08-01 a
+    /// member joined such a group THREE times in 90 seconds and never sent a
+    /// single `Ready`; the operator had to destroy the group and restart
+    /// playback inside a fresh one, which is precisely the broadcast this now
+    /// performs automatically.
+    ///
+    /// The assertion is that both members hold the SAME pli — that is what
+    /// "bound" means operationally, since a Ready echoing a pli the group does
+    /// not recognise satisfies nothing.
+    #[tokio::test]
+    async fn a_joiner_promotes_a_seed_only_queue_so_every_member_is_bound() {
+        let (h, sinks, mut creator_rx, _creator) = fresh().await;
+        let _ = snapshot_of(&h).await;
+        while creator_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "nge_ep1".into(),
+            position_ms: 609_254,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        // Still alone: the seed must stay silent, or it defeats its own purpose.
+        while let Ok(msg) = creator_rx.try_recv() {
+            assert!(
+                !matches!(msg, ServerMsg::PlayQueue { .. }),
+                "seeding must not disturb a creator who is still alone: {msg:?}"
+            );
+        }
+
+        let (_joiner, mut joiner_rx) = add_member(&h, &sinks, "jana").await;
+        let _ = snapshot_of(&h).await;
+
+        let pli_of = |rx: &mut tokio::sync::mpsc::Receiver<ServerMsg>| {
+            let mut found = None;
+            while let Ok(msg) = rx.try_recv() {
+                if let ServerMsg::PlayQueue { items, .. } = msg {
+                    found = items.first().map(|i| i.playlist_item_id.clone());
+                }
+            }
+            found
+        };
+        let joiner_pli = pli_of(&mut joiner_rx).expect("the joiner must get a queue");
+        let creator_pli = pli_of(&mut creator_rx).expect(
+            "the creator must be bound once somebody joins — without this it \
+             holds no server pli and can never satisfy a gate",
+        );
+        assert_eq!(
+            creator_pli, joiner_pli,
+            "both members must follow the SAME queue entry"
+        );
+    }
+
+    /// B182 — a seek gate must not wait the new-item timeout.
+    ///
+    /// `READY_TIMEOUT_MS` is sized for a client LOADING a new item (measured
+    /// acks out to 18.1s). A seek loads nothing: the item is already open, and
+    /// when the target sits inside the buffered range the player has nothing to
+    /// transition through, so jellyfin-web emits no `Ready` at all — the same
+    /// "cannot answer" case B137 established for the unpause gate. Measured on
+    /// the deployment 2026-08-01, 5 of 9 seeks ran the FULL 30s
+    /// (`gate_wait_seconds_sum{reason="seek",outcome="anti_wedge"} 150.005`).
+    ///
+    /// Asserted as a bound rather than an exact value: the point is that a room
+    /// full of people is not held for half a minute by an answer that cannot
+    /// arrive.
+    #[tokio::test(start_paused = true)]
+    async fn a_seek_gate_gives_up_long_before_the_new_item_timeout() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (_m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        // A seek nobody ever acks — the live shape.
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 866_103,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "the seek must have opened a gate"
+        );
+
+        tokio::time::advance(Duration::from_millis(SEEK_GATE_TIMEOUT_MS + 500)).await;
+        let _ = snapshot_of(&h).await;
+        assert_ne!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "the gate must have given up by {SEEK_GATE_TIMEOUT_MS}ms; on the \
+             30s new-item timeout this is still open and the room is frozen"
         );
     }
 
