@@ -2,6 +2,7 @@
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
 pub mod auth;
+pub mod origin;
 pub mod secret;
 pub mod segment_grid;
 pub mod time;
@@ -15,6 +16,7 @@ pub use auth::{
     AccessSchedule, AuthBackend, AuthError, AuthResult, AuthToken, TokenRecord, TokenStore, User,
     UserId, UserPolicy, UserRecord, UserStore,
 };
+pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::SecretString;
 
 use serde::{Deserialize, Serialize};
@@ -98,6 +100,18 @@ pub struct MediaItem {
     /// Unix-seconds of the last successful enrichment write; drives the TTL
     /// that stops already-matched items being re-fetched every pass.
     pub metadata_refreshed_at: Option<i64>,
+}
+
+impl MediaItem {
+    /// Where this item's bytes come from — 008.
+    ///
+    /// `path` is a `PathBuf` for every item, but only a `Local` one names a
+    /// filesystem location. Matching on the result is the only way to obtain a
+    /// [`LocalPath`], which is what filesystem-only helpers take by signature;
+    /// see [`origin`](crate::origin) for why that is a type rather than an `if`.
+    pub fn origin(&self) -> Origin<'_> {
+        Origin::classify(&self.path)
+    }
 }
 
 /// LIB-C7/C8/C9 — item-level descriptive metadata persisted alongside
