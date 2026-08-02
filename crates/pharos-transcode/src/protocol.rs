@@ -216,6 +216,13 @@ pub enum TinyOp {
         /// Codec-relative subtitle index (the `N` of `-map 0:s:N`).
         stream_rel_idx: u32,
     },
+    /// Demux a whole source without decoding it and report container faults
+    /// → `WorkerEvent::IntegrityResult`. This is the op that finds a file
+    /// which probes perfectly and breaks mid-playback. Demux-only, so it is
+    /// NFS-bound like `SubtitleWindows`, and it runs in the worker rather
+    /// than the server precisely because its input is expected to be
+    /// malformed (V6).
+    Integrity { input: PathBuf },
     /// Audio RMS waveform → `WorkerEvent::WaveformResult`.
     Waveform {
         input: PathBuf,
@@ -267,6 +274,11 @@ pub enum WorkerEvent {
     ProbeResult {
         job_id: JobId,
         info: Box<ProbeInfo>,
+    },
+    /// Reply to `TinyOp::Integrity`.
+    IntegrityResult {
+        job_id: JobId,
+        report: Box<crate::integrity::IntegrityReport>,
     },
     /// Reply to `TinyOp::Waveform` — per-bin RMS dBFS.
     WaveformResult {

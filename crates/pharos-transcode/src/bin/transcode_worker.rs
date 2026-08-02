@@ -391,6 +391,13 @@ fn handle_tiny(
             Ok(windows) => WorkerEvent::SubtitleWindowsResult { job_id, windows },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::Integrity { input } => match libav::integrity::scan_integrity(&input) {
+            Ok(report) => WorkerEvent::IntegrityResult {
+                job_id,
+                report: Box::new(report),
+            },
+            Err(e) => frame_err(job_id, e),
+        },
         TinyOp::Fingerprint {
             input,
             start_ms,

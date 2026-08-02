@@ -49,6 +49,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
+        TinyOp::Integrity { .. } => "integrity",
         TinyOp::Fingerprint { .. } => "fingerprint",
         TinyOp::FingerprintMulti { .. } => "fingerprint_multi",
         _ => "other",
@@ -64,6 +65,9 @@ fn is_heavy_op(op: &TinyOp) -> bool {
         TinyOp::Trickplay { .. }
             | TinyOp::Waveform { .. }
             | TinyOp::SubtitleWindows { .. }
+            // Integrity demuxes the whole file too, and by construction its
+            // inputs are the slowest ones in the library.
+            | TinyOp::Integrity { .. }
             | TinyOp::Fingerprint { .. }
             | TinyOp::FingerprintMulti { .. }
     )
@@ -299,6 +303,23 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Container integrity — demux the whole source, decode nothing, report
+    /// what the demuxer choked on. Whole-file, NFS-bound.
+    pub async fn integrity(
+        &self,
+        input: impl Into<PathBuf>,
+    ) -> Result<crate::integrity::IntegrityReport, PoolError> {
+        let ev = self
+            .run(TinyOp::Integrity {
+                input: input.into(),
+            })
+            .await?;
+        match ev {
+            WorkerEvent::IntegrityResult { report, .. } => Ok(*report),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Chromaprint-fingerprint an audio window (intro/outro detection).
     pub async fn fingerprint(
         &self,
@@ -451,6 +472,7 @@ impl LibavWorkerPool {
                 WorkerEvent::ProbeResult { job_id: j, .. }
                 | WorkerEvent::WaveformResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
+                | WorkerEvent::IntegrityResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
                 | WorkerEvent::FingerprintMultiResult { job_id: j, .. }
                 | WorkerEvent::Done { job_id: j, .. }
