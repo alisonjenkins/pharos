@@ -1151,6 +1151,42 @@ impl GroupState {
         });
     }
 
+    /// Turn a queue that was only SEEDED into one every member actually holds.
+    ///
+    /// A seeded queue has never been sent to anyone: the seed deliberately
+    /// declines to broadcast so a creator mid-film is not reloaded, and its own
+    /// log records the cost as `creator_bound = false`. Until it is promoted, no
+    /// client holds the server-minted `playlist_item_id`, so a group command has
+    /// no queue entry on the client to apply against — the server dispatches it
+    /// and nothing happens.
+    ///
+    /// Returns whether a promotion actually occurred.
+    fn promote_seed_only_queue(&mut self, trigger: &str) -> bool {
+        if self.queue_broadcast || self.queue.items.is_empty() {
+            return false;
+        }
+        let is_playing = matches!(self.playback, PlaybackState::Playing { .. });
+        let position_ms = self.current_position_ms();
+        tracing::info!(
+            group = %self.id,
+            trigger,
+            position_ms,
+            is_playing,
+            members = self.members.len(),
+            "syncplay: promoting a seed-only queue to a broadcast (B183/B186)"
+        );
+        metrics::counter!(
+            "pharos_syncplay_queue_promoted_total",
+            "trigger" => trigger.to_owned(),
+        )
+        .increment(1);
+        self.broadcast_play_queue("new_playlist", is_playing, position_ms);
+        for mid in self.members.keys().copied().collect::<Vec<_>>() {
+            self.send_playback_state(mid);
+        }
+        true
+    }
+
     /// The `playlist_item_id` of the queue entry the group currently plays.
     fn current_playlist_item_id(&self) -> Option<&str> {
         self.queue
@@ -2267,12 +2303,47 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
     }
 }
 
+/// Whether this command controls the group's playback of the queue it already
+/// has — as opposed to replacing that queue.
+///
+/// These are the messages that are MEANINGLESS to a client which does not hold
+/// the queue: the server dispatches them against a `playlist_item_id` the
+/// client has never seen. The queue-replacing messages are excluded because
+/// they broadcast a queue themselves; promoting first would only send it twice.
+fn controls_existing_queue(msg: &GroupMsg) -> bool {
+    matches!(
+        msg,
+        GroupMsg::Unpause { .. }
+            | GroupMsg::PauseShared { .. }
+            | GroupMsg::SeekTo { .. }
+            | GroupMsg::LeaderPlay { .. }
+            | GroupMsg::LeaderPause { .. }
+            | GroupMsg::LeaderSeek { .. }
+    )
+}
+
 async fn handle(state: &mut GroupState, msg: GroupMsg) {
     // T83 — any attributed message is a sign of life.
     if let Some(id) = msg_member(&msg) {
         if let Some(m) = state.members.get_mut(&id) {
             m.last_seen = tokio::time::Instant::now();
         }
+    }
+    // B186 — B183 promoted a seed-only queue when a SECOND member arrived, on
+    // the reasoning that inviting somebody is the moment "do not disturb the
+    // creator" stops being free. It is not the only such moment. A creator
+    // watching alone never triggers it, so their group stays unbound
+    // indefinitely: pressing play posts `/SyncPlay/Unpause`, the server accepts
+    // it and dispatches it, and nothing happens — observed live on 2026-08-02,
+    // a group seeded at `creator_bound = false` whose unpause returned 204 with
+    // no gate open, no freeze, and no other trace.
+    //
+    // Issuing a group playback command is itself an unambiguous request for
+    // group behaviour, so it earns the same one-off reload the join path
+    // already accepts. Promote FIRST, then let the command run against a queue
+    // the client actually holds.
+    if controls_existing_queue(&msg) {
+        state.promote_seed_only_queue("command");
     }
     match msg {
         GroupMsg::AddMember {
@@ -2371,22 +2442,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // No readiness gate: a gate here would be opened on members that
             // may have nothing to transition through, which is the wedge B182
             // is about. The playback state below resumes everyone directly.
-            let promote = !state.queue_broadcast && !state.queue.items.is_empty();
-            if promote {
-                let is_playing = matches!(state.playback, PlaybackState::Playing { .. });
-                let position_ms = state.current_position_ms();
-                tracing::info!(
-                    group = %state.id,
-                    %member_id,
-                    position_ms,
-                    is_playing,
-                    "syncplay: promoting a seed-only queue to a broadcast so the \
-                     joiner can start (B183)"
-                );
-                state.broadcast_play_queue("new_playlist", is_playing, position_ms);
-                for mid in state.members.keys().copied().collect::<Vec<_>>() {
-                    state.send_playback_state(mid);
-                }
+            if state.promote_seed_only_queue("join") {
                 return;
             }
             // Queue + playback catch-up so the new member loads the SAME item at
@@ -4445,6 +4501,72 @@ mod tests {
         assert!(
             !server_pli.is_empty(),
             "seeded queue must mint a non-empty server PLI the creator never saw"
+        );
+    }
+
+    /// B186 — a creator watching ALONE never gets a second member, so B183's
+    /// join-triggered promotion never fires and the group stays unbound
+    /// forever. Live 2026-08-02: a group seeded at `creator_bound = false`,
+    /// then `command dispatched command=unpause` returning 204 with no gate
+    /// open, no freeze and no other trace — the server did everything right
+    /// and the film stayed paused, because the client held no queue entry for
+    /// the command to apply to.
+    ///
+    /// Pressing play is an unambiguous request for group behaviour, so it earns
+    /// the same one-off reload the join path already accepts.
+    #[tokio::test]
+    async fn a_solo_creators_unpause_binds_the_seeded_queue() {
+        let (h, _sinks, mut creator_rx, creator) = fresh().await;
+        let _ = snapshot_of(&h).await;
+        while creator_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "iron_man".into(),
+            position_ms: 51_212,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Precondition: the seed bound nobody. Without this the test could pass
+        // on a seed that had already broadcast, proving nothing.
+        while let Ok(msg) = creator_rx.try_recv() {
+            assert!(
+                !matches!(msg, ServerMsg::PlayQueue { .. }),
+                "seed must leave the creator unbound, got {msg:?}"
+            );
+        }
+
+        // The creator — still the only member — pauses, then presses play.
+        h.tx.send(GroupMsg::PauseShared { sender: creator })
+            .await
+            .unwrap();
+        h.tx.send(GroupMsg::Unpause { sender: creator })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let mut queue_pli = None;
+        let mut resumed = false;
+        while let Ok(msg) = creator_rx.try_recv() {
+            match msg {
+                ServerMsg::PlayQueue { items, .. } => {
+                    queue_pli = items.first().map(|i| i.playlist_item_id.clone());
+                }
+                ServerMsg::Play { .. } => resumed = true,
+                _ => {}
+            }
+        }
+        let pli = queue_pli.expect(
+            "a solo creator's group command must promote the seeded queue — \
+             without a PlayQueue the client holds no entry to apply it to, which \
+             is a play button that does nothing",
+        );
+        assert!(!pli.is_empty(), "promoted queue must carry a server PLI");
+        assert!(
+            resumed,
+            "the unpause must still take effect after the promotion"
         );
     }
 
