@@ -86,6 +86,30 @@ fn probe_memo_for(cfg: &pharos_server::config::Config) -> std::sync::Arc<ProbeMe
     std::sync::Arc::new(memo)
 }
 
+/// Where the container-integrity verdicts live. Beside the probe memo, for the
+/// same reason: an operator who wants the whole library re-read deletes the
+/// file, and has to be told where it is.
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
+fn integrity_memo_for(
+    cfg: &pharos_server::config::Config,
+) -> std::sync::Arc<pharos_server::integrity_memo::IntegrityMemo> {
+    use pharos_server::integrity_memo::{IntegrityMemo, INTEGRITY_SCAN_VERSION};
+    let dir = cfg
+        .server
+        .transcode_cache_dir
+        .clone()
+        .unwrap_or_else(std::env::temp_dir);
+    let memo = IntegrityMemo::load(dir.join(".integrity.json"), INTEGRITY_SCAN_VERSION);
+    let damaged = memo.damaged().len();
+    tracing::info!(
+        path = %memo.path().display(),
+        scanned = memo.len(),
+        damaged,
+        "integrity memo loaded; delete this file to force a full re-read of every file"
+    );
+    std::sync::Arc::new(memo)
+}
+
 #[actix_web::main]
 async fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
@@ -1623,6 +1647,17 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state.stores.clone(),
         state.bg_io.clone(),
         libav_pool.clone(),
+    );
+    // Whole-file container integrity sweep. Nothing else in pharos ever reads
+    // a media file past its header, so damage in the middle of a file is
+    // invisible until a viewer hits it — which is how a zeroed region inside
+    // an episode was first diagnosed from a Google TV crash report.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pharos_server::integrity_backfill::spawn(
+        state.stores.clone(),
+        state.bg_io.clone(),
+        libav_pool.clone(),
+        integrity_memo_for(&cfg),
     );
     // T81 — resolve real cast portraits from TMDB when a key is configured.
     // Gated on the key: with none, this library's people rows keep their
