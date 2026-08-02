@@ -30,7 +30,8 @@ use ffmpeg_the_third as ffmpeg;
 
 use ffmpeg::ffi;
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Longest formatted line kept, matching libav's own default callback so we
 /// truncate exactly where it would.
@@ -46,6 +47,73 @@ const COMPONENT_MAX: usize = 32;
 /// callback is actually installed and receiving — disarm [`install`] and it
 /// stays at zero.
 pub(crate) static RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether an [`ErrorCapture`] is currently open. Read on every log line, so
+/// it is an atomic rather than a lock.
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+/// Error-or-worse lines seen while a capture is open.
+static CAPTURED: AtomicU64 = AtomicU64::new(0);
+/// The first such line, kept verbatim.
+static FIRST: Mutex<Option<String>> = Mutex::new(None);
+
+/// Serialises captures. Only one may be open at a time, because libav's log
+/// callback is process-global and has no way to attribute a line to a caller.
+fn capture_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Counts the `AV_LOG_ERROR`-and-worse lines libav emits for the duration of
+/// the guard's life, and keeps the first verbatim.
+///
+/// This exists because **a damaged container does not fail an API call**. The
+/// matroska demuxer resyncs past a hole of null bytes internally: `av_read_frame`
+/// returns no error, no packet carries `AV_PKT_FLAG_CORRUPT`, and the scan runs
+/// to EOF reporting success — while `ffmpeg -v error … -c copy -f null -` on the
+/// same file prints `0x00 at pos 77311 invalid as first byte of an EBML number`.
+/// The only place the fault is stated is the log, so that is where an integrity
+/// check has to read it. Measured, not assumed: an earlier version of this scan
+/// counted only API-level errors and called a file with a 64 KiB hole clean.
+///
+/// Holding the guard blocks any other capture, so the count belongs to exactly
+/// one scan. The `transcode-worker` runs one op at a time, so this never
+/// contends in production; it matters for tests and for any future in-process
+/// caller.
+pub(crate) struct ErrorCapture {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl ErrorCapture {
+    pub(crate) fn open() -> Self {
+        let guard = capture_lock().lock().unwrap_or_else(|e| e.into_inner());
+        CAPTURED.store(0, Ordering::Relaxed);
+        if let Ok(mut first) = FIRST.lock() {
+            *first = None;
+        }
+        CAPTURING.store(true, Ordering::SeqCst);
+        Self { _guard: guard }
+    }
+
+    /// Errors so far. Atomic-only, cheap enough to poll per packet — which is
+    /// how the scan learns *where* in the media a logged fault happened, the
+    /// log line itself carrying no timestamp.
+    pub(crate) fn count(&self) -> u64 {
+        CAPTURED.load(Ordering::Relaxed)
+    }
+
+    /// Errors so far, and the first message.
+    pub(crate) fn errors(&self) -> (u64, Option<String>) {
+        let n = CAPTURED.load(Ordering::Relaxed);
+        let first = FIRST.lock().ok().and_then(|f| f.clone());
+        (n, first)
+    }
+}
+
+impl Drop for ErrorCapture {
+    fn drop(&mut self) {
+        CAPTURING.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Point libav's global log callback at [`on_log`]. Process-wide and not
 /// undoable; call once.
@@ -73,10 +141,14 @@ unsafe extern "C" fn on_log(
 ) {
     RECEIVED.fetch_add(1, Ordering::Relaxed);
 
+    // An open capture wants every error line regardless of the global level,
+    // so it cannot be starved by a quieter filter.
+    let captured = CAPTURING.load(Ordering::SeqCst) && level <= ffi::AV_LOG_ERROR as c_int;
+
     // The level gate lives in libav's *default* callback, not in `av_vlog`, so
     // a custom callback receives everything and must filter for itself.
     // SAFETY: no arguments; safe at any time.
-    if level > unsafe { ffi::av_log_get_level() } {
+    if !captured && level > unsafe { ffi::av_log_get_level() } {
         return;
     }
 
@@ -102,6 +174,18 @@ unsafe extern "C" fn on_log(
     // SAFETY: `av_log_format_line2` NUL-terminates within `LINE_MAX`.
     let line = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
     let (component, message) = split_component(line.trim_end());
+
+    if captured {
+        CAPTURED.fetch_add(1, Ordering::Relaxed);
+        // `try_lock`: this callback runs on libav's own threads and must never
+        // block them. Losing the text of a line under contention costs a
+        // slightly less specific reason, never the count or the verdict.
+        if let Ok(mut first) = FIRST.try_lock() {
+            if first.is_none() {
+                *first = Some(format!("[{component}] {message}"));
+            }
+        }
+    }
 
     metrics::counter!(
         "pharos_libav_log_total",

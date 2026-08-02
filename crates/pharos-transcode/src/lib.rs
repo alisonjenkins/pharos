@@ -17,6 +17,7 @@ pub mod capability;
 pub mod device;
 pub mod fingerprint;
 pub mod hwaccel;
+pub mod integrity;
 #[cfg(unix)]
 pub mod libav;
 pub mod options;
