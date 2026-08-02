@@ -314,6 +314,7 @@ impl Worker for ProcWorker {
                         | WorkerEvent::ProbeResult { .. }
                         | WorkerEvent::WaveformResult { .. }
                         | WorkerEvent::SubtitleWindowsResult { .. }
+                        | WorkerEvent::IntegrityResult { .. }
                         | WorkerEvent::FingerprintResult { .. }
                         | WorkerEvent::FingerprintMultiResult { .. } => continue,
                     },

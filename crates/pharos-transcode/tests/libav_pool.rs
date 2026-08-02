@@ -159,3 +159,84 @@ async fn pool_waveform_and_subtitle() {
     assert!(text.starts_with("WEBVTT"), "no WEBVTT header: {text:?}");
     assert!(text.contains("00:00:01.000 --> 00:00:02.000"));
 }
+
+/// The integrity scan is only useful if it survives the crash boundary: it
+/// runs in the worker precisely because its inputs are expected to be
+/// malformed, so the verdict has to come back over the socketpair intact —
+/// including the demuxer's own words, which are the part a bare boolean
+/// would have dropped.
+#[tokio::test]
+async fn pool_scans_integrity_across_the_worker_boundary() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.mkv");
+    let holed = dir.path().join("holed.mkv");
+    synth_mkv(&good);
+    std::fs::copy(&good, &holed).unwrap();
+    punch_hole(&holed, 64 * 1024);
+
+    let pool = LibavWorkerPool::new(worker_bin(), 1);
+
+    let clean = pool.integrity(good).await.expect("scan good");
+    assert!(
+        !clean.is_damaged(),
+        "an intact file must survive the round trip clean: {}",
+        clean.summary()
+    );
+    assert!(
+        clean.packets > 0,
+        "no packets crossed the boundary: {clean:?}"
+    );
+
+    let damaged = pool.integrity(holed).await.expect("scan holed");
+    assert!(
+        damaged.is_damaged(),
+        "the hole must be reported through the worker: {damaged:?}"
+    );
+    assert!(
+        damaged.first_fault.is_some(),
+        "the reason must survive the wire, not just the verdict: {damaged:?}"
+    );
+}
+
+/// 20 s of H.264 in Matroska — long enough that a mid-file hole lands well
+/// past the header, so the file still opens and still probes.
+fn synth_mkv(path: &Path) {
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=20:size=320x240:rate=25",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "25",
+        ])
+        .arg(path)
+        .status()
+        .expect("spawn ffmpeg fixture");
+    assert!(status.success(), "fixture generation failed");
+}
+
+/// Zero `len` bytes starting at the midpoint of the file.
+fn punch_hole(path: &Path, len: usize) {
+    use std::io::{Seek, SeekFrom, Write};
+    let size = std::fs::metadata(path).expect("stat fixture").len();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open fixture");
+    f.seek(SeekFrom::Start(size / 2)).expect("seek");
+    f.write_all(&vec![0u8; len]).expect("write hole");
+    f.sync_all().expect("sync");
+}
