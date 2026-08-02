@@ -7,6 +7,10 @@ pub mod cli;
 pub mod config;
 pub mod dlna;
 pub mod health;
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
+pub mod integrity_backfill;
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
+pub mod integrity_memo;
 pub mod library_watch;
 pub mod metadata_backfill;
 pub mod middleware;
