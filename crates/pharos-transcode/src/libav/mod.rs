@@ -18,7 +18,9 @@ pub mod frames;
 #[cfg(feature = "backend-lib")]
 pub mod image;
 #[cfg(feature = "backend-lib")]
-mod logbridge;
+pub mod integrity;
+#[cfg(feature = "backend-lib")]
+pub(crate) mod logbridge;
 #[cfg(feature = "backend-lib")]
 pub mod probe;
 
