@@ -2004,6 +2004,13 @@ async fn vp9_audio_file(
         // reconstructing which of the three budgets expired took a code read.
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
     let mut bytes = file.bytes;
+    // What the shared init claims about its own timeline, recorded for every
+    // init served. The fragments below are re-anchored absolutely, so an init
+    // that also defers the track double-counts the offset — and nothing on this
+    // path said which session's init a client got.
+    if name == "init.mp4" {
+        fmp4::record_audio_init_shape(&bytes, media_id, file.session_start_seg);
+    }
     // B121 — put the fragment back on the timeline. ffmpeg's HLS muxer numbers
     // a session's `tfdt` from that session's OWN first fragment, so a fragment
     // produced by a seek session carries its offset within the session: a300
