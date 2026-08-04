@@ -2004,12 +2004,21 @@ async fn vp9_audio_file(
         // reconstructing which of the three budgets expired took a code read.
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
     let mut bytes = file.bytes;
-    // What the shared init claims about its own timeline, recorded for every
-    // init served. The fragments below are re-anchored absolutely, so an init
-    // that also defers the track double-counts the offset — and nothing on this
-    // path said which session's init a client got.
+    // B186 / V141 — the shared init must describe the timeline the fragments
+    // are served on, and the fragments below are re-anchored ABSOLUTELY. A seek
+    // session's init also defers the track by that session's `-output_ts_offset`
+    // (ffmpeg writes it as an empty edit), so a player honouring the edit list
+    // applies the offset twice and the audio can never overlap the video.
+    //
+    // `resolve_audio_file` hands out whichever session's init it finds, so which
+    // one a client gets is a race — and the URL is `immutable, max-age=1y`.
+    // Neutralising converges every session's init on the from-0 session's bytes,
+    // so that race has one outcome. The shape is recorded BEFORE the rewrite,
+    // because how often a deferred init reached this point is the signal.
     if name == "init.mp4" {
         fmp4::record_audio_init_shape(&bytes, media_id, file.session_start_seg);
+        fmp4::drop_empty_edits(&mut bytes)
+            .map_err(|e| error::ErrorInternalServerError(format!("audio init edit list: {e}")))?;
     }
     // B121 — put the fragment back on the timeline. ffmpeg's HLS muxer numbers
     // a session's `tfdt` from that session's OWN first fragment, so a fragment

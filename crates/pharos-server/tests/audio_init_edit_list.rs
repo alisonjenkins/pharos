@@ -19,8 +19,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use actix_web::{test, web, App};
 use pharos_cache::HlsSegmentCache;
-use pharos_server::api::jellyfin::fmp4;
+use pharos_core::{
+    MediaItem, MediaKind, MediaProbe, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
+    UserRecord, UserStore,
+};
+use pharos_server::{
+    api::jellyfin::{fmp4, hls},
+    auth::BuiltinAuth,
+    state::{AppState, Stores},
+};
 
 /// Segment the seek session starts at — deep enough that its offset is many
 /// times a segment, so a doubled offset cannot be mistaken for rounding.
@@ -126,5 +135,148 @@ async fn a_seek_sessions_init_defers_its_track_by_the_session_start() {
         from0, seek,
         "the two sessions' inits differ — 'the init is identical across sessions' is false, \
          and both are served under one immutable URL"
+    );
+}
+
+/// B186 / V141 — dropping the empty edit makes a seek session's init the
+/// whole-file session's init, byte for byte.
+///
+/// Byte equality is the assertion worth making rather than "no empty edit
+/// remains": the init is served `immutable, max-age=1y` under a URL that names
+/// the item and nothing about which session produced the bytes, so two sessions
+/// that disagree by even one byte put a stale, incompatible init in a browser
+/// for a year. Neutralising has to converge on ONE body, not merely a
+/// well-behaved one.
+#[tokio::test]
+async fn dropping_the_empty_edit_converges_on_the_whole_file_sessions_init() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let src = make_source(td.path());
+    let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
+
+    let from0 = init_of(&cache, &src, 4, 0).await;
+    let mut seek = init_of(&cache, &src, 5, SEEK_SEG).await;
+
+    let want = f64::from(SEEK_SEG) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
+    let dropped = fmp4::drop_empty_edits(&mut seek)
+        .expect("edit list rewritten")
+        .expect("a seek session's init has an empty edit to drop");
+    assert!(
+        (dropped - want).abs() < 0.05,
+        "should have dropped the session's own {want:.3}s deferral, dropped {dropped:.3}s"
+    );
+    assert_eq!(
+        fmp4::init_empty_edit_secs(&seek),
+        None,
+        "the neutralised init must defer nothing"
+    );
+    assert_eq!(
+        seek, from0,
+        "a neutralised seek-session init must be the from-0 session's init byte for byte — \
+         one immutable URL cannot have two bodies"
+    );
+}
+
+/// Neutralising an already-neutral init changes nothing and reports nothing.
+/// The serve path runs this on every init, including the overwhelmingly common
+/// from-0 one.
+#[tokio::test]
+async fn dropping_from_a_neutral_init_is_a_no_op() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let src = make_source(td.path());
+    let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
+
+    let mut init = init_of(&cache, &src, 6, 0).await;
+    let before = init.clone();
+
+    assert_eq!(
+        fmp4::drop_empty_edits(&mut init).expect("edit list read"),
+        None,
+        "a from-0 init has no empty edit to drop"
+    );
+    assert_eq!(init, before, "a no-op must not touch a byte");
+}
+
+/// Seed a store + app state around one audio-only fixture.
+async fn seed(fixture: PathBuf, cache_dir: &Path) -> (web::Data<AppState>, String) {
+    let stores = Stores::connect("sqlite::memory:").await.expect("stores");
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth
+        .hash_password(&SecretString::new("p"))
+        .expect("hash password");
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .expect("create user");
+    let token = stores.issue(uid, "t").await.expect("issue token");
+    stores
+        .put(MediaItem {
+            id: 42,
+            path: fixture,
+            title: "tone".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                audio_codec: Some("aac".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("put item");
+    let cache = HlsSegmentCache::new(cache_dir, 128 * 1024 * 1024);
+    let state = web::Data::new(AppState::new(stores, "t".into()).with_hls_cache(cache));
+    (state, token.0.expose().to_string())
+}
+
+/// B186 — the ROUTE, not just the helper, must serve a neutral init.
+///
+/// The two are worth separating: `drop_empty_edits` passing proves the rewrite
+/// works, and nothing else. Deleting its one call site in `vp9_audio_file`
+/// leaves every other test in this file green while putting the bug straight
+/// back on the wire.
+#[actix_web::test]
+async fn the_audio_init_route_serves_a_neutral_init_after_a_deep_seek() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let src = make_source(td.path());
+    let (state, token) = seed(src, &td.path().join("cache")).await;
+    let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
+
+    // Fetch a deep fragment first: that is what spawns the seek session whose
+    // init carries the empty edit, and the session the init then resolves from.
+    let frag = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!(
+                "/videos/42/vp9/audio/a{SEEK_SEG}.m4s?api_key={token}"
+            ))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        frag.status().is_success(),
+        "seek fragment should be served: {}",
+        frag.status()
+    );
+
+    let init = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/videos/42/vp9/audio/init.mp4?api_key={token}"))
+            .to_request(),
+    )
+    .await;
+
+    assert_eq!(
+        fmp4::init_empty_edit_secs(&init),
+        None,
+        "the init served after a deep seek still defers its track — every fragment \
+         under it is re-anchored to the same offset, so the audio lands at twice \
+         its true position and never overlaps the video"
     );
 }

@@ -348,10 +348,17 @@ const fn elst_entry_len(version: u8) -> usize {
 }
 
 /// One `elst` entry that DEFERS the track: an empty edit (`media_time == -1`)
-/// of `ticks` movie-timescale ticks.
+/// of `ticks` movie-timescale ticks. Located precisely enough to be removed.
 struct EmptyEdit {
     /// Empty-edit length, in movie-timescale ticks.
     ticks: u64,
+    /// Byte range of the entry itself.
+    entry: std::ops::Range<usize>,
+    /// Offsets of the 32-bit size fields that shrink when `entry` is removed:
+    /// `moov`, `trak`, `edts`, `elst`.
+    ancestors: [usize; 4],
+    /// Offset of the `elst` `entry_count` field.
+    entry_count_at: usize,
 }
 
 /// Every empty edit in an init's `moov`, innermost detail included.
@@ -420,7 +427,12 @@ fn find_empty_edits(data: &[u8]) -> Vec<EmptyEdit> {
                         (u64::from(d), i64::from(m))
                     };
                     if media_time == -1 && ticks > 0 {
-                        out.push(EmptyEdit { ticks });
+                        out.push(EmptyEdit {
+                            ticks,
+                            entry: start..end,
+                            ancestors: [moov.start, trak.start, edts.start, elst.start],
+                            entry_count_at: body + 4,
+                        });
                     }
                 }
             }
@@ -444,6 +456,73 @@ pub fn init_empty_edit_secs(init: &[u8]) -> Option<f64> {
     let timescale = movie_timescale(init, moov)?;
     let ticks: u64 = find_empty_edits(init).iter().map(|e| e.ticks).sum();
     (ticks > 0).then(|| ticks as f64 / f64::from(timescale))
+}
+
+/// Remove every EMPTY edit from `init`'s edit lists, in place. Returns how much
+/// deferral was dropped, in seconds, or `None` when there was none.
+///
+/// ## Why the init must not defer anything
+///
+/// A seek session's fragments carry their offset WITHIN that session, and the
+/// serve path shifts every one of them back onto the absolute timeline (B121).
+/// ffmpeg ALSO writes the session's `-output_ts_offset` into the init as an
+/// empty edit, so a player that honours the edit list adds the offset a second
+/// time: audio lands at twice its true position, never overlaps the video's
+/// buffered range, and the player loads fragment after fragment without ever
+/// reaching a playable state (B186 — Lace could not watch Supergirl; the
+/// browser drained 45 minutes of segments in seven and never started).
+///
+/// Dropping the edit rather than dropping the `tfdt` shift is deliberate: the
+/// shift is what B121 proved works across players, and edit-list handling is
+/// the part of MSE that clients disagree about.
+///
+/// ## Why it converges
+///
+/// The result is the byte-identical init the whole-file session would have
+/// written. That is the property the serve path needs, not merely "no empty
+/// edit": the init is served `immutable, max-age=1y` under a URL that names the
+/// item and NOTHING about which session produced the bytes, so two sessions
+/// that disagree by one byte leave one of them in a browser for a year,
+/// describing fragments it does not match.
+///
+/// Entries are spliced out back-to-front so every offset recorded by
+/// [`find_empty_edits`] stays valid: an ancestor's size field always precedes
+/// the entry it encloses.
+pub fn drop_empty_edits(init: &mut Vec<u8>) -> Result<Option<f64>, Fmp4Error> {
+    let top = walk(init, 0..init.len())?;
+    let Some(moov) = top.iter().find(|b| &b.kind == b"moov") else {
+        return Ok(None);
+    };
+    let Some(timescale) = movie_timescale(init, moov) else {
+        return Ok(None);
+    };
+    let mut edits = find_empty_edits(init);
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let ticks: u64 = edits.iter().map(|e| e.ticks).sum();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.entry.start));
+    for edit in &edits {
+        let len = edit.entry.end - edit.entry.start;
+        init.drain(edit.entry.clone());
+        for size_at in edit.ancestors {
+            let Some(field) = init.get(size_at..size_at + 4) else {
+                return Err(Fmp4Error::Truncated(size_at));
+            };
+            let size = u32::from_be_bytes(field.try_into().unwrap_or([0; 4]));
+            let next = size
+                .checked_sub(len as u32)
+                .ok_or(Fmp4Error::Truncated(size_at))?;
+            init[size_at..size_at + 4].copy_from_slice(&next.to_be_bytes());
+        }
+        let at = edit.entry_count_at;
+        let Some(field) = init.get(at..at + 4) else {
+            return Err(Fmp4Error::Truncated(at));
+        };
+        let count = u32::from_be_bytes(field.try_into().unwrap_or([0; 4]));
+        init[at..at + 4].copy_from_slice(&count.saturating_sub(1).to_be_bytes());
+    }
+    Ok(Some(ticks as f64 / f64::from(timescale)))
 }
 
 /// Record what the audio rendition's shared init declares about its own
