@@ -135,6 +135,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
@@ -149,6 +150,7 @@ libc = { version = "0.2" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
@@ -163,6 +165,7 @@ libc = { version = "0.2" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
@@ -177,6 +180,7 @@ libc = { version = "0.2" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
