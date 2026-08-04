@@ -2625,8 +2625,18 @@ impl HlsSegmentCache {
     /// start is `<= N` and which has actually written it — so a client playing
     /// on from a seek keeps drawing from that one session for every subsequent
     /// segment instead of alternating with the whole-file session as it catches
-    /// up. Non-segment names (`init.mp4`) take the first session that has one;
-    /// the init is codec configuration and is identical across sessions.
+    /// up. Non-segment names (`init.mp4`) take the first session that has one.
+    ///
+    /// That last part was justified here as "the init is codec configuration and
+    /// is identical across sessions". It is NOT (B187): ffmpeg gives a session
+    /// built with `-output_ts_offset` — every seek session — an empty edit in
+    /// its edit list equal to that offset, so which session answers decides
+    /// whether the init defers its track. Which one this returns is therefore a
+    /// race, and the URL it is served under is immutable for a year. The serve
+    /// path normalises the bytes on the way out (V141, `fmp4::drop_empty_edits`)
+    /// so that race has one outcome; this resolution stays first-wins because,
+    /// once normalised, the bodies really are equal.
+    ///
     /// Returns the file AND the segment its session started at — the caller
     /// needs that to place the fragment on the timeline (see B121: ffmpeg
     /// numbers a session's `tfdt` from ITS OWN first fragment, not from the
@@ -3020,8 +3030,10 @@ impl HlsSegmentCache {
             .and_then(|r| r.strip_suffix(".m4s"))
             .and_then(|r| r.parse::<u32>().ok())
         else {
-            // `init.mp4` / `audio.m3u8` are not on the segment timeline; any
-            // session's output answers them.
+            // `init.mp4` / `audio.m3u8` are not on the segment timeline, so any
+            // session's output answers the WAIT. Which session's init a client
+            // ends up with is not indifferent (B187) — that is normalised at
+            // serve time, not here.
             return Self::audio_session_progress(root).await;
         };
         let candidates: Vec<u32> = Self::audio_session_starts(root)
