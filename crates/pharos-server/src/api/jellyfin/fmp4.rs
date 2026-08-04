@@ -313,6 +313,175 @@ pub fn record_track_timescale(raw: &[u8], media_id: u64, seg: u32) {
     }
 }
 
+/// The movie timescale from `moov/mvhd` — the unit an `elst`'s
+/// `segment_duration` is expressed in (its `media_time`, confusingly, is on the
+/// track's own media timescale; only the duration is needed here).
+fn movie_timescale(data: &[u8], moov: &Box) -> Option<u32> {
+    let mvhd = walk(data, moov.start + moov.header..moov.end)
+        .ok()?
+        .into_iter()
+        .find(|b| &b.kind == b"mvhd")?;
+    let body = mvhd.start + mvhd.header;
+    let version = data.get(body).copied().unwrap_or(0);
+    // mvhd: version(1) flags(3) then 32-bit (v0) or 64-bit (v1)
+    // creation/modification times before the timescale.
+    let ts_off = if version == 1 {
+        body + 4 + 16
+    } else {
+        body + 4 + 8
+    };
+    data.get(ts_off..ts_off + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_be_bytes)
+        .filter(|ts| *ts > 0)
+}
+
+/// Byte length of one `elst` entry at the given box version.
+const fn elst_entry_len(version: u8) -> usize {
+    // v0: u32 segment_duration, i32 media_time, u32 media_rate.
+    // v1: u64 segment_duration, i64 media_time, u32 media_rate.
+    if version == 1 {
+        20
+    } else {
+        12
+    }
+}
+
+/// One `elst` entry that DEFERS the track: an empty edit (`media_time == -1`)
+/// of `ticks` movie-timescale ticks.
+struct EmptyEdit {
+    /// Empty-edit length, in movie-timescale ticks.
+    ticks: u64,
+}
+
+/// Every empty edit in an init's `moov`, innermost detail included.
+///
+/// Returns nothing (rather than erroring) for anything it cannot rewrite
+/// safely — a 64-bit `largesize` ancestor, a truncated box — because every
+/// caller's fallback is "serve the bytes unchanged", which is what the code did
+/// before this existed.
+fn find_empty_edits(data: &[u8]) -> Vec<EmptyEdit> {
+    let mut out = Vec::new();
+    let Ok(top) = walk(data, 0..data.len()) else {
+        return out;
+    };
+    let Some(moov) = top.iter().find(|b| &b.kind == b"moov") else {
+        return out;
+    };
+    let Ok(moov_children) = walk(data, moov.start + moov.header..moov.end) else {
+        return out;
+    };
+    for trak in moov_children.iter().filter(|b| &b.kind == b"trak") {
+        let Ok(trak_children) = walk(data, trak.start + trak.header..trak.end) else {
+            continue;
+        };
+        for edts in trak_children.iter().filter(|b| &b.kind == b"edts") {
+            let Ok(edts_children) = walk(data, edts.start + edts.header..edts.end) else {
+                continue;
+            };
+            for elst in edts_children.iter().filter(|b| &b.kind == b"elst") {
+                // Only 32-bit box headers can be rewritten by decrementing a
+                // u32 size in place; a largesize ancestor is left alone.
+                if [moov, trak, edts, elst].iter().any(|b| b.header != 8) {
+                    continue;
+                }
+                let body = elst.start + elst.header;
+                let version = data.get(body).copied().unwrap_or(0);
+                let Some(count) = data
+                    .get(body + 4..body + 8)
+                    .and_then(|s| s.try_into().ok())
+                    .map(u32::from_be_bytes)
+                else {
+                    continue;
+                };
+                let per = elst_entry_len(version);
+                for i in 0..count as usize {
+                    let start = body + 8 + i * per;
+                    let end = start + per;
+                    if end > elst.end {
+                        break;
+                    }
+                    // media_time follows segment_duration and is signed; -1
+                    // marks an EMPTY edit — dead time before the track's media
+                    // starts, i.e. a presentation offset.
+                    let (ticks, media_time) = if version == 1 {
+                        let d =
+                            u64::from_be_bytes(data[start..start + 8].try_into().unwrap_or([0; 8]));
+                        let m = i64::from_be_bytes(
+                            data[start + 8..start + 16].try_into().unwrap_or([0; 8]),
+                        );
+                        (d, m)
+                    } else {
+                        let d =
+                            u32::from_be_bytes(data[start..start + 4].try_into().unwrap_or([0; 4]));
+                        let m = i32::from_be_bytes(
+                            data[start + 4..start + 8].try_into().unwrap_or([0; 4]),
+                        );
+                        (u64::from(d), i64::from(m))
+                    };
+                    if media_time == -1 && ticks > 0 {
+                        out.push(EmptyEdit { ticks });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How long an init segment defers its track's presentation by, in seconds —
+/// the total of every EMPTY edit in its edit list, or `None` when it defers
+/// nothing.
+///
+/// ffmpeg writes such an edit whenever a session was produced with
+/// `-output_ts_offset`, which is exactly what the demuxed audio rendition's
+/// SEEK sessions use. That makes the init a property of the session that wrote
+/// it rather than of the codec, which is the assumption the rest of the
+/// rendition is built on (see `HlsSegmentCache::resolve_audio_file`).
+pub fn init_empty_edit_secs(init: &[u8]) -> Option<f64> {
+    let top = walk(init, 0..init.len()).ok()?;
+    let moov = top.iter().find(|b| &b.kind == b"moov")?;
+    let timescale = movie_timescale(init, moov)?;
+    let ticks: u64 = find_empty_edits(init).iter().map(|e| e.ticks).sum();
+    (ticks > 0).then(|| ticks as f64 / f64::from(timescale))
+}
+
+/// Record what the audio rendition's shared init declares about its own
+/// timeline, for every init served.
+///
+/// This is the signal the browser-side failure had none of. Every fragment of a
+/// seek session is re-anchored onto the absolute timeline by [`shift_tfdt`], so
+/// an init that ALSO defers the track applies the offset twice: the audio lands
+/// at double its true position, never overlaps the video's buffered range, and
+/// the player loads fragment after fragment without ever reaching a playable
+/// state. Nothing in the request path said so — every segment was produced
+/// `ok`, every response was a 200 — and the only visible trace was a client
+/// that fetched a whole title's worth of segments in seven minutes and never
+/// posted a playback start.
+///
+/// LogQL: `{namespace="pharos"} |= "audio rendition init defers"`
+/// PromQL: `sum by (shape) (pharos_audio_init_total)`
+pub fn record_audio_init_shape(init: &[u8], media_id: u64, session_start_seg: u32) -> Option<f64> {
+    let deferred = init_empty_edit_secs(init);
+    let shape = if deferred.is_some() {
+        "deferred"
+    } else {
+        "neutral"
+    };
+    metrics::counter!("pharos_audio_init_total", "shape" => shape).increment(1);
+    if let Some(secs) = deferred {
+        tracing::warn!(
+            media.id = media_id,
+            session_start_seg,
+            empty_edit_secs = secs,
+            "audio rendition init defers its track — the fragments served under it \
+             are re-anchored to the same timeline position, so a player honouring \
+             this edit places the audio at twice its true offset"
+        );
+    }
+    deferred
+}
+
 /// The `tfdt` base decode time (0-clamped) from a traf's children, if present.
 fn read_tfdt(raw: &[u8], children: &[Box]) -> Option<u64> {
     let b = children.iter().find(|b| &b.kind == b"tfdt")?;
