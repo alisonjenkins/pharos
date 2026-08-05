@@ -2646,7 +2646,20 @@ impl HlsSegmentCache {
             .strip_prefix('a')
             .and_then(|r| r.strip_suffix(".m4s"))
             .and_then(|r| r.parse::<u32>().ok());
-        for start in Self::audio_session_starts(root).await {
+        let mut starts = Self::audio_session_starts(root).await;
+        if want.is_none() {
+            // `init.mp4` takes the SHALLOWEST session that has one, which is the
+            // whole-file session whenever it exists (B188). The bodies are not
+            // interchangeable: a seek session's init defers the track by its own
+            // `-output_ts_offset`, which the serve path then has to subtract
+            // back out, while the from-0 session's carries only B120's
+            // late-audio pad. Preferring one END of the list makes which body a
+            // client gets deterministic instead of a race — and it has to be
+            // this end, because the correction the serve path applies to a seek
+            // init leaves sub-grid residue that the from-0 init would not have.
+            starts.reverse();
+        }
+        for start in starts {
             if want.is_some_and(|w| start > w) {
                 continue;
             }
@@ -7209,6 +7222,45 @@ mod tests {
         assert!(HlsSegmentCache::resolve_audio_file(td.path(), "a999.m4s")
             .await
             .is_none());
+    }
+
+    /// B188 — `init.mp4` resolves the OTHER way: shallowest session first.
+    ///
+    /// Segments want the deepest session so a client playing on from a seek
+    /// keeps one set of cut points. The init wants the shallowest, because the
+    /// two bodies are not interchangeable — a seek session's defers the track by
+    /// its own `-output_ts_offset` and the serve path has to subtract that back
+    /// out, leaving sub-grid residue the from-0 init never had. Whichever end is
+    /// chosen, it must be chosen deterministically: the init is served
+    /// `immutable, max-age=1y` under a URL that says nothing about its producer,
+    /// so a race here leaves one of the two bodies in a browser for a year.
+    #[tokio::test]
+    async fn the_audio_init_resolves_to_the_shallowest_session() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        tokio::fs::create_dir_all(root.join("s30")).await.unwrap();
+        tokio::fs::write(root.join("init.mp4"), b"from0")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("s30").join("init.mp4"), b"seek")
+            .await
+            .unwrap();
+
+        let (p, start) = HlsSegmentCache::resolve_audio_file(root, "init.mp4")
+            .await
+            .unwrap();
+        assert_eq!(start, 0, "the from-0 session must answer for the init");
+        assert_eq!(tokio::fs::read(p).await.unwrap(), b"from0");
+
+        // With no from-0 init on disk the seek session's still answers — a
+        // mid-file track switch spawns no whole-file session at all (B106), and
+        // a 404 here would be worse than an init the serve path can correct.
+        tokio::fs::remove_file(root.join("init.mp4")).await.unwrap();
+        let (p, start) = HlsSegmentCache::resolve_audio_file(root, "init.mp4")
+            .await
+            .unwrap();
+        assert_eq!(start, 30);
+        assert_eq!(tokio::fs::read(p).await.unwrap(), b"seek");
     }
 
     /// B106 — a fresh mid-file audio-track switch (new `-a{idx}` dir, no
