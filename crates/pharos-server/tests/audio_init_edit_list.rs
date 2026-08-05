@@ -47,6 +47,75 @@ fn ffmpeg(args: &[&str], what: &str) {
     );
 }
 
+/// How late `make_late_audio_source`'s audio track starts against its video.
+const AUDIO_START: f64 = 1.7;
+
+/// A source whose VIDEO starts at 0 and whose AUDIO stream starts at
+/// `AUDIO_START`. `-itsoffset` on the audio input is what makes the track's
+/// `start_time` genuinely late; padding with `adelay` here instead would leave
+/// `start_time` at 0 and reproduce nothing. This is B120's shape — the
+/// whole-file session pads the front to keep the offset, and ffmpeg records
+/// that pad as an empty edit.
+fn make_late_audio_source(dir: &Path) -> PathBuf {
+    let v = dir.join("lv.mkv");
+    let a = dir.join("la.mka");
+    let src = dir.join("late.mkv");
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=25:duration=60",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            v.to_str().expect("utf-8 path"),
+        ],
+        "late video",
+    );
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000:duration=60",
+            "-c:a",
+            "aac",
+            a.to_str().expect("utf-8 path"),
+        ],
+        "late audio",
+    );
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            v.to_str().expect("utf-8 path"),
+            "-itsoffset",
+            &format!("{AUDIO_START}"),
+            "-i",
+            a.to_str().expect("utf-8 path"),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            src.to_str().expect("utf-8 path"),
+        ],
+        "late mux",
+    );
+    src
+}
+
 /// A plain 60 s tone — long enough for a session seeked to `SEEK_SEG` to have
 /// real content after it.
 fn make_source(dir: &Path) -> PathBuf {
@@ -138,62 +207,71 @@ async fn a_seek_sessions_init_defers_its_track_by_the_session_start() {
     );
 }
 
-/// B186 / V141 — dropping the empty edit makes a seek session's init the
-/// whole-file session's init, byte for byte.
+/// B186 — a seek session's init loses exactly the session's own
+/// `-output_ts_offset` and nothing more.
 ///
-/// Byte equality is the assertion worth making rather than "no empty edit
-/// remains": the init is served `immutable, max-age=1y` under a URL that names
-/// the item and nothing about which session produced the bytes, so two sessions
-/// that disagree by even one byte put a stale, incompatible init in a browser
-/// for a year. Neutralising has to converge on ONE body, not merely a
-/// well-behaved one.
+/// What remains is sub-grid residue: `-ss` lands on a packet boundary rather
+/// than exactly on the 6 s grid, and that difference is REAL — it says where the
+/// audio actually begins relative to the grid. Zeroing it would be throwing away
+/// a measurement to make a number look tidy.
 #[tokio::test]
-async fn dropping_the_empty_edit_converges_on_the_whole_file_sessions_init() {
+async fn a_seek_sessions_init_loses_the_session_offset_and_keeps_the_residue() {
     let td = tempfile::tempdir().expect("tempdir");
     let src = make_source(td.path());
     let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
 
-    let from0 = init_of(&cache, &src, 4, 0).await;
     let mut seek = init_of(&cache, &src, 5, SEEK_SEG).await;
+    let offset = f64::from(SEEK_SEG) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
 
-    let want = f64::from(SEEK_SEG) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
-    let dropped = fmp4::drop_empty_edits(&mut seek)
+    let removed = fmp4::shrink_empty_edits(&mut seek, offset)
         .expect("edit list rewritten")
-        .expect("a seek session's init has an empty edit to drop");
+        .expect("a seek session's init has a deferral to shrink");
     assert!(
-        (dropped - want).abs() < 0.05,
-        "should have dropped the session's own {want:.3}s deferral, dropped {dropped:.3}s"
+        (removed - offset).abs() < 0.05,
+        "should have removed the session's own {offset:.3}s deferral, removed {removed:.3}s"
     );
-    assert_eq!(
-        fmp4::init_empty_edit_secs(&seek),
-        None,
-        "the neutralised init must defer nothing"
-    );
-    assert_eq!(
-        seek, from0,
-        "a neutralised seek-session init must be the from-0 session's init byte for byte — \
-         one immutable URL cannot have two bodies"
+    let left = fmp4::init_empty_edit_secs(&seek).unwrap_or(0.0);
+    assert!(
+        left < 0.05,
+        "after removing the session offset only sub-grid residue may remain, but {left:.3}s does \
+         — the fragments are already anchored absolutely, so anything of segment scale is applied twice"
     );
 }
 
-/// Neutralising an already-neutral init changes nothing and reports nothing.
-/// The serve path runs this on every init, including the overwhelmingly common
-/// from-0 one.
+/// B188 — a WHOLE-FILE session's init keeps its empty edit, because that edit is
+/// B120's late-audio pad, not a session offset.
+///
+/// `audio_hls_args` pads the front of a from-0 session when the audio track
+/// starts after the video (`-af adelay`), precisely so the fragments keep the
+/// track's true start; ffmpeg records that pad as an empty edit. Stripping it
+/// re-introduces B120 — audio ahead of picture for the whole title. The from-0
+/// session has no `-output_ts_offset` at all, so the correct amount to remove
+/// from its init is zero.
 #[tokio::test]
-async fn dropping_from_a_neutral_init_is_a_no_op() {
+async fn a_whole_file_sessions_late_audio_pad_survives() {
     let td = tempfile::tempdir().expect("tempdir");
-    let src = make_source(td.path());
+    let src = make_late_audio_source(td.path());
     let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
 
-    let mut init = init_of(&cache, &src, 6, 0).await;
+    let mut init = init_of(&cache, &src, 7, 0).await;
+    let pad = fmp4::init_empty_edit_secs(&init)
+        .expect("a from-0 session on a late-audio source pads the front (B120)");
+    assert!(
+        (pad - AUDIO_START).abs() < 0.1,
+        "the pad should be the audio track's own {AUDIO_START}s start, was {pad:.3}s"
+    );
     let before = init.clone();
 
     assert_eq!(
-        fmp4::drop_empty_edits(&mut init).expect("edit list read"),
+        fmp4::shrink_empty_edits(&mut init, 0.0).expect("edit list read"),
         None,
-        "a from-0 init has no empty edit to drop"
+        "a from-0 session defers by nothing of its own, so nothing may be removed"
     );
-    assert_eq!(init, before, "a no-op must not touch a byte");
+    assert_eq!(
+        init, before,
+        "B120's late-audio pad must survive untouched — removing it puts the audio \
+         {AUDIO_START}s ahead of picture for the whole title"
+    );
 }
 
 /// Seed a store + app state around one audio-only fixture.
@@ -272,11 +350,49 @@ async fn the_audio_init_route_serves_a_neutral_init_after_a_deep_seek() {
     )
     .await;
 
-    assert_eq!(
-        fmp4::init_empty_edit_secs(&init),
-        None,
-        "the init served after a deep seek still defers its track — every fragment \
-         under it is re-anchored to the same offset, so the audio lands at twice \
+    let left = fmp4::init_empty_edit_secs(&init).unwrap_or(0.0);
+    assert!(
+        left < 0.05,
+        "the init served after a deep seek still defers its track by {left:.3}s — every \
+         fragment under it is re-anchored to the same offset, so the audio lands at twice \
          its true position and never overlaps the video"
+    );
+}
+
+/// B188 — the ROUTE preserves B120's late-audio pad.
+///
+/// Worth asserting separately from the helper: the serve path decides what
+/// offset to pass, and passing the wrong one (or the old unconditional strip)
+/// is invisible to any test that only exercises `shrink_empty_edits` directly.
+#[actix_web::test]
+async fn the_audio_init_route_preserves_a_late_audio_pad() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let src = make_late_audio_source(td.path());
+    let (state, token) = seed(src, &td.path().join("cache")).await;
+    let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
+
+    // Segment 0 is what spawns the WHOLE-FILE session — the one that pads.
+    let frag = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/videos/42/vp9/audio/a0.m4s?api_key={token}"))
+            .to_request(),
+    )
+    .await;
+    assert!(frag.status().is_success(), "fragment: {}", frag.status());
+
+    let init = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/videos/42/vp9/audio/init.mp4?api_key={token}"))
+            .to_request(),
+    )
+    .await;
+
+    let pad = fmp4::init_empty_edit_secs(&init).unwrap_or(0.0);
+    assert!(
+        (pad - AUDIO_START).abs() < 0.1,
+        "the served init must keep the audio track's own {AUDIO_START}s start, kept {pad:.3}s — \
+         stripping it is B120 again, audio ahead of picture for the whole title"
     );
 }
