@@ -352,6 +352,11 @@ const fn elst_entry_len(version: u8) -> usize {
 struct EmptyEdit {
     /// Empty-edit length, in movie-timescale ticks.
     ticks: u64,
+    /// `elst` box version, which fixes the width of the fields below.
+    version: u8,
+    /// Offset of this entry's `segment_duration` field, so the deferral can be
+    /// REDUCED in place rather than only removed wholesale.
+    duration_at: usize,
     /// Byte range of the entry itself.
     entry: std::ops::Range<usize>,
     /// Offsets of the 32-bit size fields that shrink when `entry` is removed:
@@ -429,6 +434,8 @@ fn find_empty_edits(data: &[u8]) -> Vec<EmptyEdit> {
                     if media_time == -1 && ticks > 0 {
                         out.push(EmptyEdit {
                             ticks,
+                            version,
+                            duration_at: start,
                             entry: start..end,
                             ancestors: [moov.start, trak.start, edts.start, elst.start],
                             entry_count_at: body + 4,
@@ -458,10 +465,11 @@ pub fn init_empty_edit_secs(init: &[u8]) -> Option<f64> {
     (ticks > 0).then(|| ticks as f64 / f64::from(timescale))
 }
 
-/// Remove every EMPTY edit from `init`'s edit lists, in place. Returns how much
-/// deferral was dropped, in seconds, or `None` when there was none.
+/// Reduce `init`'s empty edits by `session_offset_secs`, in place. Returns how
+/// much deferral was removed, in seconds, or `None` when there was nothing to
+/// remove.
 ///
-/// ## Why the init must not defer anything
+/// ## What is being removed, and what must NOT be
 ///
 /// A seek session's fragments carry their offset WITHIN that session, and the
 /// serve path shifts every one of them back onto the absolute timeline (B121).
@@ -472,23 +480,41 @@ pub fn init_empty_edit_secs(init: &[u8]) -> Option<f64> {
 /// reaching a playable state (B186 — Lace could not watch Supergirl; the
 /// browser drained 45 minutes of segments in seven and never started).
 ///
-/// Dropping the edit rather than dropping the `tfdt` shift is deliberate: the
-/// shift is what B121 proved works across players, and edit-list handling is
-/// the part of MSE that clients disagree about.
+/// The amount to remove is therefore the SESSION's own offset and nothing else.
+/// An earlier version of this dropped every empty edit unconditionally, which
+/// looked equivalent and was not: a WHOLE-FILE session pads the front of a
+/// late-starting audio track on purpose (`-af adelay`, B120) so its fragments
+/// keep the track's true start, and ffmpeg records that pad as an empty edit
+/// too. Stripping it put the audio ahead of the picture for the whole title —
+/// B120 reintroduced by the fix for B186 (B188). A from-0 session has no
+/// `-output_ts_offset`, so `session_offset_secs` is 0 for it and its init is
+/// returned untouched.
 ///
-/// ## Why it converges
+/// Removing the edit rather than the `tfdt` shift is deliberate: the shift is
+/// what B121 proved works across players, and edit-list handling is the part of
+/// MSE that clients disagree about.
 ///
-/// The result is the byte-identical init the whole-file session would have
-/// written. That is the property the serve path needs, not merely "no empty
-/// edit": the init is served `immutable, max-age=1y` under a URL that names the
-/// item and NOTHING about which session produced the bytes, so two sessions
-/// that disagree by one byte leave one of them in a browser for a year,
-/// describing fragments it does not match.
+/// ## Why a residue may remain, and why that is right
 ///
-/// Entries are spliced out back-to-front so every offset recorded by
-/// [`find_empty_edits`] stays valid: an ancestor's size field always precedes
-/// the entry it encloses.
-pub fn drop_empty_edits(init: &mut Vec<u8>) -> Result<Option<f64>, Fmp4Error> {
+/// `-ss` lands on a packet boundary rather than exactly on the 6 s grid, so a
+/// seek session's edit is its offset PLUS a few milliseconds. That residue is a
+/// real measurement of where the audio begins relative to the grid; zeroing it
+/// would discard information to make the number look tidy. Only entries whose
+/// whole duration is accounted for by the offset are spliced out — and those are
+/// spliced back-to-front, so every offset [`find_empty_edits`] recorded stays
+/// valid (an ancestor's size field always precedes the entry it encloses).
+pub fn shrink_empty_edits(
+    init: &mut Vec<u8>,
+    session_offset_secs: f64,
+) -> Result<Option<f64>, Fmp4Error> {
+    // Strictly positive, and NaN takes this branch too: an unusable offset must
+    // leave the init alone rather than subtract something arbitrary from it.
+    if !matches!(
+        session_offset_secs.partial_cmp(&0.0),
+        Some(std::cmp::Ordering::Greater)
+    ) {
+        return Ok(None);
+    }
     let top = walk(init, 0..init.len())?;
     let Some(moov) = top.iter().find(|b| &b.kind == b"moov") else {
         return Ok(None);
@@ -500,9 +526,36 @@ pub fn drop_empty_edits(init: &mut Vec<u8>) -> Result<Option<f64>, Fmp4Error> {
     if edits.is_empty() {
         return Ok(None);
     }
-    let ticks: u64 = edits.iter().map(|e| e.ticks).sum();
+    // One budget spread across the (in practice single) empty edit, so several
+    // entries cannot each subtract the whole offset.
+    let mut budget = (session_offset_secs * f64::from(timescale)).round() as u64;
+    let mut removed = 0u64;
     edits.sort_by_key(|e| std::cmp::Reverse(e.entry.start));
     for edit in &edits {
+        if budget == 0 {
+            break;
+        }
+        let take = edit.ticks.min(budget);
+        budget -= take;
+        removed += take;
+        if take < edit.ticks {
+            // Partly the session's offset: keep the entry, shorten it.
+            let left = edit.ticks - take;
+            let at = edit.duration_at;
+            if edit.version == 1 {
+                let Some(field) = init.get_mut(at..at + 8) else {
+                    return Err(Fmp4Error::Truncated(at));
+                };
+                field.copy_from_slice(&left.to_be_bytes());
+            } else {
+                let Some(field) = init.get_mut(at..at + 4) else {
+                    return Err(Fmp4Error::Truncated(at));
+                };
+                field.copy_from_slice(&(left as u32).to_be_bytes());
+            }
+            continue;
+        }
+        // Entirely the session's offset: the entry has nothing left to say.
         let len = edit.entry.end - edit.entry.start;
         init.drain(edit.entry.clone());
         for size_at in edit.ancestors {
@@ -522,7 +575,7 @@ pub fn drop_empty_edits(init: &mut Vec<u8>) -> Result<Option<f64>, Fmp4Error> {
         let count = u32::from_be_bytes(field.try_into().unwrap_or([0; 4]));
         init[at..at + 4].copy_from_slice(&count.saturating_sub(1).to_be_bytes());
     }
-    Ok(Some(ticks as f64 / f64::from(timescale)))
+    Ok((removed > 0).then(|| removed as f64 / f64::from(timescale)))
 }
 
 /// Record what the audio rendition's shared init declares about its own

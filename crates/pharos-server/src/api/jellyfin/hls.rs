@@ -2017,7 +2017,13 @@ async fn vp9_audio_file(
     // because how often a deferred init reached this point is the signal.
     if name == "init.mp4" {
         fmp4::record_audio_init_shape(&bytes, media_id, file.session_start_seg);
-        fmp4::drop_empty_edits(&mut bytes)
+        // Only the SESSION's own `-output_ts_offset` comes off. A from-0
+        // session's offset is 0, so its init is returned untouched — the empty
+        // edit it carries is B120's late-audio pad, and removing that puts the
+        // audio ahead of the picture for the whole title (B188).
+        let session_offset_secs =
+            f64::from(file.session_start_seg) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
+        fmp4::shrink_empty_edits(&mut bytes, session_offset_secs)
             .map_err(|e| error::ErrorInternalServerError(format!("audio init edit list: {e}")))?;
     }
     // B121 — put the fragment back on the timeline. ffmpeg's HLS muxer numbers
