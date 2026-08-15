@@ -647,11 +647,35 @@ async fn read_progress(out: &Path) -> Option<(u64, f64)> {
 /// handful of frames would need the source frame rate here, which this layer
 /// has no honest way to know; the decode preroll is what prevents those, and
 /// `tests/segment_frame_completeness.rs` is what keeps it working.
-fn short_of_frames(progress: Option<(u64, f64)>, opts: &TranscodeOptions) -> Option<String> {
+///
+/// `is_final_segment` exempts the title's LAST window from the duration rule,
+/// and from that rule alone. The duration test compares what was produced
+/// against what the window asked for, and the window is clamped by the
+/// CONTAINER's duration while the encoder stops at the end of the VIDEO
+/// stream. Where audio outruns video — a trailing music cue, a fade over
+/// black, any mux that pads audio — the final window therefore asks for video
+/// the source does not hold, and neither a re-encode nor a longer preroll can
+/// conjure it. T113, live on 2026-08-15: Ant-Man's segment 1171 of 1172 asked
+/// for 0.773 s against 0.500 s of video and 500'd on all 14 attempts across 7
+/// play sessions, so playing that title to its end produced an error instead
+/// of an end of stream.
+///
+/// Everywhere else a short segment is exactly the silent-frame-loss defect
+/// this function exists to catch, so the exemption is deliberately narrow: at
+/// the tail, HOW MUCH video remains is a property of the source; that there is
+/// SOME is still the encoder's job, and the zero-frame rule above still runs.
+fn short_of_frames(
+    progress: Option<(u64, f64)>,
+    opts: &TranscodeOptions,
+    is_final_segment: bool,
+) -> Option<String> {
     let (frames, out_time_secs) = progress?;
     let encoding_video = opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy));
     if encoding_video && frames == 0 {
         return Some("no video frames at all".to_string());
+    }
+    if is_final_segment {
+        return None;
     }
     if let Some(want) = opts.duration_seconds() {
         if out_time_secs < want * 0.9 {
@@ -2190,7 +2214,7 @@ impl HlsSegmentCache {
             // the gross completeness check here, and for the per-frame
             // accounting on the success path below.
             reported = read_progress(&tmp).await;
-            shortfall = short_of_frames(reported, &attempt_opts);
+            shortfall = short_of_frames(reported, &attempt_opts, opts.window.is_final());
             match &shortfall {
                 None => break,
                 Some(why) => {
@@ -6207,7 +6231,7 @@ mod tests {
         let out = td.path().join("seg.ts");
         write_progress(&out, 144, 6.006).await;
         let got = read_progress(&out).await;
-        assert_eq!(short_of_frames(got, &segment_transcode_opts()), None);
+        assert_eq!(short_of_frames(got, &segment_transcode_opts(), false), None);
     }
 
     #[tokio::test]
@@ -6220,7 +6244,7 @@ mod tests {
         let out = td.path().join("seg.ts");
         write_progress(&out, 0, 6.006).await;
         let got = read_progress(&out).await;
-        let why = short_of_frames(got, &segment_transcode_opts())
+        let why = short_of_frames(got, &segment_transcode_opts(), false)
             .expect("a video segment with zero frames must be rejected");
         assert!(why.contains("no video frames"), "{why}");
     }
@@ -6235,7 +6259,67 @@ mod tests {
         opts.video = None;
         opts.video_bitrate_bps = None;
         let got = read_progress(&out).await;
-        assert_eq!(short_of_frames(got, &opts), None);
+        assert_eq!(short_of_frames(got, &opts, false), None);
+    }
+
+    /// T113 — the tail of a title whose AUDIO outruns its VIDEO.
+    ///
+    /// The grid, and so the window's clamp, comes from the CONTAINER duration;
+    /// the encoder stops at the end of the VIDEO stream. When those differ the
+    /// final window asks for video the source does not hold, and no encoder and
+    /// no preroll can produce it. Live on 2026-08-15: Ant-Man's segment 1171 of
+    /// 1172 asked for 0.773 s against 0.500 s of video and returned 500 on all
+    /// 14 attempts across 7 play sessions, so playing that title to its end
+    /// gave an error instead of an end of stream.
+    ///
+    /// The clamp added for the previous instance of this class does not cover
+    /// it: the container's duration is exactly the number that is too large.
+    #[tokio::test]
+    async fn the_final_segment_is_accepted_when_the_video_track_ended_early() {
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        // Ant-Man's numbers: 0.500 s produced against a 0.773 s window.
+        write_progress(&out, 12, 0.500).await;
+        let got = read_progress(&out).await;
+        let mut opts = segment_transcode_opts();
+        opts.duration_ticks = Some(pharos_core::time::Ticks::from_seconds(0.773).0);
+        assert_eq!(
+            short_of_frames(got, &opts, true),
+            None,
+            "the last segment of a title carries whatever video the source has \
+             left; how much that is, is a property of the source and not \
+             evidence of a bad encode"
+        );
+    }
+
+    /// The exemption is for the tail ALONE. A short segment anywhere else is
+    /// the silent-frame-loss defect this check was built for, and trading that
+    /// away to fix an error at the end of a film would be a far worse deal.
+    #[tokio::test]
+    async fn a_short_segment_that_is_not_the_tail_is_still_rejected() {
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 12, 0.500).await;
+        let got = read_progress(&out).await;
+        let mut opts = segment_transcode_opts();
+        opts.duration_ticks = Some(pharos_core::time::Ticks::from_seconds(0.773).0);
+        let why = short_of_frames(got, &opts, false)
+            .expect("a mid-file segment short of video must still be rejected");
+        assert!(why.contains("0.500") && why.contains("0.773"), "{why}");
+    }
+
+    /// The tail is exempt from the DURATION rule and from nothing else. A
+    /// final segment carrying no picture at all is still broken — the source
+    /// running out explains a short segment, never an empty one.
+    #[tokio::test]
+    async fn a_final_segment_with_no_video_frames_is_still_rejected() {
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.ts");
+        write_progress(&out, 0, 0.500).await;
+        let got = read_progress(&out).await;
+        let why = short_of_frames(got, &segment_transcode_opts(), true)
+            .expect("a final video segment with zero frames must be rejected");
+        assert!(why.contains("no video frames"), "{why}");
     }
 
     #[tokio::test]
@@ -6244,7 +6328,7 @@ mod tests {
         let out = td.path().join("seg.ts");
         write_progress(&out, 90, 3.5).await;
         let got = read_progress(&out).await;
-        let why = short_of_frames(got, &segment_transcode_opts())
+        let why = short_of_frames(got, &segment_transcode_opts(), false)
             .expect("a segment that stopped early must be rejected");
         assert!(why.contains("3.500") && why.contains("6.006"), "{why}");
     }
@@ -6257,7 +6341,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         let got = read_progress(&out).await;
-        assert_eq!(short_of_frames(got, &segment_transcode_opts()), None);
+        assert_eq!(short_of_frames(got, &segment_transcode_opts(), false), None);
     }
 
     #[tokio::test]
@@ -6348,7 +6432,7 @@ mod tests {
         // replays on every later view.
         let opts = segment_transcode_opts();
         assert_eq!(
-            short_of_frames(Some((141, 5.9)), &opts),
+            short_of_frames(Some((141, 5.9)), &opts, false),
             None,
             "the gross duration check cannot see a three-frame shortfall"
         );
