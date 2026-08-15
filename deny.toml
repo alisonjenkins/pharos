@@ -58,6 +58,47 @@ ignore = [
     # boko moves to quick-xml 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # RUSTSEC-2026-0245 — path traversal (CWE-23/CWE-36) in `sevenz-rust`
+    # 0.6.1's `decompress_impl`: an archive entry whose name is `../…` or
+    # absolute is joined onto the output directory and WRITTEN there, so a
+    # malicious `.7z` can write anywhere the process can. 8.3 high, and
+    # "no fixed upgrade is available" — the crate is superseded by
+    # `sevenz-rust2`, which is a different API and a different maintainer.
+    #
+    # Ignored on REACHABILITY, and the reachability argument here is simple
+    # enough to state exactly: the vulnerability lives in the extract-to-DISK
+    # family (`decompress`, `decompress_file`, `decompress_with_*`), which is
+    # what resolves an entry name against an output path. pharos never
+    # extracts a 7z entry to disk. Its only two uses, both in
+    # `crates/pharos-scanner/src/book/comic.rs` (`.cb7` comics), are
+    # `Archive::read` + `SevenZReader::from_archive` + `for_each_entries`,
+    # and the closure reads the entry into a `Vec<u8>` in memory. An entry
+    # NAME is only ever compared (`e.name == entry`), never joined to a path.
+    # `sevenz_rust::compress_to_path` also appears in that file, in the test
+    # module, building a fixture — compression, not extraction.
+    #
+    # Worth more care than a routine transitive ignore, because the input IS
+    # user-supplied: `.cb7` files come from the media library, which is
+    # exactly the untrusted-by-construction surface B173 was about. What
+    # would invalidate this: ANY call that writes a 7z entry to a path
+    # derived from the archive. `a_cb7_is_never_extracted_to_disk` fails the
+    # build if one appears. Drop the entry if the crate ships a fix, or when
+    # the `.cb7` path moves to `sevenz-rust2`.
+    "RUSTSEC-2026-0245",
+    # RUSTSEC-2026-0246 — `sevenz-rust` is unmaintained: the repository has
+    # been deleted, and the advisory points at `sevenz-rust2` as the
+    # successor. Not a vulnerability, and `cargo audit` only warns; cargo-deny
+    # escalates `unmaintained` to an error, which is the same asymmetry B173
+    # hit. "No safe upgrade is available" — the successor is a fork under a
+    # new name and a new maintainer, so moving is a dependency swap with its
+    # own review, not a `cargo update`.
+    #
+    # Held deliberately rather than rushed in behind a playback fix: T115
+    # tracks the migration, which also retires RUSTSEC-2026-0245 above. Until
+    # then the exposure is bounded by the same fact that makes -0245
+    # unreachable — pharos reads `.cb7` entries into memory and never writes
+    # one to disk.
+    "RUSTSEC-2026-0246",
 ]
 
 [licenses]

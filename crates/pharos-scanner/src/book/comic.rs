@@ -697,6 +697,47 @@ mod tests {
         v
     }
 
+    /// RUSTSEC-2026-0245 — `sevenz-rust` 0.6.1 joins an archive-supplied entry
+    /// name onto the output directory and writes there, so a `.7z` carrying
+    /// `../…` or an absolute path writes anywhere the process can. There is no
+    /// fixed release, and the advisory is ignored in `deny.toml` on the
+    /// grounds that pharos never extracts a 7z entry TO DISK: the `.cb7` path
+    /// reads entries into memory and only ever compares their names.
+    ///
+    /// That argument is about code, so it decays silently — one call to
+    /// `sevenz_rust::decompress*` would make a high-severity arbitrary file
+    /// write reachable from a file in the media library, with the advisory
+    /// still suppressed and CI still green. This is the check that fails
+    /// instead. `include_str!` reads THIS file at compile time, so it cannot
+    /// go stale or depend on the working directory.
+    ///
+    /// Deliberately matches `sevenz_rust::decompress` and not the bare word:
+    /// "decompression" appears in prose here, and `compress_to_path` above is
+    /// a test fixture builder — compression, not extraction.
+    #[test]
+    fn a_cb7_is_never_extracted_to_disk() {
+        // Built at runtime from two halves so this line — and the prose
+        // above it — cannot match themselves. A guard that trips on its own
+        // documentation is a guard nobody keeps.
+        let needle = format!("sevenz_rust::{}", "decompress");
+        let src = include_str!("comic.rs");
+        let hits: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.contains(&needle))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "a 7z entry is being extracted to disk, which makes \
+             RUSTSEC-2026-0245 (path traversal → arbitrary file write) \
+             reachable from a library file. The advisory is suppressed in \
+             deny.toml on the grounds that this never happens. Either drop \
+             the suppression or extract to a path you derive yourself, never \
+             one the archive supplies: {hits:?}"
+        );
+    }
+
     /// Build a `.cbz` in-test rather than checking a binary blob into the repo,
     /// so the fixture's contents are visible in the test that reads them.
     fn write_cbz(path: &Path, entries: &[(&str, Vec<u8>)]) {
