@@ -26,6 +26,7 @@ pub mod router;
 #[cfg(unix)]
 pub mod scan_tasks;
 pub mod segment_backfill;
+pub mod session_start;
 pub mod sessions;
 pub mod state;
 #[cfg(feature = "postgres")]
