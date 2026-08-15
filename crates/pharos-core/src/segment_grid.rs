@@ -178,6 +178,34 @@ mod tests {
         assert!(grid.checked(9999).is_none());
     }
 
+    /// Only the last index of the grid is the tail, and only when there IS a
+    /// grid. The completeness check relaxes its duration rule on this flag, so
+    /// a window that claimed it wrongly would switch that check off for an
+    /// ordinary segment — the silent-frame-loss defect, back.
+    #[test]
+    fn only_the_last_window_of_the_grid_is_final() {
+        // Ant-Man's shape: 7026.771 s → 1172 segments, indices 0..=1171.
+        let rate = FrameRate::from_mille(23_976);
+        let total = Some(7026.771);
+        assert!(
+            SegmentWindow::for_segment(1171, rate, total).is_final(),
+            "the last index of the grid is the tail"
+        );
+        assert!(
+            !SegmentWindow::for_segment(1170, rate, total).is_final(),
+            "the segment before the tail is an ordinary segment"
+        );
+        assert!(!SegmentWindow::for_segment(0, rate, total).is_final());
+        // Over-index: outside the grid, not the tail of it. Upstream turns
+        // this into a 404; it must not arrive carrying an exemption.
+        assert!(!SegmentWindow::for_segment(1172, rate, total).is_final());
+        // No probed duration → no grid → no last index to be.
+        assert!(!SegmentWindow::for_segment(1171, rate, None).is_final());
+        assert!(!SegmentWindow::for_segment(0, rate, None).is_final());
+        // A single-segment title is all tail.
+        assert!(SegmentWindow::for_segment(0, rate, Some(4.0)).is_final());
+    }
+
     #[test]
     fn segment_grid_resolve_maps_time_to_index() {
         let grid = SegmentGrid::new(120.0, Some(24_000));
@@ -246,6 +274,21 @@ pub struct SegmentWindow {
     /// boundary, and an older peer's payload simply carries no rate.
     #[serde(default)]
     rate: Option<crate::FrameRate>,
+    /// Whether this is the LAST window of the title's grid.
+    ///
+    /// Set here, from the grid, and nowhere else — for the same reason the
+    /// other fields are private. A delivery path that could declare its own
+    /// segment "final" could switch off the completeness check for any
+    /// segment it liked, which is the check that catches silent frame loss.
+    ///
+    /// `false` when the total duration is unknown: with no grid there is no
+    /// last index, and guessing one would exempt an arbitrary segment.
+    ///
+    /// `default` for wire compatibility, as with `rate` — an older peer's
+    /// payload simply carries no flag, which reads as "not the tail" and so
+    /// keeps the strict rule.
+    #[serde(default)]
+    is_final: bool,
 }
 
 impl SegmentWindow {
@@ -276,14 +319,19 @@ impl SegmentWindow {
         rate: Option<FrameRate>,
         total_duration_secs: Option<f64>,
     ) -> Self {
+        let mut is_final = false;
         let (start, dur) = match total_duration_secs.filter(|t| *t > 0.0) {
             Some(total) => {
                 let grid = SegmentGrid::with_rate(total, rate);
                 match grid.checked(index) {
-                    Some(i) => grid.frame_snapped_range(i),
+                    Some(i) => {
+                        is_final = i.get() + 1 == grid.count();
+                        grid.frame_snapped_range(i)
+                    }
                     // Past the end of the grid: the bounds check upstream turns
                     // this into a 404, so describe the nominal window rather
-                    // than invent a clamped one.
+                    // than invent a clamped one. Not `is_final` either — an
+                    // over-index is not the tail, it is outside the grid.
                     None => segment_range(index, rate),
                 }
             }
@@ -295,6 +343,7 @@ impl SegmentWindow {
             start_ticks: crate::time::Ticks::from_seconds(start).0,
             duration_ticks: crate::time::Ticks::from_seconds(dur).0,
             rate,
+            is_final,
         }
     }
 
@@ -302,6 +351,16 @@ impl SegmentWindow {
     /// one.
     pub fn rate(self) -> Option<crate::FrameRate> {
         self.rate
+    }
+
+    /// Whether this is the title's LAST window.
+    ///
+    /// Read by the segment completeness check: the final window is clamped by
+    /// the container's duration while the encoder stops at the end of the
+    /// video stream, so a title whose audio outruns its video legitimately
+    /// produces less video here than the window asks for (T113).
+    pub fn is_final(self) -> bool {
+        self.is_final
     }
 
     /// How many video frames this window implies, when the rate is known.
