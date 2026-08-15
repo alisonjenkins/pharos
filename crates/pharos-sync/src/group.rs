@@ -861,6 +861,45 @@ fn record_gate_outcome(reason: GateReason, opened_at: tokio::time::Instant, outc
     .record(waited.as_secs_f64());
 }
 
+/// The playback state a member was hydrated with when it joined, reconnected,
+/// or acked late. Bounded label set — asserted distinct in
+/// `hydrate_states_have_distinct_labels`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HydrateState {
+    /// Group is playing: the member was aimed at an EXTRAPOLATED position.
+    Playing,
+    /// Group is paused: the member was aimed at a stored position.
+    Paused,
+    /// Group has no playback at all — the member was told nothing.
+    Idle,
+}
+
+impl HydrateState {
+    fn label(self) -> &'static str {
+        match self {
+            HydrateState::Playing => "playing",
+            HydrateState::Paused => "paused",
+            HydrateState::Idle => "idle",
+        }
+    }
+}
+
+/// Record one member hydration. `anchor_age` is `Some` only for the playing
+/// case, where the position sent is the anchor plus that age — the term that
+/// grows without bound when an anchor stops being refreshed, and the one
+/// number that says whether a joiner was aimed somewhere real.
+fn record_hydrate(state: HydrateState, anchor_age_ms: Option<u64>) {
+    metrics::counter!(
+        "pharos_syncplay_hydrate_total",
+        "state" => state.label(),
+    )
+    .increment(1);
+    if let Some(age_ms) = anchor_age_ms {
+        metrics::histogram!("pharos_syncplay_hydrate_anchor_age_seconds")
+            .record(age_ms as f64 / 1000.0);
+    }
+}
+
 /// The readiness gate: while `Some`, the group is in `Waiting` and will not
 /// broadcast the pending `Play`/`Pause` until every member in `pending` has
 /// reported `Ready` (or `deadline` fires — the anti-wedge timeout).
@@ -1090,17 +1129,50 @@ impl GroupState {
     fn send_playback_state(&self, member_id: MemberId) {
         let server_ms = self.server_ms_now();
         match self.playback {
-            PlaybackState::Idle => {}
+            // A joiner hydrated into an idle group is told NOTHING — the same
+            // shape as the seeded-but-unbound queue (B186), where the only
+            // evidence was a line that did not appear. Say so.
+            PlaybackState::Idle => {
+                record_hydrate(HydrateState::Idle, None);
+                tracing::info!(
+                    group = %self.id,
+                    member = %member_id,
+                    state = HydrateState::Idle.label(),
+                    "syncplay: hydrated member with no playback state"
+                );
+            }
             PlaybackState::Playing {
                 position_ms,
                 anchor_server_ms,
             } => {
+                // `elapsed` is the whole extrapolation: the position this
+                // member is told to start at is the anchor PLUS however long
+                // the group has been running on that anchor. An anchor that
+                // stopped being refreshed keeps inflating this until a joiner
+                // is aimed past the end of the item and its player clamps to
+                // the final segment — invisible before this line, because the
+                // catch-up `PlayQueue` beside it was logged and the `Play`
+                // that actually places the playhead was not.
                 let elapsed = server_ms.saturating_sub(anchor_server_ms);
+                let at_server_ms = server_ms + MIN_LEAD_MS;
+                let sent_position_ms = position_ms + elapsed;
+                record_hydrate(HydrateState::Playing, Some(elapsed));
+                tracing::info!(
+                    group = %self.id,
+                    member = %member_id,
+                    state = HydrateState::Playing.label(),
+                    position_ms = sent_position_ms,
+                    anchor_position_ms = position_ms,
+                    anchor_age_ms = elapsed,
+                    at_server_ms,
+                    lead_ms = MIN_LEAD_MS,
+                    "syncplay: hydrated member with playback state"
+                );
                 self.send_one(
                     member_id,
                     ServerMsg::Play {
-                        at_server_ms: server_ms + MIN_LEAD_MS,
-                        position_ms: position_ms + elapsed,
+                        at_server_ms,
+                        position_ms: sent_position_ms,
                     },
                 );
             }
@@ -1109,10 +1181,24 @@ impl GroupState {
                 // to the command's PositionTicks after pausing. (This also
                 // survives the client's pre-time-sync queue, which keeps only
                 // the LAST queued command.)
+                let at_server_ms = server_ms + MIN_LEAD_MS;
+                // No anchor: a paused position is stored outright, so there is
+                // no extrapolation to report. Recording a 0 age here would be
+                // a lie that reads as "freshly anchored" on a dashboard.
+                record_hydrate(HydrateState::Paused, None);
+                tracing::info!(
+                    group = %self.id,
+                    member = %member_id,
+                    state = HydrateState::Paused.label(),
+                    position_ms,
+                    at_server_ms,
+                    lead_ms = MIN_LEAD_MS,
+                    "syncplay: hydrated member with playback state"
+                );
                 self.send_one(
                     member_id,
                     ServerMsg::Pause {
-                        at_server_ms: server_ms + MIN_LEAD_MS,
+                        at_server_ms,
                         position_ms,
                     },
                 );
@@ -3921,6 +4007,117 @@ mod tests {
         assert!(
             (secs - 120.0).abs() < 1.0,
             "must record the real gap (120s), got {secs}"
+        );
+    }
+
+    /// The `state` label on the hydrate signal. Three distinct values, because
+    /// the three cases fail differently: `playing` carries an extrapolation
+    /// that can run away, `paused` carries a stored position that cannot, and
+    /// `idle` means the member was handed nothing at all.
+    #[test]
+    fn hydrate_states_have_distinct_labels() {
+        const ALL: [HydrateState; 3] = [
+            HydrateState::Playing,
+            HydrateState::Paused,
+            HydrateState::Idle,
+        ];
+        assert_eq!(HydrateState::Playing.label(), "playing");
+        assert_eq!(HydrateState::Paused.label(), "paused");
+        assert_eq!(HydrateState::Idle.label(), "idle");
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "hydrate states collide: {labels:?}"
+        );
+    }
+
+    /// The anchor age must be reported in SECONDS and ONLY for the playing
+    /// case. A paused group stores its position outright, so there is no
+    /// extrapolation; recording a 0 there would read on a dashboard as a
+    /// freshly-anchored group rather than as "not applicable".
+    #[test]
+    fn hydrate_anchor_age_is_seconds_and_playing_only() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        record_hydrate(HydrateState::Playing, Some(90_000));
+        record_hydrate(HydrateState::Paused, None);
+        record_hydrate(HydrateState::Idle, None);
+
+        let samples: Vec<f64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_syncplay_hydrate_anchor_age_seconds")
+            .flat_map(|(_, _, _, v)| match v {
+                DebugValue::Histogram(s) => {
+                    s.into_iter().map(|f| f.into_inner()).collect::<Vec<f64>>()
+                }
+                other => panic!("expected a histogram, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            samples,
+            vec![90.0],
+            "exactly one sample, in seconds, for the playing case alone"
+        );
+    }
+
+    /// The load-bearing claim: hydrating a member into a PLAYING group records
+    /// the anchor age. The position that member is aimed at is its anchor plus
+    /// that age, so an anchor that stopped being refreshed walks a joiner off
+    /// the end of the item — the 2026-08-15 stuck-joiner shape, which was
+    /// undiagnosable because this call site logged and counted nothing while
+    /// the catch-up `PlayQueue` beside it recorded five fields.
+    #[tokio::test]
+    async fn hydrating_a_member_into_a_playing_group_records_the_anchor_age() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        // Drain the leader's own Play so the group is settled in `Playing`
+        // before the joiner arrives.
+        assert!(matches!(
+            leader_rx.recv().await,
+            Some(ServerMsg::Play { .. })
+        ));
+
+        let (_m2, _rx2) = add_member(&h, &sinks, "joiner").await;
+        let _ = snapshot_of(&h).await;
+
+        let snap = snapshotter.snapshot().into_vec();
+        let counted = snap
+            .iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_syncplay_hydrate_total")
+            .any(|(ck, _, _, _)| {
+                ck.key()
+                    .labels()
+                    .any(|l| l.key() == "state" && l.value() == "playing")
+            });
+        assert!(
+            counted,
+            "a member hydrated into a playing group must be counted; got {snap:?}"
+        );
+        let has_age = snap.iter().any(|(ck, _, _, v)| {
+            ck.key().name() == "pharos_syncplay_hydrate_anchor_age_seconds"
+                && matches!(v, DebugValue::Histogram(s) if !s.is_empty())
+        });
+        assert!(
+            has_age,
+            "the extrapolation a joiner is aimed with must be measured; got {snap:?}"
         );
     }
 
