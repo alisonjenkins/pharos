@@ -230,6 +230,10 @@ pub struct AppState {
     /// the abandoned episode's prefetch instead of letting it transcode to
     /// completion and steal encoder slots from the new one.
     pub prefetch_tasks: crate::prefetch_registry::PrefetchRegistry,
+    /// Which play sessions have already reported the segment they started on,
+    /// so the report fires once per session. A player aimed off the end of the
+    /// media is only visible in the FIRST index it asks for.
+    pub session_starts: crate::session_start::SessionStarts,
     /// P36 — clamped played-flag threshold (50–100) used by
     /// `Sessions/Playing/Stopped` to decide when an item flips to
     /// `played=true`. Surfaced here so handlers stay zero-allocation
@@ -591,6 +595,7 @@ impl AppState {
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
+            session_starts: crate::session_start::SessionStarts::new(),
             played_threshold_pct: 90,
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
@@ -681,6 +686,7 @@ impl AppState {
             bus,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
+            session_starts: crate::session_start::SessionStarts::new(),
             played_threshold_pct: 90,
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,

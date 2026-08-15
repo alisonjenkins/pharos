@@ -3370,6 +3370,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "mime_guess",
  "opentelemetry",
  "opentelemetry-otlp",

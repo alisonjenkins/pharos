@@ -1030,17 +1030,29 @@ async fn serve_segment(
     // cached and served forever as a 200. Only bound when the duration is known
     // (the common case); a legacy row without a probed duration keeps the old
     // permissive behaviour rather than risk rejecting a valid segment.
+    let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
         let grid =
             super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
         if grid.checked(seg).is_none() {
             return Err(error::ErrorNotFound("segment index past end of media"));
         }
+        total_segs = Some(grid.count());
     }
 
     // Frame-aligned boundaries keep audio + video locked across independent
     // per-segment transcodes (see `segment_start_secs`).
     let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+
+    crate::session_start::note_session_start(
+        &state.session_starts,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        total_segs,
+        start_secs,
+        if variant.is_some() { "variant" } else { "main" },
+    );
 
     // P2 — pull negotiated bitrate cap from the live session (if any)
     // so we can clamp the variant override below.
@@ -2162,13 +2174,24 @@ async fn vp9_segment(
     // Bounds-check against the VOD grid the playlist enumerated. An over-index
     // used to reach the encoder, produce no frames past EOF, and surface as a
     // NoMoof/NoMoov → 500; make it a clean 404 (only when duration is known).
+    let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
         let grid =
             super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
         if grid.checked(seg).is_none() {
             return Err(error::ErrorNotFound("segment index past end of media"));
         }
+        total_segs = Some(grid.count());
     }
+    crate::session_start::note_session_start(
+        &state.session_starts,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        total_segs,
+        segment_time_range(seg, item.probe.frame_rate_mille).0,
+        "vp9",
+    );
     let mut opts = vp9_segment_opts(
         &state,
         &req,
@@ -2325,13 +2348,24 @@ async fn h264cmaf_segment(
     state.note_playback_activity();
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
+    let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
         let grid =
             super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
         if grid.checked(seg).is_none() {
             return Err(error::ErrorNotFound("segment index past end of media"));
         }
+        total_segs = Some(grid.count());
     }
+    crate::session_start::note_session_start(
+        &state.session_starts,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        total_segs,
+        segment_time_range(seg, item.probe.frame_rate_mille).0,
+        "h264cmaf",
+    );
     let mut opts = fmp4_segment_opts(
         &state,
         &req,

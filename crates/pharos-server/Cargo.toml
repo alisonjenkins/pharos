@@ -84,6 +84,7 @@ postgres = ["pharos-store-sqlx/postgres"]
 [dev-dependencies]
 actix-test = "0.1"
 awc = "3"
+metrics-util.workspace = true
 pharos-jellyfin-test-client = { path = "../pharos-jellyfin-test-client" }
 proptest = "1"
 regex-lite = "0.1"
