@@ -633,6 +633,9 @@ struct PurgeSegmentsResultDto {
     last_index: u32,
     quarantined: Vec<String>,
     failed: usize,
+    /// The item's new cache epoch. Reported so a caller can confirm that
+    /// clients were actually told to let go, not just that bytes were moved.
+    cache_epoch: u32,
 }
 
 async fn purge_segments(
@@ -682,12 +685,22 @@ async fn purge_segments(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
 
+    // Removing the bytes is only half a purge. Segments go out `immutable`, so
+    // a client that already holds the bad ones keeps serving them from its own
+    // disk no matter what happens here — on 2026-08-16 five segments were
+    // deleted server-side and the viewer still could not play the timestamp
+    // until she disabled her browser cache. Bumping the epoch changes every
+    // segment URL for this item, which is the only thing that makes a client
+    // let go (T121).
+    let epoch = cache.bump_item_epoch(q.item_id);
+
     Ok(web::Json(PurgeSegmentsResultDto {
         item_id: q.item_id,
         first_index: first.get(),
         last_index: last.get(),
         quarantined: report.quarantined,
         failed: report.failed,
+        cache_epoch: epoch,
     }))
 }
 

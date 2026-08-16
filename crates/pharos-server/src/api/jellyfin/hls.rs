@@ -435,6 +435,9 @@ fn audio_codec_token(codec: &str) -> String {
 /// once per request from `MediaStore` instead of re-deriving in each
 /// handler.
 struct HlsItem {
+    /// The parsed numeric id. Carried so a playlist can stamp its URLs with the
+    /// item's cache epoch (T121) without re-parsing the path parameter.
+    media_id: u64,
     duration_seconds: f64,
     width: Option<u32>,
     height: Option<u32>,
@@ -495,6 +498,7 @@ async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_
         }
     };
     Ok(HlsItem {
+        media_id: id,
         duration_seconds,
         width: item.probe.width,
         height: item.probe.height,
@@ -911,6 +915,7 @@ async fn render_variant_playlist(
     let body = MediaPlaylist {
         version: 3,
         independent_segments: true,
+        cache_epoch: cache_epoch_for(&state, item.media_id),
         // mpegts carries its own PAT/PMT; there is no init segment.
         init_uri: None,
         // P18 — resume hint, so a client that embedded `StartTimeTicks` jumps
@@ -1962,6 +1967,7 @@ async fn vp9_audio_playlist(
         // The audio rendition is listed under a master that already declares
         // `#EXT-X-INDEPENDENT-SEGMENTS` for every variant.
         independent_segments: false,
+        cache_epoch: cache_epoch_for(&state, media_id),
         init_uri: Some(format!("/videos/{id}/vp9/audio/init.mp4?{qs}")),
         // No resume hint: the rendition is PTS-synced to the video variant,
         // which carries the seek target.
@@ -2100,6 +2106,7 @@ async fn vp9_variant(
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
+        cache_epoch: cache_epoch_for(&state, item.media_id),
         init_uri: Some(format!("/videos/{id}/vp9/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
         segment_uri: &|seg| format!("/videos/{id}/vp9/{seg}.m4s?{qs}"),
@@ -2280,6 +2287,7 @@ async fn h264cmaf_variant(
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
+        cache_epoch: cache_epoch_for(&state, item.media_id),
         init_uri: Some(format!("/videos/{id}/h264cmaf/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
         segment_uri: &|seg| format!("/videos/{id}/h264cmaf/{seg}.m4s?{qs}"),
@@ -2497,7 +2505,31 @@ struct MediaPlaylist<'a> {
     init_uri: Option<String>,
     /// `#EXT-X-START` resume hint, when the surface advertises one.
     start_offset_secs: Option<f64>,
+    /// This item's cache epoch (T121). Zero — an item never purged, i.e. almost
+    /// all of them — emits no parameter at all, so an untouched library's URLs
+    /// stay byte-identical to what they were before this existed.
+    cache_epoch: u32,
     segment_uri: &'a dyn Fn(u32) -> String,
+}
+
+/// This item's cache epoch, or 0 when there is no cache attached.
+fn cache_epoch_for(state: &AppState, media_id: u64) -> u32 {
+    state.hls.as_ref().map_or(0, |c| c.item_epoch(media_id))
+}
+
+/// Stamp a URI with the item's cache epoch.
+///
+/// Segments go out `immutable`, so a client that cached a bad one cannot be
+/// made to drop it by any server-side action — the URL itself has to change
+/// (T121). Applied HERE rather than in each of the surfaces' `segment_uri`
+/// closures because there are several and one missed closure is a surface
+/// whose poisoned segments are unrecoverable.
+fn with_cache_epoch(uri: &str, epoch: u32) -> String {
+    if epoch == 0 {
+        return uri.to_string();
+    }
+    let sep = if uri.contains('?') { '&' } else { '?' };
+    format!("{uri}{sep}e={epoch}")
 }
 
 impl MediaPlaylist<'_> {
@@ -2520,6 +2552,10 @@ impl MediaPlaylist<'_> {
         ));
         // fMP4 requires the init segment be declared before any media.
         if let Some(uri) = &self.init_uri {
+            // The init is immutable and cached exactly like a segment, so it
+            // has to move with the epoch too — a stale init under fresh
+            // segments is its own decode failure.
+            let uri = with_cache_epoch(uri, self.cache_epoch);
             body.push_str(&format!("#EXT-X-MAP:URI=\"{uri}\"\n"));
         }
         if let Some(secs) = self.start_offset_secs {
@@ -2532,7 +2568,10 @@ impl MediaPlaylist<'_> {
             // drifts against the real timeline on a non-integer-fps source and
             // desyncs A/V over a long title.
             body.push_str(&format!("#EXTINF:{len:.3},\n"));
-            body.push_str(&(self.segment_uri)(seg));
+            body.push_str(&with_cache_epoch(
+                &(self.segment_uri)(seg),
+                self.cache_epoch,
+            ));
             body.push('\n');
         }
         body.push_str("#EXT-X-ENDLIST\n");
@@ -4692,6 +4731,7 @@ mod tests {
         // forgotten in the fourth.
         let uri = |seg: u32| format!("/videos/9/hls1/720p/{seg}.ts?q=1");
         let mpegts = MediaPlaylist {
+            cache_epoch: 0,
             version: 3,
             independent_segments: true,
             init_uri: None,
@@ -4702,6 +4742,7 @@ mod tests {
 
         let cmaf_uri = |seg: u32| format!("/videos/9/h264cmaf/{seg}.m4s?q=1");
         let cmaf = MediaPlaylist {
+            cache_epoch: 0,
             version: 7,
             independent_segments: true,
             init_uri: Some("/videos/9/h264cmaf/init.mp4?q=1".into()),
@@ -4759,6 +4800,7 @@ mod tests {
         // accepts would 404 its own tail.
         let uri = |seg: u32| format!("/videos/9/vp9/{seg}.m4s");
         let body = MediaPlaylist {
+            cache_epoch: 0,
             version: 7,
             independent_segments: true,
             init_uri: None,
@@ -4785,6 +4827,7 @@ mod tests {
     fn a_playlist_omits_the_resume_hint_when_starting_from_zero() {
         let uri = |seg: u32| format!("/videos/9/vp9/{seg}.m4s");
         let body = MediaPlaylist {
+            cache_epoch: 0,
             version: 7,
             independent_segments: false,
             init_uri: None,
@@ -4934,5 +4977,56 @@ mod tests {
         // And the placement generation is still there — `s=` supplements `g=`,
         // it does not replace it. They answer different questions.
         assert!(remote_qs.contains(&format!("g={gen}")));
+    }
+
+    /// T121 — the epoch, when set, must reach the URLs a client is handed.
+    #[::core::prelude::v1::test]
+    fn a_cache_epoch_is_stamped_onto_segment_and_init_uris() {
+        let pl = MediaPlaylist {
+            version: 7,
+            independent_segments: true,
+            init_uri: Some("/videos/7/h264cmaf/init.mp4?g=17".to_string()),
+            start_offset_secs: None,
+            cache_epoch: 3,
+            segment_uri: &|seg| format!("/videos/7/h264cmaf/{seg}.m4s?g=17"),
+        };
+        let body = pl.render(12.0, Some(24_000));
+        assert!(
+            body.contains("/videos/7/h264cmaf/0.m4s?g=17&e=3"),
+            "a purged item's segment URLs must differ from the ones a client \
+             already cached: {body}"
+        );
+        assert!(
+            body.contains("init.mp4?g=17&e=3"),
+            "a stale init under fresh segments is its own decode failure: {body}"
+        );
+    }
+
+    /// …and an item that was never purged emits URLs byte-identical to the
+    /// ones it emitted before this existed. Otherwise shipping T121 would
+    /// itself invalidate every client's cache for the whole library — the
+    /// cold-start cliff, caused by the mechanism meant to avoid needing it.
+    #[::core::prelude::v1::test]
+    fn an_unpurged_item_carries_no_epoch_parameter() {
+        let pl = MediaPlaylist {
+            version: 7,
+            independent_segments: true,
+            init_uri: Some("/videos/7/h264cmaf/init.mp4?g=17".to_string()),
+            start_offset_secs: None,
+            cache_epoch: 0,
+            segment_uri: &|seg| format!("/videos/7/h264cmaf/{seg}.m4s?g=17"),
+        };
+        let body = pl.render(12.0, Some(24_000));
+        assert!(!body.contains("e="), "no epoch parameter at all: {body}");
+    }
+
+    /// The separator has to follow whatever the surface already emitted; the
+    /// mpegts variant builds URLs with a query and the audio rendition does
+    /// too, so a hardcoded `?` would produce two of them.
+    #[::core::prelude::v1::test]
+    fn the_epoch_appends_correctly_whether_or_not_a_query_exists() {
+        assert_eq!(with_cache_epoch("/a/0.ts", 2), "/a/0.ts?e=2");
+        assert_eq!(with_cache_epoch("/a/0.ts?g=17", 2), "/a/0.ts?g=17&e=2");
+        assert_eq!(with_cache_epoch("/a/0.ts?g=17", 0), "/a/0.ts?g=17");
     }
 }
