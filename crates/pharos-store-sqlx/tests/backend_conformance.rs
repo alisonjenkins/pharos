@@ -293,6 +293,69 @@ where
         .await
         .unwrap();
 
+    // T117 — the BATCHED mark, which is the path a real scan actually takes.
+    //
+    // `mark_seen_batch` had a sqlite override and no postgres one, so on the
+    // deployment every scan fell back to the trait default: one autocommit
+    // UPDATE per file, 13k transactions and 13k WAL flushes for a 13k-file
+    // library, on the same device the segment cache reads from. Nothing in the
+    // suite called it, so a broken batch query would have compiled, passed
+    // `just test`, and only failed in production.
+    let batch_root = std::path::Path::new("/media/conformance-batch");
+    let batch_scan = MediaStore::begin_scan(&store, batch_root).await.unwrap();
+    let a: MediaId = 900;
+    let b: MediaId = 901;
+    let never_marked: MediaId = 902;
+    for (id, title) in [
+        (a, "Batched A"),
+        (b, "Batched B"),
+        (never_marked, "Batched C"),
+    ] {
+        let mut it = media_item(id, title);
+        it.path = format!("/media/conformance-batch/{id}.mkv").into();
+        MediaStore::put(&store, it).await.unwrap();
+    }
+    MediaStore::mark_seen_batch(
+        &store,
+        &[(a, 1_700_000_100, 4096), (b, 1_700_000_200, 8192)],
+        batch_scan,
+    )
+    .await
+    .unwrap();
+
+    // Every row in the batch must carry ITS OWN mtime/size, not the last one's
+    // — a positional UNNEST that mismatched its arrays would still "work" here
+    // if the values were not checked per row.
+    let sa = MediaStore::scan_state(&store, a).await.unwrap().unwrap();
+    let sb = MediaStore::scan_state(&store, b).await.unwrap().unwrap();
+    assert_eq!(sa.file_mtime, 1_700_000_100, "row A keeps its own mtime");
+    assert_eq!(sa.file_size, 4096, "row A keeps its own size");
+    assert_eq!(sb.file_mtime, 1_700_000_200, "row B keeps its own mtime");
+    assert_eq!(sb.file_size, 8192, "row B keeps its own size");
+
+    // …and the batch must satisfy the sweep exactly as per-row marks do (V10):
+    // a batched mark that did not commit reads as UNSEEN and the row is deleted.
+    let swept = MediaStore::sweep_unseen(&store, batch_scan, "/media/conformance-batch")
+        .await
+        .unwrap();
+    assert!(
+        swept.contains(&never_marked),
+        "an item absent from the batch must still be swept"
+    );
+    assert!(
+        !swept.contains(&a) && !swept.contains(&b),
+        "a batched mark must protect its rows from the sweep: swept {swept:?}"
+    );
+    MediaStore::finish_scan(&store, batch_scan, 2, 1)
+        .await
+        .unwrap();
+
+    // An empty batch is a no-op, not an error: a scan whose final flush has
+    // nothing left must not fail.
+    MediaStore::mark_seen_batch(&store, &[], batch_scan)
+        .await
+        .expect("an empty batch is a no-op");
+
     // audio_items_needing_art — the album-art pass's eligibility query. Exercised
     // here rather than only in a unit test because sqlx checks neither
     // placeholder arity nor column names at compile time, so a `?` vs `$1` slip
