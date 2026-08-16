@@ -501,3 +501,78 @@ async fn leave_with_group_acknowledges_the_leaver() {
         }
     }
 }
+
+/// A command that reaches NOBODY must not be answered "204 No Content".
+///
+/// 204 is success. jellyfin-web fires SyncPlay commands and moves on, so a
+/// dropped Seek is indistinguishable from an applied one: the user scrubs,
+/// nothing happens, and no client-visible surface says why.
+///
+/// Live on 2026-08-16: a member evicted from the hub by a stale reconnect
+/// teardown kept a working socket and an open group, and 19 commands (13
+/// unpause, 7 seek, 4 pause) were dropped with "no /socket registered and no
+/// persisted group" — every one answered 204. The eviction is fixed in
+/// `pharos-sync`'s hub; this is the second half, so the next cause of a
+/// no-socket drop is visible at the client instead of silent.
+///
+/// The sibling path — a live socket with no group — keeps its 204 on purpose
+/// and is asserted above: there the client IS told, over its socket, with
+/// `NotInGroup`. This path has no socket to tell.
+#[actix_web::test]
+async fn a_command_that_reaches_nobody_is_not_reported_as_success() {
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let auth = BuiltinAuth::new(stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "alison".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose().to_string();
+    let state = web::Data::new(AppState::new(stores, "t".into()));
+
+    // No `hub.register` and no persisted snapshot: nothing can carry this
+    // command anywhere.
+    let hub = SessionHub::new();
+    let member_sinks = MemberSinks::new();
+    let registry =
+        pharos_sync::GroupRegistry::spawn(Arc::new(LocalDelivery::new(member_sinks.clone())));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .app_data(web::Data::new(registry))
+            .app_data(web::Data::new(hub))
+            .app_data(web::Data::new(member_sinks))
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/SyncPlay/Seek")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("X-Emby-Device-Id", "dev-with-no-socket"))
+            .set_json(serde_json::json!({ "PositionTicks": 10_000_000u64 }))
+            .to_request(),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        204,
+        "a command nobody received must not be answered with success"
+    );
+    assert!(
+        resp.status().is_server_error(),
+        "the drop is transient — the socket may come back — so it is a 5xx the \
+         client can distinguish from a malformed request; got {}",
+        resp.status()
+    );
+}

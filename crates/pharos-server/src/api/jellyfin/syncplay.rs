@@ -162,7 +162,12 @@ async fn dispatch(
             "syncplay: command with no deviceId — dropped"
         );
         record_command(label, CommandOutcome::NoDevice);
-        return no_content();
+        // Not 204. A command with no deviceId can never be routed, and
+        // answering "No Content" tells the caller it worked — see
+        // `dropped_no_socket` below for what that costs. 400, because unlike
+        // that case this is permanent: retrying the same request cannot help.
+        return HttpResponse::BadRequest()
+            .body("SyncPlay command carried no deviceId, so it cannot be routed to a group");
     };
     // B54 — resolve WITH RETRY: the group-forming commands (SetNewQueue
     // especially — it hands the group its media) can arrive in the same
@@ -205,6 +210,21 @@ async fn dispatch(
                     "syncplay: no /socket registered and no persisted group — command dropped"
                 );
                 record_command(label, CommandOutcome::DroppedNoSocket);
+                // Not 204 — this command reached nobody, and 204 is success.
+                // The sibling branch above can answer 204 honestly because it
+                // pushes `NotInGroup` down the caller's socket; here there is
+                // no socket to push anything down, so the HTTP status is the
+                // only surface left. Answering success made a dropped Seek
+                // indistinguishable from an applied one: on 2026-08-16, 19
+                // commands were lost this way and the only symptom anyone
+                // could see was a scrub bar that did not move.
+                //
+                // 503, not 4xx: the caller did nothing wrong and the condition
+                // is transient — its socket may reconnect and re-attach.
+                return HttpResponse::ServiceUnavailable().body(
+                    "SyncPlay command dropped: this device has no live /socket and no \
+                     persisted group membership to recover from",
+                );
             }
         }
     }
