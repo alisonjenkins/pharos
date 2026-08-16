@@ -36,3 +36,32 @@ test-threads = "num-cpus"
 # parallel runs are fine.
 filter = "package(pharos-store-sqlx)"
 test-threads = 4
+
+# T127 — the encode-rate probes measure WALL-CLOCK throughput of a real ffmpeg
+# encode, so their assertions are only meaningful if the machine's load is
+# roughly the same across the two measurements they compare. Run under the full
+# 2248-test parallel suite they compared a probe taken while cores were free
+# against one taken while they were not, and `just test` went red for a reason
+# unrelated to whatever change was in front of you — which trains everyone to
+# re-run the suite, and the next real regression gets re-run too.
+#
+# One at a time, so the probes at least contend with the same background rather
+# than with each other. If this still flakes the next step is to make the
+# assertion load-independent (compare the QUANTISED weights placement actually
+# consumes, not the raw rates) rather than to widen the margin, which would buy
+# quiet by weakening the property the design rests on.
+[test-groups]
+encode-rate-probe = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(pharos-transcode) and test(probe::rate_tests)'
+test-group = "encode-rate-probe"
+
+[[profile.ci.overrides]]
+filter = 'package(pharos-transcode) and test(probe::rate_tests)'
+test-group = "encode-rate-probe"
+
+[[profile.nix.overrides]]
+filter = 'package(pharos-transcode) and test(probe::rate_tests)'
+test-group = "encode-rate-probe"
+
