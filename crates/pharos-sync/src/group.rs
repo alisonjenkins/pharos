@@ -240,6 +240,10 @@ pub enum GroupMsg {
     SetNewQueue {
         sender: MemberId,
         item_ids: Vec<String>,
+        /// Item durations, INDEX-ALIGNED with `item_ids`. Built by mapping over
+        /// that same vec so alignment is structural rather than a convention;
+        /// a short vec degrades to `None` (unclamped) rather than misassigning.
+        item_runtimes_ms: Vec<Option<u64>>,
         playing_index: usize,
         start_position_ms: u64,
     },
@@ -312,6 +316,9 @@ pub enum GroupMsg {
     /// the queue is still empty (a real `SetNewQueue` that already landed wins).
     SeedQueue {
         item_id: String,
+        /// The seeded item's duration, when resolvable — see
+        /// [`QueueEntry::runtime_ms`].
+        runtime_ms: Option<u64>,
         position_ms: u64,
         is_paused: bool,
     },
@@ -385,6 +392,11 @@ pub enum RemoteCommand {
     SetNewQueue {
         sender: MemberId,
         item_ids: Vec<String>,
+        /// Index-aligned durations. `default` for wire compatibility: an older
+        /// peer sends none, which reads as "unknown" and simply leaves the
+        /// position unclamped rather than bounding it wrongly.
+        #[serde(default)]
+        item_runtimes_ms: Vec<Option<u64>>,
         playing_index: usize,
         start_position_ms: u64,
     },
@@ -496,11 +508,13 @@ impl RemoteCommand {
             RemoteCommand::SetNewQueue {
                 sender,
                 item_ids,
+                item_runtimes_ms,
                 playing_index,
                 start_position_ms,
             } => GroupMsg::SetNewQueue {
                 sender,
                 item_ids,
+                item_runtimes_ms,
                 playing_index,
                 start_position_ms,
             },
@@ -637,6 +651,14 @@ fn record_socket_return(rec: &mut MemberRec) {
 struct QueueEntry {
     item_id: String,
     playlist_item_id: String,
+    /// The item's duration, when the server could resolve it.
+    ///
+    /// The group extrapolates position from a wall-clock anchor, so without
+    /// this it has no idea an item has ENDED and counts on forever — a group
+    /// left Playing quietly aimed a joiner 5 h 39 m into a 2 h film (T114,
+    /// measured 2026-08-15). `None` when the item did not resolve, which
+    /// simply restores the unclamped behaviour rather than inventing a bound.
+    runtime_ms: Option<u64>,
 }
 
 /// The group's play queue (playlist + cursor + modes).
@@ -900,6 +922,34 @@ fn record_hydrate(state: HydrateState, anchor_age_ms: Option<u64>) {
     }
 }
 
+/// How far past an item's runtime the model must reach before the group is
+/// settled at the end rather than merely clamped.
+///
+/// A probed duration is not exact, so settling the instant the model touches
+/// it would pause a group a second early on a rounding difference. The clamp
+/// alone is harmless and immediate; the STATE change waits until the model is
+/// unambiguously past the end, where no plausible probe error explains it.
+const EOF_SETTLE_GRACE_MS: u64 = 10_000;
+
+/// Bound an extrapolated position by the item's runtime.
+///
+/// The group derives position as `anchor + wall-clock elapsed`, which is only
+/// true while playback is really advancing at 1×. It keeps counting through
+/// the film ending, every client closing its tab, or a local pause whose
+/// command never arrived — so the value grows without limit. On 2026-08-15 a
+/// group left Playing for 3 h 42 m aimed a joiner at 5 h 39 m, past the end of
+/// any film, and that joiner's player clamped to the final segment and stuck
+/// there (T114).
+///
+/// `None` runtime means the item did not resolve: no bound is known, so none
+/// is applied. Inventing one would be worse than the drift.
+fn clamp_to_runtime(raw_ms: u64, runtime_ms: Option<u64>) -> u64 {
+    match runtime_ms {
+        Some(runtime) => raw_ms.min(runtime),
+        None => raw_ms,
+    }
+}
+
 /// The readiness gate: while `Some`, the group is in `Waiting` and will not
 /// broadcast the pending `Play`/`Pause` until every member in `pending` has
 /// reported `Ready` (or `deadline` fires — the anti-wedge timeout).
@@ -1072,6 +1122,13 @@ impl GroupState {
     }
 
     fn current_position_ms(&self) -> u64 {
+        clamp_to_runtime(self.raw_position_ms(), self.current_item_runtime_ms())
+    }
+
+    /// The position BEFORE the runtime clamp — what the wall-clock model
+    /// believes. Kept separate so the end-of-item check can see how far past
+    /// the end the model has actually run, which the clamped value hides.
+    fn raw_position_ms(&self) -> u64 {
         match self.playback {
             PlaybackState::Idle => 0,
             PlaybackState::Paused { position_ms } => position_ms,
@@ -1080,6 +1137,41 @@ impl GroupState {
                 anchor_server_ms,
             } => position_ms + self.server_ms_now().saturating_sub(anchor_server_ms),
         }
+    }
+
+    /// Runtime of the item the queue is currently on, when known.
+    fn current_item_runtime_ms(&self) -> Option<u64> {
+        self.queue
+            .items
+            .get(self.queue.playing_index)
+            .and_then(|e| e.runtime_ms)
+    }
+
+    /// Settle a group whose model has run past the end of its item.
+    ///
+    /// The clamp keeps every READ honest, but on its own the model goes on
+    /// counting, so the group reports Playing forever and a joiner is told to
+    /// start a finished film. This is the bounded state change: once the model
+    /// is past the end by more than [`EOF_SETTLE_GRACE_MS`] — far enough that a
+    /// probe-duration rounding error cannot explain it — the group settles
+    /// Paused at the end, which is what actually happened in the room.
+    ///
+    /// Returns whether it settled, so the caller can log it once rather than
+    /// on every tick.
+    fn settle_if_past_end(&mut self) -> bool {
+        if !matches!(self.playback, PlaybackState::Playing { .. }) {
+            return false;
+        }
+        let Some(runtime) = self.current_item_runtime_ms() else {
+            return false;
+        };
+        if self.raw_position_ms() <= runtime.saturating_add(EOF_SETTLE_GRACE_MS) {
+            return false;
+        }
+        self.playback = PlaybackState::Paused {
+            position_ms: runtime,
+        };
+        true
     }
 
     /// Send one member the current queue + playback state so it (re)syncs to the
@@ -1155,7 +1247,12 @@ impl GroupState {
                 // that actually places the playhead was not.
                 let elapsed = server_ms.saturating_sub(anchor_server_ms);
                 let at_server_ms = server_ms + MIN_LEAD_MS;
-                let sent_position_ms = position_ms + elapsed;
+                // Clamped, like every other read of the position. This is the
+                // path that actually places a joiner's playhead, so an
+                // unclamped value here is the whole T114 failure: aimed past
+                // the end, the player lands on the final segment and stops.
+                let sent_position_ms =
+                    clamp_to_runtime(position_ms + elapsed, self.current_item_runtime_ms());
                 record_hydrate(HydrateState::Playing, Some(elapsed));
                 tracing::info!(
                     group = %self.id,
@@ -1181,6 +1278,7 @@ impl GroupState {
                 // to the command's PositionTicks after pausing. (This also
                 // survives the client's pre-time-sync queue, which keeps only
                 // the LAST queued command.)
+                let position_ms = clamp_to_runtime(position_ms, self.current_item_runtime_ms());
                 let at_server_ms = server_ms + MIN_LEAD_MS;
                 // No anchor: a paused position is stored outright, so there is
                 // no extrapolation to report. Recording a 0 age here would be
@@ -1781,6 +1879,7 @@ impl GroupState {
                 .map(|e| PersistQueueItem {
                     item_id: e.item_id.clone(),
                     playlist_item_id: e.playlist_item_id.clone(),
+                    runtime_ms: e.runtime_ms,
                 })
                 .collect(),
             playing_index: self.queue.playing_index,
@@ -1862,6 +1961,7 @@ impl GroupState {
             .map(|e| QueueEntry {
                 item_id: e.item_id,
                 playlist_item_id: e.playlist_item_id,
+                runtime_ms: e.runtime_ms,
             })
             .collect();
         self.queue.playing_index = ps.playing_index;
@@ -1916,6 +2016,11 @@ enum PersistPlayback {
 struct PersistQueueItem {
     item_id: String,
     playlist_item_id: String,
+    /// `default` so snapshots written before the runtime existed still load —
+    /// they restore as "unknown", which leaves the position unclamped exactly
+    /// as it was before, rather than failing to deserialise.
+    #[serde(default)]
+    runtime_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2171,6 +2276,23 @@ impl GroupHandle {
                         state.persist();
                     }
                     _ = prune_tick.tick() => {
+                        // T114 — a group left Playing counts on forever, so
+                        // settle it once the model is unambiguously past the
+                        // end of its item. Done on the existing tick rather
+                        // than on a timer of its own: nothing is waiting on
+                        // the precise instant, and the position every READ
+                        // sees is already clamped.
+                        if state.settle_if_past_end() {
+                            metrics::counter!("pharos_syncplay_settled_past_end_total")
+                                .increment(1);
+                            tracing::info!(
+                                group = %state.id,
+                                position_ms = state.current_position_ms(),
+                                pli = state.current_playlist_item_id().unwrap_or(""),
+                                "syncplay: group ran past the end of its item — settled at the end"
+                            );
+                            state.persist();
+                        }
                         let now = tokio::time::Instant::now();
                         let silent_ms = |m: &MemberRec| {
                             now.saturating_duration_since(m.last_seen).as_millis() as u64
@@ -3136,6 +3258,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         GroupMsg::SetNewQueue {
             sender: _,
             item_ids,
+            item_runtimes_ms,
             playing_index,
             start_position_ms,
         } => {
@@ -3149,9 +3272,15 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
             state.queue.items = item_ids
                 .into_iter()
-                .map(|item_id| QueueEntry {
+                .enumerate()
+                .map(|(i, item_id)| QueueEntry {
                     item_id,
                     playlist_item_id: Uuid::new_v4().simple().to_string(),
+                    // Index-aligned by construction (the caller maps over this
+                    // same list). A short or absent vec reads as unknown, which
+                    // leaves the position unclamped — never misassigns another
+                    // item's duration to this one.
+                    runtime_ms: item_runtimes_ms.get(i).copied().flatten(),
                 })
                 .collect();
             state.queue.playing_index =
@@ -3172,6 +3301,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         }
         GroupMsg::SeedQueue {
             item_id,
+            runtime_ms,
             position_ms,
             is_paused,
         } => {
@@ -3190,6 +3320,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.queue.items = vec![QueueEntry {
                 item_id,
                 playlist_item_id: Uuid::new_v4().simple().to_string(),
+                runtime_ms,
             }];
             state.queue.playing_index = 0;
             // Bump the change-timestamp so a fresh joiner's catch-up PlayQueue
@@ -4010,6 +4141,133 @@ mod tests {
         );
     }
 
+    /// T114 — the clamp. An extrapolated position is bounded by the item's
+    /// runtime, and by nothing when the runtime is unknown.
+    #[test]
+    fn a_position_is_bounded_by_the_items_runtime() {
+        // Ant-Man's real numbers from the incident: the model said 5 h 39 m
+        // into a 1 h 57 m film.
+        assert_eq!(clamp_to_runtime(20_337_295, Some(7_026_771)), 7_026_771);
+        // Inside the item, untouched.
+        assert_eq!(clamp_to_runtime(3_278_036, Some(7_026_771)), 3_278_036);
+        assert_eq!(clamp_to_runtime(7_026_771, Some(7_026_771)), 7_026_771);
+        // Unknown runtime: no bound is known, so none is imposed. Inventing
+        // one would be worse than the drift it is meant to stop.
+        assert_eq!(clamp_to_runtime(20_337_295, None), 20_337_295);
+    }
+
+    /// A joiner is never aimed past the end of the film.
+    ///
+    /// This is the whole user-visible point of T114: on 2026-08-15 a member
+    /// joined a group whose model had drifted past the runtime, her player
+    /// clamped to the final segment, and it 500'd there on every retry
+    /// (B189). Seeded at a position already past the end, because the drift
+    /// itself needs hours of wall clock to reproduce and the hydration path
+    /// cannot tell how the position got there.
+    #[tokio::test]
+    async fn a_joiner_is_never_hydrated_past_the_end_of_the_item() {
+        const RUNTIME_MS: u64 = 7_026_771;
+        let (h, sinks, _rx1, _m1) = fresh().await;
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "42".into(),
+            runtime_ms: Some(RUNTIME_MS),
+            position_ms: 20_337_295,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let (_m2, mut rx2) = add_member(&h, &sinks, "joiner").await;
+        let mut aimed_at = None;
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx2.recv()).await
+        {
+            if let ServerMsg::Play { position_ms, .. } = msg {
+                aimed_at = Some(position_ms);
+                break;
+            }
+        }
+        let aimed_at = aimed_at.expect("the joiner must be told where to play");
+        assert!(
+            aimed_at <= RUNTIME_MS,
+            "a joiner aimed past the end of the media lands on the final \
+             segment and stops there; got {aimed_at} for a {RUNTIME_MS}ms item"
+        );
+    }
+
+    /// The group stops claiming to be playing a film that has finished.
+    ///
+    /// The clamp keeps every read honest but leaves the model counting, so the
+    /// group reports Playing forever. Past the end by more than the grace, it
+    /// settles at the end instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_past_the_end_settles_rather_than_counting_forever() {
+        const RUNTIME_MS: u64 = 600_000;
+        let (h, _sinks, _rx1, _m1) = fresh().await;
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "42".into(),
+            runtime_ms: Some(RUNTIME_MS),
+            // Well past the end — beyond any probe-rounding explanation.
+            position_ms: RUNTIME_MS + 600_000,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.play_state, GroupPlayState::Playing, "seeded playing");
+
+        // Outlive the prune tick, which is where the check runs. Polled
+        // rather than asserted once: `advance` releases the timer but does not
+        // guarantee the actor has processed the tick before the next message,
+        // and a snapshot that overtakes it reads Playing. Asserting once made
+        // this test pass or fail on scheduler order — it failed roughly one
+        // run in two.
+        let mut play_state = GroupPlayState::Playing;
+        for _ in 0..20 {
+            tokio::time::advance(std::time::Duration::from_millis(
+                MEMBER_PRUNE_TICK_MS + 1_000,
+            ))
+            .await;
+            play_state = snapshot_of(&h).await.play_state;
+            if play_state == GroupPlayState::Paused {
+                break;
+            }
+        }
+        assert_eq!(
+            play_state,
+            GroupPlayState::Paused,
+            "a group whose item has ended must not still report Playing"
+        );
+    }
+
+    /// The settle waits out the grace, so a probed duration that is a shade
+    /// short cannot pause a group before the film has actually finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_barely_past_the_runtime_is_not_settled_early() {
+        const RUNTIME_MS: u64 = 600_000;
+        let (h, _sinks, _rx1, _m1) = fresh().await;
+        h.tx.send(GroupMsg::SeedQueue {
+            item_id: "42".into(),
+            runtime_ms: Some(RUNTIME_MS),
+            // Inside the grace: the kind of gap a rounding difference explains.
+            position_ms: RUNTIME_MS + (EOF_SETTLE_GRACE_MS / 2),
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(
+            MEMBER_PRUNE_TICK_MS + 1_000,
+        ))
+        .await;
+        let snap = snapshot_of(&h).await;
+        assert_eq!(
+            snap.play_state,
+            GroupPlayState::Playing,
+            "a second past a probed runtime is not evidence the film ended"
+        );
+    }
+
     /// The `state` label on the hydrate signal. Three distinct values, because
     /// the three cases fail differently: `playing` carries an extrapolation
     /// that can run away, `paused` carries a stored position that cannot, and
@@ -4517,6 +4775,7 @@ mod tests {
             RemoteCommand::SetNewQueue {
                 sender: m,
                 item_ids: vec!["a".into()],
+                item_runtimes_ms: Vec::new(),
                 playing_index: 0,
                 start_position_ms: 9
             }
@@ -4560,6 +4819,7 @@ mod tests {
         a.tx.send(GroupMsg::SetNewQueue {
             sender: leader,
             item_ids: vec!["ep1".into(), "ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 1,
             start_position_ms: 4200,
         })
@@ -4607,6 +4867,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: leader,
             item_ids: vec!["ep1".into(), "ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -4668,6 +4929,7 @@ mod tests {
         // server state only.
         h.tx.send(GroupMsg::SeedQueue {
             item_id: "nge_ep1".into(),
+            runtime_ms: None,
             position_ms: 31_667,
             is_paused: false,
         })
@@ -4719,6 +4981,7 @@ mod tests {
 
         h.tx.send(GroupMsg::SeedQueue {
             item_id: "iron_man".into(),
+            runtime_ms: None,
             position_ms: 51_212,
             is_paused: false,
         })
@@ -4880,6 +5143,7 @@ mod tests {
 
         h.tx.send(GroupMsg::SeedQueue {
             item_id: "nge_ep1".into(),
+            runtime_ms: None,
             position_ms: 609_254,
             is_paused: false,
         })
@@ -5117,6 +5381,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: m1,
             item_ids: vec!["1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -5191,6 +5456,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: m1,
             item_ids: vec!["1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -5234,6 +5500,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: m1,
             item_ids: vec!["1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -5536,6 +5803,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: m1,
             item_ids: vec!["ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -5723,6 +5991,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: m1,
             item_ids: vec!["ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -6005,6 +6274,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: _m1,
             item_ids: vec![],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -6033,6 +6303,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: m1,
             item_ids: vec!["ep1".into(), "ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 30_000,
         })
@@ -6465,6 +6736,7 @@ mod tests {
         // What `/SyncPlay/New` sends right after AddMember (leader playing @ 90s).
         h.tx.send(GroupMsg::SeedQueue {
             item_id: "ep1".into(),
+            runtime_ms: None,
             position_ms: 90_000,
             is_paused: false,
         })
@@ -6519,6 +6791,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: leader,
             item_ids: vec!["real1".into(), "real2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 1,
             start_position_ms: 0,
         })
@@ -6527,6 +6800,7 @@ mod tests {
         let _ = snapshot_of(&h).await;
         h.tx.send(GroupMsg::SeedQueue {
             item_id: "seed".into(),
+            runtime_ms: None,
             position_ms: 5_000,
             is_paused: false,
         })
@@ -7052,6 +7326,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: leader,
             item_ids: vec!["ep1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -7198,6 +7473,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: leader,
             item_ids: vec!["ep1".into(), "ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -7247,6 +7523,7 @@ mod tests {
         h.tx.send(GroupMsg::SetNewQueue {
             sender: leader,
             item_ids: vec!["10".into(), "11".into(), "12".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })

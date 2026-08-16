@@ -106,6 +106,7 @@ async fn two_sessions_start_in_lockstep_after_both_ready() {
         .send(GroupMsg::SetNewQueue {
             sender: a.member_id,
             item_ids: vec!["ep1".into(), "ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -168,6 +169,7 @@ async fn silent_member_does_not_wedge_the_group() {
         .send(GroupMsg::SetNewQueue {
             sender: a.member_id,
             item_ids: vec!["ep1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -213,6 +215,7 @@ async fn late_joiner_does_not_advance_the_queue() {
         .send(GroupMsg::SetNewQueue {
             sender: a.member_id,
             item_ids: vec!["ep1".into(), "ep2".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
@@ -296,6 +299,7 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
         .send(GroupMsg::SetNewQueue {
             sender: a.member_id,
             item_ids: vec!["ep1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })
