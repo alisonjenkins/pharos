@@ -144,3 +144,60 @@ async fn a_session_that_starts_on_the_last_segment_is_reported_as_a_tail_start()
          comparison and not an isolated fact; got {starts:?}"
     );
 }
+
+/// T126 — the ROUTE must report a segment one session keeps re-fetching.
+///
+/// `session_start.rs`'s own tests prove the counter and the report-once rule,
+/// and stay green if every call site is deleted. The call site is the point: on
+/// 2026-08-16 a wedged player pulled segment 1188 152 times and segment 929
+/// 118 times while every server-side signal read green — all 200s, warm cache,
+/// no errors. Nothing counted the repeats, so the failure was invisible for
+/// fifteen minutes.
+#[actix_web::test]
+async fn a_session_refetching_one_segment_is_reported() {
+    let _ = pharos_server::obs::init("info", None);
+    let (state, token) = seed().await;
+    register_session(&state, "psid-spin").await;
+    register_session(&state, "psid-walk").await;
+    let app = test::init_service(App::new().app_data(state.clone()).configure(hls::register)).await;
+
+    // The wedge: one session, one index, over and over. Status is irrelevant —
+    // there is no decodable source behind this item, and what is under test is
+    // that the server SAID a client was spinning.
+    for _ in 0..8 {
+        let _ = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!(
+                    "/videos/7/h264cmaf/3.m4s?PlaySessionId=psid-spin&api_key={token}"
+                ))
+                .to_request(),
+        )
+        .await;
+    }
+    // …and a healthy session walking forward, which must NOT be reported.
+    for seg in 0..8u32 {
+        let _ = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!(
+                    "/videos/7/h264cmaf/{seg}.m4s?PlaySessionId=psid-walk&api_key={token}"
+                ))
+                .to_request(),
+        )
+        .await;
+    }
+
+    let body = pharos_server::obs::render();
+    let refetch: Vec<&str> = body
+        .lines()
+        .filter(|l| l.starts_with("pharos_segment_refetch_total"))
+        .collect();
+    assert!(
+        refetch
+            .iter()
+            .any(|l| l.contains("surface=\"h264cmaf\"") && l.ends_with(" 1")),
+        "a session re-fetching one segment eight times must be reported exactly \
+         once; got {refetch:?}"
+    );
+}

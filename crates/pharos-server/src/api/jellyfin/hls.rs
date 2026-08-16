@@ -1058,6 +1058,13 @@ async fn serve_segment(
         start_secs,
         if variant.is_some() { "variant" } else { "main" },
     );
+    crate::session_start::note_segment_serve(
+        &state.segment_refetches,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        if variant.is_some() { "variant" } else { "main" },
+    );
 
     // P2 — pull negotiated bitrate cap from the live session (if any)
     // so we can clamp the variant override below.
@@ -2214,6 +2221,13 @@ async fn vp9_segment(
         segment_time_range(seg, item.probe.frame_rate_mille).0,
         "vp9",
     );
+    crate::session_start::note_segment_serve(
+        &state.segment_refetches,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        "vp9",
+    );
     let mut opts = vp9_segment_opts(
         &state,
         &req,
@@ -2389,6 +2403,14 @@ async fn h264cmaf_segment(
         segment_time_range(seg, item.probe.frame_rate_mille).0,
         "h264cmaf",
     );
+    crate::session_start::note_segment_serve(
+        &state.segment_refetches,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        "h264cmaf",
+    );
+
     let mut opts = fmp4_segment_opts(
         &state,
         &req,
