@@ -687,6 +687,67 @@ fn short_of_frames(
     None
 }
 
+/// How a segment's frame count compares with what its window implied.
+///
+/// Three values, not two, because the tail is a third case and neither of the
+/// existing ones tells the truth about it. `expected_frames` comes from
+/// [`pharos_core::SegmentWindow`], whose final window is clamped by the
+/// CONTAINER duration, while the encoder stops at the end of the VIDEO stream
+/// — so a title whose audio outruns its video reports a deficit at its last
+/// segment forever (T116; the same premise as B189/V144, which is why that
+/// segment used to 500).
+///
+/// Calling that `Short` is false — the frames do not exist to be produced —
+/// and it puts a floor of one-per-title-end under the rate you would query
+/// when hunting real frame loss. Calling it `Complete` is the worse lie: a
+/// tail that genuinely lost frames would then be indistinguishable from a
+/// healthy one. So it is counted as itself, and stays queryable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameResult {
+    /// Produced at least the frames the window implied.
+    Complete,
+    /// Short, at a segment whose window the source could have filled. This is
+    /// the silent-frame-loss signal.
+    Short,
+    /// Short, at the title's LAST segment, where the expectation is derived
+    /// from the container and the video legitimately ends earlier.
+    TailDeficit,
+}
+
+impl FrameResult {
+    fn label(self) -> &'static str {
+        match self {
+            FrameResult::Complete => "complete",
+            FrameResult::Short => "short",
+            FrameResult::TailDeficit => "tail_deficit",
+        }
+    }
+
+    /// Classify a deficit. `is_final` is [`pharos_core::SegmentWindow::is_final`],
+    /// set by the grid — a caller cannot claim it for an arbitrary segment.
+    fn classify(deficit: i64, is_final: bool) -> Self {
+        if deficit <= 0 {
+            FrameResult::Complete
+        } else if is_final {
+            FrameResult::TailDeficit
+        } else {
+            FrameResult::Short
+        }
+    }
+
+    /// Whether this warrants a WARN.
+    ///
+    /// The tail does not. Its warning named "a hitch at this boundary" for a
+    /// boundary with nothing after it to hitch into, once per title-end,
+    /// forever — and a warning that is always wrong is one the reader learns
+    /// to skip, taking the real ones with it. The numbers survive on the
+    /// `hls segment transcoded` INFO line beside it and in the counter above,
+    /// so nothing becomes unqueryable; only the severity changes.
+    fn warrants_warning(self) -> bool {
+        matches!(self, FrameResult::Short)
+    }
+}
+
 /// Stable small tag distinguishing the output video codec + CONTAINER so
 /// different segment BYTES never share a cache entry. The container matters:
 /// the same H264 codec is muxed into mpegts on the `hls1/*.ts` surface but
@@ -2401,12 +2462,13 @@ impl HlsSegmentCache {
         // warned, because a fault that only shows as a missing field on an INFO
         // line is a fault nobody queries for.
         if let Some(deficit) = frame_deficit {
+            let result = FrameResult::classify(deficit, opts.window.is_final());
             metrics::counter!(
                 "pharos_segment_frames_total",
-                "result" => if deficit > 0 { "short" } else { "complete" },
+                "result" => result.label(),
             )
             .increment(1);
-            if deficit > 0 {
+            if result.warrants_warning() {
                 tracing::warn!(
                     media.id = media_id,
                     seg = seg_index,
@@ -6260,6 +6322,62 @@ mod tests {
         opts.video_bitrate_bps = None;
         let got = read_progress(&out).await;
         assert_eq!(short_of_frames(got, &opts, false), None);
+    }
+
+    /// The `result` label is a dashboard contract: three distinct, stable
+    /// values. `tail_deficit` exists so the tail is neither counted as loss
+    /// nor laundered into `complete`.
+    #[test]
+    fn frame_results_have_distinct_labels() {
+        const ALL: [FrameResult; 3] = [
+            FrameResult::Complete,
+            FrameResult::Short,
+            FrameResult::TailDeficit,
+        ];
+        assert_eq!(FrameResult::Complete.label(), "complete");
+        assert_eq!(FrameResult::Short.label(), "short");
+        assert_eq!(FrameResult::TailDeficit.label(), "tail_deficit");
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), ALL.len(), "frame results collide: {labels:?}");
+    }
+
+    /// T116 — a deficit at the LAST segment is not frame loss. Ant-Man's
+    /// numbers, measured on the deployed B189 fix: the tail produced 15 of the
+    /// 19 frames its container-derived window implied, and those four never
+    /// existed to be produced.
+    #[test]
+    fn a_deficit_at_the_tail_is_not_counted_as_loss() {
+        assert_eq!(
+            FrameResult::classify(4, true),
+            FrameResult::TailDeficit,
+            "the tail's expectation comes from the container, not the video"
+        );
+        assert_eq!(
+            FrameResult::classify(4, false),
+            FrameResult::Short,
+            "the same deficit mid-file IS the silent-frame-loss signal"
+        );
+        // A tail that met its expectation is ordinary, and says so.
+        assert_eq!(FrameResult::classify(0, true), FrameResult::Complete);
+        assert_eq!(FrameResult::classify(-2, true), FrameResult::Complete);
+    }
+
+    /// The tail is exempted from the WARN and from nothing else. It is still
+    /// counted, under its own label, so a tail losing frames for a real reason
+    /// stays visible as a rate — which `complete` would have destroyed.
+    #[test]
+    fn only_a_real_shortfall_warns_and_the_tail_is_still_counted() {
+        assert!(FrameResult::Short.warrants_warning());
+        assert!(
+            !FrameResult::TailDeficit.warrants_warning(),
+            "a hitch cannot occur at a boundary with nothing after it"
+        );
+        assert!(!FrameResult::Complete.warrants_warning());
+        assert_ne!(
+            FrameResult::TailDeficit.label(),
+            FrameResult::Complete.label(),
+            "silencing the tail must not mean calling it healthy"
+        );
     }
 
     /// T113 — the tail of a title whose AUDIO outruns its VIDEO.
