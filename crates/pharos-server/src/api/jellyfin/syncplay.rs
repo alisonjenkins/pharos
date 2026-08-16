@@ -417,6 +417,37 @@ async fn creator_now_playing(
     })
 }
 
+/// Resolve each queue item's duration, INDEX-ALIGNED with `item_ids`.
+///
+/// Built by mapping over the same vec the caller passes to the group, so the
+/// alignment is structural. An item that does not parse, is missing, or has no
+/// probed duration yields `None` — the group then leaves that item's position
+/// unclamped, which is the behaviour it had before runtimes existed.
+///
+/// The group actor cannot do this itself: it has no store handle, and until it
+/// was told, it had no way to know an item had ENDED, so a group left Playing
+/// extrapolated past the end forever (T114).
+async fn resolve_runtimes_ms(
+    state: &crate::state::AppState,
+    item_ids: &[String],
+) -> Vec<Option<u64>> {
+    use pharos_core::MediaStore;
+    let mut out = Vec::with_capacity(item_ids.len());
+    for id in item_ids {
+        let runtime = match pharos_jellyfin_api::dto::parse_item_id(id) {
+            Some(num) => state
+                .stores
+                .get(num)
+                .await
+                .ok()
+                .and_then(|item| item.probe.duration_ms),
+            None => None,
+        };
+        out.push(runtime);
+    }
+    out
+}
+
 async fn new_group(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
@@ -468,10 +499,16 @@ async fn new_group(
             device_id = %dev, group = %handle.group_id, %item_id, position_ms, is_paused,
             "syncplay: seeding new group from creator's now-playing item"
         );
+        let runtime_ms = resolve_runtimes_ms(&state, std::slice::from_ref(&item_id))
+            .await
+            .into_iter()
+            .next()
+            .flatten();
         let _ = handle
             .tx
             .send(GroupMsg::SeedQueue {
                 item_id,
+                runtime_ms,
                 position_ms,
                 is_paused,
             })
@@ -534,6 +571,10 @@ async fn set_new_queue(
 ) -> HttpResponse {
     let body = body.into_inner();
     let start_ms = body.start_position_ticks / POSITION_TICKS_PER_MS;
+    // Resolved HERE, not in the closure: `dispatch` takes a synchronous
+    // builder, and this is a store read. Mapping over the same vec is what
+    // keeps the two index-aligned.
+    let item_runtimes_ms = resolve_runtimes_ms(&state, &body.playing_queue).await;
     dispatch(
         &hub,
         &registry,
@@ -543,6 +584,7 @@ async fn set_new_queue(
         move |mid| GroupMsg::SetNewQueue {
             sender: mid,
             item_ids: body.playing_queue,
+            item_runtimes_ms,
             playing_index: body.playing_item_position,
             start_position_ms: start_ms,
         },
