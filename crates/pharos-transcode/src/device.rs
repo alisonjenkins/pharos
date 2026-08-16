@@ -450,12 +450,38 @@ impl DeviceTable {
         opts: &TranscodeOptions,
         rendition_key: u64,
     ) -> Option<DeviceId> {
-        let supporting: SmallVec<[(DeviceId, u64); 5]> = self
+        let mut supporting: SmallVec<[(DeviceId, u64); 5]> = self
             .slots
             .iter()
             .filter(|s| device_supports(s.id, opts))
             .map(|s| (s.id, u64::from(s.weight())))
             .collect();
+        // A rendition that BURNS subtitles prefers hardware, when hardware can
+        // serve the codec at all.
+        //
+        // Burn re-encodes every frame through a filter graph, and the CPU is
+        // the one device whose permits are also spent on everything else —
+        // audio, copies, and every speculative prefetch. Landing a burn there
+        // is the difference between comfortable and stalled: live on
+        // 2026-08-16, a burning rendition drew the CPU third of the weighted
+        // spread and segment 87 waited 23.7 s for a permit while its encode
+        // took 3.9 s, with NVENC at `in_use 0` of 8 permits throughout.
+        //
+        // A preference, never an eligibility gate: with no hardware for the
+        // codec the full set stands, because a rendition that resolves to
+        // nothing cannot play at all. And it reads only `opts`, which is fixed
+        // for the life of the rendition, so the one-encoder guarantee (#114)
+        // is untouched — same rendition, same device, restart or not.
+        if opts.burn_subtitle_stream_index.is_some() {
+            let hw: SmallVec<[(DeviceId, u64); 5]> = supporting
+                .iter()
+                .copied()
+                .filter(|(id, _)| matches!(id, DeviceId::Hw { .. }))
+                .collect();
+            if !hw.is_empty() {
+                supporting = hw;
+            }
+        }
         let last = *supporting.last()?;
 
         // Weighted pick: lay the devices out as adjacent bands whose widths are
@@ -767,6 +793,73 @@ mod tests {
             cooled.rendition_device(&cmaf, key),
             Some(first),
             "cooldown is transient and must not change which device owns a rendition"
+        );
+    }
+
+    /// A rendition that BURNS subtitles goes to hardware wherever hardware can
+    /// serve it — for every key, not just most of them.
+    ///
+    /// Burn is the encode that cannot afford to lose the draw. It re-encodes
+    /// every frame through a filter graph, and the CPU is the one device whose
+    /// permits are also spent on everything else: audio, copies, and every
+    /// speculative prefetch. Live on 2026-08-16 (Black Panther, two viewers,
+    /// subtitles switched on mid-film) a burning rendition landed in the CPU
+    /// third of the weighted spread and playback stalled — segment 87 waited
+    /// 23.7 s for a permit while its actual encode took 3.9 s, and NVENC sat at
+    /// `in_use 0` of 8 the entire time. The picture stopped until a seek landed
+    /// back in warm cache.
+    ///
+    /// This is a property OF THE RENDITION, not of load, so it keeps the purity
+    /// the one-encoder rule depends on: the same rendition still resolves to
+    /// the same device forever, on a fresh table, under cooldown.
+    #[test]
+    fn a_burning_rendition_lands_on_hardware_whenever_hardware_can_serve_it() {
+        let mut burn = h264_opts();
+        burn.container = Container::Fmp4;
+        burn.burn_subtitle_stream_index = Some(0);
+        let t = table();
+        for key in 0..512u64 {
+            let picked = t
+                .rendition_device(&burn, key.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .expect("a device");
+            assert!(
+                matches!(picked, DeviceId::Hw { .. }),
+                "a burning rendition on CPU competes with every prefetch on the \
+                 machine's most contended device; key {key} picked {picked:?}"
+            );
+        }
+    }
+
+    /// …and still resolves to ONE device, which is the rule the bias must not
+    /// break.
+    #[test]
+    fn a_burning_rendition_is_still_pinned_and_deterministic() {
+        let mut burn = h264_opts();
+        burn.container = Container::Fmp4;
+        burn.burn_subtitle_stream_index = Some(0);
+        let key = 0x1234_5678_9abc_def0u64;
+        let first = table().rendition_device(&burn, key).expect("a device");
+        for _ in 0..20 {
+            assert_eq!(table().rendition_device(&burn, key), Some(first));
+        }
+        let mut cooled = table();
+        cooled.set_cooldown(first, Instant::now() + Duration::from_secs(60));
+        assert_eq!(cooled.rendition_device(&burn, key), Some(first));
+    }
+
+    /// With no hardware able to serve the codec, a burning rendition still has
+    /// to run: the bias is a preference, never an eligibility gate. Falling
+    /// through to nothing would make subtitles unplayable on a CPU-only box.
+    #[test]
+    fn a_burning_rendition_falls_back_to_cpu_when_no_hardware_serves_it() {
+        let mut burn = h264_opts();
+        burn.container = Container::Fmp4;
+        burn.burn_subtitle_stream_index = Some(0);
+        let cpu_only = DeviceTable::from_probe(&[], 4);
+        assert_eq!(
+            cpu_only.rendition_device(&burn, 42),
+            Some(DeviceId::Cpu),
+            "a preference that cannot be satisfied must not strand the encode"
         );
     }
 
