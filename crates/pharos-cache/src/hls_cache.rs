@@ -639,6 +639,87 @@ fn short_disposition(result: FrameResult, already_refused: bool) -> ShortDisposi
     }
 }
 
+/// Per-item cache epoch, carried in every segment URL (T121).
+///
+/// Segments are served `Cache-Control: public, max-age=31536000, immutable`,
+/// which is correct for content at a stable URL and fatal when the bytes behind
+/// that URL turn out to be wrong. On 2026-08-16 five poisoned segments were
+/// deleted server-side and the viewer still could not play the timestamp; the
+/// only thing that worked was disabling her browser cache entirely. NO server
+/// action can evict bytes a browser already holds — the URL has to change.
+///
+/// So a purge bumps the item's epoch, every segment URL for that item changes,
+/// and the client fetches rather than serving its stored copy.
+///
+/// Per ITEM, deliberately. A global epoch would invalidate every cached segment
+/// of every title at once, which is the 21.6 GiB cold-cache cliff of 2026-08-15
+/// with waits to 11.8 s — the exact cost B196 was written to remove.
+///
+/// Persisted in the cache BASE (beside the rate store), not in the generation
+/// subtree: an epoch that reset on a placement change would revert URLs that
+/// clients already hold. Single-writer, matching the deployment's
+/// `replicaCount: 1`; under multiple replicas each pod would keep its own
+/// counter and a bump would only invalidate the pod that served it.
+#[derive(Debug, Default)]
+pub struct ItemEpochs {
+    path: PathBuf,
+    map: DashMap<u64, u32>,
+}
+
+/// Filename of the persisted epoch map, in the cache base.
+const EPOCHS_FILE: &str = ".item_epochs.json";
+
+impl ItemEpochs {
+    fn load(base: &Path) -> Self {
+        let path = base.join(EPOCHS_FILE);
+        let map = DashMap::new();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&text) {
+                for (k, v) in obj {
+                    if let (Ok(id), Some(epoch)) = (k.parse::<u64>(), v.as_u64()) {
+                        map.insert(id, epoch as u32);
+                    }
+                }
+            }
+        }
+        Self { path, map }
+    }
+
+    /// The epoch to put in this item's URLs. Zero — the overwhelming majority —
+    /// means "never purged", and callers omit the parameter entirely so the
+    /// URLs of an untouched library are byte-identical to what they were
+    /// before this existed.
+    pub fn get(&self, media_id: u64) -> u32 {
+        self.map.get(&media_id).map(|e| *e).unwrap_or(0)
+    }
+
+    /// Advance an item's epoch and persist it. Returns the new value.
+    ///
+    /// Persisted synchronously: the whole point is to survive the restart that
+    /// might follow whatever made a purge necessary, and the map is a few bytes
+    /// per purged item.
+    pub fn bump(&self, media_id: u64) -> u32 {
+        let next = self.get(media_id).saturating_add(1);
+        self.map.insert(media_id, next);
+        let doc: serde_json::Map<String, serde_json::Value> = self
+            .map
+            .iter()
+            .map(|e| (e.key().to_string(), serde_json::json!(*e.value())))
+            .collect();
+        if let Err(e) = std::fs::write(&self.path, serde_json::Value::Object(doc).to_string()) {
+            // A lost epoch means a client keeps serving stale bytes after a
+            // restart — bad, but not a reason to fail the purge that just made
+            // the on-disk copy unservable.
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "could not persist the item cache epochs"
+            );
+        }
+        next
+    }
+}
+
 /// Where quarantined segments are parked, relative to the generation root.
 ///
 /// Dot-prefixed and NOT a media-id directory, so the purge scan can never find
@@ -1111,6 +1192,13 @@ enum AudioStart {
 #[derive(Clone)]
 pub struct HlsSegmentCache {
     root: PathBuf,
+    /// The generation root's PARENT — where state that must outlive a
+    /// generation lives (the rate store, the per-item cache epochs). An epoch
+    /// kept inside the generation would reset on every placement change,
+    /// silently reverting URLs a client already holds.
+    base: PathBuf,
+    /// Per-item cache epoch (T121), carried in every segment URL.
+    epochs: Arc<ItemEpochs>,
     max_bytes: u64,
     transcoder: FfmpegTranscoder,
     /// When set, segment transcodes are dispatched through the
@@ -1755,6 +1843,8 @@ impl HlsSegmentCache {
             "HLS cache root scoped to this generation"
         );
         Self {
+            epochs: Arc::new(ItemEpochs::load(&base)),
+            base,
             root,
             max_bytes,
             transcoder: FfmpegTranscoder::new(),
@@ -1795,6 +1885,29 @@ impl HlsSegmentCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// This item's cache epoch, for the URLs a playlist is about to emit.
+    pub fn item_epoch(&self, media_id: u64) -> u32 {
+        self.epochs.get(media_id)
+    }
+
+    /// Retire every segment URL a client holds for this item (T121).
+    pub fn bump_item_epoch(&self, media_id: u64) -> u32 {
+        let next = self.epochs.bump(media_id);
+        tracing::warn!(
+            media.id = media_id,
+            epoch = next,
+            "item cache epoch advanced; clients holding the old segment URLs \
+             will refetch"
+        );
+        metrics::counter!("pharos_item_cache_epoch_bumps_total").increment(1);
+        next
+    }
+
+    /// The cache base — the generation root's parent.
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 
     /// Take a range of an item's cached segments out of service, KEEPING the
@@ -6938,6 +7051,37 @@ mod tests {
             "a generation nothing has touched for longer than the grace is dead \
              weight against the cache cap and must be reclaimed"
         );
+    }
+
+    /// T121 — a purged item's URLs must change, and the epoch must survive a
+    /// restart.
+    ///
+    /// Segments go out `immutable`. On 2026-08-16 five poisoned segments were
+    /// deleted server-side and the viewer still could not play the timestamp;
+    /// only disabling her browser cache worked. Nothing the server does to its
+    /// own disk can evict bytes a client already holds — the URL has to move.
+    #[test]
+    fn an_items_epoch_advances_and_survives_a_reload() {
+        let td = TempDir::new().unwrap();
+        let epochs = ItemEpochs::load(td.path());
+        assert_eq!(epochs.get(7), 0, "an untouched item has no epoch");
+        assert_eq!(epochs.bump(7), 1);
+        assert_eq!(epochs.bump(7), 2);
+        assert_eq!(
+            epochs.get(9),
+            0,
+            "a purge must not move any OTHER item — a global bump is the \
+             cold-cache cliff B196 exists to avoid"
+        );
+
+        // The restart that may well follow whatever made the purge necessary.
+        let reloaded = ItemEpochs::load(td.path());
+        assert_eq!(
+            reloaded.get(7),
+            2,
+            "an epoch that resets on restart silently reverts URLs clients hold"
+        );
+        assert_eq!(reloaded.get(9), 0);
     }
 
     /// T119 — the full disposition matrix.
