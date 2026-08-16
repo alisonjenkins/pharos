@@ -34,6 +34,8 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         )
         // Library admin.
         .route("/library/refresh", web::post().to(library_refresh))
+        // Cache surgery (T120) — see `purge_segments`.
+        .route("/admin/cache/segments", web::delete().to(purge_segments))
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(scheduled_tasks))
         .route(
@@ -591,6 +593,102 @@ async fn set_user_password(
             other => error::ErrorInternalServerError(other.to_string()),
         })?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// `DELETE /Admin/Cache/Segments?itemId=&from=&to=` — take an item's cached
+/// segments over a time range out of service (T120).
+///
+/// Exists because on 2026-08-16 the only way to remove one bad segment was to
+/// run a busybox pod against the cache PVC and `rm` the file by hand: a live
+/// infrastructure mutation, needing per-command approval, with a shell inside
+/// the data directory of a running server. That was done three times in one
+/// evening.
+///
+/// `from`/`to` are SECONDS into the item, converted here against the item's own
+/// grid — every by-hand purge so far began by re-deriving `floor(seconds / 6)`,
+/// and the caller should not have to know the grid to name a timestamp a viewer
+/// reported. Both ends inclusive; `to` omitted means "just the segment
+/// containing `from`".
+///
+/// The bytes are QUARANTINED rather than deleted (T118): a purge that destroys
+/// its own evidence is why three occurrences produced no artefact to examine.
+///
+/// Admin-gated, because a purge is a denial-of-service primitive against the
+/// server's own cache — everything it removes must be re-encoded on demand.
+// Plain snake_case fields: `CiQuery` normalises every incoming key to
+// snake_case before parsing, so `itemId`, `ItemId` and `item_id` all bind —
+// and a `camelCase` rename here would match NONE of them (B18's shape).
+#[derive(Debug, Deserialize)]
+struct PurgeSegmentsQuery {
+    item_id: u64,
+    from: f64,
+    to: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PurgeSegmentsResultDto {
+    item_id: u64,
+    first_index: u32,
+    last_index: u32,
+    quarantined: Vec<String>,
+    failed: usize,
+}
+
+async fn purge_segments(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: CiQuery<PurgeSegmentsQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(cache) = state.hls.as_ref() else {
+        return Err(error::ErrorServiceUnavailable("no HLS segment cache"));
+    };
+    // Fully qualified: `Stores` implements both `UserStore` and `MediaStore`,
+    // and bare `.get` resolves to the user one.
+    let item = pharos_core::MediaStore::get(&state.stores, q.item_id)
+        .await
+        .map_err(|e| match e {
+            // An unknown item is the caller's mistake, not the server's: a
+            // mistyped id answered 500 would read as "the purge broke".
+            pharos_core::DomainError::NotFound(_) => error::ErrorNotFound(e.to_string()),
+            other => error::ErrorInternalServerError(other.to_string()),
+        })?;
+    let duration_secs =
+        item.probe
+            .duration_ms
+            .ok_or_else(|| error::ErrorBadRequest("item has no known duration"))? as f64
+            / 1000.0;
+    let grid = pharos_core::SegmentGrid::new(duration_secs, item.probe.frame_rate_mille);
+
+    // Resolving BOTH ends against the grid is what makes the caller's units
+    // seconds rather than indices. A timestamp past the end is a caller error,
+    // not something to clamp silently: clamping would purge the tail on a typo.
+    let first = grid
+        .resolve(q.from)
+        .ok_or_else(|| error::ErrorBadRequest("`from` is outside the item"))?;
+    let last = match q.to {
+        Some(to) if to < q.from => {
+            return Err(error::ErrorBadRequest("`to` precedes `from`"));
+        }
+        Some(to) => grid
+            .resolve(to)
+            .ok_or_else(|| error::ErrorBadRequest("`to` is outside the item"))?,
+        None => first,
+    };
+
+    let report = cache
+        .quarantine_segments(q.item_id, first.get()..=last.get())
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+
+    Ok(web::Json(PurgeSegmentsResultDto {
+        item_id: q.item_id,
+        first_index: first.get(),
+        last_index: last.get(),
+        quarantined: report.quarantined,
+        failed: report.failed,
+    }))
 }
 
 /// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (the dashboard

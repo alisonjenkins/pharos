@@ -739,3 +739,95 @@ async fn dashboard_named_config_and_backup_sections_render() {
         );
     }
 }
+
+/// T120 — the ROUTE must purge, not just the cache helper.
+///
+/// `hls_cache`'s own tests prove the quarantine moves bytes and respects a
+/// range; they stay green if this endpoint is never registered, and the
+/// endpoint is the entire point. Removing one bad segment on 2026-08-16 meant
+/// running a busybox pod against the cache PVC and `rm`-ing by hand, three
+/// times in one evening.
+#[actix_web::test]
+async fn an_admin_can_purge_a_time_range_of_an_items_segments() {
+    use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore};
+
+    let (state, token, _uid) = seed(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = pharos_cache::hls_cache::HlsSegmentCache::new(dir.path().to_path_buf(), 1 << 30);
+
+    // 60 s at the 6 s grid: second 30 lands in segment 5.
+    pharos_core::MediaStore::put(
+        &state.stores,
+        MediaItem {
+            id: 42,
+            path: "/nonexistent/film.mkv".into(),
+            title: "film".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = MediaStore::get(&state.stores, 42).await;
+
+    // A cached segment sitting exactly where the purge is aimed.
+    let seg_dir = cache.root().join("42");
+    std::fs::create_dir_all(&seg_dir).unwrap();
+    let seg = seg_dir.join("5-a0-s0-v2971-bauto-c26.ts");
+    std::fs::write(&seg, b"poisoned bytes").unwrap();
+
+    let state = web::Data::new(
+        AppState::new(state.stores.clone(), "t".into()).with_hls_cache(cache.clone()),
+    );
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::delete()
+        .uri("/Admin/Cache/Segments?itemId=42&from=30")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(
+        resp.status().is_success(),
+        "the purge route must exist and answer: {}",
+        resp.status()
+    );
+
+    assert!(
+        !seg.exists(),
+        "the segment the caller named must stop being servable"
+    );
+    // Quarantined, not destroyed (T118) — the reason the endpoint exists at all
+    // is that three by-hand purges left no artefact to examine.
+    let pen = cache.root().join(".quarantine");
+    let kept: Vec<_> = std::fs::read_dir(&pen)
+        .expect("the quarantine exists")
+        .flatten()
+        .map(|e| std::fs::read(e.path()).unwrap_or_default())
+        .collect();
+    assert!(
+        kept.iter().any(|b| b == b"poisoned bytes"),
+        "the purged bytes must be retained for diagnosis"
+    );
+}
+
+/// A purge is a denial-of-service primitive against the server's own cache:
+/// everything it removes has to be re-encoded on demand.
+#[actix_web::test]
+async fn a_non_admin_cannot_purge_segments() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let req = test::TestRequest::delete()
+        .uri("/Admin/Cache/Segments?itemId=42&from=30")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "a non-admin must be refused before anything is touched"
+    );
+}
