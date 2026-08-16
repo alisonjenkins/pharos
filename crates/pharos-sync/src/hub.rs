@@ -86,6 +86,22 @@ pub struct Registered {
 #[derive(Clone, Default)]
 pub struct SessionHub {
     inner: Arc<DashMap<String, SessionEntry>>,
+    /// Monotonic source of connection generations, shared by every device.
+    ///
+    /// HUB-WIDE, not per-entry, and that is the whole point. The fence in
+    /// [`remove_if_current_gen`](SessionHub::remove_if_current_gen) is an
+    /// equality test, so a generation that can come round again is a
+    /// generation that can match a teardown belonging to a socket that is
+    /// already dead. A per-entry counter did exactly that: removing the entry
+    /// took the counter with it, so the next registration started at 1 — the
+    /// value a previous connection's 20 s teardown was still holding.
+    ///
+    /// Live on 2026-08-16 it evicted a member four times in one group watch,
+    /// each time ~19 s after it had reconnected and rejoined, and it was
+    /// self-perpetuating: every eviction guaranteed the next registration
+    /// started at 1 again. Counting across devices costs nothing (the value is
+    /// only ever compared with itself) and makes reuse unrepresentable.
+    next_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionHub {
@@ -106,16 +122,23 @@ impl SessionHub {
         sink: mpsc::Sender<ServerMsg>,
     ) -> Registered {
         let member_id = member_id_for_device(&device_id);
+        // Taken BEFORE the entry is touched, so the value is unique whether
+        // this is a first connect or a reconnect, and whether or not the entry
+        // survived the last teardown.
+        let gen = self
+            .next_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let mut e = self.inner.entry(device_id).or_insert_with(|| SessionEntry {
             member_id,
             name: name.clone(),
             sink: sink.clone(),
             group: None,
-            conn_gen: 0,
+            conn_gen: gen,
         });
         e.name = name;
         e.sink = sink;
-        e.conn_gen += 1;
+        e.conn_gen = gen;
         Registered {
             member_id: e.member_id,
             group: e.group.clone(),
@@ -224,6 +247,51 @@ mod tests {
         let detached = hub.detach_group("devA").unwrap();
         assert_eq!(detached.group_id, handle.group_id);
         assert!(hub.resolve("devA").unwrap().group.is_none());
+    }
+
+    /// A generation is never REUSED, even after the entry is removed.
+    ///
+    /// The fence is an equality test, so a generation that comes round again is
+    /// a generation that matches somebody else's pending teardown. Removing the
+    /// entry used to reset the counter, so every registration after an eviction
+    /// started at 1 — the same value the previous connection's teardown was
+    /// still holding, 20 s in the future.
+    ///
+    /// Live on 2026-08-16, four times in one group watch: a member reconnected
+    /// 0.6 s after a disconnect, rejoined, and was evicted 20.002 s after that
+    /// disconnect by a teardown belonging to a socket that had already died.
+    /// Self-perpetuating, because each eviction guarantees the next
+    /// registration starts at 1 again.
+    #[tokio::test]
+    async fn a_generation_is_never_reused_after_the_entry_is_removed() {
+        let hub = SessionHub::new();
+        let first = hub.register("devABA".into(), "a".into(), sink());
+        hub.attach_group("devABA", handle());
+        // The first socket's teardown fires with nobody reconnected: legitimate.
+        // It returns the group so the caller can `RemoveMember` on it.
+        assert!(hub.remove_if_current_gen("devABA", first.gen).is_some());
+        assert!(hub.resolve("devABA").is_none());
+
+        // The device reconnects and rejoins. This is a LIVE session.
+        let second = hub.register("devABA".into(), "a".into(), sink());
+        hub.attach_group("devABA", handle());
+        assert_ne!(
+            second.gen, first.gen,
+            "a reused generation is indistinguishable from the dead one"
+        );
+
+        // A teardown scheduled by some earlier, already-dead socket that held
+        // the first generation must not touch it.
+        assert!(
+            hub.remove_if_current_gen("devABA", first.gen).is_none(),
+            "a dead socket's teardown evicted a live reconnected session"
+        );
+        assert!(
+            hub.resolve("devABA").is_some(),
+            "the live session must survive a stale teardown — losing it drops \
+             the member from the group AND makes its own socket unreachable to \
+             every later HTTP command"
+        );
     }
 
     #[tokio::test]
