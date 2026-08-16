@@ -1630,6 +1630,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         if let Some(tp) = state.trickplay.clone() {
             let prio = pharos_server::trickplay_backfill::spawn(
                 state.stores.clone(),
+                state.is_bg_leader.clone(),
                 tp,
                 state.subtitles.clone(),
                 state.images.clone(),

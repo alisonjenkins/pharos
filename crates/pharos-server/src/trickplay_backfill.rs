@@ -59,6 +59,9 @@ const GRID_PRIMARY_WIDTH: u32 = 480;
 #[derive(Clone)]
 struct GenCtx {
     stores: Stores,
+    /// Background-work leadership (T85). The SWEEP waits on this; the priority
+    /// worker deliberately does not — see [`spawn`].
+    bg_leader: Arc<std::sync::atomic::AtomicBool>,
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
     images: Option<ImageCache>,
@@ -92,8 +95,10 @@ pub type PriorityTx = mpsc::UnboundedSender<u64>;
 /// item id to bump that item — then its whole series — to the front. No task
 /// is spawned when trickplay is disabled (empty widths); the returned sender's
 /// messages are then simply dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     stores: Stores,
+    bg_leader: Arc<std::sync::atomic::AtomicBool>,
     cache: TrickplayCache,
     subtitles: Option<SubtitleCache>,
     images: Option<ImageCache>,
@@ -112,6 +117,7 @@ pub fn spawn(
         );
         let ctx = GenCtx {
             stores,
+            bg_leader,
             cache,
             subtitles,
             images,
@@ -224,6 +230,15 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
     units
 }
 
+/// Await background-work leadership. Mirrors `AppState::wait_until_bg_leader`,
+/// taking the flag directly so this module does not need `AppState` — the
+/// backfill is spawned before the state it would borrow from is finished.
+async fn wait_until_bg_leader(flag: &std::sync::atomic::AtomicBool) {
+    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 /// General sweep: newest-first pass over the whole library, repeated every
 /// `PASS_INTERVAL`. Chunks of `SWEEP_CONCURRENCY` run concurrently; each item
 /// still draws its own `bg_io` permit per heavy op, so true parallelism is
@@ -232,6 +247,21 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
 /// one-item-at-a-time.
 async fn run_sweep(ctx: GenCtx) {
     tokio::time::sleep(WARMUP).await;
+    // T85 — one replica sweeps, not all of them.
+    //
+    // The sweep derives its work in-process (every video minus the tiles
+    // already on disk, newest-first) rather than from a queue, which is correct
+    // and deliberate for a single replica: tiles ARE the durable progress
+    // record. Under the Postgres multi-replica path it stops being correct —
+    // every replica would compute the same list and run the same whole-file
+    // decodes against the same shared NFS, multiplying the heaviest background
+    // I/O in the system by the replica count.
+    //
+    // The PRIORITY worker is deliberately NOT gated: it exists to put previews
+    // in front of someone who is watching right now, it runs on whichever
+    // replica is serving that player, and its per-key cache dedup makes an
+    // overlap between replicas harmless.
+    wait_until_bg_leader(&ctx.bg_leader).await;
     // B39 — fast boot verify-pass: sprite sets generated before the
     // completion marker existed (or partial sets from interrupted runs) are
     // marker-less, so they no longer count as generated. Verifying against
@@ -463,6 +493,38 @@ mod tests {
     use super::*;
     use pharos_core::SeriesInfo;
 
+    /// T85 — the sweep must not run on a replica that is not the background
+    /// leader.
+    ///
+    /// The sweep computes its work in-process (every video minus the tiles
+    /// already on disk), so under the multi-replica Postgres path every replica
+    /// would derive the same list and run the same whole-file decodes against
+    /// the same shared NFS — the heaviest background I/O in the system,
+    /// multiplied by the replica count.
+    #[tokio::test]
+    async fn the_sweep_waits_for_background_leadership() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+
+        // A follower: the gate must not resolve.
+        let f = flag.clone();
+        let waiting = tokio::spawn(async move { wait_until_bg_leader(&f).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a follower must not sweep: every replica deriving the same work \
+             multiplies the decodes against shared storage"
+        );
+
+        // …and it resolves once this replica is elected, so a follower that
+        // takes over (the leader's pod was replaced) does start sweeping.
+        flag.store(true, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("leadership must release the gate")
+            .expect("the waiter must not panic");
+    }
+
     /// The priority-tier seed (`bypass = true`) generates immediately — it takes
     /// NO permit, so it never blocks even when the gate is fully parked (the
     /// state during live playback). Otherwise the previews for the very item
@@ -624,6 +686,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = GenCtx {
+            // A test exercising the worker directly is the leader by definition.
+            bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             stores,
             cache: TrickplayCache::new(dir.path(), 1),
             subtitles: None,
