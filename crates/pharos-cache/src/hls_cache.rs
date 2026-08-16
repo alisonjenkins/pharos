@@ -1387,6 +1387,14 @@ impl std::fmt::Debug for HlsSegmentCache {
 // deploy that changes the rule is itself the moment the rule changes, and
 // `SegmentIdentity` carries no device, so nothing downstream can tell a
 // libx264 segment from an NVENC one until a browser fails to decode it.
+// 17 (T111): the assignment rule moves a FIFTH time — a rendition that BURNS
+// subtitles now prefers hardware, so any burn rendition whose weight band put
+// it on CPU resolves to an accelerator instead. Same reasoning as 13/15/16 and
+// the same non-negotiable consequence: `SegmentIdentity` carries no device, so
+// a libx264 burn segment cached under 16 would be served beneath an
+// NVENC-produced init and fail to decode, delivered as a 200. The bias itself
+// is a pure function of the rendition — see `DeviceTable::rendition_device` —
+// but the RULE changing is exactly what these bumps exist for.
 //
 // The price is one cold cache after this deploy. The alternative is #114 fired
 // once per moved rendition during the transition, delivered as a 200.
@@ -1396,7 +1404,7 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// generation's init (see `hls::rendition_qs`). That property is what makes
 /// this re-land safe where the first attempt was not: the bump is now visible
 /// to the CLIENT cache, not only to the server's.
-pub const HLS_GEN_VERSION: u32 = 16;
+pub const HLS_GEN_VERSION: u32 = 17;
 const GEN_VERSION_MARKER: &str = ".gen_version";
 
 /// The composed generation this process is running under, installed once at
