@@ -592,6 +592,80 @@ fn record_cache_hit(
     );
 }
 
+/// Where a committed segment's provenance record lives.
+///
+/// Distinct from [`pharos_transcode::progress_sidecar_path`], which belongs to
+/// the `.tmp` file and is deleted on the way out: this one survives beside the
+/// published segment for exactly as long as the segment does.
+fn provenance_sidecar_path(segment: &Path) -> PathBuf {
+    let mut s = segment.as_os_str().to_os_string();
+    s.push(PROVENANCE_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Suffix of the provenance sidecar. Named once: the eviction walk, the
+/// quarantine and the sidecar writer all have to agree, and three string
+/// literals would drift apart silently.
+const PROVENANCE_SUFFIX: &str = ".prov.json";
+
+/// What a provenance record says about one committed segment.
+///
+/// A struct rather than a parameter list because every field is a number or an
+/// optional string: positionally, `encode_ms` and `queue_wait_ms` are the same
+/// type and swapping them would be invisible at the call site and wrong in the
+/// record for as long as the segment lives.
+struct SegmentProvenance<'a> {
+    /// The encoder that produced these bytes. `None` when the segment did not
+    /// go through the scheduler (no device was chosen), which is honest rather
+    /// than absent — see the field note in [`write_provenance`].
+    device: Option<&'a str>,
+    /// The cache generation in force when it was written, so a record found
+    /// beside a segment cannot be read as belonging to a later ruleset.
+    generation: &'a str,
+    transcode_ms: u64,
+    encode_ms: Option<u64>,
+    queue_wait_ms: Option<u64>,
+    produced_frames: Option<u64>,
+    expected_frames: Option<u64>,
+}
+
+/// Record WHO produced a segment, next to the segment itself.
+///
+/// The producing device is known at commit time — it is already on the INFO
+/// line and on `pharos_transcode_encode_seconds{device}` — but it is not
+/// durable, and a log line ages out of Loki long before a segment ages out of
+/// the cache. Asked on 2026-08-16 whether a specific cached file came off NVENC
+/// or the CPU, the honest answer was that we could not tell (T122). Without
+/// this, "does corruption cluster on one encoder" is unanswerable after the
+/// fact, which is the first question worth asking about any systematic fault.
+///
+/// Best-effort by construction: a segment that encoded correctly must never be
+/// failed because its metadata could not be written. A missing sidecar means
+/// one unattributable segment, which is exactly where we already are.
+async fn write_provenance(segment: &Path, prov: SegmentProvenance<'_>) {
+    let doc = serde_json::json!({
+        "device": prov.device,
+        "generation": prov.generation,
+        "transcode_ms": prov.transcode_ms,
+        "encode_ms": prov.encode_ms,
+        "queue_wait_ms": prov.queue_wait_ms,
+        "produced_frames": prov.produced_frames,
+        "expected_frames": prov.expected_frames,
+        "written_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+    let path = provenance_sidecar_path(segment);
+    if let Err(e) = tokio::fs::write(&path, doc.to_string()).await {
+        tracing::debug!(
+            path = %path.display(),
+            error = %e,
+            "could not record segment provenance; the segment itself is unaffected"
+        );
+    }
+}
+
 /// Age of a cached segment file, from its mtime. `None` when the filesystem
 /// does not report one — absence is not evidence of a fresh entry, so it stays
 /// an Option rather than defaulting to 0.
@@ -2539,6 +2613,24 @@ impl HlsSegmentCache {
             produced_secs = reported.map(|(_, s)| s),
             "hls segment transcoded (cache miss)"
         );
+        // The same facts the line above carries, made DURABLE beside the bytes
+        // they describe (T122). The line is the signal while it is fresh; this
+        // is the signal once the segment outlives it, which is the case that
+        // matters when a cached file turns out to be bad days later.
+        let device = timing.as_ref().map(|t| t.device.to_string());
+        write_provenance(
+            &path,
+            SegmentProvenance {
+                device: device.as_deref(),
+                generation: generation(),
+                transcode_ms: transcode_ms as u64,
+                encode_ms: timing.as_ref().map(|t| t.encode_ms),
+                queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
+                produced_frames,
+                expected_frames,
+            },
+        )
+        .await;
         // A segment short by even ONE frame is a visible hitch at its boundary,
         // and it is cached — so it replays identically on every later view.
         // Counted (bounded label: whether the source rate was known at all) and
@@ -3847,6 +3939,11 @@ impl HlsSegmentCache {
         }
         for (_, path) in to_remove {
             let _ = tokio::fs::remove_file(&path).await;
+            // The provenance record describes THESE bytes and is worthless once
+            // they are gone; left behind it would accumulate one small file per
+            // segment ever evicted, in a directory whose size is the thing
+            // being enforced here.
+            let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
         }
     }
 
@@ -4054,6 +4151,16 @@ mod tests {
     /// reconciles the generation marker by wiping everything else in its root,
     /// which would delete the stub and the counter.
     fn slow_test_cache(dir: &TempDir, delay: std::time::Duration) -> (HlsSegmentCache, PathBuf) {
+        slow_test_cache_capped(dir, delay, 1 << 30)
+    }
+
+    /// [`slow_test_cache`] with an explicit byte budget, for the tests that
+    /// need eviction to actually fire.
+    fn slow_test_cache_capped(
+        dir: &TempDir,
+        delay: std::time::Duration,
+        max_bytes: u64,
+    ) -> (HlsSegmentCache, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.path().join("slow-ffmpeg");
         let encodes = dir.path().join("encodes");
@@ -4068,13 +4175,118 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cache = HlsSegmentCache::new(dir.path().join("cache"), 1 << 30).with_ffmpeg(&bin);
+        let cache = HlsSegmentCache::new(dir.path().join("cache"), max_bytes).with_ffmpeg(&bin);
         (cache, encodes)
     }
 
     /// How many times the stub encoder actually ran.
     fn encode_count(encodes: &Path) -> u64 {
         std::fs::metadata(encodes).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Every provenance sidecar under `root`, recursively. The test does not
+    /// know the keyed segment path (it is derived from a private hash), so it
+    /// finds the record by its suffix rather than by reconstructing the name —
+    /// which also means a sidecar written to the WRONG place still fails the
+    /// assertion it is supposed to satisfy.
+    fn provenance_files(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                found.extend(provenance_files(&p));
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(PROVENANCE_SUFFIX))
+            {
+                found.push(p);
+            }
+        }
+        found
+    }
+
+    /// T122 — a cached segment must say which encoder produced it.
+    ///
+    /// Asked on 2026-08-16 whether a specific cached Black Panther segment came
+    /// off NVENC or the CPU, the answer was that we could not tell: the device
+    /// is on the INFO line and on a metric label, and both age out long before
+    /// the file does. Corruption that clusters on one encoder is the first
+    /// hypothesis worth testing and it was untestable after the fact.
+    #[tokio::test]
+    async fn a_committed_segment_records_how_it_was_produced() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+
+        cache
+            .segment_bytes(1, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
+            .await
+            .expect("the stub produces a segment");
+
+        let records = provenance_files(&dir.path().join("cache"));
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one committed segment, so exactly one provenance record; got {records:?}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&records[0]).unwrap())
+                .expect("the record is valid JSON");
+        // The device is null here because this stub never reaches the
+        // scheduler — production always has one. What must hold regardless is
+        // that the FIELD exists: a record whose shape depends on how the
+        // segment happened to be produced cannot be queried across a cache.
+        assert!(
+            doc.get("device").is_some(),
+            "the record must carry a device field even when unscheduled: {doc}"
+        );
+        assert_eq!(
+            doc.get("generation").and_then(|v| v.as_str()),
+            Some(generation()),
+            "the record must name the generation whose rules produced these \
+             bytes, or a stale record reads as current: {doc}"
+        );
+        assert!(
+            doc.get("transcode_ms").and_then(|v| v.as_u64()).is_some(),
+            "the record must carry what the encode cost: {doc}"
+        );
+    }
+
+    /// The record describes bytes; when the bytes go, it goes. Otherwise the
+    /// cache accumulates one small file per segment ever evicted, inside the
+    /// directory whose size the eviction exists to bound.
+    #[tokio::test]
+    async fn evicting_a_segment_takes_its_provenance_record_with_it() {
+        let dir = TempDir::new().unwrap();
+        // The stub's payload is 80 bytes, so a 100-byte budget holds exactly
+        // one segment and the second one evicts the first.
+        let (cache, _) = slow_test_cache_capped(&dir, std::time::Duration::ZERO, 100);
+        let opts = slow_opts();
+
+        cache
+            .segment_bytes(1, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
+            .await
+            .expect("the stub produces a segment");
+        assert_eq!(
+            provenance_files(&dir.path().join("cache")).len(),
+            1,
+            "the segment was recorded before eviction"
+        );
+
+        cache
+            .segment_bytes(2, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
+            .await
+            .expect("the stub produces a second segment");
+
+        let left = provenance_files(&dir.path().join("cache"));
+        assert!(
+            left.len() <= 1,
+            "an evicted segment left its provenance record behind: {left:?}"
+        );
     }
 
     /// Options the stub can satisfy: no video judgement, no continuous-audio
