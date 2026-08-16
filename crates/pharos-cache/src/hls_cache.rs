@@ -1638,7 +1638,7 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// generation's init (see `hls::rendition_qs`). That property is what makes
 /// this re-land safe where the first attempt was not: the bump is now visible
 /// to the CLIENT cache, not only to the server's.
-pub const HLS_GEN_VERSION: u32 = 17;
+pub const HLS_GEN_VERSION: u32 = 18;
 /// How long a generation subtree must go untouched before it is reclaimed.
 ///
 /// Sized against a ROLLING UPDATE, not against disk pressure: while the new
@@ -4358,6 +4358,7 @@ mod tests {
             ),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -4391,6 +4392,7 @@ mod tests {
             ),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -4653,6 +4655,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -7607,6 +7610,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -8104,6 +8108,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -8128,6 +8133,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -8155,6 +8161,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -8195,6 +8202,7 @@ mod tests {
                 window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
+                burn_intent: false,
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
@@ -8215,6 +8223,7 @@ mod tests {
                 window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
                 audio_source_stream_index: None,
                 burn_subtitle_stream_index: None,
+                burn_intent: false,
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,

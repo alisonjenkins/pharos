@@ -107,6 +107,7 @@ fn transcode_segment(
         duration_ticks: Some(dur_secs * TICKS_PER_SEC),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: if burn_text { Some(0) } else { None },
+        burn_intent: true,
         burn_subtitle_is_text: burn_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
@@ -190,6 +191,7 @@ fn transcode_segment_from_sidecar(
         // A real text burn: index + is_text set, plus the sidecar path the
         // filter should read INSTEAD of re-demuxing `input`.
         burn_subtitle_stream_index: Some(0),
+        burn_intent: true,
         burn_subtitle_is_text: true,
         burn_subtitle_ass_path: Some(ass.to_path_buf()),
         burn_fonts_dir: None,

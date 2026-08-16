@@ -469,10 +469,17 @@ impl DeviceTable {
         //
         // A preference, never an eligibility gate: with no hardware for the
         // codec the full set stands, because a rendition that resolves to
-        // nothing cannot play at all. And it reads only `opts`, which is fixed
-        // for the life of the rendition, so the one-encoder guarantee (#114)
-        // is untouched — same rendition, same device, restart or not.
-        if opts.burn_subtitle_stream_index.is_some() {
+        // nothing cannot play at all.
+        //
+        // Reads `burn_intent`, NOT `burn_subtitle_stream_index`. This comment
+        // used to claim the index was "fixed for the life of the rendition" and
+        // it was not: `maybe_gate_burn` clears it for any segment whose window
+        // holds no subtitle event, so placement keyed on it sent every quiet
+        // stretch of a film to a different encoder from the dialogue around it
+        // — NVENC Main beside libx264 High, under one `avcC`, undecodable
+        // (B200/V153, #114). The intent is a property of the rendition and
+        // cannot be gated, which is what makes it a legal placement input.
+        if opts.burn_intent {
             let hw: SmallVec<[(DeviceId, u64); 5]> = supporting
                 .iter()
                 .copied()
@@ -709,6 +716,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -769,6 +777,48 @@ mod tests {
     /// This is the property that replaces the CPU-only exclusion. If it fails,
     /// issue #114 is back: segments produced by a second encoder are undecodable
     /// under the init the client already holds.
+    /// B200/V153 — the per-segment burn gate must not move the encoder.
+    ///
+    /// `maybe_gate_burn` clears `burn_subtitle_stream_index` for any segment
+    /// whose window holds no subtitle event. Placement used to read that index,
+    /// so a quiet stretch of a burning rendition was placed on the CPU while
+    /// the dialogue around it went to NVENC — libx264 High beside NVENC Main,
+    /// under one `avcC`, undecodable. Live on 2026-08-16 that froze playback at
+    /// six separate timestamps and drove one segment to 152 refetches.
+    #[test]
+    fn a_gated_off_segment_lands_on_the_same_device_as_its_burning_neighbour() {
+        let t = table();
+        let key = 0x5eed_1234_5678_9abcu64;
+
+        let mut burning = h264_opts();
+        burning.container = Container::Fmp4;
+        burning.burn_intent = true;
+        burning.burn_subtitle_stream_index = Some(0);
+        burning.burn_intent = true;
+
+        // The same rendition, one segment later, with nothing to draw.
+        let mut quiet = burning.clone();
+        quiet.burn_subtitle_stream_index = None; // the gate
+        assert!(quiet.burn_intent, "the gate must not clear the intent");
+
+        // Swept over many keys: a single key can agree by luck, since without
+        // the bias the quiet segment still falls somewhere in the weighted
+        // spread and may land on hardware anyway. Disarmed (placement reading
+        // the gated index), this fails on the keys that spread to the CPU.
+        for k in 0..512u64 {
+            let key = k.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let a = t.rendition_device(&burning, key).expect("a device");
+            let b = t.rendition_device(&quiet, key).expect("a device");
+            assert_eq!(
+                a, b,
+                "a segment with no subtitle in it belongs to the same rendition \
+                 as the one before it, and must come from the same encoder; \
+                 key {k} split {a:?} vs {b:?}"
+            );
+        }
+        let _ = key;
+    }
+
     #[test]
     fn a_rendition_always_resolves_to_the_same_device() {
         let mut cmaf = h264_opts();
@@ -817,6 +867,7 @@ mod tests {
         let mut burn = h264_opts();
         burn.container = Container::Fmp4;
         burn.burn_subtitle_stream_index = Some(0);
+        burn.burn_intent = true;
         let t = table();
         for key in 0..512u64 {
             let picked = t
@@ -837,6 +888,7 @@ mod tests {
         let mut burn = h264_opts();
         burn.container = Container::Fmp4;
         burn.burn_subtitle_stream_index = Some(0);
+        burn.burn_intent = true;
         let key = 0x1234_5678_9abc_def0u64;
         let first = table().rendition_device(&burn, key).expect("a device");
         for _ in 0..20 {
@@ -855,6 +907,7 @@ mod tests {
         let mut burn = h264_opts();
         burn.container = Container::Fmp4;
         burn.burn_subtitle_stream_index = Some(0);
+        burn.burn_intent = true;
         let cpu_only = DeviceTable::from_probe(&[], 4);
         assert_eq!(
             cpu_only.rendition_device(&burn, 42),
@@ -1155,6 +1208,7 @@ mod pool_tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,

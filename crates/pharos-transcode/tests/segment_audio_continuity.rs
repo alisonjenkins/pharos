@@ -161,6 +161,7 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
         window: pharos_core::SegmentWindow::for_segment(seg, rate, Some(40.0)),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        burn_intent: false,
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,

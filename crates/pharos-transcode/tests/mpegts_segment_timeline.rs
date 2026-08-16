@@ -96,6 +96,7 @@ fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path:
         duration_ticks: Some(6 * TICKS_PER_SECOND),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        burn_intent: false,
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
