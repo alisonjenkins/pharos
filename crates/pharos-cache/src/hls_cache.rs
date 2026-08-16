@@ -603,6 +603,42 @@ fn provenance_sidecar_path(segment: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// What to do with a segment whose frame count disagrees with its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortDisposition {
+    /// Keep the bytes in the cache.
+    Keep,
+    /// Serve these bytes but do not cache them; the next request re-encodes.
+    ReEncode,
+}
+
+/// The T119 policy, as a pure function of the two facts it turns on.
+///
+/// Extracted so it is testable at all: the decision lives in `produce_segment`
+/// downstream of a real encoder writing a real `-progress` sidecar, and the
+/// in-tree stub encoder never gets one (its inline path pipes to stdout and is
+/// passed no `-progress` argument), so the branch is unreachable from the unit
+/// harness. A test that drove the cache and asserted on the outcome would pass
+/// against a no-op, which is worse than no test.
+///
+/// Only a genuine `Short` is ever refused:
+/// - `Complete` is the whole point of caching.
+/// - `TailDeficit` is NOT a fault (T116/B191). The final window is clamped by
+///   the CONTAINER duration while the encoder stops at the end of the VIDEO
+///   stream, so a title whose audio outruns its video reports a deficit there
+///   forever. Refusing it would re-encode the last segment of such a title on
+///   every single request — the exact runaway this bounds elsewhere, handed to
+///   the one index guaranteed to trigger it.
+fn short_disposition(result: FrameResult, already_refused: bool) -> ShortDisposition {
+    match result {
+        FrameResult::Short if !already_refused => ShortDisposition::ReEncode,
+        // A second short production is evidence about the SOURCE rather than
+        // the encode: two encoders agreeing on the count means the frames are
+        // probably not there to encode.
+        _ => ShortDisposition::Keep,
+    }
+}
+
 /// Where quarantined segments are parked, relative to the generation root.
 ///
 /// Dot-prefixed and NOT a media-id directory, so the purge scan can never find
@@ -1095,6 +1131,19 @@ pub struct HlsSegmentCache {
     /// poisonous: the client's own later request for that segment inherited the
     /// entire wait (B108).
     inflight: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
+    /// Segment identities already refused once for coming up short of the
+    /// frames their window implies (T119).
+    ///
+    /// The refusal exists so one bad encode is not cached forever; this bounds
+    /// it so a genuinely short segment is not RE-ENCODED forever either. A
+    /// second short production is accepted, on the reasoning that two encoders
+    /// agreeing on the frame count is evidence about the SOURCE rather than
+    /// about the encode.
+    ///
+    /// Process-local and unbounded in principle, bounded in practice by the
+    /// population it tracks: 6 entries per 24 h on the deployment (0.06% of
+    /// segments produced), and it holds only the key, not the bytes.
+    refused_once: Arc<DashMap<SegmentIdentity, ()>>,
     /// Source of [`InFlightSegment::id`]. One registration is not
     /// interchangeable with the next for the same key, and two places have to
     /// be able to say so under the map's shard lock: the driver's deregistration
@@ -1712,6 +1761,7 @@ impl HlsSegmentCache {
             scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
             inflight: Arc::new(DashMap::new()),
+            refused_once: Arc::new(DashMap::new()),
             next_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -2797,6 +2847,54 @@ impl HlsSegmentCache {
                     "hls segment is short of the frames its window implies — \
                      expect a hitch at this boundary"
                 );
+                // …and do not KEEP it (T119). Detecting a short segment and
+                // caching it anyway means one bad encode replays identically
+                // for every later viewer of that index, forever: the fault
+                // becomes permanent at the moment it is noticed. Measured on
+                // the deployment before this shipped, the population is 6 short
+                // against 9506 produced in 24 h (0.06%), so refusing them costs
+                // a re-encode per thousand segments.
+                //
+                // Bounded to ONE refusal per segment identity. A source that is
+                // genuinely short here — the frames do not exist to encode —
+                // would otherwise re-encode on every request forever, which
+                // trades a visible hitch for unbounded load on the disk that
+                // T117 says is already the constraint. The second production
+                // is accepted and said so, loudly.
+                let already_refused = self.refused_once.insert(key, ()).is_some();
+                if matches!(
+                    short_disposition(result, already_refused),
+                    ShortDisposition::ReEncode
+                ) {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                    metrics::counter!(
+                        "pharos_segment_frames_refused_total",
+                        "disposition" => "reencode",
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        deficit,
+                        "short segment served but NOT cached; the next request \
+                         re-encodes it"
+                    );
+                } else {
+                    metrics::counter!(
+                        "pharos_segment_frames_refused_total",
+                        "disposition" => "accepted",
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        deficit,
+                        "short segment came back short on re-encode; caching it \
+                         rather than re-encoding forever — the frames are \
+                         probably not in the source"
+                    );
+                }
             }
         }
         // A segment covering N seconds of content that takes >3×N to encode
@@ -6839,6 +6937,45 @@ mod tests {
             !old.exists(),
             "a generation nothing has touched for longer than the grace is dead \
              weight against the cache cap and must be reclaimed"
+        );
+    }
+
+    /// T119 — the full disposition matrix.
+    ///
+    /// Detecting a short segment and caching it anyway is how one bad encode
+    /// became permanent: it replays identically for every later viewer of that
+    /// index. Measured before this shipped, the population is 6 short against
+    /// 9506 produced in 24 h (0.06%), so refusing costs a re-encode per
+    /// thousand segments.
+    #[test]
+    fn only_a_first_genuine_shortfall_is_refused() {
+        assert_eq!(
+            short_disposition(FrameResult::Short, false),
+            ShortDisposition::ReEncode,
+            "a short segment must not be cached the first time it is seen"
+        );
+        assert_eq!(
+            short_disposition(FrameResult::Short, true),
+            ShortDisposition::Keep,
+            "a second short production is evidence about the source; \
+             re-encoding forever trades a hitch for unbounded disk load"
+        );
+        assert_eq!(
+            short_disposition(FrameResult::Complete, false),
+            ShortDisposition::Keep,
+            "a complete segment is the entire point of the cache"
+        );
+        // The one that would be a genuine outage: the tail reports a deficit on
+        // every title whose audio outruns its video (T116/B191), so refusing it
+        // would re-encode the last segment of such a title on every request.
+        assert_eq!(
+            short_disposition(FrameResult::TailDeficit, false),
+            ShortDisposition::Keep,
+            "the tail's deficit is not a fault and must never be refused"
+        );
+        assert_eq!(
+            short_disposition(FrameResult::TailDeficit, true),
+            ShortDisposition::Keep
         );
     }
 
