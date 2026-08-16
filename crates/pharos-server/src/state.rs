@@ -234,6 +234,9 @@ pub struct AppState {
     /// so the report fires once per session. A player aimed off the end of the
     /// media is only visible in the FIRST index it asks for.
     pub session_starts: crate::session_start::SessionStarts,
+    /// Repeat serves of one segment to one session (T126) — the signal a
+    /// wedged player produces while every rate and latency metric reads green.
+    pub segment_refetches: crate::session_start::SegmentRefetches,
     /// P36 — clamped played-flag threshold (50–100) used by
     /// `Sessions/Playing/Stopped` to decide when an item flips to
     /// `played=true`. Surfaced here so handlers stay zero-allocation
@@ -596,6 +599,7 @@ impl AppState {
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
+            segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
@@ -687,6 +691,7 @@ impl AppState {
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
+            segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,

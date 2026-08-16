@@ -24,7 +24,7 @@
 //! ordinary playback, and counting those would bury the signal under the very
 //! traffic it has to be visible against.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Above this many tracked sessions, forget them all and start again. A play
@@ -137,8 +137,145 @@ pub fn note_session_start(
     );
 }
 
+/// How many times one play session may ask for the SAME segment before the
+/// server says so.
+///
+/// A healthy client fetches an index once. Two is ordinary across a seek, three
+/// happens. Tonight's wedge served segment 1188 **152 times** to one session and
+/// segment 929 118 times, so this threshold is not a tuning question — anything
+/// in this range is a player that cannot use what it is being given.
+const REFETCH_THRESHOLD: u32 = 5;
+
+/// Above this many tracked (session, segment) pairs, forget them all. Same
+/// trade as [`MAX_TRACKED_SESSIONS`]: a cleared entry costs at most one delayed
+/// warning, which is far cheaper than an LRU on the segment hot path.
+const MAX_TRACKED_REFETCHES: usize = 16_384;
+
+/// Counts repeat serves of one segment to one play session (T126).
+///
+/// The gap this fills: on 2026-08-16 a viewer stared at a frozen frame for
+/// fifteen minutes while every server-side signal read GREEN — 2765 serves
+/// across 71 unique indices, a 38.9x repeat factor, every one a 200 with a
+/// sub-millisecond cache read. That is what a wedged player looks like from
+/// the server, and it looks EXCELLENT: the cache hit ratio approaches 1 and the
+/// transcode histogram sees almost nothing, precisely because the client keeps
+/// asking for bytes that are already warm. Every existing metric is a rate or a
+/// latency and both improve as the failure worsens.
+///
+/// Note the asymmetry with `http_client_aborted_total`, which catches the
+/// client that GIVES UP. This catches the one that never does.
+#[derive(Default)]
+pub struct SegmentRefetches {
+    counts: Mutex<HashMap<(String, u32), u32>>,
+}
+
+impl SegmentRefetches {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one serve of `seg` to `psid`. Returns `Some(count)` exactly once,
+    /// on the serve that crosses [`REFETCH_THRESHOLD`], so a spinning client
+    /// produces ONE line rather than one per repeat — the failure being
+    /// reported is unbounded by nature and must not take the log with it.
+    pub fn note(&self, psid: Option<&str>, seg: u32) -> Option<u32> {
+        let psid = psid?;
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.len() >= MAX_TRACKED_REFETCHES {
+            counts.clear();
+        }
+        let n = counts.entry((psid.to_string(), seg)).or_insert(0);
+        *n += 1;
+        (*n == REFETCH_THRESHOLD).then_some(*n)
+    }
+}
+
+/// Report a segment one session keeps re-fetching.
+///
+/// `surface` matches [`note_session_start`]'s: bounded, and carried because a
+/// wedge on one delivery surface says nothing about the others.
+pub fn note_segment_serve(
+    refetches: &SegmentRefetches,
+    psid: Option<&str>,
+    media_id: u64,
+    seg: u32,
+    surface: &'static str,
+) {
+    let Some(count) = refetches.note(psid, seg) else {
+        return;
+    };
+    metrics::counter!("pharos_segment_refetch_total", "surface" => surface).increment(1);
+    tracing::warn!(
+        media.id = media_id,
+        seg,
+        surface,
+        count,
+        play_session = psid.unwrap_or("?"),
+        "a play session has re-requested one segment past the point a healthy \
+         client would — it is being served bytes it cannot use"
+    );
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// T126 — a session that keeps asking for one segment must be reported.
+    ///
+    /// The failure this names served segment 1188 to one session 152 times
+    /// while every rate and latency metric read green.
+    #[test]
+    fn a_repeatedly_refetched_segment_is_reported_once() {
+        let r = SegmentRefetches::new();
+        let psid = Some("sess-a");
+        // Below the threshold: ordinary playback, including a seek or two.
+        for _ in 1..REFETCH_THRESHOLD {
+            assert_eq!(r.note(psid, 42), None, "a normal refetch must stay quiet");
+        }
+        assert_eq!(
+            r.note(psid, 42),
+            Some(REFETCH_THRESHOLD),
+            "crossing the threshold must report"
+        );
+        // …and ONLY once: the failure is unbounded by nature and must not take
+        // the log with it.
+        for _ in 0..50 {
+            assert_eq!(r.note(psid, 42), None, "reported once, not once per repeat");
+        }
+    }
+
+    /// The count is per (session, segment): one session's spinning must not be
+    /// attributed to another's, and a session walking forward normally must
+    /// never trip it.
+    #[test]
+    fn refetch_counts_do_not_bleed_across_sessions_or_segments() {
+        let r = SegmentRefetches::new();
+        for _ in 0..REFETCH_THRESHOLD {
+            let _ = r.note(Some("sess-a"), 1);
+        }
+        assert_eq!(
+            r.note(Some("sess-b"), 1),
+            None,
+            "another session asking for the same segment is not a refetch"
+        );
+        for seg in 0..50 {
+            assert_eq!(
+                r.note(Some("sess-c"), seg),
+                None,
+                "ordinary forward playback must never trip the threshold"
+            );
+        }
+    }
+
+    /// A request with no session cannot be attributed, exactly as with
+    /// `note_first` — and legacy clients that omit it must not be reported on
+    /// every request.
+    #[test]
+    fn a_sessionless_request_is_never_counted() {
+        let r = SegmentRefetches::new();
+        for _ in 0..100 {
+            assert_eq!(r.note(None, 7), None);
+        }
+    }
     use super::*;
     use metrics_util::debugging::DebuggingRecorder;
 
