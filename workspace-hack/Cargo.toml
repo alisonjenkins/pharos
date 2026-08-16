@@ -19,7 +19,6 @@ actix-router = { version = "0.5", default-features = false, features = ["http", 
 actix-rt = { version = "2" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
-byteorder = { version = "1" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
@@ -41,7 +40,7 @@ hashbrown = { version = "0.14", default-features = false, features = ["ahash", "
 indexmap = { version = "2" }
 itertools = { version = "0.10" }
 log = { version = "0.4", default-features = false, features = ["std"] }
-lzma-rust = { version = "0.1", default-features = false, features = ["encoder"] }
+lzma-rust2 = { version = "0.18", default-features = false, features = ["encoder", "optimization", "std"] }
 memchr = { version = "2" }
 metrics-util = { version = "0.17" }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -57,8 +56,9 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sevenz-rust = { version = "0.6", default-features = false, features = ["compress"] }
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["compress", "util"] }
 sha1_smol = { version = "1", default-features = false, features = ["std"] }
+sha2 = { version = "0.10" }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
@@ -69,7 +69,6 @@ sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
-time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -82,7 +81,6 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
-byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
@@ -114,6 +112,7 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
+sha2 = { version = "0.10" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
@@ -123,7 +122,6 @@ sqlx-postgres = { version = "0.8", default-features = false, features = ["migrat
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log"] }
@@ -135,7 +133,6 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
@@ -150,7 +147,6 @@ libc = { version = "0.2" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
@@ -165,7 +161,6 @@ libc = { version = "0.2" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
@@ -180,7 +175,6 @@ libc = { version = "0.2" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }

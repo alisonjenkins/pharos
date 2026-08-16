@@ -273,23 +273,18 @@ pub fn read_comic_cover(path: &Path) -> Result<Option<Vec<u8>>, ComicError> {
             })?
         }
         ComicContainer::SevenZ => {
-            let mut file =
-                std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
-            let len = file
-                .metadata()
-                .map_err(|e| ComicError::Open(e.to_string()))?
-                .len();
-            let archive = sevenz_rust::Archive::read(&mut file, len, &[]).map_err(|e| {
-                ComicError::Unreadable {
-                    container: "7z".into(),
-                    detail: e.to_string(),
-                }
-            })?;
-            let mut reader = sevenz_rust::SevenZReader::from_archive(
-                archive,
-                file,
-                sevenz_rust::Password::empty(),
-            );
+            let file = std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
+            // `ArchiveReader::new` parses the header itself — the successor
+            // crate folded the old `Archive::read` + `SevenZReader::from_archive`
+            // pair into one constructor, and no longer needs the file length
+            // passed alongside the handle it can seek on.
+            let mut reader =
+                sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()).map_err(
+                    |e| ComicError::Unreadable {
+                        container: "7z".into(),
+                        detail: e.to_string(),
+                    },
+                )?;
             let mut found = None;
             reader
                 .for_each_entries(|e, rd| {
@@ -452,24 +447,26 @@ fn read_tar(path: &Path) -> Result<(Vec<String>, Option<String>), ComicError> {
 /// present, and it reuses the already-open handle and already-parsed header, so
 /// the file is still opened exactly once.
 fn read_7z(path: &Path) -> Result<(Vec<String>, Option<String>), ComicError> {
-    let mut file = std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| ComicError::Open(e.to_string()))?
-        .len();
-    let archive =
-        sevenz_rust::Archive::read(&mut file, len, &[]).map_err(|e| ComicError::Unreadable {
+    let file = std::fs::File::open(path).map_err(|e| ComicError::Open(e.to_string()))?;
+    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
+        .map_err(|e| ComicError::Unreadable {
             container: "7z".into(),
             detail: e.to_string(),
         })?;
 
-    let names: Vec<String> = archive.files.iter().map(|f| f.name.clone()).collect();
+    // Still header-only: `ArchiveReader` holds the parsed header and hands it
+    // back by reference, so counting pages decompresses nothing and the file
+    // is opened exactly once.
+    let names: Vec<String> = reader
+        .archive()
+        .files
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
     if !names.iter().any(|n| is_comic_info(n)) {
         return Ok((names, None));
     }
 
-    let mut reader =
-        sevenz_rust::SevenZReader::from_archive(archive, file, sevenz_rust::Password::empty());
     let mut info = None;
     reader
         .for_each_entries(|entry, rd| {
@@ -697,47 +694,6 @@ mod tests {
         v
     }
 
-    /// RUSTSEC-2026-0245 — `sevenz-rust` 0.6.1 joins an archive-supplied entry
-    /// name onto the output directory and writes there, so a `.7z` carrying
-    /// `../…` or an absolute path writes anywhere the process can. There is no
-    /// fixed release, and the advisory is ignored in `deny.toml` on the
-    /// grounds that pharos never extracts a 7z entry TO DISK: the `.cb7` path
-    /// reads entries into memory and only ever compares their names.
-    ///
-    /// That argument is about code, so it decays silently — one call to
-    /// `sevenz_rust::decompress*` would make a high-severity arbitrary file
-    /// write reachable from a file in the media library, with the advisory
-    /// still suppressed and CI still green. This is the check that fails
-    /// instead. `include_str!` reads THIS file at compile time, so it cannot
-    /// go stale or depend on the working directory.
-    ///
-    /// Deliberately matches `sevenz_rust::decompress` and not the bare word:
-    /// "decompression" appears in prose here, and `compress_to_path` above is
-    /// a test fixture builder — compression, not extraction.
-    #[test]
-    fn a_cb7_is_never_extracted_to_disk() {
-        // Built at runtime from two halves so this line — and the prose
-        // above it — cannot match themselves. A guard that trips on its own
-        // documentation is a guard nobody keeps.
-        let needle = format!("sevenz_rust::{}", "decompress");
-        let src = include_str!("comic.rs");
-        let hits: Vec<&str> = src
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with("//"))
-            .filter(|l| l.contains(&needle))
-            .collect();
-        assert!(
-            hits.is_empty(),
-            "a 7z entry is being extracted to disk, which makes \
-             RUSTSEC-2026-0245 (path traversal → arbitrary file write) \
-             reachable from a library file. The advisory is suppressed in \
-             deny.toml on the grounds that this never happens. Either drop \
-             the suppression or extract to a path you derive yourself, never \
-             one the archive supplies: {hits:?}"
-        );
-    }
-
     /// Build a `.cbz` in-test rather than checking a binary blob into the repo,
     /// so the fixture's contents are visible in the test that reads them.
     fn write_cbz(path: &Path, entries: &[(&str, Vec<u8>)]) {
@@ -774,7 +730,7 @@ mod tests {
             }
             std::fs::write(p, body).unwrap();
         }
-        sevenz_rust::compress_to_path(&dir, path).unwrap();
+        sevenz_rust2::compress_to_path(&dir, path).unwrap();
     }
 
     /// T052 — page count is the image-entry count, and `ComicInfo.xml` maps

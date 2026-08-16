@@ -30,7 +30,7 @@ quick-xml = { workspace = true }
 # 004-books — book containers. `quick-xml` above is reused for the epub OPF,
 # `META-INF/container.xml` and `ComicInfo.xml`; no new XML crate is needed.
 zip = { workspace = true }
-sevenz-rust = { workspace = true }
+sevenz-rust2 = { workspace = true }
 tar = { workspace = true }
 lopdf = { workspace = true }
 # 005-kindle-conversion — `.mobi`/`.azw`/`.azw3` → EPUB, so the three readers
@@ -73,7 +73,7 @@ metrics-util.workspace = true
 # choice as the epub fixtures). `compress` is `lzma-rust/encoder` — still pure
 # Rust — and it is a dev-dependency only, so the shipped binary keeps the
 # decoder alone.
-sevenz-rust = { workspace = true, features = ["compress"] }
+sevenz-rust2 = { workspace = true, features = ["compress", "util"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
