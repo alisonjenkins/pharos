@@ -1910,6 +1910,64 @@ impl HlsSegmentCache {
         &self.base
     }
 
+    /// What is currently held in quarantine (T123).
+    ///
+    /// The purge retains evidence; without this the only way to READ it is to
+    /// mount the PVC with a debug pod, which is the operation T120 existed to
+    /// remove. Done twice on the night of 2026-08-16 — once to probe the
+    /// segments and once to read their provenance — so the automated half was
+    /// the purge and the half done under time pressure was still cluster
+    /// surgery.
+    ///
+    /// Returns `(file name, bytes, age in seconds)`, newest first: during an
+    /// incident the interesting artefact is always the most recent one.
+    pub fn quarantined(&self) -> Vec<(String, u64, u64)> {
+        let pen = self.root.join(QUARANTINE_DIR);
+        let Ok(entries) = std::fs::read_dir(&pen) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, u64, u64, std::time::SystemTime)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                let modified = meta.modified().ok()?;
+                let age = modified.elapsed().ok().map(|d| d.as_secs()).unwrap_or(0);
+                Some((
+                    e.file_name().to_str()?.to_string(),
+                    meta.len(),
+                    age,
+                    modified,
+                ))
+            })
+            .collect();
+        out.sort_by_key(|e| std::cmp::Reverse(e.3));
+        out.into_iter().map(|(n, b, a, _)| (n, b, a)).collect()
+    }
+
+    /// Absolute path of one quarantined artefact, or `None` when it is not
+    /// there.
+    ///
+    /// `name` is treated as a bare file name and nothing else: any path
+    /// separator or parent component is refused outright rather than
+    /// normalised, because this is reached from an HTTP route and the cache
+    /// root sits beside the media library. A traversal here would serve
+    /// arbitrary files off the volume.
+    pub fn quarantined_path(&self, name: &str) -> Option<PathBuf> {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || Path::new(name).components().count() != 1
+        {
+            return None;
+        }
+        let p = self.root.join(QUARANTINE_DIR).join(name);
+        p.is_file().then_some(p)
+    }
+
     /// Take a range of an item's cached segments out of service, KEEPING the
     /// bytes (T118).
     ///

@@ -831,3 +831,111 @@ async fn a_non_admin_cannot_purge_segments() {
         "a non-admin must be refused before anything is touched"
     );
 }
+
+/// T123 — the retained bytes must be readable over the API.
+///
+/// The purge keeps evidence (T118), and on 2026-08-16 the only way to look at
+/// it was a busybox pod mounting the cache PVC — twice in one night, once for
+/// the segments and once for their provenance. That is the cluster surgery T120
+/// existed to remove, still being performed for the half of the job done under
+/// time pressure.
+#[actix_web::test]
+async fn an_admin_can_list_and_fetch_quarantined_artefacts() {
+    let (state, token, _uid) = seed(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = pharos_cache::hls_cache::HlsSegmentCache::new(dir.path().to_path_buf(), 1 << 30);
+
+    let pen = cache.root().join(".quarantine");
+    std::fs::create_dir_all(&pen).unwrap();
+    std::fs::write(
+        pen.join("42-896-a0-s0-v2971-bauto-c26.ts"),
+        b"suspect bytes",
+    )
+    .unwrap();
+
+    let state = web::Data::new(
+        AppState::new(state.stores.clone(), "t".into()).with_hls_cache(cache.clone()),
+    );
+    let app = test::init_service(build_app(state)).await;
+
+    let raw = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Admin/Cache/Quarantine")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v[0]["Name"], "42-896-a0-s0-v2971-bauto-c26.ts",
+        "the listing must name what is held: {v}"
+    );
+    assert_eq!(v[0]["SizeBytes"], 13, "{v}");
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Admin/Cache/Quarantine/42-896-a0-s0-v2971-bauto-c26.ts")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        &body[..],
+        b"suspect bytes",
+        "the artefact must come back byte-for-byte, or it cannot be probed"
+    );
+}
+
+/// This route is reachable over HTTP and the cache root sits beside the media
+/// library, so a name with a path component must be refused rather than
+/// normalised.
+#[actix_web::test]
+async fn a_quarantine_fetch_cannot_escape_its_directory() {
+    let (state, token, _uid) = seed(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = pharos_cache::hls_cache::HlsSegmentCache::new(dir.path().to_path_buf(), 1 << 30);
+    // A secret sitting one level up from the quarantine, as the rate store and
+    // the probe-failure memo really do.
+    std::fs::create_dir_all(cache.root()).unwrap();
+    std::fs::write(cache.root().join("secret.json"), b"not yours").unwrap();
+
+    let state = web::Data::new(
+        AppState::new(state.stores.clone(), "t".into()).with_hls_cache(cache.clone()),
+    );
+    let app = test::init_service(build_app(state)).await;
+
+    for attempt in ["..%2Fsecret.json", "..", "%2Fetc%2Fpasswd"] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/Admin/Cache/Quarantine/{attempt}"))
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert!(
+            resp.status().is_client_error(),
+            "traversal attempt {attempt:?} must be refused, got {}",
+            resp.status()
+        );
+    }
+}
+
+/// The quarantine holds whatever was serving when something went wrong, so
+/// reading it is admin-only like the purge that created it.
+#[actix_web::test]
+async fn a_non_admin_cannot_read_the_quarantine() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Admin/Cache/Quarantine")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 403);
+}

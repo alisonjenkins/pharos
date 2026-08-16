@@ -36,6 +36,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/library/refresh", web::post().to(library_refresh))
         // Cache surgery (T120) — see `purge_segments`.
         .route("/admin/cache/segments", web::delete().to(purge_segments))
+        .route("/admin/cache/quarantine", web::get().to(list_quarantine))
+        .route(
+            "/admin/cache/quarantine/{name}",
+            web::get().to(fetch_quarantined),
+        )
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(scheduled_tasks))
         .route(
@@ -702,6 +707,69 @@ async fn purge_segments(
         failed: report.failed,
         cache_epoch: epoch,
     }))
+}
+
+/// `GET /Admin/Cache/Quarantine` — what the purge is currently holding (T123).
+///
+/// A purge retains the bytes (T118) so the next occurrence leaves something to
+/// probe. Without these two routes the only way to READ them is a debug pod
+/// mounting the cache PVC — done twice on 2026-08-16, once for the segments and
+/// once for their provenance — which is exactly the cluster surgery T120 was
+/// written to remove. The purge half was automated; the half performed under
+/// time pressure was not.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct QuarantineEntryDto {
+    name: String,
+    size_bytes: u64,
+    age_seconds: u64,
+}
+
+async fn list_quarantine(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(cache) = state.hls.as_ref() else {
+        return Err(error::ErrorServiceUnavailable("no HLS segment cache"));
+    };
+    let items: Vec<QuarantineEntryDto> = cache
+        .quarantined()
+        .into_iter()
+        .map(|(name, size_bytes, age_seconds)| QuarantineEntryDto {
+            name,
+            size_bytes,
+            age_seconds,
+        })
+        .collect();
+    Ok(web::Json(items))
+}
+
+/// `GET /Admin/Cache/Quarantine/{name}` — stream one retained artefact.
+///
+/// Serves the raw bytes so they can be probed off the volume. `name` is a bare
+/// file name; the cache refuses anything with a path component, because this
+/// route is reachable over HTTP and the cache root sits beside the media
+/// library.
+async fn fetch_quarantined(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(cache) = state.hls.as_ref() else {
+        return Err(error::ErrorServiceUnavailable("no HLS segment cache"));
+    };
+    let name = path.into_inner();
+    let Some(p) = cache.quarantined_path(&name) else {
+        return Err(error::ErrorNotFound("no such quarantined artefact"));
+    };
+    let bytes = tokio::fs::read(&p)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .body(bytes))
 }
 
 /// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (the dashboard
