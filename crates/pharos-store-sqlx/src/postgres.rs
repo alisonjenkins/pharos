@@ -913,6 +913,73 @@ impl MediaStore for PostgresStore {
         Ok(())
     }
 
+    /// T117 — the scan's bulk write path, as ONE statement.
+    ///
+    /// The default trait implementation loops `mark_seen`, and each of those is
+    /// an autocommit `UPDATE`: a 13k-file scan was 13k transactions and 13k WAL
+    /// flushes. Postgres shares `dm-0` with the segment cache on this
+    /// deployment, so that write amplification is paid by PLAYBACK — measured
+    /// 2026-08-16, a `hit_path=fast` read of an already-present segment took
+    /// 23712 ms while the device sat at 97% `io_time`, and
+    /// `pharos_segment_cache_read_seconds` ran p50 0 s / p90 4.29 s over 6906
+    /// reads. The sqlite store has batched this since it was written; postgres
+    /// silently inherited the slow default.
+    ///
+    /// `UNNEST` rather than a loop inside a transaction: one round trip, one
+    /// plan, one commit. The arrays are positional, so all three must be the
+    /// same length — they are built from one iteration of `items` below.
+    ///
+    /// V10/B98 note: `sweep_unseen` deletes on `last_seen_scan_id`, so a mark
+    /// that is not committed reads as UNSEEN. This is safe because the sweep
+    /// runs only after the walk completes, and the scanner flushes its final
+    /// batch before then; a crash mid-scan skips the sweep entirely rather than
+    /// sweeping against a partial set. The batch size therefore bounds only how
+    /// much work a crash discards, never how much it can wrongly delete.
+    #[tracing::instrument(skip(self, items), fields(scan.id = scan_id, rows = items.len()))]
+    async fn mark_seen_batch(
+        &self,
+        items: &[(MediaId, i64, u64)],
+        scan_id: i64,
+    ) -> DomainResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut ids = Vec::with_capacity(items.len());
+        let mut mtimes = Vec::with_capacity(items.len());
+        let mut sizes = Vec::with_capacity(items.len());
+        for &(id, mtime, size) in items {
+            ids.push(media_id_i64(id)?);
+            mtimes.push(mtime);
+            sizes.push(
+                i64::try_from(size)
+                    .map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?,
+            );
+        }
+        let now = now_unix_secs();
+        sqlx::query(
+            "UPDATE media_items AS m SET \
+               file_mtime = v.mtime, \
+               file_size_seen = v.size, \
+               last_scanned = $1, \
+               last_seen_scan_id = $2, \
+               probe_schema_version = CASE WHEN m.kind = 'book' THEN $3 ELSE $4 END \
+             FROM UNNEST($5::bigint[], $6::bigint[], $7::bigint[]) \
+               AS v(id, mtime, size) \
+             WHERE m.id = v.id",
+        )
+        .bind(now)
+        .bind(scan_id)
+        .bind(pharos_core::BOOK_SCHEMA_VERSION)
+        .bind(pharos_core::PROBE_SCHEMA_VERSION)
+        .bind(&ids)
+        .bind(&mtimes)
+        .bind(&sizes)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), fields(scan.id = scan_id))]
     async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
         // Root-scoped, single atomic DELETE (V10). Path-separator boundary so a
