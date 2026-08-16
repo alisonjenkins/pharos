@@ -1100,8 +1100,11 @@ async fn serve_segment(
                 opts.video = None;
                 opts.video_bitrate_bps = None;
                 // Drop subtitle burn-in: makes no sense in an audio-
-                // only stream.
+                // only stream. The INTENT goes too — unlike the burn gate
+                // below, this is not a quiet stretch of a burning rendition,
+                // it is a rendition with no video to burn into (B200).
                 opts.burn_subtitle_stream_index = None;
+                opts.burn_intent = false;
             }
         }
     }
@@ -1552,6 +1555,8 @@ fn build_segment_opts(
                     source_video_codec: source_video_codec(&item.probe),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
+
+                    burn_intent: subtitle_stream_index.is_some(),
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
@@ -1583,6 +1588,8 @@ fn build_segment_opts(
                     source_video_codec: source_video_codec(&item.probe),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
+
+                    burn_intent: subtitle_stream_index.is_some(),
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
@@ -1614,6 +1621,8 @@ fn build_segment_opts(
         source_video_codec: source_video_codec(&item.probe),
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index: subtitle_stream_index,
+
+        burn_intent: subtitle_stream_index.is_some(),
         burn_subtitle_is_text: subtitle_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
@@ -1679,6 +1688,12 @@ async fn gate_image_sub_burn(
                     start_secs,
                     "burn gated off: no subtitle event in segment window"
                 );
+                // Only the SEGMENT's index. `burn_intent` deliberately
+                // survives: it is what device placement reads, and clearing it
+                // here is exactly the bug — a quiet stretch would then be
+                // placed on a different encoder from the dialogue around it,
+                // and two H.264 profiles under one `avcC` do not decode
+                // (B200/V153, #114).
                 opts.burn_subtitle_stream_index = None;
             }
         }
@@ -2941,6 +2956,7 @@ fn spawn_one_prefetch(
     // cache key from what the client then requests WITH the sub, so it always
     // missed and encoded live, hanging exactly when the subtitle appeared.
     o.burn_subtitle_stream_index = wanted_burn;
+    o.burn_intent = wanted_burn.is_some();
     // actix arbiter spawn: the future awaits I/O + the scheduler channel
     // (the encode runs in the transcode worker pool, not here), so it
     // yields the worker immediately and never blocks request handling.
@@ -3276,6 +3292,8 @@ fn fmp4_segment_opts_resolved(
         source_video_codec: source_video_codec(&item.probe),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
+
+        burn_intent: sub_rel.is_some(),
         burn_subtitle_is_text: sub_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,

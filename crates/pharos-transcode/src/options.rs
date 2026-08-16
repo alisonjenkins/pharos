@@ -335,6 +335,20 @@ pub struct TranscodeOptions {
     /// `subtitles=` filter cannot render image subs). None leaves subtitles
     /// out of the encode entirely.
     pub burn_subtitle_stream_index: Option<u32>,
+    /// Whether the RENDITION this segment belongs to burns subtitles, as
+    /// opposed to whether this segment does. Device placement reads this and
+    /// never the per-segment index — see `SegmentOpts::burn_intent` (B200).
+    ///
+    /// Part of the `RenditionKey` canon, unlike the per-segment burn index
+    /// which is zeroed there: a burning rendition and a non-burning one are
+    /// genuinely different renditions and must be able to pin separately,
+    /// while the two sides of a burn GATE are the same rendition and must not.
+    ///
+    /// Always serialized. `skip_serializing_if` would have kept every
+    /// non-burning rendition's key byte-identical, but the worker protocol
+    /// frames these options in a NON-SELF-DESCRIBING format, where an omitted
+    /// field is a decode error rather than a default.
+    pub burn_intent: bool,
     /// `true` when `burn_subtitle_stream_index` refers to a TEXT/ASS track
     /// (picks ffmpeg's `subtitles=` filter instead of the image `overlay`
     /// graph). `false` for image-subtitle burn or when no burn is set.
@@ -430,6 +444,15 @@ impl RenditionKey {
         o.start_position_ticks = 0;
         o.duration_ticks = None;
         o.decode_preroll_seconds = None;
+        o.burn_subtitle_stream_index = None;
+        // PER-SEGMENT, like the position fields above: `maybe_gate_burn` clears
+        // this for any segment whose window carries no subtitle event, so two
+        // segments of ONE rendition disagree on it. Left in the canon it split
+        // the rendition in half — the dialogue segments hashing to one key and
+        // the quiet ones to another, each free to resolve to a different
+        // encoder, which is undecodable under a shared init (B200/V153, #114).
+        // The rendition-level truth lives in `burn_intent`, which placement
+        // reads directly.
         if let Some(m) = o.muxed_audio_source.as_mut() {
             // The muxed-audio PATH is part of the rendition; the offset into it
             // is per-segment.
@@ -479,6 +502,7 @@ mod tests {
             duration_ticks: Some(50_000_000),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -503,6 +527,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -548,6 +573,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -593,9 +619,27 @@ mod tests {
         o.audio_source_stream_index = Some(2);
         assert_ne!(base, RenditionKey::new(path, &o), "audio track");
 
+        // The burn VARIANT is expressed by the rendition-level intent, not by
+        // the per-segment index: the index is gated off for any segment with
+        // no subtitle event in its window, so keying on it split one rendition
+        // into two that could resolve to different encoders (B200/V153).
         let mut o = cmaf_opts();
+        o.burn_intent = true;
         o.burn_subtitle_stream_index = Some(1);
         assert_ne!(base, RenditionKey::new(path, &o), "burn variant");
+
+        // …and the gate must NOT split it: same rendition, one segment with a
+        // subtitle in it and one without.
+        let mut burning = cmaf_opts();
+        burning.burn_intent = true;
+        burning.burn_subtitle_stream_index = Some(1);
+        let mut gated = burning.clone();
+        gated.burn_subtitle_stream_index = None;
+        assert_eq!(
+            RenditionKey::new(path, &burning),
+            RenditionKey::new(path, &gated),
+            "the burn gate varies WITHIN a rendition and must not split it"
+        );
 
         let mut o = cmaf_opts();
         o.source_frame_rate = pharos_core::FrameRate::from_mille(23_976);
@@ -646,6 +690,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,

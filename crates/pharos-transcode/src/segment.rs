@@ -165,7 +165,21 @@ pub struct SegmentOpts {
     /// Source-relative audio-stream index (`-map 0:a:{N}`).
     pub audio_source_stream_index: Option<u32>,
     /// Subtitle-relative stream index for subtitle burn-in (image OR text).
+    ///
+    /// This is the SEGMENT's value and may be cleared for an individual
+    /// segment by the burn gate when no subtitle event falls in its window.
+    /// Anything that must hold across a whole rendition — device placement
+    /// above all — has to read [`Self::burn_intent`] instead (B200/V153).
     pub burn_subtitle_stream_index: Option<u32>,
+    /// Whether this RENDITION burns subtitles at all, independent of whether
+    /// this particular segment happens to contain one.
+    ///
+    /// Exists because the two differ, and the difference was undecodable:
+    /// `maybe_gate_burn` clears the index for a quiet stretch, and placement
+    /// keyed on that index sent the quiet segments to a different encoder from
+    /// their neighbours — two H.264 profiles under one `avcC` (B200, #114).
+    /// The gate is still worth having; it just may not move the encoder.
+    pub burn_intent: bool,
     /// `true` when `burn_subtitle_stream_index` refers to a TEXT/ASS track
     /// (Task 7 picks the `subtitles=` filter instead of `overlay`). `false`
     /// for image-subtitle burn (PGS/VOBSUB/DVB) or when no burn is set.
@@ -289,6 +303,7 @@ impl ResolvedSegment {
             duration_ticks: Some(s.window.duration_ticks()),
             audio_source_stream_index: s.audio_source_stream_index,
             burn_subtitle_stream_index: s.burn_subtitle_stream_index,
+            burn_intent: s.burn_intent,
             burn_subtitle_is_text: s.burn_subtitle_is_text,
             burn_subtitle_ass_path: s.burn_subtitle_ass_path.clone(),
             burn_fonts_dir: s.burn_fonts_dir.clone(),
@@ -323,6 +338,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(10, None, Some(600.0)),
             audio_source_stream_index: Some(1),
             burn_subtitle_stream_index: Some(0),
+            burn_intent: true,
             burn_subtitle_is_text: true,
             burn_subtitle_ass_path: Some(std::path::PathBuf::from("/cache/sub.ass")),
             burn_fonts_dir: Some(std::path::PathBuf::from("/cache/fonts")),
@@ -390,6 +406,7 @@ mod tests {
             window: pharos_core::SegmentWindow::for_segment(1, None, Some(600.0)),
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,

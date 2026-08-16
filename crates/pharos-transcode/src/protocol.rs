@@ -485,6 +485,7 @@ mod tests {
                 duration_ticks: Some(60_000_000),
                 audio_source_stream_index: Some(1),
                 burn_subtitle_stream_index: None,
+                burn_intent: false,
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,

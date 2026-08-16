@@ -3486,6 +3486,7 @@ mod tests {
             duration_ticks: None,
             audio_source_stream_index: None,
             burn_subtitle_stream_index: None,
+            burn_intent: false,
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
@@ -3818,10 +3819,20 @@ mod tests {
     #[tokio::test]
     async fn a_cooled_rendition_device_fails_instead_of_spilling_to_another_encoder() {
         let mut t = table();
+        // A BURNING rendition, so the precondition below is guaranteed rather
+        // than a property of where this particular key happens to fall in the
+        // weighted spread: burn intent pins hardware (B195), which is what the
+        // cooldown then has to be tested against.
+        let burning = {
+            let mut o = cmaf();
+            o.burn_intent = true;
+            o.burn_subtitle_stream_index = Some(0);
+            o
+        };
         let dev = t
-            .rendition_device(&cmaf(), {
+            .rendition_device(&burning, {
                 use crate::options::RenditionKey;
-                RenditionKey::new(std::path::Path::new("/m/show.mkv"), &cmaf()).value()
+                RenditionKey::new(std::path::Path::new("/m/show.mkv"), &burning).value()
             })
             .expect("a device");
         assert!(matches!(dev, DeviceId::Hw { .. }), "precondition: hardware");
@@ -3834,7 +3845,7 @@ mod tests {
         let res = s
             .submit(
                 PathBuf::from("/m/show.mkv"),
-                cmaf(),
+                burning.clone(),
                 file_sink(),
                 JobClass::Interactive,
                 JobHint::default(),
@@ -5868,9 +5879,13 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
+        // SAME input as the seed above, so both jobs resolve to the same
+        // device by construction: `background_peers` counts peers ON THAT
+        // DEVICE, and two different paths hash to two different points in the
+        // weighted spread, which co-located them only by luck.
         let seeded = s
             .submit(
-                PathBuf::from("/m/seed-client"),
+                PathBuf::from("/m/seed"),
                 cmaf_with_duration(),
                 file_sink(),
                 JobClass::Interactive,
@@ -9620,10 +9635,17 @@ mod tests {
 
             let probe = {
                 let s2 = s.clone();
+                // A BURNING rendition, so the pin is hardware by construction
+                // rather than by where this path's hash happens to fall in the
+                // weighted spread — the GPU is what the holds above occupy,
+                // and the point here is that a pinned job waits for it.
+                let mut o = cmaf();
+                o.burn_intent = true;
+                o.burn_subtitle_stream_index = Some(0);
                 tokio::spawn(async move {
                     s2.submit(
                         PathBuf::from("/m/probe"),
-                        cmaf(),
+                        o,
                         file_sink(),
                         class,
                         JobHint::default(),

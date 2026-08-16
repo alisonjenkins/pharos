@@ -549,6 +549,8 @@ async fn stream_transcoded_webm(
         duration_ticks: None,
         audio_source_stream_index: audio_rel,
         burn_subtitle_stream_index: sub_rel,
+
+        burn_intent: sub_rel.is_some(),
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,

@@ -123,6 +123,7 @@ fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
         window: pharos_core::SegmentWindow::for_segment(seg, Some(frame_rate()), Some(20.0)),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        burn_intent: false,
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,

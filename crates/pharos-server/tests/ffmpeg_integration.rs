@@ -148,6 +148,7 @@ async fn transcoder_streams_bytes_from_real_video() {
         duration_ticks: None,
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        burn_intent: false,
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
@@ -302,6 +303,7 @@ async fn transcoder_honours_audio_stream_index() {
         duration_ticks: Some(20_000_000), // 2 seconds
         audio_source_stream_index: Some(0),
         burn_subtitle_stream_index: None,
+        burn_intent: false,
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
@@ -354,6 +356,7 @@ async fn transcoder_honours_burn_subtitle_index() {
         duration_ticks: Some(20_000_000),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: None,
+        burn_intent: false,
         burn_subtitle_is_text: false,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
