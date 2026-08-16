@@ -1446,6 +1446,25 @@ static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// come up), so no placement happens at all and the bare version is the whole
 /// identity. It cannot collide with a placed generation: those always carry the
 /// `-<hex>` suffix.
+/// Whether a directory name is one [`compose_generation`] could have produced
+/// WITH a placement fingerprint: `<version>-<16 lowercase hex>`.
+///
+/// The bare-version form (`"17"`, produced when no fingerprint is installed) is
+/// deliberately NOT recognised. A media id is also all digits, and the cache
+/// base held one directory per media id before B196 — so treating a numeric
+/// name as a generation is precisely how B197 deleted a live cache. Failing to
+/// reclaim a fingerprint-less generation leaks a bounded amount of disk;
+/// mistaking an item directory for one loses another pod's working set.
+fn is_generation_dir(name: &str) -> bool {
+    let Some((version, fingerprint)) = name.split_once('-') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit())
+        && fingerprint.len() == 16
+        && fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn compose_generation(placement_fingerprint: Option<u64>) -> String {
     match placement_fingerprint {
         Some(fp) => format!("{HLS_GEN_VERSION}-{fp:016x}"),
@@ -1530,7 +1549,18 @@ impl HlsSegmentCache {
                 continue;
             }
             match p.file_name().and_then(|n| n.to_str()) {
-                Some(name) if name != current => {}
+                // Only a directory whose NAME IS A GENERATION may be reclaimed.
+                // Without this the rule reads "every directory in the base that
+                // is not mine", and on the first boot after B196 the base still
+                // holds the PRE-B196 layout — one directory per media item, plus
+                // `_audiohls` — so the reclaim deleted the entire live cache
+                // while the outgoing pod was still serving from it (B197,
+                // observed on the 2026-08-16 deploy: `"generation":
+                // "4956781705437454830"` is a media id, not a generation).
+                // Anything unrecognised is left alone: an orphaned directory
+                // costs bounded disk, and deleting another process's working
+                // set is the failure this whole mechanism exists to prevent.
+                Some(name) if name != current && is_generation_dir(name) => {}
                 _ => continue,
             }
             let recent = std::fs::metadata(&p)
@@ -6457,6 +6487,75 @@ mod tests {
             "a generation nothing has touched for longer than the grace is dead \
              weight against the cache cap and must be reclaimed"
         );
+    }
+
+    /// B197 — the reclaim must not delete a directory that is not a generation.
+    ///
+    /// Regression from the live 2026-08-16 deploy, using the exact names that
+    /// were destroyed: on the FIRST boot after B196 the cache base still held
+    /// the pre-B196 layout — one directory per media id, plus `_audiohls` — and
+    /// the reclaim, whose rule was "any directory that is not the current
+    /// generation", deleted the entire cache while the outgoing pod was still
+    /// serving from it. The logs named a media id as a generation:
+    /// `"reclaiming a cache generation nothing has written to",
+    /// "generation":"4956781705437454830"`. That is the wipe B196 exists to
+    /// prevent, performed by B196's own cleanup.
+    #[test]
+    fn reclaim_never_touches_a_directory_that_is_not_a_generation() {
+        let td = TempDir::new().unwrap();
+        let current = "17-2cdd45df65324f56";
+        std::fs::create_dir_all(HlsSegmentCache::generation_root(td.path(), current)).unwrap();
+
+        // The pre-B196 layout, aged well past the grace so nothing but the
+        // name-shape rule can save it.
+        let item = td.path().join("4956781705437454830");
+        let audio = td.path().join("_audiohls");
+        for d in [&item, &audio] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("716-a0-s0-v2971-bauto-c26.ts"), b"live bytes").unwrap();
+            let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+            let h = std::fs::File::open(d).unwrap();
+            h.set_times(std::fs::FileTimes::new().set_modified(stale))
+                .unwrap();
+        }
+
+        HlsSegmentCache::reclaim_stale_generations(
+            td.path(),
+            current,
+            std::time::Duration::from_secs(600),
+        );
+
+        assert!(
+            item.exists(),
+            "a media-id directory is not a generation — deleting it takes the \
+             cache another pod is serving from"
+        );
+        assert!(
+            audio.exists(),
+            "the audio rendition root is not a generation either"
+        );
+    }
+
+    /// The name rule itself, including the case that makes it necessary: a
+    /// media id is all digits, and so is a fingerprint-less generation.
+    #[test]
+    fn only_a_fingerprinted_generation_name_is_reclaimable() {
+        assert!(is_generation_dir("17-2cdd45df65324f56"));
+        assert!(is_generation_dir("16-ffffffffffffffff"));
+        assert!(
+            !is_generation_dir("4956781705437454830"),
+            "a media id must never read as a generation (B197)"
+        );
+        assert!(
+            !is_generation_dir("17"),
+            "the bare-version form is unreclaimable ON PURPOSE — it cannot be \
+             told apart from a media id, and leaking disk beats deleting a \
+             live working set"
+        );
+        assert!(!is_generation_dir("_audiohls"));
+        assert!(!is_generation_dir("17-2cdd45df65324f5"), "15 hex digits");
+        assert!(!is_generation_dir("17-2cdd45df65324f56z"), "not all hex");
+        assert!(!is_generation_dir("-2cdd45df65324f56"), "no version");
     }
 
     /// The `result` label is a dashboard contract: three distinct, stable
