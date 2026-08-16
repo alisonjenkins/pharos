@@ -603,6 +603,29 @@ fn provenance_sidecar_path(segment: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Where quarantined segments are parked, relative to the generation root.
+///
+/// Dot-prefixed and NOT a media-id directory, so the purge scan can never find
+/// its own output and quarantine it twice — and so `is_generation_dir` will
+/// never mistake it for a generation (V150).
+const QUARANTINE_DIR: &str = ".quarantine";
+
+/// How many quarantined files are kept. Small on purpose: this is evidence for
+/// the incident in progress, not an archive, and it lives inside the cache
+/// whose size is enforced elsewhere.
+const QUARANTINE_MAX: usize = 64;
+
+/// What a purge did.
+#[derive(Debug, Default, Clone)]
+pub struct QuarantineReport {
+    /// Filenames moved out of service, in scan order.
+    pub quarantined: Vec<String>,
+    /// Files that matched but could not be moved. Reported rather than
+    /// swallowed: a partial purge leaves servable bytes behind, and the caller
+    /// asked for them to be gone.
+    pub failed: usize,
+}
+
 /// Suffix of the provenance sidecar. Named once: the eviction walk, the
 /// quarantine and the sidecar writer all have to agree, and three string
 /// literals would drift apart silently.
@@ -1722,6 +1745,124 @@ impl HlsSegmentCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Take a range of an item's cached segments out of service, KEEPING the
+    /// bytes (T118).
+    ///
+    /// Purging by hand three times in one evening (2026-08-16, Black Panther)
+    /// produced three re-encodes and not one retained sample: segment 827 was
+    /// unlinked before anyone copied it, so the only trace of a fault that hit
+    /// viewers three times is an md5 of bytes nobody can inspect. Every rule
+    /// proposed for catching that class since has been guessed from symptoms,
+    /// because there has never been a bad segment to look at. A purge that
+    /// destroys its own evidence is why.
+    ///
+    /// So a purged segment is MOVED, not deleted: out of the keyed path, where
+    /// it can never be served again, into a bounded quarantine ring where it
+    /// can be pulled off the volume and probed. Its provenance record (T122)
+    /// travels with it — the artefact and the name of the encoder that produced
+    /// it are only useful together.
+    ///
+    /// The range is in SEGMENT INDICES; converting a human timestamp is the
+    /// caller's job, because only the caller knows the grid.
+    pub async fn quarantine_segments(
+        &self,
+        media_id: u64,
+        indices: std::ops::RangeInclusive<u32>,
+    ) -> std::io::Result<QuarantineReport> {
+        let dir = self.root.join(media_id.to_string());
+        let pen = self.root.join(QUARANTINE_DIR);
+        let mut report = QuarantineReport::default();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            // No cached segments for this item is a successful purge of
+            // nothing, not an error: the caller asked for these bytes to be
+            // unservable and they are.
+            return Ok(report);
+        };
+        tokio::fs::create_dir_all(&pen).await?;
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // The index is the leading field of the filename; the provenance
+            // sidecar carries the same prefix and rides along with it.
+            let Some(idx) = name
+                .split_once('-')
+                .and_then(|(i, _)| i.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if !indices.contains(&idx) {
+                continue;
+            }
+            let dest = pen.join(format!("{media_id}-{name}"));
+            match tokio::fs::rename(&path, &dest).await {
+                Ok(()) => report.quarantined.push(name.to_string()),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not quarantine a cached segment"
+                    );
+                    report.failed += 1;
+                }
+            }
+        }
+        // The in-memory LRU still bills these bytes and would serve them from
+        // its own bookkeeping; drop the entries and their weight together.
+        {
+            let mut state = self.state.lock().await;
+            let doomed: Vec<SegmentIdentity> = state
+                .entries
+                .keys()
+                .filter(|k| k.media_id == media_id && indices.contains(&k.seg_index))
+                .copied()
+                .collect();
+            for key in doomed {
+                if let Some(meta) = state.entries.remove(&key) {
+                    state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
+                }
+            }
+        }
+        Self::trim_quarantine(&pen).await;
+        metrics::counter!("pharos_segment_quarantined_total")
+            .increment(report.quarantined.len() as u64);
+        tracing::warn!(
+            media.id = media_id,
+            first_index = *indices.start(),
+            last_index = *indices.end(),
+            quarantined = report.quarantined.len(),
+            failed = report.failed,
+            "cached segments taken out of service and retained for inspection"
+        );
+        Ok(report)
+    }
+
+    /// Keep the quarantine bounded: the newest [`QUARANTINE_MAX`] files stay,
+    /// everything older goes. A diagnostic that grows without limit inside the
+    /// cache would eventually be the outage.
+    async fn trim_quarantine(pen: &Path) {
+        let Ok(entries) = std::fs::read_dir(pen) else {
+            return;
+        };
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let m = std::fs::metadata(&p).ok()?.modified().ok()?;
+                p.is_file().then_some((m, p))
+            })
+            .collect();
+        if files.len() <= QUARANTINE_MAX {
+            return;
+        }
+        files.sort_by_key(|(m, _)| *m);
+        let excess = files.len() - QUARANTINE_MAX;
+        for (_, p) in files.into_iter().take(excess) {
+            let _ = tokio::fs::remove_file(&p).await;
+        }
     }
 
     /// Fetch the bytes for `(media_id, seg_index)` with no per-track
@@ -6698,6 +6839,154 @@ mod tests {
             !old.exists(),
             "a generation nothing has touched for longer than the grace is dead \
              weight against the cache cap and must be reclaimed"
+        );
+    }
+
+    /// T118 — a purge must keep the bytes it takes out of service.
+    ///
+    /// Three by-hand purges on 2026-08-16 produced three re-encodes and not one
+    /// retained sample; segment 827 was unlinked before it was copied, so the
+    /// fault that hit viewers three times has no artefact at all. Every rule
+    /// proposed for catching that class has been guessed from symptoms since.
+    #[tokio::test]
+    async fn a_purged_segment_is_kept_for_inspection_rather_than_destroyed() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        cache
+            .segment_bytes(1, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
+            .await
+            .expect("the stub produces a segment");
+
+        let served = cache.root().join("1");
+        let before: Vec<_> = std::fs::read_dir(&served)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(!before.is_empty(), "the segment is in the keyed path");
+
+        let report = cache.quarantine_segments(1, 0..=0).await.unwrap();
+        assert_eq!(report.failed, 0, "nothing failed to move");
+        assert!(
+            !report.quarantined.is_empty(),
+            "the purge reports what it took: {report:?}"
+        );
+
+        // Unservable...
+        for p in &before {
+            assert!(
+                !p.exists(),
+                "a purged segment must not remain where it can be served: {}",
+                p.display()
+            );
+        }
+        // ...but not destroyed. This is the whole point of the task.
+        let pen = cache.root().join(QUARANTINE_DIR);
+        let kept: Vec<_> = std::fs::read_dir(&pen)
+            .expect("the quarantine exists")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            kept.iter().any(|p| std::fs::read(p)
+                .map(|b| b == SLOW_SEGMENT_BYTES.as_bytes())
+                .unwrap_or(false)),
+            "the purged bytes must still be readable for diagnosis; found {kept:?}"
+        );
+        // The provenance record travels with the artefact: the bytes and the
+        // name of the encoder that produced them are only useful together.
+        assert!(
+            kept.iter()
+                .any(|p| p.to_string_lossy().ends_with(PROVENANCE_SUFFIX)),
+            "the provenance record must be quarantined alongside its segment; \
+             found {kept:?}"
+        );
+    }
+
+    /// A segment outside the requested range must not be touched. The purge is
+    /// aimed at a timestamp a viewer reported; taking neighbours with it turns
+    /// a targeted repair into a partial wipe.
+    #[tokio::test]
+    async fn a_purge_takes_only_the_range_it_was_given() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let mut opts = slow_opts();
+        for seg in [0u32, 1, 2] {
+            opts.window = pharos_core::SegmentWindow::for_segment(seg, None, Some(600.0));
+            cache
+                .segment_bytes(
+                    1,
+                    seg,
+                    Path::new("/no/source"),
+                    &opts,
+                    JobClass::Interactive,
+                )
+                .await
+                .expect("the stub produces a segment");
+        }
+        let names = |d: &Path| -> Vec<String> {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                        .filter(|n| !n.ends_with(PROVENANCE_SUFFIX))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(names(&cache.root().join("1")).len(), 3, "three cached");
+
+        cache.quarantine_segments(1, 1..=1).await.unwrap();
+
+        let left = names(&cache.root().join("1"));
+        assert_eq!(left.len(), 2, "only the named segment goes: {left:?}");
+        assert!(
+            left.iter().all(|n| !n.starts_with("1-")),
+            "the requested index must be the one removed: {left:?}"
+        );
+    }
+
+    /// The quarantine is evidence for the incident in progress, not an
+    /// archive, and it lives inside the cache whose size is enforced elsewhere.
+    #[tokio::test]
+    async fn the_quarantine_is_bounded() {
+        let dir = TempDir::new().unwrap();
+        let pen = dir.path().join("pen");
+        std::fs::create_dir_all(&pen).unwrap();
+        for i in 0..(QUARANTINE_MAX + 10) {
+            let p = pen.join(format!("seg-{i}.ts"));
+            std::fs::write(&p, b"x").unwrap();
+            // Distinct, increasing mtimes so "oldest" is well defined without
+            // depending on filesystem timestamp resolution.
+            let when =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(1000 - i as u64);
+            std::fs::File::open(&p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
+
+        HlsSegmentCache::trim_quarantine(&pen).await;
+
+        let left: Vec<_> = std::fs::read_dir(&pen).unwrap().flatten().collect();
+        assert_eq!(
+            left.len(),
+            QUARANTINE_MAX,
+            "the quarantine must stay bounded"
+        );
+        assert!(
+            left.iter().all(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                let i: usize = n
+                    .trim_start_matches("seg-")
+                    .trim_end_matches(".ts")
+                    .parse()
+                    .unwrap();
+                i >= 10
+            }),
+            "the OLDEST files go — the newest are the incident being diagnosed"
         );
     }
 
