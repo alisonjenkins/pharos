@@ -214,6 +214,7 @@ async fn command_from_non_owner_reaches_members_on_both_replicas() {
         .send(GroupMsg::SetNewQueue {
             sender: m_a,
             item_ids: vec!["ep1".into()],
+            item_runtimes_ms: Vec::new(),
             playing_index: 0,
             start_position_ms: 0,
         })

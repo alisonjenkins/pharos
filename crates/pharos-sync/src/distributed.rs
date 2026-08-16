@@ -122,11 +122,13 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::SetNewQueue {
             sender,
             item_ids,
+            item_runtimes_ms,
             playing_index,
             start_position_ms,
         } => RemoteCommand::SetNewQueue {
             sender,
             item_ids,
+            item_runtimes_ms,
             playing_index,
             start_position_ms,
         },
