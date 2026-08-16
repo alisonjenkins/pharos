@@ -1405,7 +1405,15 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// this re-land safe where the first attempt was not: the bump is now visible
 /// to the CLIENT cache, not only to the server's.
 pub const HLS_GEN_VERSION: u32 = 17;
-const GEN_VERSION_MARKER: &str = ".gen_version";
+/// How long a generation subtree must go untouched before it is reclaimed.
+///
+/// Sized against a ROLLING UPDATE, not against disk pressure: while the new
+/// pod boots and the old one drains, the old generation is still serving
+/// segments, and reclaiming it on sight would break the playback the overlap
+/// exists to protect. Ten minutes comfortably outlives a drain (the pod's
+/// terminationGracePeriod is a fraction of it) while still returning the disk
+/// within one restart.
+const GENERATION_RECLAIM_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The composed generation this process is running under, installed once at
 /// boot by [`install_placement_fingerprint`].
@@ -1474,9 +1482,102 @@ pub fn generation() -> &'static str {
 }
 
 impl HlsSegmentCache {
+    /// The cache subtree a generation owns.
+    ///
+    /// Namespacing by generation is what makes a mixed-encoder rendition
+    /// unrepresentable rather than unlikely. The `.gen_version` marker it
+    /// replaces assumed a single writer and wiped the shared tree at boot; a
+    /// RollingUpdate guarantees two writers, so on 2026-08-16 the new pod
+    /// wiped and the OLD pod — still alive, still on the previous placement
+    /// rule — wrote segments 712-716 straight back into the paths just
+    /// cleared. One rendition, two encoders, one init, and a viewer watching
+    /// two frames flicker (#114).
+    ///
+    /// A pod on the old rule cannot address a path in the new generation's
+    /// tree at all, however long the overlap lasts.
+    pub fn generation_root(base: &std::path::Path, generation: &str) -> PathBuf {
+        base.join(generation)
+    }
+
+    /// Delete generation subtrees that are neither in force nor recently
+    /// written.
+    ///
+    /// The grace is the load-bearing part. During a rolling update the OTHER
+    /// generation is a LIVE pod's working set — it is still serving segments
+    /// from it — so reclaiming on sight would break the very playback the
+    /// overlap exists to protect. Anything untouched for longer than the grace
+    /// has no process behind it.
+    ///
+    /// Only DIRECTORIES are considered, which is also what spares the
+    /// persisted rate store: it is a file beside the generations, and
+    /// re-probing is what moves placement, so deleting it would make this
+    /// cleanup cause the re-placement it is tidying up after.
+    ///
+    /// Best-effort throughout: anything that cannot be read or removed is left
+    /// for the next pass. Reclaiming disk is never worth failing a boot over.
+    pub fn reclaim_stale_generations(
+        base: &std::path::Path,
+        current: &str,
+        grace: std::time::Duration,
+    ) {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            match p.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name != current => {}
+                _ => continue,
+            }
+            let recent = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map_or(true, |age| age < grace);
+            if recent {
+                continue;
+            }
+            tracing::info!(
+                generation = ?p.file_name(),
+                "reclaiming a cache generation nothing has written to"
+            );
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// The cache root is the GENERATION's subtree, not the bare directory.
+    ///
+    /// Everything below — segment paths, tmp files, audio rendition dirs, the
+    /// LRU's own walk — inherits the namespace for free, which is why this is
+    /// done here rather than threaded through every path builder. Two pods on
+    /// different placement rules then cannot address the same file at all, and
+    /// the mixed-encoder rendition of 2026-08-16 becomes unrepresentable
+    /// instead of a matter of how long a rolling update overlaps (#114).
+    ///
+    /// Nothing is wiped. The previous generation is left exactly where it is,
+    /// because during that overlap it is a live pod's working set; it is
+    /// reclaimed later by [`Self::reclaim_stale_generations`] once nothing has
+    /// written to it. That also removes the cliff the wipe caused — a
+    /// placement change used to empty the cache under every viewer at once
+    /// (measured 2026-08-16: 21.6 GiB discarded, every stream cold, waits to
+    /// 11.8 s), where now the new generation simply fills as it is watched.
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
-        let root: PathBuf = root.into();
-        Self::reconcile_generation(&root, generation());
+        let base: PathBuf = root.into();
+        let generation = generation();
+        // Reclaim BEFORE creating this generation's tree, so a boot after a
+        // completed rollout tidies the one it replaced.
+        Self::reclaim_stale_generations(&base, generation, GENERATION_RECLAIM_GRACE);
+        let root = Self::generation_root(&base, generation);
+        let _ = std::fs::create_dir_all(&root);
+        tracing::info!(
+            base = %base.display(),
+            generation,
+            "HLS cache root scoped to this generation"
+        );
         Self {
             root,
             max_bytes,
@@ -1486,62 +1587,6 @@ impl HlsSegmentCache {
             inflight: Arc::new(DashMap::new()),
             next_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
-    }
-
-    /// Wipe every cached segment when the on-disk generation doesn't match
-    /// [`generation()`] (same pattern as the trickplay cache).
-    /// Best-effort: fs errors leave the cache as-is rather than failing boot.
-    ///
-    /// The marker holds the COMPOSED generation, not the bare
-    /// [`HLS_GEN_VERSION`], so a device table that re-places renditions wipes
-    /// the segments the previous placement produced. A marker written by an
-    /// older build holds a bare integer, which simply doesn't match — one cold
-    /// cache on upgrade, which is required anyway because the same deploy makes
-    /// `g=` change shape.
-    ///
-    /// `want` is passed rather than read from [`generation()`] so this stays a
-    /// pure function of its arguments: the generation is a process-wide
-    /// `OnceLock`, and a test that reconciled against it would fix it for every
-    /// other test sharing the binary.
-    ///
-    /// Two entries survive the wipe: this cache's own marker, and the
-    /// transcode-rate store (`RATE_STORE_FILE`), which is parked in the same
-    /// root. Deleting the latter would force a re-probe on precisely the boot
-    /// where placement stability matters most — and a fresh probe is what moves
-    /// placement, so the wipe would be causing a second re-placement while
-    /// cleaning up after the first. Everything else in this root is a cached
-    /// artefact of the generation being discarded.
-    fn reconcile_generation(root: &std::path::Path, want: &str) {
-        let marker = root.join(GEN_VERSION_MARKER);
-        let on_disk = std::fs::read_to_string(&marker)
-            .ok()
-            .map(|s| s.trim().to_string());
-        if on_disk.as_deref() == Some(want) {
-            return;
-        }
-        tracing::info!(
-            on_disk = on_disk.as_deref().unwrap_or("<none>"),
-            generation = %want,
-            "HLS cache generation changed; discarding every cached artefact"
-        );
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if matches!(
-                    p.file_name().and_then(|n| n.to_str()),
-                    Some(GEN_VERSION_MARKER) | Some(pharos_transcode::rate_store::RATE_STORE_FILE)
-                ) {
-                    continue;
-                }
-                if p.is_dir() {
-                    let _ = std::fs::remove_dir_all(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
-        let _ = std::fs::create_dir_all(root);
-        let _ = std::fs::write(&marker, want);
     }
 
     /// Route segment transcodes through the load-balancing scheduler.
@@ -6332,6 +6377,88 @@ mod tests {
         assert_eq!(short_of_frames(got, &opts, false), None);
     }
 
+    /// Two generations must not share a segment path.
+    ///
+    /// The wipe-at-boot marker assumes ONE writer. A RollingUpdate guarantees
+    /// the opposite: the new pod boots, wipes, and writes its marker while the
+    /// OLD pod is still alive, still applying the previous placement rule, and
+    /// still writing into the very paths that were just cleared. Live on
+    /// 2026-08-16 that split one rendition across two encoders — segments
+    /// 712-716 from libx264, 717+ from NVENC, under a single init — and the
+    /// viewer's player flickered between two frames at the boundary, because
+    /// two encoders' SPS are not interchangeable (#114).
+    ///
+    /// Namespacing the ROOT by generation makes that unrepresentable rather
+    /// than unlikely: a pod on the old rule cannot address a path in the new
+    /// generation's tree at all, however long the two overlap.
+    #[test]
+    fn two_generations_never_share_a_segment_path() {
+        let td = TempDir::new().unwrap();
+        let a = HlsSegmentCache::generation_root(td.path(), "16-2cdd45df65324f56");
+        let b = HlsSegmentCache::generation_root(td.path(), "17-2cdd45df65324f56");
+        assert_ne!(a, b, "a generation change must move the whole tree");
+        assert!(a.starts_with(td.path()) && b.starts_with(td.path()));
+        // …and the same identity under each lands in different files.
+        let rel = "4956781705437454830/716-a0-s0-v2971-bauto-c26.ts";
+        assert_ne!(a.join(rel), b.join(rel));
+    }
+
+    /// Reclaiming old generations must never touch the one in force, and must
+    /// leave a recently-written one alone: during a rolling update the other
+    /// generation is a LIVE pod's working set, and deleting it would break the
+    /// segments that pod is still serving.
+    #[test]
+    fn reclaim_spares_the_current_generation_and_anything_recent() {
+        let td = TempDir::new().unwrap();
+        let current = "17-2cdd45df65324f56";
+        let cur = HlsSegmentCache::generation_root(td.path(), current);
+        let old = HlsSegmentCache::generation_root(td.path(), "16-2cdd45df65324f56");
+        let recent = HlsSegmentCache::generation_root(td.path(), "16-ffffffffffffffff");
+        for d in [&cur, &old, &recent] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Age only `old` past the grace; the others stay fresh.
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let h = std::fs::File::open(&old).unwrap();
+        h.set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+
+        // The persisted encode-rate probe lives in the BASE root beside the
+        // generation dirs. Reclaiming must not take it: re-probing is what
+        // MOVES placement, so deleting the rates would make the cleanup cause
+        // the very re-placement it is tidying up after.
+        let rates = td
+            .path()
+            .join(pharos_transcode::rate_store::RATE_STORE_FILE);
+        std::fs::write(&rates, b"{\"version\":1}").unwrap();
+
+        HlsSegmentCache::reclaim_stale_generations(
+            td.path(),
+            current,
+            std::time::Duration::from_secs(900),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&rates).unwrap(),
+            "{\"version\":1}",
+            "the rate store is boot-time state beside the generations, not one of them"
+        );
+
+        assert!(
+            cur.exists(),
+            "the generation in force must never be reclaimed"
+        );
+        assert!(
+            recent.exists(),
+            "a recently-written generation is a draining pod's working set"
+        );
+        assert!(
+            !old.exists(),
+            "a generation nothing has touched for longer than the grace is dead \
+             weight against the cache cap and must be reclaimed"
+        );
+    }
+
     /// The `result` label is a dashboard contract: three distinct, stable
     /// values. `tail_deficit` exists so the tail is neither counted as loss
     /// nor laundered into `complete`.
@@ -7797,69 +7924,6 @@ mod generation_tests {
         );
     }
 
-    /// A marker matching the generation in force keeps the cache; anything else
-    /// — including the bare integer an older build wrote — wipes it and leaves
-    /// the new generation behind.
-    #[test]
-    fn reconcile_wipes_on_a_generation_change_and_keeps_it_otherwise() {
-        let td = TempDir::new().unwrap();
-        let root = td.path();
-        let marker = root.join(GEN_VERSION_MARKER);
-        let seed = || {
-            std::fs::create_dir_all(root.join("media7")).unwrap();
-            std::fs::write(root.join("media7/seg0.m4s"), b"bytes").unwrap();
-        };
-
-        // Same generation → the cache survives.
-        seed();
-        std::fs::write(&marker, "16-aaaaaaaaaaaaaaaa").unwrap();
-        HlsSegmentCache::reconcile_generation(root, "16-aaaaaaaaaaaaaaaa");
-        assert!(root.join("media7/seg0.m4s").exists(), "no reason to wipe");
-
-        // A drifted placement digest → wiped, and the marker records the new one.
-        HlsSegmentCache::reconcile_generation(root, "16-bbbbbbbbbbbbbbbb");
-        assert!(
-            !root.join("media7/seg0.m4s").exists(),
-            "segments from the previous placement must be orphaned"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&marker).unwrap(),
-            "16-bbbbbbbbbbbbbbbb"
-        );
-
-        // A marker from a build that predates the digest is not a match.
-        seed();
-        std::fs::write(&marker, "16").unwrap();
-        HlsSegmentCache::reconcile_generation(root, "16-bbbbbbbbbbbbbbbb");
-        assert!(!root.join("media7/seg0.m4s").exists());
-    }
-
-    /// The persisted encode-rate probe lives in this same root, and a
-    /// generation wipe must not take it: re-probing is what MOVES placement, so
-    /// deleting the stored rates would make the cleanup cause a second
-    /// re-placement on the very boot that was recovering from the first.
-    #[test]
-    fn the_wipe_spares_the_persisted_rate_store() {
-        let td = TempDir::new().unwrap();
-        let root = td.path();
-        let rates = root.join(pharos_transcode::rate_store::RATE_STORE_FILE);
-        std::fs::create_dir_all(root.join("media7")).unwrap();
-        std::fs::write(root.join("media7/seg0.m4s"), b"bytes").unwrap();
-        std::fs::write(&rates, b"{\"version\":1}").unwrap();
-
-        HlsSegmentCache::reconcile_generation(root, "16-cccccccccccccccc");
-
-        assert!(
-            !root.join("media7/seg0.m4s").exists(),
-            "cached artefacts of the old generation still go"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&rates).unwrap(),
-            "{\"version\":1}",
-            "the rate store is boot-time state, not a cached artefact"
-        );
-    }
-
     /// `install_placement_fingerprint` fixes the generation for the process and
     /// both readers see exactly that string. The second install is a bug (URLs
     /// are already out) so the first value wins.
@@ -7880,13 +7944,14 @@ mod generation_tests {
             "a second install must not move a generation already in client URLs"
         );
 
-        // And it is the string the on-disk marker is reconciled against.
+        // And it is the DIRECTORY the cache roots itself in — the generation
+        // is a path now, not a marker file, which is what stops two pods on
+        // different placement rules sharing a segment.
         let td = TempDir::new().unwrap();
-        std::fs::write(td.path().join(GEN_VERSION_MARKER), "stale").unwrap();
         let _cache = HlsSegmentCache::new(td.path(), 1024);
-        assert_eq!(
-            std::fs::read_to_string(td.path().join(GEN_VERSION_MARKER)).unwrap(),
-            generation()
+        assert!(
+            td.path().join(generation()).is_dir(),
+            "the cache must root itself under the generation in force"
         );
     }
 }
