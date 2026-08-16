@@ -35,6 +35,32 @@ jobs:
       - name: nix flake check (build + tests + clippy + fmt + doctests)
         run: nix flake check -L
 
+  postgres:
+    name: store (postgres)
+    # T80 — the store suite against a REAL postgres.
+    #
+    # `just test` does NOT cover postgres: the postgres arms skip themselves
+    # when PHAROS_TEST_POSTGRES_URL is unset (they are the bulk of the
+    # "N skipped" line), and sqlx checks neither placeholder arity nor column
+    # names at compile time. So a postgres-only defect compiles, passes the
+    # whole local suite, and reaches production untouched — which is exactly
+    # what happened with `mark_seen_batch`: it had a sqlite override and none
+    # for postgres, so every scan on the deployment silently fell back to one
+    # autocommit UPDATE per file (T117), and no test anywhere called it.
+    #
+    # The recipe brings up its own postgres via nix, so this needs no service
+    # container and no credentials.
+    runs-on: pharos-nix-builder-amd64
+    timeout-minutes: 60
+    if: ${{ github.event.pull_request.head.repo.fork != true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: alisonjenkins/setup-host-nix@v1
+
+      - name: store suite against real postgres
+        run: nix develop --command just test-postgres
+
   audit:
     name: supply-chain
     # Self-hosted home nix builder (host daemon + warm store), same as the
