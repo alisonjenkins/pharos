@@ -55,7 +55,7 @@ quick-xml = "0.41"
 # beyond ffmpeg is what rules out a PDF rasteriser (R11) and a rar reader
 # (R7). An epub IS a zip, so `zip` covers epub and cbz both.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-sevenz-rust = { version = "0.6", default-features = false }
+sevenz-rust2 = { version = "0.21", default-features = false }
 # `.cbt` is a TAR of images. `tar` is pure Rust like the two above, so the
 # no-C-library rule that permanently rules out `.cbr` (R7) does not apply here
 # — a cbt is read for real rather than recorded as unsupported.

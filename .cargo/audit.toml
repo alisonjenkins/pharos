@@ -27,15 +27,4 @@ ignore = [
     # invalidate it, is in deny.toml; V123 says it has to be written down.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # RUSTSEC-2026-0245 — path traversal in `sevenz-rust` 0.6.1's
-    # `decompress_impl` (arbitrary file write from a malicious `.7z`). No
-    # fixed version exists. Unreachable: pharos never extracts a 7z entry to
-    # disk — the `.cb7` comic path reads entries into memory via
-    # `for_each_entries` and only ever COMPARES entry names. Guarded by
-    # `a_cb7_is_never_extracted_to_disk`; full argument in deny.toml.
-    "RUSTSEC-2026-0245",
-    # RUSTSEC-2026-0246 — `sevenz-rust` unmaintained (repository deleted);
-    # successor is the `sevenz-rust2` fork. Not a vuln. Migration tracked as
-    # T115, which also retires RUSTSEC-2026-0245. Rationale in deny.toml.
-    "RUSTSEC-2026-0246",
 ]
