@@ -69,6 +69,9 @@ const PASS_INTERVAL: Duration = Duration::from_secs(3600);
 const MAX_PER_PASS: usize = 200;
 
 struct Ctx {
+    /// Background-work leadership (T85). Gates the sweep so replicas do not
+    /// duplicate it.
+    bg_leader: Arc<std::sync::atomic::AtomicBool>,
     stores: Stores,
     bg_io: Arc<Semaphore>,
     pool: LibavWorkerPool,
@@ -79,6 +82,7 @@ struct Ctx {
 /// sweep (logged), never the server.
 pub fn spawn(
     stores: Stores,
+    bg_leader: Arc<std::sync::atomic::AtomicBool>,
     bg_io: Arc<Semaphore>,
     pool: LibavWorkerPool,
     memo: Arc<IntegrityMemo>,
@@ -90,14 +94,30 @@ pub fn spawn(
     );
     tokio::spawn(run_sweep(Ctx {
         stores,
+        bg_leader,
         bg_io,
         pool,
         memo,
     }));
 }
 
+/// Await background-work leadership. Local copy rather than a dependency on
+/// another background module; mirrors `AppState::wait_until_bg_leader`.
+async fn wait_until_bg_leader(flag: &std::sync::atomic::AtomicBool) {
+    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 async fn run_sweep(ctx: Ctx) {
     tokio::time::sleep(WARMUP).await;
+    // T85 — one replica sweeps, not all of them. This loop lists the WHOLE
+    // library and does heavy per-item work (the integrity sweep reads every file end to end), so a second replica
+    // running it duplicates the most expensive background I/O in the system
+    // against the same shared storage. Unlike the trickplay priority worker
+    // there is no per-viewer component here to keep un-gated: every item this
+    // touches is bulk work nobody is waiting on.
+    wait_until_bg_leader(&ctx.bg_leader).await;
     loop {
         match ctx.stores.list().await {
             Ok(items) => run_pass(&ctx, &items).await,
@@ -265,5 +285,30 @@ mod tests {
             !scannable(&local("ytdlp://youtube/dQw4w9WgXcQ")),
             "a synthetic path is not a file; scanning it can only ever fail"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod leader_gate_tests {
+    use super::*;
+
+    /// T85 — this sweep lists the WHOLE library and does heavy per-item work,
+    /// so a replica that is not the background leader must not run it: two
+    /// replicas would duplicate the most expensive background I/O in the
+    /// system against the same shared storage.
+    #[tokio::test]
+    async fn the_sweep_waits_for_background_leadership() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        let waiting = tokio::spawn(async move { wait_until_bg_leader(&f).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a follower must not sweep");
+        flag.store(true, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("election must release the gate")
+            .expect("the waiter must not panic");
     }
 }

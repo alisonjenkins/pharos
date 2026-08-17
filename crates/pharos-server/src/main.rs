@@ -1646,6 +1646,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     pharos_server::segment_backfill::spawn(
         state.stores.clone(),
+        state.is_bg_leader.clone(),
         state.bg_io.clone(),
         libav_pool.clone(),
     );
@@ -1656,6 +1657,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     pharos_server::integrity_backfill::spawn(
         state.stores.clone(),
+        state.is_bg_leader.clone(),
         state.bg_io.clone(),
         libav_pool.clone(),
         integrity_memo_for(&cfg),
