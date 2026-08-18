@@ -132,13 +132,35 @@ pub fn default_audio_stream_index(
     preferred_languages: &[String],
     prefer_default_track: bool,
 ) -> Option<u32> {
-    let sorted = sorted_by_score(audio, preferred_languages);
     if prefer_default_track {
+        let sorted = sorted_by_score(audio, preferred_languages);
         if let Some(s) = sorted.iter().find(|s| s.is_default) {
             return Some(s.index);
         }
+        return sorted.first().map(|s| s.index);
     }
-    sorted.first().map(|s| s.index)
+    // T129: `stream_score`'s `is_default` digit is a tiebreak meant for when
+    // the setting above is ON — see its doc comment, "`prefer_default_track`
+    // has to be a separate override rather than another term here". With the
+    // setting OFF that digit still sits in the score and decides ties anyway,
+    // so a foreign-language default-flagged track can outrank the container's
+    // actual first track whenever the language digits tie (no preference, or
+    // no track matches one). Score each track as if it carried no default
+    // flag so the tiebreak falls through to the stable sort's container
+    // order instead — sort_by_key's stability is load-bearing here; swapping
+    // it for sort_unstable_by_key would silently reopen this bug with every
+    // test above still green, since none of them discriminate on order alone.
+    let neutralized: Vec<StreamFacts> = audio
+        .iter()
+        .cloned()
+        .map(|s| StreamFacts {
+            is_default: false,
+            ..s
+        })
+        .collect();
+    sorted_by_score(&neutralized, preferred_languages)
+        .first()
+        .map(|s| s.index)
 }
 
 /// The subtitle track to start on under `mode`, given the language of the
@@ -433,6 +455,30 @@ mod tests {
                 "prefs {prefs:?} prefer_default {prefer_default}"
             );
         }
+    }
+
+    /// T129: the container's default-flagged track is NOT the first one, and
+    /// no preferred language matches either (an empty list, exactly what
+    /// `OriginalLanguage` degrades to when the item's own metadata is empty —
+    /// see `original_language_degrades_when_the_item_has_none` in
+    /// `jellyfin_track_selection.rs`). Unlike every other fixture in this
+    /// file, index 1 here is default WITHOUT also being first, so this is the
+    /// one case that actually discriminates "the flag decided the tie" from
+    /// "the container order decided the tie" — the two prior tests' `(&[],
+    /// false, _)` rows pass either way, which is how this shipped.
+    #[test]
+    fn an_off_default_track_does_not_win_a_language_tie() {
+        let streams = vec![audio(0, "eng", false), audio(2, "tur", true)];
+        assert_eq!(
+            default_audio_stream_index(&streams, &langs(&[]), false),
+            Some(0),
+            "prefer_default_track off, no language signal: container order wins, not the flag"
+        );
+        assert_eq!(
+            default_audio_stream_index(&streams, &langs(&[]), true),
+            Some(2),
+            "prefer_default_track on: the default flag still wins, unchanged"
+        );
     }
 
     #[test]
