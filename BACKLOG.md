@@ -116,7 +116,18 @@ exact native-client request (adb logcat / mitm) — do not guess.
   `pharos-jellyfin-api/src/dto.rs` + `wire::json()`; inbound bodies use
   `SimdJson<T>`. sonic-rs (SIMD) is the serializer both directions.
 
-### 3. camelCase query-param binding  (B11/B13 open note — the recurring one)
+### 3. camelCase query-param binding  (B11/B13 open note — the recurring one) — RESOLVED, verified 2026-08-18
+The systemic fix landed: `crates/pharos-server/src/api/jellyfin/ci_query.rs`
+defines `CiQuery<T>`, a drop-in `web::Query<T>` replacement that
+snake_cases every query key before parsing (so `SeasonId`/`seasonId` both
+bind), with its own unit tests and a doc comment citing this exact bug
+class (B18). Verified 2026-08-18: zero `web::Query<` call sites remain in
+any of the files this note originally listed
+(users/system/item_ops/syncplay/search/sessions/admin/items.rs, plus
+admin.rs/playlists.rs/stubs.rs/subtitles.rs/live_tv.rs — every file that
+still declared `rename_all = "PascalCase"`); `CiQuery<` has 59 call sites
+across 8 files. Leaving the historical detail below for context.
+
 - **27** `web::Query` structs still `rename_all = "PascalCase"` across
   users/system/item_ops/syncplay/search/sessions/admin/items.rs.
 - kotlin/native SDKs send **camelCase** query params; ASP.NET binds
