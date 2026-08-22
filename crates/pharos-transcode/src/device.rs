@@ -722,6 +722,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         }
     }
 
@@ -1214,6 +1215,7 @@ mod pool_tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         }
     }
 
