@@ -144,6 +144,20 @@ pub struct JobSpec {
     /// 10-bit AV1 source to a card with no AV1 decode block.
     pub decode_offload: crate::DecodeOffload,
     pub sink: OutputSink,
+    /// B201 — when set, the worker builds a synthetic `lavfi` input (black
+    /// video, plus silence for a muxed audio rendition) instead of decoding
+    /// `input`, because the retry ladder already exhausted itself against
+    /// this window and it came back short of — or with zero — video frames.
+    ///
+    /// Travels HERE, beside `decode_offload`, rather than inside `opts`
+    /// (`TranscodeOptions::filler` exists too, but is `#[serde(skip)]` and
+    /// never reaches the wire — see its doc comment). Same shape of fact as
+    /// `decode_offload`: a decision about THIS job, made by the process that
+    /// can see the whole retry history, not a property of the rendition
+    /// `RenditionKey` pins — so it must not be able to move that key, and a
+    /// field on `JobSpec` cannot, by construction (the key is computed from
+    /// `input` + `opts` alone).
+    pub filler: Option<crate::options::FillerSpec>,
 }
 
 /// One in-process libav "tiny op" — the high-frequency ffmpeg/ffprobe
@@ -491,11 +505,13 @@ mod tests {
                 burn_fonts_dir: None,
                 decode_preroll_seconds: None,
                 muxed_audio_source: None,
+                filler: None,
             },
             device: DeviceId::hw(HwAccel::Nvenc, 0),
             sink: OutputSink::FileDirect {
                 path: PathBuf::from("/cache/1/0.tmp"),
             },
+            filler: None,
         }
     }
 

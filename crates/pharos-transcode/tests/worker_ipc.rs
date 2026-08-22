@@ -79,9 +79,11 @@ async fn worker_transcodes_file_direct() {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         },
         device: DeviceId::Cpu,
         sink: OutputSink::FileDirect { path: out.clone() },
+        filler: None,
     };
 
     let res = tokio::time::timeout(Duration::from_secs(60), worker.run(spec))
@@ -134,9 +136,11 @@ async fn worker_reports_bad_input() {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         },
         device: DeviceId::Cpu,
         sink: OutputSink::FileDirect { path: out.clone() },
+        filler: None,
     };
 
     let res = tokio::time::timeout(Duration::from_secs(30), worker.run(spec))
@@ -184,9 +188,11 @@ async fn worker_streams_live_to_stdout() {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         },
         device: DeviceId::Cpu,
         sink: OutputSink::Stdout,
+        filler: None,
     };
 
     let mut stream = spawner

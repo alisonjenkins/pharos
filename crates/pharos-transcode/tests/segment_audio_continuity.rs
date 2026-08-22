@@ -182,6 +182,7 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
         DeviceId::Cpu,
         out.to_str().unwrap(),
         pharos_transcode::DecodeOffload::Allowed,
+        None,
     );
     let res = Command::new("ffmpeg")
         .args(&args)
