@@ -140,6 +140,12 @@ pub struct AppState {
     pub transcode_sessions: TranscodeSessionRegistry<Stores>,
     pub images: Option<ImageCache>,
     pub hls: Option<HlsSegmentCache>,
+    /// Container-integrity verdicts (whole-file demux scan). `None` on a
+    /// build/platform without the sweep (non-unix, or `ffmpeg-lib` off —
+    /// see `main.rs`'s `integrity_memo_for`, which is the only producer).
+    /// Read by `GET /admin/integrity/damaged` — the one place "a number
+    /// stating corruption" becomes "which files".
+    pub integrity_memo: Option<std::sync::Arc<crate::integrity_memo::IntegrityMemo>>,
     /// Load-balancing transcode scheduler (multi-GPU + all-CPU). When
     /// present, the live/uncached HLS path streams through it; the cached
     /// path uses its own clone held inside `HlsSegmentCache`.
@@ -575,6 +581,7 @@ impl AppState {
             transcode_sessions,
             images: None,
             hls: None,
+            integrity_memo: None,
             transcode_scheduler: None,
             remote: None,
             remote_cache: None,
@@ -667,6 +674,7 @@ impl AppState {
             transcode_sessions,
             images: None,
             hls: None,
+            integrity_memo: None,
             transcode_scheduler: None,
             remote: None,
             remote_cache: None,
@@ -849,6 +857,14 @@ impl AppState {
 
     pub fn with_trickplay_cache(mut self, cache: TrickplayCache) -> Self {
         self.trickplay = Some(cache);
+        self
+    }
+
+    pub fn with_integrity_memo(
+        mut self,
+        memo: std::sync::Arc<crate::integrity_memo::IntegrityMemo>,
+    ) -> Self {
+        self.integrity_memo = Some(memo);
         self
     }
 
